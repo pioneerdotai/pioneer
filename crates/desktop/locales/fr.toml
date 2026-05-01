@@ -1,0 +1,864 @@
+_version = 1
+
+[chat.composer]
+placeholder = "Envoyez un message à l'assistant"
+
+[chat.composer.mode]
+agent_label = "Agent"
+agent_description = "Automatisation complète et intégration transparente dans votre flux de travail."
+chat_label = "Chat"
+chat_description = "IA conversationnelle pour l'analyse, la rédaction et le raisonnement sans automatisation."
+
+[chat.composer.model]
+select_label = "Sélectionner le modèle"
+dialog_title = "Sélectionner le modèle"
+provider_label = "Fournisseur"
+provider_placeholder = "Rechercher des fournisseurs..."
+model_label = "Modèle"
+model_placeholder = "Rechercher des modèles..."
+loading_models = "Chargement des modèles..."
+loading_providers = "Chargement des fournisseurs..."
+no_providers = "Aucun fournisseur configuré"
+no_models = "Aucun modèle disponible"
+load_error = "Erreur de chargement : %{error}"
+
+[chat.composer.preview]
+skill = "Compétence : %{name}"
+mention = "Mention : %{name}"
+
+[common]
+address = "Adresse"
+copy = "Copier"
+name = "Nom"
+ok = "OK"
+or = "ou"
+token = "Jeton"
+
+[buttons]
+cancel = "Annuler"
+save = "Enregistrer"
+
+[conversation.error]
+turn_failed = "Le tour a échoué"
+
+[errors.command]
+exit_status = "statut de sortie %{status}"
+failed_with_output = "`%{command_label}` a échoué : %{details}"
+launchctl_print_failed = "impossible d'exécuter `launchctl print`"
+powershell_task_status_failed = "impossible d'exécuter powershell pour l'état de la tâche planifiée"
+run_failed = "impossible d'exécuter `%{command_label}`"
+systemctl_is_active_failed = "impossible d'exécuter `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` doit être supérieur à 0"
+load_app = "impossible de charger la configuration de l'application"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` doit être supérieur à 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` doit être supérieur à 0"
+
+[errors.gateway]
+address_conflict_inactive_service = "l'adresse `%{listen_addr}` est déjà utilisée, mais le service configuré `%{service_name}` n'est pas actif ; arrêtez le processus/service en conflit ou changez gateway.listen_addr"
+address_empty = "l'adresse de la passerelle ne doit pas être vide"
+id_not_found = "id de passerelle `%{id}` introuvable"
+invalid_address = "adresse de passerelle invalide `%{normalized}` ; attendu host:port"
+resolve_empty = "l'adresse de passerelle `%{listen_addr}` n'a été résolue vers aucune adresse socket"
+resolve_failed = "impossible de résoudre l'adresse de passerelle `%{listen_addr}`"
+start_command_failed_manual_help = "impossible d'installer ou de démarrer automatiquement la passerelle locale ; réessayez et vérifiez la configuration locale de la passerelle"
+startup_timeout = "le service de passerelle n'est pas devenu joignable à `%{listen_addr}` dans les %{startup_timeout_ms}ms"
+unreachable_verify = "la passerelle `%{address}` est injoignable ; vérifiez l'adresse et que la passerelle est en cours d'exécution"
+
+[errors.registry]
+parse_failed = "impossible d'analyser le registre de la passerelle `%{path}`"
+read_failed = "impossible de lire le registre de la passerelle `%{path}`"
+serialize_failed = "impossible de sérialiser le registre de la passerelle"
+unsupported_version = "version de registre de la passerelle `%{version}` non prise en charge dans `%{path}` ; attendu `%{current_registry_version}`"
+write_failed = "impossible d'écrire le registre de la passerelle `%{path}`"
+
+[errors.runtime]
+ensure_home = "impossible de préparer le répertoire principal de l'environnement d'exécution"
+
+[errors.theme]
+watch_dir_failed = "Impossible de surveiller le dossier des thèmes"
+
+[errors.window]
+open_failed = "impossible d'ouvrir la fenêtre de l'application de bureau"
+
+[gateway.action]
+connect_remote = "Connecter une passerelle distante"
+start_local = "Démarrer la passerelle locale"
+
+[gateway.endpoint]
+local_name = "Passerelle locale"
+local_with_address = "Locale - %{address}"
+remote_name = "Distante %{index}"
+remote_with_address = "Distante - %{address}"
+
+[gateway.error]
+with_details = "Erreur de passerelle : %{error}."
+
+[gateway.initial]
+description = "Indiquez une adresse de passerelle ou démarrez un service de passerelle locale."
+title = "Connecter la passerelle"
+
+[gateway.popover]
+no_available = "Aucune passerelle disponible."
+
+[gateway.status]
+connected = "Passerelle connectée"
+connecting = "Connexion de la passerelle..."
+connecting_named = "Connexion à %{gateway_name}..."
+connecting_remote = "Connexion à la passerelle distante..."
+failed_check = "Échec de la vérification de l'état de la passerelle : %{error}"
+local_conflict = "Conflit de la passerelle locale : l'adresse est occupée par un autre processus."
+local_conflict_at = "Conflit de la passerelle locale à %{gateway_address} : l'adresse est occupée par un autre processus."
+local_stopped = "La passerelle locale est arrêtée : %{gateway_address}. Démarrez la passerelle locale ou basculez vers une distante."
+not_configured = "La passerelle n'est pas encore configurée. Ajoutez une adresse distante ou démarrez une passerelle locale."
+remote_unavailable = "Passerelle distante indisponible : %{gateway_name} (%{gateway_address})"
+starting_local = "Démarrage de la passerelle locale..."
+installing = "Installation de la passerelle..."
+updating = "Mise à jour de la passerelle..."
+subsystem_failed = "Le sous-système de passerelle n'a pas pu être initialisé : %{error}"
+subsystem_not_ready = "Le sous-système de passerelle n'est pas prêt"
+unavailable = "Passerelle indisponible"
+
+[gateway.notification]
+path_update_skipped = "La passerelle est démarrée. Pour la commande `pioneer`, vous devrez peut-être ajouter %{bin_dir} au PATH dans une nouvelle session de terminal."
+
+[logs.gateway]
+launcher_did_not_reach_service = "le programme n'a pas rendu le service de passerelle configuré joignable"
+launcher_failed = "le programme a échoué"
+launcher_unavailable = "le programme n'est pas disponible"
+service_started = "service de passerelle démarré"
+
+[logs.runtime]
+home_ready = "le répertoire principal de l'environnement d'exécution est prêt"
+prepare_home_failed = "impossible de préparer le répertoire principal de l'environnement d'exécution"
+
+[menu.app]
+name = "Pioneer"
+about = "À propos de Pioneer"
+services = "Services"
+hide = "Masquer Pioneer"
+hide_others = "Masquer les autres"
+show_all = "Tout afficher"
+quit = "Quitter Pioneer"
+
+[menu.about]
+version = "Version %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "Nouveau fil"
+providers = "Fournisseurs"
+
+[sidebar.thread]
+untitled = "Nouveau fil"
+
+[sidebar.title]
+threads = "Fils"
+
+[sidebar.folder]
+new = "Nouveau dossier"
+
+[sidebar.contextmenu.folder]
+rename = "Renommer"
+delete = "Supprimer"
+
+[dialog.folder.rename]
+title = "Renommer le dossier"
+description = "Choisissez un nom court et facile à retenir."
+
+[providers.screen]
+title = "Fournisseurs"
+description = "Configurez les clés API pour les fournisseurs de modèles disponibles."
+empty_connected = "Aucun fournisseur connecté pour le moment."
+
+[providers.sidebar]
+all = "Tous"
+connected = "Connectés"
+
+[providers.button]
+submit = "Enregistrer la clé"
+remove_key = "Supprimer la clé"
+
+[providers.dialog]
+title = "Configurer %{provider}"
+api_key_label = "Clé API *"
+api_key_placeholder = "Saisissez la clé API"
+replace_hint = "Une clé est déjà configurée pour %{provider}. L'enregistrement la remplacera."
+
+[providers.error]
+gateway_not_connected = "La passerelle n'est pas connectée."
+load_failed = "Échec du chargement de la configuration des fournisseurs"
+save_failed = "Échec de l'enregistrement de la clé API"
+delete_failed = "Échec de la suppression de la clé API"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Claude et autres modèles d’Anthropic"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "Modèles via AWS Bedrock"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Modèles via Azure OpenAI Service"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "Utiliser des modèles via Claude Code CLI"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Exécuter des modèles via une API compatible Copilot"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "Fournisseur DeepSeek compatible OpenAI"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Modèles Gemini de Google AI"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "Utiliser des modèles via l’outil Gemini CLI"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "Modèles GLM et compatibles Zhipu"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Inférence rapide avec le matériel Groq"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "Proxy et passerelle LiteLLM"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "API Mistral via endpoint compatible OpenAI"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "Exécuter des modèles Ollama locaux"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT et autres modèles OpenAI"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "Routeur pour de nombreux fournisseurs de modèles"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Endpoint d’inférence Telnyx"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "Modèles xAI Grok"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Modèles hébergés par Together"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "APIs de modèles hébergés par Fireworks"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "Endpoint Novita compatible OpenAI"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Modèles API Perplexity"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Endpoint de compatibilité Cohere"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "API de modèles Venice"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "API de modèles Cerebras"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "API de modèles SambaNova"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Modèles hébergés par Hyperbolic"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "Endpoint DeepInfra compatible OpenAI"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "Endpoint de routeur HF"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "Endpoint AI21 Studio"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Endpoint de modèles Reka"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Endpoint d’inférence Baseten"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Endpoint d’inférence Nscale"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Endpoints de modèles hébergés par Anyscale"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Endpoint Nebius AI Studio"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Endpoint serverless Friendli"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Endpoint Lepton AI"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "API de modèles SiliconFlow"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "Endpoint API AIHubMix"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "API de modèles ASTRAI"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "Endpoint de modèles StepFun"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "API de modèles Baichuan"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "API de modèles Lingyiwanwu / Yi"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "API de modèles Tencent Hunyuan"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "Endpoint IA OVHcloud"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "Endpoint NVIDIA NIM"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "Endpoint Synthetic compatible OpenAI"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Endpoint Volcengine Ark"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "API de modèles Baidu Qianfan"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "API locale LM Studio compatible OpenAI"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "API locale llama.cpp compatible OpenAI"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "API locale SGLang compatible OpenAI"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "API locale vLLM compatible OpenAI"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "API locale OSaurus compatible OpenAI"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "Utiliser des modèles via Kilo CLI"
+
+[settings.screen]
+title = "Paramètres"
+description = "Gérez les préférences de l'application."
+
+[settings.sidebar]
+back = "Retour"
+general = "General"
+
+[settings.option.language]
+label = "Langue de l'application"
+description = "Choisissez la langue utilisée dans l'interface."
+
+[settings.option.theme]
+label = "Thème de couleur"
+description = "Choisissez le mode d'apparence préféré."
+
+[settings.language]
+system = "Par défaut du système"
+english = "Anglais"
+russian = "Russe"
+german = "Allemand"
+spanish = "Espagnol"
+french = "Français"
+hindi = "Hindi"
+japanese = "Japonais"
+chinese = "Chinois"
+
+[settings.theme]
+system = "Système"
+light = "Clair"
+dark = "Sombre"
+
+[mcp.screen]
+title = "MCP"
+description = "Serveurs Model Context Protocol installés pour l'espace actuel."
+found_count = "Trouvés :"
+
+[mcp.empty]
+title = "Aucun serveur MCP installé"
+description = "Installez de nouveaux serveurs MCP et étendez les capacités de vos agents."
+
+[mcp.dialog]
+install_title = "Installer un serveur MCP"
+install = "Installer"
+uninstall_title = "Désinstaller %{name} ?"
+uninstall_description = "Supprime ce serveur MCP de l'espace de travail actuel et arrête sa tâche d'exécution."
+uninstall = "Désinstaller"
+config_json = "Configuration JSON"
+secret_store_hint = "Les valeurs secrètes de env, headers, tokens et authorization sont stockées dans le stockage des secrets de la passerelle."
+
+[mcp.dialog.error]
+config_required = "La configuration JSON MCP est requise"
+config_invalid = "La configuration JSON MCP est invalide : %{error}"
+servers_required = "La configuration JSON MCP doit contenir un objet mcpServers"
+servers_empty = "La configuration JSON MCP doit contenir au moins un serveur"
+server_name_empty = "Le nom du serveur MCP ne peut pas être vide"
+server_config_object = "%{name} : la configuration du serveur doit être un objet"
+command_or_url_required = "%{name} : command ou url est requis"
+command_url_exclusive = "%{name} : command et url ne peuvent pas être définis ensemble"
+gateway_not_connected = "La passerelle n'est pas connectée"
+workspace_not_selected = "Aucun espace de travail sélectionné"
+install_failed = "Impossible d'installer le serveur MCP : %{error}"
+server_validation_error = "%{name} : erreur de validation"
+validation_failed = "La validation de la configuration MCP a échoué"
+diagnostic = "%{name} : %{level} : %{message}%{field}"
+level_error = "erreur"
+level_warning = "avertissement"
+
+[mcp.status]
+not_started = "Non démarré"
+disabled = "Désactivé"
+starting = "Démarrage"
+ready = "Prêt"
+degraded = "Dégradé"
+auth_required = "Autorisation requise"
+failed = "Échec"
+stopping = "Arrêt"
+stopped = "Arrêté"
+restarting = "Redémarrage"
+
+[mcp.capabilities]
+tools = "outils"
+resources = "ressources"
+templates = "modèles"
+prompts = "prompts"
+
+[mcp.sidebar]
+install = "Installer"
+refresh = "Actualiser"
+back = "Retour"
+update_config = "Mettre à jour"
+restart = "Redémarrer"
+uninstall = "Désinstaller"
+
+[mcp.details]
+not_selected = "Aucun serveur MCP sélectionné"
+enabled = "Activé"
+implicit = "Implicite"
+refresh = "Actualiser"
+source = "Source"
+scope = "Portée"
+transport = "Transport"
+loaded = "Chargé"
+runtime = "Exécution"
+live = "Actif"
+last_seen = "Dernière activité"
+retry_attempt = "Tentative de reprise"
+next_retry = "Prochaine reprise"
+last_error = "Dernière erreur"
+stderr = "stderr"
+health = "État"
+tools = "Outils"
+tools_count = "Outils : %{count}"
+resources = "Ressources"
+resources_count = "Ressources : %{count}"
+resource_templates = "Modèles de ressources"
+templates_count = "Modèles : %{count}"
+prompts = "Prompts"
+prompts_count = "Prompts : %{count}"
+audit = "Audit"
+audit_count = "Événements d'audit : %{count}"
+source_config = "Configuration"
+scope_workspace = "Espace de travail"
+scope_user = "Utilisateur"
+
+[mcp.audit]
+column_time = "Heure"
+column_time_hint = "Heure locale à laquelle l'événement d'audit MCP a été écrit."
+column_event = "Événement"
+column_event_hint = "Action d'audit et outil MCP brut lorsqu'il existe."
+column_result = "Résultat"
+column_result_hint = "Décision de la passerelle pour cet événement MCP."
+column_details = "Détails"
+column_details_hint = "Code de raison et détails compacts de l'événement."
+reason_tooltip = "%{details}\nRaison : %{reason}"
+action_install = "Installé"
+action_update = "Mis à jour"
+action_uninstall = "Supprimé"
+action_policy = "Politique modifiée"
+action_start = "Démarrage"
+action_started = "Démarré"
+action_start_failed = "Échec du démarrage"
+action_stop = "Arrêt"
+action_stopped = "Arrêté"
+action_restart = "Redémarrage"
+action_catalog_refreshed = "Catalogue actualisé"
+action_call = "Appel d'outil"
+action_call_completed = "Appel terminé"
+action_call_failed = "Échec de l'appel"
+decision_allowed = "Autorisé"
+decision_blocked = "Bloqué"
+decision_warning = "Avertissement"
+
+[mcp.common]
+yes = "Oui"
+no = "Non"
+none = "Non renseigné"
+empty = "Aucun détail"
+items_count = "Éléments : %{count}"
+keys_count = "Clés : %{count}"
+
+[mcp.error]
+server_name_required = "Le nom du serveur MCP est requis"
+gateway_not_connected = "La passerelle n'est pas connectée"
+workspace_not_selected = "Aucun espace de travail sélectionné"
+server_not_available = "Le serveur MCP n'est pas disponible dans l'espace de travail actuel"
+load_servers_failed = "Impossible de charger les serveurs MCP : %{error}"
+load_details_failed = "Impossible de charger les détails du serveur MCP : %{error}"
+policy_update_failed = "Impossible de mettre à jour la politique MCP : %{error}"
+restart_failed = "Impossible de redémarrer le serveur MCP : %{error}"
+uninstall_failed = "Impossible de désinstaller le serveur MCP : %{error}"
+
+[skills.screen]
+title = "Compétences"
+description = "Compétences installées pour l'espace actuel."
+installed_count = "Trouvées :"
+
+[skills.empty]
+title = "Aucune compétence installée"
+description = "Installez de nouvelles compétences et étendez les capacités des agents."
+
+[skills.error]
+gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "No active workspace selected."
+load_failed = "Failed to load installed skills"
+path_required = "Path is required."
+invalid_skill_target = "Invalid skill target."
+install_failed = "Failed to install skill"
+update_failed = "Failed to update skill"
+uninstall_failed = "Failed to uninstall skill"
+policy_failed = "Failed to update skill policy"
+path_picker_failed = "Failed to open source picker"
+
+[skills.card]
+version = "Version"
+fingerprint = "Empreinte"
+
+[skills.status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[skills.button]
+install = "Install"
+update = "Update"
+uninstall = "Uninstall"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Preparing skill upload"
+installing = "Uploading skill"
+updating = "Uploading update"
+cancelling = "Cancelling upload"
+
+[skills.dialog]
+install_title = "Install Skill"
+update_title = "Update %{slug}"
+source_kind_description = "Choose a skill folder from disk."
+pick_folder = "Choose folder"
+pick_archive = "Choose archive"
+
+[skills.diagnostics]
+reason = "Reason:"
+validation = "Validation"
+dependencies = "Dependencies"
+dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
+dependencies_column_action = "What to do"
+dependencies_hint_requirement = "What this skill expects to find on your machine."
+dependencies_hint_status = "Current result of the dependency check."
+dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
+dependencies_kind_bin = "Command"
+dependencies_kind_env = "Environment variable"
+dependencies_kind_api_key = "API key"
+dependencies_kind_command = "Command"
+dependencies_kind_mcp = "MCP server"
+dependencies_kind_tool = "Dependency"
+dependencies_status_ready = "Ready"
+dependencies_status_missing = "Missing"
+dependencies_status_blocked = "Blocked"
+dependencies_status_warning = "Warning"
+dependencies_status_unknown = "Unknown"
+security = "Security"
+security_intro = "Potential risks found while scanning skill files."
+security_column_rule = "Rule"
+security_column_finding = "Finding"
+security_column_location = "Location"
+security_hint_level = "Severity of the security finding."
+security_hint_rule = "Identifier of the rule that triggered this finding."
+security_hint_finding = "What exactly was detected and why it matters."
+security_hint_location = "File path where the finding was detected."
+security_location_unknown = "Path not specified"
+security_severity_critical = "Critical"
+security_severity_high = "High"
+security_severity_medium = "Medium"
+security_severity_low = "Low"
+security_severity_info = "Info"
+trust_gate = "Trust gates"
+trust_gate_intro = "Permission decisions based on required trust level."
+trust_column_tool = "Tool type"
+trust_column_min_trust = "Required trust"
+trust_column_explanation = "Explanation"
+trust_hint_tool = "Which tool category this gate controls."
+trust_hint_min_trust = "Minimum trust level required to use this tool."
+trust_hint_decision = "Whether the tool use is currently allowed."
+trust_hint_explanation = "Simple reason for the current decision."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Allowed"
+trust_decision_blocked = "Blocked"
+trust_explanation_allowed = "Current trust level is enough."
+trust_explanation_blocked = "Blocked until trust level reaches"
+audit = "Recent audit"
+audit_intro = "Recent actions and checks related to this skill."
+audit_column_time = "When"
+audit_column_event = "Event"
+audit_column_result = "Result"
+audit_column_details = "Details"
+audit_hint_time = "When this event was recorded."
+audit_hint_event = "What happened with the skill."
+audit_hint_result = "Whether the action was allowed, blocked, or warned."
+audit_hint_details = "Reason and technical details behind the decision."
+audit_action_install = "Installed"
+audit_action_update = "Updated"
+audit_action_uninstall = "Removed"
+audit_action_resolve_allowed = "Resolved for prompt"
+audit_action_resolve_blocked = "Blocked on resolve"
+audit_action_runtime_allowed = "Allowed on runtime"
+audit_action_runtime_blocked = "Blocked on runtime"
+audit_action_security_warn = "Security warning"
+audit_decision_allowed = "Allowed"
+audit_decision_blocked = "Blocked"
+audit_decision_warning = "Warning"
+audit_reason_none = "No explicit reason"
+audit_details_empty = "No extra details"
+none = "none"
+empty_validation = "No validation issues found."
+empty_dependencies = "No dependency issues found."
+empty_security = "No security findings."
+empty_trust_gate = "No trust gate decisions."
+empty_audit = "No audit events yet."
+
+[skills.catalog]
+source = "Source"
+trust = "Confiance"
+
+[bottom_bar]
+gateway_disconnected = "Passerelle déconnectée"
+starting_thread = "Démarrage du fil..."
+finishing_turn = "Finalisation du tour..."
+turn_running = "Le tour `%{turn_id}` est en cours"
+previous_turn_failed = "Le tour précédent a échoué. Vous pouvez envoyer un nouveau message."
+turn_cancelled = "Tour annulé. Vous pouvez envoyer un nouveau message."
+turn_completed = "Tour terminé. Prêt pour le message suivant."
+ready = "Prêt"
+starting_turn = "Démarrage du tour..."
+agent_processing = "L’agent traite..."
+
+[timeline.empty]
+start_thread = "Envoyez un message pour démarrer ce fil"
+
+[timeline.elapsed]
+hours_minutes = "%{hours} h %{minutes} min"
+minutes_seconds = "%{minutes} min %{seconds} s"
+seconds = "%{seconds} s"
+
+[timeline.common]
+url_missing = "URL non fournie"
+no_details = "Aucun détail"
+truncated = "... [tronqué]"
+
+[timeline.reasoning]
+summary = "Résumé :"
+content = "Contenu :"
+running = "Réflexion"
+completed = "Réflexion terminée"
+
+[timeline.agent_message]
+subagent_completed = "Sous-agent a répondu"
+
+[timeline.work_group]
+completed = "A travaillé"
+
+[timeline.web_search]
+fallback_query = "Recherche web"
+running = "Recherche sur le web"
+no_results = "Aucun résultat de recherche"
+results_count = "%{count} résultats"
+
+[timeline.file_change]
+cancelled = "Annulé"
+failed = "Modifications non appliquées"
+running = "Application des modifications"
+completed = "Fichiers modifiés"
+no_files = "Aucun fichier indiqué"
+one_file = "1 fichier"
+files_count = "%{count} fichiers"
+exit_code = "Code de sortie :"
+more_files = "et %{count} de plus"
+output = "Sortie"
+
+[timeline.download]
+cancelled = "Annulé"
+failed = "Téléchargement échoué"
+running = "Téléchargement du fichier"
+completed = "Fichier téléchargé"
+size = "Taille : %{size}"
+unit_b = "o"
+unit_kb = "Ko"
+unit_mb = "Mo"
+unit_gb = "Go"
+unit_tb = "To"
+
+[timeline.web_fetch]
+cancelled = "Annulé"
+failed = "Échec de l’ouverture"
+running = "Ouverture du lien"
+completed = "Chargé"
+
+[timeline.tool]
+cancelled = "Annulé"
+failed = "Échec"
+running = "Exécution de l’outil"
+completed = "Terminé"
+arguments = "Arguments"
+result = "Résultat"
+open_mcp_server = "Ouvrir le serveur MCP"
+started = "Outil en cours : %{tool_name}"
+started_kind = "Outil en cours : %{tool_name} (%{kind})"
+finished = "Outil `%{tool_name}` terminé"
+command = "Commande : %{command}"
+cwd = "Dossier de travail : %{cwd}"
+query = "Requête : %{query}"
+url = "URL : %{url}"
+exit_code = "Code de sortie : %{exit_code}"
+duration_ms = "Durée : %{duration_ms} ms"
+timed_out = "Délai dépassé"
+changed_files = "Fichiers modifiés :"
+results = "Résultats : %{count}"
+provider = "Fournisseur : %{provider}"
+status_code = "Code de statut : %{status_code}"
+title = "Titre : %{title}"
+path = "Chemin : %{path}"
+bytes = "Octets : %{bytes}"
+stage = "[Étape] %{value}"
+progress = "[Progression] %{value}"
+stderr = "[Erreur] %{value}"
+
+[timeline.command]
+running = "Exécution de la commande"
+completed = "Commande terminée"
+
+[timeline.system]
+info = "Événement système"
+warning = "Avertissement"
+error = "Erreur"
+tool = "outil"
+attempt = "Tentative n°%{attempt}"
+timeout_with_recovery = "L’étape a expiré ; récupération démarrée"
+timeout_without_recovery = "L’étape a expiré ; la récupération automatique est indisponible"
+timeout_label = "Expiration"
+timeout_delta_recovery_scheduled = "[timeout] tentative n°%{attempt} %{reason} ; récupération planifiée (job `%{job_id}`)"
+timeout_delta_no_recovery = "[timeout] tentative n°%{attempt} %{reason} ; aucune récupération automatique"
+recovery_opened = "Démarrage de la récupération de l’étape"
+recovery_attached = "Récupération associée à une nouvelle étape"
+retry_scheduled = "Nouvelle tentative de récupération planifiée"
+retry_started = "Nouvelle tentative de récupération démarrée"
+recovery_succeeded = "Récupération terminée"
+recovery_failed = "Récupération échouée"
+recovery_label = "Récupération"
+retry_label = "Nouvelle tentative"
+recovered_label = "Récupéré"
+tool_retry_scheduled = "Nouvelle tentative de %{tool_name}"
+tool_retry_scheduled_with_attempt = "Nouvelle tentative de l’outil %{tool_name} (tentative n°%{attempt})"
+tool_retry_resolved = "%{tool_name} terminé après nouvelle tentative"
+tool_retry_exhausted = "%{tool_name} a échoué après les nouvelles tentatives"
+retry_resolved_label = "Nouvelle tentative terminée"
+retries_exhausted_label = "Nouvelles tentatives épuisées"
+tool_loop_budget_exceeded = "Limite d’appels d’outils atteinte"
+code = "Code :"

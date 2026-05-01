@@ -1,0 +1,317 @@
+use super::*;
+use anyhow::{Context, Result};
+use pioneer_crud::{
+    McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
+};
+use pioneer_mcp::{
+    InstallParseContext, McpScopeKind, McpServerInstallation, McpTransportConfig,
+    parse_install_config,
+};
+use serde_json::json;
+use std::str::FromStr;
+use tracing::warn;
+
+const MCP_ERROR_INVALID_REQUEST: &str = "mcp.invalid_request";
+const MCP_ERROR_NOT_FOUND: &str = "mcp.not_found";
+const MCP_ERROR_INTERNAL: &str = "mcp.internal_error";
+
+mod details;
+mod install;
+mod list;
+mod policy;
+mod restart;
+mod uninstall;
+
+impl MessageProcessor {
+    pub(crate) async fn start_mcp_workspace_supervisor(self: &std::sync::Arc<Self>) {
+        let this = self.clone();
+        let _handle = tokio::spawn(async move {
+            let workspaces = match this.workspace_manager.list_workspaces().await {
+                Ok(workspaces) => workspaces
+                    .into_iter()
+                    .filter(|workspace| workspace.is_active)
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed to list workspaces for MCP startup supervisor"
+                    );
+                    return;
+                }
+            };
+
+            for workspace in workspaces {
+                if let Err(error) = this
+                    .mcp_service
+                    .reload_workspace(workspace.id.as_str())
+                    .await
+                {
+                    warn!(
+                        workspace_id = workspace.id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to start MCP workspace runtime"
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn mcp_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    code: &'static str,
+    message: impl Into<String>,
+    details: serde_json::Value,
+) -> JsonRpcErrorResponse {
+    JsonRpcErrorResponse {
+        jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
+        id: request_id,
+        error: pioneer_protocol::JsonRpcError {
+            code: jsonrpc_code,
+            message: message.into(),
+            data: Some(json!({
+                "code": code,
+                "details": details,
+            })),
+        },
+    }
+}
+
+fn to_protocol_validation(
+    diagnostic: &pioneer_mcp::McpValidationDiagnostic,
+) -> McpValidationDiagnostic {
+    McpValidationDiagnostic {
+        code: diagnostic.code.clone(),
+        level: match diagnostic.level {
+            pioneer_mcp::McpDiagnosticLevel::Warning => McpDiagnosticLevel::Warning,
+            pioneer_mcp::McpDiagnosticLevel::Error => McpDiagnosticLevel::Error,
+        },
+        message: diagnostic.message.clone(),
+        field_path: diagnostic.field_path.clone(),
+    }
+}
+
+fn installation_record_from_domain(
+    installation: &McpServerInstallation,
+) -> Result<McpServerInstallationRecord> {
+    Ok(McpServerInstallationRecord {
+        id: None,
+        scope_kind: installation.scope_kind.as_str().to_owned(),
+        scope_key: installation.scope_key.clone(),
+        name: installation.name.clone(),
+        display_name: installation.display_name.clone(),
+        source_kind: installation.source_kind.as_str().to_owned(),
+        source_ref: serde_json::to_string(&installation.source_ref)
+            .context("failed to encode MCP source_ref")?,
+        transport_kind: installation.transport_kind().to_owned(),
+        transport_json: serde_json::to_string(&installation.transport)
+            .context("failed to encode MCP transport")?,
+        auth_json: serde_json::to_string(&installation.auth)
+            .context("failed to encode MCP auth config")?,
+        secret_refs_json: serde_json::to_string(&installation.secret_refs)
+            .context("failed to encode MCP secret refs")?,
+        enabled: installation.enabled,
+        allow_implicit_invocation: installation.allow_implicit_invocation,
+        required: installation.required,
+        fingerprint: installation.fingerprint.clone(),
+        updated_at_unix: 0,
+    })
+}
+
+fn list_item_from_record(record: &McpServerInstallationRecord) -> McpListItem {
+    list_item_from_record_with_catalog_and_runtime(record, None, None)
+        .expect("fresh MCP installation record should map to protocol item")
+}
+
+fn list_item_from_record_with_catalog_and_runtime(
+    record: &McpServerInstallationRecord,
+    catalog: Option<&McpServerCatalogSnapshotRecord>,
+    runtime: Option<&pioneer_mcp::McpServerRuntimeSnapshot>,
+) -> Result<McpListItem> {
+    let runtime_state = runtime
+        .map(|runtime| protocol_runtime_state(runtime.state))
+        .unwrap_or_else(|| {
+            if record.enabled {
+                McpRuntimeState::NotStarted
+            } else {
+                McpRuntimeState::Disabled
+            }
+        });
+    let status_reason = runtime
+        .and_then(|runtime| runtime.status_reason.clone())
+        .or_else(|| {
+            if record.enabled {
+                Some("runtime supervisor has not started this server yet".to_owned())
+            } else {
+                Some("server is disabled".to_owned())
+            }
+        });
+
+    Ok(McpListItem {
+        id: record.id.clone().unwrap_or_default(),
+        name: record.name.clone(),
+        display_name: record.display_name.clone(),
+        scope: protocol_scope_kind(record.scope_kind.as_str())?,
+        source_kind: protocol_source_kind(record.source_kind.as_str())?,
+        transport: transport_summary(
+            record.transport_kind.as_str(),
+            record.transport_json.as_str(),
+        )?,
+        policy: McpPolicyState {
+            enabled: record.enabled,
+            allow_implicit_invocation: record.allow_implicit_invocation,
+        },
+        required: record.required,
+        fingerprint: record.fingerprint.clone(),
+        runtime: McpRuntimeStatus {
+            state: runtime_state,
+            live: runtime.map(|runtime| runtime.live).unwrap_or(false),
+            last_seen_at: runtime.and_then(|runtime| runtime.last_seen_at_unix),
+            last_error: runtime.and_then(|runtime| runtime.last_error.clone()),
+        },
+        tools_count: catalog
+            .map(|catalog| count_json_array(catalog.tools_json.as_str()))
+            .unwrap_or(0),
+        resources_count: catalog
+            .map(|catalog| count_json_array(catalog.resources_json.as_str()))
+            .unwrap_or(0),
+        resource_templates_count: catalog
+            .map(|catalog| count_json_array(catalog.resource_templates_json.as_str()))
+            .unwrap_or(0),
+        prompts_count: catalog
+            .map(|catalog| count_json_array(catalog.prompts_json.as_str()))
+            .unwrap_or(0),
+        status: McpServerStatus::from(runtime_state),
+        status_reason,
+    })
+}
+
+fn protocol_runtime_state(state: pioneer_mcp::McpRuntimeState) -> McpRuntimeState {
+    match state {
+        pioneer_mcp::McpRuntimeState::NotStarted => McpRuntimeState::NotStarted,
+        pioneer_mcp::McpRuntimeState::Disabled => McpRuntimeState::Disabled,
+        pioneer_mcp::McpRuntimeState::Starting => McpRuntimeState::Starting,
+        pioneer_mcp::McpRuntimeState::Ready => McpRuntimeState::Ready,
+        pioneer_mcp::McpRuntimeState::Degraded => McpRuntimeState::Degraded,
+        pioneer_mcp::McpRuntimeState::AuthRequired => McpRuntimeState::AuthRequired,
+        pioneer_mcp::McpRuntimeState::Failed => McpRuntimeState::Failed,
+        pioneer_mcp::McpRuntimeState::Stopping => McpRuntimeState::Stopping,
+        pioneer_mcp::McpRuntimeState::Stopped => McpRuntimeState::Stopped,
+        pioneer_mcp::McpRuntimeState::Restarting => McpRuntimeState::Restarting,
+    }
+}
+
+fn count_json_array(value: &str) -> usize {
+    serde_json::from_str::<Vec<serde_json::Value>>(value)
+        .map(|items| items.len())
+        .unwrap_or(0)
+}
+
+fn protocol_scope_kind(value: &str) -> Result<pioneer_protocol::McpScopeKind> {
+    match value {
+        "workspace" => Ok(pioneer_protocol::McpScopeKind::Workspace),
+        "user" => Ok(pioneer_protocol::McpScopeKind::User),
+        other => anyhow::bail!("unknown MCP scope kind `{other}`"),
+    }
+}
+
+fn protocol_source_kind(value: &str) -> Result<McpSourceKind> {
+    match value {
+        "config" => Ok(McpSourceKind::Config),
+        other => anyhow::bail!("unknown MCP source kind `{other}`"),
+    }
+}
+
+fn transport_summary(kind: &str, transport_json: &str) -> Result<McpTransportSummary> {
+    let parsed = serde_json::from_str::<McpTransportConfig>(transport_json)
+        .with_context(|| format!("failed to decode normalized MCP transport `{kind}`"))?;
+    match parsed {
+        McpTransportConfig::Stdio { command, .. } => Ok(McpTransportSummary::Stdio { command }),
+        McpTransportConfig::StreamableHttp { url, .. } => {
+            Ok(McpTransportSummary::StreamableHttp { url })
+        }
+    }
+}
+
+impl MessageProcessor {
+    pub(crate) async fn notify_mcp_changed(
+        &self,
+        workspace_id: &str,
+        changed: Vec<McpChangedItem>,
+        _event_timestamp_secs: i64,
+    ) {
+        if changed.is_empty() {
+            return;
+        }
+
+        let snapshot_version = self.next_mcp_snapshot_version();
+        let notification = McpChangedNotification {
+            workspace_id: workspace_id.to_owned(),
+            snapshot_version,
+            changed,
+        };
+        self.send_notification_to_workspace_connections(
+            workspace_id,
+            events::MCP_CHANGED,
+            &notification,
+        )
+        .await;
+    }
+
+    async fn validate_mcp_workspace(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        workspace_id: String,
+        method: &str,
+    ) -> std::result::Result<String, JsonRpcErrorResponse> {
+        if workspace_id.trim().is_empty() {
+            return Err(mcp_error(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                MCP_ERROR_INVALID_REQUEST,
+                format!("`workspace_id` is required for `{method}`"),
+                json!({}),
+            ));
+        }
+
+        let workspace_id = self
+            .workspace_manager
+            .validate_workspace_id(workspace_id.as_str())
+            .await
+            .map_err(|error| match error {
+                WorkspaceError::Internal(message) => mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_REQUEST_CODE,
+                    MCP_ERROR_INTERNAL,
+                    format!("failed to validate workspace: {message}"),
+                    json!({}),
+                ),
+                WorkspaceError::WorkspaceNotFound(_) | WorkspaceError::WorkspaceInactive(_) => {
+                    mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_PARAMS_CODE,
+                        MCP_ERROR_NOT_FOUND,
+                        format!("workspace `{}` is unavailable", workspace_id),
+                        json!({"workspace_id": workspace_id}),
+                    )
+                }
+                WorkspaceError::InvalidWorkspaceId | WorkspaceError::InvalidWorkspaceName => {
+                    mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_PARAMS_CODE,
+                        MCP_ERROR_INVALID_REQUEST,
+                        format!("invalid workspace_id for `{method}`"),
+                        json!({"workspace_id": workspace_id}),
+                    )
+                }
+            })?;
+
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+
+        Ok(workspace_id)
+    }
+}

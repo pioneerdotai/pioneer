@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRetryBudgetKind",
+  "type": "string",
+  "enum": [
+    "episode",
+    "error_class",
+    "tool_name",
+    "failure_signature"
+  ]
+}

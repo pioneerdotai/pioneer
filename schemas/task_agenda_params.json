@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgendaParams",
+  "type": "object",
+  "required": [
+    "workspaceId"
+  ],
+  "properties": {
+    "from": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "includeCompleted": {
+      "default": false,
+      "type": "boolean"
+    },
+    "includePaused": {
+      "default": false,
+      "type": "boolean"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "ownerId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ownerKind": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TaskOwnerKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "statuses": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskStatus"
+      }
+    },
+    "to": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "triggerKinds": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskTriggerKind"
+      }
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TaskOwnerKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "thread",
+        "workspace",
+        "system"
+      ]
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "scheduled",
+        "queued",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "TaskTriggerKind": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "scheduled_at",
+        "interval",
+        "cron",
+        "manual",
+        "external",
+        "dependency"
+      ]
+    }
+  }
+}

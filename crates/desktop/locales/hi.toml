@@ -1,0 +1,864 @@
+_version = 1
+
+[chat.composer]
+placeholder = "सहायक को संदेश भेजें"
+
+[chat.composer.mode]
+agent_label = "एजेंट"
+agent_description = "आपके कार्यप्रवाह में पूर्ण स्वचालन और सहज एकीकरण।"
+chat_label = "चैट"
+chat_description = "बिना स्वचालन के विश्लेषण, लेखन और तर्क के लिए संवादात्मक AI।"
+
+[chat.composer.model]
+select_label = "मॉडल चुनें"
+dialog_title = "मॉडल चुनें"
+provider_label = "प्रदाता"
+provider_placeholder = "प्रदाता खोजें..."
+model_label = "मॉडल"
+model_placeholder = "मॉडल खोजें..."
+loading_models = "मॉडल लोड हो रहे हैं..."
+loading_providers = "प्रदाता लोड हो रहे हैं..."
+no_providers = "कोई प्रदाता कॉन्फ़िगर नहीं है"
+no_models = "कोई मॉडल उपलब्ध नहीं है"
+load_error = "लोड करने में त्रुटि: %{error}"
+
+[chat.composer.preview]
+skill = "स्किल: %{name}"
+mention = "उल्लेख: %{name}"
+
+[common]
+address = "पता"
+copy = "कॉपी"
+name = "नाम"
+ok = "ठीक है"
+or = "या"
+token = "टोकन"
+
+[buttons]
+cancel = "रद्द करें"
+save = "सहेजें"
+
+[conversation.error]
+turn_failed = "टर्न विफल हुआ"
+
+[errors.command]
+exit_status = "एग्जिट स्टेटस %{status}"
+failed_with_output = "`%{command_label}` विफल हुआ: %{details}"
+launchctl_print_failed = "`launchctl print` चलाने में विफल"
+powershell_task_status_failed = "शेड्यूल्ड टास्क स्थिति जांचने के लिए powershell चलाने में विफल"
+run_failed = "`%{command_label}` चलाने में विफल"
+systemctl_is_active_failed = "`systemctl --user is-active` चलाने में विफल"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` 0 से बड़ा होना चाहिए"
+load_app = "ऐप कॉन्फ़िग लोड करने में विफल"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` 0 से बड़ा होना चाहिए"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 0 से बड़ा होना चाहिए"
+
+[errors.gateway]
+address_conflict_inactive_service = "पता `%{listen_addr}` पहले से उपयोग में है, लेकिन कॉन्फ़िगर की गई सेवा `%{service_name}` सक्रिय नहीं है; टकराने वाली प्रक्रिया/सेवा रोकें या gateway.listen_addr बदलें"
+address_empty = "गेटवे पता खाली नहीं होना चाहिए"
+id_not_found = "गेटवे आईडी `%{id}` नहीं मिली"
+invalid_address = "अमान्य गेटवे पता `%{normalized}`; अपेक्षित host:port"
+resolve_empty = "गेटवे पता `%{listen_addr}` किसी socket address में resolve नहीं हुआ"
+resolve_failed = "गेटवे पता `%{listen_addr}` resolve करने में विफल"
+start_command_failed_manual_help = "लोकल गेटवे को अपने-आप इंस्टॉल या शुरू नहीं किया जा सका; फिर से कोशिश करें और लोकल गेटवे कॉन्फ़िगरेशन जांचें"
+startup_timeout = "गेटवे सेवा `%{listen_addr}` पर %{startup_timeout_ms}ms के भीतर उपलब्ध नहीं हुई"
+unreachable_verify = "गेटवे `%{address}` तक पहुंच नहीं है; पता और गेटवे चल रहा है या नहीं जांचें"
+
+[errors.registry]
+parse_failed = "गेटवे रजिस्ट्री `%{path}` पार्स करने में विफल"
+read_failed = "गेटवे रजिस्ट्री `%{path}` पढ़ने में विफल"
+serialize_failed = "गेटवे रजिस्ट्री serialize करने में विफल"
+unsupported_version = "`%{path}` में गेटवे रजिस्ट्री संस्करण `%{version}` समर्थित नहीं है; अपेक्षित `%{current_registry_version}`"
+write_failed = "गेटवे रजिस्ट्री `%{path}` लिखने में विफल"
+
+[errors.runtime]
+ensure_home = "रनटाइम परिवेश की होम डायरेक्टरी तैयार करने में विफल"
+
+[errors.theme]
+watch_dir_failed = "थीम डायरेक्टरी को वॉच करने में विफल"
+
+[errors.window]
+open_failed = "डेस्कटॉप विंडो खोलने में विफल"
+
+[gateway.action]
+connect_remote = "दूरस्थ गेटवे से कनेक्ट करें"
+start_local = "स्थानीय गेटवे शुरू करें"
+
+[gateway.endpoint]
+local_name = "स्थानीय गेटवे"
+local_with_address = "स्थानीय - %{address}"
+remote_name = "दूरस्थ %{index}"
+remote_with_address = "दूरस्थ - %{address}"
+
+[gateway.error]
+with_details = "गेटवे त्रुटि: %{error}."
+
+[gateway.initial]
+description = "गेटवे पता दर्ज करें या स्थानीय गेटवे सेवा शुरू करें।"
+title = "गेटवे से कनेक्ट करें"
+
+[gateway.popover]
+no_available = "कोई गेटवे उपलब्ध नहीं है।"
+
+[gateway.status]
+connected = "गेटवे कनेक्ट हो गया"
+connecting = "गेटवे कनेक्ट हो रहा है..."
+connecting_named = "%{gateway_name} से कनेक्ट किया जा रहा है..."
+connecting_remote = "दूरस्थ गेटवे से कनेक्ट किया जा रहा है..."
+failed_check = "गेटवे स्थिति जांचने में विफल: %{error}"
+local_conflict = "स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
+local_conflict_at = "%{gateway_address} पर स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
+local_stopped = "स्थानीय गेटवे रुका हुआ है: %{gateway_address}। स्थानीय गेटवे शुरू करें या दूरस्थ पर स्विच करें।"
+not_configured = "गेटवे अभी कॉन्फ़िगर नहीं है। दूरस्थ पता जोड़ें या स्थानीय गेटवे शुरू करें।"
+remote_unavailable = "दूरस्थ गेटवे उपलब्ध नहीं है: %{gateway_name} (%{gateway_address})"
+starting_local = "स्थानीय गेटवे शुरू किया जा रहा है..."
+installing = "गेटवे इंस्टॉल किया जा रहा है..."
+updating = "गेटवे अपडेट किया जा रहा है..."
+subsystem_failed = "गेटवे सबसिस्टम प्रारंभ नहीं हो सका: %{error}"
+subsystem_not_ready = "गेटवे सबसिस्टम तैयार नहीं है"
+unavailable = "गेटवे उपलब्ध नहीं है"
+
+[gateway.notification]
+path_update_skipped = "गेटवे शुरू हो गया है। `pioneer` कमांड के लिए नई टर्मिनल सत्र में %{bin_dir} को PATH में जोड़ना पड़ सकता है।"
+
+[logs.gateway]
+launcher_did_not_reach_service = "प्रोग्राम कॉन्फ़िगर किए गए गेटवे सेवा को पहुंच योग्य नहीं बना सका"
+launcher_failed = "प्रोग्राम विफल हुआ"
+launcher_unavailable = "प्रोग्राम उपलब्ध नहीं है"
+service_started = "गेटवे सेवा शुरू हो गई"
+
+[logs.runtime]
+home_ready = "रनटाइम परिवेश की होम डायरेक्टरी तैयार है"
+prepare_home_failed = "रनटाइम परिवेश की होम डायरेक्टरी तैयार करने में विफल"
+
+[menu.app]
+name = "Pioneer"
+about = "Pioneer के बारे में"
+services = "सेवाएं"
+hide = "Pioneer छुपाएँ"
+hide_others = "बाकी छुपाएँ"
+show_all = "सभी दिखाएँ"
+quit = "Pioneer से बाहर निकलें"
+
+[menu.about]
+version = "संस्करण %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "नया थ्रेड"
+providers = "प्रोवाइडर"
+
+[sidebar.thread]
+untitled = "नया थ्रेड"
+
+[sidebar.title]
+threads = "थ्रेड्स"
+
+[sidebar.folder]
+new = "नया फ़ोल्डर"
+
+[sidebar.contextmenu.folder]
+rename = "नाम बदलें"
+delete = "हटाएँ"
+
+[dialog.folder.rename]
+title = "फ़ोल्डर का नाम बदलें"
+description = "इसे छोटा और याद रखने में आसान रखें।"
+
+[providers.screen]
+title = "प्रोवाइडर"
+description = "उपलब्ध मॉडल प्रोवाइडरों के लिए API कुंजियां कॉन्फ़िगर करें।"
+empty_connected = "अभी तक कोई कनेक्टेड प्रोवाइडर नहीं है।"
+
+[providers.sidebar]
+all = "सभी"
+connected = "कनेक्टेड"
+
+[providers.button]
+submit = "कुंजी सहेजें"
+remove_key = "कुंजी हटाएँ"
+
+[providers.dialog]
+title = "%{provider} कॉन्फ़िगर करें"
+api_key_label = "API कुंजी *"
+api_key_placeholder = "API कुंजी दर्ज करें"
+replace_hint = "%{provider} के लिए पहले से एक कुंजी कॉन्फ़िगर है। सहेजने पर यह बदल जाएगी।"
+
+[providers.error]
+gateway_not_connected = "गेटवे कनेक्ट नहीं है।"
+load_failed = "प्रोवाइडर कॉन्फ़िगरेशन लोड करने में विफल"
+save_failed = "API कुंजी सहेजने में विफल"
+delete_failed = "API कुंजी हटाने में विफल"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Anthropic के Claude और अन्य मॉडल"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "AWS Bedrock के जरिए मॉडल"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Azure OpenAI Service के जरिए मॉडल"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "Claude Code CLI के जरिए मॉडल उपयोग करें"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Copilot-compatible API के जरिए मॉडल चलाएं"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI-compatible DeepSeek प्रदाता"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Google AI के Gemini मॉडल"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "Gemini CLI टूल के जरिए मॉडल उपयोग करें"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM और Zhipu-compatible मॉडल"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Groq हार्डवेयर पर तेज inference"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM proxy और gateway"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "OpenAI-compatible endpoint के जरिए Mistral API"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "स्थानीय Ollama मॉडल चलाएं"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT और अन्य OpenAI मॉडल"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "कई मॉडल प्रदाताओं के लिए router"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx inference endpoint"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok मॉडल"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Together पर hosted मॉडल"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks hosted model APIs"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "Novita OpenAI-compatible endpoint"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API मॉडल"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere compatibility endpoint"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice model API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras model API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova model API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic hosted मॉडल"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "DeepInfra OpenAI-compatible endpoint"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF router endpoint"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio endpoint"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka model endpoint"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten inference endpoint"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale inference endpoint"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale hosted model endpoints"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio endpoint"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli serverless endpoint"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI endpoint"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow model API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API endpoint"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI model API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun model endpoint"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan model API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi model API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan model API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI endpoint"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM endpoint"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "Synthetic OpenAI-compatible endpoint"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark endpoint"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan model API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "स्थानीय LM Studio OpenAI-compatible API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "स्थानीय llama.cpp OpenAI-compatible API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "स्थानीय SGLang OpenAI-compatible API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "स्थानीय vLLM OpenAI-compatible API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "स्थानीय OSaurus OpenAI-compatible API"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "Kilo CLI के जरिए मॉडल उपयोग करें"
+
+[settings.screen]
+title = "सेटिंग्स"
+description = "एप्लिकेशन प्राथमिकताओं का प्रबंधन करें।"
+
+[settings.sidebar]
+back = "वापस"
+general = "General"
+
+[settings.option.language]
+label = "ऐप भाषा"
+description = "इंटरफ़ेस में उपयोग की जाने वाली भाषा चुनें।"
+
+[settings.option.theme]
+label = "रंग थीम"
+description = "पसंदीदा रूप-रंग मोड चुनें।"
+
+[settings.language]
+system = "सिस्टम डिफ़ॉल्ट"
+english = "अंग्रेज़ी"
+russian = "रूसी"
+german = "जर्मन"
+spanish = "स्पेनिश"
+french = "फ़्रेंच"
+hindi = "हिन्दी"
+japanese = "जापानी"
+chinese = "चीनी"
+
+[settings.theme]
+system = "सिस्टम"
+light = "हल्का"
+dark = "गहरा"
+
+[mcp.screen]
+title = "MCP"
+description = "वर्तमान स्पेस के लिए इंस्टॉल किए गए Model Context Protocol सर्वर।"
+found_count = "मिले:"
+
+[mcp.empty]
+title = "कोई MCP सर्वर इंस्टॉल नहीं है"
+description = "नए MCP सर्वर इंस्टॉल करें और अपने एजेंटों की क्षमताएं बढ़ाएं।"
+
+[mcp.dialog]
+install_title = "MCP सर्वर इंस्टॉल करें"
+install = "इंस्टॉल"
+uninstall_title = "%{name} अनइंस्टॉल करें?"
+uninstall_description = "इस MCP सर्वर को वर्तमान वर्कस्पेस से हटाएं और उसका रनटाइम कार्य रोकें।"
+uninstall = "अनइंस्टॉल"
+config_json = "JSON कॉन्फिग"
+secret_store_hint = "env, headers, tokens और authorization के सीक्रेट मान गेटवे के सीक्रेट स्टोर में संग्रहीत होते हैं।"
+
+[mcp.dialog.error]
+config_required = "MCP JSON कॉन्फिग आवश्यक है"
+config_invalid = "MCP JSON कॉन्फिग अमान्य है: %{error}"
+servers_required = "MCP JSON कॉन्फिग में mcpServers ऑब्जेक्ट होना चाहिए"
+servers_empty = "MCP JSON कॉन्फिग में कम से कम एक सर्वर होना चाहिए"
+server_name_empty = "MCP सर्वर का नाम खाली नहीं हो सकता"
+server_config_object = "%{name}: सर्वर कॉन्फिग एक ऑब्जेक्ट होना चाहिए"
+command_or_url_required = "%{name}: command या url आवश्यक है"
+command_url_exclusive = "%{name}: command और url दोनों साथ में सेट नहीं किए जा सकते"
+gateway_not_connected = "गेटवे कनेक्ट नहीं है"
+workspace_not_selected = "वर्कस्पेस चयनित नहीं है"
+install_failed = "MCP सर्वर इंस्टॉल नहीं हो सका: %{error}"
+server_validation_error = "%{name}: वैलिडेशन त्रुटि"
+validation_failed = "MCP कॉन्फिग वैलिडेशन विफल हुआ"
+diagnostic = "%{name}: %{level}: %{message}%{field}"
+level_error = "त्रुटि"
+level_warning = "चेतावनी"
+
+[mcp.status]
+not_started = "शुरू नहीं हुआ"
+disabled = "अक्षम"
+starting = "शुरू हो रहा है"
+ready = "तैयार"
+degraded = "आंशिक रूप से उपलब्ध"
+auth_required = "अनुमति आवश्यक"
+failed = "विफल"
+stopping = "रोका जा रहा है"
+stopped = "रुका हुआ"
+restarting = "फिर शुरू हो रहा है"
+
+[mcp.capabilities]
+tools = "टूल"
+resources = "संसाधन"
+templates = "टेम्पलेट"
+prompts = "प्रॉम्प्ट"
+
+[mcp.sidebar]
+install = "इंस्टॉल"
+refresh = "रीफ़्रेश"
+back = "वापस"
+update_config = "अपडेट करें"
+restart = "फिर शुरू करें"
+uninstall = "अनइंस्टॉल"
+
+[mcp.details]
+not_selected = "MCP सर्वर चयनित नहीं है"
+enabled = "सक्षम"
+implicit = "इम्प्लिसिट"
+refresh = "रीफ़्रेश"
+source = "स्रोत"
+scope = "स्कोप"
+transport = "ट्रांसपोर्ट"
+loaded = "लोडेड"
+runtime = "रनटाइम"
+live = "लाइव"
+last_seen = "अंतिम गतिविधि"
+retry_attempt = "रीट्राई प्रयास"
+next_retry = "अगला रीट्राई"
+last_error = "अंतिम त्रुटि"
+stderr = "stderr"
+health = "स्थिति"
+tools = "टूल"
+tools_count = "टूल: %{count}"
+resources = "संसाधन"
+resources_count = "संसाधन: %{count}"
+resource_templates = "संसाधन टेम्पलेट"
+templates_count = "टेम्पलेट: %{count}"
+prompts = "प्रॉम्प्ट"
+prompts_count = "प्रॉम्प्ट: %{count}"
+audit = "ऑडिट"
+audit_count = "ऑडिट इवेंट: %{count}"
+source_config = "कॉन्फिग"
+scope_workspace = "वर्कस्पेस"
+scope_user = "यूज़र"
+
+[mcp.audit]
+column_time = "समय"
+column_time_hint = "MCP ऑडिट इवेंट लिखे जाने का स्थानीय समय।"
+column_event = "इवेंट"
+column_event_hint = "ऑडिट कार्रवाई और उपलब्ध होने पर कच्चा MCP टूल।"
+column_result = "परिणाम"
+column_result_hint = "इस MCP इवेंट के लिए गेटवे का निर्णय।"
+column_details = "विवरण"
+column_details_hint = "कारण कोड और संक्षिप्त इवेंट विवरण।"
+reason_tooltip = "%{details}\nकारण: %{reason}"
+action_install = "इंस्टॉल किया गया"
+action_update = "अपडेट किया गया"
+action_uninstall = "हटाया गया"
+action_policy = "नीति बदली गई"
+action_start = "शुरू"
+action_started = "शुरू हुआ"
+action_start_failed = "शुरू नहीं हो सका"
+action_stop = "रोकना"
+action_stopped = "रुका"
+action_restart = "फिर शुरू"
+action_catalog_refreshed = "कैटलॉग रीफ़्रेश हुआ"
+action_call = "टूल कॉल"
+action_call_completed = "कॉल पूरी हुई"
+action_call_failed = "कॉल विफल"
+decision_allowed = "अनुमत"
+decision_blocked = "ब्लॉक"
+decision_warning = "चेतावनी"
+
+[mcp.common]
+yes = "हाँ"
+no = "नहीं"
+none = "निर्दिष्ट नहीं"
+empty = "कोई विवरण नहीं"
+items_count = "आइटम: %{count}"
+keys_count = "कुंजियां: %{count}"
+
+[mcp.error]
+server_name_required = "MCP सर्वर नाम आवश्यक है"
+gateway_not_connected = "गेटवे कनेक्ट नहीं है"
+workspace_not_selected = "वर्कस्पेस चयनित नहीं है"
+server_not_available = "MCP सर्वर वर्तमान वर्कस्पेस में उपलब्ध नहीं है"
+load_servers_failed = "MCP सर्वर लोड नहीं हो सके: %{error}"
+load_details_failed = "MCP सर्वर विवरण लोड नहीं हो सके: %{error}"
+policy_update_failed = "MCP नीति अपडेट नहीं हो सकी: %{error}"
+restart_failed = "MCP सर्वर फिर शुरू नहीं हो सका: %{error}"
+uninstall_failed = "MCP सर्वर अनइंस्टॉल नहीं हो सका: %{error}"
+
+[skills.screen]
+title = "कौशल"
+description = "वर्तमान स्पेस के लिए इंस्टॉल किए गए कौशल।"
+installed_count = "मिले:"
+
+[skills.empty]
+title = "कोई इंस्टॉल किए गए कौशल नहीं"
+description = "नए कौशल इंस्टॉल करें और एजेंटों की क्षमताओं का विस्तार करें।"
+
+[skills.error]
+gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "No active workspace selected."
+load_failed = "Failed to load installed skills"
+path_required = "Path is required."
+invalid_skill_target = "Invalid skill target."
+install_failed = "Failed to install skill"
+update_failed = "Failed to update skill"
+uninstall_failed = "Failed to uninstall skill"
+policy_failed = "Failed to update skill policy"
+path_picker_failed = "Failed to open source picker"
+
+[skills.card]
+version = "संस्करण"
+fingerprint = "फिंगरप्रिंट"
+
+[skills.status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[skills.button]
+install = "Install"
+update = "Update"
+uninstall = "Uninstall"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Preparing skill upload"
+installing = "Uploading skill"
+updating = "Uploading update"
+cancelling = "Cancelling upload"
+
+[skills.dialog]
+install_title = "Install Skill"
+update_title = "Update %{slug}"
+source_kind_description = "Choose a skill folder from disk."
+pick_folder = "Choose folder"
+pick_archive = "Choose archive"
+
+[skills.diagnostics]
+reason = "Reason:"
+validation = "Validation"
+dependencies = "Dependencies"
+dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
+dependencies_column_action = "What to do"
+dependencies_hint_requirement = "What this skill expects to find on your machine."
+dependencies_hint_status = "Current result of the dependency check."
+dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
+dependencies_kind_bin = "Command"
+dependencies_kind_env = "Environment variable"
+dependencies_kind_api_key = "API key"
+dependencies_kind_command = "Command"
+dependencies_kind_mcp = "MCP server"
+dependencies_kind_tool = "Dependency"
+dependencies_status_ready = "Ready"
+dependencies_status_missing = "Missing"
+dependencies_status_blocked = "Blocked"
+dependencies_status_warning = "Warning"
+dependencies_status_unknown = "Unknown"
+security = "Security"
+security_intro = "Potential risks found while scanning skill files."
+security_column_rule = "Rule"
+security_column_finding = "Finding"
+security_column_location = "Location"
+security_hint_level = "Severity of the security finding."
+security_hint_rule = "Identifier of the rule that triggered this finding."
+security_hint_finding = "What exactly was detected and why it matters."
+security_hint_location = "File path where the finding was detected."
+security_location_unknown = "Path not specified"
+security_severity_critical = "Critical"
+security_severity_high = "High"
+security_severity_medium = "Medium"
+security_severity_low = "Low"
+security_severity_info = "Info"
+trust_gate = "Trust gates"
+trust_gate_intro = "Permission decisions based on required trust level."
+trust_column_tool = "Tool type"
+trust_column_min_trust = "Required trust"
+trust_column_explanation = "Explanation"
+trust_hint_tool = "Which tool category this gate controls."
+trust_hint_min_trust = "Minimum trust level required to use this tool."
+trust_hint_decision = "Whether the tool use is currently allowed."
+trust_hint_explanation = "Simple reason for the current decision."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Allowed"
+trust_decision_blocked = "Blocked"
+trust_explanation_allowed = "Current trust level is enough."
+trust_explanation_blocked = "Blocked until trust level reaches"
+audit = "Recent audit"
+audit_intro = "Recent actions and checks related to this skill."
+audit_column_time = "When"
+audit_column_event = "Event"
+audit_column_result = "Result"
+audit_column_details = "Details"
+audit_hint_time = "When this event was recorded."
+audit_hint_event = "What happened with the skill."
+audit_hint_result = "Whether the action was allowed, blocked, or warned."
+audit_hint_details = "Reason and technical details behind the decision."
+audit_action_install = "Installed"
+audit_action_update = "Updated"
+audit_action_uninstall = "Removed"
+audit_action_resolve_allowed = "Resolved for prompt"
+audit_action_resolve_blocked = "Blocked on resolve"
+audit_action_runtime_allowed = "Allowed on runtime"
+audit_action_runtime_blocked = "Blocked on runtime"
+audit_action_security_warn = "Security warning"
+audit_decision_allowed = "Allowed"
+audit_decision_blocked = "Blocked"
+audit_decision_warning = "Warning"
+audit_reason_none = "No explicit reason"
+audit_details_empty = "No extra details"
+none = "none"
+empty_validation = "No validation issues found."
+empty_dependencies = "No dependency issues found."
+empty_security = "No security findings."
+empty_trust_gate = "No trust gate decisions."
+empty_audit = "No audit events yet."
+
+[skills.catalog]
+source = "स्रोत"
+trust = "विश्वास"
+
+[bottom_bar]
+gateway_disconnected = "गेटवे डिस्कनेक्ट है"
+starting_thread = "थ्रेड शुरू हो रहा है..."
+finishing_turn = "टर्न पूरा किया जा रहा है..."
+turn_running = "टर्न `%{turn_id}` चल रहा है"
+previous_turn_failed = "पिछला टर्न विफल हुआ। आप नया संदेश भेज सकते हैं।"
+turn_cancelled = "टर्न रद्द हुआ। आप नया संदेश भेज सकते हैं।"
+turn_completed = "टर्न पूरा हुआ। अगला संदेश भेजने के लिए तैयार।"
+ready = "तैयार"
+starting_turn = "टर्न शुरू हो रहा है..."
+agent_processing = "Agent प्रोसेस कर रहा है..."
+
+[timeline.empty]
+start_thread = "यह थ्रेड शुरू करने के लिए संदेश भेजें"
+
+[timeline.elapsed]
+hours_minutes = "%{hours} घं %{minutes} मि"
+minutes_seconds = "%{minutes} मि %{seconds} से"
+seconds = "%{seconds} से"
+
+[timeline.common]
+url_missing = "URL नहीं दिया गया"
+no_details = "कोई विवरण नहीं"
+truncated = "... [काटा गया]"
+
+[timeline.reasoning]
+summary = "सारांश:"
+content = "सामग्री:"
+running = "सोच रहा है"
+completed = "सोचा"
+
+[timeline.agent_message]
+subagent_completed = "सब-एजेंट ने जवाब दिया"
+
+[timeline.work_group]
+completed = "काम किया"
+
+[timeline.web_search]
+fallback_query = "वेब खोज"
+running = "वेब पर खोज रहा है"
+no_results = "कोई खोज परिणाम नहीं"
+results_count = "%{count} परिणाम"
+
+[timeline.file_change]
+cancelled = "रद्द"
+failed = "बदलाव लागू नहीं हुए"
+running = "बदलाव लागू हो रहे हैं"
+completed = "फाइलें बदली गईं"
+no_files = "कोई फाइल निर्दिष्ट नहीं"
+one_file = "1 फाइल"
+files_count = "%{count} फाइलें"
+exit_code = "एग्जिट कोड:"
+more_files = "और %{count}"
+output = "आउटपुट"
+
+[timeline.download]
+cancelled = "रद्द"
+failed = "डाउनलोड विफल"
+running = "फाइल डाउनलोड हो रही है"
+completed = "फाइल डाउनलोड हुई"
+size = "आकार: %{size}"
+unit_b = "B"
+unit_kb = "KB"
+unit_mb = "MB"
+unit_gb = "GB"
+unit_tb = "TB"
+
+[timeline.web_fetch]
+cancelled = "रद्द"
+failed = "खोलने में विफल"
+running = "लिंक खोला जा रहा है"
+completed = "लोड हुआ"
+
+[timeline.tool]
+cancelled = "रद्द"
+failed = "विफल"
+running = "टूल चल रहा है"
+completed = "पूरा हुआ"
+arguments = "आर्ग्युमेंट"
+result = "परिणाम"
+open_mcp_server = "MCP सर्वर खोलें"
+started = "टूल चल रहा है: %{tool_name}"
+started_kind = "टूल चल रहा है: %{tool_name} (%{kind})"
+finished = "टूल `%{tool_name}` पूरा हुआ"
+command = "कमांड: %{command}"
+cwd = "कार्य फ़ोल्डर: %{cwd}"
+query = "क्वेरी: %{query}"
+url = "URL: %{url}"
+exit_code = "निकास कोड: %{exit_code}"
+duration_ms = "अवधि: %{duration_ms} मि.से."
+timed_out = "समय समाप्त"
+changed_files = "बदली गई फ़ाइलें:"
+results = "परिणाम: %{count}"
+provider = "प्रदाता: %{provider}"
+status_code = "स्थिति कोड: %{status_code}"
+title = "शीर्षक: %{title}"
+path = "पथ: %{path}"
+bytes = "बाइट: %{bytes}"
+stage = "[चरण] %{value}"
+progress = "[प्रगति] %{value}"
+stderr = "[त्रुटि] %{value}"
+
+[timeline.command]
+running = "कमांड चल रही है"
+completed = "कमांड पूरी हुई"
+
+[timeline.system]
+info = "सिस्टम इवेंट"
+warning = "चेतावनी"
+error = "त्रुटि"
+tool = "टूल"
+attempt = "प्रयास #%{attempt}"
+timeout_with_recovery = "स्टेप टाइम आउट हुआ; रिकवरी शुरू हुई"
+timeout_without_recovery = "स्टेप टाइम आउट हुआ; ऑटोमेटिक रिकवरी उपलब्ध नहीं"
+timeout_label = "टाइमआउट"
+timeout_delta_recovery_scheduled = "[timeout] प्रयास #%{attempt} %{reason}; रिकवरी शेड्यूल हुई (job `%{job_id}`)"
+timeout_delta_no_recovery = "[timeout] प्रयास #%{attempt} %{reason}; ऑटोमेटिक रिकवरी नहीं"
+recovery_opened = "स्टेप रिकवरी शुरू हो रही है"
+recovery_attached = "रिकवरी नए स्टेप से जुड़ी"
+retry_scheduled = "रिकवरी रीट्राई शेड्यूल हुआ"
+retry_started = "रिकवरी रीट्राई शुरू हुआ"
+recovery_succeeded = "रिकवरी पूरी हुई"
+recovery_failed = "रिकवरी विफल"
+recovery_label = "रिकवरी"
+retry_label = "रीट्राई"
+recovered_label = "रिकवर हुआ"
+tool_retry_scheduled = "%{tool_name} फिर चलाया जा रहा है"
+tool_retry_scheduled_with_attempt = "टूल %{tool_name} फिर चलाया जा रहा है (प्रयास #%{attempt})"
+tool_retry_resolved = "%{tool_name} रीट्राई के बाद पूरा हुआ"
+tool_retry_exhausted = "%{tool_name} रीट्राई के बाद भी विफल हुआ"
+retry_resolved_label = "रीट्राई पूरा हुआ"
+retries_exhausted_label = "रीट्राई खत्म हुए"
+tool_loop_budget_exceeded = "टूल कॉल सीमा पूरी हो गई"
+code = "कोड:"

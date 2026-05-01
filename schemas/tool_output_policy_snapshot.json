@@ -1,0 +1,457 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolOutputPolicySnapshot",
+  "type": "object",
+  "required": [
+    "deltas",
+    "llm",
+    "llmRetention",
+    "recovery",
+    "storage",
+    "timeline"
+  ],
+  "properties": {
+    "deltas": {
+      "$ref": "#/definitions/DeltaOutputPolicy"
+    },
+    "llm": {
+      "$ref": "#/definitions/LlmOutputPolicy"
+    },
+    "llmRetention": {
+      "$ref": "#/definitions/LlmRetentionPolicy"
+    },
+    "recovery": {
+      "$ref": "#/definitions/RecoveryOutputPolicy"
+    },
+    "storage": {
+      "$ref": "#/definitions/StorageOutputPolicy"
+    },
+    "timeline": {
+      "$ref": "#/definitions/TimelineOutputPolicy"
+    }
+  },
+  "definitions": {
+    "DeltaOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "max_chunk_bytes",
+            "max_total_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_chunk_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_total_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "persist_and_display"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "progress_only"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "disabled"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "DiagnosticExcerptPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "disabled"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "max_chars",
+            "mode"
+          ],
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "errors_only"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "max_chars",
+            "mode"
+          ],
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "output"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "LlmOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "max_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "max_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "structured"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "summary_only"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "LlmRetentionPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "max_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "until_turn_terminal"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "do_not_retain"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "RecoveryOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "diagnostic_excerpt",
+            "include_error_class",
+            "include_exit_status",
+            "include_fingerprints",
+            "include_retry_hint",
+            "mode"
+          ],
+          "properties": {
+            "diagnostic_excerpt": {
+              "$ref": "#/definitions/DiagnosticExcerptPolicy"
+            },
+            "include_error_class": {
+              "type": "boolean"
+            },
+            "include_exit_status": {
+              "type": "boolean"
+            },
+            "include_fingerprints": {
+              "type": "boolean"
+            },
+            "include_retry_hint": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "evidence"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "metadata_only"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "StorageOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "max_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "max_chars",
+            "mode"
+          ],
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "summary"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "metadata_only"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "TimelineOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "max_bytes",
+            "mode"
+          ],
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "full"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "max_chars",
+            "mode"
+          ],
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "summary"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "metadata_only"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "hidden"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,551 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDeliveryDeliveredNotification",
+  "type": "object",
+  "required": [
+    "attempt",
+    "context",
+    "delivery"
+  ],
+  "properties": {
+    "attempt": {
+      "$ref": "#/definitions/TaskDeliveryAttempt"
+    },
+    "context": {
+      "$ref": "#/definitions/TaskNotificationContext"
+    },
+    "delivery": {
+      "$ref": "#/definitions/TaskDelivery"
+    }
+  },
+  "definitions": {
+    "TaskArtifact": {
+      "type": "object",
+      "properties": {
+        "artifactId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TaskDelivery": {
+      "type": "object",
+      "required": [
+        "attemptCount",
+        "createdAt",
+        "deliveryKey",
+        "id",
+        "maxAttempts",
+        "mode",
+        "runId",
+        "status",
+        "taskId",
+        "updatedAt",
+        "workspaceId"
+      ],
+      "properties": {
+        "attemptCount": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "deliveredAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "deliveredNotificationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deliveredTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deliveryKey": {
+          "type": "string"
+        },
+        "errorSnapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mode": {
+          "$ref": "#/definitions/TaskDeliveryMode"
+        },
+        "nextAttemptAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "resultSnapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/TaskDeliveryStatus"
+        },
+        "targetThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "targetUserId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "webhookUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "webhookUrlFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      }
+    },
+    "TaskDeliveryAttempt": {
+      "type": "object",
+      "required": [
+        "attemptNumber",
+        "deliveryId",
+        "id",
+        "startedAt",
+        "status"
+      ],
+      "properties": {
+        "attemptNumber": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "completedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "deliveryId": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "id": {
+          "type": "string"
+        },
+        "responseFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/definitions/TaskDeliveryAttemptStatus"
+        }
+      }
+    },
+    "TaskDeliveryAttemptStatus": {
+      "type": "string",
+      "enum": [
+        "started",
+        "delivered",
+        "failed"
+      ]
+    },
+    "TaskDeliveryMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "owner_thread",
+        "thread",
+        "user_notification",
+        "webhook"
+      ]
+    },
+    "TaskDeliveryStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "delivering",
+        "delivered",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "TaskError": {
+      "type": "object",
+      "required": [
+        "class",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "class": {
+          "$ref": "#/definitions/TaskErrorClass"
+        },
+        "code": {
+          "type": "string"
+        },
+        "details": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failedRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "TaskErrorClass": {
+      "type": "string",
+      "enum": [
+        "cancelled",
+        "timeout",
+        "provider",
+        "tool",
+        "validation",
+        "dependency",
+        "policy",
+        "internal",
+        "unknown"
+      ]
+    },
+    "TaskNotificationContext": {
+      "type": "object",
+      "required": [
+        "eventId",
+        "sequence",
+        "taskId",
+        "workspaceId"
+      ],
+      "properties": {
+        "eventId": {
+          "type": "string"
+        },
+        "parentTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      }
+    },
+    "TaskResult": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskArtifact"
+          }
+        },
+        "completedByRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TaskValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "integer"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "string"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskValue"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/TaskValue"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

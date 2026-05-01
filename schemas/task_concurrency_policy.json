@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskConcurrencyPolicy",
+  "type": "object",
+  "required": [
+    "maxParallelRuns",
+    "onConflict"
+  ],
+  "properties": {
+    "key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "maxParallelRuns": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "onConflict": {
+      "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+    }
+  },
+  "definitions": {
+    "TaskConcurrencyConflictPolicy": {
+      "type": "string",
+      "enum": [
+        "queue",
+        "reject",
+        "cancel_existing",
+        "allow"
+      ]
+    }
+  }
+}

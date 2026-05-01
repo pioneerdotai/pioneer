@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskTurnItem",
+  "type": "object",
+  "required": [
+    "createdAt",
+    "depth",
+    "executorKind",
+    "id",
+    "maxDepth",
+    "status",
+    "taskId",
+    "title",
+    "triggerKind",
+    "updatedAt"
+  ],
+  "properties": {
+    "agentRole": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "childThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "childTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "depth": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "errorPreview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executorKind": {
+      "$ref": "#/definitions/TaskExecutorKind"
+    },
+    "id": {
+      "type": "string"
+    },
+    "maxDepth": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "nextFireAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "parentTaskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resultPreview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rootTaskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/TaskStatus"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "triggerKind": {
+      "$ref": "#/definitions/TaskTriggerKind"
+    },
+    "updatedAt": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "definitions": {
+    "TaskExecutorKind": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "tool",
+        "workflow",
+        "webhook",
+        "system"
+      ]
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "scheduled",
+        "queued",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "TaskTriggerKind": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "scheduled_at",
+        "interval",
+        "cron",
+        "manual",
+        "external",
+        "dependency"
+      ]
+    }
+  }
+}

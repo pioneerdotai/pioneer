@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDeliveryPolicy",
+  "type": "object",
+  "required": [
+    "format",
+    "includeResult",
+    "mode"
+  ],
+  "properties": {
+    "format": {
+      "$ref": "#/definitions/TaskDeliveryFormat"
+    },
+    "includeResult": {
+      "type": "boolean"
+    },
+    "mode": {
+      "$ref": "#/definitions/TaskDeliveryMode"
+    },
+    "threadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "webhookUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "TaskDeliveryFormat": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "full_result"
+      ]
+    },
+    "TaskDeliveryMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "owner_thread",
+        "thread",
+        "user_notification",
+        "webhook"
+      ]
+    }
+  }
+}

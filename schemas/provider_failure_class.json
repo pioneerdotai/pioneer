@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProviderFailureClass",
+  "type": "string",
+  "enum": [
+    "network_transient",
+    "rate_limit",
+    "provider_5xx",
+    "auth_expired",
+    "model_not_found",
+    "prompt_too_long",
+    "max_output_tokens",
+    "stream_stall",
+    "stream_truncated",
+    "invalid_request",
+    "permission_denied",
+    "unknown"
+  ]
+}

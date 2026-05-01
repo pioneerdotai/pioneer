@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsPolicyListResponse",
+  "type": "object",
+  "properties": {
+    "policies": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SkillWorkspacePolicy"
+      }
+    }
+  },
+  "definitions": {
+    "SkillWorkspacePolicy": {
+      "type": "object",
+      "required": [
+        "skill_slug",
+        "source_kind",
+        "workspace_id"
+      ],
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "skill_slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnGetResponse",
+  "type": "object",
+  "required": [
+    "thread_id",
+    "turn",
+    "workspace_id"
+  ],
+  "properties": {
+    "thread_id": {
+      "type": "string"
+    },
+    "turn": {
+      "$ref": "#/definitions/Turn"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "PromptManifest": {
+      "type": "object",
+      "required": [
+        "compiler_version",
+        "fingerprint_dynamic",
+        "fingerprint_full",
+        "fingerprint_stable",
+        "profile"
+      ],
+      "properties": {
+        "compiler_version": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PromptManifestDiagnostic"
+          }
+        },
+        "fingerprint_dynamic": {
+          "type": "string"
+        },
+        "fingerprint_full": {
+          "type": "string"
+        },
+        "fingerprint_stable": {
+          "type": "string"
+        },
+        "profile": {
+          "$ref": "#/definitions/PromptManifestProfile"
+        },
+        "section_ids": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PromptManifestDiagnostic": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/PromptManifestDiagnosticCode"
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "PromptManifestDiagnosticCode": {
+      "type": "string",
+      "enum": [
+        "missing_file",
+        "file_read_error",
+        "file_truncated",
+        "total_budget_truncated",
+        "file_filtered_by_profile"
+      ]
+    },
+    "PromptManifestProfile": {
+      "type": "string",
+      "enum": [
+        "assistant_full",
+        "assistant_minimal",
+        "assistant_none"
+      ]
+    },
+    "Turn": {
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "prompt_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PromptManifest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/TurnStatus"
+        }
+      }
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "InProgress",
+        "Completed",
+        "Failed",
+        "Interrupted"
+      ]
+    }
+  }
+}

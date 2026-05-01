@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillLifecycleResultSkill",
+  "type": "object",
+  "required": [
+    "fingerprint",
+    "install_path",
+    "slug",
+    "source_kind",
+    "trust_level"
+  ],
+  "properties": {
+    "fingerprint": {
+      "type": "string"
+    },
+    "install_path": {
+      "type": "string"
+    },
+    "slug": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    },
+    "trust_level": {
+      "type": "string"
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

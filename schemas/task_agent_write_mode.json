@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgentWriteMode",
+  "type": "string",
+  "enum": [
+    "read_only",
+    "workspace_write",
+    "scoped_write",
+    "full_access"
+  ]
+}

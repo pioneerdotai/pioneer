@@ -1,0 +1,21 @@
+[package]
+name = "pioneer-crud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-sqlite.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+serde_json.workspace = true
+serde.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing.workspace = true
+
+[dev-dependencies]
+pioneer-migration.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskWriteLock",
+  "type": "object",
+  "required": [
+    "acquiredAt",
+    "conflictPolicy",
+    "createdAt",
+    "id",
+    "runId",
+    "scopeKind",
+    "scopePath",
+    "status",
+    "taskId",
+    "updatedAt",
+    "workspaceId"
+  ],
+  "properties": {
+    "acquiredAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "conflictPolicy": {
+      "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "expiresAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "releasedAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "scopeKind": {
+      "$ref": "#/definitions/TaskWriteLockScopeKind"
+    },
+    "scopePath": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/definitions/TaskWriteLockStatus"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "updatedAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TaskConcurrencyConflictPolicy": {
+      "type": "string",
+      "enum": [
+        "queue",
+        "reject",
+        "cancel_existing",
+        "allow"
+      ]
+    },
+    "TaskWriteLockScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "path"
+      ]
+    },
+    "TaskWriteLockStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "acquired",
+        "released",
+        "expired",
+        "cancelled",
+        "blocked"
+      ]
+    }
+  }
+}

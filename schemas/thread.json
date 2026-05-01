@@ -1,0 +1,240 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Thread",
+  "type": "object",
+  "required": [
+    "created_at",
+    "id",
+    "mode",
+    "model",
+    "model_provider",
+    "preview",
+    "status",
+    "turns",
+    "updated_at",
+    "workspace_id"
+  ],
+  "properties": {
+    "agent_nickname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "id": {
+      "type": "string"
+    },
+    "mode": {
+      "$ref": "#/definitions/ThreadMode"
+    },
+    "model": {
+      "type": "string"
+    },
+    "model_provider": {
+      "type": "string"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "origin_kind": {
+      "default": "user",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ThreadOriginKind"
+        }
+      ]
+    },
+    "preview": {
+      "type": "string"
+    },
+    "sidebar_visibility": {
+      "default": "visible",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ThreadSidebarVisibility"
+        }
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/ThreadStatus"
+    },
+    "turns": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Turn"
+      }
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "PromptManifest": {
+      "type": "object",
+      "required": [
+        "compiler_version",
+        "fingerprint_dynamic",
+        "fingerprint_full",
+        "fingerprint_stable",
+        "profile"
+      ],
+      "properties": {
+        "compiler_version": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PromptManifestDiagnostic"
+          }
+        },
+        "fingerprint_dynamic": {
+          "type": "string"
+        },
+        "fingerprint_full": {
+          "type": "string"
+        },
+        "fingerprint_stable": {
+          "type": "string"
+        },
+        "profile": {
+          "$ref": "#/definitions/PromptManifestProfile"
+        },
+        "section_ids": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PromptManifestDiagnostic": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/PromptManifestDiagnosticCode"
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "PromptManifestDiagnosticCode": {
+      "type": "string",
+      "enum": [
+        "missing_file",
+        "file_read_error",
+        "file_truncated",
+        "total_budget_truncated",
+        "file_filtered_by_profile"
+      ]
+    },
+    "PromptManifestProfile": {
+      "type": "string",
+      "enum": [
+        "assistant_full",
+        "assistant_minimal",
+        "assistant_none"
+      ]
+    },
+    "ThreadMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "Agent"
+      ]
+    },
+    "ThreadOriginKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "task_run",
+        "system"
+      ]
+    },
+    "ThreadSidebarVisibility": {
+      "type": "string",
+      "enum": [
+        "visible",
+        "hidden"
+      ]
+    },
+    "ThreadStatus": {
+      "type": "string",
+      "enum": [
+        "Active",
+        "Idle",
+        "Closed"
+      ]
+    },
+    "Turn": {
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "prompt_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PromptManifest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/TurnStatus"
+        }
+      }
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "InProgress",
+        "Completed",
+        "Failed",
+        "Interrupted"
+      ]
+    }
+  }
+}

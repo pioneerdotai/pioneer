@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkspaceDefaultResponse",
+  "type": "object",
+  "required": [
+    "workspace"
+  ],
+  "properties": {
+    "workspace": {
+      "$ref": "#/definitions/Workspace"
+    }
+  },
+  "definitions": {
+    "Workspace": {
+      "type": "object",
+      "required": [
+        "created_at",
+        "id",
+        "is_active",
+        "is_current",
+        "name",
+        "updated_at"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskRunStatus",
+  "type": "string",
+  "enum": [
+    "queued",
+    "starting",
+    "running",
+    "waiting",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "timed_out"
+  ]
+}

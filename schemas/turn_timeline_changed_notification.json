@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnTimelineChangedNotification",
+  "type": "object",
+  "required": [
+    "reason",
+    "threadId",
+    "turnId",
+    "workspaceId"
+  ],
+  "properties": {
+    "childThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "childTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "$ref": "#/definitions/TurnTimelineChangedReason"
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TurnTimelineChangedReason": {
+      "type": "string",
+      "enum": [
+        "parent_turn_changed",
+        "task_event_changed",
+        "child_turn_changed",
+        "collapse_state_hint_changed"
+      ]
+    }
+  }
+}

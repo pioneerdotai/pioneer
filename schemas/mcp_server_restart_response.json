@@ -1,0 +1,228 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpServerRestartResponse",
+  "type": "object",
+  "required": [
+    "accepted",
+    "server"
+  ],
+  "properties": {
+    "accepted": {
+      "type": "boolean"
+    },
+    "server": {
+      "$ref": "#/definitions/McpListItem"
+    }
+  },
+  "definitions": {
+    "McpListItem": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "id",
+        "name",
+        "policy",
+        "prompts_count",
+        "required",
+        "resource_templates_count",
+        "resources_count",
+        "runtime",
+        "scope",
+        "source_kind",
+        "status",
+        "tools_count",
+        "transport"
+      ],
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/definitions/McpPolicyState"
+        },
+        "prompts_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resource_templates_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "resources_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "runtime": {
+          "$ref": "#/definitions/McpRuntimeStatus"
+        },
+        "scope": {
+          "$ref": "#/definitions/McpScopeKind"
+        },
+        "source_kind": {
+          "$ref": "#/definitions/McpSourceKind"
+        },
+        "status": {
+          "$ref": "#/definitions/McpServerStatus"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransportSummary"
+        }
+      }
+    },
+    "McpPolicyState": {
+      "type": "object",
+      "required": [
+        "allow_implicit_invocation",
+        "enabled"
+      ],
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "required": [
+        "live",
+        "state"
+      ],
+      "properties": {
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/definitions/McpRuntimeState"
+        }
+      }
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    },
+    "McpTransportSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "command",
+            "kind"
+          ],
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "stdio"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "url"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "streamable_http"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

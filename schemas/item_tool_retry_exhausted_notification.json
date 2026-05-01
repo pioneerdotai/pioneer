@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ItemToolRetryExhaustedNotification",
+  "type": "object",
+  "required": [
+    "attempt_number",
+    "error_class",
+    "exhaustion_kind",
+    "failure_signature_fingerprint",
+    "item_id",
+    "item_type",
+    "reason",
+    "thread_id",
+    "tool_name",
+    "tool_retry_episode_id",
+    "turn_id",
+    "workspace_id"
+  ],
+  "properties": {
+    "attempt_number": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "budgets": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ToolRetryBudgetUsage"
+      }
+    },
+    "error_class": {
+      "$ref": "#/definitions/ToolRetryErrorClass"
+    },
+    "exhaustion_kind": {
+      "$ref": "#/definitions/ToolRetryExhaustionKind"
+    },
+    "failure_signature_fingerprint": {
+      "type": "string"
+    },
+    "item_id": {
+      "type": "string"
+    },
+    "item_type": {
+      "$ref": "#/definitions/TurnItemType"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "tool_name": {
+      "type": "string"
+    },
+    "tool_retry_episode_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "ToolRetryBudgetKind": {
+      "type": "string",
+      "enum": [
+        "episode",
+        "error_class",
+        "tool_name",
+        "failure_signature"
+      ]
+    },
+    "ToolRetryBudgetUsage": {
+      "type": "object",
+      "required": [
+        "kind",
+        "limit",
+        "used"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ToolRetryBudgetKind"
+        },
+        "limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "used": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ToolRetryErrorClass": {
+      "type": "string",
+      "enum": [
+        "invalid_arguments",
+        "not_found",
+        "permission_denied",
+        "command_not_found",
+        "timeout",
+        "cancelled",
+        "execution_failed",
+        "needs_narrowing",
+        "internal",
+        "output_truncated",
+        "unknown"
+      ]
+    },
+    "ToolRetryExhaustionKind": {
+      "type": "string",
+      "enum": [
+        "total_retry_rounds",
+        "error_class",
+        "tool_name",
+        "failure_signature"
+      ]
+    },
+    "TurnItemType": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "agent_message",
+        "reasoning",
+        "system_event",
+        "task",
+        "command_execution",
+        "file_change",
+        "web_search",
+        "web_fetch",
+        "download",
+        "dynamic_tool_call"
+      ]
+    }
+  }
+}

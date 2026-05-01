@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsInstallParams",
+  "type": "object",
+  "required": [
+    "source",
+    "target_source_kind",
+    "workspace_id"
+  ],
+  "properties": {
+    "source": {
+      "$ref": "#/definitions/SkillLifecycleSource"
+    },
+    "target_source_kind": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "SkillLifecycleSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "upload_id"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "uploaded_archive"
+              ]
+            },
+            "upload_id": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "pioneer-migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "migration"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+sea-orm-migration = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+pioneer-entity.workspace = true

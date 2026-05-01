@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpRuntimeStatus",
+  "type": "object",
+  "required": [
+    "live",
+    "state"
+  ],
+  "properties": {
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_seen_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "live": {
+      "type": "boolean"
+    },
+    "state": {
+      "$ref": "#/definitions/McpRuntimeState"
+    }
+  },
+  "definitions": {
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    }
+  }
+}

@@ -1,0 +1,864 @@
+_version = 1
+
+[chat.composer]
+placeholder = "アシスタントにメッセージを送信"
+
+[chat.composer.mode]
+agent_label = "エージェント"
+agent_description = "ワークフローへの完全な自動化とシームレスな統合。"
+chat_label = "チャット"
+chat_description = "自動化なしで分析、執筆、推論を行う対話型AI。"
+
+[chat.composer.model]
+select_label = "モデルを選択"
+dialog_title = "モデルを選択"
+provider_label = "プロバイダー"
+provider_placeholder = "プロバイダーを検索..."
+model_label = "モデル"
+model_placeholder = "モデルを検索..."
+loading_models = "モデルを読み込み中..."
+loading_providers = "プロバイダーを読み込み中..."
+no_providers = "プロバイダーが設定されていません"
+no_models = "利用可能なモデルがありません"
+load_error = "読み込みエラー: %{error}"
+
+[chat.composer.preview]
+skill = "スキル: %{name}"
+mention = "メンション: %{name}"
+
+[common]
+address = "アドレス"
+copy = "コピー"
+name = "名前"
+ok = "OK"
+or = "または"
+token = "トークン"
+
+[buttons]
+cancel = "キャンセル"
+save = "保存"
+
+[conversation.error]
+turn_failed = "ターンが失敗しました"
+
+[errors.command]
+exit_status = "終了ステータス %{status}"
+failed_with_output = "`%{command_label}` が失敗しました: %{details}"
+launchctl_print_failed = "`launchctl print` の実行に失敗しました"
+powershell_task_status_failed = "スケジュールタスク状態確認のための powershell 実行に失敗しました"
+run_failed = "`%{command_label}` の実行に失敗しました"
+systemctl_is_active_failed = "`systemctl --user is-active` の実行に失敗しました"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` は 0 より大きくする必要があります"
+load_app = "アプリ設定の読み込みに失敗しました"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` は 0 より大きくする必要があります"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` は 0 より大きくする必要があります"
+
+[errors.gateway]
+address_conflict_inactive_service = "アドレス `%{listen_addr}` はすでに使用中ですが、設定されたサービス `%{service_name}` は稼働していません。競合プロセス/サービスを停止するか gateway.listen_addr を変更してください"
+address_empty = "ゲートウェイのアドレスは空にできません"
+id_not_found = "ゲートウェイ id `%{id}` が見つかりません"
+invalid_address = "無効なゲートウェイアドレス `%{normalized}` です。host:port 形式を指定してください"
+resolve_empty = "ゲートウェイアドレス `%{listen_addr}` はソケットアドレスに解決されませんでした"
+resolve_failed = "ゲートウェイアドレス `%{listen_addr}` の解決に失敗しました"
+start_command_failed_manual_help = "ローカルゲートウェイを自動でインストールまたは起動できませんでした。再試行し、ローカルのゲートウェイ設定を確認してください"
+startup_timeout = "ゲートウェイサービスは %{startup_timeout_ms}ms 以内に `%{listen_addr}` で到達可能になりませんでした"
+unreachable_verify = "ゲートウェイ `%{address}` に到達できません。アドレスとゲートウェイが起動していることを確認してください"
+
+[errors.registry]
+parse_failed = "ゲートウェイレジストリ `%{path}` の解析に失敗しました"
+read_failed = "ゲートウェイレジストリ `%{path}` の読み込みに失敗しました"
+serialize_failed = "ゲートウェイレジストリのシリアライズに失敗しました"
+unsupported_version = "`%{path}` のゲートウェイレジストリバージョン `%{version}` は未対応です。期待値: `%{current_registry_version}`"
+write_failed = "ゲートウェイレジストリ `%{path}` の書き込みに失敗しました"
+
+[errors.runtime]
+ensure_home = "実行環境のホームディレクトリの準備に失敗しました"
+
+[errors.theme]
+watch_dir_failed = "テーマディレクトリの監視に失敗しました"
+
+[errors.window]
+open_failed = "デスクトップウィンドウを開けませんでした"
+
+[gateway.action]
+connect_remote = "リモートに接続"
+start_local = "ローカルゲートウェイを起動"
+
+[gateway.endpoint]
+local_name = "ローカルゲートウェイ"
+local_with_address = "ローカル - %{address}"
+remote_name = "リモート %{index}"
+remote_with_address = "リモート - %{address}"
+
+[gateway.error]
+with_details = "ゲートウェイエラー: %{error}."
+
+[gateway.initial]
+description = "ゲートウェイアドレスを指定するか、ローカルゲートウェイサービスを起動してください。"
+title = "ゲートウェイに接続"
+
+[gateway.popover]
+no_available = "利用可能なゲートウェイがありません。"
+
+[gateway.status]
+connected = "ゲートウェイ接続済み"
+connecting = "ゲートウェイ接続中..."
+connecting_named = "%{gateway_name} に接続中..."
+connecting_remote = "リモートゲートウェイに接続中..."
+failed_check = "ゲートウェイの状態確認に失敗しました: %{error}"
+local_conflict = "ローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
+local_conflict_at = "%{gateway_address} でローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
+local_stopped = "ローカルゲートウェイは停止しています: %{gateway_address}。ローカルゲートウェイを起動するか、リモートに切り替えてください。"
+not_configured = "ゲートウェイはまだ設定されていません。リモートアドレスを追加するか、ローカルゲートウェイを起動してください。"
+remote_unavailable = "リモートゲートウェイは利用できません: %{gateway_name} (%{gateway_address})"
+starting_local = "ローカルゲートウェイを起動中..."
+installing = "ゲートウェイをインストール中..."
+updating = "ゲートウェイを更新中..."
+subsystem_failed = "ゲートウェイサブシステムの初期化に失敗しました: %{error}"
+subsystem_not_ready = "ゲートウェイサブシステムは準備できていません"
+unavailable = "ゲートウェイは利用できません"
+
+[gateway.notification]
+path_update_skipped = "ゲートウェイを起動しました。`pioneer` コマンドを使うには、新しいターミナルセッションで %{bin_dir} を PATH に追加する必要がある場合があります。"
+
+[logs.gateway]
+launcher_did_not_reach_service = "起動プログラムは設定済みゲートウェイサービスを到達可能にできませんでした"
+launcher_failed = "起動プログラムが失敗しました"
+launcher_unavailable = "起動プログラムは利用できません"
+service_started = "ゲートウェイサービスを起動しました"
+
+[logs.runtime]
+home_ready = "実行環境のホームディレクトリの準備が完了しました"
+prepare_home_failed = "実行環境のホームディレクトリの準備に失敗しました"
+
+[menu.app]
+name = "Pioneer"
+about = "Pioneerについて"
+services = "サービス"
+hide = "Pioneerを隠す"
+hide_others = "ほかを隠す"
+show_all = "すべて表示"
+quit = "Pioneerを終了"
+
+[menu.about]
+version = "バージョン %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "新しいスレッド"
+providers = "プロバイダー"
+
+[sidebar.thread]
+untitled = "新しいスレッド"
+
+[sidebar.title]
+threads = "スレッド"
+
+[sidebar.folder]
+new = "新しいフォルダ"
+
+[sidebar.contextmenu.folder]
+rename = "名前を変更"
+delete = "削除"
+
+[dialog.folder.rename]
+title = "フォルダ名を変更"
+description = "短く、覚えやすい名前にしてください。"
+
+[providers.screen]
+title = "プロバイダー"
+description = "利用可能なモデルプロバイダーの API キーを設定します。"
+empty_connected = "接続済みプロバイダーはまだありません。"
+
+[providers.sidebar]
+all = "すべて"
+connected = "接続済み"
+
+[providers.button]
+submit = "キーを保存"
+remove_key = "キーを削除"
+
+[providers.dialog]
+title = "%{provider} を設定"
+api_key_label = "API キー *"
+api_key_placeholder = "API キーを入力"
+replace_hint = "%{provider} にはすでにキーが設定されています。保存すると置き換えられます。"
+
+[providers.error]
+gateway_not_connected = "Gateway に接続されていません。"
+load_failed = "プロバイダー設定の読み込みに失敗しました"
+save_failed = "API キーの保存に失敗しました"
+delete_failed = "API キーの削除に失敗しました"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Anthropic の Claude とその他のモデル"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "AWS Bedrock 経由のモデル"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Azure OpenAI Service 経由のモデル"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "Claude Code CLI 経由でモデルを使用"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Copilot 互換 API 経由でモデルを実行"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI 互換の DeepSeek プロバイダー"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Google AI の Gemini モデル"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "Gemini CLI ツール経由でモデルを使用"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM と Zhipu 互換モデル"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Groq ハードウェアによる高速推論"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM プロキシとゲートウェイ"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "OpenAI 互換エンドポイント経由の Mistral API"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "ローカル Ollama モデルを実行"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT とその他の OpenAI モデル"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "多数のモデルプロバイダー向けルーター"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx 推論エンドポイント"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok モデル"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Together がホストするモデル"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks のホスト済みモデル API"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "OpenAI 互換の Novita エンドポイント"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API モデル"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere 互換エンドポイント"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice モデル API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras モデル API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova モデル API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic のホスト済みモデル"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "OpenAI 互換の DeepInfra エンドポイント"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF ルーターエンドポイント"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio エンドポイント"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka モデルエンドポイント"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten 推論エンドポイント"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale 推論エンドポイント"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale のホスト済みモデルエンドポイント"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio エンドポイント"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli サーバーレスエンドポイント"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI エンドポイント"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow モデル API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API エンドポイント"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI モデル API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun モデルエンドポイント"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan モデル API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi モデル API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan モデル API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI エンドポイント"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM エンドポイント"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "OpenAI 互換の Synthetic エンドポイント"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark エンドポイント"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan モデル API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "ローカル LM Studio OpenAI 互換 API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "ローカル llama.cpp OpenAI 互換 API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "ローカル SGLang OpenAI 互換 API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "ローカル vLLM OpenAI 互換 API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "ローカル OSaurus OpenAI 互換 API"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "Kilo CLI 経由でモデルを使用"
+
+[settings.screen]
+title = "設定"
+description = "アプリの設定を管理します。"
+
+[settings.sidebar]
+back = "戻る"
+general = "General"
+
+[settings.option.language]
+label = "アプリの言語"
+description = "インターフェースで使用する言語を選択します。"
+
+[settings.option.theme]
+label = "カラーテーマ"
+description = "表示モードを選択します。"
+
+[settings.language]
+system = "システム既定"
+english = "英語"
+russian = "ロシア語"
+german = "ドイツ語"
+spanish = "スペイン語"
+french = "フランス語"
+hindi = "ヒンディー語"
+japanese = "日本語"
+chinese = "中国語"
+
+[settings.theme]
+system = "システム"
+light = "ライト"
+dark = "ダーク"
+
+[mcp.screen]
+title = "MCP"
+description = "現在のスペース向けにインストール済みの Model Context Protocol サーバー。"
+found_count = "検出:"
+
+[mcp.empty]
+title = "インストール済み MCP サーバーはありません"
+description = "新しい MCP サーバーをインストールして、エージェントの機能を拡張します。"
+
+[mcp.dialog]
+install_title = "MCP サーバーをインストール"
+install = "インストール"
+uninstall_title = "%{name} をアンインストールしますか？"
+uninstall_description = "現在のワークスペースからこの MCP サーバーを削除し、実行タスクを停止します。"
+uninstall = "アンインストール"
+config_json = "JSON 設定"
+secret_store_hint = "env、headers、tokens、authorization のシークレット値はゲートウェイのシークレットストアに保存されます。"
+
+[mcp.dialog.error]
+config_required = "MCP JSON 設定が必要です"
+config_invalid = "MCP JSON 設定が無効です: %{error}"
+servers_required = "MCP JSON 設定には mcpServers オブジェクトが必要です"
+servers_empty = "MCP JSON 設定には少なくとも 1 つのサーバーが必要です"
+server_name_empty = "MCP サーバー名は空にできません"
+server_config_object = "%{name}: サーバー設定はオブジェクトである必要があります"
+command_or_url_required = "%{name}: command または url が必要です"
+command_url_exclusive = "%{name}: command と url は同時に設定できません"
+gateway_not_connected = "ゲートウェイに接続されていません"
+workspace_not_selected = "ワークスペースが選択されていません"
+install_failed = "MCP サーバーをインストールできませんでした: %{error}"
+server_validation_error = "%{name}: 検証エラー"
+validation_failed = "MCP 設定の検証に失敗しました"
+diagnostic = "%{name}: %{level}: %{message}%{field}"
+level_error = "エラー"
+level_warning = "警告"
+
+[mcp.status]
+not_started = "未起動"
+disabled = "無効"
+starting = "起動中"
+ready = "準備完了"
+degraded = "一部機能低下"
+auth_required = "認証が必要"
+failed = "失敗"
+stopping = "停止中"
+stopped = "停止済み"
+restarting = "再起動中"
+
+[mcp.capabilities]
+tools = "ツール"
+resources = "リソース"
+templates = "テンプレート"
+prompts = "プロンプト"
+
+[mcp.sidebar]
+install = "インストール"
+refresh = "更新"
+back = "戻る"
+update_config = "更新"
+restart = "再起動"
+uninstall = "アンインストール"
+
+[mcp.details]
+not_selected = "MCP サーバーが選択されていません"
+enabled = "有効"
+implicit = "暗黙"
+refresh = "更新"
+source = "ソース"
+scope = "スコープ"
+transport = "トランスポート"
+loaded = "読み込み済み"
+runtime = "ランタイム"
+live = "稼働中"
+last_seen = "最終確認"
+retry_attempt = "再試行回数"
+next_retry = "次の再試行"
+last_error = "最後のエラー"
+stderr = "stderr"
+health = "状態"
+tools = "ツール"
+tools_count = "ツール: %{count}"
+resources = "リソース"
+resources_count = "リソース: %{count}"
+resource_templates = "リソーステンプレート"
+templates_count = "テンプレート: %{count}"
+prompts = "プロンプト"
+prompts_count = "プロンプト: %{count}"
+audit = "監査"
+audit_count = "監査イベント: %{count}"
+source_config = "設定"
+scope_workspace = "ワークスペース"
+scope_user = "ユーザー"
+
+[mcp.audit]
+column_time = "時刻"
+column_time_hint = "MCP 監査イベントが記録されたローカル時刻。"
+column_event = "イベント"
+column_event_hint = "監査アクションと、存在する場合は元の MCP ツール。"
+column_result = "結果"
+column_result_hint = "この MCP イベントに対するゲートウェイの判断。"
+column_details = "詳細"
+column_details_hint = "理由コードと簡潔なイベント詳細。"
+reason_tooltip = "%{details}\n理由: %{reason}"
+action_install = "インストール済み"
+action_update = "更新済み"
+action_uninstall = "削除済み"
+action_policy = "ポリシー変更"
+action_start = "起動"
+action_started = "起動済み"
+action_start_failed = "起動失敗"
+action_stop = "停止"
+action_stopped = "停止済み"
+action_restart = "再起動"
+action_catalog_refreshed = "カタログ更新済み"
+action_call = "ツール呼び出し"
+action_call_completed = "呼び出し完了"
+action_call_failed = "呼び出し失敗"
+decision_allowed = "許可"
+decision_blocked = "ブロック"
+decision_warning = "警告"
+
+[mcp.common]
+yes = "はい"
+no = "いいえ"
+none = "未指定"
+empty = "詳細なし"
+items_count = "項目: %{count}"
+keys_count = "キー: %{count}"
+
+[mcp.error]
+server_name_required = "MCP サーバー名が必要です"
+gateway_not_connected = "ゲートウェイに接続されていません"
+workspace_not_selected = "ワークスペースが選択されていません"
+server_not_available = "現在のワークスペースで MCP サーバーを利用できません"
+load_servers_failed = "MCP サーバーを読み込めませんでした: %{error}"
+load_details_failed = "MCP サーバー詳細を読み込めませんでした: %{error}"
+policy_update_failed = "MCP ポリシーを更新できませんでした: %{error}"
+restart_failed = "MCP サーバーを再起動できませんでした: %{error}"
+uninstall_failed = "MCP サーバーをアンインストールできませんでした: %{error}"
+
+[skills.screen]
+title = "スキル"
+description = "現在のスペース向けにインストール済みのスキル。"
+installed_count = "検出:"
+
+[skills.empty]
+title = "インストール済みスキルはありません"
+description = "新しいスキルをインストールして、エージェントの機能を拡張しましょう。"
+
+[skills.error]
+gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "No active workspace selected."
+load_failed = "Failed to load installed skills"
+path_required = "Path is required."
+invalid_skill_target = "Invalid skill target."
+install_failed = "Failed to install skill"
+update_failed = "Failed to update skill"
+uninstall_failed = "Failed to uninstall skill"
+policy_failed = "Failed to update skill policy"
+path_picker_failed = "Failed to open source picker"
+
+[skills.card]
+version = "バージョン"
+fingerprint = "フィンガープリント"
+
+[skills.status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[skills.button]
+install = "Install"
+update = "Update"
+uninstall = "Uninstall"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Preparing skill upload"
+installing = "Uploading skill"
+updating = "Uploading update"
+cancelling = "Cancelling upload"
+
+[skills.dialog]
+install_title = "Install Skill"
+update_title = "Update %{slug}"
+source_kind_description = "Choose a skill folder from disk."
+pick_folder = "Choose folder"
+pick_archive = "Choose archive"
+
+[skills.diagnostics]
+reason = "Reason:"
+validation = "Validation"
+dependencies = "Dependencies"
+dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
+dependencies_column_action = "What to do"
+dependencies_hint_requirement = "What this skill expects to find on your machine."
+dependencies_hint_status = "Current result of the dependency check."
+dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
+dependencies_kind_bin = "Command"
+dependencies_kind_env = "Environment variable"
+dependencies_kind_api_key = "API key"
+dependencies_kind_command = "Command"
+dependencies_kind_mcp = "MCP server"
+dependencies_kind_tool = "Dependency"
+dependencies_status_ready = "Ready"
+dependencies_status_missing = "Missing"
+dependencies_status_blocked = "Blocked"
+dependencies_status_warning = "Warning"
+dependencies_status_unknown = "Unknown"
+security = "Security"
+security_intro = "Potential risks found while scanning skill files."
+security_column_rule = "Rule"
+security_column_finding = "Finding"
+security_column_location = "Location"
+security_hint_level = "Severity of the security finding."
+security_hint_rule = "Identifier of the rule that triggered this finding."
+security_hint_finding = "What exactly was detected and why it matters."
+security_hint_location = "File path where the finding was detected."
+security_location_unknown = "Path not specified"
+security_severity_critical = "Critical"
+security_severity_high = "High"
+security_severity_medium = "Medium"
+security_severity_low = "Low"
+security_severity_info = "Info"
+trust_gate = "Trust gates"
+trust_gate_intro = "Permission decisions based on required trust level."
+trust_column_tool = "Tool type"
+trust_column_min_trust = "Required trust"
+trust_column_explanation = "Explanation"
+trust_hint_tool = "Which tool category this gate controls."
+trust_hint_min_trust = "Minimum trust level required to use this tool."
+trust_hint_decision = "Whether the tool use is currently allowed."
+trust_hint_explanation = "Simple reason for the current decision."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Allowed"
+trust_decision_blocked = "Blocked"
+trust_explanation_allowed = "Current trust level is enough."
+trust_explanation_blocked = "Blocked until trust level reaches"
+audit = "Recent audit"
+audit_intro = "Recent actions and checks related to this skill."
+audit_column_time = "When"
+audit_column_event = "Event"
+audit_column_result = "Result"
+audit_column_details = "Details"
+audit_hint_time = "When this event was recorded."
+audit_hint_event = "What happened with the skill."
+audit_hint_result = "Whether the action was allowed, blocked, or warned."
+audit_hint_details = "Reason and technical details behind the decision."
+audit_action_install = "Installed"
+audit_action_update = "Updated"
+audit_action_uninstall = "Removed"
+audit_action_resolve_allowed = "Resolved for prompt"
+audit_action_resolve_blocked = "Blocked on resolve"
+audit_action_runtime_allowed = "Allowed on runtime"
+audit_action_runtime_blocked = "Blocked on runtime"
+audit_action_security_warn = "Security warning"
+audit_decision_allowed = "Allowed"
+audit_decision_blocked = "Blocked"
+audit_decision_warning = "Warning"
+audit_reason_none = "No explicit reason"
+audit_details_empty = "No extra details"
+none = "none"
+empty_validation = "No validation issues found."
+empty_dependencies = "No dependency issues found."
+empty_security = "No security findings."
+empty_trust_gate = "No trust gate decisions."
+empty_audit = "No audit events yet."
+
+[skills.catalog]
+source = "ソース"
+trust = "信頼"
+
+[bottom_bar]
+gateway_disconnected = "ゲートウェイは切断されています"
+starting_thread = "スレッドを開始しています..."
+finishing_turn = "ターンを完了しています..."
+turn_running = "ターン `%{turn_id}` は実行中です"
+previous_turn_failed = "前のターンが失敗しました。新しいメッセージを送信できます。"
+turn_cancelled = "ターンはキャンセルされました。新しいメッセージを送信できます。"
+turn_completed = "ターンが完了しました。次のメッセージを送信できます。"
+ready = "準備完了"
+starting_turn = "ターンを開始しています..."
+agent_processing = "Agent が処理しています..."
+
+[timeline.empty]
+start_thread = "このスレッドを開始するにはメッセージを送信してください"
+
+[timeline.elapsed]
+hours_minutes = "%{hours}時間 %{minutes}分"
+minutes_seconds = "%{minutes}分 %{seconds}秒"
+seconds = "%{seconds}秒"
+
+[timeline.common]
+url_missing = "URL が指定されていません"
+no_details = "詳細はありません"
+truncated = "... [切り詰め]"
+
+[timeline.reasoning]
+summary = "要約:"
+content = "内容:"
+running = "思考中"
+completed = "思考済み"
+
+[timeline.agent_message]
+subagent_completed = "サブエージェントが回答しました"
+
+[timeline.work_group]
+completed = "作業済み"
+
+[timeline.web_search]
+fallback_query = "Web 検索"
+running = "Web を検索中"
+no_results = "検索結果はありません"
+results_count = "%{count} 件の結果"
+
+[timeline.file_change]
+cancelled = "キャンセル済み"
+failed = "変更は適用されませんでした"
+running = "変更を適用中"
+completed = "ファイルを変更しました"
+no_files = "ファイルが指定されていません"
+one_file = "1 ファイル"
+files_count = "%{count} ファイル"
+exit_code = "終了コード:"
+more_files = "他 %{count} 件"
+output = "出力"
+
+[timeline.download]
+cancelled = "キャンセル済み"
+failed = "ダウンロードに失敗しました"
+running = "ファイルをダウンロード中"
+completed = "ファイルをダウンロードしました"
+size = "サイズ: %{size}"
+unit_b = "B"
+unit_kb = "KB"
+unit_mb = "MB"
+unit_gb = "GB"
+unit_tb = "TB"
+
+[timeline.web_fetch]
+cancelled = "キャンセル済み"
+failed = "開けませんでした"
+running = "リンクを開いています"
+completed = "読み込み済み"
+
+[timeline.tool]
+cancelled = "キャンセル済み"
+failed = "失敗"
+running = "ツールを実行中"
+completed = "完了"
+arguments = "引数"
+result = "結果"
+open_mcp_server = "MCP サーバーを開く"
+started = "ツールを実行中: %{tool_name}"
+started_kind = "ツールを実行中: %{tool_name} (%{kind})"
+finished = "ツール `%{tool_name}` が完了しました"
+command = "コマンド: %{command}"
+cwd = "作業フォルダー: %{cwd}"
+query = "クエリ: %{query}"
+url = "URL: %{url}"
+exit_code = "終了コード: %{exit_code}"
+duration_ms = "所要時間: %{duration_ms} ms"
+timed_out = "タイムアウトしました"
+changed_files = "変更されたファイル:"
+results = "結果: %{count}"
+provider = "プロバイダー: %{provider}"
+status_code = "ステータスコード: %{status_code}"
+title = "タイトル: %{title}"
+path = "パス: %{path}"
+bytes = "バイト: %{bytes}"
+stage = "[ステージ] %{value}"
+progress = "[進行状況] %{value}"
+stderr = "[エラー] %{value}"
+
+[timeline.command]
+running = "コマンドを実行中"
+completed = "コマンド完了"
+
+[timeline.system]
+info = "システムイベント"
+warning = "警告"
+error = "エラー"
+tool = "ツール"
+attempt = "試行 #%{attempt}"
+timeout_with_recovery = "ステップがタイムアウトしました。復旧を開始しました"
+timeout_without_recovery = "ステップがタイムアウトしました。自動復旧は利用できません"
+timeout_label = "タイムアウト"
+timeout_delta_recovery_scheduled = "[timeout] 試行 #%{attempt} %{reason}; 復旧を予定しました (job `%{job_id}`)"
+timeout_delta_no_recovery = "[timeout] 試行 #%{attempt} %{reason}; 自動復旧なし"
+recovery_opened = "ステップ復旧を開始しています"
+recovery_attached = "復旧が新しいステップに関連付けられました"
+retry_scheduled = "復旧リトライを予定しました"
+retry_started = "復旧リトライを開始しました"
+recovery_succeeded = "復旧が完了しました"
+recovery_failed = "復旧に失敗しました"
+recovery_label = "復旧"
+retry_label = "リトライ"
+recovered_label = "復旧済み"
+tool_retry_scheduled = "%{tool_name} を再試行しています"
+tool_retry_scheduled_with_attempt = "ツール %{tool_name} を再試行しています (試行 #%{attempt})"
+tool_retry_resolved = "%{tool_name} はリトライ後に完了しました"
+tool_retry_exhausted = "%{tool_name} はリトライ後も失敗しました"
+retry_resolved_label = "リトライ完了"
+retries_exhausted_label = "リトライ上限"
+tool_loop_budget_exceeded = "ツール呼び出しの上限に達しました"
+code = "コード:"

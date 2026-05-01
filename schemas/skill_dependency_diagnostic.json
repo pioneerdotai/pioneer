@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillDependencyDiagnostic",
+  "type": "object",
+  "required": [
+    "hint",
+    "kind",
+    "name",
+    "status"
+  ],
+  "properties": {
+    "hint": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  }
+}

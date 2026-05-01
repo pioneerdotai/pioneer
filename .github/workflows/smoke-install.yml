@@ -1,0 +1,603 @@
+name: Smoke Install
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-path-warning-macos:
+    name: smoke-path-warning-macos
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build-cli-and-prepare-local-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p pioneer-cli
+
+          smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
+          mkdir -p "${smoke_dir}"
+
+          asset_name="pioneer-gateway-macos-aarch64.gz"
+          asset_path="${smoke_dir}/${asset_name}"
+          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          sha="$(shasum -a 256 "${asset_path}" | awk '{print $1}')"
+          printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
+
+          smoke_home="${smoke_dir}/home"
+          install_root="${smoke_dir}/install-root"
+          mkdir -p "${smoke_home}"
+          touch "${smoke_home}/.bash_profile"
+          chmod 0444 "${smoke_home}/.bash_profile"
+
+          {
+            echo "SMOKE_HOME=${smoke_home}"
+            echo "SMOKE_ASSET=${asset_path}"
+            echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
+            echo "SMOKE_INSTALL_ROOT=${install_root}"
+            echo "SMOKE_BINARY=${install_root}/bin/pioneer"
+          } >> "${GITHUB_ENV}"
+
+      - name: install-force-start-with-path-warning
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_file="${RUNNER_TEMP}/install-report.json"
+          env \
+            HOME="${SMOKE_HOME}" \
+            PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
+            target/release/pioneer install \
+              --source local \
+              --asset "${SMOKE_ASSET}" \
+              --checksums "${SMOKE_CHECKSUMS}" \
+              --managed-by desktop \
+              --force-start \
+              --json > "${report_file}"
+
+          python3 - "${report_file}" <<'PY'
+          import json, sys
+          payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          assert payload.get("command_link_created") is True, "command link must be created"
+          assert payload.get("service_active") is True, "service should be active after install"
+          assert payload.get("gateway_reachable") is True, "gateway should be reachable after install"
+          warnings = payload.get("warnings") or []
+          assert any((w.get("code") == "path_update_skipped") for w in warnings), "expected path_update_skipped warning"
+          PY
+
+      - name: verify-status-and-stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" status --json)"
+          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "service should stay active"; assert p.get("gateway_reachable"), "gateway should stay reachable"' "${status}"
+          env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" stop
+
+      - name: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x "${SMOKE_BINARY}" ]]; then
+            env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" stop || true
+          fi
+          rm -rf "${RUNNER_TEMP}/pioneer-path-warning-smoke" || true
+
+  smoke-path-warning-linux:
+    name: smoke-path-warning-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build-cli-and-prepare-local-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p pioneer-cli
+
+          smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
+          mkdir -p "${smoke_dir}"
+
+          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_path="${smoke_dir}/${asset_name}"
+          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
+          printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
+
+          smoke_home="${smoke_dir}/home"
+          install_root="${smoke_dir}/install-root"
+          mkdir -p "${smoke_home}"
+          touch "${smoke_home}/.bash_profile"
+          chmod 0444 "${smoke_home}/.bash_profile"
+
+          {
+            echo "SMOKE_HOME=${smoke_home}"
+            echo "SMOKE_ASSET=${asset_path}"
+            echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
+            echo "SMOKE_INSTALL_ROOT=${install_root}"
+            echo "SMOKE_BINARY=${install_root}/bin/pioneer"
+          } >> "${GITHUB_ENV}"
+
+      - name: install-force-start-with-path-warning
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_file="${RUNNER_TEMP}/install-report-linux.json"
+          env \
+            HOME="${SMOKE_HOME}" \
+            PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
+            target/release/pioneer install \
+              --source local \
+              --asset "${SMOKE_ASSET}" \
+              --checksums "${SMOKE_CHECKSUMS}" \
+              --managed-by desktop \
+              --force-start \
+              --json > "${report_file}"
+
+          python3 - "${report_file}" <<'PY'
+          import json, sys
+          payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          assert payload.get("command_link_created") is True, "command link must be created"
+          assert payload.get("service_active") is True, "service should be active after install"
+          assert payload.get("gateway_reachable") is True, "gateway should be reachable after install"
+          warnings = payload.get("warnings") or []
+          assert any((w.get("code") == "path_update_skipped") for w in warnings), "expected path_update_skipped warning"
+          PY
+
+      - name: verify-status-and-stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" status --json)"
+          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "service should stay active"; assert p.get("gateway_reachable"), "gateway should stay reachable"' "${status}"
+          env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" stop
+
+      - name: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x "${SMOKE_BINARY}" ]]; then
+            env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" stop || true
+          fi
+          rm -rf "${RUNNER_TEMP}/pioneer-path-warning-smoke" || true
+
+  smoke-path-warning-windows:
+    name: smoke-path-warning-windows
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: build-cli-and-prepare-local-assets
+        shell: pwsh
+        run: |
+          cargo build --release -p pioneer-cli --target x86_64-pc-windows-msvc
+
+          $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-path-warning-smoke"
+          New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
+
+          $assetName = "pioneer-gateway-windows-x86_64.zip"
+          $assetPath = Join-Path $smokeDir $assetName
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/pioneer.exe" -DestinationPath $assetPath -Force
+
+          $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
+
+          $installRoot = Join-Path $smokeDir "install-root"
+          $binaryPath = Join-Path $installRoot "bin\\pioneer.exe"
+
+          "SMOKE_ASSET=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_CHECKSUMS=$(Join-Path $smokeDir 'SHA256SUMS')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_INSTALL_ROOT=$installRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_BINARY=$binaryPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: install-force-start-with-path-warning
+        shell: pwsh
+        run: |
+          $reportPath = Join-Path $env:RUNNER_TEMP "install-report-windows.json"
+
+          $env:PIONEER_INSTALL_ROOT = $env:SMOKE_INSTALL_ROOT
+          $env:PIONEER_FORCE_PATH_WARNING = "1"
+
+          & "target/x86_64-pc-windows-msvc/release/pioneer.exe" install `
+            --source local `
+            --asset $env:SMOKE_ASSET `
+            --checksums $env:SMOKE_CHECKSUMS `
+            --managed-by desktop `
+            --force-start `
+            --json > $reportPath
+
+          $payload = Get-Content -Raw -Path $reportPath | ConvertFrom-Json
+          if (-not $payload.command_link_created) { throw "command link must be created" }
+          if ($payload.path_updated) { throw "path_updated should be false when warning forced" }
+          if (-not $payload.service_active) { throw "service should be active after install" }
+          if (-not $payload.gateway_reachable) { throw "gateway should be reachable after install" }
+
+          $warnings = @($payload.warnings)
+          $hasWarning = $false
+          foreach ($warning in $warnings) {
+            if ($warning.code -eq "path_update_skipped") {
+              $hasWarning = $true
+              break
+            }
+          }
+          if (-not $hasWarning) { throw "expected path_update_skipped warning" }
+
+      - name: verify-status-and-stop
+        shell: pwsh
+        run: |
+          $statusJson = & $env:SMOKE_BINARY status --json
+          $status = $statusJson | ConvertFrom-Json
+          if (-not $status.service_active) { throw "service should stay active" }
+          if (-not $status.gateway_reachable) { throw "gateway should stay reachable" }
+          & $env:SMOKE_BINARY stop
+
+      - name: cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path -Path $env:SMOKE_BINARY -PathType Leaf) {
+            & $env:SMOKE_BINARY stop *>$null
+          }
+          if (Test-Path -Path $env:SMOKE_INSTALL_ROOT -PathType Container) {
+            Remove-Item -Path $env:SMOKE_INSTALL_ROOT -Recurse -Force
+          }
+          if ($env:LOCALAPPDATA) {
+            $userBin = Join-Path $env:LOCALAPPDATA "Pioneer\\bin\\pioneer.exe"
+            if (Test-Path -Path $userBin -PathType Leaf) {
+              Remove-Item -Path $userBin -Force
+            }
+          }
+
+  smoke-linux:
+    name: smoke-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build-cli-and-prepare-local-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p pioneer-cli
+
+          smoke_dir="${RUNNER_TEMP}/pioneer-smoke"
+          mkdir -p "${smoke_dir}"
+
+          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_path="${smoke_dir}/${asset_name}"
+          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
+          printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
+
+          {
+            echo "SMOKE_ASSET=${asset_path}"
+            echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
+            echo "SMOKE_INSTALL_ROOT=${smoke_dir}/install-root"
+            echo "SMOKE_LINK_PATH=${smoke_dir}/bin/pioneer-smoke-ci"
+          } >> "${GITHUB_ENV}"
+
+      - name: install-and-start
+        shell: bash
+        run: |
+          set -euo pipefail
+          env \
+            PIONEER_LOCAL_ASSET_FILE="${SMOKE_ASSET}" \
+            PIONEER_LOCAL_CHECKSUMS_FILE="${SMOKE_CHECKSUMS}" \
+            PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
+            PIONEER_LINK_PATH="${SMOKE_LINK_PATH}" \
+            bash ./install.sh --force-start
+
+      - name: verify-running
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${SMOKE_LINK_PATH}" version --json
+          status="$("${SMOKE_LINK_PATH}" status --json)"
+          python3 -c 'import json,sys; payload=json.loads(sys.argv[1]); assert payload.get("service_active"), "gateway service is not active"; assert payload.get("gateway_reachable"), "gateway is not reachable"' "${status}"
+
+      - name: update-in-place
+        shell: bash
+        run: |
+          set -euo pipefail
+          env \
+            PIONEER_LOCAL_ASSET_FILE="${SMOKE_ASSET}" \
+            PIONEER_LOCAL_CHECKSUMS_FILE="${SMOKE_CHECKSUMS}" \
+            PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
+            PIONEER_LINK_PATH="${SMOKE_LINK_PATH}" \
+            bash ./install.sh --force-start
+
+      - name: stop-and-verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${SMOKE_LINK_PATH}" stop
+          status="$("${SMOKE_LINK_PATH}" status --json)"
+          python3 -c 'import json,sys; payload=json.loads(sys.argv[1]); assert not payload.get("service_active"), "gateway service should be stopped"' "${status}"
+
+      - name: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x "${SMOKE_LINK_PATH}" ]]; then
+            "${SMOKE_LINK_PATH}" stop || true
+          fi
+          rm -f "${SMOKE_LINK_PATH}" || true
+          rm -rf "${SMOKE_INSTALL_ROOT}" || true
+
+  smoke-windows:
+    name: smoke-windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: build-cli-and-prepare-local-assets
+        shell: pwsh
+        run: |
+          cargo build --release -p pioneer-cli --target x86_64-pc-windows-msvc
+
+          $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-smoke"
+          New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
+
+          $assetName = "pioneer-gateway-windows-x86_64.zip"
+          $assetPath = Join-Path $smokeDir $assetName
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/pioneer.exe" -DestinationPath $assetPath -Force
+
+          $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
+
+          $installRoot = Join-Path $smokeDir "install-root"
+          $binaryPath = Join-Path $installRoot "bin\\pioneer.exe"
+
+          "SMOKE_ASSET=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_CHECKSUMS=$(Join-Path $smokeDir 'SHA256SUMS')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_INSTALL_ROOT=$installRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SMOKE_BINARY=$binaryPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: install-and-start
+        shell: pwsh
+        run: |
+          $env:PIONEER_LOCAL_ASSET_FILE = $env:SMOKE_ASSET
+          $env:PIONEER_LOCAL_CHECKSUMS_FILE = $env:SMOKE_CHECKSUMS
+          $env:PIONEER_INSTALL_ROOT = $env:SMOKE_INSTALL_ROOT
+          ./install.ps1 -ForceStart
+
+          if (-not (Test-Path -Path $env:SMOKE_BINARY -PathType Leaf)) {
+            throw "expected installed binary at $env:SMOKE_BINARY"
+          }
+
+      - name: verify-running
+        shell: pwsh
+        run: |
+          & $env:SMOKE_BINARY version --json | Write-Output
+          $statusJson = & $env:SMOKE_BINARY status --json
+          $status = $statusJson | ConvertFrom-Json
+          $expectedUserBin = Join-Path $env:LOCALAPPDATA "Pioneer\\bin"
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $userPathParts = @()
+          if ($userPath) {
+            $userPathParts = $userPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          }
+          if (-not ($userPathParts -contains $expectedUserBin)) {
+            throw "expected user PATH to contain Pioneer user bin directory: $expectedUserBin"
+          }
+
+          if (-not $status.service_active) {
+            throw "gateway service is not active"
+          }
+          if (-not $status.gateway_reachable) {
+            throw "gateway is not reachable"
+          }
+
+      - name: update-in-place
+        shell: pwsh
+        run: |
+          $env:PIONEER_LOCAL_ASSET_FILE = $env:SMOKE_ASSET
+          $env:PIONEER_LOCAL_CHECKSUMS_FILE = $env:SMOKE_CHECKSUMS
+          $env:PIONEER_INSTALL_ROOT = $env:SMOKE_INSTALL_ROOT
+          ./install.ps1 -ForceStart
+
+      - name: stop-and-verify
+        shell: pwsh
+        run: |
+          & $env:SMOKE_BINARY stop
+          $statusJson = & $env:SMOKE_BINARY status --json
+          $status = $statusJson | ConvertFrom-Json
+
+          if ($status.service_active) {
+            throw "gateway service should be stopped"
+          }
+
+      - name: cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path -Path $env:SMOKE_BINARY -PathType Leaf) {
+            & $env:SMOKE_BINARY stop *>$null
+          }
+          if (Test-Path -Path $env:SMOKE_INSTALL_ROOT -PathType Container) {
+            Remove-Item -Path $env:SMOKE_INSTALL_ROOT -Recurse -Force
+          }
+
+  smoke-desktop-local-linux:
+    name: smoke-desktop-local-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build-binaries-and-test-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p pioneer-cli
+
+          smoke_dir="${RUNNER_TEMP}/pioneer-desktop-smoke"
+          mkdir -p "${smoke_dir}"
+
+          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_path="${smoke_dir}/${asset_name}"
+          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
+          printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
+
+          {
+            echo "DESKTOP_SMOKE_ASSET=${asset_path}"
+            echo "DESKTOP_SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
+            echo "DESKTOP_SMOKE_INSTALL_ROOT=${smoke_dir}/install-root"
+            echo "DESKTOP_SMOKE_LINK_PATH=${smoke_dir}/bin/pioneer-desktop-smoke-ci"
+            echo "DESKTOP_SMOKE_BINARY=${smoke_dir}/install-root/bin/pioneer"
+            echo "DESKTOP_WARN_HOME=${smoke_dir}/warning-home"
+            echo "DESKTOP_WARN_INSTALL_ROOT=${smoke_dir}/warning-install-root"
+            echo "DESKTOP_WARN_BINARY=${smoke_dir}/warning-install-root/bin/pioneer"
+            echo "DESKTOP_SMOKE_BOOTSTRAP=${GITHUB_WORKSPACE}/target/release/pioneer"
+          } >> "${GITHUB_ENV}"
+
+      - name: first-install-from-local-bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          env \
+            PIONEER_INSTALL_ROOT="${DESKTOP_SMOKE_INSTALL_ROOT}" \
+            PIONEER_LINK_PATH="${DESKTOP_SMOKE_LINK_PATH}" \
+            "${DESKTOP_SMOKE_BOOTSTRAP}" install \
+              --source local \
+              --asset "${DESKTOP_SMOKE_ASSET}" \
+              --checksums "${DESKTOP_SMOKE_CHECKSUMS}" \
+              --managed-by desktop \
+              --force-start \
+              --json
+
+      - name: verify-installed-and-running
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$("${DESKTOP_SMOKE_BINARY}" status --json)"
+          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "service inactive after desktop install"; assert p.get("gateway_reachable"), "gateway unreachable after desktop install"' "${status}"
+
+      - name: update-existing-local-install
+        shell: bash
+        run: |
+          set -euo pipefail
+          env \
+            PIONEER_INSTALL_ROOT="${DESKTOP_SMOKE_INSTALL_ROOT}" \
+            PIONEER_LINK_PATH="${DESKTOP_SMOKE_LINK_PATH}" \
+            "${DESKTOP_SMOKE_BOOTSTRAP}" update \
+              --source local \
+              --asset "${DESKTOP_SMOKE_ASSET}" \
+              --checksums "${DESKTOP_SMOKE_CHECKSUMS}" \
+              --managed-by desktop \
+              --force-start \
+              --json
+
+      - name: verify-running-after-update
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$("${DESKTOP_SMOKE_BINARY}" status --json)"
+          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "service inactive after desktop update"; assert p.get("gateway_reachable"), "gateway unreachable after desktop update"' "${status}"
+
+      - name: desktop-start-local-warning-flow
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${DESKTOP_WARN_HOME}"
+          touch "${DESKTOP_WARN_HOME}/.bash_profile"
+          chmod 0444 "${DESKTOP_WARN_HOME}/.bash_profile"
+
+          report_file="${RUNNER_TEMP}/desktop-warning-flow-install-report.json"
+          env \
+            HOME="${DESKTOP_WARN_HOME}" \
+            PIONEER_INSTALL_ROOT="${DESKTOP_WARN_INSTALL_ROOT}" \
+            PIONEER_FORCE_PATH_WARNING="1" \
+            "${DESKTOP_SMOKE_BOOTSTRAP}" install \
+              --source local \
+              --asset "${DESKTOP_SMOKE_ASSET}" \
+              --checksums "${DESKTOP_SMOKE_CHECKSUMS}" \
+              --managed-by desktop \
+              --force-start \
+              --json > "${report_file}"
+
+          python3 - "${report_file}" <<'PY'
+          import json, sys
+          payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          assert payload.get("service_active"), "desktop warning flow: service must be active"
+          assert payload.get("gateway_reachable"), "desktop warning flow: gateway must be reachable"
+          warnings = payload.get("warnings") or []
+          assert any((w.get("code") == "path_update_skipped") for w in warnings), "desktop warning flow: expected path_update_skipped warning"
+          PY
+
+          status="$(env HOME="${DESKTOP_WARN_HOME}" "${DESKTOP_WARN_BINARY}" status --json)"
+          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "desktop warning flow: service should stay active"; assert p.get("gateway_reachable"), "desktop warning flow: gateway should stay reachable"' "${status}"
+          env HOME="${DESKTOP_WARN_HOME}" "${DESKTOP_WARN_BINARY}" stop
+
+      - name: ws-reconnect-smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p pioneer-desktop gateway::ws::tests::reconnects_after_server_returns -- --nocapture
+
+      - name: desktop-path-warning-notification-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p pioneer-desktop app::gateway::tests::warning_notification_uses_friendly_path_message_for_path_update_warning
+
+      - name: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x "${DESKTOP_SMOKE_BINARY}" ]]; then
+            "${DESKTOP_SMOKE_BINARY}" stop || true
+          fi
+          if [[ -x "${DESKTOP_WARN_BINARY}" ]]; then
+            env HOME="${DESKTOP_WARN_HOME}" "${DESKTOP_WARN_BINARY}" stop || true
+          fi
+          rm -f "${DESKTOP_SMOKE_LINK_PATH}" || true
+          rm -rf "${DESKTOP_SMOKE_INSTALL_ROOT}" || true
+          rm -rf "${DESKTOP_WARN_INSTALL_ROOT}" || true

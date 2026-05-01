@@ -1,0 +1,153 @@
+use super::*;
+use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
+use crate::{state, window};
+use gpui_component::table::TableState;
+use pioneer_protocol::ThreadMode;
+
+impl PioneerDesktop {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        window::install_window_state_persistence(window, cx);
+
+        let gateway_name_input_state = cx.new(|cx| InputState::new(window, cx));
+        let gateway_address_input_state = cx.new(|cx| InputState::new(window, cx));
+        let gateway_token_input_state = cx.new(|cx| InputState::new(window, cx));
+        let composer_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 13)
+                .placeholder(t!("chat.composer.placeholder").to_string())
+        });
+        let thread_tree_state = cx.new(|cx| TreeState::new(cx));
+        let settings_tree_state = cx.new(|cx| TreeState::new(cx));
+        let provider_tree_state = cx.new(|cx| TreeState::new(cx));
+        let skills_audit_table_state = cx.new(|cx| {
+            TableState::new(
+                SkillDiagnosticsTableDelegate::new("skills-audit-table"),
+                window,
+                cx,
+            )
+            .row_selectable(false)
+            .col_selectable(false)
+            .sortable(false)
+            .col_movable(false)
+            .col_resizable(false)
+            .loop_selection(false)
+        });
+        let mcp_audit_table_state = cx.new(|cx| {
+            TableState::new(
+                SkillDiagnosticsTableDelegate::new("mcp-audit-table"),
+                window,
+                cx,
+            )
+            .row_selectable(false)
+            .col_selectable(false)
+            .sortable(false)
+            .col_movable(false)
+            .col_resizable(false)
+            .loop_selection(false)
+        });
+        let gateway_ws_client = GatewayWsClient::new();
+        let gateway_ws_command_sender = gateway_ws_client.command_sender();
+
+        let mut view = Self {
+            thread_coordinators: HashMap::new(),
+            thread_folders: HashMap::new(),
+            thread_placements: HashMap::new(),
+            thread_folder_expanded: state::thread_folders_expanded(cx),
+            thread_tree_selected_node_id: None,
+            thread_tree_state,
+            settings_content_view: SettingsContentView::General,
+            settings_tree_state,
+            provider_tree_state,
+            thread_list_loading: false,
+            thread_list_refresh_requested: false,
+            active_thread_id: None,
+            draft_thread_id: None,
+            preferred_workspace_id: None,
+            composer_state,
+            composer_attachments: Vec::new(),
+            composer_turn_mode: ThreadMode::Agent,
+            composer_selected_provider: None,
+            composer_selected_model: None,
+            main_content_view: MainContentView::Threads,
+            provider_configured_names: HashSet::new(),
+            provider_filter: ProviderFilter::All,
+            providers_loading: false,
+            providers_error: None,
+            mcp_servers: Vec::new(),
+            mcp_selected_server_id: None,
+            mcp_server_details: None,
+            mcp_loading: false,
+            mcp_details_loading: false,
+            mcp_error: None,
+            mcp_refresh_requested: false,
+            mcp_details_refresh_requested: false,
+            mcp_poller_started: false,
+            mcp_pending_actions: HashSet::new(),
+            mcp_list_scroll_handle: VirtualListScrollHandle::new(),
+            mcp_details_expanded_sections: HashSet::new(),
+            mcp_audit_table_state,
+            installed_skills: Vec::new(),
+            skills_catalog: Vec::new(),
+            skills_health_details: HashMap::new(),
+            skills_loading: false,
+            skills_error: None,
+            skills_upload_progress: None,
+            skills_upload_cancel_token: None,
+            skills_refresh_requested: false,
+            skills_poller_started: false,
+            skills_pending_actions: HashSet::new(),
+            selected_skill_target: None,
+            skills_list_scroll_handle: VirtualListScrollHandle::new(),
+            skills_details_expanded_sections: HashSet::new(),
+            skills_audit_table_state,
+            thread_drafts: HashMap::new(),
+            thread_draft_attachments: HashMap::new(),
+            thread_start: ThreadStartCoordinator::default(),
+            thread_start_requested: false,
+            thread_timeline_scroll_handle: VirtualListScrollHandle::new(),
+            thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
+            thread_timeline_item_expanded: RefCell::new(HashSet::new()),
+            thread_timeline_terminal_item: RefCell::new(HashMap::new()),
+            ready_turn_resume_threads: VecDeque::new(),
+            ready_turn_resume_thread_set: HashSet::new(),
+            turn_timeline_refresh: HashMap::new(),
+            gateway_name_input_state,
+            gateway_address_input_state,
+            gateway_token_input_state,
+            show_sidebar: true,
+            sidebar_panel_width: px(320.),
+            gateway: GatewayCoordinator {
+                runtime: None,
+                ws_client: gateway_ws_client,
+                ws_command_sender: gateway_ws_command_sender,
+                ws_connection_id: None,
+                connection_epoch: 0,
+                connection_state: GatewayConnectionState::Connecting,
+                status: t!("gateway.status.connecting").to_string(),
+                status_level: GatewayStatusLevel::Neutral,
+                error: None,
+                connecting: true,
+                setup_action: None,
+                bootstrap_complete: false,
+            },
+        };
+
+        cx.observe_window_bounds(window, |view, _, cx| {
+            {
+                let mut state = view.thread_timeline_view_state.borrow_mut();
+                state.pending_width_probe = true;
+                state.width_probe_attempts = 0;
+            }
+            cx.notify();
+        })
+        .detach();
+
+        view.sync_settings_sidebar_tree_state(cx);
+        view.sync_provider_sidebar_tree_state(cx);
+        view.start_gateway_ws_event_pump(cx);
+        view.bootstrap_gateway_runtime(cx);
+
+        view
+    }
+}

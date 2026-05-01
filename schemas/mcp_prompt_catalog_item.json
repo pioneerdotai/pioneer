@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpPromptCatalogItem",
+  "type": "object",
+  "required": [
+    "arguments_count",
+    "name"
+  ],
+  "properties": {
+    "arguments_count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

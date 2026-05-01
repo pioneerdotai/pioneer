@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ByteRange",
+  "type": "object",
+  "required": [
+    "end",
+    "start"
+  ],
+  "properties": {
+    "end": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "start": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    }
+  }
+}

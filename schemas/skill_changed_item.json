@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillChangedItem",
+  "type": "object",
+  "required": [
+    "change_type",
+    "slug",
+    "source_kind"
+  ],
+  "properties": {
+    "change_type": {
+      "type": "string"
+    },
+    "fingerprint_after": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fingerprint_before": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "slug": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    }
+  }
+}

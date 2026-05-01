@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsUpdateResponse",
+  "type": "object",
+  "required": [
+    "audit",
+    "skill",
+    "status"
+  ],
+  "properties": {
+    "audit": {
+      "$ref": "#/definitions/SkillLifecycleAuditSummary"
+    },
+    "skill": {
+      "$ref": "#/definitions/SkillLifecycleResultSkill"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "SkillLifecycleAuditSummary": {
+      "type": "object",
+      "required": [
+        "events_written"
+      ],
+      "properties": {
+        "events_written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SkillLifecycleResultSkill": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "install_path",
+        "slug",
+        "source_kind",
+        "trust_level"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "install_path": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

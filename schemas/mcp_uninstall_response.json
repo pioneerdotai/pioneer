@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpUninstallResponse",
+  "type": "object",
+  "required": [
+    "audit",
+    "name",
+    "removed",
+    "scope_kind",
+    "server_id"
+  ],
+  "properties": {
+    "audit": {
+      "$ref": "#/definitions/McpLifecycleAuditSummary"
+    },
+    "name": {
+      "type": "string"
+    },
+    "removed": {
+      "type": "boolean"
+    },
+    "scope_kind": {
+      "$ref": "#/definitions/McpScopeKind"
+    },
+    "server_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "McpLifecycleAuditSummary": {
+      "type": "object",
+      "required": [
+        "events_written"
+      ],
+      "properties": {
+        "events_written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}

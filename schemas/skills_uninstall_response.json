@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsUninstallResponse",
+  "type": "object",
+  "required": [
+    "audit",
+    "slug",
+    "source_kind",
+    "status"
+  ],
+  "properties": {
+    "audit": {
+      "$ref": "#/definitions/SkillLifecycleAuditSummary"
+    },
+    "removed_install_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "slug": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "SkillLifecycleAuditSummary": {
+      "type": "object",
+      "required": [
+        "events_written"
+      ],
+      "properties": {
+        "events_written": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

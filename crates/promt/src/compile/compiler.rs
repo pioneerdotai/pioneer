@@ -1,0 +1,915 @@
+use crate::boundary::PROMT_CACHE_BOUNDARY;
+use crate::bundle::{
+    CompiledPromptBundle, PromptCompileInput, PromptSourceManifestEntry, PromptSourceStatus,
+};
+use crate::compile::policy;
+use crate::constants::files::{BootstrapFileKind, CANONICAL_FILE_ORDER};
+use crate::content;
+use crate::diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
+use crate::fingerprint::sha256_hex;
+use crate::profile::PromptProfile;
+use crate::render::text::render_sections;
+use crate::section::{PromptSection, PromptSectionId, PromptStability};
+use crate::sources::budget::{BudgetedBootstrapFile, apply_budgets};
+use crate::sources::files::load_bootstrap_files;
+
+fn build_identity_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::IdentityBase,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_IDENTITY_BASE.to_owned(),
+        content: content::IDENTITY_BASE_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn build_safety_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::AssistantSafety,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_ASSISTANT_SAFETY.to_owned(),
+        content: content::ASSISTANT_SAFETY_LINES.join("\n"),
+        sources: Vec::new(),
+    }
+}
+
+fn build_tool_recovery_policy_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::ToolRecoveryPolicy,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_TOOL_RECOVERY_POLICY.to_owned(),
+        content: content::TOOL_RECOVERY_POLICY_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn build_task_orchestration_policy_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::TaskOrchestrationPolicy,
+        stability: PromptStability::Dynamic,
+        title: content::SECTION_TITLE_TASK_ORCHESTRATION_POLICY.to_owned(),
+        content: content::TASK_ORCHESTRATION_POLICY_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn format_file_block(file: &BudgetedBootstrapFile) -> String {
+    content::IDENTITY_FILE_BLOCK_TEMPLATE
+        .replace(content::IDENTITY_FILE_BLOCK_NAME_TOKEN, file.name.as_str())
+        .replace(
+            content::IDENTITY_FILE_BLOCK_PATH_TOKEN,
+            file.path.display().to_string().as_str(),
+        )
+        .replace(
+            content::IDENTITY_FILE_BLOCK_CONTENT_TOKEN,
+            file.content.trim(),
+        )
+}
+
+fn build_identity_file_section(
+    id: PromptSectionId,
+    title: &str,
+    file: &BudgetedBootstrapFile,
+) -> Option<PromptSection> {
+    if file.content.trim().is_empty() {
+        return None;
+    }
+
+    Some(PromptSection {
+        id,
+        stability: PromptStability::Stable,
+        title: title.to_owned(),
+        content: format_file_block(file),
+        sources: vec![file.path.display().to_string()],
+    })
+}
+
+fn build_default_soul_core_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::SoulCore,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_SOUL_CORE.to_owned(),
+        content: content::DEFAULT_SOUL_CORE_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn build_default_identity_core_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::IdentityCore,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_IDENTITY_CORE.to_owned(),
+        content: content::DEFAULT_IDENTITY_CORE_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn diagnostic_matches_file(diagnostic: &PromptDiagnostic, canonical_name: &str) -> bool {
+    diagnostic
+        .file
+        .as_deref()
+        .is_some_and(|file| file.ends_with(canonical_name))
+}
+
+fn build_source_manifest(
+    workspace_root: &std::path::Path,
+    profile: PromptProfile,
+    files: &[BudgetedBootstrapFile],
+    diagnostics: &[PromptDiagnostic],
+) -> Vec<PromptSourceManifestEntry> {
+    if !policy::include_workspace_context(profile) {
+        return Vec::new();
+    }
+
+    let mut manifest = Vec::with_capacity(CANONICAL_FILE_ORDER.len());
+
+    for kind in CANONICAL_FILE_ORDER {
+        let canonical_name = kind.canonical_name();
+        let entry_path = workspace_root.join(canonical_name).display().to_string();
+        let has_truncation_diagnostic = diagnostics.iter().any(|diagnostic| {
+            diagnostic_matches_file(diagnostic, canonical_name)
+                && matches!(
+                    diagnostic.code,
+                    PromptDiagnosticCode::FileTruncated
+                        | PromptDiagnosticCode::TotalBudgetTruncated
+                )
+        });
+
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::MissingFile
+                && diagnostic_matches_file(diagnostic, canonical_name)
+        }) {
+            manifest.push(PromptSourceManifestEntry {
+                file: canonical_name.to_owned(),
+                path: entry_path,
+                status: PromptSourceStatus::Missing,
+                chars: 0,
+            });
+            continue;
+        }
+
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::FileReadError
+                && diagnostic_matches_file(diagnostic, canonical_name)
+        }) {
+            manifest.push(PromptSourceManifestEntry {
+                file: canonical_name.to_owned(),
+                path: entry_path,
+                status: PromptSourceStatus::ReadError,
+                chars: 0,
+            });
+            continue;
+        }
+
+        if let Some(file) = files.iter().find(|file| file.kind == kind) {
+            manifest.push(PromptSourceManifestEntry {
+                file: canonical_name.to_owned(),
+                path: file.path.display().to_string(),
+                status: if has_truncation_diagnostic {
+                    PromptSourceStatus::Truncated
+                } else {
+                    PromptSourceStatus::Loaded
+                },
+                chars: file.content.chars().count(),
+            });
+            continue;
+        }
+
+        if has_truncation_diagnostic {
+            manifest.push(PromptSourceManifestEntry {
+                file: canonical_name.to_owned(),
+                path: entry_path,
+                status: PromptSourceStatus::Truncated,
+                chars: 0,
+            });
+            continue;
+        }
+
+        manifest.push(PromptSourceManifestEntry {
+            file: canonical_name.to_owned(),
+            path: entry_path,
+            status: PromptSourceStatus::Missing,
+            chars: 0,
+        });
+    }
+
+    manifest
+}
+
+fn build_runtime_dynamic_sections(input: &PromptCompileInput) -> Vec<PromptSection> {
+    let mut sections = Vec::new();
+
+    if input.continue_generation_hint {
+        sections.push(PromptSection {
+            id: PromptSectionId::RecoveryContinuation,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_RECOVERY_CONTINUATION.to_owned(),
+            content: content::RECOVERY_CONTINUATION_PROMPT.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
+    if let Some(skills_prompt) = input.skills_prompt.as_deref().map(str::trim)
+        && !skills_prompt.is_empty()
+    {
+        sections.push(PromptSection {
+            id: PromptSectionId::SkillsRuntimePrompt,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_SKILLS_RUNTIME.to_owned(),
+            content: skills_prompt.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
+    if let Some(retry_instruction) = input.retry_instruction.as_deref().map(str::trim)
+        && !retry_instruction.is_empty()
+    {
+        sections.push(PromptSection {
+            id: PromptSectionId::RetryRuntimeInstruction,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_RETRY_INSTRUCTION.to_owned(),
+            content: retry_instruction.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
+    if let Some(dynamic_context) = input.dynamic_context.as_deref().map(str::trim)
+        && !dynamic_context.is_empty()
+    {
+        sections.push(PromptSection {
+            id: PromptSectionId::DynamicContext,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_DYNAMIC_CONTEXT.to_owned(),
+            content: dynamic_context.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
+    if let Some(extra_system) = input.extra_system.as_deref().map(str::trim)
+        && !extra_system.is_empty()
+    {
+        sections.push(PromptSection {
+            id: PromptSectionId::ExtraSystem,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_EXTRA_SYSTEM.to_owned(),
+            content: extra_system.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
+    sections
+}
+
+pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromptBundle> {
+    let profile = input.profile;
+    let mut diagnostics = Vec::<PromptDiagnostic>::new();
+    let mut source_manifest = Vec::<PromptSourceManifestEntry>::new();
+
+    let mut sections = Vec::<PromptSection>::new();
+
+    if policy::include_identity_base(profile) {
+        sections.push(build_identity_section());
+    }
+
+    if policy::include_safety(profile) {
+        sections.push(build_safety_section());
+    }
+
+    if policy::include_workspace_context(profile) {
+        let (loaded_files, mut file_diagnostics) =
+            load_bootstrap_files(input.workspace_root.as_path(), profile);
+
+        diagnostics.append(&mut file_diagnostics);
+
+        let (budgeted_files, mut budget_diagnostics) = apply_budgets(
+            loaded_files,
+            input.limits.max_chars_per_file,
+            input.limits.max_chars_total,
+        );
+
+        diagnostics.append(&mut budget_diagnostics);
+
+        source_manifest = build_source_manifest(
+            input.workspace_root.as_path(),
+            profile,
+            budgeted_files.as_slice(),
+            diagnostics.as_slice(),
+        );
+
+        let mut soul_file: Option<BudgetedBootstrapFile> = None;
+        let mut identity_file: Option<BudgetedBootstrapFile> = None;
+        let mut user_file: Option<BudgetedBootstrapFile> = None;
+
+        for file in budgeted_files {
+            match file.kind {
+                BootstrapFileKind::Soul => soul_file = Some(file),
+                BootstrapFileKind::Identity => identity_file = Some(file),
+                BootstrapFileKind::User => user_file = Some(file),
+            }
+        }
+
+        if let Some(file) = soul_file.as_ref()
+            && let Some(section) = build_identity_file_section(
+                PromptSectionId::SoulCore,
+                content::SECTION_TITLE_SOUL_CORE,
+                file,
+            )
+        {
+            sections.push(section);
+        } else {
+            sections.push(build_default_soul_core_section());
+        }
+
+        if let Some(file) = identity_file.as_ref()
+            && let Some(section) = build_identity_file_section(
+                PromptSectionId::IdentityCore,
+                content::SECTION_TITLE_IDENTITY_CORE,
+                file,
+            )
+        {
+            sections.push(section);
+        } else {
+            sections.push(build_default_identity_core_section());
+        }
+
+        if let Some(file) = user_file.as_ref()
+            && let Some(section) = build_identity_file_section(
+                PromptSectionId::UserPersona,
+                content::SECTION_TITLE_USER_PERSONA,
+                file,
+            )
+        {
+            sections.push(section);
+        }
+    }
+
+    if policy::include_tool_recovery_policy(profile, input.include_tool_recovery_policy) {
+        sections.push(build_tool_recovery_policy_section());
+    }
+
+    if input.include_task_orchestration_policy {
+        sections.push(build_task_orchestration_policy_section());
+    }
+
+    sections.extend(build_runtime_dynamic_sections(&input));
+
+    if profile == PromptProfile::AssistantNone {
+        sections.retain(|section| section.id == PromptSectionId::IdentityBase);
+    }
+
+    let stable_sections = sections
+        .iter()
+        .filter(|section| section.stability == PromptStability::Stable)
+        .cloned()
+        .collect::<Vec<_>>();
+    let dynamic_sections = sections
+        .iter()
+        .filter(|section| section.stability == PromptStability::Dynamic)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let stable_system_text = render_sections(stable_sections.as_slice());
+    let dynamic_system_text = render_sections(dynamic_sections.as_slice());
+
+    let full_system_text = match (
+        stable_system_text.trim().is_empty(),
+        dynamic_system_text.trim().is_empty(),
+    ) {
+        (true, true) => String::new(),
+        (false, true) => stable_system_text.clone(),
+        (true, false) => format!("{PROMT_CACHE_BOUNDARY}{dynamic_system_text}"),
+        (false, false) => {
+            format!("{stable_system_text}{PROMT_CACHE_BOUNDARY}{dynamic_system_text}")
+        }
+    };
+
+    Ok(CompiledPromptBundle {
+        compiler_version: env!("CARGO_PKG_VERSION"),
+        profile,
+        full_system_text: full_system_text.clone(),
+        stable_system_text: stable_system_text.clone(),
+        dynamic_system_text: dynamic_system_text.clone(),
+        boundary_marker: PROMT_CACHE_BOUNDARY,
+        fingerprint_stable: sha256_hex(stable_system_text.as_str()),
+        fingerprint_dynamic: sha256_hex(dynamic_system_text.as_str()),
+        fingerprint_full: sha256_hex(full_system_text.as_str()),
+        sections,
+        source_manifest,
+        diagnostics,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_prompt;
+    use crate::bundle::{PromptCompileInput, PromptLimits};
+    use crate::diagnostics::PromptDiagnosticCode;
+    use crate::profile::PromptProfile;
+    use crate::section::PromptSectionId;
+
+    fn temp_workspace(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pioneer_promt_compile_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        root
+    }
+
+    #[test]
+    fn deterministic_output_for_same_input() {
+        let root = temp_workspace("deterministic");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let input = PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
+            retry_instruction: Some("retry with corrected arguments".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            dynamic_context: Some("dynamic".to_owned()),
+            extra_system: None,
+            limits: PromptLimits::default(),
+        };
+
+        let first = compile_prompt(input.clone()).expect("compile 1");
+        let second = compile_prompt(input).expect("compile 2");
+        assert_eq!(first.full_system_text, second.full_system_text);
+        assert_eq!(first.fingerprint_full, second.fingerprint_full);
+        assert_eq!(first.source_manifest, second.source_manifest);
+        assert_eq!(first.diagnostics, second.diagnostics);
+    }
+
+    #[test]
+    fn assistant_none_keeps_only_identity() {
+        let root = temp_workspace("none");
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantNone,
+            skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
+            retry_instruction: Some("retry".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            dynamic_context: Some("dynamic".to_owned()),
+            extra_system: Some("extra".to_owned()),
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(compiled.stable_system_text.contains("personal assistant"));
+        assert!(compiled.dynamic_system_text.is_empty());
+    }
+
+    #[test]
+    fn runtime_section_order_is_deterministic() {
+        let root = temp_workspace("runtime_order");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
+            retry_instruction: Some("retry".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            dynamic_context: Some("ctx".to_owned()),
+            extra_system: Some("extra".to_owned()),
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            section_ids,
+            vec![
+                PromptSectionId::IdentityBase,
+                PromptSectionId::AssistantSafety,
+                PromptSectionId::SoulCore,
+                PromptSectionId::IdentityCore,
+                PromptSectionId::UserPersona,
+                PromptSectionId::ToolRecoveryPolicy,
+                PromptSectionId::RecoveryContinuation,
+                PromptSectionId::SkillsRuntimePrompt,
+                PromptSectionId::RetryRuntimeInstruction,
+                PromptSectionId::DynamicContext,
+                PromptSectionId::ExtraSystem,
+            ]
+        );
+    }
+
+    #[test]
+    fn task_orchestration_policy_is_dynamic_and_opt_in() {
+        let root = temp_workspace("task_orchestration");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: true,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let task_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::TaskOrchestrationPolicy)
+            .expect("task orchestration section should be present");
+        assert_eq!(
+            task_section.stability,
+            crate::section::PromptStability::Dynamic
+        );
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("## Task Orchestration")
+        );
+        assert!(compiled.dynamic_system_text.contains("task_create"));
+        assert!(compiled.dynamic_system_text.contains("task_wait"));
+    }
+
+    #[test]
+    fn non_identity_files_are_ignored_in_identity_only_mode() {
+        let root = temp_workspace("identity_only_mode");
+        std::fs::write(root.join("AGENTS.md"), "Agent rules").expect("write AGENTS");
+        std::fs::write(root.join("TOOLS.md"), "tool notes").expect("write TOOLS");
+        std::fs::write(root.join("HEARTBEAT.md"), "heartbeat tasks").expect("write HEARTBEAT");
+        std::fs::write(root.join("BOOTSTRAP.md"), "first run checklist").expect("write BOOTSTRAP");
+        std::fs::write(root.join("MEMORY.md"), "long-term memory").expect("write MEMORY");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect::<Vec<_>>();
+        assert!(section_ids.contains(&PromptSectionId::SoulCore));
+        assert!(section_ids.contains(&PromptSectionId::IdentityCore));
+        assert!(section_ids.contains(&PromptSectionId::UserPersona));
+        assert!(
+            !compiled.full_system_text.contains("AGENTS.md")
+                && !compiled.full_system_text.contains("TOOLS.md")
+                && !compiled.full_system_text.contains("HEARTBEAT.md")
+                && !compiled.full_system_text.contains("BOOTSTRAP.md")
+                && !compiled.full_system_text.contains("MEMORY.md")
+        );
+    }
+
+    #[test]
+    fn changing_identity_files_changes_stable_fingerprint() {
+        fn compile_fingerprint(
+            root: &std::path::Path,
+            soul: &str,
+            identity: &str,
+            user: &str,
+        ) -> String {
+            std::fs::write(root.join("SOUL.md"), soul).expect("write SOUL");
+            std::fs::write(root.join("IDENTITY.md"), identity).expect("write IDENTITY");
+            std::fs::write(root.join("USER.md"), user).expect("write USER");
+            compile_prompt(PromptCompileInput {
+                workspace_root: root.to_path_buf(),
+                profile: PromptProfile::AssistantFull,
+                skills_prompt: None,
+                retry_instruction: None,
+                include_tool_recovery_policy: true,
+                include_task_orchestration_policy: false,
+                continue_generation_hint: false,
+                dynamic_context: None,
+                extra_system: None,
+                limits: PromptLimits::default(),
+            })
+            .expect("compile")
+            .fingerprint_stable
+        }
+
+        let root = temp_workspace("identity_fingerprint");
+        let baseline = compile_fingerprint(&root, "Voice: direct", "Name: Pioneer", "Name: Alex");
+        let soul_changed = compile_fingerprint(
+            &root,
+            "Voice: direct and concise",
+            "Name: Pioneer",
+            "Name: Alex",
+        );
+        let identity_changed = compile_fingerprint(
+            &root,
+            "Voice: direct",
+            "Name: Pioneer Assistant",
+            "Name: Alex",
+        );
+        let user_changed =
+            compile_fingerprint(&root, "Voice: direct", "Name: Pioneer", "Name: Alexander");
+
+        assert_ne!(baseline, soul_changed);
+        assert_ne!(baseline, identity_changed);
+        assert_ne!(baseline, user_changed);
+    }
+
+    #[test]
+    fn changing_dynamic_input_does_not_change_stable_fingerprint() {
+        let root = temp_workspace("stable_vs_dynamic");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let baseline = compile_prompt(PromptCompileInput {
+            workspace_root: root.clone(),
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile baseline");
+
+        let dynamic_changed = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: Some("[Skills]\n- sample.skill".to_owned()),
+            retry_instruction: Some("retry with corrected args".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            dynamic_context: Some("session dynamic context".to_owned()),
+            extra_system: Some("runtime override".to_owned()),
+            limits: PromptLimits::default(),
+        })
+        .expect("compile dynamic changed");
+
+        assert_eq!(
+            baseline.fingerprint_stable,
+            dynamic_changed.fingerprint_stable
+        );
+        assert_ne!(
+            baseline.fingerprint_dynamic,
+            dynamic_changed.fingerprint_dynamic
+        );
+        assert_ne!(baseline.fingerprint_full, dynamic_changed.fingerprint_full);
+    }
+
+    #[test]
+    fn missing_identity_files_emit_diagnostics_without_failing_compile() {
+        let root = temp_workspace("missing_identity");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let codes = compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+        assert!(
+            codes.contains(&PromptDiagnosticCode::MissingFile),
+            "expected MissingFile diagnostics"
+        );
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect::<Vec<_>>();
+        assert!(section_ids.contains(&PromptSectionId::SoulCore));
+        assert!(section_ids.contains(&PromptSectionId::IdentityCore));
+        assert!(!section_ids.contains(&PromptSectionId::UserPersona));
+
+        let source_manifest = &compiled.source_manifest;
+        assert_eq!(source_manifest.len(), 3);
+        assert_eq!(
+            source_manifest[0].status,
+            crate::bundle::PromptSourceStatus::Missing
+        );
+        assert_eq!(
+            source_manifest[1].status,
+            crate::bundle::PromptSourceStatus::Missing
+        );
+        assert_eq!(
+            source_manifest[2].status,
+            crate::bundle::PromptSourceStatus::Missing
+        );
+    }
+
+    #[test]
+    fn empty_identity_file_is_ignored_without_failure() {
+        let root = temp_workspace("empty_identity");
+        std::fs::write(root.join("SOUL.md"), "\n \n").expect("write empty SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect::<Vec<_>>();
+        assert!(section_ids.contains(&PromptSectionId::SoulCore));
+        assert!(section_ids.contains(&PromptSectionId::IdentityCore));
+        assert!(section_ids.contains(&PromptSectionId::UserPersona));
+    }
+
+    #[test]
+    fn defaults_are_replaced_by_custom_identity_files() {
+        let root = temp_workspace("custom_replaces_defaults");
+        std::fs::write(root.join("SOUL.md"), "Voice: exact and serious").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer Custom").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(compiled.full_system_text.contains("### SOUL.md"));
+        assert!(compiled.full_system_text.contains("### IDENTITY.md"));
+        assert!(
+            !compiled
+                .full_system_text
+                .contains("You're not a chatbot. You're becoming someone.")
+        );
+        assert!(
+            !compiled
+                .full_system_text
+                .contains("A flat, efficient response is just a worse Google.")
+        );
+    }
+
+    #[test]
+    fn defaults_are_used_when_soul_and_identity_are_missing() {
+        let root = temp_workspace("defaults_missing_soul_identity");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(compiled.full_system_text.contains("## Soul Core"));
+        assert!(compiled.full_system_text.contains("## Core Truths"));
+        assert!(
+            compiled
+                .full_system_text
+                .contains("You're not a chatbot. You're becoming someone.")
+        );
+        assert!(compiled.full_system_text.contains("## Identity Core"));
+        assert!(compiled.full_system_text.contains("### Who Am I?"));
+        assert!(compiled.full_system_text.contains("- Name: Pioneer"));
+        assert!(
+            compiled
+                .full_system_text
+                .contains("- Creature: software-native assistant")
+        );
+        assert!(compiled.full_system_text.contains("### USER.md"));
+    }
+
+    #[test]
+    fn read_error_on_identity_file_emits_diagnostic_without_failing_compile() {
+        let root = temp_workspace("read_error_identity");
+        std::fs::create_dir_all(root.join("SOUL.md")).expect("create directory named SOUL.md");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::FileReadError
+                && diagnostic
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| file.ends_with("SOUL.md"))
+        }));
+
+        let source_manifest = &compiled.source_manifest;
+        let soul = source_manifest
+            .iter()
+            .find(|entry| entry.file == "SOUL.md")
+            .expect("soul entry must exist");
+        assert_eq!(soul.status, crate::bundle::PromptSourceStatus::ReadError);
+    }
+
+    #[test]
+    fn truncation_marks_source_manifest_entry_as_truncated() {
+        let root = temp_workspace("truncated_source_manifest");
+        std::fs::write(root.join("SOUL.md"), "A".repeat(120)).expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "B".repeat(120)).expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "C".repeat(120)).expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits {
+                max_chars_per_file: 40,
+                max_chars_total: 90,
+            },
+        })
+        .expect("compile");
+
+        let source_manifest = &compiled.source_manifest;
+        assert!(
+            source_manifest
+                .iter()
+                .any(|entry| entry.status == crate::bundle::PromptSourceStatus::Truncated),
+            "expected at least one truncated source entry"
+        );
+    }
+}

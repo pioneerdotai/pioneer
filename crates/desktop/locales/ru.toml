@@ -1,0 +1,864 @@
+_version = 1
+
+[chat.composer]
+placeholder = "Отправьте сообщение ассистенту"
+
+[chat.composer.mode]
+agent_label = "Агент"
+agent_description = "Полная автоматизация и бесшовная интеграция в ваш рабочий процесс."
+chat_label = "Чат"
+chat_description = "Разговорный ИИ для анализа, написания текстов и рассуждений без автоматизации."
+
+[chat.composer.model]
+select_label = "Выбрать модель"
+dialog_title = "Выбор модели"
+provider_label = "Провайдер"
+provider_placeholder = "Поиск провайдеров..."
+model_label = "Модель"
+model_placeholder = "Поиск моделей..."
+loading_models = "Загрузка моделей..."
+loading_providers = "Загрузка провайдеров..."
+no_providers = "Нет настроенных провайдеров"
+no_models = "Нет доступных моделей"
+load_error = "Ошибка загрузки: %{error}"
+
+[chat.composer.preview]
+skill = "Навык: %{name}"
+mention = "Упоминание: %{name}"
+
+[common]
+address = "Адрес"
+copy = "Копировать"
+name = "Имя"
+ok = "ОК"
+or = "или"
+token = "Токен"
+
+[buttons]
+cancel = "Отмена"
+save = "Сохранить"
+
+[conversation.error]
+turn_failed = "Ход завершился ошибкой"
+
+[errors.command]
+exit_status = "код выхода %{status}"
+failed_with_output = "`%{command_label}` завершилась с ошибкой: %{details}"
+launchctl_print_failed = "не удалось выполнить `launchctl print`"
+powershell_task_status_failed = "не удалось выполнить powershell для проверки состояния планировщика задач"
+run_failed = "не удалось выполнить `%{command_label}`"
+systemctl_is_active_failed = "не удалось выполнить `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` должен быть больше 0"
+load_app = "не удалось загрузить конфигурацию приложения"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` должен быть больше 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` должен быть больше 0"
+
+[errors.gateway]
+address_conflict_inactive_service = "адрес `%{listen_addr}` уже занят, но настроенная служба `%{service_name}` не активна; остановите конфликтующий процесс/службу или измените gateway.listen_addr"
+address_empty = "адрес шлюза не должен быть пустым"
+id_not_found = "шлюз с id `%{id}` не найден"
+invalid_address = "некорректный адрес шлюза `%{normalized}`; ожидается host:port"
+resolve_empty = "адрес шлюза `%{listen_addr}` не разрешился ни в один сокет-адрес"
+resolve_failed = "не удалось разрешить адрес шлюза `%{listen_addr}`"
+start_command_failed_manual_help = "не удалось автоматически установить или запустить локальный шлюз; повторите попытку и проверьте локальную конфигурацию шлюза"
+startup_timeout = "служба шлюза не стала доступна по `%{listen_addr}` в течение %{startup_timeout_ms} мс"
+unreachable_verify = "шлюз `%{address}` недоступен; проверьте адрес и что шлюз запущен"
+
+[errors.registry]
+parse_failed = "не удалось разобрать реестр шлюза `%{path}`"
+read_failed = "не удалось прочитать реестр шлюза `%{path}`"
+serialize_failed = "не удалось сериализовать реестр шлюза"
+unsupported_version = "неподдерживаемая версия реестра шлюза `%{version}` в `%{path}`; ожидается `%{current_registry_version}`"
+write_failed = "не удалось записать реестр шлюза `%{path}`"
+
+[errors.runtime]
+ensure_home = "не удалось подготовить домашнюю директорию среды выполнения"
+
+[errors.theme]
+watch_dir_failed = "не удалось отслеживать директорию тем"
+
+[errors.window]
+open_failed = "не удалось открыть окно настольного приложения"
+
+[gateway.action]
+connect_remote = "Подключить удалённый шлюз"
+start_local = "Запустить локальный шлюз"
+
+[gateway.endpoint]
+local_name = "Локальный шлюз"
+local_with_address = "Локальный - %{address}"
+remote_name = "Удалённый %{index}"
+remote_with_address = "Удалённый - %{address}"
+
+[gateway.error]
+with_details = "Ошибка шлюза: %{error}."
+
+[gateway.initial]
+description = "Укажите адрес шлюза или запустите локальную службу шлюза."
+title = "Подключение шлюза"
+
+[gateway.popover]
+no_available = "Нет доступных шлюзов."
+
+[gateway.status]
+connected = "Шлюз подключён"
+connecting = "Подключение шлюза..."
+connecting_named = "Подключение к %{gateway_name}..."
+connecting_remote = "Подключение к удалённому шлюзу..."
+failed_check = "Не удалось проверить состояние шлюза: %{error}"
+local_conflict = "Конфликт локального шлюза: адрес занят другим процессом."
+local_conflict_at = "Конфликт локального шлюза на %{gateway_address}: адрес занят другим процессом."
+local_stopped = "Локальный шлюз остановлен: %{gateway_address}. Запустите локальный шлюз или переключитесь на удалённый."
+not_configured = "Шлюз ещё не настроен. Добавьте удалённый адрес или запустите локальный шлюз."
+remote_unavailable = "Удалённый шлюз недоступен: %{gateway_name} (%{gateway_address})"
+starting_local = "Запуск локального шлюза..."
+installing = "Установка шлюза..."
+updating = "Обновление шлюза..."
+subsystem_failed = "Подсистема шлюза не инициализировалась: %{error}"
+subsystem_not_ready = "Подсистема шлюза не готова"
+unavailable = "Шлюз недоступен"
+
+[gateway.notification]
+path_update_skipped = "Шлюз запущен. Для команды `pioneer` в новом терминале может потребоваться добавить %{bin_dir} в PATH."
+
+[logs.gateway]
+launcher_did_not_reach_service = "программа не смогла сделать настроенную службу шлюза доступной"
+launcher_failed = "программа завершилась с ошибкой"
+launcher_unavailable = "программа недоступна"
+service_started = "служба шлюза запущена"
+
+[logs.runtime]
+home_ready = "домашняя директория среды выполнения готова"
+prepare_home_failed = "не удалось подготовить домашнюю директорию среды выполнения"
+
+[menu.app]
+name = "Pioneer"
+about = "О Pioneer"
+services = "Службы"
+hide = "Скрыть Pioneer"
+hide_others = "Скрыть остальные"
+show_all = "Показать все"
+quit = "Выйти из Pioneer"
+
+[menu.about]
+version = "Версия %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "Новый тред"
+providers = "Провайдеры"
+
+[sidebar.thread]
+untitled = "Новый тред"
+
+[sidebar.title]
+threads = "Треды"
+
+[sidebar.folder]
+new = "Новая папка"
+
+[sidebar.contextmenu.folder]
+rename = "Переименовать"
+delete = "Удалить"
+
+[dialog.folder.rename]
+title = "Переименовать папку"
+description = "Сделайте название коротким и легко запоминающимся."
+
+[providers.screen]
+title = "Провайдеры"
+description = "Настройте API-ключи для доступных провайдеров моделей."
+empty_connected = "Подключенных провайдеров пока нет."
+
+[providers.sidebar]
+all = "Все"
+connected = "Подключенные"
+
+[providers.button]
+submit = "Сохранить ключ"
+remove_key = "Удалить ключ"
+
+[providers.dialog]
+title = "Настроить %{provider}"
+api_key_label = "API Key *"
+api_key_placeholder = "Введите API ключ"
+replace_hint = "Для %{provider} уже настроен ключ. Сохранение заменит его."
+
+[providers.error]
+gateway_not_connected = "Gateway не подключен."
+load_failed = "Не удалось загрузить конфигурацию провайдеров"
+save_failed = "Не удалось сохранить API ключ"
+delete_failed = "Не удалось удалить API ключ"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Claude и другие модели от Anthropic"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "Модели через AWS Bedrock"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Модели через Azure OpenAI Service"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "Используйте модели через Claude Code CLI"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Запуск моделей через Copilot-совместимый API"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI-совместимый провайдер DeepSeek"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Модели Gemini от Google AI"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "Используйте модели через Gemini CLI"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM и Zhipu-совместимые модели"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Быстрый inference на оборудовании Groq"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM proxy и gateway"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "Mistral API через OpenAI-совместимый endpoint"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "Запуск локальных моделей Ollama"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT и другие модели OpenAI"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "Маршрутизатор для множества провайдеров моделей"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Inference endpoint Telnyx"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "Модели xAI Grok"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Модели, размещённые в Together"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Hosted model APIs Fireworks"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "OpenAI-совместимый endpoint Novita"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "API моделей Perplexity"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Endpoint совместимости Cohere"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "API моделей Venice"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "API моделей Cerebras"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "API моделей SambaNova"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Модели, размещённые в Hyperbolic"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "OpenAI-совместимый endpoint DeepInfra"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "Endpoint роутера HF"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "Endpoint AI21 Studio"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Endpoint моделей Reka"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Inference endpoint Baseten"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Inference endpoint Nscale"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Hosted model endpoints Anyscale"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Endpoint Nebius AI Studio"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Serverless endpoint Friendli"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Endpoint Lepton AI"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "API моделей SiliconFlow"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "API endpoint AIHubMix"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "API моделей ASTRAI"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "Endpoint моделей StepFun"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "API моделей Baichuan"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "API моделей Lingyiwanwu / Yi"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "API моделей Tencent Hunyuan"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "AI endpoint OVHcloud"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "Endpoint NVIDIA NIM"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "OpenAI-совместимый endpoint Synthetic"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Endpoint Volcengine Ark"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "API моделей Baidu Qianfan"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "Локальный OpenAI-совместимый API LM Studio"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "Локальный OpenAI-совместимый API llama.cpp"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "Локальный OpenAI-совместимый API SGLang"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "Локальный OpenAI-совместимый API vLLM"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "Локальный OpenAI-совместимый API OSaurus"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "Используйте модели через Kilo CLI"
+
+[mcp.screen]
+title = "MCP"
+description = "Установленные MCP серверы для текущего пространства."
+found_count = "Найдено:"
+
+[mcp.empty]
+title = "Нет установленных MCP серверов"
+description = "Установите новые MCP серверы и расширьте возможности агентов."
+
+[mcp.dialog]
+install_title = "Установка MCP сервера"
+install = "Установить"
+uninstall_title = "Удалить %{name}?"
+uninstall_description = "Удалить этот MCP сервер из текущего пространства и остановить его выполнение."
+uninstall = "Удалить"
+config_json = "JSON конфиг"
+secret_store_hint = "Секретные значения из env, headers, tokens и authorization сохраняются в хранилище секретов шлюза."
+
+[mcp.dialog.error]
+config_required = "Нужно указать JSON конфиг MCP"
+config_invalid = "JSON конфиг MCP некорректен: %{error}"
+servers_required = "JSON конфиг MCP должен содержать объект mcpServers"
+servers_empty = "JSON конфиг MCP должен содержать хотя бы один сервер"
+server_name_empty = "Имя MCP сервера не может быть пустым"
+server_config_object = "%{name}: конфиг сервера должен быть объектом"
+command_or_url_required = "%{name}: нужно указать command или url"
+command_url_exclusive = "%{name}: command и url нельзя указывать одновременно"
+gateway_not_connected = "Шлюз не подключен"
+workspace_not_selected = "Рабочее пространство не выбрано"
+install_failed = "Не удалось установить MCP сервер: %{error}"
+server_validation_error = "%{name}: ошибка валидации"
+validation_failed = "Валидация JSON конфига MCP не прошла"
+diagnostic = "%{name}: %{level}: %{message}%{field}"
+level_error = "ошибка"
+level_warning = "предупреждение"
+
+[mcp.status]
+not_started = "Не запущен"
+disabled = "Выключен"
+starting = "Запускается"
+ready = "Готов"
+degraded = "Частично работает"
+auth_required = "Нужна авторизация"
+failed = "Ошибка"
+stopping = "Останавливается"
+stopped = "Остановлен"
+restarting = "Перезапускается"
+
+[mcp.capabilities]
+tools = "инструментов"
+resources = "ресурсов"
+templates = "шаблонов"
+prompts = "промптов"
+
+[mcp.sidebar]
+install = "Установить"
+refresh = "Обновить"
+back = "Назад"
+update_config = "Обновить"
+restart = "Перезапустить"
+uninstall = "Удалить"
+
+[mcp.details]
+not_selected = "MCP сервер не выбран"
+enabled = "Включён"
+implicit = "Неявный"
+refresh = "Обновить"
+source = "Источник"
+scope = "Область"
+transport = "Транспорт"
+loaded = "Загружено"
+runtime = "Выполнение"
+live = "Активен"
+last_seen = "Последний сигнал"
+retry_attempt = "Попытка повтора"
+next_retry = "Следующий повтор"
+last_error = "Последняя ошибка"
+stderr = "stderr"
+health = "Состояние"
+tools = "Инструменты"
+tools_count = "Инструментов: %{count}"
+resources = "Ресурсы"
+resources_count = "Ресурсов: %{count}"
+resource_templates = "Шаблоны ресурсов"
+templates_count = "Шаблонов: %{count}"
+prompts = "Промпты"
+prompts_count = "Промптов: %{count}"
+audit = "Аудит"
+audit_count = "Событий аудита: %{count}"
+source_config = "Конфиг"
+scope_workspace = "Пространство"
+scope_user = "Пользователь"
+
+[mcp.audit]
+column_time = "Время"
+column_time_hint = "Локальное время записи события аудита MCP."
+column_event = "Событие"
+column_event_hint = "Действие аудита и исходный MCP инструмент, если он есть."
+column_result = "Результат"
+column_result_hint = "Решение шлюза для этого MCP события."
+column_details = "Детали"
+column_details_hint = "Код причины и краткие технические детали события."
+reason_tooltip = "%{details}\nПричина: %{reason}"
+action_install = "Установлен"
+action_update = "Обновлён"
+action_uninstall = "Удалён"
+action_policy = "Политика изменена"
+action_start = "Запуск"
+action_started = "Запущен"
+action_start_failed = "Ошибка запуска"
+action_stop = "Остановка"
+action_stopped = "Остановлен"
+action_restart = "Перезапуск"
+action_catalog_refreshed = "Каталог обновлён"
+action_call = "Вызов инструмента"
+action_call_completed = "Вызов завершён"
+action_call_failed = "Ошибка вызова"
+decision_allowed = "Разрешено"
+decision_blocked = "Заблокировано"
+decision_warning = "Предупреждение"
+
+[mcp.common]
+yes = "Да"
+no = "Нет"
+none = "Не указано"
+empty = "Нет деталей"
+items_count = "Элементов: %{count}"
+keys_count = "Ключей: %{count}"
+
+[mcp.error]
+server_name_required = "Имя MCP сервера обязательно"
+gateway_not_connected = "Шлюз не подключен"
+workspace_not_selected = "Рабочее пространство не выбрано"
+server_not_available = "MCP сервер недоступен в текущем рабочем пространстве"
+load_servers_failed = "Не удалось загрузить MCP серверы: %{error}"
+load_details_failed = "Не удалось загрузить детали MCP сервера: %{error}"
+policy_update_failed = "Не удалось обновить политику MCP: %{error}"
+restart_failed = "Не удалось перезапустить MCP сервер: %{error}"
+uninstall_failed = "Не удалось удалить MCP сервер: %{error}"
+
+[skills.screen]
+title = "Навыки"
+description = "Установленные навыки для текущего пространства."
+installed_count = "Найдено:"
+
+[skills.empty]
+title = "Нет установленных навыков"
+description = "Установите новые навыки и расширьте возможности агентов."
+
+[skills.error]
+gateway_not_connected = "Gateway не подключен."
+workspace_not_selected = "Активный workspace не выбран."
+load_failed = "Не удалось загрузить установленные скиллы"
+path_required = "Нужно указать путь."
+invalid_skill_target = "Некорректный target скилла."
+install_failed = "Не удалось установить скилл"
+update_failed = "Не удалось обновить скилл"
+uninstall_failed = "Не удалось удалить скилл"
+policy_failed = "Не удалось обновить политику скилла"
+path_picker_failed = "Не удалось открыть выбор источника."
+
+[skills.card]
+version = "Версия"
+fingerprint = "Отпечаток"
+
+[skills.button]
+install = "Установить"
+update = "Обновить"
+uninstall = "Удалить"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Подготовка загрузки скилла"
+installing = "Загрузка скилла"
+updating = "Загрузка обновления"
+cancelling = "Отмена загрузки"
+
+[skills.dialog]
+install_title = "Установка скилла"
+update_title = "Обновить %{slug}"
+source_kind_description = "Выберите папку со скиллом на диске."
+pick_folder = "Выбрать папку"
+pick_archive = "Выбрать архив"
+
+[skills.diagnostics]
+reason = "Причина:"
+validation = "Валидация"
+dependencies = "Зависимости"
+dependencies_intro = "Быстрая проверка требований, необходимых для запуска навыка."
+dependencies_column_action = "Что сделать"
+dependencies_hint_requirement = "Что этот навык ожидает найти в вашей системе."
+dependencies_hint_status = "Текущий результат проверки зависимости."
+dependencies_hint_action = "Что нужно сделать, если зависимость отсутствует или заблокирована."
+dependencies_kind_bin = "Команда"
+dependencies_kind_env = "Переменная окружения"
+dependencies_kind_api_key = "API-ключ"
+dependencies_kind_command = "Команда"
+dependencies_kind_mcp = "MCP сервер"
+dependencies_kind_tool = "Зависимость"
+dependencies_status_ready = "Готово"
+dependencies_status_missing = "Не найдено"
+dependencies_status_blocked = "Заблокировано"
+dependencies_status_warning = "Предупреждение"
+dependencies_status_unknown = "Неизвестно"
+security = "Безопасность"
+security_intro = "Потенциальные риски, найденные при проверке файлов навыка."
+security_column_rule = "Правило"
+security_column_finding = "Наблюдение"
+security_column_location = "Расположение"
+security_hint_level = "Насколько критична проблема безопасности."
+security_hint_rule = "Идентификатор правила, которое сработало."
+security_hint_finding = "Что именно найдено и почему это важно."
+security_hint_location = "Путь к файлу, где найдена проблема."
+security_location_unknown = "Путь не указан"
+security_severity_critical = "Критично"
+security_severity_high = "Высокий"
+security_severity_medium = "Средний"
+security_severity_low = "Низкий"
+security_severity_info = "Инфо"
+trust_gate = "Trust gates"
+trust_gate_intro = "Решения по доступу к инструментам на основе уровня доверия."
+trust_column_tool = "Тип инструмента"
+trust_column_min_trust = "Требуемый trust"
+trust_column_explanation = "Пояснение"
+trust_hint_tool = "Какой класс инструментов контролирует это правило."
+trust_hint_min_trust = "Минимальный уровень доверия для использования этого инструмента."
+trust_hint_decision = "Разрешено ли использование сейчас."
+trust_hint_explanation = "Простая причина текущего решения."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Разрешено"
+trust_decision_blocked = "Заблокировано"
+trust_explanation_allowed = "Текущий уровень доверия достаточен."
+trust_explanation_blocked = "Заблокировано, пока trust не достигнет уровня"
+audit = "Последние audit-события"
+audit_intro = "Последние действия и проверки, связанные с этим навыком."
+audit_column_time = "Когда"
+audit_column_event = "Событие"
+audit_column_result = "Результат"
+audit_column_details = "Детали"
+audit_hint_time = "Когда было зафиксировано событие."
+audit_hint_event = "Что произошло с навыком."
+audit_hint_result = "Было ли действие разрешено, заблокировано или помечено предупреждением."
+audit_hint_details = "Причина и технические детали решения."
+audit_action_install = "Установлен"
+audit_action_update = "Обновлён"
+audit_action_uninstall = "Удалён"
+audit_action_resolve_allowed = "Разрешён в промпт"
+audit_action_resolve_blocked = "Заблокирован при резолве"
+audit_action_runtime_allowed = "Разрешён во время выполнения"
+audit_action_runtime_blocked = "Заблокирован во время выполнения"
+audit_action_security_warn = "Предупреждение безопасности"
+audit_decision_allowed = "Разрешено"
+audit_decision_blocked = "Заблокировано"
+audit_decision_warning = "Предупреждение"
+audit_reason_none = "Причина не указана"
+audit_details_empty = "Нет дополнительных деталей"
+none = "none"
+empty_validation = "Проблем валидации не обнаружено."
+empty_dependencies = "Проблем зависимостей не обнаружено."
+empty_security = "Проблем безопасности не обнаружено."
+empty_trust_gate = "Ограничения trust gates отсутствуют."
+empty_audit = "Аудит-события отсутствуют."
+
+[skills.catalog]
+source = "Источник"
+trust = "Доверие"
+
+[skills.status]
+active = "Активен"
+blocked = "Заблокирован"
+disabled = "Выключен"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[settings.screen]
+title = "Настройки"
+description = "Управляйте параметрами приложения."
+
+[settings.sidebar]
+back = "Назад"
+general = "General"
+
+[settings.option.language]
+label = "Язык приложения"
+description = "Выберите язык интерфейса."
+
+[settings.option.theme]
+label = "Цветовая тема"
+description = "Выберите предпочтительный режим оформления."
+
+[settings.language]
+system = "Как в системе"
+english = "English"
+russian = "Русский"
+german = "Deutsch"
+spanish = "Español"
+french = "Français"
+hindi = "हिन्दी"
+japanese = "日本語"
+chinese = "中文"
+
+[settings.theme]
+system = "Системная"
+light = "Светлая"
+dark = "Тёмная"
+
+[bottom_bar]
+gateway_disconnected = "Шлюз отключён"
+starting_thread = "Запуск треда..."
+finishing_turn = "Завершаю ход..."
+turn_running = "Ход `%{turn_id}` выполняется"
+previous_turn_failed = "Предыдущий ход завершился ошибкой. Можно отправить новое сообщение."
+turn_cancelled = "Ход отменён. Можно отправить новое сообщение."
+turn_completed = "Ход завершён. Можно отправить следующее сообщение."
+ready = "Готово"
+starting_turn = "Запуск хода..."
+agent_processing = "Агент обрабатывает..."
+
+[timeline.empty]
+start_thread = "Отправьте сообщение, чтобы начать этот тред"
+
+[timeline.elapsed]
+hours_minutes = "%{hours} ч %{minutes} мин"
+minutes_seconds = "%{minutes} мин %{seconds} сек"
+seconds = "%{seconds} сек"
+
+[timeline.common]
+url_missing = "Ссылка не указана"
+no_details = "Нет деталей"
+truncated = "... [обрезано]"
+
+[timeline.reasoning]
+summary = "Сводка:"
+content = "Содержимое:"
+running = "Думаю"
+completed = "Думал"
+
+[timeline.agent_message]
+subagent_completed = "Субагент ответил"
+
+[timeline.work_group]
+completed = "Работал"
+
+[timeline.web_search]
+fallback_query = "Поиск в интернете"
+running = "Ищу в интернете"
+no_results = "Поиск не дал результатов"
+results_count = "%{count} результатов"
+
+[timeline.file_change]
+cancelled = "Отменено"
+failed = "Изменения не применены"
+running = "Применяю изменения"
+completed = "Файлы изменены"
+no_files = "Файлы не указаны"
+one_file = "1 файл"
+files_count = "%{count} файлов"
+exit_code = "Код завершения:"
+more_files = "и ещё %{count}"
+output = "Вывод"
+
+[timeline.download]
+cancelled = "Отменено"
+failed = "Не удалось скачать"
+running = "Скачиваю файл"
+completed = "Файл скачан"
+size = "Размер: %{size}"
+unit_b = "Б"
+unit_kb = "КБ"
+unit_mb = "МБ"
+unit_gb = "ГБ"
+unit_tb = "ТБ"
+
+[timeline.web_fetch]
+cancelled = "Отменено"
+failed = "Не удалось открыть"
+running = "Открываю ссылку"
+completed = "Загружено"
+
+[timeline.tool]
+cancelled = "Отменено"
+failed = "Не выполнен"
+running = "Выполняю инструмент"
+completed = "Выполнен"
+arguments = "Аргументы"
+result = "Результат"
+open_mcp_server = "Открыть MCP сервер"
+started = "Запущен инструмент: %{tool_name}"
+started_kind = "Запущен инструмент: %{tool_name} (%{kind})"
+finished = "Инструмент `%{tool_name}` завершен"
+command = "Команда: %{command}"
+cwd = "Рабочая папка: %{cwd}"
+query = "Запрос: %{query}"
+url = "URL: %{url}"
+exit_code = "Код выхода: %{exit_code}"
+duration_ms = "Длительность: %{duration_ms} мс"
+timed_out = "Истекло время ожидания"
+changed_files = "Измененные файлы:"
+results = "Результаты: %{count}"
+provider = "Провайдер: %{provider}"
+status_code = "Код статуса: %{status_code}"
+title = "Заголовок: %{title}"
+path = "Путь: %{path}"
+bytes = "Байты: %{bytes}"
+stage = "[Этап] %{value}"
+progress = "[Прогресс] %{value}"
+stderr = "[Ошибка] %{value}"
+
+[timeline.command]
+running = "Выполняю команду"
+completed = "Выполнил команду"
+
+[timeline.system]
+info = "Системное событие"
+warning = "Предупреждение"
+error = "Ошибка"
+tool = "инструмент"
+attempt = "Попытка #%{attempt}"
+timeout_with_recovery = "Шаг не ответил вовремя, запущено восстановление"
+timeout_without_recovery = "Шаг не ответил вовремя, автоматическое восстановление недоступно"
+timeout_label = "Таймаут"
+timeout_delta_recovery_scheduled = "[таймаут] попытка #%{attempt} %{reason}; восстановление запланировано (job `%{job_id}`)"
+timeout_delta_no_recovery = "[таймаут] попытка #%{attempt} %{reason}; автоматического восстановления нет"
+recovery_opened = "Запускаю восстановление шага"
+recovery_attached = "Восстановление связано с новым шагом"
+retry_scheduled = "Запланирован повтор восстановления"
+retry_started = "Начат повтор восстановления"
+recovery_succeeded = "Восстановление выполнено"
+recovery_failed = "Восстановление не удалось"
+recovery_label = "Восстановление"
+retry_label = "Повтор"
+recovered_label = "Восстановлено"
+tool_retry_scheduled = "Повторяю %{tool_name}"
+tool_retry_scheduled_with_attempt = "Повторяю инструмент %{tool_name} (попытка #%{attempt})"
+tool_retry_resolved = "%{tool_name} выполнен после повтора"
+tool_retry_exhausted = "%{tool_name} не выполнен после повторов"
+retry_resolved_label = "Повтор выполнен"
+retries_exhausted_label = "Повторы исчерпаны"
+tool_loop_budget_exceeded = "Достигнут лимит вызовов инструментов"
+code = "Код:"

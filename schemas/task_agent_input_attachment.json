@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgentInputAttachment",
+  "type": "object",
+  "required": [
+    "kind"
+  ],
+  "properties": {
+    "artifactId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "$ref": "#/definitions/TaskAgentInputAttachmentKind"
+    },
+    "mimeType": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "TaskAgentInputAttachmentKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "artifact",
+        "url"
+      ]
+    }
+  }
+}

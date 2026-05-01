@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillHealthSummary",
+  "type": "object",
+  "required": [
+    "status"
+  ],
+  "properties": {
+    "dependency_failures": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SkillDependencyDiagnostic"
+      }
+    },
+    "security_blocks": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SkillSecurityFinding"
+      }
+    },
+    "status": {
+      "type": "string"
+    },
+    "validation_issues": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SkillValidationDiagnostic"
+      }
+    }
+  },
+  "definitions": {
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "required": [
+        "hint",
+        "kind",
+        "name",
+        "status"
+      ],
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "required": [
+        "message",
+        "rule_id",
+        "severity"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      }
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "required": [
+        "code",
+        "level",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

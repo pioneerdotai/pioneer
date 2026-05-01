@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpAuditEventSummary",
+  "type": "object",
+  "required": [
+    "action",
+    "created_at",
+    "decision",
+    "server_name"
+  ],
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "callable_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "catalog_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "decision": {
+      "type": "string"
+    },
+    "details": {
+      "default": null
+    },
+    "raw_tool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_installation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_name": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

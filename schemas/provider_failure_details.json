@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProviderFailureDetails",
+  "type": "object",
+  "required": [
+    "class",
+    "is_recoverable_hint",
+    "model",
+    "provider",
+    "stage",
+    "transport"
+  ],
+  "properties": {
+    "class": {
+      "$ref": "#/definitions/ProviderFailureClass"
+    },
+    "http_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "is_recoverable_hint": {
+      "type": "boolean"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "provider_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retry_after_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "stage": {
+      "$ref": "#/definitions/ProviderFailureStage"
+    },
+    "transport": {
+      "$ref": "#/definitions/ProviderTransportKind"
+    }
+  },
+  "definitions": {
+    "ProviderFailureClass": {
+      "type": "string",
+      "enum": [
+        "network_transient",
+        "rate_limit",
+        "provider_5xx",
+        "auth_expired",
+        "model_not_found",
+        "prompt_too_long",
+        "max_output_tokens",
+        "stream_stall",
+        "stream_truncated",
+        "invalid_request",
+        "permission_denied",
+        "unknown"
+      ]
+    },
+    "ProviderFailureStage": {
+      "type": "string",
+      "enum": [
+        "connect",
+        "first_chunk",
+        "mid_stream",
+        "finalize"
+      ]
+    },
+    "ProviderTransportKind": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "non_stream",
+        "ws",
+        "sse"
+      ]
+    }
+  }
+}

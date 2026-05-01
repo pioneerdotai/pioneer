@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRecoveryIdempotencyMode",
+  "type": "string",
+  "enum": [
+    "none",
+    "safe",
+    "requires_key",
+    "session_bound"
+  ]
+}

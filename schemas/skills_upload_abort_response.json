@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsUploadAbortResponse",
+  "type": "object",
+  "required": [
+    "status",
+    "upload_id"
+  ],
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "upload_id": {
+      "type": "string"
+    }
+  }
+}

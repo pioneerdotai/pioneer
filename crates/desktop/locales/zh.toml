@@ -1,0 +1,864 @@
+_version = 1
+
+[chat.composer]
+placeholder = "向助手发送消息"
+
+[chat.composer.mode]
+agent_label = "智能体"
+agent_description = "全面自动化，无缝集成到您的工作流程中。"
+chat_label = "聊天"
+chat_description = "用于分析、写作和推理的对话式AI，无需自动化。"
+
+[chat.composer.model]
+select_label = "选择模型"
+dialog_title = "选择模型"
+provider_label = "提供商"
+provider_placeholder = "搜索提供商..."
+model_label = "模型"
+model_placeholder = "搜索模型..."
+loading_models = "正在加载模型..."
+loading_providers = "正在加载提供商..."
+no_providers = "未配置提供商"
+no_models = "没有可用的模型"
+load_error = "加载失败：%{error}"
+
+[chat.composer.preview]
+skill = "技能：%{name}"
+mention = "提及：%{name}"
+
+[common]
+address = "地址"
+copy = "复制"
+name = "名称"
+ok = "确定"
+or = "或"
+token = "令牌"
+
+[buttons]
+cancel = "取消"
+save = "保存"
+
+[conversation.error]
+turn_failed = "回合失败"
+
+[errors.command]
+exit_status = "退出状态 %{status}"
+failed_with_output = "`%{command_label}` 执行失败：%{details}"
+launchctl_print_failed = "无法运行 `launchctl print`"
+powershell_task_status_failed = "无法运行 powershell 检查计划任务状态"
+run_failed = "无法运行 `%{command_label}`"
+systemctl_is_active_failed = "无法运行 `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` 必须大于 0"
+load_app = "无法加载应用配置"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` 必须大于 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 必须大于 0"
+
+[errors.gateway]
+address_conflict_inactive_service = "地址 `%{listen_addr}` 已被占用，但配置的服务 `%{service_name}` 未激活；请停止冲突进程/服务或修改 gateway.listen_addr"
+address_empty = "网关地址不能为空"
+id_not_found = "未找到网关 id `%{id}`"
+invalid_address = "网关地址 `%{normalized}` 无效；应为 host:port"
+resolve_empty = "网关地址 `%{listen_addr}` 未解析到任何套接字地址"
+resolve_failed = "无法解析网关地址 `%{listen_addr}`"
+start_command_failed_manual_help = "无法自动安装或启动本地网关；请重试并检查本地网关配置"
+startup_timeout = "在 %{startup_timeout_ms}ms 内，网关服务未在 `%{listen_addr}` 变为可达"
+unreachable_verify = "网关 `%{address}` 不可达；请检查地址并确认网关正在运行"
+
+[errors.registry]
+parse_failed = "无法解析网关注册表 `%{path}`"
+read_failed = "无法读取网关注册表 `%{path}`"
+serialize_failed = "无法序列化网关注册表"
+unsupported_version = "`%{path}` 中的网关注册表版本 `%{version}` 不受支持；期望 `%{current_registry_version}`"
+write_failed = "无法写入网关注册表 `%{path}`"
+
+[errors.runtime]
+ensure_home = "无法准备运行环境主目录"
+
+[errors.theme]
+watch_dir_failed = "无法监视主题目录"
+
+[errors.window]
+open_failed = "无法打开桌面窗口"
+
+[gateway.action]
+connect_remote = "连接远程网关"
+start_local = "启动本地网关"
+
+[gateway.endpoint]
+local_name = "本地网关"
+local_with_address = "本地 - %{address}"
+remote_name = "远程 %{index}"
+remote_with_address = "远程 - %{address}"
+
+[gateway.error]
+with_details = "网关错误：%{error}。"
+
+[gateway.initial]
+description = "请填写网关地址，或启动本地网关服务。"
+title = "连接网关"
+
+[gateway.popover]
+no_available = "没有可用网关。"
+
+[gateway.status]
+connected = "网关已连接"
+connecting = "正在连接网关..."
+connecting_named = "正在连接到 %{gateway_name}..."
+connecting_remote = "正在连接远程网关..."
+failed_check = "检查网关状态失败：%{error}"
+local_conflict = "本地网关冲突：地址被其他进程占用。"
+local_conflict_at = "本地网关在 %{gateway_address} 冲突：地址被其他进程占用。"
+local_stopped = "本地网关已停止：%{gateway_address}。请启动本地网关或切换到远程。"
+not_configured = "网关尚未配置。请添加远程地址或启动本地网关。"
+remote_unavailable = "远程网关不可用：%{gateway_name} (%{gateway_address})"
+starting_local = "正在启动本地网关..."
+installing = "正在安装网关..."
+updating = "正在更新网关..."
+subsystem_failed = "网关子系统初始化失败：%{error}"
+subsystem_not_ready = "网关子系统尚未就绪"
+unavailable = "网关不可用"
+
+[gateway.notification]
+path_update_skipped = "网关已启动。对于 `pioneer` 命令，你可能需要在新的终端会话中将 %{bin_dir} 手动加入 PATH。"
+
+[logs.gateway]
+launcher_did_not_reach_service = "启动程序未能使已配置的网关服务可达"
+launcher_failed = "启动程序失败"
+launcher_unavailable = "启动程序不可用"
+service_started = "网关服务已启动"
+
+[logs.runtime]
+home_ready = "运行环境主目录已就绪"
+prepare_home_failed = "准备运行环境主目录失败"
+
+[menu.app]
+name = "Pioneer"
+about = "关于 Pioneer"
+services = "服务"
+hide = "隐藏 Pioneer"
+hide_others = "隐藏其他"
+show_all = "显示全部"
+quit = "退出 Pioneer"
+
+[menu.about]
+version = "版本 %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "新建话题"
+providers = "供应商"
+
+[sidebar.thread]
+untitled = "新建话题"
+
+[sidebar.title]
+threads = "话题"
+
+[sidebar.folder]
+new = "新建文件夹"
+
+[sidebar.contextmenu.folder]
+rename = "重命名"
+delete = "删除"
+
+[dialog.folder.rename]
+title = "重命名文件夹"
+description = "请保持简短且便于记忆。"
+
+[providers.screen]
+title = "供应商"
+description = "为可用的模型供应商配置 API 密钥。"
+empty_connected = "还没有已连接的供应商。"
+
+[providers.sidebar]
+all = "全部"
+connected = "已连接"
+
+[providers.button]
+submit = "保存密钥"
+remove_key = "移除密钥"
+
+[providers.dialog]
+title = "配置 %{provider}"
+api_key_label = "API 密钥 *"
+api_key_placeholder = "输入 API 密钥"
+replace_hint = "%{provider} 已配置密钥。保存后将替换现有密钥。"
+
+[providers.error]
+gateway_not_connected = "Gateway 未连接。"
+load_failed = "加载供应商配置失败"
+save_failed = "保存 API 密钥失败"
+delete_failed = "移除 API 密钥失败"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Anthropic 的 Claude 和其他模型"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "通过 AWS Bedrock 使用模型"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "通过 Azure OpenAI 服务使用模型"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "通过 Claude Code CLI 使用模型"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "通过兼容 Copilot 的 API 运行模型"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "兼容 OpenAI 的 DeepSeek 提供方"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "来自 Google AI 的 Gemini 模型"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "通过 Gemini CLI 工具使用模型"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM 和兼容 Zhipu 的模型"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "使用 Groq 硬件进行快速推理"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM 代理和网关"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "通过兼容 OpenAI 的端点使用 Mistral API"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "运行本地 Ollama 模型"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT 和其他 OpenAI 模型"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "面向多个模型提供方的路由器"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx 推理端点"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok 模型"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "由 Together 托管的模型"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks 托管模型 API"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "兼容 OpenAI 的 Novita 端点"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API 模型"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere 兼容端点"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice 模型 API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras 模型 API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova 模型 API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic 托管模型"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "兼容 OpenAI 的 DeepInfra 端点"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF 路由器端点"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio 端点"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka 模型端点"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten 推理端点"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale 推理端点"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale 托管模型端点"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio 端点"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli 无服务器端点"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI 端点"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow 模型 API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API 端点"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI 模型 API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun 模型端点"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan 模型 API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi 模型 API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan 模型 API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI 端点"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM 端点"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "兼容 OpenAI 的 Synthetic 端点"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark 端点"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan 模型 API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "本地 LM Studio 兼容 OpenAI API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "本地 llama.cpp 兼容 OpenAI API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "本地 SGLang 兼容 OpenAI API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "本地 vLLM 兼容 OpenAI API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "本地 OSaurus 兼容 OpenAI API"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "通过 Kilo CLI 使用模型"
+
+[settings.screen]
+title = "设置"
+description = "管理应用偏好设置。"
+
+[settings.sidebar]
+back = "返回"
+general = "General"
+
+[settings.option.language]
+label = "应用语言"
+description = "选择界面使用的语言。"
+
+[settings.option.theme]
+label = "颜色主题"
+description = "选择偏好的外观模式。"
+
+[settings.language]
+system = "跟随系统"
+english = "英语"
+russian = "俄语"
+german = "德语"
+spanish = "西班牙语"
+french = "法语"
+hindi = "印地语"
+japanese = "日语"
+chinese = "中文"
+
+[settings.theme]
+system = "系统"
+light = "浅色"
+dark = "深色"
+
+[mcp.screen]
+title = "MCP"
+description = "当前空间的已安装 Model Context Protocol 服务器。"
+found_count = "已找到："
+
+[mcp.empty]
+title = "未安装任何 MCP 服务器"
+description = "安装新的 MCP 服务器，扩展智能体能力。"
+
+[mcp.dialog]
+install_title = "安装 MCP 服务器"
+install = "安装"
+uninstall_title = "卸载 %{name}？"
+uninstall_description = "从当前工作区移除此 MCP 服务器，并停止它的运行任务。"
+uninstall = "卸载"
+config_json = "JSON 配置"
+secret_store_hint = "env、headers、tokens 和 authorization 中的密钥值会存储在网关的密钥存储中。"
+
+[mcp.dialog.error]
+config_required = "必须填写 MCP JSON 配置"
+config_invalid = "MCP JSON 配置无效：%{error}"
+servers_required = "MCP JSON 配置必须包含 mcpServers 对象"
+servers_empty = "MCP JSON 配置必须至少包含一个服务器"
+server_name_empty = "MCP 服务器名称不能为空"
+server_config_object = "%{name}：服务器配置必须是对象"
+command_or_url_required = "%{name}：必须提供 command 或 url"
+command_url_exclusive = "%{name}：command 和 url 不能同时设置"
+gateway_not_connected = "网关未连接"
+workspace_not_selected = "未选择工作区"
+install_failed = "无法安装 MCP 服务器：%{error}"
+server_validation_error = "%{name}：验证错误"
+validation_failed = "MCP 配置验证失败"
+diagnostic = "%{name}：%{level}：%{message}%{field}"
+level_error = "错误"
+level_warning = "警告"
+
+[mcp.status]
+not_started = "未启动"
+disabled = "已禁用"
+starting = "启动中"
+ready = "就绪"
+degraded = "降级"
+auth_required = "需要授权"
+failed = "失败"
+stopping = "停止中"
+stopped = "已停止"
+restarting = "重启中"
+
+[mcp.capabilities]
+tools = "工具"
+resources = "资源"
+templates = "模板"
+prompts = "提示"
+
+[mcp.sidebar]
+install = "安装"
+refresh = "刷新"
+back = "返回"
+update_config = "更新"
+restart = "重启"
+uninstall = "卸载"
+
+[mcp.details]
+not_selected = "未选择 MCP 服务器"
+enabled = "已启用"
+implicit = "隐式"
+refresh = "刷新"
+source = "来源"
+scope = "范围"
+transport = "传输"
+loaded = "已加载"
+runtime = "运行时"
+live = "在线"
+last_seen = "最后活动"
+retry_attempt = "重试次数"
+next_retry = "下次重试"
+last_error = "最后错误"
+stderr = "stderr"
+health = "状态"
+tools = "工具"
+tools_count = "工具：%{count}"
+resources = "资源"
+resources_count = "资源：%{count}"
+resource_templates = "资源模板"
+templates_count = "模板：%{count}"
+prompts = "提示"
+prompts_count = "提示：%{count}"
+audit = "审计"
+audit_count = "审计事件：%{count}"
+source_config = "配置"
+scope_workspace = "工作区"
+scope_user = "用户"
+
+[mcp.audit]
+column_time = "时间"
+column_time_hint = "写入 MCP 审计事件的本地时间。"
+column_event = "事件"
+column_event_hint = "审计操作，以及存在时的原始 MCP 工具。"
+column_result = "结果"
+column_result_hint = "网关对此 MCP 事件的决策。"
+column_details = "详情"
+column_details_hint = "原因代码和紧凑事件详情。"
+reason_tooltip = "%{details}\n原因：%{reason}"
+action_install = "已安装"
+action_update = "已更新"
+action_uninstall = "已移除"
+action_policy = "策略已更改"
+action_start = "启动"
+action_started = "已启动"
+action_start_failed = "启动失败"
+action_stop = "停止"
+action_stopped = "已停止"
+action_restart = "重启"
+action_catalog_refreshed = "目录已刷新"
+action_call = "工具调用"
+action_call_completed = "调用已完成"
+action_call_failed = "调用失败"
+decision_allowed = "已允许"
+decision_blocked = "已阻止"
+decision_warning = "警告"
+
+[mcp.common]
+yes = "是"
+no = "否"
+none = "未指定"
+empty = "无详情"
+items_count = "项目：%{count}"
+keys_count = "键：%{count}"
+
+[mcp.error]
+server_name_required = "必须填写 MCP 服务器名称"
+gateway_not_connected = "网关未连接"
+workspace_not_selected = "未选择工作区"
+server_not_available = "当前工作区中没有可用的 MCP 服务器"
+load_servers_failed = "无法加载 MCP 服务器：%{error}"
+load_details_failed = "无法加载 MCP 服务器详情：%{error}"
+policy_update_failed = "无法更新 MCP 策略：%{error}"
+restart_failed = "无法重启 MCP 服务器：%{error}"
+uninstall_failed = "无法卸载 MCP 服务器：%{error}"
+
+[skills.screen]
+title = "技能"
+description = "当前空间的已安装技能。"
+installed_count = "已找到："
+
+[skills.empty]
+title = "未安装任何技能"
+description = "安装新技能，扩展智能体能力。"
+
+[skills.error]
+gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "No active workspace selected."
+load_failed = "Failed to load installed skills"
+path_required = "Path is required."
+invalid_skill_target = "Invalid skill target."
+install_failed = "Failed to install skill"
+update_failed = "Failed to update skill"
+uninstall_failed = "Failed to uninstall skill"
+policy_failed = "Failed to update skill policy"
+path_picker_failed = "Failed to open source picker"
+
+[skills.card]
+version = "版本"
+fingerprint = "指纹"
+
+[skills.status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[skills.button]
+install = "Install"
+update = "Update"
+uninstall = "Uninstall"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Preparing skill upload"
+installing = "Uploading skill"
+updating = "Uploading update"
+cancelling = "Cancelling upload"
+
+[skills.dialog]
+install_title = "Install Skill"
+update_title = "Update %{slug}"
+source_kind_description = "Choose a skill folder from disk."
+pick_folder = "Choose folder"
+pick_archive = "Choose archive"
+
+[skills.diagnostics]
+reason = "Reason:"
+validation = "Validation"
+dependencies = "Dependencies"
+dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
+dependencies_column_action = "What to do"
+dependencies_hint_requirement = "What this skill expects to find on your machine."
+dependencies_hint_status = "Current result of the dependency check."
+dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
+dependencies_kind_bin = "Command"
+dependencies_kind_env = "Environment variable"
+dependencies_kind_api_key = "API key"
+dependencies_kind_command = "Command"
+dependencies_kind_mcp = "MCP server"
+dependencies_kind_tool = "Dependency"
+dependencies_status_ready = "Ready"
+dependencies_status_missing = "Missing"
+dependencies_status_blocked = "Blocked"
+dependencies_status_warning = "Warning"
+dependencies_status_unknown = "Unknown"
+security = "Security"
+security_intro = "Potential risks found while scanning skill files."
+security_column_rule = "Rule"
+security_column_finding = "Finding"
+security_column_location = "Location"
+security_hint_level = "Severity of the security finding."
+security_hint_rule = "Identifier of the rule that triggered this finding."
+security_hint_finding = "What exactly was detected and why it matters."
+security_hint_location = "File path where the finding was detected."
+security_location_unknown = "Path not specified"
+security_severity_critical = "Critical"
+security_severity_high = "High"
+security_severity_medium = "Medium"
+security_severity_low = "Low"
+security_severity_info = "Info"
+trust_gate = "Trust gates"
+trust_gate_intro = "Permission decisions based on required trust level."
+trust_column_tool = "Tool type"
+trust_column_min_trust = "Required trust"
+trust_column_explanation = "Explanation"
+trust_hint_tool = "Which tool category this gate controls."
+trust_hint_min_trust = "Minimum trust level required to use this tool."
+trust_hint_decision = "Whether the tool use is currently allowed."
+trust_hint_explanation = "Simple reason for the current decision."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Allowed"
+trust_decision_blocked = "Blocked"
+trust_explanation_allowed = "Current trust level is enough."
+trust_explanation_blocked = "Blocked until trust level reaches"
+audit = "Recent audit"
+audit_intro = "Recent actions and checks related to this skill."
+audit_column_time = "When"
+audit_column_event = "Event"
+audit_column_result = "Result"
+audit_column_details = "Details"
+audit_hint_time = "When this event was recorded."
+audit_hint_event = "What happened with the skill."
+audit_hint_result = "Whether the action was allowed, blocked, or warned."
+audit_hint_details = "Reason and technical details behind the decision."
+audit_action_install = "Installed"
+audit_action_update = "Updated"
+audit_action_uninstall = "Removed"
+audit_action_resolve_allowed = "Resolved for prompt"
+audit_action_resolve_blocked = "Blocked on resolve"
+audit_action_runtime_allowed = "Allowed on runtime"
+audit_action_runtime_blocked = "Blocked on runtime"
+audit_action_security_warn = "Security warning"
+audit_decision_allowed = "Allowed"
+audit_decision_blocked = "Blocked"
+audit_decision_warning = "Warning"
+audit_reason_none = "No explicit reason"
+audit_details_empty = "No extra details"
+none = "none"
+empty_validation = "No validation issues found."
+empty_dependencies = "No dependency issues found."
+empty_security = "No security findings."
+empty_trust_gate = "No trust gate decisions."
+empty_audit = "No audit events yet."
+
+[skills.catalog]
+source = "来源"
+trust = "信任"
+
+[bottom_bar]
+gateway_disconnected = "网关已断开"
+starting_thread = "正在启动线程..."
+finishing_turn = "正在结束回合..."
+turn_running = "回合 `%{turn_id}` 正在运行"
+previous_turn_failed = "上一个回合失败。你可以发送新消息。"
+turn_cancelled = "回合已取消。你可以发送新消息。"
+turn_completed = "回合已完成。可以发送下一条消息。"
+ready = "就绪"
+starting_turn = "正在启动回合..."
+agent_processing = "Agent 正在处理..."
+
+[timeline.empty]
+start_thread = "发送消息以开始此线程"
+
+[timeline.elapsed]
+hours_minutes = "%{hours} 小时 %{minutes} 分"
+minutes_seconds = "%{minutes} 分 %{seconds} 秒"
+seconds = "%{seconds} 秒"
+
+[timeline.common]
+url_missing = "未提供链接"
+no_details = "无详情"
+truncated = "... [已截断]"
+
+[timeline.reasoning]
+summary = "摘要："
+content = "内容："
+running = "正在思考"
+completed = "已思考"
+
+[timeline.agent_message]
+subagent_completed = "子代理已回复"
+
+[timeline.work_group]
+completed = "已工作"
+
+[timeline.web_search]
+fallback_query = "网页搜索"
+running = "正在搜索网页"
+no_results = "没有搜索结果"
+results_count = "%{count} 个结果"
+
+[timeline.file_change]
+cancelled = "已取消"
+failed = "更改未应用"
+running = "正在应用更改"
+completed = "文件已更改"
+no_files = "未指定文件"
+one_file = "1 个文件"
+files_count = "%{count} 个文件"
+exit_code = "退出码："
+more_files = "还有 %{count} 个"
+output = "输出"
+
+[timeline.download]
+cancelled = "已取消"
+failed = "下载失败"
+running = "正在下载文件"
+completed = "文件已下载"
+size = "大小：%{size}"
+unit_b = "B"
+unit_kb = "KB"
+unit_mb = "MB"
+unit_gb = "GB"
+unit_tb = "TB"
+
+[timeline.web_fetch]
+cancelled = "已取消"
+failed = "打开失败"
+running = "正在打开链接"
+completed = "已加载"
+
+[timeline.tool]
+cancelled = "已取消"
+failed = "失败"
+running = "正在运行工具"
+completed = "已完成"
+arguments = "参数"
+result = "结果"
+open_mcp_server = "打开 MCP 服务器"
+started = "正在运行工具：%{tool_name}"
+started_kind = "正在运行工具：%{tool_name}（%{kind}）"
+finished = "工具 `%{tool_name}` 已完成"
+command = "命令：%{command}"
+cwd = "工作目录：%{cwd}"
+query = "查询：%{query}"
+url = "URL：%{url}"
+exit_code = "退出代码：%{exit_code}"
+duration_ms = "耗时：%{duration_ms} 毫秒"
+timed_out = "已超时"
+changed_files = "已更改文件："
+results = "结果数：%{count}"
+provider = "提供商：%{provider}"
+status_code = "状态码：%{status_code}"
+title = "标题：%{title}"
+path = "路径：%{path}"
+bytes = "字节数：%{bytes}"
+stage = "[阶段] %{value}"
+progress = "[进度] %{value}"
+stderr = "[错误] %{value}"
+
+[timeline.command]
+running = "正在执行命令"
+completed = "命令已完成"
+
+[timeline.system]
+info = "系统事件"
+warning = "警告"
+error = "错误"
+tool = "工具"
+attempt = "第 %{attempt} 次尝试"
+timeout_with_recovery = "步骤超时，已开始恢复"
+timeout_without_recovery = "步骤超时，自动恢复不可用"
+timeout_label = "超时"
+timeout_delta_recovery_scheduled = "[超时] 第 %{attempt} 次尝试 %{reason}；已计划恢复（job `%{job_id}`）"
+timeout_delta_no_recovery = "[超时] 第 %{attempt} 次尝试 %{reason}；无自动恢复"
+recovery_opened = "正在启动步骤恢复"
+recovery_attached = "恢复已关联到新步骤"
+retry_scheduled = "已计划恢复重试"
+retry_started = "已开始恢复重试"
+recovery_succeeded = "恢复已完成"
+recovery_failed = "恢复失败"
+recovery_label = "恢复"
+retry_label = "重试"
+recovered_label = "已恢复"
+tool_retry_scheduled = "正在重试 %{tool_name}"
+tool_retry_scheduled_with_attempt = "正在重试工具 %{tool_name}（第 %{attempt} 次）"
+tool_retry_resolved = "%{tool_name} 重试后已完成"
+tool_retry_exhausted = "%{tool_name} 多次重试后失败"
+retry_resolved_label = "重试已完成"
+retries_exhausted_label = "重试已耗尽"
+tool_loop_budget_exceeded = "已达到工具调用限制"
+code = "代码："

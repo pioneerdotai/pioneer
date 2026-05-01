@@ -1,0 +1,41 @@
+[package]
+name = "pioneer-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pioneer-agent.workspace = true
+pioneer-config.workspace = true
+pioneer-crud.workspace = true
+pioneer-migration.workspace = true
+pioneer-mcp.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-provider.workspace = true
+pioneer-skills.workspace = true
+pioneer-sqlite.workspace = true
+pioneer-tasks.workspace = true
+pioneer-tools.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+jsonwebtoken.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+markdown.workspace = true
+chrono.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+tiktoken-rs.workspace = true
+flate2.workspace = true
+tar.workspace = true
+sha2.workspace = true
+hex.workspace = true

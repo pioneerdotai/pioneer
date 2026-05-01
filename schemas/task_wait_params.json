@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskWaitParams",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "default": "all_terminal",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TaskWaitMode"
+        }
+      ]
+    },
+    "returnCompleted": {
+      "default": false,
+      "type": "boolean"
+    },
+    "returnPending": {
+      "default": false,
+      "type": "boolean"
+    },
+    "runIds": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "taskIds": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "timeoutMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "TaskWaitMode": {
+      "type": "string",
+      "enum": [
+        "all_terminal",
+        "any_terminal"
+      ]
+    }
+  }
+}

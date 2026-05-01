@@ -1,0 +1,25 @@
+[package]
+name = "pioneer-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+http.workspace = true
+process-wrap.workspace = true
+rmcp.workspace = true
+reqwest_0_13 = { package = "reqwest", version = "0.13.3", default-features = false, features = ["rustls"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum = "0.8"

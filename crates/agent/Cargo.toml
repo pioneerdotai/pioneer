@@ -1,0 +1,26 @@
+[package]
+name = "pioneer-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+pioneer-protocol.workspace = true
+pioneer-provider.workspace = true
+pioneer-skills.workspace = true
+pioneer-tools.workspace = true
+pioneer-promt.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["full"] }
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

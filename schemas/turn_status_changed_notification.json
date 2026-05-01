@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnStatusChangedNotification",
+  "type": "object",
+  "required": [
+    "status",
+    "thread_id",
+    "turn_id"
+  ],
+  "properties": {
+    "status": {
+      "$ref": "#/definitions/TurnStatus"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "InProgress",
+        "Completed",
+        "Failed",
+        "Interrupted"
+      ]
+    }
+  }
+}

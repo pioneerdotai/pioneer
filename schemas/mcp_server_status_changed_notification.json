@@ -1,0 +1,123 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpServerStatusChangedNotification",
+  "type": "object",
+  "required": [
+    "server",
+    "snapshot_version",
+    "workspace_id"
+  ],
+  "properties": {
+    "server": {
+      "$ref": "#/definitions/McpServerStatusItem"
+    },
+    "snapshot_version": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "required": [
+        "live",
+        "state"
+      ],
+      "properties": {
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/definitions/McpRuntimeState"
+        }
+      }
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpServerStatusItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "runtime",
+        "scope_kind",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "runtime": {
+          "$ref": "#/definitions/McpRuntimeStatus"
+        },
+        "scope_kind": {
+          "$ref": "#/definitions/McpScopeKind"
+        },
+        "status": {
+          "$ref": "#/definitions/McpServerStatus"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

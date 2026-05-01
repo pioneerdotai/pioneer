@@ -1,0 +1,1090 @@
+use super::*;
+use pioneer_protocol::{
+    McpInstallParams, McpListParams, McpPolicySetParams, SkillListParams, SkillsHealthParams,
+    SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
+    SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
+    TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
+    TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
+    TurnTimelineParams,
+};
+
+impl MessageProcessor {
+    pub async fn process_request(&self, connection_id: ConnectionId, payload: &str) {
+        let request_value = match serde_json::from_str::<JsonValue>(payload) {
+            Ok(value) => value,
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        PARSE_ERROR_CODE,
+                        "failed to parse JSON-RPC payload",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let request_id = parse_request_id(&request_value);
+
+        let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
+            Ok(request) => request,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        request_id,
+                        INVALID_REQUEST_CODE,
+                        format!("invalid JSON-RPC request: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if request.jsonrpc != JSONRPC_VERSION {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request.id),
+                    INVALID_REQUEST_CODE,
+                    format!("unsupported jsonrpc version `{}`", request.jsonrpc),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        match request.method.as_str() {
+            methods::WORKSPACE_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<WorkspaceListParams>(params_value) {
+                    Ok(params) => {
+                        self.workspace_list(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::WORKSPACE_LIST
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::WORKSPACE_CREATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<WorkspaceCreateParams>(params_value) {
+                    Ok(params) => {
+                        self.workspace_create(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::WORKSPACE_CREATE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::WORKSPACE_DEFAULT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<WorkspaceDefaultParams>(params_value) {
+                    Ok(params) => {
+                        self.workspace_default(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::WORKSPACE_DEFAULT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadStartParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_start(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::THREAD_START),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_TREE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadTreeParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_tree(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::THREAD_TREE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_MOVE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadMoveParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_move(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::THREAD_MOVE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_FOLDER_CREATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadFolderCreateParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_folder_create(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_FOLDER_CREATE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_FOLDER_MOVE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadFolderMoveParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_folder_move(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_FOLDER_MOVE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_FOLDER_DELETE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadFolderDeleteParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_folder_delete(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_FOLDER_DELETE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadGetParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_get(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::THREAD_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_HISTORY => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadHistoryParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_history(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_HISTORY
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TurnStartParams>(params_value) {
+                    Ok(params) => {
+                        self.turn_start(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_START),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                let params = if params_value.is_null() {
+                    Ok(TurnGetParams::default())
+                } else {
+                    serde_json::from_value::<TurnGetParams>(params_value)
+                };
+
+                match params {
+                    Ok(params) => {
+                        self.turn_get(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_ITEMS => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                let params = if params_value.is_null() {
+                    Ok(TurnItemsParams::default())
+                } else {
+                    serde_json::from_value::<TurnItemsParams>(params_value)
+                };
+
+                match params {
+                    Ok(params) => {
+                        self.turn_items(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_ITEMS),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_TIMELINE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                let params = if params_value.is_null() {
+                    Ok(TurnTimelineParams::default())
+                } else {
+                    serde_json::from_value::<TurnTimelineParams>(params_value)
+                };
+
+                match params {
+                    Ok(params) => {
+                        self.turn_timeline(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_TIMELINE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_UNSUBSCRIBE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadUnsubscribeParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_unsubscribe(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_UNSUBSCRIBE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::PROVIDER_LIST => {
+                self.provider_list(connection_id, request.id).await;
+            }
+            methods::PROVIDER_MODELS_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ProviderListModelsParams>(params_value) {
+                    Ok(params) => {
+                        self.provider_list_models(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::PROVIDER_MODELS_LIST
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::PROVIDER_SET_API_KEY => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ProviderSetApiKeyParams>(params_value) {
+                    Ok(params) => {
+                        self.provider_set_api_key(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::PROVIDER_SET_API_KEY
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::PROVIDER_DELETE_API_KEY => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ProviderDeleteApiKeyParams>(params_value) {
+                    Ok(params) => {
+                        self.provider_delete_api_key(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::PROVIDER_DELETE_API_KEY
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpListParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_list(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MCP_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_INSTALL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpInstallParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_install(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MCP_INSTALL),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_POLICY_SET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpPolicySetParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_policy_set(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MCP_POLICY_SET
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_SERVER_RESTART => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpServerRestartParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_server_restart(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MCP_SERVER_RESTART
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_UNINSTALL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpUninstallParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_uninstall(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MCP_UNINSTALL),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MCP_SERVER_DETAILS => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<McpServerDetailsParams>(params_value) {
+                    Ok(params) => {
+                        self.mcp_server_details(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MCP_SERVER_DETAILS
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillListParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_list(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::SKILLS_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_INSTALL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsInstallParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_install(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_INSTALL
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_UPDATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsUpdateParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_update(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::SKILLS_UPDATE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_UNINSTALL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsUninstallParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_uninstall(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_UNINSTALL
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_UPLOAD_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsUploadStartParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_upload_start(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_UPLOAD_START
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_UPLOAD_FINISH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsUploadFinishParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_upload_finish(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_UPLOAD_FINISH
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_UPLOAD_ABORT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsUploadAbortParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_upload_abort(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_UPLOAD_ABORT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_HEALTH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsHealthParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_health(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::SKILLS_HEALTH),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_POLICY_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsPolicyListParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_policy_list(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_POLICY_LIST
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SKILLS_POLICY_SET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<SkillsPolicySetParams>(params_value) {
+                    Ok(params) => {
+                        self.skills_policy_set(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SKILLS_POLICY_SET
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_CREATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskCreateParams>(params_value) {
+                    Ok(params) => self.task_create(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_CREATE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskGetParams>(params_value) {
+                    Ok(params) => self.task_get(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskListParams>(params_value) {
+                    Ok(params) => self.task_list(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_TREE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskTreeTaskParams>(params_value) {
+                    Ok(params) => self.task_tree(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_TREE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_EVENTS => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskEventsParams>(params_value) {
+                    Ok(params) => self.task_events(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_EVENTS),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_WAIT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskWaitParams>(params_value) {
+                    Ok(params) => self.task_wait(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_WAIT),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_CANCEL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskCancelParams>(params_value) {
+                    Ok(params) => self.task_cancel(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_CANCEL),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_RESCHEDULE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskRescheduleParams>(params_value) {
+                    Ok(params) => {
+                        self.task_reschedule(connection_id, request.id, params)
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::TASK_RESCHEDULE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_PAUSE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskPauseParams>(params_value) {
+                    Ok(params) => self.task_pause(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_PAUSE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_RESUME => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskResumeParams>(params_value) {
+                    Ok(params) => self.task_resume(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_RESUME),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_AGENDA => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskAgendaParams>(params_value) {
+                    Ok(params) => self.task_agenda(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_AGENDA),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_DELIVERIES => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskDeliveriesParams>(params_value) {
+                    Ok(params) => {
+                        self.task_deliveries(connection_id, request.id, params)
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::TASK_DELIVERIES
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_DETACH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskDetachParams>(params_value) {
+                    Ok(params) => self.task_detach(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_DETACH),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request.id),
+                        METHOD_NOT_FOUND_CODE,
+                        format!("method `{}` is not supported", request.method),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub async fn connection_closed(&self, connection_id: ConnectionId) {
+        let removed_thread_ids = self.thread_manager.connection_closed(connection_id).await;
+        if removed_thread_ids.is_empty() {
+            return;
+        }
+
+        for thread_id in &removed_thread_ids {
+            self.teardown_agent_thread(thread_id).await;
+        }
+
+        debug!(
+            connection_id,
+            removed_thread_ids = ?removed_thread_ids,
+            "removed detached idle threads after connection closed"
+        );
+    }
+}

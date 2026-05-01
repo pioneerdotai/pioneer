@@ -1,0 +1,10 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpInstallResultStatus",
+  "type": "string",
+  "enum": [
+    "installed",
+    "updated",
+    "validation_error"
+  ]
+}

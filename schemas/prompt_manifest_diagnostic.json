@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PromptManifestDiagnostic",
+  "type": "object",
+  "required": [
+    "code",
+    "message"
+  ],
+  "properties": {
+    "code": {
+      "$ref": "#/definitions/PromptManifestDiagnosticCode"
+    },
+    "file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "PromptManifestDiagnosticCode": {
+      "type": "string",
+      "enum": [
+        "missing_file",
+        "file_read_error",
+        "file_truncated",
+        "total_budget_truncated",
+        "file_filtered_by_profile"
+      ]
+    }
+  }
+}

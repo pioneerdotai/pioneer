@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpChangedNotification",
+  "type": "object",
+  "required": [
+    "snapshot_version",
+    "workspace_id"
+  ],
+  "properties": {
+    "changed": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/McpChangedItem"
+      }
+    },
+    "snapshot_version": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "McpChangedAction": {
+      "type": "string",
+      "enum": [
+        "install",
+        "policy",
+        "update",
+        "uninstall"
+      ]
+    },
+    "McpChangedItem": {
+      "type": "object",
+      "required": [
+        "action",
+        "name",
+        "source_kind"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/McpChangedAction"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "$ref": "#/definitions/McpSourceKind"
+        }
+      }
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRetryBudgetUsage",
+  "type": "object",
+  "required": [
+    "kind",
+    "limit",
+    "used"
+  ],
+  "properties": {
+    "kind": {
+      "$ref": "#/definitions/ToolRetryBudgetKind"
+    },
+    "limit": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "used": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "ToolRetryBudgetKind": {
+      "type": "string",
+      "enum": [
+        "episode",
+        "error_class",
+        "tool_name",
+        "failure_signature"
+      ]
+    }
+  }
+}

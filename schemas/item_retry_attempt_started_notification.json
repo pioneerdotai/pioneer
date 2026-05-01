@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ItemRetryAttemptStartedNotification",
+  "type": "object",
+  "required": [
+    "attempt_number",
+    "item_id",
+    "item_type",
+    "recovery_job_id",
+    "thread_id",
+    "turn_id",
+    "workspace_id"
+  ],
+  "properties": {
+    "attempt_number": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "item_id": {
+      "type": "string"
+    },
+    "item_type": {
+      "$ref": "#/definitions/TurnItemType"
+    },
+    "recovery_job_id": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TurnItemType": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "agent_message",
+        "reasoning",
+        "system_event",
+        "task",
+        "command_execution",
+        "file_change",
+        "web_search",
+        "web_fetch",
+        "download",
+        "dynamic_tool_call"
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolMetadataRawKind",
+  "type": "string",
+  "enum": [
+    "content",
+    "body",
+    "blob",
+    "base64",
+    "bytes",
+    "data",
+    "html",
+    "image",
+    "output",
+    "screenshot",
+    "stdout",
+    "stderr",
+    "text",
+    "unknown"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpChangedItem",
+  "type": "object",
+  "required": [
+    "action",
+    "name",
+    "source_kind"
+  ],
+  "properties": {
+    "action": {
+      "$ref": "#/definitions/McpChangedAction"
+    },
+    "name": {
+      "type": "string"
+    },
+    "source_kind": {
+      "$ref": "#/definitions/McpSourceKind"
+    }
+  },
+  "definitions": {
+    "McpChangedAction": {
+      "type": "string",
+      "enum": [
+        "install",
+        "policy",
+        "update",
+        "uninstall"
+      ]
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    }
+  }
+}

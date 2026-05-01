@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDeliveryMode",
+  "type": "string",
+  "enum": [
+    "none",
+    "owner_thread",
+    "thread",
+    "user_notification",
+    "webhook"
+  ]
+}

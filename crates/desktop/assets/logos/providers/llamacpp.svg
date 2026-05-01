@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" rx="18" fill="#292524"/>
+  <!-- Stylized llama head/neck outline -->
+  <!-- body -->
+  <ellipse cx="50" cy="68" rx="22" ry="16" fill="#78716c"/>
+  <!-- neck -->
+  <rect x="42" y="42" width="16" height="28" rx="8" fill="#78716c"/>
+  <!-- head -->
+  <ellipse cx="50" cy="36" rx="14" ry="12" fill="#a8a29e"/>
+  <!-- ear left -->
+  <ellipse cx="40" cy="26" rx="5" ry="8" fill="#a8a29e" transform="rotate(-15 40 26)"/>
+  <!-- ear right -->
+  <ellipse cx="60" cy="26" rx="5" ry="8" fill="#a8a29e" transform="rotate(15 60 26)"/>
+  <!-- eye -->
+  <circle cx="45" cy="35" r="2.5" fill="#1c1917"/>
+  <circle cx="55" cy="35" r="2.5" fill="#1c1917"/>
+  <!-- .cpp text hint -->
+  <text x="50" y="95" font-family="monospace" font-size="10" fill="#78716c" text-anchor="middle">.cpp</text>
+</svg>

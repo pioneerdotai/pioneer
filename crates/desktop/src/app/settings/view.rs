@@ -1,0 +1,280 @@
+use crate::{
+    app::root::{PioneerDesktop, SettingsContentView},
+    assets::PioneerIconName,
+    components::buttonts::small_outline_button,
+    settings::{self, AppLanguagePreference, WindowThemePreference},
+};
+use gpui::{prelude::*, *};
+use gpui_component::{
+    button::*,
+    popover::{Popover, PopoverState},
+    theme::ActiveTheme,
+    *,
+};
+
+const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
+
+const LANGUAGE_OPTIONS: [AppLanguagePreference; 9] = [
+    AppLanguagePreference::System,
+    AppLanguagePreference::English,
+    AppLanguagePreference::Russian,
+    AppLanguagePreference::German,
+    AppLanguagePreference::Spanish,
+    AppLanguagePreference::French,
+    AppLanguagePreference::Hindi,
+    AppLanguagePreference::Japanese,
+    AppLanguagePreference::Chinese,
+];
+
+impl PioneerDesktop {
+    pub(crate) fn render_settings(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        match self.settings_content_view {
+            SettingsContentView::General => self.render_settings_general(cx),
+        }
+    }
+
+    fn render_settings_general(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected_language = settings::app_language(cx);
+        let selected_theme = settings::window_theme(cx);
+        let desktop_entity = cx.entity().clone();
+
+        v_flex()
+            .id("settings-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_6()
+            .bg(cx.theme().background)
+            .child(
+                h_flex().w_full().justify_center().child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH_PX))
+                        .gap_6()
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_semibold()
+                                        .child(t!("settings.screen.title").to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .opacity(0.6)
+                                        .child(t!("settings.screen.description").to_string()),
+                                ),
+                        )
+                        .child(Self::render_locale_setting(
+                            selected_language,
+                            desktop_entity.clone(),
+                            cx,
+                        ))
+                        .child(Self::render_theme_setting(
+                            selected_theme,
+                            desktop_entity,
+                            cx,
+                        )),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_locale_setting(
+        selected_language: AppLanguagePreference,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_label = Self::language_option_label(selected_language);
+
+        v_flex()
+            .w_full()
+            .gap_6()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .gap_6()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("settings.option.language.label").to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(t!("settings.option.language.description").to_string()),
+                            ),
+                    )
+                    .child(
+                        Popover::new("settings-language-popover")
+                            .anchor(Corner::TopRight)
+                            .p_0()
+                            .trigger(
+                                small_outline_button("settings-language-trigger").child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_1()
+                                        .child(div().text_sm().child(selected_label))
+                                        .child(Icon::new(IconName::ChevronsUpDown).size_3p5()),
+                                ),
+                            )
+                            .content(move |_, _, popover_cx| {
+                                let popover_entity: Entity<PopoverState> = popover_cx.entity();
+
+                                v_flex().children(LANGUAGE_OPTIONS.iter().enumerate().map(
+                                    |(index, option)| {
+                                        let option = *option;
+
+                                        let option_label = Self::language_option_label(option);
+                                        let is_selected = option == selected_language;
+
+                                        let desktop_entity = desktop_entity.clone();
+                                        let popover_entity = popover_entity.clone();
+
+                                        Button::new(("settings-language-option", index))
+                                            .ghost()
+                                            .small()
+                                            .rounded_none()
+                                            .h_7()
+                                            .justify_start()
+                                            .selected(is_selected)
+                                            .label(option_label)
+                                            .on_click(move |_, window, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.apply_language_setting(option, cx);
+                                                    cx.notify();
+                                                });
+                                                let _ = popover_entity.update(cx, |popover, cx| {
+                                                    popover.dismiss(window, cx);
+                                                });
+                                            })
+                                    },
+                                ))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_theme_setting(
+        selected_theme: WindowThemePreference,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let options = [
+            (
+                WindowThemePreference::System,
+                t!("settings.theme.system").to_string(),
+            ),
+            (
+                WindowThemePreference::Light,
+                t!("settings.theme.light").to_string(),
+            ),
+            (
+                WindowThemePreference::Dark,
+                t!("settings.theme.dark").to_string(),
+            ),
+        ];
+        let preferences = [
+            WindowThemePreference::System,
+            WindowThemePreference::Light,
+            WindowThemePreference::Dark,
+        ];
+
+        v_flex()
+            .w_full()
+            .gap_6()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .gap_6()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("settings.option.theme.label").to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(t!("settings.option.theme.description").to_string()),
+                            ),
+                    )
+                    .child(
+                        ButtonGroup::new("settings-theme-group")
+                            .children(options.into_iter().enumerate().map(
+                                |(index, (preference, label))| {
+                                    let is_selected = selected_theme == preference;
+
+                                    small_outline_button(("settings-theme-option", index))
+                                        .selected(is_selected)
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Self::theme_icon(preference))
+                                                .child(div().text_sm().child(label)),
+                                        )
+                                },
+                            ))
+                            .on_click(move |selected_indices, window, cx| {
+                                let Some(index) = selected_indices.first().copied() else {
+                                    return;
+                                };
+                                let Some(preference) = preferences.get(index).copied() else {
+                                    return;
+                                };
+
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.apply_theme_setting(preference, window, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn theme_icon(preference: WindowThemePreference) -> AnyElement {
+        match preference {
+            WindowThemePreference::System => Icon::new(PioneerIconName::SunMoon)
+                .size_3p5()
+                .into_any_element(),
+            WindowThemePreference::Light => Icon::new(IconName::Sun).size_3p5().into_any_element(),
+            WindowThemePreference::Dark => Icon::new(IconName::Moon).size_3p5().into_any_element(),
+        }
+    }
+
+    fn language_option_label(language: AppLanguagePreference) -> String {
+        match language {
+            AppLanguagePreference::System => t!("settings.language.system").to_string(),
+            AppLanguagePreference::English => t!("settings.language.english").to_string(),
+            AppLanguagePreference::Russian => t!("settings.language.russian").to_string(),
+            AppLanguagePreference::German => t!("settings.language.german").to_string(),
+            AppLanguagePreference::Spanish => t!("settings.language.spanish").to_string(),
+            AppLanguagePreference::French => t!("settings.language.french").to_string(),
+            AppLanguagePreference::Hindi => t!("settings.language.hindi").to_string(),
+            AppLanguagePreference::Japanese => t!("settings.language.japanese").to_string(),
+            AppLanguagePreference::Chinese => t!("settings.language.chinese").to_string(),
+        }
+    }
+}

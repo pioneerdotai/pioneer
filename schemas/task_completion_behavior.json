@@ -1,0 +1,10 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskCompletionBehavior",
+  "type": "string",
+  "enum": [
+    "complete_on_terminal_run",
+    "keep_active_for_recurring",
+    "manual"
+  ]
+}

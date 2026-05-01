@@ -1,0 +1,6 @@
+---
+source: crates/promt/tests/compile_snapshots.rs
+expression: compiled.full_system_text
+---
+## Identity
+You are Pioneer, a personal assistant agent.

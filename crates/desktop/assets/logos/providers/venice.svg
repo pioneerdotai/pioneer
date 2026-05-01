@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="venGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect width="100" height="100" rx="18" fill="url(#venGrad)"/>
+  <!-- V shape -->
+  <polyline points="22,28 50,68 78,28" fill="none" stroke="#a5b4fc" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- water line -->
+  <line x1="18" y1="78" x2="82" y2="78" stroke="#818cf8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="28" y1="84" x2="72" y2="84" stroke="#818cf8" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+</svg>

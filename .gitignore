@@ -1,0 +1,10 @@
+# Local
+.DS_Store
+config/local.toml
+
+# Builds
+target
+
+# Environment
+.env
+.env.local

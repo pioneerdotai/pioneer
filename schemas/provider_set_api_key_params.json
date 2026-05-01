@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProviderSetApiKeyParams",
+  "type": "object",
+  "required": [
+    "api_key",
+    "provider"
+  ],
+  "properties": {
+    "api_key": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    }
+  }
+}

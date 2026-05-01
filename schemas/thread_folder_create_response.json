@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ThreadFolderCreateResponse",
+  "type": "object",
+  "required": [
+    "folder"
+  ],
+  "properties": {
+    "folder": {
+      "$ref": "#/definitions/ThreadFolder"
+    }
+  },
+  "definitions": {
+    "ThreadFolder": {
+      "type": "object",
+      "required": [
+        "created_at",
+        "id",
+        "name",
+        "updated_at",
+        "workspace_id"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parent_folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

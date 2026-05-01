@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRetryExhaustionKind",
+  "type": "string",
+  "enum": [
+    "total_retry_rounds",
+    "error_class",
+    "tool_name",
+    "failure_signature"
+  ]
+}

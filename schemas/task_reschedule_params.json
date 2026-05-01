@@ -1,0 +1,384 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskRescheduleParams",
+  "type": "object",
+  "required": [
+    "taskId",
+    "trigger"
+  ],
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "trigger": {
+      "$ref": "#/definitions/TaskTriggerInput"
+    }
+  },
+  "definitions": {
+    "TaskDependencyTriggerMode": {
+      "type": "string",
+      "enum": [
+        "all_succeeded",
+        "any_succeeded",
+        "all_terminal"
+      ]
+    },
+    "TaskDependencyTriggerPolicy": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "dependsOnTaskIds": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/definitions/TaskDependencyTriggerMode"
+        }
+      }
+    },
+    "TaskExternalTriggerFilter": {
+      "type": "object",
+      "properties": {
+        "expression": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/TaskValue"
+          }
+        }
+      }
+    },
+    "TaskManualActor": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "workspace_member",
+        "system",
+        "any"
+      ]
+    },
+    "TaskTriggerInput": {
+      "type": "object",
+      "required": [
+        "spec"
+      ],
+      "properties": {
+        "spec": {
+          "$ref": "#/definitions/TaskTriggerSpec"
+        }
+      }
+    },
+    "TaskTriggerSpec": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "immediate"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "scheduled_at"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "scheduled_at"
+              ]
+            },
+            "scheduled_at": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "timezone": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "interval_seconds",
+            "kind"
+          ],
+          "properties": {
+            "interval_anchor_at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "interval_seconds": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "interval"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cron_expr",
+            "kind",
+            "timezone"
+          ],
+          "properties": {
+            "cron_expr": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cron"
+              ]
+            },
+            "timezone": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "allowed_actor": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TaskManualActor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "manual"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "source"
+          ],
+          "properties": {
+            "event_type": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "filter": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TaskExternalTriggerFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "external"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "policy"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "dependency"
+              ]
+            },
+            "policy": {
+              "$ref": "#/definitions/TaskDependencyTriggerPolicy"
+            }
+          }
+        }
+      ]
+    },
+    "TaskValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "integer"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "string"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/TaskValue"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/TaskValue"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

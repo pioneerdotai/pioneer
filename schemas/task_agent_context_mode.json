@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgentContextMode",
+  "type": "string",
+  "enum": [
+    "inherit_parent",
+    "last_n_turns",
+    "summary_only",
+    "empty",
+    "custom"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxPolicy",
+  "type": "object",
+  "required": [
+    "mode"
+  ],
+  "properties": {
+    "mode": {
+      "$ref": "#/definitions/SandboxMode"
+    }
+  },
+  "definitions": {
+    "SandboxMode": {
+      "type": "string",
+      "enum": [
+        "FullAccess"
+      ]
+    }
+  }
+}

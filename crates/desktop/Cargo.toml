@@ -1,0 +1,44 @@
+[package]
+name = "pioneer-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pioneer-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+pioneer-config.workspace = true
+pioneer-gateway.workspace = true
+pioneer-protocol.workspace = true
+pioneer-skills.workspace = true
+pioneer-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+gpui.workspace = true
+gpui-terminal.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+rust-i18n.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+sys-locale.workspace = true
+rust-embed.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+flate2.workspace = true
+tar.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[package.metadata.i18n]
+available-locales = ["en", "ru", "zh", "hi", "es", "de", "fr", "jp"]
+default-locale = "en"
+load-path = "locales"

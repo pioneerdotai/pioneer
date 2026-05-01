@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRetryErrorClass",
+  "type": "string",
+  "enum": [
+    "invalid_arguments",
+    "not_found",
+    "permission_denied",
+    "command_not_found",
+    "timeout",
+    "cancelled",
+    "execution_failed",
+    "needs_narrowing",
+    "internal",
+    "output_truncated",
+    "unknown"
+  ]
+}

@@ -1,0 +1,182 @@
+use crate::{
+    app::root::{MainContentView, PioneerDesktop, SettingsContentView},
+    assets::PioneerIconName,
+};
+use gpui::{prelude::*, *};
+use gpui_component::{Icon, button::*, popover::Popover, theme::ActiveTheme, *};
+
+impl PioneerDesktop {
+    pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_threads_view_active = self.main_content_view == MainContentView::Threads;
+        let is_providers_view_active = self.main_content_view == MainContentView::Providers;
+        let is_settings_view_active = self.main_content_view == MainContentView::Settings;
+        let is_mcp_view_active = matches!(
+            self.main_content_view,
+            MainContentView::Mcp | MainContentView::McpDetails
+        );
+        let is_skills_view_active = matches!(
+            self.main_content_view,
+            MainContentView::Skills | MainContentView::SkillDetails
+        );
+        let show_status_button = self.should_show_active_thread_status();
+
+        h_flex()
+            .justify_between()
+            .items_center()
+            .px_2()
+            .h_8()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(
+                        Button::new("bottom-bar-open-threads")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::FolderTree)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_threads_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Threads {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.set_main_content_view(MainContentView::Threads, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("bottom-bar-open-providers")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(IconName::Bot)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_providers_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Providers {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.open_providers_screen_from_bottom_bar(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("bottom-bar-open-mcp")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Mcp)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_mcp_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Mcp {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.open_mcp_screen_from_bottom_bar(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("bottom-bar-open-skills")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Zap)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_skills_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Skills {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.open_skills_screen_from_bottom_bar(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("bottom-bar-open-settings")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Bolt)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_settings_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Settings {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.open_settings_content_from_sidebar(
+                                        SettingsContentView::General,
+                                        cx,
+                                    );
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(if show_status_button {
+                self.render_active_thread_status_button()
+            } else {
+                div().into_any_element()
+            })
+            .into_any_element()
+    }
+
+    fn render_active_thread_status_button(&self) -> AnyElement {
+        let status_text = self.active_thread_status_text();
+
+        Popover::new("active-thread-status-popover")
+            .anchor(Corner::BottomRight)
+            .trigger(
+                Button::new("active-thread-status-trigger")
+                    .ghost()
+                    .small()
+                    .compact()
+                    .child(
+                        Icon::new(PioneerIconName::MessageCircle)
+                            .size_3p5()
+                            .opacity(0.6),
+                    ),
+            )
+            .content(move |_, _, _| {
+                v_flex().w(px(320.)).gap_2().p_1().child(
+                    div()
+                        .text_xs()
+                        .line_height(relative(1.15))
+                        .whitespace_normal()
+                        .child(status_text.clone()),
+                )
+            })
+            .into_any_element()
+    }
+}

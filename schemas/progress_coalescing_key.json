@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProgressCoalescingKey",
+  "type": "object",
+  "required": [
+    "item_id",
+    "stream",
+    "thread_id",
+    "turn_id",
+    "workspace_id"
+  ],
+  "properties": {
+    "item_id": {
+      "type": "string"
+    },
+    "stream": {
+      "$ref": "#/definitions/ItemDeltaStream"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "ItemDeltaStream": {
+      "type": "string",
+      "enum": [
+        "agent_message",
+        "stdout",
+        "stderr",
+        "tool_progress",
+        "file_change",
+        "generic"
+      ]
+    }
+  }
+}

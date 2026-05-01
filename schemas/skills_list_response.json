@@ -1,0 +1,236 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillListResponse",
+  "type": "object",
+  "required": [
+    "generated_at",
+    "snapshot_version"
+  ],
+  "properties": {
+    "generated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "skills": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SkillListItem"
+      }
+    },
+    "snapshot_version": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "required": [
+        "hint",
+        "kind",
+        "name",
+        "status"
+      ],
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "SkillHealthSummary": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "dependency_failures": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SkillDependencyDiagnostic"
+          }
+        },
+        "security_blocks": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SkillSecurityFinding"
+          }
+        },
+        "status": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SkillValidationDiagnostic"
+          }
+        }
+      }
+    },
+    "SkillInstallState": {
+      "type": "object",
+      "required": [
+        "installed",
+        "managed"
+      ],
+      "properties": {
+        "install_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "SkillListItem": {
+      "type": "object",
+      "required": [
+        "description",
+        "display_name",
+        "fingerprint",
+        "health",
+        "install",
+        "policy",
+        "slug",
+        "source_kind",
+        "status",
+        "trust_level"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/definitions/SkillHealthSummary"
+        },
+        "install": {
+          "$ref": "#/definitions/SkillInstallState"
+        },
+        "policy": {
+          "$ref": "#/definitions/SkillPolicyState"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SkillPolicyState": {
+      "type": "object",
+      "required": [
+        "allow_implicit_invocation",
+        "enabled"
+      ],
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "required": [
+        "message",
+        "rule_id",
+        "severity"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      }
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "required": [
+        "code",
+        "level",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

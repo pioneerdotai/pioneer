@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnTimelineChangedReason",
+  "type": "string",
+  "enum": [
+    "parent_turn_changed",
+    "task_event_changed",
+    "child_turn_changed",
+    "collapse_state_hint_changed"
+  ]
+}

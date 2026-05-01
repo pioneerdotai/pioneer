@@ -1,0 +1,167 @@
+home_directory = ".pioneer"
+install_state_file_name = "install-state.toml"
+
+[gateway]
+settings_version = 1
+settings_file_name = "gateway-settings.toml"
+service_name = "com.pioneer.gateway"
+listen_addr = "127.0.0.1:8787"
+outbound_queue_capacity = 128
+
+[gateway.thread]
+default_model = "google/gemini-3-flash-preview"
+default_model_provider = "openrouter"
+max_context_tokens = 128000
+response_reserve_tokens = 16000
+# summary_model = "gpt-5.4" — if omitted, uses thread's model
+# summary_model_provider = "openai" — if omitted, uses thread's model
+# title_model = "gpt-5.4" — if omitted, uses thread's model
+# title_model_provider = "openai" — if omitted, uses thread's model
+
+[gateway.tools.web]
+default_timeout_ms = 20000
+hard_max_timeout_ms = 120000
+default_fetch_max_bytes = 2097152
+hard_fetch_max_bytes = 8388608
+default_download_max_bytes = 134217728
+hard_download_max_bytes = 1073741824
+default_max_results = 8
+hard_max_results = 20
+default_snippet_chars = 420
+hard_max_snippet_chars = 4096
+default_link_count = 40
+hard_link_count = 200
+default_render_max_chars = 40000
+ddg_html_search_url = "https://duckduckgo.com/html/"
+ddg_instant_api_url = "https://api.duckduckgo.com/"
+default_user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+[gateway.tools.computer_use]
+artifacts_subdir = "tools/computer_use"
+retention_hours = 24
+max_total_bytes = 1073741824
+run_max_steps_default = 300
+snapshot_transport_max_bytes = 8388608
+snapshot_transport_max_side_px = 1280
+snapshot_transport_min_side_px = 320
+snapshot_downscale_factor = 0.85
+max_consecutive_same_snapshot_hash = 6
+max_consecutive_same_action_signature = 8
+max_consecutive_no_progress_steps = 4
+max_recovery_attempts_per_step = 2
+max_recovery_attempts_per_run = 12
+
+[gateway.tools.budget]
+max_agent_rounds_per_turn = 512
+max_tool_calls_per_turn = 2048
+
+[gateway.tools.retry]
+max_recoverable_retry_rounds_per_episode = 32
+max_same_tool_error_retries_per_episode = 3
+max_retries_per_tool_name_per_episode = 16
+
+[gateway.skills]
+enabled = true
+max_skills_per_source = 256
+max_skill_file_bytes = 1048576
+prompt_max_chars = 24000
+allow_implicit_invocation = false
+
+[gateway.skills.paths]
+system = ["{homeDirectory}/skills/system"]
+user = ["{homeDirectory}/skills/user"]
+workspace = ["{homeDirectory}/skills/workspace/{workspaceId}"]
+registry = ["{homeDirectory}/skills/registry"]
+
+[gateway.skills.validation]
+strict_agentskills = true
+accept_openclaw_profile = true
+
+[gateway.skills.security]
+allow_untrusted_install = true
+min_trust_for_shell_tools = "untrusted"
+min_trust_for_http_tools = "untrusted"
+min_trust_for_function_proxy_tools = "untrusted"
+max_install_archive_compressed_bytes = 10485760
+max_install_archive_uncompressed_bytes = 52428800
+max_install_archive_entries = 2048
+max_install_file_bytes = 1048576
+upload_ttl_secs = 3600
+upload_recommended_chunk_size_bytes = 262144
+upload_max_chunk_size_bytes = 1048576
+
+[gateway.skills.dependencies]
+preflight_on_resolve = true
+runtime_recheck_on_tool_call = true
+
+[gateway.skills.runtime]
+enable_dynamic_tools = true
+enable_read_skill = true
+max_dynamic_tools_per_skill = 64
+read_skill_max_chars = 24000
+compact_mode_threshold = 6
+allow_shell_tools = true
+allow_http_tools = true
+allow_function_proxy_tools = true
+
+[gateway.provider]
+default_timeout_secs = 120
+
+[gateway.provider.attachments]
+max_bytes_per_attachment = 104857600
+max_total_bytes_per_request = 209715200
+max_attachments_per_request = 64
+upload_preferred_min_bytes = 524288
+upload_registry_enabled = true
+upload_registry_ttl_secs = 604800
+enforce_path_allowlist = false
+allowed_path_roots = []
+allow_url_sources = true
+allow_http = false
+allow_private_network = false
+max_url_redirects = 3
+url_fetch_timeout_ms = 15000
+url_fetch_max_bytes = 20971520
+url_allowed_domains = []
+url_blocked_domains = ["localhost"]
+security_dry_run = false
+strict_mime_match = false
+max_base64_chars = 209715200
+max_filename_chars = 128
+retry_max_attempts = 3
+retry_initial_backoff_ms = 200
+retry_max_backoff_ms = 2000
+retry_jitter_ms = 80
+circuit_breaker_failure_threshold = 5
+circuit_breaker_open_ms = 30000
+
+[gateway.database]
+file_name = "gateway.db"
+max_connections = 1
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+idle_timeout_ms = 30000
+sqlx_logging = false
+run_migrations_on_startup = true
+
+[gateway.auth]
+jwt_issuer = "pioneer"
+jwt_audience = "pioneer-clients"
+superuser_subject = "superuser"
+superuser_role = "superuser"
+secret_size_bytes = 64
+token_ttl_seconds = 31536000
+token_refresh_leeway_seconds = 86400
+
+[desktop.gateway]
+connect_timeout_ms = 300
+startup_timeout_ms = 10000
+poll_interval_ms = 200
+ws_ping_interval_ms = 10000
+ws_pong_timeout_ms = 30000
+ws_reconnect_initial_ms = 500
+ws_reconnect_max_ms = 10000
+ws_reconnect_jitter_percent = 20
+registry_file_name = "gateway-registry.toml"
+local_gateway_id = "local"
+registry_version = 1

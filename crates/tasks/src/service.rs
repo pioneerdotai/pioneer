@@ -1,0 +1,1722 @@
+use crate::TaskRuntimeResult;
+use crate::event_bus::{TaskEventBus, TaskEventFilter};
+use crate::executor::{
+    TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
+};
+use crate::policy::{
+    TaskCreateContext, TaskMutationContext, TaskWaitContext, default_delivery_policy,
+    default_lifecycle_policy, default_retry_policy,
+};
+use crate::projector::TaskProjector;
+use crate::reconciliation::TaskStartupReconciler;
+use crate::scheduler::TaskScheduler;
+use crate::trigger::TaskTriggerCalculator;
+use anyhow::{anyhow, bail};
+use pioneer_crud::{AppendedTaskEvent, CrudStore};
+use pioneer_protocol::{
+    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec, TaskAgentWriteMode,
+    TaskAttachmentMode, TaskCancelParams, TaskCancelResponse, TaskCancelScope,
+    TaskConcurrencyConflictPolicy, TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskDeliveryAttemptStatus,
+    TaskDeliveryMode, TaskDeliveryStatus, TaskDetachParams, TaskDetachResponse, TaskError,
+    TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind,
+    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskListResponse,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse,
+    TaskRescheduleParams, TaskRescheduleResponse, TaskResumeParams, TaskResumeResponse, TaskRun,
+    TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams, TaskTreeResponse, TaskTrigger,
+    TaskTriggerKind, TaskTriggerStatus, TaskWaitItem, TaskWaitMode, TaskWaitParams,
+    TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
+    TaskWriteLockStatus, generate_id,
+};
+use std::collections::VecDeque;
+use std::path::{Component, Path};
+use std::sync::{Arc, Weak};
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
+
+const ID_LEN: usize = 21;
+const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
+const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
+
+pub struct TaskRuntime {
+    service: Arc<TaskService>,
+    scheduler: Arc<TaskScheduler>,
+    event_bus: Arc<TaskEventBus>,
+    executors: Arc<TaskExecutorRegistry>,
+    reconciler: Arc<TaskStartupReconciler>,
+    scheduler_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TaskRuntime {
+    pub fn new(store: Arc<CrudStore>) -> Self {
+        let event_bus = Arc::new(TaskEventBus::new());
+        let executors = Arc::new(TaskExecutorRegistry::new());
+        let service = Arc::new(TaskService::new(
+            store.clone(),
+            event_bus.clone(),
+            executors.clone(),
+        ));
+        let scheduler = Arc::new(TaskScheduler::new(
+            store.clone(),
+            event_bus.clone(),
+            executors.clone(),
+        ));
+        service.set_scheduler(Arc::downgrade(&scheduler));
+        let reconciler = Arc::new(TaskStartupReconciler::new(
+            store,
+            event_bus.clone(),
+            executors.clone(),
+            scheduler.handle(),
+        ));
+        Self {
+            service,
+            scheduler,
+            event_bus,
+            executors,
+            reconciler,
+            scheduler_task: Mutex::new(None),
+        }
+    }
+
+    pub fn service(&self) -> Arc<TaskService> {
+        self.service.clone()
+    }
+
+    pub fn event_bus(&self) -> Arc<TaskEventBus> {
+        self.event_bus.clone()
+    }
+
+    pub async fn register_executor(&self, executor: Arc<dyn TaskExecutor>) {
+        self.executors.register(executor).await;
+    }
+
+    pub async fn start(&self) -> TaskRuntimeResult<()> {
+        let now = now_timestamp_secs();
+        self.reconciler.reconcile(now).await?;
+        self.service.recover_retry_and_lock_state(now).await?;
+        self.service.recover_stuck_deliveries(now, 1024).await?;
+        let mut guard = self.scheduler_task.lock().await;
+        if guard.is_none() {
+            let scheduler = self.scheduler.clone();
+            *guard = Some(tokio::spawn(async move {
+                scheduler.run().await;
+            }));
+        }
+        Ok(())
+    }
+
+    pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
+        self.scheduler.process_due_once(now).await
+    }
+}
+
+pub struct TaskService {
+    store: Arc<CrudStore>,
+    projector: TaskProjector,
+    event_bus: Arc<TaskEventBus>,
+    executors: Arc<TaskExecutorRegistry>,
+    scheduler: RwLock<Option<Weak<TaskScheduler>>>,
+}
+
+impl TaskService {
+    pub fn new(
+        store: Arc<CrudStore>,
+        event_bus: Arc<TaskEventBus>,
+        executors: Arc<TaskExecutorRegistry>,
+    ) -> Self {
+        let projector = TaskProjector::new(store.clone());
+        Self {
+            store,
+            projector,
+            event_bus,
+            executors,
+            scheduler: RwLock::new(None),
+        }
+    }
+
+    pub fn set_scheduler(&self, scheduler: Weak<TaskScheduler>) {
+        if let Ok(mut guard) = self.scheduler.try_write() {
+            *guard = Some(scheduler);
+        }
+    }
+
+    pub async fn create_task(
+        &self,
+        _context: TaskCreateContext,
+        params: TaskCreateParams,
+    ) -> TaskRuntimeResult<TaskCreateResponse> {
+        validate_create_params(&params)?;
+        let now = now_timestamp_secs();
+        let parent = self
+            .parent_context(params.parent_task_id.as_deref())
+            .await?;
+        let trigger_kind = params.trigger.spec.kind();
+        TaskTriggerCalculator::validate(&params.trigger.spec)?;
+
+        let depth = parent.depth;
+        let max_depth = normalize_max_depth(depth, parent.max_depth, params.agent_spec.as_ref())?;
+        if depth > max_depth {
+            bail!("task depth {depth} exceeds max depth {max_depth}");
+        }
+
+        let task_id = generate_id(ID_LEN);
+        let trigger_id = generate_id(ID_LEN);
+        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
+        let task = Task {
+            id: task_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            owner_kind: params.owner_kind,
+            owner_id: params.owner_id.clone(),
+            created_by_thread_id: params.created_by_thread_id.clone(),
+            created_by_turn_id: params.created_by_turn_id.clone(),
+            root_task_id: parent.root_task_id.clone(),
+            parent_task_id: params.parent_task_id.clone(),
+            executor_kind: params.executor_kind,
+            status: TaskStatus::Draft,
+            title: required_trimmed(&params.title, "title")?,
+            goal: required_trimmed(&params.goal, "goal")?,
+            priority: params.priority,
+            lifecycle_policy: Some(params.lifecycle_policy.clone().unwrap_or_else(|| {
+                default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
+            })),
+            delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
+                default_delivery_policy(
+                    trigger_kind,
+                    params.owner_kind,
+                    params.owner_id.as_deref(),
+                    params.created_by_thread_id.as_deref(),
+                )
+            })),
+            retry_policy: Some(
+                params
+                    .retry_policy
+                    .clone()
+                    .unwrap_or_else(default_retry_policy),
+            ),
+            timeout_policy: params.timeout_policy.clone(),
+            concurrency_policy: params.concurrency_policy.clone(),
+            metadata: params.metadata.clone(),
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let trigger = TaskTrigger {
+            id: trigger_id.clone(),
+            task_id: task_id.clone(),
+            status: TaskTriggerStatus::Active,
+            spec: params.trigger.spec.clone(),
+            next_fire_at,
+            last_fire_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let immediate_run = (trigger_kind == TaskTriggerKind::Immediate).then(|| TaskRun {
+            id: generate_id(ID_LEN),
+            task_id: task_id.clone(),
+            trigger_id: Some(trigger_id.clone()),
+            parent_run_id: None,
+            run_group_id: generate_id(ID_LEN),
+            attempt_number: 1,
+            retry_of_run_id: None,
+            ready_at: Some(now),
+            run_number: 1,
+            status: TaskRunStatus::Queued,
+            executor_kind: params.executor_kind,
+            started_at: None,
+            completed_at: None,
+            heartbeat_at: None,
+            locked_by: None,
+            lock_expires_at: None,
+            result: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let agent_spec = params.agent_spec.clone().map(|input| TaskAgentSpec {
+            id: generate_id(ID_LEN),
+            task_id: task_id.clone(),
+            run_id: None,
+            agent_role: input.agent_role,
+            agent_nickname: input.agent_nickname,
+            model: input.model,
+            model_provider: input.model_provider,
+            prompt: input.prompt,
+            context_policy: input.context_policy,
+            tool_policy: input.tool_policy,
+            result_contract: input.result_contract,
+            depth,
+            max_depth,
+            created_at: now,
+            updated_at: now,
+        });
+
+        let mut events = vec![
+            TaskEventPayload::TaskCreated { task: task.clone() },
+            TaskEventPayload::TriggerCreated {
+                trigger: trigger.clone(),
+            },
+        ];
+        if let Some(agent_spec) = agent_spec.clone() {
+            events.push(TaskEventPayload::AgentSpecCreated { agent_spec });
+        }
+        match trigger_kind {
+            TaskTriggerKind::Immediate => events.push(TaskEventPayload::TaskQueued {
+                task_id: task_id.clone(),
+                run_id: immediate_run.as_ref().map(|run| run.id.clone()),
+            }),
+            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron => {
+                events.push(TaskEventPayload::TaskScheduled {
+                    task_id: task_id.clone(),
+                    trigger_id: trigger_id.clone(),
+                    next_fire_at,
+                })
+            }
+            _ => {}
+        }
+        if let Some(run) = immediate_run.clone() {
+            events.push(TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: agent_spec.clone().map(|mut spec| {
+                    spec.run_id = Some(run.id.clone());
+                    spec.updated_at = now;
+                    spec
+                }),
+            });
+            let mut exhausted_trigger = trigger.clone();
+            exhausted_trigger.last_fire_at = Some(now);
+            exhausted_trigger.next_fire_at = None;
+            exhausted_trigger.status = TaskTriggerStatus::Exhausted;
+            exhausted_trigger.updated_at = now;
+            events.push(TaskEventPayload::TaskRescheduled {
+                task_id: task_id.clone(),
+                trigger: exhausted_trigger,
+                rescheduled_at: now,
+            });
+        }
+        let appended = self.append_events(events, now).await?;
+        self.publish_and_wake(appended).await;
+        if trigger_kind == TaskTriggerKind::Immediate {
+            self.process_due_once(now).await?;
+        }
+
+        let response = self
+            .store
+            .get_task(task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task disappeared after creation"))?;
+        Ok(TaskCreateResponse {
+            task: response.task,
+            trigger: response
+                .triggers
+                .into_iter()
+                .find(|candidate| candidate.id == trigger_id)
+                .unwrap_or(trigger),
+            run: response.runs.last().cloned(),
+            agent_spec: response
+                .agent_specs
+                .into_iter()
+                .find(|spec| spec.run_id.is_none())
+                .or(agent_spec),
+        })
+    }
+
+    pub async fn wait_tasks(
+        &self,
+        _context: TaskWaitContext,
+        mut params: TaskWaitParams,
+    ) -> TaskRuntimeResult<TaskWaitResponse> {
+        if params.task_ids.is_empty() && params.run_ids.is_empty() {
+            bail!("`task_ids` or `run_ids` is required");
+        }
+        if !params.return_completed && !params.return_pending {
+            params.return_completed = true;
+            params.return_pending = true;
+        }
+
+        let initial = self.collect_wait_state(&params).await?;
+        if wait_condition_satisfied(&initial) {
+            return Ok(initial);
+        }
+
+        let mut subscription = self.event_bus.subscribe(TaskEventFilter {
+            task_ids: params.task_ids.clone(),
+            run_ids: params.run_ids.clone(),
+            ..Default::default()
+        });
+        let after_subscribe = self.collect_wait_state(&params).await?;
+        if wait_condition_satisfied(&after_subscribe) {
+            return Ok(after_subscribe);
+        }
+
+        let wait_future = async {
+            loop {
+                if subscription.recv().await.is_none() {
+                    break;
+                }
+                let response = self.collect_wait_state(&params).await?;
+                if wait_condition_satisfied(&response) {
+                    return Ok(response);
+                }
+            }
+            self.collect_wait_state(&params).await
+        };
+
+        if let Some(timeout_ms) = params.timeout_ms {
+            match timeout(Duration::from_millis(timeout_ms), wait_future).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut response = self.collect_wait_state(&params).await?;
+                    response.timed_out = true;
+                    Ok(response)
+                }
+            }
+        } else {
+            wait_future.await
+        }
+    }
+
+    pub async fn cancel_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskCancelParams,
+    ) -> TaskRuntimeResult<TaskCancelResponse> {
+        let Some(root_response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        if is_terminal_task(root_response.task.status) {
+            return Ok(TaskCancelResponse {
+                task: root_response.task,
+                cancelled_tasks: Vec::new(),
+                detached_tasks: Vec::new(),
+                kept_tasks: Vec::new(),
+                cancelled_runs: Vec::new(),
+                cancelled_deliveries: Vec::new(),
+            });
+        }
+
+        let now = now_timestamp_secs();
+        let reason = params
+            .reason
+            .clone()
+            .unwrap_or_else(|| "task cancelled".to_owned());
+        let tree = self
+            .store
+            .get_task_tree(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` disappeared during cancellation", params.task_id))?;
+        let plan = plan_cancellation(&tree, params.scope);
+        let mut events = Vec::new();
+        let mut cancelled_runs = Vec::new();
+        let mut cancelled_deliveries = Vec::new();
+
+        for task in &plan.cancelled_tasks {
+            let Some(response) = self.store.get_task(task.id.as_str()).await? else {
+                continue;
+            };
+            self.push_cancel_task_events(
+                &response,
+                reason.as_str(),
+                now,
+                &mut events,
+                &mut cancelled_runs,
+                &mut cancelled_deliveries,
+            )
+            .await?;
+        }
+
+        for task in &plan.detached_tasks {
+            let Some(response) = self.store.get_task(task.id.as_str()).await? else {
+                continue;
+            };
+            if is_terminal_task(response.task.status) {
+                continue;
+            }
+            let mut detached = response.task;
+            let mut lifecycle = detached
+                .lifecycle_policy
+                .clone()
+                .unwrap_or_else(|| default_lifecycle_policy(TaskTriggerKind::Immediate, false));
+            lifecycle.attachment = TaskAttachmentMode::Detached;
+            lifecycle.on_parent_cancel = TaskParentTerminalAction::KeepRunning;
+            detached.lifecycle_policy = Some(lifecycle);
+            detached.updated_at = now;
+            detached.revision = detached.revision.saturating_add(1);
+            events.push(TaskEventPayload::TaskDetached {
+                task: detached,
+                detached_at: now,
+            });
+        }
+
+        let appended = self.append_events(events, now).await?;
+        self.publish_and_wake(appended).await;
+        let task = self
+            .store
+            .get_task(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task disappeared after cancellation"))?
+            .task;
+        Ok(TaskCancelResponse {
+            task,
+            cancelled_tasks: plan.cancelled_tasks,
+            detached_tasks: plan.detached_tasks,
+            kept_tasks: plan.kept_tasks,
+            cancelled_runs,
+            cancelled_deliveries,
+        })
+    }
+
+    pub async fn detach_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskDetachParams,
+    ) -> TaskRuntimeResult<TaskDetachResponse> {
+        let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        let mut task = response.task;
+        if is_terminal_task(task.status) {
+            return Ok(TaskDetachResponse { task });
+        }
+        let mut lifecycle = task.lifecycle_policy.clone().unwrap_or_else(|| {
+            default_lifecycle_policy(
+                response
+                    .triggers
+                    .first()
+                    .map(|trigger| trigger.kind())
+                    .unwrap_or(TaskTriggerKind::Immediate),
+                task.created_by_turn_id.is_some(),
+            )
+        });
+        lifecycle.attachment = pioneer_protocol::TaskAttachmentMode::Detached;
+        task.lifecycle_policy = Some(lifecycle);
+        task.revision = task.revision.saturating_add(1);
+        task.updated_at = now_timestamp_secs();
+        let appended = self
+            .append_event(
+                TaskEventPayload::TaskDetached {
+                    task: task.clone(),
+                    detached_at: task.updated_at,
+                },
+                task.updated_at,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        Ok(TaskDetachResponse { task })
+    }
+
+    pub async fn reschedule_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskRescheduleParams,
+    ) -> TaskRuntimeResult<TaskRescheduleResponse> {
+        let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        if is_terminal_task(response.task.status) {
+            bail!("terminal task `{}` cannot be rescheduled", params.task_id);
+        }
+        TaskTriggerCalculator::validate(&params.trigger.spec)?;
+        let now = now_timestamp_secs();
+        let trigger_id = response
+            .triggers
+            .last()
+            .map(|trigger| trigger.id.clone())
+            .unwrap_or_else(|| generate_id(ID_LEN));
+        let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
+        let trigger = TaskTrigger {
+            id: trigger_id,
+            task_id: params.task_id.clone(),
+            status: TaskTriggerStatus::Active,
+            spec: params.trigger.spec,
+            next_fire_at,
+            last_fire_at: response
+                .triggers
+                .last()
+                .and_then(|trigger| trigger.last_fire_at),
+            created_at: response
+                .triggers
+                .last()
+                .map(|trigger| trigger.created_at)
+                .unwrap_or(now),
+            updated_at: now,
+        };
+        let appended = self
+            .append_event(
+                TaskEventPayload::TaskRescheduled {
+                    task_id: params.task_id.clone(),
+                    trigger: trigger.clone(),
+                    rescheduled_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        self.process_due_once(now).await?;
+        let task = self
+            .store
+            .get_task(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task disappeared after reschedule"))?
+            .task;
+        Ok(TaskRescheduleResponse { task, trigger })
+    }
+
+    pub async fn pause_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskPauseParams,
+    ) -> TaskRuntimeResult<TaskPauseResponse> {
+        let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        if is_terminal_task(response.task.status) {
+            return Ok(TaskPauseResponse {
+                task: response.task,
+                triggers: response.triggers,
+            });
+        }
+        let now = now_timestamp_secs();
+        let mut task = response.task;
+        task.updated_at = now;
+        task.revision = task.revision.saturating_add(1);
+        let triggers = response
+            .triggers
+            .into_iter()
+            .map(|mut trigger| {
+                if trigger.status == TaskTriggerStatus::Active {
+                    trigger.status = TaskTriggerStatus::Paused;
+                    trigger.updated_at = now;
+                }
+                trigger
+            })
+            .collect::<Vec<_>>();
+        let appended = self
+            .append_event(
+                TaskEventPayload::TaskPaused {
+                    task: task.clone(),
+                    triggers: triggers.clone(),
+                    reason: params.reason,
+                    paused_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        Ok(TaskPauseResponse { task, triggers })
+    }
+
+    pub async fn resume_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskResumeParams,
+    ) -> TaskRuntimeResult<TaskResumeResponse> {
+        let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        if is_terminal_task(response.task.status) {
+            bail!("terminal task `{}` cannot be resumed", params.task_id);
+        }
+        let now = now_timestamp_secs();
+        let mut task = response.task;
+        let mut resumed_any = false;
+        let mut triggers = Vec::with_capacity(response.triggers.len());
+        for mut trigger in response.triggers {
+            if trigger.status == TaskTriggerStatus::Paused {
+                trigger.status = TaskTriggerStatus::Active;
+                trigger.next_fire_at = resume_next_fire_at(&trigger, now)?;
+                trigger.updated_at = now;
+                resumed_any = true;
+            }
+            triggers.push(trigger);
+        }
+        if !resumed_any {
+            return Ok(TaskResumeResponse { task, triggers });
+        }
+        task.status = if triggers
+            .iter()
+            .any(|trigger| trigger.next_fire_at.is_some())
+        {
+            TaskStatus::Scheduled
+        } else {
+            TaskStatus::Waiting
+        };
+        task.updated_at = now;
+        task.revision = task.revision.saturating_add(1);
+        let appended = self
+            .append_event(
+                TaskEventPayload::TaskResumed {
+                    task: task.clone(),
+                    triggers: triggers.clone(),
+                    reason: params.reason,
+                    resumed_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        self.process_due_once(now).await?;
+        Ok(TaskResumeResponse { task, triggers })
+    }
+
+    pub async fn list_agenda(
+        &self,
+        params: TaskAgendaParams,
+    ) -> TaskRuntimeResult<TaskAgendaResponse> {
+        Ok(self.store.list_task_agenda(params).await?)
+    }
+
+    pub async fn list_deliveries(
+        &self,
+        params: TaskDeliveriesParams,
+    ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
+        Ok(self.store.list_task_deliveries(params).await?)
+    }
+
+    pub async fn start_delivery(
+        &self,
+        delivery_id: &str,
+        started_at: i64,
+    ) -> TaskRuntimeResult<Option<(TaskDelivery, TaskDeliveryAttempt)>> {
+        let Some(mut delivery) = self.store.get_task_delivery(delivery_id).await? else {
+            return Ok(None);
+        };
+        if delivery.status != TaskDeliveryStatus::Pending {
+            return Ok(None);
+        }
+        if let Some(next_attempt_at) = delivery.next_attempt_at
+            && next_attempt_at > started_at
+        {
+            return Ok(None);
+        }
+        let attempt_number = delivery.attempt_count.saturating_add(1);
+        delivery.status = TaskDeliveryStatus::Delivering;
+        delivery.attempt_count = attempt_number;
+        delivery.next_attempt_at = None;
+        delivery.updated_at = started_at;
+        let attempt = TaskDeliveryAttempt {
+            id: generate_id(ID_LEN),
+            delivery_id: delivery.id.clone(),
+            attempt_number,
+            status: TaskDeliveryAttemptStatus::Started,
+            started_at,
+            completed_at: None,
+            http_status: None,
+            error: None,
+            response_fingerprint: None,
+        };
+        let appended = self
+            .append_event(
+                TaskEventPayload::DeliveryStarted {
+                    delivery: delivery.clone(),
+                    attempt: attempt.clone(),
+                },
+                started_at,
+            )
+            .await?;
+        self.event_bus.publish(appended).await;
+        Ok(Some((delivery, attempt)))
+    }
+
+    pub async fn complete_delivery(
+        &self,
+        mut delivery: TaskDelivery,
+        mut attempt: TaskDeliveryAttempt,
+        delivered_turn_id: Option<String>,
+        delivered_notification_id: Option<String>,
+        http_status: Option<u16>,
+        response_fingerprint: Option<String>,
+        delivered_at: i64,
+    ) -> TaskRuntimeResult<TaskDelivery> {
+        delivery.status = TaskDeliveryStatus::Delivered;
+        delivery.delivered_turn_id = delivered_turn_id;
+        delivery.delivered_notification_id = delivered_notification_id;
+        delivery.delivered_at = Some(delivered_at);
+        delivery.next_attempt_at = None;
+        delivery.last_error = None;
+        delivery.updated_at = delivered_at;
+        attempt.status = TaskDeliveryAttemptStatus::Delivered;
+        attempt.completed_at = Some(delivered_at);
+        attempt.http_status = http_status;
+        attempt.response_fingerprint = response_fingerprint;
+        let appended = self
+            .append_event(
+                TaskEventPayload::DeliveryDelivered {
+                    delivery: delivery.clone(),
+                    attempt,
+                },
+                delivered_at,
+            )
+            .await?;
+        self.event_bus.publish(appended).await;
+        Ok(delivery)
+    }
+
+    pub async fn fail_delivery(
+        &self,
+        mut delivery: TaskDelivery,
+        mut attempt: TaskDeliveryAttempt,
+        error: String,
+        http_status: Option<u16>,
+        response_fingerprint: Option<String>,
+        failed_at: i64,
+    ) -> TaskRuntimeResult<TaskDelivery> {
+        let retryable = delivery.attempt_count < delivery.max_attempts;
+        delivery.status = if retryable {
+            TaskDeliveryStatus::Pending
+        } else {
+            TaskDeliveryStatus::Failed
+        };
+        delivery.next_attempt_at = retryable.then_some(failed_at.saturating_add(60));
+        delivery.last_error = Some(error.clone());
+        delivery.updated_at = failed_at;
+        attempt.status = TaskDeliveryAttemptStatus::Failed;
+        attempt.completed_at = Some(failed_at);
+        attempt.http_status = http_status;
+        attempt.error = Some(error);
+        attempt.response_fingerprint = response_fingerprint;
+        let appended = self
+            .append_event(
+                TaskEventPayload::DeliveryFailed {
+                    delivery: delivery.clone(),
+                    attempt,
+                },
+                failed_at,
+            )
+            .await?;
+        self.event_bus.publish(appended).await;
+        Ok(delivery)
+    }
+
+    pub async fn recover_stuck_deliveries(&self, now: i64, limit: u64) -> TaskRuntimeResult<usize> {
+        let cutoff = now.saturating_sub(300);
+        let deliveries = self.store.list_stuck_task_deliveries(cutoff, limit).await?;
+        let mut recovered = 0usize;
+        for mut delivery in deliveries {
+            delivery.status = TaskDeliveryStatus::Pending;
+            delivery.next_attempt_at = Some(now);
+            delivery.last_error = Some("delivery recovered after gateway restart".to_owned());
+            delivery.updated_at = now;
+            let appended = self
+                .append_event(TaskEventPayload::DeliveryQueued { delivery }, now)
+                .await?;
+            self.event_bus.publish(appended).await;
+            recovered = recovered.saturating_add(1);
+        }
+        Ok(recovered)
+    }
+
+    pub async fn get_task(&self, params: TaskGetParams) -> TaskRuntimeResult<TaskGetResponse> {
+        self.store
+            .get_task(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))
+    }
+
+    pub async fn list_tasks(&self, params: TaskListParams) -> TaskRuntimeResult<TaskListResponse> {
+        Ok(TaskListResponse {
+            tasks: self.store.list_tasks(params).await?,
+        })
+    }
+
+    pub async fn get_task_tree(
+        &self,
+        params: TaskTreeParams,
+    ) -> TaskRuntimeResult<TaskTreeResponse> {
+        self.store
+            .get_task_tree(params.task_id.as_str())
+            .await?
+            .map(|tree| TaskTreeResponse { tree })
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))
+    }
+
+    pub async fn get_task_events(
+        &self,
+        params: TaskEventsParams,
+    ) -> TaskRuntimeResult<TaskEventsResponse> {
+        self.store
+            .get_task_events(params.task_id.as_str(), params.after_sequence)
+            .await
+    }
+
+    pub async fn acquire_write_locks_for_run(
+        &self,
+        run_id: &str,
+        now: i64,
+    ) -> TaskRuntimeResult<WriteLockDecision> {
+        let Some(run) = self.store.get_task_run(run_id).await? else {
+            bail!("task run `{run_id}` not found");
+        };
+        let Some(response) = self.store.get_task(run.task_id.as_str()).await? else {
+            bail!("task `{}` not found", run.task_id);
+        };
+        let Some(agent_spec) = response
+            .agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.as_deref() == Some(run.id.as_str()))
+            .or_else(|| {
+                response
+                    .agent_specs
+                    .iter()
+                    .rev()
+                    .find(|spec| spec.run_id.is_none())
+            })
+        else {
+            return Ok(WriteLockDecision::NoLocksRequired);
+        };
+        let scopes = write_lock_scopes(agent_spec)?;
+        if scopes.is_empty() {
+            return Ok(WriteLockDecision::NoLocksRequired);
+        }
+
+        let policy = response
+            .task
+            .concurrency_policy
+            .as_ref()
+            .map(|policy| policy.on_conflict)
+            .unwrap_or(TaskConcurrencyConflictPolicy::Queue);
+        if policy == TaskConcurrencyConflictPolicy::Allow {
+            return Ok(WriteLockDecision::NoLocksRequired);
+        }
+
+        let existing_for_run = self
+            .store
+            .list_task_write_locks_by_run(run.id.as_str())
+            .await?;
+        if existing_for_run.iter().any(|lock| {
+            lock.status == TaskWriteLockStatus::Acquired
+                && lock.expires_at.is_none_or(|expires_at| expires_at > now)
+        }) {
+            return Ok(WriteLockDecision::Acquired(existing_for_run));
+        }
+
+        let conflicts = self
+            .active_write_lock_conflicts(response.task.workspace_id.as_str(), &scopes, now)
+            .await?;
+        if !conflicts.is_empty() {
+            match policy {
+                TaskConcurrencyConflictPolicy::Reject => {
+                    self.append_and_publish_lock_blocked(
+                        response.task.id.as_str(),
+                        run.id.as_str(),
+                        conflicts,
+                        now,
+                    )
+                    .await?;
+                    return Ok(WriteLockDecision::Rejected);
+                }
+                TaskConcurrencyConflictPolicy::Queue => {
+                    self.append_and_publish_lock_blocked(
+                        response.task.id.as_str(),
+                        run.id.as_str(),
+                        conflicts,
+                        now,
+                    )
+                    .await?;
+                    return Ok(WriteLockDecision::Queued);
+                }
+                TaskConcurrencyConflictPolicy::CancelExisting => {
+                    for conflict in conflicts {
+                        let _ = self
+                            .cancel_task(
+                                TaskMutationContext::default(),
+                                TaskCancelParams {
+                                    task_id: conflict.task_id,
+                                    reason: Some(format!(
+                                        "cancelled by write-lock conflict with run {}",
+                                        run.id
+                                    )),
+                                    scope: TaskCancelScope::TaskOnly,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                TaskConcurrencyConflictPolicy::Allow => {}
+            }
+        }
+
+        let expires_at = now.saturating_add(3600);
+        let locks = scopes
+            .into_iter()
+            .map(|scope| TaskWriteLock {
+                id: generate_id(ID_LEN),
+                workspace_id: response.task.workspace_id.clone(),
+                task_id: response.task.id.clone(),
+                run_id: run.id.clone(),
+                scope_kind: scope.kind,
+                scope_path: scope.path,
+                status: TaskWriteLockStatus::Acquired,
+                acquired_at: now,
+                expires_at: Some(expires_at),
+                released_at: None,
+                conflict_policy: policy,
+                reason: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
+        let events = locks
+            .iter()
+            .cloned()
+            .map(|lock| TaskEventPayload::WriteLockAcquired { lock })
+            .collect::<Vec<_>>();
+        let appended = self.append_events(events, now).await?;
+        self.publish_and_wake(appended).await;
+        Ok(WriteLockDecision::Acquired(locks))
+    }
+
+    pub async fn recover_retry_and_lock_state(&self, now: i64) -> TaskRuntimeResult<usize> {
+        let mut recovered = 0usize;
+        let mut events = Vec::new();
+        for mut lock in self.store.list_stale_task_write_locks(now, 1024).await? {
+            lock.status = TaskWriteLockStatus::Expired;
+            lock.released_at = Some(now);
+            lock.reason = Some("write lock expired during startup recovery".to_owned());
+            lock.updated_at = now;
+            events.push(TaskEventPayload::WriteLockExpired {
+                lock,
+                expired_at: now,
+            });
+            recovered = recovered.saturating_add(1);
+        }
+        for run in self
+            .store
+            .list_task_runs_by_status(TaskRunStatus::Succeeded, 1024)
+            .await?
+            .into_iter()
+            .chain(
+                self.store
+                    .list_task_runs_by_status(TaskRunStatus::Failed, 1024)
+                    .await?
+                    .into_iter(),
+            )
+            .chain(
+                self.store
+                    .list_task_runs_by_status(TaskRunStatus::Cancelled, 1024)
+                    .await?
+                    .into_iter(),
+            )
+        {
+            for mut lock in self
+                .store
+                .list_task_write_locks_by_run(run.id.as_str())
+                .await?
+                .into_iter()
+                .filter(|lock| lock.status == TaskWriteLockStatus::Acquired)
+            {
+                lock.status = TaskWriteLockStatus::Released;
+                lock.released_at = Some(now);
+                lock.reason = Some("terminal run lock released during startup recovery".to_owned());
+                lock.updated_at = now;
+                events.push(TaskEventPayload::WriteLockReleased {
+                    lock,
+                    released_at: now,
+                });
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        if !events.is_empty() {
+            let appended = self.append_events(events, now).await?;
+            self.publish_and_wake(appended).await;
+        }
+        Ok(recovered)
+    }
+
+    pub(crate) async fn append_event(
+        &self,
+        event: TaskEventPayload,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<AppendedTaskEvent> {
+        self.projector
+            .append_event(event, event_timestamp_secs)
+            .await
+    }
+
+    pub(crate) async fn append_events(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        self.projector
+            .append_events(events, event_timestamp_secs)
+            .await
+    }
+
+    pub(crate) async fn publish_and_wake(&self, events: Vec<AppendedTaskEvent>) {
+        self.event_bus.publish_many(events).await;
+        self.wake_scheduler().await;
+    }
+
+    async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {
+        let scheduler = self.scheduler.read().await.as_ref().and_then(Weak::upgrade);
+        if let Some(scheduler) = scheduler {
+            scheduler.process_due_once(now).await
+        } else {
+            Ok(0)
+        }
+    }
+
+    async fn wake_scheduler(&self) {
+        if let Some(scheduler) = self.scheduler.read().await.as_ref().and_then(Weak::upgrade) {
+            scheduler.wake();
+        }
+    }
+
+    async fn parent_context(
+        &self,
+        parent_task_id: Option<&str>,
+    ) -> TaskRuntimeResult<ParentContext> {
+        if let Some(parent_task_id) = parent_task_id {
+            if let Some(parent) = self.store.get_task(parent_task_id).await? {
+                let parent_spec = parent.agent_specs.last();
+                let parent_depth = parent_spec.map(|spec| spec.depth).unwrap_or(0);
+                let max_depth = parent_spec
+                    .map(|spec| spec.max_depth)
+                    .unwrap_or(DEFAULT_MAX_TASK_DEPTH);
+                return Ok(ParentContext {
+                    root_task_id: Some(
+                        parent
+                            .task
+                            .root_task_id
+                            .clone()
+                            .unwrap_or_else(|| parent.task.id.clone()),
+                    ),
+                    depth: parent_depth.saturating_add(1),
+                    max_depth,
+                });
+            }
+            bail!("parent task `{parent_task_id}` not found");
+        }
+        Ok(ParentContext {
+            root_task_id: None,
+            depth: 1,
+            max_depth: DEFAULT_MAX_TASK_DEPTH,
+        })
+    }
+
+    async fn collect_wait_state(
+        &self,
+        params: &TaskWaitParams,
+    ) -> TaskRuntimeResult<TaskWaitResponse> {
+        let mut task_ids = params.task_ids.clone();
+        for run_id in &params.run_ids {
+            if let Some(run) = self.store.get_task_run(run_id).await?
+                && !task_ids.iter().any(|task_id| task_id == &run.task_id)
+            {
+                task_ids.push(run.task_id);
+            }
+        }
+        task_ids.sort();
+        task_ids.dedup();
+
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        let mut cancelled = Vec::new();
+        let mut pending = Vec::new();
+        let mut total_count = 0u32;
+        let mut terminal_count = 0u32;
+        let mut pending_count = 0u32;
+
+        for task_id in task_ids {
+            let Some(response) = self.store.get_task(task_id.as_str()).await? else {
+                total_count = total_count.saturating_add(1);
+                terminal_count = terminal_count.saturating_add(1);
+                continue;
+            };
+            let run = select_wait_run(&response.runs, &params.run_ids);
+            let lineage = match run.as_ref() {
+                Some(run) => self
+                    .store
+                    .list_thread_lineage_for_run(run.id.as_str())
+                    .await?
+                    .into_iter()
+                    .last(),
+                None => None,
+            };
+            let item = TaskWaitItem {
+                task: response.task,
+                run,
+                child_thread_id: lineage
+                    .as_ref()
+                    .map(|lineage| lineage.child_thread_id.clone()),
+                child_turn_id: lineage
+                    .as_ref()
+                    .map(|lineage| lineage.child_turn_id.clone()),
+            };
+            total_count = total_count.saturating_add(1);
+            match wait_item_state(&item) {
+                WaitItemState::Completed => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    if params.return_completed {
+                        completed.push(item);
+                    }
+                }
+                WaitItemState::Failed => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    failed.push(item);
+                }
+                WaitItemState::Cancelled => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    cancelled.push(item);
+                }
+                WaitItemState::Pending => {
+                    pending_count = pending_count.saturating_add(1);
+                    if params.return_pending {
+                        pending.push(item);
+                    }
+                }
+            }
+        }
+
+        Ok(TaskWaitResponse {
+            completed,
+            failed,
+            cancelled,
+            pending,
+            timed_out: false,
+            total_count,
+            terminal_count,
+            pending_count,
+            mode: params.mode,
+        })
+    }
+
+    async fn push_cancel_task_events(
+        &self,
+        response: &TaskGetResponse,
+        reason: &str,
+        now: i64,
+        events: &mut Vec<TaskEventPayload>,
+        cancelled_runs: &mut Vec<TaskRun>,
+        cancelled_deliveries: &mut Vec<TaskDelivery>,
+    ) -> TaskRuntimeResult<()> {
+        if is_terminal_task(response.task.status) {
+            return Ok(());
+        }
+        for run in response
+            .runs
+            .iter()
+            .filter(|run| !is_terminal_run(run.status))
+        {
+            if let Some(executor) = self.executors.get(run.executor_kind).await {
+                let handle = TaskExecutionHandle::new(
+                    self.store.clone(),
+                    self.event_bus.clone(),
+                    response.task.id.clone(),
+                    run.id.clone(),
+                );
+                let _ = executor
+                    .cancel_run(
+                        TaskExecutionContext {
+                            workspace_id: response.task.workspace_id.clone(),
+                            task_id: response.task.id.clone(),
+                        },
+                        run.id.as_str(),
+                        reason,
+                        handle,
+                    )
+                    .await;
+            }
+            events.push(TaskEventPayload::RunCancelled {
+                task_id: response.task.id.clone(),
+                run_id: run.id.clone(),
+                reason: Some(reason.to_owned()),
+                cancelled_at: now,
+            });
+            cancelled_runs.push(run.clone());
+            self.push_cancelled_write_locks_for_run(run.id.as_str(), reason, now, events)
+                .await?;
+        }
+        for trigger in response
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.status == TaskTriggerStatus::Active)
+        {
+            let mut trigger = trigger.clone();
+            trigger.status = TaskTriggerStatus::Cancelled;
+            trigger.next_fire_at = None;
+            trigger.updated_at = now;
+            events.push(TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger,
+                rescheduled_at: now,
+            });
+        }
+        for mut delivery in self
+            .store
+            .list_task_deliveries(TaskDeliveriesParams {
+                workspace_id: response.task.workspace_id.clone(),
+                task_id: Some(response.task.id.clone()),
+                run_id: None,
+                statuses: vec![TaskDeliveryStatus::Pending, TaskDeliveryStatus::Delivering],
+                limit: Some(1000),
+            })
+            .await?
+            .deliveries
+        {
+            delivery.status = TaskDeliveryStatus::Cancelled;
+            delivery.next_attempt_at = None;
+            delivery.last_error = Some(reason.to_owned());
+            delivery.updated_at = now;
+            events.push(TaskEventPayload::DeliveryCancelled {
+                delivery: delivery.clone(),
+                reason: Some(reason.to_owned()),
+            });
+            cancelled_deliveries.push(delivery);
+        }
+        events.push(TaskEventPayload::TaskCancelled {
+            task_id: response.task.id.clone(),
+            reason: Some(reason.to_owned()),
+            completed_at: now,
+        });
+        Ok(())
+    }
+
+    async fn push_cancelled_write_locks_for_run(
+        &self,
+        run_id: &str,
+        reason: &str,
+        now: i64,
+        events: &mut Vec<TaskEventPayload>,
+    ) -> TaskRuntimeResult<()> {
+        for mut lock in self
+            .store
+            .list_task_write_locks_by_run(run_id)
+            .await?
+            .into_iter()
+            .filter(|lock| {
+                matches!(
+                    lock.status,
+                    TaskWriteLockStatus::Pending
+                        | TaskWriteLockStatus::Acquired
+                        | TaskWriteLockStatus::Blocked
+                )
+            })
+        {
+            lock.status = TaskWriteLockStatus::Cancelled;
+            lock.released_at = Some(now);
+            lock.reason = Some(reason.to_owned());
+            lock.updated_at = now;
+            events.push(TaskEventPayload::WriteLockReleased {
+                lock,
+                released_at: now,
+            });
+        }
+        Ok(())
+    }
+
+    async fn active_write_lock_conflicts(
+        &self,
+        workspace_id: &str,
+        scopes: &[WriteLockScope],
+        now: i64,
+    ) -> TaskRuntimeResult<Vec<TaskWriteLockConflict>> {
+        let mut conflicts = Vec::new();
+        for lock in self
+            .store
+            .list_active_task_write_locks(workspace_id, now, 4096)
+            .await?
+        {
+            if scopes.iter().any(|scope| {
+                write_lock_paths_overlap(scope.path.as_str(), lock.scope_path.as_str())
+            }) {
+                conflicts.push(TaskWriteLockConflict {
+                    lock_id: lock.id,
+                    task_id: lock.task_id,
+                    run_id: lock.run_id,
+                    scope_kind: lock.scope_kind,
+                    scope_path: lock.scope_path,
+                });
+            }
+        }
+        Ok(conflicts)
+    }
+
+    async fn append_and_publish_lock_blocked(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        conflicts: Vec<TaskWriteLockConflict>,
+        now: i64,
+    ) -> TaskRuntimeResult<()> {
+        let appended = self
+            .append_event(
+                TaskEventPayload::WriteLockBlocked {
+                    task_id: task_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    conflicts,
+                    blocked_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParentContext {
+    root_task_id: Option<String>,
+    depth: i64,
+    max_depth: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteLockDecision {
+    NoLocksRequired,
+    Acquired(Vec<TaskWriteLock>),
+    Queued,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteLockScope {
+    kind: TaskWriteLockScopeKind,
+    path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CancellationPlan {
+    cancelled_tasks: Vec<Task>,
+    detached_tasks: Vec<Task>,
+    kept_tasks: Vec<Task>,
+}
+
+fn plan_cancellation(tree: &TaskTree, scope: TaskCancelScope) -> CancellationPlan {
+    let mut plan = CancellationPlan::default();
+    match scope {
+        TaskCancelScope::TaskOnly => {
+            plan.cancelled_tasks.push(tree.task.clone());
+            for child in &tree.children {
+                collect_kept_subtree(child, &mut plan);
+            }
+        }
+        TaskCancelScope::FullSubtree => collect_cancelled_subtree(tree, &mut plan),
+        TaskCancelScope::AttachedSubtree => {
+            plan.cancelled_tasks.push(tree.task.clone());
+            for child in &tree.children {
+                plan_attached_descendant(child, &mut plan);
+            }
+        }
+    }
+    plan.cancelled_tasks.reverse();
+    plan
+}
+
+fn collect_cancelled_subtree(tree: &TaskTree, plan: &mut CancellationPlan) {
+    plan.cancelled_tasks.push(tree.task.clone());
+    for child in &tree.children {
+        collect_cancelled_subtree(child, plan);
+    }
+}
+
+fn collect_kept_subtree(tree: &TaskTree, plan: &mut CancellationPlan) {
+    plan.kept_tasks.push(tree.task.clone());
+    for child in &tree.children {
+        collect_kept_subtree(child, plan);
+    }
+}
+
+fn plan_attached_descendant(tree: &TaskTree, plan: &mut CancellationPlan) {
+    let lifecycle = effective_lifecycle_policy(&tree.task);
+    if lifecycle.attachment != TaskAttachmentMode::Attached {
+        collect_kept_subtree(tree, plan);
+        return;
+    }
+    match lifecycle.on_parent_cancel {
+        TaskParentTerminalAction::Cancel => {
+            plan.cancelled_tasks.push(tree.task.clone());
+            for child in &tree.children {
+                plan_attached_descendant(child, plan);
+            }
+        }
+        TaskParentTerminalAction::Detach => {
+            plan.detached_tasks.push(tree.task.clone());
+            for child in &tree.children {
+                collect_kept_subtree(child, plan);
+            }
+        }
+        TaskParentTerminalAction::KeepRunning => collect_kept_subtree(tree, plan),
+    }
+}
+
+fn effective_lifecycle_policy(task: &Task) -> TaskLifecyclePolicy {
+    task.lifecycle_policy
+        .clone()
+        .unwrap_or_else(|| default_lifecycle_policy(TaskTriggerKind::Immediate, false))
+}
+
+fn write_lock_scopes(agent_spec: &TaskAgentSpec) -> TaskRuntimeResult<Vec<WriteLockScope>> {
+    let Some(policy) = agent_spec.tool_policy.as_ref() else {
+        return Ok(Vec::new());
+    };
+    match policy.write_mode {
+        TaskAgentWriteMode::ReadOnly => Ok(Vec::new()),
+        TaskAgentWriteMode::WorkspaceWrite | TaskAgentWriteMode::FullAccess => {
+            Ok(vec![WriteLockScope {
+                kind: TaskWriteLockScopeKind::Workspace,
+                path: ".".to_owned(),
+            }])
+        }
+        TaskAgentWriteMode::ScopedWrite => {
+            if policy.allowed_paths.is_empty() {
+                bail!("scoped write task requires allowed_paths");
+            }
+            policy
+                .allowed_paths
+                .iter()
+                .map(|path| {
+                    Ok(WriteLockScope {
+                        kind: TaskWriteLockScopeKind::Path,
+                        path: normalize_workspace_relative_path(path)?,
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+fn normalize_workspace_relative_path(path: &str) -> TaskRuntimeResult<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(".".to_owned());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        bail!("write lock path `{trimmed}` must be workspace-relative");
+    }
+    let mut parts = VecDeque::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let Some(value) = value.to_str() else {
+                    bail!("write lock path `{trimmed}` is not valid UTF-8");
+                };
+                parts.push_back(value.to_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop_back().is_none() {
+                    bail!("write lock path `{trimmed}` escapes the workspace");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("write lock path `{trimmed}` must be workspace-relative");
+            }
+        }
+    }
+    if parts.is_empty() {
+        Ok(".".to_owned())
+    } else {
+        Ok(parts.into_iter().collect::<Vec<_>>().join("/"))
+    }
+}
+
+fn write_lock_paths_overlap(left: &str, right: &str) -> bool {
+    if left == "." || right == "." {
+        return true;
+    }
+    let left_parts = left.split('/').collect::<Vec<_>>();
+    let right_parts = right.split('/').collect::<Vec<_>>();
+    left_parts.starts_with(right_parts.as_slice()) || right_parts.starts_with(left_parts.as_slice())
+}
+
+fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
+    if params.workspace_id.trim().is_empty() {
+        bail!("workspace_id is required");
+    }
+    required_trimmed(&params.title, "title")?;
+    required_trimmed(&params.goal, "goal")?;
+    if params.executor_kind == TaskExecutorKind::Agent {
+        let agent_spec = params
+            .agent_spec
+            .as_ref()
+            .ok_or_else(|| anyhow!("agent executor requires agent_spec"))?;
+        if agent_spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            bail!("agent executor requires agent_spec.model");
+        }
+        if agent_spec
+            .model_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            bail!("agent executor requires agent_spec.model_provider");
+        }
+    }
+    if params.owner_kind == TaskOwnerKind::Thread && params.owner_id.is_none() {
+        bail!("thread-owned task requires owner_id");
+    }
+    if let Some(policy) = params.delivery_policy.as_ref() {
+        validate_delivery_policy(policy)?;
+    }
+    Ok(())
+}
+
+fn validate_delivery_policy(
+    policy: &pioneer_protocol::TaskDeliveryPolicy,
+) -> TaskRuntimeResult<()> {
+    match policy.mode {
+        TaskDeliveryMode::None
+        | TaskDeliveryMode::OwnerThread
+        | TaskDeliveryMode::UserNotification => {}
+        TaskDeliveryMode::Thread => {
+            if policy
+                .thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|thread_id| !thread_id.is_empty())
+                .is_none()
+            {
+                bail!("thread delivery requires delivery_policy.thread_id");
+            }
+        }
+        TaskDeliveryMode::Webhook => {
+            let Some(url) = policy
+                .webhook_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            else {
+                bail!("webhook delivery requires delivery_policy.webhook_url");
+            };
+            if !url.starts_with("https://") {
+                bail!("webhook delivery requires an https:// URL");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_max_depth(
+    depth: i64,
+    parent_max_depth: i64,
+    agent_spec: Option<&pioneer_protocol::TaskAgentSpecInput>,
+) -> TaskRuntimeResult<i64> {
+    let requested = agent_spec
+        .map(|spec| spec.max_depth)
+        .unwrap_or(parent_max_depth);
+    if requested < 0 {
+        bail!("max_depth must be non-negative");
+    }
+    if depth > 0 && requested > parent_max_depth {
+        bail!("child task cannot raise inherited max_depth");
+    }
+    Ok(requested.min(MAX_ROOT_TASK_DEPTH_LIMIT))
+}
+
+fn resume_next_fire_at(trigger: &TaskTrigger, now: i64) -> TaskRuntimeResult<Option<i64>> {
+    match &trigger.spec {
+        pioneer_protocol::TaskTriggerSpec::ScheduledAt { scheduled_at, .. } => {
+            if *scheduled_at <= now {
+                bail!(
+                    "scheduled task `{}` missed its one-shot fire time; reschedule before resume",
+                    trigger.task_id
+                );
+            }
+            Ok(Some(*scheduled_at))
+        }
+        pioneer_protocol::TaskTriggerSpec::Interval { .. }
+        | pioneer_protocol::TaskTriggerSpec::Cron { .. } => {
+            TaskTriggerCalculator::initial_next_fire_at(&trigger.spec, now)
+        }
+        pioneer_protocol::TaskTriggerSpec::Immediate => Ok(Some(now)),
+        pioneer_protocol::TaskTriggerSpec::Manual { .. }
+        | pioneer_protocol::TaskTriggerSpec::External { .. }
+        | pioneer_protocol::TaskTriggerSpec::Dependency { .. } => Ok(None),
+    }
+}
+
+fn required_trimmed(value: &str, field: &str) -> TaskRuntimeResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("`{field}` is required");
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub(crate) fn now_timestamp_secs() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+pub(crate) fn is_terminal_task(status: TaskStatus) -> bool {
+    status.is_terminal()
+}
+
+pub(crate) fn is_terminal_run(status: TaskRunStatus) -> bool {
+    status.is_terminal()
+}
+
+fn select_wait_run(runs: &[TaskRun], run_ids: &[String]) -> Option<TaskRun> {
+    if run_ids.is_empty() {
+        return runs.last().cloned();
+    }
+    runs.iter()
+        .rev()
+        .find(|run| run_ids.iter().any(|run_id| run_id == &run.id))
+        .cloned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitItemState {
+    Completed,
+    Failed,
+    Cancelled,
+    Pending,
+}
+
+fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
+    if let Some(run) = item.run.as_ref() {
+        match run.status {
+            TaskRunStatus::Succeeded => return WaitItemState::Completed,
+            TaskRunStatus::Failed | TaskRunStatus::TimedOut => return WaitItemState::Failed,
+            TaskRunStatus::Cancelled => return WaitItemState::Cancelled,
+            _ => {}
+        }
+    }
+
+    match item.task.status {
+        TaskStatus::Completed => WaitItemState::Completed,
+        TaskStatus::Failed => WaitItemState::Failed,
+        TaskStatus::Cancelled => WaitItemState::Cancelled,
+        _ => WaitItemState::Pending,
+    }
+}
+
+fn wait_condition_satisfied(response: &TaskWaitResponse) -> bool {
+    match response.mode {
+        TaskWaitMode::AllTerminal => response.pending_count == 0,
+        TaskWaitMode::AnyTerminal => response.terminal_count > 0 || response.total_count == 0,
+    }
+}
+
+pub(crate) fn task_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    class: TaskErrorClass,
+    failed_run_id: Option<String>,
+) -> TaskError {
+    TaskError {
+        code: code.into(),
+        message: message.into(),
+        class,
+        details: None,
+        failed_run_id,
+    }
+}

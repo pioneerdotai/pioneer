@@ -1,0 +1,863 @@
+_version = 1
+
+[chat.composer]
+placeholder = "Send a message to the assistant"
+
+[chat.composer.mode]
+agent_label = "Agent"
+agent_description = "Full automation and seamless integration into your workflow."
+chat_label = "Chat"
+chat_description = "Conversational AI for analysis, writing, and reasoning without automation."
+
+[chat.composer.model]
+select_label = "Select model"
+dialog_title = "Select Model"
+provider_label = "Provider"
+provider_placeholder = "Search providers..."
+model_label = "Model"
+model_placeholder = "Search models..."
+loading_models = "Loading models..."
+loading_providers = "Loading providers..."
+no_providers = "No providers configured"
+no_models = "No models available"
+load_error = "Failed to load: %{error}"
+
+[chat.composer.preview]
+skill = "Skill: %{name}"
+mention = "Mention: %{name}"
+
+[common]
+address = "Address"
+copy = "Copy"
+name = "Name"
+ok = "OK"
+or = "or"
+token = "Token"
+
+[buttons]
+cancel = "Cancel"
+save = "Save"
+
+[conversation.error]
+turn_failed = "Turn failed"
+
+[errors.command]
+exit_status = "exit status %{status}"
+failed_with_output = "`%{command_label}` failed: %{details}"
+launchctl_print_failed = "failed to run `launchctl print`"
+powershell_task_status_failed = "failed to run powershell for scheduled task status"
+run_failed = "failed to run `%{command_label}`"
+systemctl_is_active_failed = "failed to run `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "desktop.gateway.connect_timeout_ms must be greater than 0"
+load_app = "failed to load app config"
+poll_interval_positive = "desktop.gateway.poll_interval_ms must be greater than 0"
+startup_timeout_positive = "desktop.gateway.startup_timeout_ms must be greater than 0"
+
+[errors.gateway]
+address_conflict_inactive_service = "address `%{listen_addr}` is already occupied, but configured service `%{service_name}` is not active; stop the conflicting process/service or change gateway.listen_addr"
+address_empty = "gateway address must not be empty"
+id_not_found = "gateway id `%{id}` not found"
+invalid_address = "invalid gateway address `%{normalized}`; expected host:port"
+resolve_empty = "gateway address `%{listen_addr}` resolved to no socket addresses"
+resolve_failed = "failed to resolve gateway address `%{listen_addr}`"
+start_command_failed_manual_help = "failed to install or start local gateway automatically; retry and verify local gateway configuration"
+startup_timeout = "gateway service did not become reachable at `%{listen_addr}` within %{startup_timeout_ms}ms"
+unreachable_verify = "gateway `%{address}` is unreachable; verify address and that gateway is running"
+
+[errors.registry]
+parse_failed = "failed to parse gateway registry `%{path}`"
+read_failed = "failed to read gateway registry `%{path}`"
+serialize_failed = "failed to serialize gateway registry"
+unsupported_version = "unsupported gateway registry version `%{version}` in `%{path}`; expected `%{current_registry_version}`"
+write_failed = "failed to write gateway registry `%{path}`"
+
+[errors.runtime]
+ensure_home = "failed to ensure runtime home directory"
+
+[errors.theme]
+watch_dir_failed = "Failed to watch themes directory"
+
+[errors.window]
+open_failed = "failed to open desktop window"
+
+[gateway.action]
+connect_remote = "Connect remote"
+start_local = "Start local gateway"
+
+[gateway.endpoint]
+local_name = "Local Gateway"
+local_with_address = "Local - %{address}"
+remote_name = "Remote %{index}"
+remote_with_address = "Remote - %{address}"
+
+[gateway.error]
+with_details = "Gateway error: %{error}."
+
+[gateway.initial]
+description = "Specify a gateway address or start a local gateway service."
+title = "Connect gateway"
+
+[gateway.popover]
+no_available = "No available gateways."
+
+[gateway.status]
+connected = "Gateway connected"
+connecting = "Gateway connecting..."
+connecting_named = "Connecting to %{gateway_name}..."
+connecting_remote = "Connecting to remote gateway..."
+failed_check = "Failed to check gateway status: %{error}"
+local_conflict = "Local gateway conflict: address is occupied by another process."
+local_conflict_at = "Local gateway conflict at %{gateway_address}: address is occupied by another process."
+local_stopped = "Local gateway is stopped: %{gateway_address}. Start local gateway or switch to remote."
+not_configured = "Gateway is not configured yet. Add remote address or start local gateway."
+remote_unavailable = "Remote gateway unavailable: %{gateway_name} (%{gateway_address})"
+starting_local = "Starting local gateway..."
+installing = "Installing gateway..."
+updating = "Updating gateway..."
+subsystem_failed = "Gateway subsystem failed to initialize: %{error}"
+subsystem_not_ready = "Gateway subsystem is not ready"
+unavailable = "Gateway is unavailable"
+
+[gateway.notification]
+path_update_skipped = "Gateway started. For the `pioneer` command, you may need to add %{bin_dir} to PATH in a new terminal session."
+
+[logs.gateway]
+launcher_did_not_reach_service = "launcher did not make configured gateway service reachable"
+launcher_failed = "launcher failed"
+launcher_unavailable = "launcher is not available"
+service_started = "gateway service started"
+
+[logs.runtime]
+home_ready = "runtime home directory is ready"
+prepare_home_failed = "failed to prepare runtime home directory"
+
+[menu.app]
+name = "Pioneer"
+about = "About Pioneer"
+services = "Services"
+hide = "Hide Pioneer"
+hide_others = "Hide Others"
+show_all = "Show All"
+quit = "Quit Pioneer"
+
+[menu.about]
+version = "Version %{version}"
+copyright = "© Pioneer Contributors"
+
+[sidebar.action]
+new_thread = "New thread"
+providers = "Providers"
+
+[sidebar.thread]
+untitled = "New thread"
+
+[sidebar.title]
+threads = "Threads"
+
+[sidebar.folder]
+new = "New folder"
+
+[sidebar.contextmenu.folder]
+rename = "Rename"
+delete = "Delete"
+
+[dialog.folder.rename]
+title = "Rename folder"
+description = "Make it short and easy to remember."
+
+[providers.screen]
+title = "Providers"
+description = "Configure API keys for available model providers."
+empty_connected = "No connected providers yet."
+
+[providers.sidebar]
+all = "All"
+connected = "Connected"
+
+[providers.button]
+submit = "Save key"
+remove_key = "Remove key"
+
+[providers.dialog]
+title = "Configure %{provider}"
+api_key_label = "API Key *"
+api_key_placeholder = "Enter API key"
+replace_hint = "A key is already configured for %{provider}. Saving will replace it."
+
+[providers.error]
+gateway_not_connected = "Gateway is not connected."
+load_failed = "Failed to load provider configuration"
+save_failed = "Failed to save API key"
+delete_failed = "Failed to remove API key"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Claude and other models from Anthropic"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "Models through AWS Bedrock"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Models through Azure OpenAI Service"
+
+[providers.catalog.claude-code]
+title = "Claude Code CLI"
+description = "Use models via Claude Code CLI"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Run models via Copilot-compatible API"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI-compatible DeepSeek provider"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Gemini models from Google AI"
+
+[providers.catalog.gemini-cli]
+title = "Gemini CLI"
+description = "Use models via Gemini CLI tool"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM and Zhipu-compatible models"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Fast inference with Groq hardware"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM proxy and gateway"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "Mistral API via OpenAI-compatible endpoint"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "Run local Ollama models"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT and other OpenAI models"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "Router for many model providers"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx inference endpoint"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok models"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Models hosted by Together"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks hosted model APIs"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "Novita OpenAI-compatible endpoint"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API models"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere compatibility endpoint"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice model API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras model API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova model API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic hosted models"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "DeepInfra OpenAI-compatible endpoint"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF router endpoint"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio endpoint"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka model endpoint"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten inference endpoint"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale inference endpoint"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale hosted model endpoints"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio endpoint"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli serverless endpoint"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI endpoint"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow model API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API endpoint"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI model API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun model endpoint"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan model API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi model API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan model API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI endpoint"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM endpoint"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "Synthetic OpenAI-compatible endpoint"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark endpoint"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan model API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "Local LM Studio OpenAI-compatible API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "Local llama.cpp OpenAI-compatible API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "Local SGLang OpenAI-compatible API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "Local vLLM OpenAI-compatible API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "Local OSaurus OpenAI-compatible API"
+
+[providers.catalog.kilocli]
+title = "Kilo CLI"
+description = "Use models via Kilo CLI"
+
+[mcp.screen]
+title = "MCP"
+description = "Installed Model Context Protocol servers for the current space."
+found_count = "Found:"
+
+[mcp.empty]
+title = "No installed MCP servers"
+description = "Install new MCP servers and expand your agents' capabilities."
+
+[mcp.dialog]
+install_title = "Install MCP server"
+install = "Install"
+uninstall_title = "Uninstall %{name}?"
+uninstall_description = "Remove this MCP server from the current workspace and stop its runtime task."
+uninstall = "Uninstall"
+config_json = "Config JSON"
+secret_store_hint = "Secret values from env, headers, tokens and authorization fields are stored through the gateway secret store."
+
+[mcp.dialog.error]
+config_required = "MCP config JSON is required"
+config_invalid = "MCP config JSON is invalid: %{error}"
+servers_required = "MCP config JSON must contain an mcpServers object"
+servers_empty = "MCP config JSON must contain at least one server"
+server_name_empty = "MCP server name cannot be empty"
+server_config_object = "%{name}: server config must be an object"
+command_or_url_required = "%{name}: command or url is required"
+command_url_exclusive = "%{name}: command and url cannot both be set"
+gateway_not_connected = "Gateway is not connected"
+workspace_not_selected = "Workspace is not selected"
+install_failed = "Failed to install MCP server: %{error}"
+server_validation_error = "%{name}: validation error"
+validation_failed = "MCP config validation failed"
+diagnostic = "%{name}: %{level}: %{message}%{field}"
+level_error = "error"
+level_warning = "warning"
+
+[mcp.status]
+not_started = "Not started"
+disabled = "Disabled"
+starting = "Starting"
+ready = "Ready"
+degraded = "Degraded"
+auth_required = "Auth required"
+failed = "Failed"
+stopping = "Stopping"
+stopped = "Stopped"
+restarting = "Restarting"
+
+[mcp.capabilities]
+tools = "tools"
+resources = "resources"
+templates = "templates"
+prompts = "prompts"
+
+[mcp.sidebar]
+install = "Install"
+refresh = "Refresh"
+back = "Back"
+update_config = "Update"
+restart = "Restart"
+uninstall = "Uninstall"
+
+[mcp.details]
+not_selected = "MCP server is not selected"
+enabled = "Enabled"
+implicit = "Implicit"
+refresh = "Refresh"
+source = "Source"
+scope = "Scope"
+transport = "Transport"
+loaded = "Loaded"
+runtime = "Runtime"
+live = "Live"
+last_seen = "Last seen"
+retry_attempt = "Retry attempt"
+next_retry = "Next retry"
+last_error = "Last error"
+stderr = "stderr"
+health = "Health"
+tools = "Tools"
+tools_count = "Tools: %{count}"
+resources = "Resources"
+resources_count = "Resources: %{count}"
+resource_templates = "Resource templates"
+templates_count = "Templates: %{count}"
+prompts = "Prompts"
+prompts_count = "Prompts: %{count}"
+audit = "Audit"
+audit_count = "Audit events: %{count}"
+source_config = "Config"
+scope_workspace = "Workspace"
+scope_user = "User"
+
+[mcp.audit]
+column_time = "Time"
+column_time_hint = "Local time when the MCP audit event was written."
+column_event = "Event"
+column_event_hint = "Audit action and raw MCP tool when present."
+column_result = "Result"
+column_result_hint = "Gateway decision for this MCP event."
+column_details = "Details"
+column_details_hint = "Reason code and compact event details."
+reason_tooltip = "%{details}\nReason: %{reason}"
+action_install = "Installed"
+action_update = "Updated"
+action_uninstall = "Removed"
+action_policy = "Policy changed"
+action_start = "Start"
+action_started = "Started"
+action_start_failed = "Start failed"
+action_stop = "Stop"
+action_stopped = "Stopped"
+action_restart = "Restart"
+action_catalog_refreshed = "Catalog refreshed"
+action_call = "Tool call"
+action_call_completed = "Tool completed"
+action_call_failed = "Tool failed"
+decision_allowed = "Allowed"
+decision_blocked = "Blocked"
+decision_warning = "Warning"
+
+[mcp.common]
+yes = "Yes"
+no = "No"
+none = "None"
+empty = "No details"
+items_count = "Items: %{count}"
+keys_count = "Keys: %{count}"
+
+[mcp.error]
+server_name_required = "MCP server name is required"
+gateway_not_connected = "Gateway is not connected"
+workspace_not_selected = "Workspace is not selected"
+server_not_available = "MCP server is not available in the current workspace"
+load_servers_failed = "Failed to load MCP servers: %{error}"
+load_details_failed = "Failed to load MCP server details: %{error}"
+policy_update_failed = "Failed to update MCP policy: %{error}"
+restart_failed = "Failed to restart MCP server: %{error}"
+uninstall_failed = "Failed to uninstall MCP server: %{error}"
+
+[skills.screen]
+title = "Skills"
+description = "Installed skills for the current space."
+installed_count = "Found:"
+
+[skills.empty]
+title = "No installed skills"
+description = "Install new skills and expand your agents' capabilities."
+
+[skills.error]
+gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "No active workspace selected."
+load_failed = "Failed to load installed skills"
+path_required = "Path is required."
+invalid_skill_target = "Invalid skill target."
+install_failed = "Failed to install skill"
+update_failed = "Failed to update skill"
+uninstall_failed = "Failed to uninstall skill"
+policy_failed = "Failed to update skill policy"
+path_picker_failed = "Failed to open source picker"
+
+[skills.card]
+version = "Version"
+fingerprint = "Fingerprint"
+
+[skills.button]
+install = "Install"
+update = "Update"
+uninstall = "Uninstall"
+enabled = "Enabled"
+implicit = "Implicit"
+
+[skills.upload]
+preparing = "Preparing skill upload"
+installing = "Uploading skill"
+updating = "Uploading update"
+cancelling = "Cancelling upload"
+
+[skills.dialog]
+install_title = "Install Skill"
+update_title = "Update %{slug}"
+source_kind_description = "Choose a skill folder from disk."
+pick_folder = "Choose folder"
+pick_archive = "Choose archive"
+
+[skills.diagnostics]
+reason = "Reason:"
+validation = "Validation"
+dependencies = "Dependencies"
+dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
+dependencies_column_action = "What to do"
+dependencies_hint_requirement = "What this skill expects to find on your machine."
+dependencies_hint_status = "Current result of the dependency check."
+dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
+dependencies_kind_bin = "Command"
+dependencies_kind_env = "Environment variable"
+dependencies_kind_api_key = "API key"
+dependencies_kind_command = "Command"
+dependencies_kind_mcp = "MCP server"
+dependencies_kind_tool = "Dependency"
+dependencies_status_ready = "Ready"
+dependencies_status_missing = "Missing"
+dependencies_status_blocked = "Blocked"
+dependencies_status_warning = "Warning"
+dependencies_status_unknown = "Unknown"
+security = "Security"
+security_intro = "Potential risks found while scanning skill files."
+security_column_rule = "Rule"
+security_column_finding = "Finding"
+security_column_location = "Location"
+security_hint_level = "Severity of the security finding."
+security_hint_rule = "Identifier of the rule that triggered this finding."
+security_hint_finding = "What exactly was detected and why it matters."
+security_hint_location = "File path where the finding was detected."
+security_location_unknown = "Path not specified"
+security_severity_critical = "Critical"
+security_severity_high = "High"
+security_severity_medium = "Medium"
+security_severity_low = "Low"
+security_severity_info = "Info"
+trust_gate = "Trust gates"
+trust_gate_intro = "Permission decisions based on required trust level."
+trust_column_tool = "Tool type"
+trust_column_min_trust = "Required trust"
+trust_column_explanation = "Explanation"
+trust_hint_tool = "Which tool category this gate controls."
+trust_hint_min_trust = "Minimum trust level required to use this tool."
+trust_hint_decision = "Whether the tool use is currently allowed."
+trust_hint_explanation = "Simple reason for the current decision."
+trust_tool_shell = "Shell"
+trust_tool_http = "HTTP"
+trust_tool_function_proxy = "Function proxy"
+trust_tool_mcp = "MCP"
+trust_decision_allowed = "Allowed"
+trust_decision_blocked = "Blocked"
+trust_explanation_allowed = "Current trust level is enough."
+trust_explanation_blocked = "Blocked until trust level reaches"
+audit = "Recent audit"
+audit_intro = "Recent actions and checks related to this skill."
+audit_column_time = "When"
+audit_column_event = "Event"
+audit_column_result = "Result"
+audit_column_details = "Details"
+audit_hint_time = "When this event was recorded."
+audit_hint_event = "What happened with the skill."
+audit_hint_result = "Whether the action was allowed, blocked, or warned."
+audit_hint_details = "Reason and technical details behind the decision."
+audit_action_install = "Installed"
+audit_action_update = "Updated"
+audit_action_uninstall = "Removed"
+audit_action_resolve_allowed = "Resolved for prompt"
+audit_action_resolve_blocked = "Blocked on resolve"
+audit_action_runtime_allowed = "Allowed on runtime"
+audit_action_runtime_blocked = "Blocked on runtime"
+audit_action_security_warn = "Security warning"
+audit_decision_allowed = "Allowed"
+audit_decision_blocked = "Blocked"
+audit_decision_warning = "Warning"
+audit_reason_none = "No explicit reason"
+audit_details_empty = "No extra details"
+none = "none"
+empty_validation = "No validation issues found."
+empty_dependencies = "No dependency issues found."
+empty_security = "No security findings."
+empty_trust_gate = "No trust gate decisions."
+empty_audit = "No audit events yet."
+
+[skills.catalog]
+source = "Source"
+trust = "Trust"
+
+[skills.status]
+active = "Active"
+blocked = "Blocked"
+disabled = "Disabled"
+
+[skills.source]
+system = "System"
+user = "User"
+workspace = "Workspace"
+registry = "Registry"
+
+[skills.trust]
+internal = "Internal"
+verified = "Verified"
+community = "Community"
+untrusted = "Untrusted"
+
+[settings.screen]
+title = "Settings"
+description = "Manage application preferences."
+
+[settings.sidebar]
+back = "Back"
+general = "General"
+
+[settings.option.language]
+label = "App language"
+description = "Choose the language used in the interface."
+
+[settings.option.theme]
+label = "Color theme"
+description = "Pick a preferred appearance mode."
+
+[settings.language]
+system = "System default"
+english = "English"
+russian = "Russian"
+german = "German"
+spanish = "Spanish"
+french = "French"
+hindi = "Hindi"
+japanese = "Japanese"
+chinese = "Chinese"
+
+[settings.theme]
+system = "System"
+light = "Light"
+dark = "Dark"
+
+[bottom_bar]
+gateway_disconnected = "Gateway is disconnected"
+starting_thread = "Starting thread..."
+finishing_turn = "Finishing turn..."
+turn_running = "Turn `%{turn_id}` is running"
+previous_turn_failed = "Previous turn failed. You can send a new message."
+turn_cancelled = "Turn cancelled. You can send a new message."
+turn_completed = "Turn completed. Ready for the next message."
+ready = "Ready"
+starting_turn = "Starting turn..."
+agent_processing = "Agent is processing..."
+
+[timeline.empty]
+start_thread = "Send a message to start this thread"
+
+[timeline.elapsed]
+hours_minutes = "%{hours} h %{minutes} min"
+minutes_seconds = "%{minutes} min %{seconds} sec"
+seconds = "%{seconds} sec"
+
+[timeline.common]
+url_missing = "No URL provided"
+no_details = "No details"
+truncated = "... [truncated]"
+
+[timeline.reasoning]
+summary = "Summary:"
+content = "Content:"
+running = "Thinking"
+completed = "Thought"
+
+[timeline.agent_message]
+subagent_completed = "Subagent answered"
+
+[timeline.work_group]
+completed = "Worked"
+
+[timeline.web_search]
+fallback_query = "Web search"
+running = "Searching the web"
+no_results = "No search results"
+results_count = "%{count} results"
+
+[timeline.file_change]
+cancelled = "Cancelled"
+failed = "Changes not applied"
+running = "Applying changes"
+completed = "Files changed"
+no_files = "No files specified"
+one_file = "1 file"
+files_count = "%{count} files"
+exit_code = "Exit code:"
+more_files = "and %{count} more"
+output = "Output"
+
+[timeline.download]
+cancelled = "Cancelled"
+failed = "Download failed"
+running = "Downloading file"
+completed = "File downloaded"
+size = "Size: %{size}"
+unit_b = "B"
+unit_kb = "KB"
+unit_mb = "MB"
+unit_gb = "GB"
+unit_tb = "TB"
+
+[timeline.web_fetch]
+cancelled = "Cancelled"
+failed = "Failed to open"
+running = "Opening link"
+completed = "Loaded"
+
+[timeline.tool]
+cancelled = "Cancelled"
+failed = "Failed"
+running = "Running tool"
+completed = "Completed"
+arguments = "Arguments"
+result = "Result"
+open_mcp_server = "Open MCP server"
+started = "Running tool: %{tool_name}"
+started_kind = "Running tool: %{tool_name} (%{kind})"
+finished = "Tool `%{tool_name}` finished"
+command = "Command: %{command}"
+cwd = "Working directory: %{cwd}"
+query = "Query: %{query}"
+url = "URL: %{url}"
+exit_code = "Exit code: %{exit_code}"
+duration_ms = "Duration: %{duration_ms} ms"
+timed_out = "Timed out"
+changed_files = "Changed files:"
+results = "Results: %{count}"
+provider = "Provider: %{provider}"
+status_code = "Status code: %{status_code}"
+title = "Title: %{title}"
+path = "Path: %{path}"
+bytes = "Bytes: %{bytes}"
+progress = "[Progress] %{value}"
+stderr = "[Stderr] %{value}"
+
+[timeline.command]
+running = "Running command"
+completed = "Command completed"
+
+[timeline.system]
+info = "System event"
+warning = "Warning"
+error = "Error"
+tool = "tool"
+attempt = "Attempt #%{attempt}"
+timeout_with_recovery = "The step timed out; recovery started"
+timeout_without_recovery = "The step timed out; automatic recovery is unavailable"
+timeout_label = "Timeout"
+timeout_delta_recovery_scheduled = "[timeout] attempt #%{attempt} %{reason}; recovery scheduled (job `%{job_id}`)"
+timeout_delta_no_recovery = "[timeout] attempt #%{attempt} %{reason}; no automatic recovery"
+recovery_opened = "Starting step recovery"
+recovery_attached = "Recovery attached to a new step"
+retry_scheduled = "Recovery retry scheduled"
+retry_started = "Recovery retry started"
+recovery_succeeded = "Recovery completed"
+recovery_failed = "Recovery failed"
+recovery_label = "Recovery"
+retry_label = "Retry"
+recovered_label = "Recovered"
+tool_retry_scheduled = "Retrying %{tool_name}"
+tool_retry_scheduled_with_attempt = "Retrying tool %{tool_name} (attempt #%{attempt})"
+tool_retry_resolved = "%{tool_name} completed after retry"
+tool_retry_exhausted = "%{tool_name} failed after retries"
+retry_resolved_label = "Retry completed"
+retries_exhausted_label = "Retries exhausted"
+tool_loop_budget_exceeded = "Tool call limit reached"
+code = "Code:"

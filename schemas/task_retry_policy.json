@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskRetryPolicy",
+  "type": "object",
+  "required": [
+    "backoff",
+    "maxAttempts"
+  ],
+  "properties": {
+    "backoff": {
+      "$ref": "#/definitions/TaskRetryBackoffKind"
+    },
+    "initialDelaySeconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "maxAttempts": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "maxDelaySeconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "retryOn": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskErrorClass"
+      }
+    }
+  },
+  "definitions": {
+    "TaskErrorClass": {
+      "type": "string",
+      "enum": [
+        "cancelled",
+        "timeout",
+        "provider",
+        "tool",
+        "validation",
+        "dependency",
+        "policy",
+        "internal",
+        "unknown"
+      ]
+    },
+    "TaskRetryBackoffKind": {
+      "type": "string",
+      "enum": [
+        "none",
+        "fixed",
+        "exponential"
+      ]
+    }
+  }
+}

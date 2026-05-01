@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolRecoveryView",
+  "type": "object",
+  "required": [
+    "wasTruncated"
+  ],
+  "properties": {
+    "contentFingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "continuation": true,
+    "diagnosticExcerpt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "diagnosticSummary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "errorClass": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "incompleteReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "outputFingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retryHint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "wasTruncated": {
+      "type": "boolean"
+    }
+  }
+}

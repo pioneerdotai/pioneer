@@ -1,0 +1,28 @@
+[package]
+name = "pioneer-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pioneer-protocol.workspace = true
+pioneer-provider.workspace = true
+pioneer-skills.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+url.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+libc.workspace = true
+scraper.workspace = true
+webclaw-core.workspace = true
+futures-util.workspace = true
+enigo.workspace = true
+xcap.workspace = true

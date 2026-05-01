@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DurableEventCausalityKey",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "scope",
+        "turn_id"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "turn"
+          ]
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "scope",
+        "task_id"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "task"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "scope",
+        "task_run_id"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "task_run"
+          ]
+        },
+        "task_run_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "child_thread_id",
+        "scope"
+      ],
+      "properties": {
+        "child_thread_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "thread_lineage"
+          ]
+        }
+      }
+    }
+  ]
+}

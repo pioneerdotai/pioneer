@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDeliveriesParams",
+  "type": "object",
+  "required": [
+    "workspaceId"
+  ],
+  "properties": {
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "statuses": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskDeliveryStatus"
+      }
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TaskDeliveryStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "delivering",
+        "delivered",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

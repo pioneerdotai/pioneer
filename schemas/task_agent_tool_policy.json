@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgentToolPolicy",
+  "type": "object",
+  "required": [
+    "networkAccess",
+    "writeMode"
+  ],
+  "properties": {
+    "allowedPaths": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowedTools": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "deniedTools": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "networkAccess": {
+      "type": "boolean"
+    },
+    "writeMode": {
+      "$ref": "#/definitions/TaskAgentWriteMode"
+    }
+  },
+  "definitions": {
+    "TaskAgentWriteMode": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "workspace_write",
+        "scoped_write",
+        "full_access"
+      ]
+    }
+  }
+}

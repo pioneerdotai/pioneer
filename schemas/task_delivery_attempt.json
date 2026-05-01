@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDeliveryAttempt",
+  "type": "object",
+  "required": [
+    "attemptNumber",
+    "deliveryId",
+    "id",
+    "startedAt",
+    "status"
+  ],
+  "properties": {
+    "attemptNumber": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "completedAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "deliveryId": {
+      "type": "string"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "httpStatus": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "id": {
+      "type": "string"
+    },
+    "responseFingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "startedAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "status": {
+      "$ref": "#/definitions/TaskDeliveryAttemptStatus"
+    }
+  },
+  "definitions": {
+    "TaskDeliveryAttemptStatus": {
+      "type": "string",
+      "enum": [
+        "started",
+        "delivered",
+        "failed"
+      ]
+    }
+  }
+}

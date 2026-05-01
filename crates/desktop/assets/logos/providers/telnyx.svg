@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <rect width="100" height="100" rx="18" fill="#000000"/>
+  <!-- Telnyx green accent bar + T shape -->
+  <rect x="22" y="28" width="56" height="8" rx="4" fill="#00E3AA"/>
+  <rect x="44" y="36" width="12" height="38" rx="4" fill="#00E3AA"/>
+  <!-- small accent dots -->
+  <circle cx="22" cy="72" r="5" fill="#00E3AA" opacity="0.5"/>
+  <circle cx="78" cy="72" r="5" fill="#00E3AA" opacity="0.5"/>
+</svg>

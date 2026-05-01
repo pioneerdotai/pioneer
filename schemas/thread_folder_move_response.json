@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ThreadFolderMoveResponse",
+  "type": "object",
+  "required": [
+    "moved"
+  ],
+  "properties": {
+    "moved": {
+      "type": "boolean"
+    }
+  }
+}

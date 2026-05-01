@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskDependencyTriggerPolicy",
+  "type": "object",
+  "required": [
+    "mode"
+  ],
+  "properties": {
+    "dependsOnTaskIds": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "mode": {
+      "$ref": "#/definitions/TaskDependencyTriggerMode"
+    }
+  },
+  "definitions": {
+    "TaskDependencyTriggerMode": {
+      "type": "string",
+      "enum": [
+        "all_succeeded",
+        "any_succeeded",
+        "all_terminal"
+      ]
+    }
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Map_of_ToolMetadataValue",
+  "type": "object",
+  "additionalProperties": {
+    "$ref": "#/definitions/ToolMetadataValue"
+  },
+  "definitions": {
+    "ToolMetadataRawKind": {
+      "type": "string",
+      "enum": [
+        "content",
+        "body",
+        "blob",
+        "base64",
+        "bytes",
+        "data",
+        "html",
+        "image",
+        "output",
+        "screenshot",
+        "stdout",
+        "stderr",
+        "text",
+        "unknown"
+      ]
+    },
+    "ToolMetadataValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bool"
+              ]
+            },
+            "value": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "number"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "string"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "values"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "array"
+              ]
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ToolMetadataValue"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "fields",
+            "kind"
+          ],
+          "properties": {
+            "fields": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ToolMetadataValue"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "object"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "bytes",
+            "kind",
+            "raw_kind",
+            "sha256",
+            "value_kind"
+          ],
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "redacted_raw"
+              ]
+            },
+            "raw_kind": {
+              "$ref": "#/definitions/ToolMetadataRawKind"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "value_kind": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

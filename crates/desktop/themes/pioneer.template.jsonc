@@ -1,0 +1,255 @@
+{
+  "$schema": "https://github.com/longbridge/gpui-component/raw/refs/heads/main/.theme-schema.json",
+  // ThemeSet name
+  "name": "Pioneer",
+  // ThemeSet author (optional)
+  "author": "Your Team",
+  // ThemeSet URL (optional)
+  "url": "https://example.com",
+  "themes": [
+    {
+      // Whether this theme is default in the set
+      "is_default": true,
+      // Theme display name
+      "name": "Pioneer Light",
+      // light | dark
+      "mode": "light",
+      // Base UI font size
+      "font.size": 16,
+      // Base UI font family
+      "font.family": "Inter",
+      // Monospace font family
+      "mono_font.family": "Menlo",
+      // Monospace font size
+      "mono_font.size": 13,
+      // Base corner radius
+      "radius": 6,
+      // Large corner radius (dialogs, notifications)
+      "radius.lg": 8,
+      // Enable component shadows
+      "shadow": true,
+      "colors": {
+        // Used for accents such as hover background on MenuItem, ListItem, etc.
+        "accent.background": "#000000",
+        // Used for accent text color.
+        "accent.foreground": "#000000",
+        // Accordion background color.
+        "accordion.background": "#000000",
+        // Accordion hover background color.
+        "accordion.hover.background": "#000000",
+        // Default background color.
+        "background": "#000000",
+        // Default border color
+        "border": "#000000",
+        // Background color for GroupBox.
+        "group_box.background": "#000000",
+        // Text color for GroupBox.
+        "group_box.foreground": "#000000",
+        // Title text color for GroupBox.
+        "group_box.title.foreground": "#000000",
+        // Input caret color (Blinking cursor).
+        "caret": "#000000",
+        // Chart 1 color.
+        "chart.1": "#000000",
+        // Chart 2 color.
+        "chart.2": "#000000",
+        // Chart 3 color.
+        "chart.3": "#000000",
+        // Chart 4 color.
+        "chart.4": "#000000",
+        // Chart 5 color.
+        "chart.5": "#000000",
+        // Danger background color.
+        "danger.background": "#000000",
+        // Danger active background color.
+        "danger.active.background": "#000000",
+        // Danger text color.
+        "danger.foreground": "#000000",
+        // Danger hover background color.
+        "danger.hover.background": "#000000",
+        // Description List label background color.
+        "description_list.label.background": "#000000",
+        // Description List label foreground color.
+        "description_list.label.foreground": "#000000",
+        // Drag border color.
+        "drag.border": "#000000",
+        // Drop target background color.
+        "drop_target.background": "#000000",
+        // Default text color.
+        "foreground": "#000000",
+        // Info background color.
+        "info.background": "#000000",
+        // Info active background color.
+        "info.active.background": "#000000",
+        // Info text color.
+        "info.foreground": "#000000",
+        // Info hover background color.
+        "info.hover.background": "#000000",
+        // Border color for inputs such as Input, Select, etc.
+        "input.border": "#000000",
+        // Link text color.
+        "link": "#000000",
+        // Active link text color.
+        "link.active": "#000000",
+        // Hover link text color.
+        "link.hover": "#000000",
+        // Background color for List and ListItem.
+        "list.background": "#000000",
+        // Background color for active ListItem.
+        "list.active.background": "#000000",
+        // Border color for active ListItem.
+        "list.active.border": "#000000",
+        // Stripe background color for even ListItem.
+        "list.even.background": "#000000",
+        // Background color for List header.
+        "list.head.background": "#000000",
+        // Hover background color for ListItem.
+        "list.hover.background": "#000000",
+        // Muted backgrounds such as Skeleton and Switch.
+        "muted.background": "#000000",
+        // Muted text color, as used in disabled text.
+        "muted.foreground": "#000000",
+        // Background color for Popover.
+        "popover.background": "#000000",
+        // Text color for Popover.
+        "popover.foreground": "#000000",
+        // Primary background color.
+        "primary.background": "#000000",
+        // Active primary background color.
+        "primary.active.background": "#000000",
+        // Primary text color.
+        "primary.foreground": "#000000",
+        // Hover primary background color.
+        "primary.hover.background": "#000000",
+        // Progress bar background color.
+        "progress.bar.background": "#000000",
+        // Used for focus ring.
+        "ring": "#000000",
+        // Scrollbar background color.
+        "scrollbar.background": "#000000",
+        // Scrollbar thumb background color.
+        "scrollbar.thumb.background": "#000000",
+        // Scrollbar thumb hover background color.
+        "scrollbar.thumb.hover.background": "#000000",
+        // Secondary background color.
+        "secondary.background": "#000000",
+        // Active secondary background color.
+        "secondary.active.background": "#000000",
+        // Secondary text color, used for secondary Button text color or secondary text.
+        "secondary.foreground": "#000000",
+        // Hover secondary background color.
+        "secondary.hover.background": "#000000",
+        // Input selection background color.
+        "selection.background": "#000000",
+        // Sidebar background color.
+        "sidebar.background": "#000000",
+        // Sidebar accent background color.
+        "sidebar.accent.background": "#000000",
+        // Sidebar accent text color.
+        "sidebar.accent.foreground": "#000000",
+        // Sidebar border color.
+        "sidebar.border": "#000000",
+        // Sidebar text color.
+        "sidebar.foreground": "#000000",
+        // Sidebar primary background color.
+        "sidebar.primary.background": "#000000",
+        // Sidebar primary text color.
+        "sidebar.primary.foreground": "#000000",
+        // Skeleton background color.
+        "skeleton.background": "#000000",
+        // Slider bar background color.
+        "slider.background": "#000000",
+        // Slider thumb background color.
+        "slider.thumb.background": "#000000",
+        // Success background color.
+        "success.background": "#000000",
+        // Success text color.
+        "success.foreground": "#000000",
+        // Success hover background color.
+        "success.hover.background": "#000000",
+        // Success active background color.
+        "success.active.background": "#000000",
+        // Bullish color for candlestick charts (upward price movement).
+        "bullish.background": "#000000",
+        // Bearish color for candlestick charts (downward price movement).
+        "bearish.background": "#000000",
+        // Switch background color.
+        "switch.background": "#000000",
+        // Switch thumb background color.
+        "switch.thumb.background": "#000000",
+        // Tab background color.
+        "tab.background": "#000000",
+        // Tab active background color.
+        "tab.active.background": "#000000",
+        // Tab active text color.
+        "tab.active.foreground": "#000000",
+        // TabBar background color.
+        "tab_bar.background": "#000000",
+        // TabBar segmented background color.
+        "tab_bar.segmented.background": "#000000",
+        // Tab text color.
+        "tab.foreground": "#000000",
+        // Table background color.
+        "table.background": "#000000",
+        // Table active item background color.
+        "table.active.background": "#000000",
+        // Table active item border color.
+        "table.active.border": "#000000",
+        // Stripe background color for even TableRow.
+        "table.even.background": "#000000",
+        // Table head background color.
+        "table.head.background": "#000000",
+        // Table head text color.
+        "table.head.foreground": "#000000",
+        // Table item hover background color.
+        "table.hover.background": "#000000",
+        // Table row border color.
+        "table.row.border": "#000000",
+        // TitleBar background color, use for Window title bar.
+        "title_bar.background": "#000000",
+        // TitleBar border color.
+        "title_bar.border": "#000000",
+        // Background color for Tiles.
+        "tiles.background": "#000000",
+        // Warning background color.
+        "warning.background": "#000000",
+        // Warning active background color.
+        "warning.active.background": "#000000",
+        // Warning hover background color.
+        "warning.hover.background": "#000000",
+        // Warning foreground color.
+        "warning.foreground": "#000000",
+        // Overlay background color.
+        "overlay": "#000000",
+        // Window border color.  # Platform specific:  This is only works on Linux, other platforms we can't change the window border color.
+        "window.border": "#000000",
+        // Base blue color.
+        "base.blue": "#000000",
+        // Base light blue color.
+        "base.blue.light": "#000000",
+        // Base cyan color.
+        "base.cyan": "#000000",
+        // Base light cyan color.
+        "base.cyan.light": "#000000",
+        // Base green color.
+        "base.green": "#000000",
+        // Base light green color.
+        "base.green.light": "#000000",
+        // Base magenta color.
+        "base.magenta": "#000000",
+        // No description in schema.
+        "base.magenta.light": "#000000",
+        // Base red color.
+        "base.red": "#000000",
+        // Base light red color.
+        "base.red.light": "#000000",
+        // Base yellow color.
+        "base.yellow": "#000000",
+        // Base light yellow color.
+        "base.yellow.light": "#000000",
+      },
+      // Optional syntax highlighting theme style (Zed-compatible object)
+      // "highlight": {}
+    },
+  ],
+}

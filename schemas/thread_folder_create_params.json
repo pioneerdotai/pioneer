@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ThreadFolderCreateParams",
+  "type": "object",
+  "required": [
+    "name",
+    "workspace_id"
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "parent_folder_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  }
+}

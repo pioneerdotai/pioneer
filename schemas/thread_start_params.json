@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ThreadStartParams",
+  "type": "object",
+  "required": [
+    "thread_id",
+    "workspace_id"
+  ],
+  "properties": {
+    "agent_nickname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "origin_kind": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadOriginKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sandbox": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SandboxMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sidebar_visibility": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadSidebarVisibility"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "SandboxMode": {
+      "type": "string",
+      "enum": [
+        "FullAccess"
+      ]
+    },
+    "ThreadMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "Agent"
+      ]
+    },
+    "ThreadOriginKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "task_run",
+        "system"
+      ]
+    },
+    "ThreadSidebarVisibility": {
+      "type": "string",
+      "enum": [
+        "visible",
+        "hidden"
+      ]
+    }
+  }
+}

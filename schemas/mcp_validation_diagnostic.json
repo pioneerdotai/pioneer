@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpValidationDiagnostic",
+  "type": "object",
+  "required": [
+    "code",
+    "level",
+    "message"
+  ],
+  "properties": {
+    "code": {
+      "type": "string"
+    },
+    "field_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "level": {
+      "$ref": "#/definitions/McpDiagnosticLevel"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "McpDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning"
+      ]
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillsPolicySetParams",
+  "type": "object",
+  "required": [
+    "skill_slug",
+    "source_kind",
+    "workspace_id"
+  ],
+  "properties": {
+    "allow_implicit_invocation": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "skill_slug": {
+      "type": "string"
+    },
+    "source_kind": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  }
+}

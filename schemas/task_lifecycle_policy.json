@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskLifecyclePolicy",
+  "type": "object",
+  "required": [
+    "attachment",
+    "completion",
+    "onParentCancel",
+    "onParentFailure"
+  ],
+  "properties": {
+    "attachment": {
+      "$ref": "#/definitions/TaskAttachmentMode"
+    },
+    "completion": {
+      "$ref": "#/definitions/TaskCompletionBehavior"
+    },
+    "onParentCancel": {
+      "$ref": "#/definitions/TaskParentTerminalAction"
+    },
+    "onParentFailure": {
+      "$ref": "#/definitions/TaskParentTerminalAction"
+    }
+  },
+  "definitions": {
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
+    "TaskCompletionBehavior": {
+      "type": "string",
+      "enum": [
+        "complete_on_terminal_run",
+        "keep_active_for_recurring",
+        "manual"
+      ]
+    },
+    "TaskParentTerminalAction": {
+      "type": "string",
+      "enum": [
+        "cancel",
+        "detach",
+        "keep_running"
+      ]
+    }
+  }
+}

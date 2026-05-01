@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskAgentInputReference",
+  "type": "object",
+  "required": [
+    "id",
+    "kind"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/TaskAgentInputReferenceKind"
+    },
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "TaskAgentInputReferenceKind": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "turn",
+        "task",
+        "task_run",
+        "artifact"
+      ]
+    }
+  }
+}
