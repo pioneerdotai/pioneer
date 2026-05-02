@@ -121,7 +121,7 @@ function Run-BootstrapInstaller {
     & $InstallerBinary @args
 }
 
-$repo = if ($env:PIONEER_RELEASE_REPO) { $env:PIONEER_RELEASE_REPO } else { "pioneer-ai/pioneer" }
+$repo = if ($env:PIONEER_RELEASE_REPO) { $env:PIONEER_RELEASE_REPO } else { "pioneerdotai/pioneer" }
 $releaseApiBase = if ($env:PIONEER_RELEASE_API_BASE) { $env:PIONEER_RELEASE_API_BASE } else { "https://api.github.com/repos/$repo/releases" }
 $releaseDownloadBase = if ($env:PIONEER_RELEASE_DOWNLOAD_BASE) { $env:PIONEER_RELEASE_DOWNLOAD_BASE } else { "https://github.com/$repo/releases/download" }
 

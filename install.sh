@@ -6,7 +6,7 @@ VERSION=""
 NO_START=0
 FORCE_START=0
 
-REPO="${PIONEER_RELEASE_REPO:-pioneer-ai/pioneer}"
+REPO="${PIONEER_RELEASE_REPO:-pioneerdotai/pioneer}"
 API_BASE="${PIONEER_RELEASE_API_BASE:-https://api.github.com/repos/${REPO}/releases}"
 DOWNLOAD_BASE="${PIONEER_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}"
 

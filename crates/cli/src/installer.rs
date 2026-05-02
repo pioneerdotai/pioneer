@@ -368,7 +368,7 @@ fn resolve_release_install_source(
     version: Option<&str>,
 ) -> Result<ResolvedInstallSource> {
     let repo =
-        std::env::var("PIONEER_RELEASE_REPO").unwrap_or_else(|_| "pioneer-ai/pioneer".into());
+        std::env::var("PIONEER_RELEASE_REPO").unwrap_or_else(|_| "pioneerdotai/pioneer".into());
     let api_base = std::env::var("PIONEER_RELEASE_API_BASE")
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{repo}/releases"));
     let download_base = std::env::var("PIONEER_RELEASE_DOWNLOAD_BASE")
