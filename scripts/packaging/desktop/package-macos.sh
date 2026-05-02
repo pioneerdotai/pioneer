@@ -208,8 +208,16 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 DESKTOP_EXECUTABLE_NAME="pioneer-app"
+MACOS_ICON_NAME="Pioneer.icns"
+MACOS_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon.icns"
 MACOS_DMG_SIGN_IDENTITY="${MACOS_DMG_SIGN_IDENTITY:-${MACOS_DESKTOP_SIGN_IDENTITY:-}}"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+if [[ ! -f "$MACOS_ICON_SOURCE" ]]; then
+  echo "missing macOS app icon: $MACOS_ICON_SOURCE" >&2
+  exit 1
+fi
+cp "$MACOS_ICON_SOURCE" "$RESOURCES_DIR/$MACOS_ICON_NAME"
 
 cp "target/$TARGET/release/pioneer-app" "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
@@ -256,6 +264,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <string>APPL</string>
   <key>CFBundleExecutable</key>
   <string>${DESKTOP_EXECUTABLE_NAME}</string>
+  <key>CFBundleIconFile</key>
+  <string>${MACOS_ICON_NAME}</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
 </dict>

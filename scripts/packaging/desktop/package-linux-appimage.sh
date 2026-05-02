@@ -104,6 +104,12 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 APPDIR="$WORK_DIR/Pioneer.AppDir"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
+LINUX_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon-256.png"
+if [[ ! -f "$LINUX_ICON_SOURCE" ]]; then
+  echo "missing Linux app icon: $LINUX_ICON_SOURCE" >&2
+  exit 1
+fi
+
 cp "target/$TARGET/release/pioneer-app" "$APPDIR/usr/bin/pioneer-app"
 chmod 0755 "$APPDIR/usr/bin/pioneer-app"
 
@@ -138,10 +144,7 @@ Terminal=false
 DESKTOP
 cp "$APPDIR/pioneer.desktop" "$APPDIR/usr/share/applications/pioneer.desktop"
 
-# 1x1 transparent PNG placeholder to satisfy AppImage icon metadata requirements.
-base64 -d > "$APPDIR/pioneer.png" <<'PNG'
-iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z7WQAAAAASUVORK5CYII=
-PNG
+cp "$LINUX_ICON_SOURCE" "$APPDIR/pioneer.png"
 cp "$APPDIR/pioneer.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/pioneer.png"
 ln -s "pioneer.png" "$APPDIR/.DirIcon"
 

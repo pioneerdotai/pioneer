@@ -269,6 +269,11 @@ $signingRequired = Test-True -Value $env:WINDOWS_SIGNING_REQUIRED
 $productVersion = Resolve-ProductVersion -RepoRoot $repoRoot
 $upgradeCode = "4f0b8f79-0f9c-4b7f-a0d1-f9cf472a61b4"
 $bundleUpgradeCode = "8d3f730a-1ef9-4d3d-a4cd-b36640bcc350"
+$appIconPath = Join-Path $repoRoot "crates/desktop/assets/app-icon.ico"
+
+if (-not (Test-Path -Path $appIconPath)) {
+    throw "missing Windows app icon: $appIconPath"
+}
 
 cargo build --release -p pioneer-desktop --target $Target
 cargo build --release -p pioneer-cli --target $Target
@@ -301,6 +306,8 @@ try {
   <Package Name="Pioneer" Manufacturer="Pioneer" Version="`$(var.Version)" UpgradeCode="`$(var.UpgradeCode)" Language="1033" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Pioneer is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="PioneerAppIcon" SourceFile="`$(var.AppIconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="PioneerAppIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Pioneer">
@@ -334,7 +341,7 @@ try {
     $msiName = "Pioneer-$archLabel.msi"
     $msiPath = Join-Path $OutDir $msiName
 
-    & $WixPath build $wxsPath -arch $wixArch -d "Version=$productVersion" -d "UpgradeCode=$upgradeCode" -d "StageDir=$stageDir" -o $msiPath
+    & $WixPath build $wxsPath -arch $wixArch -d "Version=$productVersion" -d "UpgradeCode=$upgradeCode" -d "StageDir=$stageDir" -d "AppIconPath=$appIconPath" -o $msiPath
     if ($LASTEXITCODE -ne 0) {
         throw "wix build failed with exit code $LASTEXITCODE"
     }
@@ -342,7 +349,7 @@ try {
     $bundleWxsPath = Join-Path $workDir "PioneerBundle.wxs"
     @"
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
-  <Bundle Name="Pioneer" Manufacturer="Pioneer" Version="`$(var.Version)" UpgradeCode="`$(var.BundleUpgradeCode)">
+  <Bundle Name="Pioneer" Manufacturer="Pioneer" Version="`$(var.Version)" UpgradeCode="`$(var.BundleUpgradeCode)" IconSourceFile="`$(var.AppIconPath)">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="https://pioneer.ai/license" />
     </BootstrapperApplication>
@@ -356,7 +363,7 @@ try {
     $exeName = "Pioneer-$archLabel.exe"
     $exePath = Join-Path $OutDir $exeName
 
-    & $WixPath build $bundleWxsPath -arch $wixArch -ext WixToolset.Bal.wixext -d "Version=$productVersion" -d "BundleUpgradeCode=$bundleUpgradeCode" -d "MsiPath=$msiPath" -o $exePath
+    & $WixPath build $bundleWxsPath -arch $wixArch -ext WixToolset.Bal.wixext -d "Version=$productVersion" -d "BundleUpgradeCode=$bundleUpgradeCode" -d "MsiPath=$msiPath" -d "AppIconPath=$appIconPath" -o $exePath
     if ($LASTEXITCODE -ne 0) {
         throw "wix bundle build failed with exit code $LASTEXITCODE"
     }
