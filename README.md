@@ -1,7 +1,5 @@
-# Pioneer
-
 <p align="center">
-  <img src="assets/pioneer.png" alt="Pioneer" width="80">
+  <img src="assets/pioneer.png" alt="Pioneer" width="50">
 </p>
 
 <p align="center">
