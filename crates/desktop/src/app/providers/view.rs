@@ -32,7 +32,10 @@ impl PioneerDesktop {
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .p_6()
+                    .pt_3()
+                    .px_6()
+                    .pb_3()
+                    .gap_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
