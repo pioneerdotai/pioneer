@@ -4,10 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+default-run = "pioneer"
+
+[features]
+dev = []
 
 [[bin]]
 name = "pioneer"
 path = "src/main.rs"
+
+[[bin]]
+name = "pioneer-dev"
+path = "src/dev.rs"
+required-features = ["dev"]
 
 [dependencies]
 anyhow.workspace = true

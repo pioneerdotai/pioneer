@@ -12,6 +12,8 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
     let service_label = settings.service_name.as_str();
     let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
     let executable = env::current_exe().context("failed to determine current executable path")?;
+    let launchd_executable = launchd_executable_path(settings, &executable)
+        .context("failed to prepare macOS launchd executable path")?;
     let logs_dir = user_logs_dir()
         .context("failed to resolve user logs directory for launch agent")?
         .join("Logs")
@@ -29,9 +31,10 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
     let launchd_path = super::resolve_service_path();
     let plist_content = render_launchd_plist(
         service_label,
-        &executable,
+        &launchd_executable,
         &logs_dir,
         launchd_path.as_deref(),
+        settings.macos_associated_bundle_identifier.as_str(),
     );
     fs::write(&plist_path, plist_content).with_context(|| {
         format!(
@@ -44,6 +47,7 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
     let service_target = format!("{domain}/{service_label}");
     let plist_path_str = path_to_str(&plist_path)?;
 
+    remove_legacy_services(domain.as_str(), settings.legacy_service_names.as_slice())?;
     let _ = run_launchctl(&["bootout", domain.as_str(), plist_path_str.as_ref()]);
     run_launchctl(&["enable", &service_target])?;
     run_launchctl(&["bootstrap", domain.as_str(), plist_path_str.as_ref()])?;
@@ -106,11 +110,23 @@ fn render_launchd_plist(
     executable: &Path,
     logs_dir: &Path,
     path_env: Option<&str>,
+    associated_bundle_identifier: &str,
 ) -> String {
     let service_label = xml_escape(service_label);
     let executable = xml_escape(&executable.display().to_string());
     let stdout_log = xml_escape(&logs_dir.join("gateway.out.log").display().to_string());
     let stderr_log = xml_escape(&logs_dir.join("gateway.err.log").display().to_string());
+    let associated_bundle_section = if associated_bundle_identifier.trim().is_empty() {
+        String::new()
+    } else {
+        let bundle_identifier = xml_escape(associated_bundle_identifier.trim());
+        format!(
+            "<key>AssociatedBundleIdentifiers</key>
+            <array>
+            <string>{bundle_identifier}</string>
+            </array>"
+        )
+    };
     let environment_section = path_env
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -138,6 +154,7 @@ fn render_launchd_plist(
             <string>{executable}</string>
             <string>{SERVICE_MODE_ARG}</string>
             </array>
+            {associated_bundle_section}
             <key>RunAtLoad</key>
             <true/>
             <key>KeepAlive</key>
@@ -151,6 +168,88 @@ fn render_launchd_plist(
         </plist>
         "#
     )
+}
+
+fn launchd_executable_path(settings: &ServiceSettings, executable: &Path) -> Result<PathBuf> {
+    let Some(background_item_name) =
+        normalize_background_item_name(settings.macos_background_item_name.as_str())?
+    else {
+        return Ok(executable.to_path_buf());
+    };
+
+    if executable
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| stem == background_item_name)
+    {
+        return Ok(executable.to_path_buf());
+    }
+
+    let launchd_dir = settings.runtime_home_dir.join("launchd");
+    fs::create_dir_all(&launchd_dir).with_context(|| {
+        format!(
+            "failed to create launchd executable directory `{}`",
+            launchd_dir.display()
+        )
+    })?;
+
+    let link_path = launchd_dir.join(background_item_name);
+    recreate_symlink(executable, &link_path)?;
+    Ok(link_path)
+}
+
+fn normalize_background_item_name(value: &str) -> Result<Option<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains('/') || trimmed.contains('\0') {
+        bail!("install.macos_background_item_name must not contain path separators or NUL bytes");
+    }
+    if trimmed == "." || trimmed == ".." {
+        bail!("install.macos_background_item_name must be a file name");
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn recreate_symlink(target: &Path, link_path: &Path) -> Result<()> {
+    if link_path.exists() || fs::symlink_metadata(link_path).is_ok() {
+        fs::remove_file(link_path).with_context(|| {
+            format!(
+                "failed to remove existing launchd executable link `{}`",
+                link_path.display()
+            )
+        })?;
+    }
+
+    std::os::unix::fs::symlink(target, link_path).with_context(|| {
+        format!(
+            "failed to create launchd executable link `{}` -> `{}`",
+            link_path.display(),
+            target.display()
+        )
+    })
+}
+
+fn remove_legacy_services(domain: &str, legacy_service_names: &[String]) -> Result<()> {
+    for service_name in legacy_service_names {
+        let plist_path = launch_agents_dir()?.join(format!("{service_name}.plist"));
+        let service_target = format!("{domain}/{service_name}");
+        if plist_path.exists() {
+            let plist_path_str = path_to_str(&plist_path)?;
+            let _ = run_launchctl(&["bootout", domain, plist_path_str.as_ref()]);
+            fs::remove_file(&plist_path).with_context(|| {
+                format!(
+                    "failed to remove legacy launchd service file at {}",
+                    plist_path.display()
+                )
+            })?;
+        }
+        let _ = run_launchctl(&["bootout", service_target.as_str()]);
+        let _ = run_launchctl(&["disable", service_target.as_str()]);
+        let _ = run_launchctl(&["remove", service_name.as_str()]);
+    }
+    Ok(())
 }
 
 fn xml_escape(input: &str) -> String {
@@ -255,10 +354,13 @@ mod tests {
             Path::new("/tmp/pioneer"),
             Path::new("/tmp/logs"),
             Some("/opt/homebrew/bin:/usr/bin:/bin"),
+            "ai.pioneer.test",
         );
 
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>PATH</key>"));
         assert!(plist.contains("/opt/homebrew/bin:/usr/bin:/bin"));
+        assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
+        assert!(plist.contains("ai.pioneer.test"));
     }
 }

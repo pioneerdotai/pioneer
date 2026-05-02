@@ -27,10 +27,7 @@ const THREAD_ID_LEN: usize = 21;
 
 #[test]
 fn normalize_ws_url_keeps_existing_scheme() {
-    assert_eq!(
-        normalize_ws_url("ws://127.0.0.1:8787"),
-        "ws://127.0.0.1:8787"
-    );
+    assert_eq!(normalize_ws_url("ws://0.0.0.0:17878"), "ws://0.0.0.0:17878");
     assert_eq!(
         normalize_ws_url("wss://gateway.example.com/socket"),
         "wss://gateway.example.com/socket"
@@ -39,7 +36,7 @@ fn normalize_ws_url_keeps_existing_scheme() {
 
 #[test]
 fn normalize_ws_url_adds_ws_scheme_when_missing() {
-    assert_eq!(normalize_ws_url("127.0.0.1:8787"), "ws://127.0.0.1:8787");
+    assert_eq!(normalize_ws_url("0.0.0.0:17878"), "ws://0.0.0.0:17878");
     assert_eq!(
         normalize_ws_url(" gateway.example.com:443 "),
         "ws://gateway.example.com:443"

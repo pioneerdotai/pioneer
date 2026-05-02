@@ -1,6 +1,7 @@
 use crate::gateway::connectivity::is_gateway_reachable;
 use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
+use pioneer_config::AppConfig;
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::io::ErrorKind;
@@ -86,7 +87,7 @@ pub(crate) fn start_gateway_service(
 
     if let Some(command) = make_development_pioneer_start_command()
         && let Some(warnings) = try_start_with_launcher(
-            "development cargo pioneer-cli",
+            "development cargo pioneer-dev",
             command,
             service_name,
             listen_addr,
@@ -97,7 +98,7 @@ pub(crate) fn start_gateway_service(
     }
 
     if let Some(warnings) = try_start_with_launcher(
-        "pioneer in PATH",
+        "configured pioneer command in PATH",
         make_pioneer_start_command(),
         service_name,
         listen_addr,
@@ -140,7 +141,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
 
     if let Some(command) = make_development_pioneer_start_command()
         && let Some(warnings) = try_start_with_launcher(
-            "development cargo pioneer-cli",
+            "development cargo pioneer-dev",
             command,
             service_name,
             listen_addr,
@@ -151,7 +152,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
     }
 
     if let Some(warnings) = try_start_with_launcher(
-        "pioneer in PATH",
+        "configured pioneer command in PATH",
         make_pioneer_start_command(),
         service_name,
         listen_addr,
@@ -172,13 +173,13 @@ pub(crate) fn request_local_superuser_token() -> Result<String> {
 
     if let Some(command) = make_development_pioneer_issue_superuser_token_command()
         && let Some(token) =
-            try_request_token_with_launcher("development cargo pioneer-cli", command)?
+            try_request_token_with_launcher("development cargo pioneer-dev", command)?
     {
         return Ok(token);
     }
 
     if let Some(token) = try_request_token_with_launcher(
-        "pioneer in PATH",
+        "configured pioneer command in PATH",
         make_pioneer_issue_superuser_token_command(),
     )? {
         return Ok(token);
@@ -260,7 +261,7 @@ fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimings) -> Resu
 }
 
 fn make_pioneer_start_command() -> Command {
-    let mut command = Command::new("pioneer");
+    let mut command = Command::new(configured_pioneer_command_file_name());
     command.arg("start");
     apply_desktop_command_env(&mut command);
     command
@@ -283,7 +284,7 @@ fn make_development_pioneer_start_command() -> Option<Command> {
 }
 
 fn make_pioneer_issue_superuser_token_command() -> Command {
-    let mut command = Command::new("pioneer");
+    let mut command = Command::new(configured_pioneer_command_file_name());
     command.arg("issue-superuser-token");
     apply_desktop_command_env(&mut command);
     command
@@ -316,6 +317,10 @@ fn make_development_pioneer_command(subcommand: &'static str) -> Option<Command>
     command.arg("--quiet");
     command.arg("-p");
     command.arg("pioneer-cli");
+    command.arg("--features");
+    command.arg("dev");
+    command.arg("--bin");
+    command.arg("pioneer-dev");
     command.arg("--");
     command.arg(subcommand);
     command.current_dir(workspace_root);
@@ -437,6 +442,21 @@ fn gateway_arch_label() -> &'static str {
 
 fn apply_desktop_command_env(command: &mut Command) {
     command.env("PIONEER_MANAGED_BY", DESKTOP_MANAGED_BY);
+}
+
+fn configured_pioneer_command_file_name() -> String {
+    AppConfig::load()
+        .ok()
+        .and_then(|config| config.install_command_file_name().ok())
+        .unwrap_or_else(default_pioneer_command_file_name)
+}
+
+fn default_pioneer_command_file_name() -> String {
+    if cfg!(windows) {
+        "pioneer.exe".to_owned()
+    } else {
+        "pioneer".to_owned()
+    }
 }
 
 fn try_start_with_command(mut command: Command) -> Result<StartAttempt> {

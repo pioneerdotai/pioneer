@@ -132,14 +132,16 @@ struct ResolvedInstallSource {
 }
 
 pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
+    let config = AppConfig::load().context("failed to load app config for install/update")?;
+
     let source = resolve_install_source(&options)
         .context("failed to resolve installer source for install/update")?;
 
-    let install_root = install_root_path()?;
+    let install_root = install_root_path(&config)?;
     let bin_dir = install_root.join("bin");
-    let target_binary = bin_dir.join(binary_file_name());
-    let staged_binary = bin_dir.join(staged_binary_file_name());
-    let rollback_binary = bin_dir.join(rollback_binary_file_name());
+    let target_binary = bin_dir.join(config.install_binary_file_name()?);
+    let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
+    let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
     fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed to create install directory `{}`", bin_dir.display()))?;
 
@@ -224,7 +226,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         });
     }
 
-    let link_result = match ensure_global_command_link(&target_binary) {
+    let link_result = match ensure_global_command_link(&config, &target_binary) {
         Ok(result) => result,
         Err(error) => {
             restore_binary_and_config(
@@ -239,7 +241,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 was_active,
                 &options.managed_by,
             );
-            bail!("failed to expose pioneer command globally: {error:#}; update rolled back");
+            bail!("failed to expose command globally: {error:#}; update rolled back");
         }
     };
     let command_link_created = link_result.link_created;
@@ -922,7 +924,7 @@ fn restore_runtime_toml(runtime_home: &Path, backup_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_root_path() -> Result<PathBuf> {
+fn install_root_path(config: &AppConfig) -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("PIONEER_INSTALL_ROOT") {
         return Ok(PathBuf::from(value));
     }
@@ -942,24 +944,31 @@ fn install_root_path() -> Result<PathBuf> {
 
     #[cfg(windows)]
     {
-        return Ok(base.join("Pioneer").join("managed"));
+        return Ok(base
+            .join(config.install_root_directory_name()?)
+            .join(config.install_managed_directory_name()?));
     }
 
     #[cfg(not(windows))]
     {
-        Ok(base.join("pioneer").join("managed"))
+        Ok(base
+            .join(config.install_root_directory_name()?)
+            .join(config.install_managed_directory_name()?))
     }
 }
 
-fn ensure_global_command_link(target_binary: &Path) -> Result<CommandLinkResult> {
+fn ensure_global_command_link(
+    config: &AppConfig,
+    target_binary: &Path,
+) -> Result<CommandLinkResult> {
     #[cfg(windows)]
     {
-        ensure_windows_path(target_binary)
+        ensure_windows_path(config, target_binary)
     }
 
     #[cfg(not(windows))]
     {
-        ensure_unix_symlink(target_binary)
+        ensure_unix_symlink(config, target_binary)
     }
 }
 
@@ -974,7 +983,7 @@ fn force_path_update_warning() -> bool {
 }
 
 #[cfg(not(windows))]
-fn ensure_unix_symlink(target_binary: &Path) -> Result<CommandLinkResult> {
+fn ensure_unix_symlink(config: &AppConfig, target_binary: &Path) -> Result<CommandLinkResult> {
     use std::os::unix::fs::symlink;
 
     let link_path_overridden = std::env::var_os("PIONEER_LINK_PATH").is_some();
@@ -983,7 +992,9 @@ fn ensure_unix_symlink(target_binary: &Path) -> Result<CommandLinkResult> {
     } else {
         let home = dirs::home_dir()
             .context("failed to resolve current user home directory for command link")?;
-        home.join(".local").join("bin").join("pioneer")
+        home.join(".local")
+            .join("bin")
+            .join(config.install_command_file_name()?)
     };
     let mut warnings = Vec::new();
     let mut path_updated = true;
@@ -1044,9 +1055,9 @@ fn ensure_unix_symlink(target_binary: &Path) -> Result<CommandLinkResult> {
 }
 
 #[cfg(windows)]
-fn ensure_windows_path(target_binary: &Path) -> Result<CommandLinkResult> {
+fn ensure_windows_path(config: &AppConfig, target_binary: &Path) -> Result<CommandLinkResult> {
     let mut warnings = Vec::new();
-    let command_binary = windows_command_binary_path()?;
+    let command_binary = windows_command_binary_path(config)?;
     let command_binary_parent = command_binary.parent().with_context(|| {
         format!(
             "command binary path has no parent directory: `{}`",
@@ -1141,7 +1152,7 @@ fn powershell_single_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_command_binary_path() -> Result<PathBuf> {
+fn windows_command_binary_path(config: &AppConfig) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PIONEER_LINK_PATH") {
         return Ok(PathBuf::from(path));
     }
@@ -1149,7 +1160,10 @@ fn windows_command_binary_path() -> Result<PathBuf> {
     let base =
         dirs::data_local_dir().or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from));
     let base = base.context("failed to resolve LOCALAPPDATA for user command path")?;
-    Ok(base.join("Pioneer").join("bin").join("pioneer.exe"))
+    Ok(base
+        .join(config.install_root_directory_name()?)
+        .join("bin")
+        .join(config.install_command_file_name()?))
 }
 
 #[cfg(not(windows))]
@@ -1260,30 +1274,6 @@ fn unix_shell_double_quote_escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
-}
-
-fn binary_file_name() -> &'static str {
-    if cfg!(windows) {
-        "pioneer.exe"
-    } else {
-        "pioneer"
-    }
-}
-
-fn staged_binary_file_name() -> &'static str {
-    if cfg!(windows) {
-        "pioneer.new.exe"
-    } else {
-        "pioneer.new"
-    }
-}
-
-fn rollback_binary_file_name() -> &'static str {
-    if cfg!(windows) {
-        "pioneer.rollback.exe"
-    } else {
-        "pioneer.rollback"
-    }
 }
 
 fn managed_by_label(value: &InstallManagedBy) -> &'static str {

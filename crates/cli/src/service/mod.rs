@@ -12,6 +12,10 @@ pub const SERVICE_MODE_ARG: &str = "gateway-service";
 
 pub(crate) struct ServiceSettings {
     pub service_name: String,
+    pub legacy_service_names: Vec<String>,
+    pub runtime_home_dir: PathBuf,
+    pub macos_background_item_name: String,
+    pub macos_associated_bundle_identifier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +95,33 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
         bail!("gateway.service_name must not contain path separators");
     }
 
-    Ok(ServiceSettings { service_name })
+    let mut legacy_service_names = Vec::new();
+    for legacy_service_name in &config.gateway.legacy_service_names {
+        let legacy_service_name = legacy_service_name.trim();
+        if legacy_service_name.is_empty() {
+            continue;
+        }
+        if legacy_service_name.contains('/') || legacy_service_name.contains('\\') {
+            bail!("gateway.legacy_service_names entries must not contain path separators");
+        }
+        if legacy_service_name != service_name {
+            legacy_service_names.push(legacy_service_name.to_owned());
+        }
+    }
+    legacy_service_names.sort();
+    legacy_service_names.dedup();
+
+    Ok(ServiceSettings {
+        service_name,
+        legacy_service_names,
+        runtime_home_dir: config.runtime_home_dir()?,
+        macos_background_item_name: config.install.macos_background_item_name.trim().to_owned(),
+        macos_associated_bundle_identifier: config
+            .install
+            .macos_associated_bundle_identifier
+            .trim()
+            .to_owned(),
+    })
 }
 
 fn save_install_state_from_current_context(config: &AppConfig) -> Result<()> {

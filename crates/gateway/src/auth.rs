@@ -191,7 +191,7 @@ mod tests {
         AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig,
         GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
-        GatewayToolsConfig, GatewayWebToolsConfig,
+        GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -275,7 +275,7 @@ mod tests {
     }
 
     fn request_with_token(token: Option<&str>) -> Request {
-        let mut builder = Request::builder().method("GET").uri("ws://127.0.0.1:8787");
+        let mut builder = Request::builder().method("GET").uri("ws://0.0.0.0:17878");
 
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
@@ -288,11 +288,22 @@ mod tests {
         AppConfig {
             home_directory: ".pioneer.test".to_owned(),
             install_state_file_name: "install-state.toml".to_owned(),
+            install: InstallConfig {
+                unix_root_directory_name: "pioneer-test".to_owned(),
+                macos_root_directory_name: "PioneerTest".to_owned(),
+                windows_root_directory_name: "PioneerTest".to_owned(),
+                managed_directory_name: "managed-test".to_owned(),
+                binary_name: "pioneer-test".to_owned(),
+                command_name: "pioneer-test".to_owned(),
+                macos_background_item_name: "Pioneer Test".to_owned(),
+                macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
+            },
             gateway: GatewayConfig {
                 settings_version: 1,
                 settings_file_name: "gateway-settings.toml".to_owned(),
                 service_name: "com.pioneer.gateway".to_owned(),
-                listen_addr: "127.0.0.1:8787".to_owned(),
+                legacy_service_names: Vec::new(),
+                listen_addr: "0.0.0.0:17878".to_owned(),
                 outbound_queue_capacity: 128,
                 thread: GatewayThreadConfig {
                     default_model: "gpt-5.4".to_owned(),

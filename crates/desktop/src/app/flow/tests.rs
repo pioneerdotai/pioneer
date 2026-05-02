@@ -48,7 +48,7 @@ fn ws_event_fencing_ignores_stale_connection_id() {
         connection_id: 42,
         endpoint_id: "remote-42".to_owned(),
         endpoint_name: "remote".to_owned(),
-        address: "127.0.0.1:8787".to_owned(),
+        address: "0.0.0.0:17878".to_owned(),
     };
 
     assert!(should_apply_ws_event(Some(42), &event));
@@ -129,7 +129,7 @@ fn ws_event_fencing_handles_all_event_kinds() {
             endpoint_id: "local".to_owned(),
             endpoint_name: "local".to_owned(),
             endpoint_kind: GatewayEndpointKind::Local,
-            address: "127.0.0.1:8787".to_owned(),
+            address: "0.0.0.0:17878".to_owned(),
             reason: "closed".to_owned(),
         },
         GatewayWsEvent::ConnectFailed {
@@ -137,7 +137,7 @@ fn ws_event_fencing_handles_all_event_kinds() {
             endpoint_id: "local".to_owned(),
             endpoint_name: "local".to_owned(),
             endpoint_kind: GatewayEndpointKind::Local,
-            address: "127.0.0.1:8787".to_owned(),
+            address: "0.0.0.0:17878".to_owned(),
             error: "refused".to_owned(),
         },
         GatewayWsEvent::Notification {

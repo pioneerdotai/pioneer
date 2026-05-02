@@ -13,8 +13,21 @@ const USER_CONFIG_FILE_NAME: &str = "config.toml";
 pub struct AppConfig {
     pub home_directory: String,
     pub install_state_file_name: String,
+    pub install: InstallConfig,
     pub gateway: GatewayConfig,
     pub desktop: DesktopConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallConfig {
+    pub unix_root_directory_name: String,
+    pub macos_root_directory_name: String,
+    pub windows_root_directory_name: String,
+    pub managed_directory_name: String,
+    pub binary_name: String,
+    pub command_name: String,
+    pub macos_background_item_name: String,
+    pub macos_associated_bundle_identifier: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,6 +35,8 @@ pub struct GatewayConfig {
     pub settings_version: u32,
     pub settings_file_name: String,
     pub service_name: String,
+    #[serde(default)]
+    pub legacy_service_names: Vec<String>,
     pub listen_addr: String,
     pub outbound_queue_capacity: usize,
     pub thread: GatewayThreadConfig,
@@ -963,6 +978,55 @@ impl AppConfig {
         )?;
         Ok(self.runtime_home_dir()?.join(file_name))
     }
+
+    pub fn install_root_directory_name(&self) -> Result<String> {
+        #[cfg(windows)]
+        {
+            normalize_runtime_leaf_name(
+                self.install.windows_root_directory_name.as_str(),
+                "install.windows_root_directory_name",
+            )
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            normalize_runtime_leaf_name(
+                self.install.macos_root_directory_name.as_str(),
+                "install.macos_root_directory_name",
+            )
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            normalize_runtime_leaf_name(
+                self.install.unix_root_directory_name.as_str(),
+                "install.unix_root_directory_name",
+            )
+        }
+    }
+
+    pub fn install_managed_directory_name(&self) -> Result<String> {
+        normalize_runtime_leaf_name(
+            self.install.managed_directory_name.as_str(),
+            "install.managed_directory_name",
+        )
+    }
+
+    pub fn install_binary_file_name(&self) -> Result<String> {
+        executable_file_name(self.install.binary_name.as_str(), "install.binary_name")
+    }
+
+    pub fn install_staged_binary_file_name(&self) -> Result<String> {
+        executable_file_name_with_suffix(self.install.binary_name.as_str(), "new")
+    }
+
+    pub fn install_rollback_binary_file_name(&self) -> Result<String> {
+        executable_file_name_with_suffix(self.install.binary_name.as_str(), "rollback")
+    }
+
+    pub fn install_command_file_name(&self) -> Result<String> {
+        executable_file_name(self.install.command_name.as_str(), "install.command_name")
+    }
 }
 
 fn is_disallowed_component(component: Component<'_>) -> bool {
@@ -988,6 +1052,70 @@ fn normalize_runtime_file_name(value: &str, field_name: &str) -> Result<String> 
     }
 
     Ok(trimmed.to_owned())
+}
+
+fn normalize_runtime_leaf_name(value: &str, field_name: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field_name} in config must not be empty");
+    }
+
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        bail!("{field_name} in config must not contain path separators");
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        bail!("{field_name} in config must be relative");
+    }
+
+    if path.components().any(is_disallowed_component) {
+        bail!("{field_name} in config must not contain parent or root components");
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+fn executable_file_name(value: &str, field_name: &str) -> Result<String> {
+    let name = normalize_runtime_leaf_name(value, field_name)?;
+
+    #[cfg(windows)]
+    {
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            Ok(name)
+        } else {
+            Ok(format!("{name}.exe"))
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(name)
+    }
+}
+
+fn executable_file_name_with_suffix(value: &str, suffix: &str) -> Result<String> {
+    let name = normalize_runtime_leaf_name(value, "install.binary_name")?;
+
+    #[cfg(windows)]
+    {
+        let stem = strip_windows_exe_suffix(name.as_str());
+        Ok(format!("{stem}.{suffix}.exe"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(format!("{name}.{suffix}"))
+    }
+}
+
+#[cfg(windows)]
+fn strip_windows_exe_suffix(value: &str) -> &str {
+    if value.len() >= 4 && value[value.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &value[..value.len() - 4]
+    } else {
+        value
+    }
 }
 
 pub fn load_install_state(path: &Path) -> Result<Option<InstallState>> {
@@ -1080,7 +1208,18 @@ fn workspace_local_config_path() -> PathBuf {
 }
 
 fn user_override_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|path| path.join("pioneer").join(USER_CONFIG_FILE_NAME))
+    dirs::config_dir().map(|path| {
+        path.join(user_config_directory_name())
+            .join(USER_CONFIG_FILE_NAME)
+    })
+}
+
+fn user_config_directory_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "pioneer-dev"
+    } else {
+        "pioneer"
+    }
 }
 
 #[cfg(test)]
@@ -1130,10 +1269,10 @@ mod tests {
         write_file(
             &workspace_override,
             r#"
-home_directory = ".pioneer.local.test"
-[gateway]
-service_name = "com.pioneer.gateway.local.test"
-"#,
+            home_directory = ".pioneer.local.test"
+            [gateway]
+            service_name = "com.pioneer.gateway.local.test"
+            "#,
         );
 
         let config =
@@ -1142,6 +1281,14 @@ service_name = "com.pioneer.gateway.local.test"
 
         assert_eq!(config.home_directory, ".pioneer.local.test");
         assert_eq!(config.install_state_file_name, "install-state.toml");
+        assert_eq!(
+            config.install_binary_file_name().unwrap(),
+            expected_executable_name("pioneer")
+        );
+        assert_eq!(
+            config.install_command_file_name().unwrap(),
+            expected_executable_name("pioneer")
+        );
         assert_eq!(
             config.gateway.service_name,
             "com.pioneer.gateway.local.test"
@@ -1202,6 +1349,27 @@ service_name = "com.pioneer.gateway.env"
 
         assert_eq!(config.home_directory, ".pioneer");
         assert_eq!(config.install_state_file_name, "install-state.toml");
+        assert_eq!(
+            config.install_root_directory_name().unwrap(),
+            expected_install_root_directory_name()
+        );
+        assert_eq!(config.install_managed_directory_name().unwrap(), "managed");
+        assert_eq!(
+            config.install_binary_file_name().unwrap(),
+            expected_executable_name("pioneer")
+        );
+        assert_eq!(
+            config.install_staged_binary_file_name().unwrap(),
+            expected_executable_name("pioneer.new")
+        );
+        assert_eq!(
+            config.install_rollback_binary_file_name().unwrap(),
+            expected_executable_name("pioneer.rollback")
+        );
+        assert_eq!(
+            config.install_command_file_name().unwrap(),
+            expected_executable_name("pioneer")
+        );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
     }
 
@@ -1430,5 +1598,21 @@ service_name = "com.pioneer.gateway.env"
             .as_nanos();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("{prefix}-{nanos}-{id}.toml"))
+    }
+
+    fn expected_executable_name(stem: &str) -> String {
+        if cfg!(windows) {
+            format!("{stem}.exe")
+        } else {
+            stem.to_owned()
+        }
+    }
+
+    fn expected_install_root_directory_name() -> String {
+        if cfg!(any(windows, target_os = "macos")) {
+            "Pioneer".to_owned()
+        } else {
+            "pioneer".to_owned()
+        }
     }
 }

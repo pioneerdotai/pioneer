@@ -1,11 +1,21 @@
 home_directory = ".pioneer"
 install_state_file_name = "install-state.toml"
 
+[install]
+unix_root_directory_name = "pioneer"
+macos_root_directory_name = "Pioneer"
+windows_root_directory_name = "Pioneer"
+managed_directory_name = "managed"
+binary_name = "pioneer"
+command_name = "pioneer"
+macos_background_item_name = "Pioneer"
+macos_associated_bundle_identifier = "ai.pioneer.macos"
+
 [gateway]
 settings_version = 1
 settings_file_name = "gateway-settings.toml"
 service_name = "com.pioneer.gateway"
-listen_addr = "127.0.0.1:8787"
+listen_addr = "0.0.0.0:17878"
 outbound_queue_capacity = 128
 
 [gateway.thread]
