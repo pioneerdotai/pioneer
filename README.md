@@ -1,7 +1,7 @@
 # Pioneer
 
 <p align="center">
-  <img src="crates/desktop/assets/app-icon-256.png" alt="Pioneer" width="96">
+  <img src="assets/pioneer.png" alt="Pioneer" width="96">
 </p>
 
 <p align="center">
@@ -24,11 +24,12 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Gateway-centered design** - all important work happens in the gateway: workspaces, threads, turns, tools, MCP, skills, tasks, provider settings, auth, and durable storage.
 - **Local or remote deployment** - run a gateway on your personal computer for a local assistant, or host gateways on separate servers for work, study, home, or other isolated environments.
 - **One desktop, many gateways** - connect the desktop app to any number of gateways and switch between them from one native client.
-- **Multi-agent workflows** - the gateway can automatically fan work out to task agents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
+- **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
+- **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
 - **Bring your own model** - built-in providers for OpenAI, Anthropic, OpenRouter, Gemini, Azure OpenAI, Bedrock, Ollama, Copilot, Claude Code, Gemini CLI, Kilo CLI, and many OpenAI-compatible endpoints.
 - **Real tools** - shell sessions, file reads and edits, patch application, grep, web search/fetch, URL downloads, computer use, MCP tool proxying, and dynamic skill tools.
-- **MCP servers** - install and manage MCP servers per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.
-- **Skills** - agentskills-compatible installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
+- **MCP servers** - install and manage servers compatible with [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.
+- **Skills** - compatible with the [Agent Skills specification](https://agentskills.io/home), with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
 - **Tasks** - scheduled and on-demand task execution with dependencies, retries, delivery state, progress events, write locks, and task trees.
 - **Protocol-first architecture** - `pioneer-protocol` defines the public JSON-RPC surface and generated schemas under `schemas/`.
 - **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
@@ -54,9 +55,9 @@ For a multi-environment setup, install gateways wherever the work should live: a
 
 ## Multi-Agent Workflows
 
-Pioneer is designed for more than one long-running chat thread. The gateway can coordinate task agents automatically as part of the task system: a parent task can create an agent spec, start a child thread, run that agent with its own model and instructions, and link the result back to the parent task.
+Pioneer is designed for more than one long-running chat thread. The gateway can coordinate subagents automatically as part of the task system: a parent task can create an agent spec, start a child thread, run that subagent with its own model and instructions, and link the result back to the parent task.
 
-Each task agent can be scoped independently:
+Each subagent can be scoped independently:
 
 - **Role and identity** - give the agent a role and nickname so its work is understandable in task history.
 - **Model choice** - choose the model and provider per agent, instead of forcing every subtask through the same model.
@@ -65,7 +66,7 @@ Each task agent can be scoped independently:
 - **Result contract** - ask for text, Markdown, JSON, or artifacts with required outputs.
 - **Depth and lineage** - nested agent work is tracked through child threads and task lineage, so delegated work can be audited and recovered.
 
-This makes the gateway useful as a coordinator: one agent can break work into subtasks, specialized agents can handle pieces in isolated threads, and the desktop app can still show the full task tree from one place. Users can shape this with goals and policies, but the orchestration is handled by Pioneer.
+This makes the gateway useful as a coordinator: one agent can break work into subtasks, specialized subagents can handle pieces in isolated threads, and the desktop app can still show the full task tree from one place. Users can shape this with goals and policies, but the orchestration is handled by Pioneer.
 
 ## MCP Servers
 
