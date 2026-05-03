@@ -2,12 +2,20 @@ use super::*;
 
 impl MessageProcessor {
     pub(super) async fn provider_list(&self, connection_id: ConnectionId, request_id: RequestId) {
-        let provider_names = {
-            let settings = self
-                .gateway_settings
-                .read()
-                .expect("gateway settings lock poisoned");
-            settings.configured_provider_names()
+        let provider_names = match self.gateway_secrets.list_configured_provider_names() {
+            Ok(provider_names) => provider_names,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to list provider api keys: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
         };
 
         let result = ProviderListResponse {
@@ -186,32 +194,69 @@ impl MessageProcessor {
             return;
         }
 
-        let save_result = {
-            let mut settings = self
-                .gateway_settings
-                .write()
-                .expect("gateway settings lock poisoned");
-            settings.set_provider_api_key(&params.provider, params.api_key);
-            save_gateway_settings(&self.settings_path, &settings)
-        };
-
-        if let Err(error) = save_result {
+        if params.api_key.trim().is_empty() {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to save gateway settings: {error:#}"),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `api_key` must not be empty",
+                        methods::PROVIDER_SET_API_KEY
+                    ),
                 ),
             )
             .await;
             return;
         }
 
-        self.provider_registry.invalidate(&params.provider);
+        let requested_provider = params.provider.as_str();
+        if let Err(error) = self
+            .gateway_secrets
+            .normalize_provider_name(requested_provider)
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: invalid `provider`: {error:#}",
+                        methods::PROVIDER_SET_API_KEY
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let raw_provider = params.provider;
+        let normalized_provider = match self
+            .gateway_secrets
+            .set_provider_api_key(&raw_provider, params.api_key.as_str())
+        {
+            Ok(normalized_provider) => normalized_provider,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to save provider api key: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.provider_registry.invalidate(&raw_provider);
+        if raw_provider != normalized_provider {
+            self.provider_registry.invalidate(&normalized_provider);
+        }
 
         let response = ProviderSetApiKeyResponse {
-            provider: params.provider,
+            provider: normalized_provider,
             updated: true,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response) {
@@ -261,37 +306,52 @@ impl MessageProcessor {
             return;
         }
 
-        let (deleted, save_error) = {
-            let mut settings = self
-                .gateway_settings
-                .write()
-                .expect("gateway settings lock poisoned");
-            let deleted = settings.delete_provider_api_key(&params.provider);
-            if deleted {
-                let save_result = save_gateway_settings(&self.settings_path, &settings)
-                    .err()
-                    .map(|error| format!("failed to save gateway settings: {error:#}"));
-                (deleted, save_result)
-            } else {
-                (deleted, None)
-            }
-        };
-
-        if let Some(message) = save_error {
+        if let Err(error) = self
+            .gateway_secrets
+            .normalize_provider_name(&params.provider)
+        {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: invalid `provider`: {error:#}",
+                        methods::PROVIDER_DELETE_API_KEY
+                    ),
+                ),
             )
             .await;
             return;
         }
 
+        let raw_provider = params.provider;
+        let (normalized_provider, deleted) =
+            match self.gateway_secrets.delete_provider_api_key(&raw_provider) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to delete provider api key: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
         if deleted {
-            self.provider_registry.invalidate(&params.provider);
+            self.provider_registry.invalidate(&raw_provider);
+            if raw_provider != normalized_provider {
+                self.provider_registry.invalidate(&normalized_provider);
+            }
         }
 
         let response = ProviderDeleteApiKeyResponse {
-            provider: params.provider,
+            provider: normalized_provider,
             deleted,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response) {

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 
-use crate::helpers::{decode_hex, normalize_non_empty, unix_timestamp_secs};
-use crate::settings::GatewaySettings;
+use crate::helpers::{normalize_non_empty, unix_timestamp_secs};
+use crate::secrets::ensure_jwt_material_len;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JwtClaims {
@@ -124,25 +124,25 @@ impl JwtClaims {
     }
 }
 
-pub fn initialize(app_config: &AppConfig, settings: &GatewaySettings) -> Result<JwtAuth> {
+pub fn initialize(app_config: &AppConfig, jwt_material: &[u8]) -> Result<JwtAuth> {
     let config = JwtRuntimeConfig::from_app_config(app_config)?;
-    let secret = decode_gateway_secret(settings)?;
+    ensure_jwt_material_len(jwt_material)?;
 
     Ok(JwtAuth {
-        decoding_key: Arc::new(DecodingKey::from_secret(secret.as_slice())),
+        decoding_key: Arc::new(DecodingKey::from_secret(jwt_material)),
         config: Arc::new(config),
     })
 }
 
-pub fn issue_superuser_token(app_config: &AppConfig, settings: &GatewaySettings) -> Result<String> {
+pub fn issue_superuser_token(app_config: &AppConfig, jwt_material: &[u8]) -> Result<String> {
     let config = JwtRuntimeConfig::from_app_config(app_config)?;
-    let secret = decode_gateway_secret(settings)?;
+    ensure_jwt_material_len(jwt_material)?;
 
     let claims = JwtClaims::new(unix_timestamp_secs()?, config.token_ttl, &config)?;
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_slice()),
+        &EncodingKey::from_secret(jwt_material),
     )
     .context("failed to generate superuser jwt token")?;
 
@@ -157,17 +157,6 @@ fn ensure_superuser_claims(claims: &JwtClaims, config: &JwtRuntimeConfig) -> Res
         bail!("jwt role is not superuser");
     }
     Ok(())
-}
-
-fn decode_gateway_secret(settings: &GatewaySettings) -> Result<Vec<u8>> {
-    let secret = decode_hex(settings.jwt_secret().trim())
-        .context("failed to decode jwt secret from gateway settings")?;
-
-    if secret.len() < 32 {
-        bail!("jwt secret from gateway settings is too short");
-    }
-
-    Ok(secret)
 }
 
 fn extract_bearer_token(value: &str) -> Option<&str> {
@@ -186,83 +175,178 @@ fn extract_bearer_token(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{JwtAuth, extract_bearer_token, initialize, issue_superuser_token};
-    use crate::settings::load_or_create_gateway_settings;
+    use crate::secrets::GatewaySecrets;
     use pioneer_config::{
         AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig,
         GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
         GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
     };
+    use pioneer_keystore::{
+        MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretMeta, SecretStore,
+    };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_tungstenite::tungstenite::handshake::server::Request;
 
-    fn load_test_settings(temp_dir: &PathBuf, config: &AppConfig) -> super::GatewaySettings {
-        let settings_path = temp_dir.join(config.gateway.settings_file_name.as_str());
-        load_or_create_gateway_settings(
-            &settings_path,
-            config.gateway.settings_version,
-            config.gateway.settings_file_name.as_str(),
-            config.gateway.auth.secret_size_bytes,
-        )
-        .expect("settings should load or create")
+    #[test]
+    fn load_or_create_superuser_jwt_material_creates_and_reuses_memory_value() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+
+        let first = secrets
+            .load_or_create_superuser_jwt_material(64)
+            .expect("create superuser jwt material");
+        let second = secrets
+            .load_or_create_superuser_jwt_material(64)
+            .expect("reuse jwt material");
+
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, second);
+        let stored = store
+            .get_string(&SecretId::superuser_jwt_token())
+            .expect("read stored material")
+            .expect("stored material exists");
+        assert_eq!(stored.len(), 128);
+        let entries = store
+            .list(SecretFilter::Kind(SecretKind::SuperuserJwtToken))
+            .expect("list jwt material");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].id,
+            SecretId::superuser_jwt_token(),
+            "superuser jwt must use the singleton superuser id"
+        );
     }
 
     #[test]
-    fn initialize_creates_settings_file() {
+    fn load_or_create_superuser_jwt_material_persists_in_db_store() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
-        let config = test_app_config();
-        let settings = load_test_settings(&temp_dir, &config);
-        let _ = initialize(&config, &settings).expect("expected jwt init to succeed");
+        let first = {
+            let secrets = GatewaySecrets::open(&temp_dir).expect("open gateway secrets");
+            secrets
+                .load_or_create_superuser_jwt_material(64)
+                .expect("create material")
+        };
 
-        assert!(
-            temp_dir
-                .join(config.gateway.settings_file_name.as_str())
-                .exists()
-        );
+        let second = {
+            let secrets = GatewaySecrets::open(&temp_dir).expect("reopen gateway secrets");
+            secrets
+                .load_or_create_superuser_jwt_material(64)
+                .expect("reuse material")
+        };
+
+        assert_eq!(first, second);
+        assert!(temp_dir.join("keystore.db").exists());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn issue_superuser_token_returns_valid_token() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+    fn load_or_create_superuser_jwt_material_rejects_invalid_existing_value() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        store
+            .put_string(
+                &SecretId::superuser_jwt_token(),
+                "not-hex",
+                SecretMeta::new(
+                    SecretKind::SuperuserJwtToken,
+                    Some("superuser".to_owned()),
+                    1,
+                ),
+            )
+            .expect("seed invalid material");
 
+        let error = secrets
+            .load_or_create_superuser_jwt_material(64)
+            .expect_err("invalid existing material should fail");
+        assert!(
+            format!("{error:#}").contains("failed to decode superuser jwt material"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_or_create_superuser_jwt_material_rejects_short_existing_value() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        store
+            .put_string(
+                &SecretId::superuser_jwt_token(),
+                "00",
+                SecretMeta::new(
+                    SecretKind::SuperuserJwtToken,
+                    Some("superuser".to_owned()),
+                    1,
+                ),
+            )
+            .expect("seed short material");
+
+        let error = secrets
+            .load_or_create_superuser_jwt_material(64)
+            .expect_err("short existing material should fail");
+        assert!(
+            format!("{error:#}").contains("jwt material is too short"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn issue_superuser_token_returns_valid_token() {
         let config = test_app_config();
-        let settings = load_test_settings(&temp_dir, &config);
-        let auth = initialize(&config, &settings).expect("expected jwt init to succeed");
-        let token = issue_superuser_token(&config, &settings).expect("token issue should succeed");
+        let jwt_material = test_jwt_material();
+        let auth = initialize(&config, jwt_material.as_slice()).expect("expected jwt init");
+        let token = issue_superuser_token(&config, jwt_material.as_slice())
+            .expect("token issue should succeed");
 
         let request = request_with_token(Some(token.as_str()));
         auth.authorize_request(&request)
             .expect("expected generated token to be valid");
+    }
 
-        let settings_content =
-            fs::read_to_string(temp_dir.join(config.gateway.settings_file_name.as_str()))
-                .expect("read settings");
-        assert!(!settings_content.contains("superuser_token"));
+    #[test]
+    fn public_issue_superuser_token_uses_keystore_without_settings_secret() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        let config = test_app_config();
+        let token = crate::issue_superuser_token(&config, &temp_dir)
+            .expect("public token issue should succeed");
+        assert!(temp_dir.join("keystore.db").exists());
+        assert!(
+            !temp_dir
+                .join(config.gateway.settings_file_name.as_str())
+                .exists(),
+            "public token issue should not create gateway settings"
+        );
+
+        let secrets = GatewaySecrets::open(&temp_dir).expect("reopen gateway secrets");
+        let jwt_material = secrets
+            .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)
+            .expect("reload jwt material");
+        let auth = initialize(&config, jwt_material.as_slice()).expect("expected jwt init");
+        let request = request_with_token(Some(token.as_str()));
+        auth.authorize_request(&request)
+            .expect("publicly issued token should validate");
 
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn authorize_request_rejects_missing_header() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-
         let config = test_app_config();
-        let settings = load_test_settings(&temp_dir, &config);
-        let auth: JwtAuth = initialize(&config, &settings).expect("expected jwt init to succeed");
+        let jwt_material = test_jwt_material();
+        let auth: JwtAuth =
+            initialize(&config, jwt_material.as_slice()).expect("expected jwt init to succeed");
         let request = request_with_token(None);
 
         assert!(auth.authorize_request(&request).is_err());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -282,6 +366,10 @@ mod tests {
         }
 
         builder.body(()).expect("failed to build request")
+    }
+
+    fn test_jwt_material() -> Vec<u8> {
+        (0..64).map(|value| value as u8).collect()
     }
 
     fn test_app_config() -> AppConfig {

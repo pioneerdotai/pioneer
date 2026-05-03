@@ -1,65 +1,49 @@
 use anyhow::{Context, Result, bail};
-use rand::RngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path};
 
-use crate::helpers::{encode_hex, normalize_non_empty};
+use crate::helpers::normalize_non_empty;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GatewaySettings {
     version: u32,
-    jwt_secret: String,
-    #[serde(default)]
-    providers: ProviderSettings,
-    #[serde(default)]
+    secrets: GatewaySecretsSettings,
+    #[serde(default, skip_serializing_if = "McpSecretSettings::is_empty")]
     mcp: McpSecretSettings,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct ProviderSettings {
-    #[serde(default)]
-    keys: HashMap<String, String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GatewaySecretsSettings {
+    backend: GatewaySecretsBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GatewaySecretsBackend {
+    Keystore,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct McpSecretSettings {
     #[serde(default)]
-    secrets: HashMap<String, String>,
+    secrets: std::collections::HashMap<String, String>,
+}
+
+impl Default for GatewaySecretsSettings {
+    fn default() -> Self {
+        Self {
+            backend: GatewaySecretsBackend::Keystore,
+        }
+    }
 }
 
 impl GatewaySettings {
-    pub(crate) fn jwt_secret(&self) -> &str {
-        self.jwt_secret.as_str()
-    }
-
-    pub(crate) fn provider_api_key(&self, provider_name: &str) -> Option<&str> {
-        self.providers
-            .keys
-            .get(provider_name)
-            .map(String::as_str)
-            .filter(|v| !v.is_empty())
-    }
-
-    pub(crate) fn set_provider_api_key(&mut self, provider_name: &str, api_key: String) {
-        self.providers
-            .keys
-            .insert(provider_name.to_owned(), api_key);
-    }
-
-    pub(crate) fn delete_provider_api_key(&mut self, provider_name: &str) -> bool {
-        self.providers.keys.remove(provider_name).is_some()
-    }
-
-    pub(crate) fn configured_provider_names(&self) -> Vec<String> {
-        self.providers
-            .keys
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, _)| k.clone())
-            .collect()
+    pub(crate) fn secrets_backend(&self) -> GatewaySecretsBackend {
+        self.secrets.backend
     }
 
     pub(crate) fn set_mcp_secret(&mut self, ref_id: &str, value: String) {
@@ -73,6 +57,12 @@ impl GatewaySettings {
             .get(ref_id)
             .map(String::as_str)
             .filter(|value| !value.is_empty())
+    }
+}
+
+impl McpSecretSettings {
+    fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
     }
 }
 
@@ -95,19 +85,14 @@ pub(crate) fn load_or_create_gateway_settings(
     path: &Path,
     expected_version: u32,
     settings_file_name: &str,
-    secret_size_bytes: usize,
 ) -> Result<GatewaySettings> {
     if path.exists() {
         return load_gateway_settings(path, expected_version, settings_file_name);
     }
 
-    let mut secret = vec![0u8; secret_size_bytes];
-    OsRng.fill_bytes(secret.as_mut_slice());
-
     let settings = GatewaySettings {
         version: expected_version,
-        jwt_secret: encode_hex(secret.as_slice()),
-        providers: ProviderSettings::default(),
+        secrets: GatewaySecretsSettings::default(),
         mcp: McpSecretSettings::default(),
     };
 
@@ -133,6 +118,13 @@ fn load_gateway_settings(
             settings.version,
             path.display(),
             expected_version
+        );
+    }
+
+    if settings.secrets_backend() != GatewaySecretsBackend::Keystore {
+        bail!(
+            "unsupported gateway secrets backend in `{}`",
+            path.display()
         );
     }
 
@@ -202,8 +194,7 @@ impl GatewaySettings {
     pub(crate) fn default_for_tests() -> Self {
         Self {
             version: 1,
-            jwt_secret: "00".repeat(32),
-            providers: ProviderSettings::default(),
+            secrets: GatewaySecretsSettings::default(),
             mcp: McpSecretSettings::default(),
         }
     }
@@ -218,6 +209,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn creates_sanitized_gateway_settings_without_jwt_or_provider_secrets() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+
+        let _settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+        let content = fs::read_to_string(&path).expect("read settings");
+
+        assert!(content.contains("[secrets]"));
+        assert!(content.contains("backend = \"keystore\""));
+        assert!(!content.contains("jwt_secret"));
+        assert!(!content.contains("[providers]"));
+        assert!(!content.contains("[providers.keys]"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn rejects_gateway_settings_with_unsupported_version() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -226,12 +236,14 @@ mod tests {
             &path,
             r#"
 version = 2
-jwt_secret = "abcd"
+
+[secrets]
+backend = "keystore"
 "#,
         )
         .expect("write unsupported-version settings");
 
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml", 64)
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
             .expect_err("unsupported settings version should be rejected");
         assert!(
             format!("{error:#}").contains("unsupported gateway settings version"),
@@ -242,23 +254,81 @@ jwt_secret = "abcd"
     }
 
     #[test]
-    fn rejects_gateway_settings_with_major_version_mismatch() {
+    fn rejects_gateway_settings_with_removed_jwt_secret_field() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
         let path = temp_dir.join("gateway-settings.toml");
         fs::write(
             &path,
             r#"
-version = 99
+version = 1
 jwt_secret = "abcd"
+
+[secrets]
+backend = "keystore"
 "#,
         )
-        .expect("write old settings");
+        .expect("write settings with removed jwt field");
 
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml", 64)
-            .expect_err("unsupported settings version should be rejected");
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("removed jwt_secret field should be rejected");
         assert!(
-            format!("{error:#}").contains("unsupported gateway settings version"),
+            format!("{error:#}").contains("unknown field `jwt_secret`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn rejects_gateway_settings_with_removed_providers_field() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[providers.keys]
+openrouter = "sk-test"
+"#,
+        )
+        .expect("write settings with removed providers field");
+
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("removed providers field should be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `providers`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn rejects_gateway_settings_with_unsupported_secret_backend() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "db-keystore"
+"#,
+        )
+        .expect("write settings with unsupported backend");
+
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("unsupported backend should be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown variant `db-keystore`"),
             "unexpected error: {error:#}"
         );
 

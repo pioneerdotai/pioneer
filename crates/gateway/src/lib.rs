@@ -6,6 +6,7 @@ mod helpers;
 mod mcp_service;
 mod message;
 mod resilience;
+mod secrets;
 mod session;
 mod settings;
 mod task_tools;
@@ -40,6 +41,7 @@ use crate::database::initialize as initialize_database;
 use crate::message::MessageProcessor;
 use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
+use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::settings::{
     GatewaySettings, load_or_create_gateway_settings, normalize_settings_file_name,
@@ -59,7 +61,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     );
 
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
-    let auth = initialize_jwt_auth(&config, &gateway_settings)?;
+    let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
+    let jwt_material = gateway_secrets
+        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
+    let auth = initialize_jwt_auth(&config, jwt_material.as_slice())?;
     let database = initialize_database(&runtime_home, &config).await?;
 
     run_bootstrap(&database).await?;
@@ -76,13 +81,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let gateway_settings = Arc::new(RwLock::new(gateway_settings));
 
     let provider_registry = Arc::new(ProviderRegistry::new({
-        let settings = gateway_settings.clone();
-        move |provider_name| {
-            let settings = settings
-                .read()
-                .expect("gateway settings lock poisoned while resolving provider key");
-            resolve_provider_api_key(provider_name, &settings)
-        }
+        let gateway_secrets = gateway_secrets.clone();
+        move |provider_name| gateway_secrets.resolve_provider_api_key(provider_name)
     }));
 
     let settings_path = runtime_home.join(
@@ -298,6 +298,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         crud_store,
         gateway_settings,
         settings_path,
+        gateway_secrets,
         summary_config,
         context_budget,
         tool_loop_config,
@@ -328,8 +329,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 }
 
 pub fn issue_superuser_token(config: &AppConfig, runtime_home: &Path) -> Result<String> {
-    let settings = load_gateway_settings(runtime_home, config)?;
-    issue_superuser_token_internal(config, &settings)
+    let gateway_secrets = GatewaySecrets::open(runtime_home)?;
+    let jwt_material = gateway_secrets
+        .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
+    issue_superuser_token_internal(config, jwt_material.as_slice())
 }
 
 fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<GatewaySettings> {
@@ -340,33 +343,7 @@ fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<Gate
         &settings_path,
         config.gateway.settings_version,
         settings_file_name.as_str(),
-        config.gateway.auth.secret_size_bytes,
     )
-}
-
-fn resolve_provider_api_key(provider_name: &str, settings: &GatewaySettings) -> String {
-    // Local / CLI providers — no API key needed
-    if matches!(
-        provider_name,
-        "ollama"
-            | "lmstudio"
-            | "llamacpp"
-            | "sglang"
-            | "vllm"
-            | "osaurus"
-            | "litellm"
-            | "claude-code"
-            | "gemini-cli"
-            | "kilocli"
-    ) {
-        return String::new();
-    }
-
-    if let Some(value) = settings.provider_api_key(provider_name) {
-        return value.to_owned();
-    }
-
-    String::new()
 }
 
 fn parse_skill_trust_level(raw: &str, field_name: &str) -> Result<SkillTrustLevel> {
@@ -433,36 +410,23 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        expand_home_directory_templates, parse_skill_trust_level, resolve_provider_api_key,
-    };
-    use crate::settings::GatewaySettings;
+    use super::{expand_home_directory_templates, parse_skill_trust_level};
+    use crate::secrets::GatewaySecrets;
+    use pioneer_keystore::MemorySecretStore;
     use pioneer_skills::SkillTrustLevel;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     #[test]
-    fn provider_key_resolver_reads_latest_shared_settings() {
-        let settings = Arc::new(RwLock::new(GatewaySettings::default_for_tests()));
-        let resolver = {
-            let settings = settings.clone();
-            move |provider_name: &str| {
-                let settings = settings
-                    .read()
-                    .expect("gateway settings lock poisoned in test");
-                resolve_provider_api_key(provider_name, &settings)
-            }
-        };
+    fn provider_key_resolver_reads_latest_keystore_value() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
 
-        assert!(resolver("deepseek").is_empty());
+        assert!(secrets.resolve_provider_api_key("deepseek").is_empty());
 
-        {
-            let mut settings = settings
-                .write()
-                .expect("gateway settings lock poisoned in test");
-            settings.set_provider_api_key("deepseek", "sk-test-key".to_owned());
-        }
+        secrets
+            .set_provider_api_key("deepseek", "sk-test-key")
+            .expect("set key");
 
-        assert_eq!(resolver("deepseek"), "sk-test-key");
+        assert_eq!(secrets.resolve_provider_api_key("deepseek"), "sk-test-key");
     }
 
     #[test]

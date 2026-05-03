@@ -6692,6 +6692,7 @@ dependencies = [
  "pioneer-config",
  "pioneer-crud",
  "pioneer-entity",
+ "pioneer-keystore",
  "pioneer-mcp",
  "pioneer-migration",
  "pioneer-protocol",

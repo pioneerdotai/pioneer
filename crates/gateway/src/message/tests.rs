@@ -1,5 +1,6 @@
 use super::MessageProcessor;
 use crate::bootstrap::bootstrap;
+use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
 use crate::workspace::WorkspaceManager;
@@ -10,6 +11,7 @@ use pioneer_agent::{AgentManager, AgentMcpToolProvider, SkillsLoopConfig, ToolLo
 use pioneer_config::GatewayWebToolsConfig;
 use pioneer_crud::CrudStore;
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
+use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, INVALID_REQUEST_CODE, ItemCompletedNotification,
     ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
@@ -18,14 +20,16 @@ use pioneer_protocol::{
     McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState,
     McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
     McpUninstallResponse, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-    PromptManifestProfile, RecoveryAction, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
-    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
-    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
-    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
-    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentSpecInput, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    PromptManifestProfile, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction,
+    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
+    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
+    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
+    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
+    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
     TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
     TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
     TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadClosedNotification,
@@ -576,6 +580,164 @@ fn test_settings_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/pioneer-test-settings.toml")
 }
 
+fn test_gateway_secrets() -> Arc<GatewaySecrets> {
+    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())))
+}
+
+async fn setup_provider_api_key_processor(
+    case_id: &str,
+) -> (
+    MessageProcessor,
+    Arc<MemorySecretStore>,
+    mpsc::Receiver<Message>,
+    u64,
+    std::path::PathBuf,
+) {
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, rx) = mpsc::channel(16);
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let secret_store = Arc::new(MemorySecretStore::new());
+    let gateway_secrets = Arc::new(GatewaySecrets::new(secret_store.clone()));
+    let base_dir = unique_temp_dir(case_id);
+    std::fs::create_dir_all(&base_dir).expect("create settings dir");
+    let settings_path = base_dir.join("gateway-settings.toml");
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_settings(),
+        settings_path.clone(),
+        gateway_secrets,
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    (processor, secret_store, rx, connection_id, settings_path)
+}
+
+#[tokio::test]
+async fn provider_api_key_handlers_use_keystore_without_settings_write() {
+    let (processor, secret_store, mut rx, connection_id, settings_path) =
+        setup_provider_api_key_processor("provider_api_key_handlers").await;
+    let set_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "set"))
+            .expect("valid set request id");
+    let list_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list"))
+            .expect("valid list request id");
+    let delete_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "delete"))
+            .expect("valid delete request id");
+    let delete_missing_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "missing"))
+            .expect("valid missing delete request id");
+
+    processor
+        .provider_set_api_key(
+            connection_id,
+            set_request_id.clone(),
+            ProviderSetApiKeyParams {
+                provider: "  OpenRouter  ".to_owned(),
+                api_key: "sk-secret-provider-key".to_owned(),
+            },
+        )
+        .await;
+    let set_response = recv_response_by_id(&mut rx, set_request_id.as_str()).await;
+    let set_payload: ProviderSetApiKeyResponse =
+        serde_json::from_value(set_response.result).expect("provider/set_api_key payload");
+    assert_eq!(set_payload.provider, "openrouter");
+    assert!(set_payload.updated);
+    assert_eq!(
+        secret_store
+            .get_string(&SecretId::provider_api_key("openrouter").expect("provider id"))
+            .expect("read provider key"),
+        Some("sk-secret-provider-key".to_owned())
+    );
+    assert!(
+        !settings_path.exists(),
+        "provider key handler must not write gateway settings"
+    );
+
+    processor
+        .provider_list(connection_id, list_request_id.clone())
+        .await;
+    let list_response = recv_response_by_id(&mut rx, list_request_id.as_str()).await;
+    let list_payload: ProviderListResponse =
+        serde_json::from_value(list_response.result).expect("provider/list payload");
+    assert_eq!(list_payload.providers.len(), 1);
+    assert_eq!(list_payload.providers[0].name, "openrouter");
+
+    processor
+        .provider_delete_api_key(
+            connection_id,
+            delete_request_id.clone(),
+            ProviderDeleteApiKeyParams {
+                provider: "OpenRouter".to_owned(),
+            },
+        )
+        .await;
+    let delete_response = recv_response_by_id(&mut rx, delete_request_id.as_str()).await;
+    let delete_payload: ProviderDeleteApiKeyResponse =
+        serde_json::from_value(delete_response.result).expect("provider/delete_api_key payload");
+    assert_eq!(delete_payload.provider, "openrouter");
+    assert!(delete_payload.deleted);
+    assert_eq!(
+        secret_store
+            .get_string(&SecretId::provider_api_key("openrouter").expect("provider id"))
+            .expect("read deleted provider key"),
+        None
+    );
+
+    processor
+        .provider_delete_api_key(
+            connection_id,
+            delete_missing_request_id.clone(),
+            ProviderDeleteApiKeyParams {
+                provider: "openrouter".to_owned(),
+            },
+        )
+        .await;
+    let missing_delete_response =
+        recv_response_by_id(&mut rx, delete_missing_request_id.as_str()).await;
+    let missing_delete_payload: ProviderDeleteApiKeyResponse =
+        serde_json::from_value(missing_delete_response.result)
+            .expect("provider/delete_api_key missing payload");
+    assert_eq!(missing_delete_payload.provider, "openrouter");
+    assert!(!missing_delete_payload.deleted);
+}
+
+#[tokio::test]
+async fn provider_set_api_key_rejects_empty_key_without_store_write() {
+    let (processor, secret_store, mut rx, connection_id, _settings_path) =
+        setup_provider_api_key_processor("provider_api_key_empty").await;
+    let request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "empty"))
+            .expect("valid request id");
+
+    processor
+        .provider_set_api_key(
+            connection_id,
+            request_id.clone(),
+            ProviderSetApiKeyParams {
+                provider: "openrouter".to_owned(),
+                api_key: "   ".to_owned(),
+            },
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
+    assert_eq!(error.error.code, pioneer_protocol::INVALID_PARAMS_CODE);
+    let entries = secret_store
+        .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
+        .expect("list provider keys");
+    assert!(entries.is_empty());
+}
+
 fn test_task_create_params(
     workspace_id: &str,
     parent_thread_id: &str,
@@ -991,6 +1153,7 @@ async fn setup_progress_delta_harness(
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -1389,6 +1552,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         summary_config,
         test_context_budget(),
         test_tool_loop_config(),
@@ -1464,6 +1628,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         summary_config,
         test_context_budget(),
         test_tool_loop_config(),
@@ -1545,6 +1710,7 @@ async fn title_generation_retries_after_transient_failure() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         summary_config,
         test_context_budget(),
         test_tool_loop_config(),
@@ -1625,6 +1791,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         summary_config,
         test_context_budget(),
         test_tool_loop_config(),
@@ -1818,6 +1985,7 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -1927,6 +2095,7 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -1991,6 +2160,7 @@ async fn task_depth_limit_rejects_subtask_creation() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2043,6 +2213,7 @@ async fn task_detach_updates_lifecycle_policy() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2113,6 +2284,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2188,6 +2360,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2255,6 +2428,7 @@ async fn task_create_tool_persists_anchor_and_composed_timeline() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2605,6 +2779,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2800,6 +2975,7 @@ async fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion()
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2900,6 +3076,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -2958,6 +3135,7 @@ async fn thread_start_returns_response_and_started_notification() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3013,6 +3191,7 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3409,6 +3588,7 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3504,6 +3684,7 @@ async fn thread_start_rejects_unknown_workspace_id() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3549,6 +3730,7 @@ async fn thread_start_rejects_missing_thread_id() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3601,6 +3783,7 @@ async fn thread_start_rejects_missing_workspace_id() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3653,6 +3836,7 @@ async fn workspace_list_returns_existing_workspaces() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3693,6 +3877,7 @@ async fn workspace_default_returns_single_active_workspace() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3733,6 +3918,7 @@ async fn workspace_create_creates_new_workspace() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3778,6 +3964,7 @@ async fn workspace_create_rejects_missing_workspace_id() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3826,6 +4013,7 @@ async fn turn_start_returns_response_and_started_notification() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -3925,6 +4113,7 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         tool_loop_config,
@@ -4005,6 +4194,7 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4048,6 +4238,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4121,6 +4312,7 @@ async fn prompt_manifest_event_updates_turn_state_and_persists() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4412,6 +4604,7 @@ async fn turn_get_returns_turn_snapshot() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4492,6 +4685,7 @@ async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4629,6 +4823,7 @@ async fn turn_cancel_rejects_non_subscribed_connection() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4705,6 +4900,7 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4784,6 +4980,7 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -4892,6 +5089,7 @@ async fn folder_delete_promotes_nested_contents_to_parent() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5062,6 +5260,7 @@ async fn thread_and_folder_move_support_root_target() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5228,6 +5427,7 @@ async fn thread_tree_changed_is_broadcast_to_other_connections() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5289,6 +5489,7 @@ async fn thread_history_returns_materialized_history() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5409,6 +5610,7 @@ async fn turn_items_returns_stream_events_for_resume() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5504,6 +5706,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5613,6 +5816,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
         crud_store.clone(),
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5703,6 +5907,7 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -5930,6 +6135,7 @@ Gateway skill body"#,
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         tool_loop_config,
@@ -6039,6 +6245,7 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         tool_loop_config.clone(),
@@ -6240,6 +6447,7 @@ Gateway HTTP skill body"#
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         tool_loop_config,
@@ -6396,6 +6604,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -6485,6 +6694,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -6601,6 +6811,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -6813,6 +7024,7 @@ async fn skills_health_returns_dependency_diagnostics() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -6877,6 +7089,7 @@ async fn skills_install_rejects_relative_path_with_structured_error_code() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -6949,6 +7162,7 @@ async fn skills_upload_abort_is_connection_bound() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -7064,6 +7278,7 @@ async fn skills_upload_chunk_digest_mismatch_aborts_session() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -7167,6 +7382,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -7288,6 +7504,7 @@ async fn skills_install_blocks_dependency_failure_under_default_policy() {
         crud_store,
         test_gateway_settings(),
         test_settings_path(),
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
@@ -7423,6 +7640,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         crud_store,
         settings.clone(),
         settings_path,
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -7684,6 +7902,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         crud_store,
         settings,
         settings_path,
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -7788,6 +8007,7 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         crud_store,
         test_gateway_settings(),
         settings_path,
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -7999,6 +8219,7 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
         crud_store,
         test_gateway_settings(),
         settings_path,
+        test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),

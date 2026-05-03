@@ -78,6 +78,7 @@ use crate::resilience::{
     RecoveryCoordinator, RecoveryPolicyRegistry, RecoveryTerminalOutcome, TimeoutPolicyRegistry,
     TimeoutSupervisor,
 };
+use crate::secrets::GatewaySecrets;
 use crate::session::{ConnectionId, SessionManager};
 use crate::settings::{GatewaySettings, save_gateway_settings};
 use crate::thread::ThreadManager;
@@ -121,6 +122,7 @@ pub struct MessageProcessor {
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_settings: Arc<RwLock<GatewaySettings>>,
     settings_path: PathBuf,
+    gateway_secrets: Arc<GatewaySecrets>,
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
@@ -151,6 +153,7 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_settings: Arc<RwLock<GatewaySettings>>,
         settings_path: PathBuf,
+        gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
         context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
@@ -194,6 +197,7 @@ impl MessageProcessor {
             crud_store,
             gateway_settings,
             settings_path,
+            gateway_secrets,
             summary_config: Arc::new(summary_config),
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -537,6 +541,9 @@ impl MessageProcessor {
             crud_store,
             gateway_settings,
             settings_path: PathBuf::from("/tmp/pioneer-test-settings.toml"),
+            gateway_secrets: Arc::new(GatewaySecrets::new(Arc::new(
+                pioneer_keystore::MemorySecretStore::new(),
+            ))),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),
