@@ -27,6 +27,10 @@ impl Conversation {
         self.state_machine.in_flight_turn_id()
     }
 
+    pub(in crate::app) fn is_cancelling_turn(&self) -> bool {
+        self.state_machine.status_label() == "cancelling"
+    }
+
     pub(in crate::app) fn status_label(&self) -> &str {
         self.state_machine.status_label()
     }
@@ -75,6 +79,14 @@ impl Conversation {
                     error.as_str(),
                     ts_unix_ms,
                 );
+            }
+            ConversationEvent::LocalTurnCancelRequested { .. } => {
+                self.pending_completion_turn_id = None;
+            }
+            ConversationEvent::LocalTurnCancelRejected { error, .. } => {
+                self.pending_completion_turn_id = None;
+                self.projector
+                    .apply_local_turn_cancel_rejected(error.as_str());
             }
             ConversationEvent::TurnStarted { turn, .. } => {
                 self.pending_completion_turn_id = None;

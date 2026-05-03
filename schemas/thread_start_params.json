@@ -41,6 +41,12 @@
         "null"
       ]
     },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "origin_kind": {
       "anyOf": [
         {

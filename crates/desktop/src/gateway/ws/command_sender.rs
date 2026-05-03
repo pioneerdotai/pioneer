@@ -156,6 +156,17 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::TURN_START, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn turn_cancel(&self, params: TurnCancelParams) -> Result<TurnCancelResponse> {
+        if params.thread_id.trim().is_empty() {
+            return Err(anyhow!("thread_id is required for turn/cancel"));
+        }
+        if params.turn_id.trim().is_empty() {
+            return Err(anyhow!("turn_id is required for turn/cancel"));
+        }
+
+        self.send_request_typed(methods::TURN_CANCEL, &params, RPC_REQUEST_TIMEOUT)
+    }
+
     pub fn provider_list(&self) -> Result<ProviderListResponse> {
         self.send_request_typed(
             methods::PROVIDER_LIST,

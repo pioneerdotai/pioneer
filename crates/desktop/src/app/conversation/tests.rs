@@ -178,6 +178,71 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
 }
 
 #[test]
+fn cancel_request_locks_until_rejected_or_interrupted() {
+    let mut conversation = Conversation::new(THREAD_ID);
+
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        user_text: "hello".to_owned(),
+    });
+    conversation.apply(ConversationEvent::LocalTurnStartAccepted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        pending_request_id: PENDING_REQUEST_ID.to_owned(),
+    });
+
+    conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+    });
+
+    assert!(!conversation.can_submit_message());
+    assert!(conversation.is_cancelling_turn());
+    assert_eq!(conversation.in_flight_turn_id(), Some(TURN_ID));
+    assert!(conversation.projection().composer_locked);
+    assert_eq!(conversation.projection().phase_label, "cancelling");
+
+    conversation.apply(ConversationEvent::LocalTurnCancelRejected {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        error: "gateway unavailable".to_owned(),
+    });
+
+    assert!(!conversation.can_submit_message());
+    assert_eq!(conversation.status_label(), "running");
+    assert_eq!(
+        conversation.projection().last_error.as_deref(),
+        Some("gateway unavailable")
+    );
+
+    conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+    });
+    conversation.apply(ConversationEvent::TurnFailed {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Interrupted,
+            error: Some("stopped by user".to_owned()),
+
+            prompt_manifest: None,
+        },
+    });
+    conversation.apply(ConversationEvent::LocalTurnCancelRejected {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        error: "late error".to_owned(),
+    });
+
+    assert!(conversation.can_submit_message());
+    assert_eq!(conversation.status_label(), "cancelled");
+    assert_eq!(conversation.in_flight_turn_id(), None);
+}
+
+#[test]
 fn item_delta_streams_text_until_completion() {
     let mut conversation = Conversation::new(THREAD_ID);
 

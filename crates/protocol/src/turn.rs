@@ -336,6 +336,21 @@ pub struct TurnStartResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnCancelParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnCancelResponse {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub turn: Turn,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnGetParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -2035,6 +2050,34 @@ mod tests {
                         "url": "https://example.com/image.png"
                     }
                 ]
+            })
+        );
+    }
+
+    #[test]
+    fn turn_cancel_params_roundtrip_optional_reason() {
+        let params: TurnCancelParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "reason": "user clicked stop"
+        }))
+        .expect("params should decode");
+
+        assert_eq!(params.thread_id, "thr_123");
+        assert_eq!(params.turn_id, "turn_123");
+        assert_eq!(params.reason.as_deref(), Some("user clicked stop"));
+
+        let encoded = serde_json::to_value(TurnCancelParams {
+            thread_id: "thr_123".to_owned(),
+            turn_id: "turn_123".to_owned(),
+            reason: None,
+        })
+        .expect("params should encode");
+        assert_eq!(
+            encoded,
+            json!({
+                "thread_id": "thr_123",
+                "turn_id": "turn_123"
             })
         );
     }

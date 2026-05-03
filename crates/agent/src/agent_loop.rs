@@ -8,7 +8,10 @@ use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 use tracing::error;
+
+const TURN_CANCEL_GRACE_MS: u64 = 750;
 
 pub(super) async fn run_agent_loop(
     thread_id: String,
@@ -245,8 +248,18 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
+                if let Some(control) = active_turn_control.as_ref() {
+                    control.cancel_all_attempts().await;
+                }
+
                 if let Some(task) = active_turn_task.take() {
-                    task.abort();
+                    sleep(Duration::from_millis(TURN_CANCEL_GRACE_MS)).await;
+                    if task.is_finished() {
+                        let _ = task.await;
+                    } else {
+                        task.abort();
+                        let _ = task.await;
+                    }
                 }
                 let recovery = active_recovery.take();
                 active_turn_id = None;
@@ -265,10 +278,10 @@ pub(super) async fn run_agent_loop(
                 .await;
                 publish_loop_durable_event(
                     event_hub.as_ref(),
-                    AgentDurableEvent::TurnFailed {
+                    AgentDurableEvent::TurnInterrupted {
                         thread_id: thread_id.clone(),
                         turn_id,
-                        error: reason,
+                        reason,
                         recovery,
                     },
                 )

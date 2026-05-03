@@ -27,10 +27,10 @@ use pioneer_protocol::{
     ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse,
     ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
     ThreadStartParams, ThreadStartResponse, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, TurnGetParams, TurnGetResponse,
-    TurnItemsParams, TurnItemsResponse, TurnStartParams, TurnStartResponse, TurnTimelineParams,
-    TurnTimelineResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, constants::events,
-    constants::methods,
+    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, TurnCancelParams, TurnCancelResponse,
+    TurnGetParams, TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnStartParams,
+    TurnStartResponse, TurnTimelineParams, TurnTimelineResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, constants::events, constants::methods,
 };
 use pioneer_skills::is_qualified_skill_slug;
 use serde::de::DeserializeOwned;

@@ -1,4 +1,4 @@
-use crate::app::root::PioneerDesktop;
+use crate::{app::root::PioneerDesktop, assets::PioneerIconName};
 use gpui::{prelude::*, *};
 use gpui_component::{IconName, button::*, input::Input, theme::ActiveTheme, *};
 use std::path::Path;
@@ -8,6 +8,28 @@ impl PioneerDesktop {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
         let can_send = self.can_submit_message(cx);
+        let in_flight_turn_id = self
+            .active_thread_conversation()
+            .and_then(|conversation| conversation.in_flight_turn_id().map(str::to_owned));
+        let is_cancelling = self
+            .active_thread_conversation()
+            .is_some_and(|conversation| conversation.is_cancelling_turn());
+        let can_stop = in_flight_turn_id.is_some()
+            && self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected
+            && !is_cancelling;
+        let has_in_flight_turn = in_flight_turn_id.is_some();
+
+        let composer_action_id = if has_in_flight_turn {
+            "stop-turn"
+        } else {
+            "send-message"
+        };
+
+        let composer_action_disabled = if has_in_flight_turn {
+            !can_stop
+        } else {
+            !can_send
+        };
 
         h_flex()
             .w_full()
@@ -54,13 +76,23 @@ impl PioneerDesktop {
                                 )
                                 .child(
                                     div().child(
-                                        Button::new("send-message")
+                                        Button::new(composer_action_id)
                                             .primary()
                                             .rounded_full()
-                                            .icon(IconName::ArrowUp)
-                                            .disabled(!can_send)
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                view.submit_composer_message(window, cx);
+                                            .disabled(composer_action_disabled)
+                                            .loading(has_in_flight_turn && is_cancelling)
+                                            .when(has_in_flight_turn, |this| {
+                                                this.icon(PioneerIconName::Square)
+                                            })
+                                            .when(!has_in_flight_turn, |this| {
+                                                this.icon(IconName::ArrowUp)
+                                            })
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                if has_in_flight_turn {
+                                                    view.stop_active_turn(window, cx);
+                                                } else {
+                                                    view.submit_composer_message(window, cx);
+                                                }
                                             })),
                                     ),
                                 ),

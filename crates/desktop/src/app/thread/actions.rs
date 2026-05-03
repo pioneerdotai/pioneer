@@ -3,7 +3,7 @@ use super::super::{
     root::{ComposerAttachment, ComposerAttachmentKind, PioneerDesktop},
 };
 use gpui::{prelude::*, *};
-use pioneer_protocol::{REQUEST_ID_LEN, TurnStartParams, UserInput, generate_id};
+use pioneer_protocol::{REQUEST_ID_LEN, TurnCancelParams, TurnStartParams, UserInput, generate_id};
 use std::path::{Path, PathBuf};
 
 const TURN_ID_LEN: usize = 21;
@@ -162,6 +162,63 @@ impl PioneerDesktop {
                                 error: format!("{error:#}"),
                             });
                         }
+                    }
+
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    pub(super) fn stop_active_turn(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.active_thread_id.clone() else {
+            return;
+        };
+        let Some(turn_id) = self.in_flight_turn_id_for_thread(thread_id.as_str()) else {
+            return;
+        };
+
+        let Some(conversation) = self.thread_conversation_mut(thread_id.as_str()) else {
+            return;
+        };
+        if conversation.is_cancelling_turn() {
+            return;
+        }
+
+        conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        });
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let thread_id_for_request = thread_id.clone();
+            let turn_id_for_request = turn_id.clone();
+
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.turn_cancel(TurnCancelParams {
+                            thread_id: thread_id_for_request,
+                            turn_id: turn_id_for_request,
+                            reason: Some(t!("chat.composer.stop_reason").to_string()),
+                        })
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if let Err(error) = result
+                        && let Some(conversation) = view.thread_conversation_mut(thread_id.as_str())
+                    {
+                        conversation.apply(ConversationEvent::LocalTurnCancelRejected {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            error: format!("{error:#}"),
+                        });
                     }
 
                     cx.notify();

@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "Envoyez un message à l'assistant"
+stop = "Arreter"
+stopping = "Arret..."
+stop_reason = "Tour annule par l'utilisateur"
 
 [chat.composer.mode]
 agent_label = "Agent"

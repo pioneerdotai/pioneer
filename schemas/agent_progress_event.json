@@ -23,6 +23,40 @@
     {
       "type": "object",
       "required": [
+        "item_id",
+        "item_type",
+        "kind",
+        "thread_id",
+        "turn_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "item_type": {
+          "$ref": "#/definitions/TurnItemType"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "item_heartbeat"
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
         "delta",
         "item_id",
         "kind",
@@ -462,6 +496,22 @@
             }
           }
         }
+      ]
+    },
+    "TurnItemType": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "agent_message",
+        "reasoning",
+        "system_event",
+        "task",
+        "command_execution",
+        "file_change",
+        "web_search",
+        "web_fetch",
+        "download",
+        "dynamic_tool_call"
       ]
     }
   }

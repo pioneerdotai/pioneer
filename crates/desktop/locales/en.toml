@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "Send a message to the assistant"
+stop = "Stop"
+stopping = "Stopping..."
+stop_reason = "Turn cancelled by user"
 
 [chat.composer.mode]
 agent_label = "Agent"

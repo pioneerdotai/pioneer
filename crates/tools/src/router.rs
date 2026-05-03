@@ -14,6 +14,7 @@ use crate::visibility::ToolVisibilitySnapshot;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct RawToolCall {
@@ -172,6 +173,7 @@ impl ToolRouter {
         source: ToolCallSource,
         workdir: PathBuf,
         trace: &ToolEventTrace,
+        cancellation: CancellationToken,
     ) -> Result<crate::context::AnyToolResult, ToolError> {
         let invocation = ToolInvocation {
             call_id: call.call_id,
@@ -182,6 +184,7 @@ impl ToolRouter {
             attempt_id: 1,
             idempotency_key: call.idempotency_key,
             recovery: call.recovery,
+            cancellation,
         };
         orchestrator.run(&self.registry, invocation, trace).await
     }

@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
+
+const DISPATCH_CANCEL_GRACE_MS: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct ToolCallRuntime {
@@ -141,13 +144,9 @@ impl ToolCallRuntime {
                     },
                 }?;
 
-                let dispatch =
-                    self.dispatch_call(call.clone(), &cancellation, &trace, source, &workdir);
-                tokio::pin!(dispatch);
-                let output = tokio::select! {
-                    _ = cancellation.cancelled() => Err(ToolError::cancelled("cancelled during shared execution")),
-                    result = &mut dispatch => result,
-                };
+                let output = self
+                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                    .await;
                 drop(read_guard);
                 output
             }
@@ -181,13 +180,9 @@ impl ToolCallRuntime {
                     },
                 }?;
 
-                let dispatch =
-                    self.dispatch_call(call.clone(), &cancellation, &trace, source, &workdir);
-                tokio::pin!(dispatch);
-                let output = tokio::select! {
-                    _ = cancellation.cancelled() => Err(ToolError::cancelled("cancelled during exclusive execution")),
-                    result = &mut dispatch => result,
-                };
+                let output = self
+                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                    .await;
                 drop(write_guard);
                 output
             }
@@ -244,13 +239,9 @@ impl ToolCallRuntime {
                     })),
                 );
 
-                let dispatch =
-                    self.dispatch_call(call.clone(), &cancellation, &trace, source, &workdir);
-                tokio::pin!(dispatch);
-                let output = tokio::select! {
-                    _ = cancellation.cancelled() => Err(ToolError::cancelled("cancelled during session-scoped execution")),
-                    result = &mut dispatch => result,
-                };
+                let output = self
+                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                    .await;
                 drop(session_guard);
                 drop(read_guard);
                 output
@@ -322,14 +313,18 @@ impl ToolCallRuntime {
             source,
             workdir.clone(),
             trace,
+            cancellation.clone(),
         );
         tokio::pin!(dispatch);
 
         tokio::select! {
-            _ = cancellation.cancelled() => {
-                Err(ToolError::cancelled("tool dispatch cancelled"))
-            }
             result = &mut dispatch => result,
+            _ = cancellation.cancelled() => {
+                match timeout(Duration::from_millis(DISPATCH_CANCEL_GRACE_MS), &mut dispatch).await {
+                    Ok(result) => result,
+                    Err(_) => Err(ToolError::cancelled("tool dispatch cancelled")),
+                }
+            }
         }
     }
 }
@@ -349,6 +344,7 @@ fn classify_call_error(
         attempt_id: 1,
         idempotency_key: call.idempotency_key.clone(),
         recovery: call.recovery,
+        cancellation: CancellationToken::new(),
     };
     DefaultErrorClassifier.classify_error(&invocation, error)
 }

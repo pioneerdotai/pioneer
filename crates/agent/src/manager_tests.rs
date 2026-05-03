@@ -686,6 +686,17 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             error,
             recovery,
         }),
+        AgentDurableEvent::TurnInterrupted {
+            thread_id,
+            turn_id,
+            reason,
+            recovery,
+        } => Some(AgentEvent::TurnFailed {
+            thread_id,
+            turn_id,
+            error: reason,
+            recovery,
+        }),
         AgentDurableEvent::TaskEvent { .. } | AgentDurableEvent::ThreadLineageCreated { .. } => {
             None
         }
@@ -1308,6 +1319,81 @@ async fn start_turn_rejects_second_running_turn() {
         .await
         .expect_err("second turn should be rejected while first is running");
     assert_eq!(error, AgentStartError::TurnAlreadyRunning);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_turn_emits_interrupted_durable_event() {
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "pending",
+        Arc::new(PendingProvider),
+    ));
+    let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
+    let thread_id = "thr_000000000000000003";
+    let turn_id = "turn_000000000000000003";
+
+    manager
+        .ensure_thread(thread_id, "ws_000000000000000003")
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_turn(
+            thread_id,
+            turn_id,
+            ThreadMode::Chat,
+            "openai/gpt-4o",
+            "pending",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "first".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let cancel_manager = manager.clone();
+    let cancel_handle = tokio::spawn(async move {
+        cancel_manager
+            .cancel_turn(thread_id, turn_id, "user clicked stop")
+            .await
+    });
+
+    yield_now().await;
+    advance(Duration::from_millis(800)).await;
+    yield_now().await;
+
+    cancel_handle
+        .await
+        .expect("cancel task should not panic")
+        .expect("turn cancellation should succeed");
+
+    for _ in 0..16 {
+        let event = timeout(Duration::from_secs(1), durable_events.recv())
+            .await
+            .expect("durable event should be emitted")
+            .expect("durable receiver should stay open");
+        if let AgentDurableEvent::TurnInterrupted {
+            thread_id: event_thread_id,
+            turn_id: event_turn_id,
+            reason,
+            recovery,
+        } = event
+        {
+            assert_eq!(event_thread_id, thread_id);
+            assert_eq!(event_turn_id, turn_id);
+            assert_eq!(reason, "user clicked stop");
+            assert!(recovery.is_none());
+            return;
+        }
+    }
+
+    panic!("turn cancellation should emit TurnInterrupted");
 }
 
 #[tokio::test(start_paused = true)]

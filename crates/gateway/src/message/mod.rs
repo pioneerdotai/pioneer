@@ -52,12 +52,12 @@ use pioneer_protocol::{
     ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse, ThreadStartParams,
     ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
     ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin, TimelineOriginKind,
-    TimelinePayload, ToolCallStatus, TurnCompletedNotification, TurnFailedNotification,
-    TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType,
-    TurnItemsParams, TurnStartParams, TurnStatus, TurnTimelineChangedNotification,
-    TurnTimelineChangedReason, TurnTimelineParams, TurnTimelineResponse, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse,
+    TimelinePayload, ToolCallStatus, TurnCancelParams, TurnCancelResponse,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem,
+    TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnStartParams,
+    TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
     constants::{events, methods},
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};

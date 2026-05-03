@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "アシスタントにメッセージを送信"
+stop = "停止"
+stopping = "停止中..."
+stop_reason = "ユーザーがターンをキャンセルしました"
 
 [chat.composer.mode]
 agent_label = "エージェント"

@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "Sende eine Nachricht an den Assistenten"
+stop = "Stoppen"
+stopping = "Wird gestoppt..."
+stop_reason = "Turn vom Benutzer abgebrochen"
 
 [chat.composer.mode]
 agent_label = "Agent"

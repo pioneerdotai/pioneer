@@ -388,6 +388,42 @@
     {
       "type": "object",
       "required": [
+        "kind",
+        "reason",
+        "thread_id",
+        "turn_id"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "turn_interrupted"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "recovery": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RecoveryAttemptContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
         "event",
         "kind"
       ],

@@ -5,7 +5,7 @@ use pioneer_protocol::{
     SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
     TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
     TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
-    TurnTimelineParams,
+    TurnCancelParams, TurnTimelineParams,
 };
 
 impl MessageProcessor {
@@ -306,6 +306,25 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::TURN_START),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_CANCEL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TurnCancelParams>(params_value) {
+                    Ok(params) => {
+                        self.turn_cancel(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_CANCEL),
                             ),
                         )
                         .await;

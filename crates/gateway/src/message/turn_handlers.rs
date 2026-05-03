@@ -260,6 +260,193 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn turn_cancel(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: TurnCancelParams,
+    ) {
+        if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `thread_id` and `turn_id` are required",
+                        methods::TURN_CANCEL
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let thread_id = params.thread_id.trim().to_owned();
+        let turn_id = params.turn_id.trim().to_owned();
+        let reason = params
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("turn cancelled by user")
+            .to_owned();
+
+        let Some((workspace_id, turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        else {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("turn `{turn_id}` not found in thread `{thread_id}`"),
+                ),
+            )
+            .await;
+            return;
+        };
+
+        let subscribed = self
+            .thread_manager
+            .subscribed_connection_ids(thread_id.as_str())
+            .await
+            .contains(&connection_id);
+        if !subscribed {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "connection `{connection_id}` is not subscribed to thread `{thread_id}`"
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if turn.status != TurnStatus::InProgress {
+            self.send_turn_cancel_response(
+                connection_id,
+                request_id,
+                TurnCancelResponse {
+                    thread_id,
+                    workspace_id,
+                    turn,
+                },
+            )
+            .await;
+            return;
+        }
+
+        match self
+            .agent_manager
+            .cancel_turn(thread_id.as_str(), turn_id.as_str(), reason.as_str())
+            .await
+        {
+            Ok(()) => {}
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+            | Err(pioneer_agent::AgentControlError::NoActiveTurn) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    "agent runtime had no active turn during turn/cancel; terminalizing in gateway"
+                );
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to cancel turn: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        if !self
+            .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to interrupt turn `{turn_id}` in thread `{thread_id}`"),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let Some((workspace_id, turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        else {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("turn `{turn_id}` disappeared after cancellation"),
+                ),
+            )
+            .await;
+            return;
+        };
+
+        self.send_turn_cancel_response(
+            connection_id,
+            request_id,
+            TurnCancelResponse {
+                thread_id,
+                workspace_id,
+                turn,
+            },
+        )
+        .await;
+    }
+
+    async fn send_turn_cancel_response(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        response_payload: TurnCancelResponse,
+    ) {
+        let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send turn/cancel response"
+            );
+        }
+    }
+
     pub(super) async fn turn_get(
         &self,
         connection_id: ConnectionId,

@@ -692,6 +692,9 @@ impl ProgressCoalescer {
             }
             | AgentDurableEvent::TurnFailed {
                 thread_id, turn_id, ..
+            }
+            | AgentDurableEvent::TurnInterrupted {
+                thread_id, turn_id, ..
             } => {
                 self.flush_turn(thread_id, turn_id).await;
             }
@@ -1294,6 +1297,19 @@ impl TurnExecutionControl {
 
         token.cancel();
         true
+    }
+
+    async fn cancel_all_attempts(&self) {
+        let tokens = self
+            .attempt_controls
+            .lock()
+            .await
+            .values()
+            .map(|control| control.cancellation_token.clone())
+            .collect::<Vec<_>>();
+        for token in tokens {
+            token.cancel();
+        }
     }
 }
 

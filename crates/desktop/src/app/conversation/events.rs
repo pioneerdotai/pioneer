@@ -12,6 +12,8 @@ pub(crate) enum EventKind {
     LocalTurnStartRequested,
     LocalTurnStartAccepted,
     LocalTurnStartRejected,
+    LocalTurnCancelRequested,
+    LocalTurnCancelRejected,
     TurnStarted,
     TurnCompleted,
     TurnFailed,
@@ -50,6 +52,15 @@ pub(crate) enum ConversationEvent {
         thread_id: String,
         turn_id: String,
         pending_request_id: String,
+        error: String,
+    },
+    LocalTurnCancelRequested {
+        thread_id: String,
+        turn_id: String,
+    },
+    LocalTurnCancelRejected {
+        thread_id: String,
+        turn_id: String,
         error: String,
     },
     TurnStarted {
@@ -210,6 +221,8 @@ impl ConversationEvent {
             Self::LocalTurnStartRequested { thread_id, .. }
             | Self::LocalTurnStartAccepted { thread_id, .. }
             | Self::LocalTurnStartRejected { thread_id, .. }
+            | Self::LocalTurnCancelRequested { thread_id, .. }
+            | Self::LocalTurnCancelRejected { thread_id, .. }
             | Self::TurnStarted { thread_id, .. }
             | Self::TurnCompleted { thread_id, .. }
             | Self::TurnFailed { thread_id, .. }
@@ -236,6 +249,8 @@ impl ConversationEvent {
             Self::LocalTurnStartRequested { turn_id, .. }
             | Self::LocalTurnStartAccepted { turn_id, .. }
             | Self::LocalTurnStartRejected { turn_id, .. }
+            | Self::LocalTurnCancelRequested { turn_id, .. }
+            | Self::LocalTurnCancelRejected { turn_id, .. }
             | Self::ItemStarted { turn_id, .. }
             | Self::ItemDelta { turn_id, .. }
             | Self::ItemTimeoutDetected { turn_id, .. }
@@ -276,6 +291,8 @@ impl ConversationEvent {
             Self::LocalTurnStartRequested { .. }
             | Self::LocalTurnStartAccepted { .. }
             | Self::LocalTurnStartRejected { .. }
+            | Self::LocalTurnCancelRequested { .. }
+            | Self::LocalTurnCancelRejected { .. }
             | Self::TurnStarted { .. }
             | Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
@@ -288,6 +305,8 @@ impl ConversationEvent {
             Self::LocalTurnStartRequested { .. } => EventKind::LocalTurnStartRequested,
             Self::LocalTurnStartAccepted { .. } => EventKind::LocalTurnStartAccepted,
             Self::LocalTurnStartRejected { .. } => EventKind::LocalTurnStartRejected,
+            Self::LocalTurnCancelRequested { .. } => EventKind::LocalTurnCancelRequested,
+            Self::LocalTurnCancelRejected { .. } => EventKind::LocalTurnCancelRejected,
             Self::TurnStarted { .. } => EventKind::TurnStarted,
             Self::TurnCompleted { .. } => EventKind::TurnCompleted,
             Self::TurnFailed { turn, .. } => {

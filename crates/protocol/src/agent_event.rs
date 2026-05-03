@@ -96,6 +96,13 @@ pub enum AgentDurableEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryAttemptContext>,
     },
+    TurnInterrupted {
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryAttemptContext>,
+    },
     TaskEvent {
         event: TaskEvent,
     },
@@ -160,7 +167,8 @@ impl AgentDurableEvent {
             | Self::ProviderFailureDetected { turn_id, .. }
             | Self::RecoveryAttemptSucceeded { turn_id, .. }
             | Self::TurnCompleted { turn_id, .. }
-            | Self::TurnFailed { turn_id, .. } => DurableEventCausalityKey::Turn {
+            | Self::TurnFailed { turn_id, .. }
+            | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
@@ -192,6 +200,7 @@ impl AgentDurableEvent {
         match self {
             Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
+            | Self::TurnInterrupted { .. }
             | Self::ItemCompleted { .. }
             | Self::ItemToolRetryExhausted { .. } => true,
             Self::TaskEvent { event } => event.is_terminal(),
@@ -427,6 +436,24 @@ mod tests {
             }
         );
         assert!(!event.is_terminal());
+    }
+
+    #[test]
+    fn durable_turn_interrupted_is_terminal_turn_event() {
+        let event = AgentDurableEvent::TurnInterrupted {
+            thread_id: "thread_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            reason: "user clicked stop".to_owned(),
+            recovery: None,
+        };
+
+        assert_eq!(
+            event.causality_key(),
+            DurableEventCausalityKey::Turn {
+                turn_id: "turn_1".to_owned()
+            }
+        );
+        assert!(event.is_terminal());
     }
 
     #[test]

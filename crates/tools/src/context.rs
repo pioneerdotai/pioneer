@@ -4,6 +4,7 @@ use pioneer_provider::ModelInputItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecCommandArgs {
@@ -106,6 +107,7 @@ pub struct ToolInvocation {
     pub attempt_id: u32,
     pub idempotency_key: Option<String>,
     pub recovery: ToolRecoveryMetadata,
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

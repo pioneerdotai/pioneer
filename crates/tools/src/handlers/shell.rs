@@ -286,7 +286,10 @@ impl ToolHandler for UnifiedExecHandler {
             LocalShellPayload::ExecCommand(args) => {
                 self.handle_exec_command(args, invocation, trace).await
             }
-            LocalShellPayload::WriteStdin(args) => self.handle_write_stdin(args, trace).await,
+            LocalShellPayload::WriteStdin(args) => {
+                self.handle_write_stdin(args, invocation.cancellation, trace)
+                    .await
+            }
         }
     }
 }
@@ -299,9 +302,11 @@ impl UnifiedExecHandler {
         trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         self.cleanup_stale_sessions().await;
+        let cancellation = invocation.cancellation.clone();
         let use_tty = args.tty.unwrap_or(false);
         if !use_tty {
-            let result = run_one_shot(args, invocation.workdir.as_path(), &trace).await?;
+            let result =
+                run_one_shot(args, invocation.workdir.as_path(), &trace, cancellation).await?;
             return Ok(Box::new(result.into_tool_output()));
         }
 
@@ -361,10 +366,22 @@ impl UnifiedExecHandler {
             persistence.insert_live(session_id, command_preview.as_slice(), child_pid);
         }
 
-        sleep(Duration::from_millis(
-            args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS),
-        ))
-        .await;
+        let session_cancelled = tokio::select! {
+            _ = cancellation.cancelled() => true,
+            _ = sleep(Duration::from_millis(args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS))) => false,
+        };
+
+        if session_cancelled {
+            {
+                let mut guard = session.lock().await;
+                let _ = terminate_child_process(&mut guard.child).await;
+            }
+            self.sessions.lock().await.remove(&session_id);
+            if let Some(persistence) = self.persistence.as_ref() {
+                persistence.remove(session_id);
+            }
+            return Err(ToolError::cancelled("command cancelled"));
+        }
 
         let initial = read_session_chunk(session.clone()).await?;
         emit_shell_chunk_delta(&trace, &initial.stdout, "stdout");
@@ -407,6 +424,7 @@ impl UnifiedExecHandler {
     async fn handle_write_stdin(
         &self,
         args: WriteStdinArgs,
+        cancellation: tokio_util::sync::CancellationToken,
         trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         self.cleanup_stale_sessions().await;
@@ -448,10 +466,12 @@ impl UnifiedExecHandler {
             }
         }
 
-        sleep(Duration::from_millis(
-            args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS),
-        ))
-        .await;
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(ToolError::cancelled("write_stdin cancelled"));
+            }
+            _ = sleep(Duration::from_millis(args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS))) => {}
+        }
 
         let chunk = read_session_chunk(session.clone()).await?;
         emit_shell_chunk_delta(&trace, &chunk.stdout, "stdout");
@@ -622,6 +642,7 @@ async fn run_one_shot(
     args: ExecCommandArgs,
     base_dir: &Path,
     trace: &crate::events::ToolEventTrace,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
     let cwd = resolve_workdir(base_dir, args.workdir.as_deref());
@@ -656,6 +677,7 @@ async fn run_one_shot(
 
     let mut status_opt: Option<ExitStatus> = None;
     let mut timed_out = false;
+    let mut cancelled = false;
 
     loop {
         if status_opt.is_some() && stdout_task.is_finished() && stderr_task.is_finished() {
@@ -663,6 +685,10 @@ async fn run_one_shot(
         }
 
         tokio::select! {
+            _ = cancellation.cancelled(), if status_opt.is_none() => {
+                cancelled = true;
+                status_opt = Some(terminate_child_process(&mut child).await?);
+            }
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
                 status_opt = Some(terminate_child_process(&mut child).await?);
@@ -717,6 +743,10 @@ async fn run_one_shot(
     let status = status_opt.ok_or_else(|| {
         ToolError::execution_failed("command finished without exit status".to_owned())
     })?;
+
+    if cancelled {
+        return Err(ToolError::cancelled("command cancelled"));
+    }
 
     let payload = build_exec_model_payload(ExecPayloadInput {
         exit_code: status.code(),
@@ -1073,6 +1103,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1296,6 +1327,104 @@ mod tests {
             json.get("timed_out").and_then(serde_json::Value::as_bool),
             Some(true),
             "payload should include timed_out=true: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_command_cancellation_terminates_one_shot_process() {
+        let handler = UnifiedExecHandler::default();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                cmd: None,
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "sleep 5; echo should-not-run".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(false),
+                login: None,
+                shell: None,
+            })),
+        );
+        tool_invocation.cancellation = cancellation.clone();
+
+        let handle =
+            tokio::spawn(
+                async move { handler.handle(tool_invocation, trace("exec_command")).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelled command should finish promptly")
+            .expect("command task should not panic");
+
+        match result {
+            Ok(output) => panic!(
+                "cancelled command should not succeed: {}",
+                output.raw_text()
+            ),
+            Err(error) => assert!(matches!(error, ToolError::Cancelled(_))),
+        }
+    }
+
+    #[tokio::test]
+    async fn tty_exec_command_cancellation_removes_live_session() {
+        let handler = std::sync::Arc::new(UnifiedExecHandler::default());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                cmd: None,
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "sleep 5; echo should-not-run".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: Some(1_000),
+                tty: Some(true),
+                login: Some(false),
+                shell: None,
+            })),
+        );
+        tool_invocation.cancellation = cancellation.clone();
+
+        let task_handler = handler.clone();
+        let handle = tokio::spawn(async move {
+            task_handler
+                .handle(tool_invocation, trace("exec_command"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelled tty command should finish promptly")
+            .expect("command task should not panic");
+
+        match result {
+            Ok(output) => panic!(
+                "cancelled tty command should not succeed: {}",
+                output.raw_text()
+            ),
+            Err(error) => assert!(matches!(error, ToolError::Cancelled(_))),
+        }
+        assert!(
+            handler.sessions.lock().await.is_empty(),
+            "cancelled tty command should not leave a live session"
         );
     }
 

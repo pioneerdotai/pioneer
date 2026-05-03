@@ -11,21 +11,21 @@ use pioneer_config::GatewayWebToolsConfig;
 use pioneer_crud::CrudStore;
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemStartedNotification, ItemToolRetryScheduledNotification,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse, McpChangedAction,
-    McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
-    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpServerDetailsResponse,
-    McpServerStatus, McpSourceKind, McpTransportSummary, McpUninstallResponse, PromptManifest,
-    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile, RecoveryAction,
-    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
-    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
-    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
-    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
-    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
-    TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    AgentDurableEvent, AgentProgressEvent, INVALID_REQUEST_CODE, ItemCompletedNotification,
+    ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
+    ItemToolRetryScheduledNotification, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
+    McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
+    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState,
+    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
+    McpUninstallResponse, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestProfile, RecoveryAction, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
+    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
+    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
+    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
+    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentSpecInput, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
+    TaskDeliveryPolicy, TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
     TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
     TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
     TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadClosedNotification,
@@ -33,10 +33,11 @@ use pioneer_protocol::{
     ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMoveResponse, ThreadSidebarVisibility,
     ThreadStartParams, ThreadStartResponse, ThreadTreeResponse, ThreadUnsubscribeResponse,
     ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnCompletedNotification,
-    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnSkillBinding,
-    TurnStartResponse, TurnStatus, TurnTimelineResponse, UserInput, UserMessageAttachment,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse, constants::events,
+    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnSkillBinding, TurnStartResponse, TurnStatus,
+    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceCreateResponse,
+    WorkspaceDefaultResponse, WorkspaceListResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -4469,6 +4470,306 @@ async fn turn_get_returns_turn_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "too late".to_owned(),
+        }),
+    ));
+    let crud_store_for_assert = crud_store.clone();
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_settings(),
+        test_settings_path(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_request_id = generate_test_request_id("turncancel", "thread");
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": thread_request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": "thr_000000000000000022",
+            "workspace_id": workspace_id,
+            "model": "test-model",
+            "model_provider": "delayed"
+        }
+    });
+    processor
+        .process_request(connection_id, &thread_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, thread_request_id.as_str()).await;
+
+    let turn_start_request_id = generate_test_request_id("turncancel", "start");
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_start_request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": "thr_000000000000000022",
+            "turn_id": "turn_000000000000000022",
+            "mode": "Chat",
+            "model": "test-model",
+            "model_provider": "delayed",
+            "input": [{"type": "text", "text": "hello"}]
+        }
+    });
+    processor
+        .process_request(connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
+
+    let turn_cancel_request_id = generate_test_request_id("turncancel", "stop1");
+    let turn_cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_cancel_request_id,
+        "method": "turn/cancel",
+        "params": {
+            "thread_id": "thr_000000000000000022",
+            "turn_id": "turn_000000000000000022",
+            "reason": "user clicked stop"
+        }
+    });
+    processor
+        .process_request(connection_id, &turn_cancel_request.to_string())
+        .await;
+
+    let (cancel_response, failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        turn_cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
+    let failed_params = failed_notification
+        .params
+        .expect("turn/failed params should exist");
+    let failed: TurnFailedNotification =
+        serde_json::from_value(failed_params).expect("turn/failed params should decode");
+    assert_eq!(failed.turn.id, "turn_000000000000000022");
+    assert_eq!(failed.turn.status, TurnStatus::Interrupted);
+    assert_eq!(failed.turn.error.as_deref(), Some("user clicked stop"));
+
+    let cancel_result: TurnCancelResponse =
+        serde_json::from_value(cancel_response.result).expect("turn/cancel response should decode");
+    assert_eq!(cancel_result.thread_id, "thr_000000000000000022");
+    assert_eq!(cancel_result.turn.status, TurnStatus::Interrupted);
+    assert_eq!(
+        cancel_result.turn.error.as_deref(),
+        Some("user clicked stop")
+    );
+
+    let second_cancel_request_id = generate_test_request_id("turncancel", "stop2");
+    let second_cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": second_cancel_request_id,
+        "method": "turn/cancel",
+        "params": {
+            "thread_id": "thr_000000000000000022",
+            "turn_id": "turn_000000000000000022",
+            "reason": "second click"
+        }
+    });
+    processor
+        .process_request(connection_id, &second_cancel_request.to_string())
+        .await;
+
+    let second_response = recv_response_by_id(&mut rx, second_cancel_request_id.as_str()).await;
+    let second_result: TurnCancelResponse = serde_json::from_value(second_response.result)
+        .expect("second turn/cancel response should decode");
+    assert_eq!(second_result.turn.status, TurnStatus::Interrupted);
+    assert_eq!(
+        second_result.turn.error.as_deref(),
+        Some("user clicked stop")
+    );
+
+    let (_, persisted_turn) = crud_store_for_assert
+        .get_turn("thr_000000000000000022", "turn_000000000000000022")
+        .await
+        .expect("persisted turn should load")
+        .expect("interrupted turn should be persisted");
+    assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
+    assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_cancel_rejects_non_subscribed_connection() {
+    let (tx_owner, mut rx_owner) = mpsc::channel(16);
+    let (tx_foreign, mut rx_foreign) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let owner_connection_id = session_manager.register_connection(tx_owner).await;
+    let foreign_connection_id = session_manager.register_connection(tx_foreign).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "too late".to_owned(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_settings(),
+        test_settings_path(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_request_id = generate_test_request_id("turncancelforeign", "thread");
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": thread_request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": "thr_000000000000000023",
+            "workspace_id": workspace_id,
+            "model": "test-model",
+            "model_provider": "delayed"
+        }
+    });
+    processor
+        .process_request(owner_connection_id, &thread_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx_owner, thread_request_id.as_str()).await;
+
+    let turn_start_request_id = generate_test_request_id("turncancelforeign", "start");
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_start_request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": "thr_000000000000000023",
+            "turn_id": "turn_000000000000000023",
+            "mode": "Chat",
+            "model": "test-model",
+            "model_provider": "delayed",
+            "input": [{"type": "text", "text": "hello"}]
+        }
+    });
+    processor
+        .process_request(owner_connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx_owner, turn_start_request_id.as_str()).await;
+
+    let cancel_request_id = generate_test_request_id("turncancelforeign", "stop");
+    let cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": cancel_request_id,
+        "method": "turn/cancel",
+        "params": {
+            "thread_id": "thr_000000000000000023",
+            "turn_id": "turn_000000000000000023",
+            "reason": "foreign stop"
+        }
+    });
+    processor
+        .process_request(foreign_connection_id, &cancel_request.to_string())
+        .await;
+
+    let error = recv_error_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+    assert!(error.error.message.contains("is not subscribed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_cancel_completed_turn_returns_completed_snapshot() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_settings(),
+        test_settings_path(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_request_id = generate_test_request_id("turncancelcompleted", "thread");
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": thread_request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": "thr_000000000000000024",
+            "workspace_id": workspace_id,
+            "model": "test-model",
+            "model_provider": "openai"
+        }
+    });
+    processor
+        .process_request(connection_id, &thread_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, thread_request_id.as_str()).await;
+
+    let turn_start_request_id = generate_test_request_id("turncancelcompleted", "start");
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_start_request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": "thr_000000000000000024",
+            "turn_id": "turn_000000000000000024",
+            "mode": "Chat",
+            "model": "test-model",
+            "model_provider": "openai",
+            "input": [{"type": "text", "text": "hello"}]
+        }
+    });
+    processor
+        .process_request(connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let cancel_request_id = generate_test_request_id("turncancelcompleted", "stop");
+    let cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": cancel_request_id,
+        "method": "turn/cancel",
+        "params": {
+            "thread_id": "thr_000000000000000024",
+            "turn_id": "turn_000000000000000024",
+            "reason": "too late"
+        }
+    });
+    processor
+        .process_request(connection_id, &cancel_request.to_string())
+        .await;
+
+    let response = recv_response_by_id(&mut rx, cancel_request_id.as_str()).await;
+    let result: TurnCancelResponse =
+        serde_json::from_value(response.result).expect("turn/cancel response should decode");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    assert!(result.turn.error.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_returns_folders_and_placements_after_moves() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -8010,6 +8311,49 @@ async fn recv_response_by_id(
     }
 
     panic!("timed out waiting for response id `{request_id}`");
+}
+
+async fn recv_response_and_notification_by_id_method(
+    rx: &mut mpsc::Receiver<Message>,
+    request_id: &str,
+    method: &str,
+) -> (JsonRpcResponse, JsonRpcNotification) {
+    let mut response = None;
+    let mut notification = None;
+
+    for _ in 0..200 {
+        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("json-rpc payload should decode");
+
+        if response.is_none()
+            && value.get("id").and_then(serde_json::Value::as_str) == Some(request_id)
+        {
+            response = Some(
+                serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+                    panic!("json-rpc response should decode: {error}; payload: {value}")
+                }),
+            );
+        } else if notification.is_none()
+            && value.get("id").is_none()
+            && value.get("method").and_then(serde_json::Value::as_str) == Some(method)
+        {
+            notification = Some(
+                serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+                    panic!("json-rpc notification should decode: {error}; payload: {value}")
+                }),
+            );
+        }
+
+        if response.is_some() && notification.is_some() {
+            return (
+                response.expect("response should be present"),
+                notification.expect("notification should be present"),
+            );
+        }
+    }
+
+    panic!("timed out waiting for response id `{request_id}` and notification `{method}`");
 }
 
 async fn recv_error_by_id(

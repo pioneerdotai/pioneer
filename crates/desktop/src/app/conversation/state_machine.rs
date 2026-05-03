@@ -11,6 +11,9 @@ pub(super) enum TurnFlowState {
     Running {
         turn_id: String,
     },
+    Cancelling {
+        turn_id: String,
+    },
     Completing {
         turn_id: String,
     },
@@ -61,6 +64,7 @@ impl TurnStateMachine {
         match &self.state {
             TurnFlowState::Starting { turn_id, .. }
             | TurnFlowState::Running { turn_id }
+            | TurnFlowState::Cancelling { turn_id }
             | TurnFlowState::Completing { turn_id } => Some(turn_id.as_str()),
             TurnFlowState::Idle
             | TurnFlowState::Completed { .. }
@@ -76,6 +80,7 @@ impl TurnStateMachine {
             } => Some(pending_request_id.as_str()),
             TurnFlowState::Idle
             | TurnFlowState::Running { .. }
+            | TurnFlowState::Cancelling { .. }
             | TurnFlowState::Completing { .. }
             | TurnFlowState::Completed { .. }
             | TurnFlowState::Failed { .. }
@@ -88,6 +93,7 @@ impl TurnStateMachine {
             TurnFlowState::Idle => "idle",
             TurnFlowState::Starting { .. } => "starting",
             TurnFlowState::Running { .. } => "running",
+            TurnFlowState::Cancelling { .. } => "cancelling",
             TurnFlowState::Completing { .. } => "completing",
             TurnFlowState::Completed { .. } => "completed",
             TurnFlowState::Failed { .. } => "failed",
@@ -137,6 +143,25 @@ impl TurnStateMachine {
                 if self.matches_turn(turn.id.as_str()) || self.can_start_new_turn() {
                     self.state = TurnFlowState::Running {
                         turn_id: turn.id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::LocalTurnCancelRequested { turn_id, .. } => {
+                if self.matches_turn(turn_id.as_str()) {
+                    self.state = TurnFlowState::Cancelling {
+                        turn_id: turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::LocalTurnCancelRejected { turn_id, .. } => {
+                if matches!(
+                    &self.state,
+                    TurnFlowState::Cancelling {
+                        turn_id: current_turn_id,
+                    } if current_turn_id == turn_id
+                ) {
+                    self.state = TurnFlowState::Running {
+                        turn_id: turn_id.clone(),
                     };
                 }
             }
@@ -242,6 +267,9 @@ impl TurnStateMachine {
                 ..
             }
             | TurnFlowState::Running {
+                turn_id: current_turn_id,
+            }
+            | TurnFlowState::Cancelling {
                 turn_id: current_turn_id,
             }
             | TurnFlowState::Completing {

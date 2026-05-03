@@ -175,6 +175,10 @@ impl ConversationProjector {
         );
     }
 
+    pub(super) fn apply_local_turn_cancel_rejected(&mut self, error: &str) {
+        self.view_state.last_error = Some(error.to_owned());
+    }
+
     pub(super) fn apply_turn_started(&mut self, turn: &Turn, ts_unix_ms: i64) {
         self.upsert_turn(
             turn.id.as_str(),

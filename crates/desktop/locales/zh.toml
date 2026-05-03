@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "向助手发送消息"
+stop = "停止"
+stopping = "正在停止..."
+stop_reason = "用户取消了回合"
 
 [chat.composer.mode]
 agent_label = "智能体"

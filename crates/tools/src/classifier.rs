@@ -137,6 +137,7 @@ pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
         attempt_id: 1,
         idempotency_key: None,
         recovery: crate::spec::ToolRecoveryMetadata::default(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
     };
     classifier.classify_error(&invocation, error)
 }
@@ -691,6 +692,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(
             &invocation,
@@ -732,6 +734,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(&invocation, &serde_json::json!(payload), true);
         assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
@@ -752,6 +755,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(
             &invocation,
@@ -783,6 +787,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(
             &invocation,

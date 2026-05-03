@@ -2,6 +2,9 @@ _version = 1
 
 [chat.composer]
 placeholder = "सहायक को संदेश भेजें"
+stop = "रोकें"
+stopping = "रोका जा रहा है..."
+stop_reason = "उपयोगकर्ता ने turn रद्द किया"
 
 [chat.composer.mode]
 agent_label = "एजेंट"

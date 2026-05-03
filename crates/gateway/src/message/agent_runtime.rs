@@ -71,7 +71,8 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
         | AgentDurableEvent::TurnCompleted { thread_id, .. }
-        | AgentDurableEvent::TurnFailed { thread_id, .. } => Some(thread_id.as_str()),
+        | AgentDurableEvent::TurnFailed { thread_id, .. }
+        | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemToolRetryScheduled { notification } => {
@@ -945,6 +946,19 @@ impl MessageProcessor {
                     return false;
                 }
             }
+            AgentDurableEvent::TurnInterrupted {
+                thread_id,
+                turn_id,
+                reason,
+                recovery,
+            } => {
+                if !self
+                    .mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, recovery)
+                    .await
+                {
+                    return false;
+                }
+            }
             AgentDurableEvent::TaskEvent { .. }
             | AgentDurableEvent::ThreadLineageCreated { .. } => return false,
         }
@@ -994,7 +1008,7 @@ impl MessageProcessor {
                     TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
-                
+
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
                         .await;
@@ -2131,6 +2145,198 @@ impl MessageProcessor {
     ) {
         self.mark_turn_failed_with_recovery(thread_id, turn_id, error_message, None)
             .await;
+    }
+
+    pub(super) async fn mark_turn_interrupted(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+    ) -> bool {
+        self.mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, None)
+            .await
+    }
+
+    pub(super) async fn mark_turn_interrupted_with_recovery(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    ) -> bool {
+        if let Some((_workspace_id, current_turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            if current_turn.status == TurnStatus::Interrupted {
+                return true;
+            }
+            if current_turn.status != TurnStatus::InProgress {
+                return false;
+            }
+        }
+
+        if let Some(recovery) = recovery.as_ref() {
+            match self
+                .recovery_coordinator
+                .is_active_recovery_attempt(turn_id.as_str(), recovery)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        recovery_job_id = %recovery.job_id,
+                        recovery_attempt_id = %recovery.attempt_id,
+                        error = %format!("{error:#}"),
+                        "failed to verify recovery interruption context"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        let finish_outcome = match self
+            .thread_manager
+            .turn_finish(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                TurnStatus::Interrupted,
+                Some(reason.clone()),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to mark turn as interrupted"
+                );
+                return false;
+            }
+        };
+
+        let turn_failed = TurnFailedNotification {
+            workspace_id: finish_outcome.workspace_id.clone(),
+            thread_id: finish_outcome.thread_id,
+            turn: finish_outcome.turn,
+        };
+
+        let event_timestamp = now_timestamp_secs();
+        if let Err(error) = self
+            .crud_store
+            .materialize_turn_failed(turn_failed.clone(), event_timestamp)
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_finish(finish_outcome.rollback_context)
+                .await;
+
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to persist turn/interrupted event"
+            );
+            return false;
+        }
+
+        if let Err(error) = self
+            .task_agent_executor
+            .reconcile_child_turn_failed(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                turn_failed
+                    .turn
+                    .error
+                    .as_deref()
+                    .unwrap_or("turn interrupted"),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to reconcile interrupted child task turn"
+            );
+        }
+
+        if let Err(error) = self
+            .crud_store
+            .delete_turn_llm_context_for_turn(turn_id.as_str())
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to delete turn_llm_context rows after turn interruption"
+            );
+        }
+        self.clear_turn_llm_context_state(turn_id.as_str()).await;
+
+        match self
+            .recovery_coordinator
+            .fail_active_recoveries_for_turn(
+                turn_id.as_str(),
+                recovery.as_ref(),
+                turn_failed
+                    .turn
+                    .error
+                    .as_deref()
+                    .unwrap_or("turn interrupted"),
+                event_timestamp,
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    if let crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) =
+                        event
+                    {
+                        self.send_recovery_exhausted_notification(&outcome, event_timestamp)
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to mark active recovery jobs interrupted"
+                );
+            }
+        }
+
+        self.send_notification_to_connections(
+            events::TURN_FAILED,
+            &turn_failed,
+            finish_outcome.connection_ids,
+        )
+        .await;
+        self.notify_parent_timeline_changed_for_child_turn(
+            turn_failed.thread_id.as_str(),
+            turn_failed.turn.id.as_str(),
+            Some(turn_failed.workspace_id.as_str()),
+            TurnTimelineChangedReason::ChildTurnChanged,
+        )
+        .await;
+
+        if self
+            .thread_manager
+            .unload_orphaned_thread_if_idle(thread_id.as_str())
+            .await
+        {
+            self.agent_manager.remove_thread(thread_id.as_str()).await;
+        }
+        true
     }
 
     pub(super) async fn mark_turn_failed_with_recovery(
