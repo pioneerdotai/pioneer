@@ -16,6 +16,20 @@ pub(crate) struct GatewaySecrets {
     store: Arc<dyn SecretStore>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpSecretDeleteReport {
+    pub attempted: usize,
+    pub deleted: usize,
+    pub missing: usize,
+    pub failed: Vec<McpSecretDeleteFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpSecretDeleteFailure {
+    pub ref_id: String,
+    pub error: String,
+}
+
 impl GatewaySecrets {
     pub(crate) fn open(runtime_home: &Path) -> Result<Self> {
         let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(runtime_home))
@@ -152,11 +166,115 @@ impl GatewaySecrets {
         Ok(material)
     }
 
+    pub(crate) fn get_mcp_secret(&self, ref_id: &str) -> Result<Option<String>> {
+        let id = SecretId::mcp_secret(ref_id).context("invalid MCP secret ref id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read MCP secret from keystore")
+    }
+
+    pub(crate) fn put_mcp_secret(
+        &self,
+        ref_id: &str,
+        value: &str,
+        label: Option<String>,
+    ) -> Result<()> {
+        if value.is_empty() {
+            bail!("MCP secret value must not be empty");
+        }
+
+        let id = SecretId::mcp_secret(ref_id).context("invalid MCP secret ref id")?;
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_mcp_secret_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+        let label = label
+            .and_then(|label| {
+                let trimmed = label.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            })
+            .unwrap_or_else(|| id.user().to_owned());
+
+        self.store
+            .put_string(
+                &id,
+                value,
+                SecretMeta {
+                    kind: SecretKind::McpSecret,
+                    label: Some(label),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write MCP secret to keystore")
+    }
+
+    pub(crate) fn delete_mcp_secret(&self, ref_id: &str) -> Result<bool> {
+        let id = SecretId::mcp_secret(ref_id).context("invalid MCP secret ref id")?;
+        self.store
+            .delete(&id)
+            .context("failed to delete MCP secret from keystore")
+    }
+
+    pub(crate) fn delete_mcp_secrets<'a>(
+        &self,
+        ref_ids: impl IntoIterator<Item = &'a str>,
+    ) -> McpSecretDeleteReport {
+        let mut report = McpSecretDeleteReport {
+            attempted: 0,
+            deleted: 0,
+            missing: 0,
+            failed: Vec::new(),
+        };
+        let mut seen = BTreeSet::new();
+
+        for ref_id in ref_ids {
+            if !seen.insert(ref_id.to_owned()) {
+                continue;
+            }
+            report.attempted = report.attempted.saturating_add(1);
+            match self.delete_mcp_secret(ref_id) {
+                Ok(true) => report.deleted = report.deleted.saturating_add(1),
+                Ok(false) => report.missing = report.missing.saturating_add(1),
+                Err(error) => report.failed.push(McpSecretDeleteFailure {
+                    ref_id: ref_id.to_owned(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+
+        report
+    }
+
+    pub(crate) fn list_mcp_secret_refs(&self) -> Result<Vec<String>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::McpSecret))
+            .context("failed to list MCP secrets from keystore")?;
+
+        let mut refs = entries
+            .into_iter()
+            .map(|entry| entry.id.user().to_owned())
+            .collect::<Vec<_>>();
+        refs.sort();
+        refs.dedup();
+        Ok(refs)
+    }
+
     fn existing_provider_secret_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
         let entries = self
             .store
             .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
             .context("failed to read provider api key metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
+    fn existing_mcp_secret_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::McpSecret))
+            .context("failed to read MCP secret metadata from keystore")?;
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
 }
@@ -281,6 +399,135 @@ mod tests {
         let secrets = GatewaySecrets::new(Arc::new(FailingSecretStore));
 
         assert_eq!(secrets.resolve_provider_api_key("ollama"), "");
+    }
+
+    #[test]
+    fn mcp_methods_write_list_read_and_delete_secret() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        let ref_id = "gateway_settings:mcp:workspace:ws:resend:env:RESEND_API_KEY";
+
+        secrets
+            .put_mcp_secret(
+                ref_id,
+                "re_secret",
+                Some("resend:env:RESEND_API_KEY".to_owned()),
+            )
+            .expect("put MCP secret");
+
+        assert_eq!(
+            store
+                .get_string(&SecretId::mcp_secret(ref_id).expect("mcp id"))
+                .expect("raw read"),
+            Some("re_secret".to_owned())
+        );
+        assert_eq!(
+            secrets.get_mcp_secret(ref_id).expect("read MCP secret"),
+            Some("re_secret".to_owned())
+        );
+        assert_eq!(
+            secrets.list_mcp_secret_refs().expect("list MCP refs"),
+            vec![ref_id.to_owned()]
+        );
+
+        assert!(secrets.delete_mcp_secret(ref_id).expect("delete existing"));
+        assert_eq!(
+            secrets
+                .get_mcp_secret(ref_id)
+                .expect("read deleted MCP secret"),
+            None
+        );
+        assert!(!secrets.delete_mcp_secret(ref_id).expect("delete missing"));
+    }
+
+    #[test]
+    fn mcp_overwrite_preserves_created_at_and_updates_metadata() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store.clone());
+        let ref_id = "gateway_settings:mcp:workspace:ws:resend:header:authorization";
+        let id = SecretId::mcp_secret(ref_id).expect("mcp id");
+
+        store
+            .put_string(
+                &id,
+                "old",
+                SecretMeta {
+                    kind: SecretKind::McpSecret,
+                    label: Some("old label".to_owned()),
+                    created_at_unix: 123,
+                    updated_at_unix: 456,
+                },
+            )
+            .expect("seed MCP secret");
+
+        secrets
+            .put_mcp_secret(
+                ref_id,
+                "new",
+                Some("resend:header:authorization".to_owned()),
+            )
+            .expect("overwrite MCP secret");
+
+        let entry = store
+            .list(SecretFilter::Kind(SecretKind::McpSecret))
+            .expect("list metadata")
+            .pop()
+            .expect("metadata entry");
+        assert_eq!(entry.created_at_unix, Some(123));
+        assert!(
+            entry.updated_at_unix.unwrap_or_default() >= 456,
+            "updated_at should be refreshed"
+        );
+        assert_eq!(
+            store.get_string(&id).expect("read overwritten secret"),
+            Some("new".to_owned())
+        );
+    }
+
+    #[test]
+    fn mcp_bulk_delete_reports_deleted_missing_and_failed_refs() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store);
+
+        secrets
+            .put_mcp_secret("ref_existing", "secret", None)
+            .expect("put existing");
+        let report = secrets.delete_mcp_secrets(["ref_existing", "ref_existing", "ref_missing"]);
+
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.missing, 1);
+        assert!(report.failed.is_empty());
+
+        let failing = GatewaySecrets::new(Arc::new(FailingSecretStore));
+        let report = failing.delete_mcp_secrets(["ref_failed"]);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].ref_id, "ref_failed");
+    }
+
+    #[test]
+    fn mcp_list_returns_refs_without_values() {
+        let store = Arc::new(MemorySecretStore::new());
+        let secrets = GatewaySecrets::new(store);
+
+        secrets
+            .put_mcp_secret("ref_alpha", "secret-alpha", Some("alpha".to_owned()))
+            .expect("put alpha");
+        secrets
+            .put_mcp_secret("ref_beta", "secret-beta", Some("beta".to_owned()))
+            .expect("put beta");
+        secrets
+            .set_provider_api_key("openrouter", "sk-provider")
+            .expect("put provider");
+
+        let refs = secrets.list_mcp_secret_refs().expect("list MCP refs");
+        assert_eq!(refs, vec!["ref_alpha".to_owned(), "ref_beta".to_owned()]);
+        assert!(!format!("{refs:?}").contains("secret-alpha"));
+        assert!(!format!("{refs:?}").contains("secret-beta"));
+        assert!(!format!("{refs:?}").contains("sk-provider"));
     }
 
     struct FailingSecretStore;

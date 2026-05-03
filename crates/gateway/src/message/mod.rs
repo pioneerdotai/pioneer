@@ -65,9 +65,8 @@ use pioneer_tasks::TaskRuntime;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -80,7 +79,6 @@ use crate::resilience::{
 };
 use crate::secrets::GatewaySecrets;
 use crate::session::{ConnectionId, SessionManager};
-use crate::settings::{GatewaySettings, save_gateway_settings};
 use crate::thread::ThreadManager;
 use crate::workspace::{WorkspaceError, WorkspaceManager};
 
@@ -120,8 +118,6 @@ pub struct MessageProcessor {
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
-    gateway_settings: Arc<RwLock<GatewaySettings>>,
-    settings_path: PathBuf,
     gateway_secrets: Arc<GatewaySecrets>,
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
@@ -151,8 +147,6 @@ impl MessageProcessor {
         session_manager: Arc<SessionManager>,
         workspace_manager: Arc<WorkspaceManager>,
         crud_store: Arc<CrudStore>,
-        gateway_settings: Arc<RwLock<GatewaySettings>>,
-        settings_path: PathBuf,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
         context_budget: ContextBudget,
@@ -169,7 +163,7 @@ impl MessageProcessor {
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),
-            gateway_settings.clone(),
+            gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
         ));
         let agent_manager = Arc::new(AgentManager::new_with_mcp(
@@ -195,8 +189,6 @@ impl MessageProcessor {
             session_manager,
             workspace_manager,
             crud_store,
-            gateway_settings,
-            settings_path,
             gateway_secrets,
             summary_config: Arc::new(summary_config),
             context_budget,
@@ -520,14 +512,14 @@ impl MessageProcessor {
             Err(_) => 0,
         };
         let web = pioneer_config::GatewayWebToolsConfig::default();
-        let gateway_settings = Arc::new(RwLock::new(
-            crate::settings::GatewaySettings::default_for_tests(),
-        ));
+        let gateway_secrets = Arc::new(GatewaySecrets::new(Arc::new(
+            pioneer_keystore::MemorySecretStore::new(),
+        )));
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),
-            gateway_settings.clone(),
+            gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
         ));
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
@@ -539,11 +531,7 @@ impl MessageProcessor {
             session_manager,
             workspace_manager,
             crud_store,
-            gateway_settings,
-            settings_path: PathBuf::from("/tmp/pioneer-test-settings.toml"),
-            gateway_secrets: Arc::new(GatewaySecrets::new(Arc::new(
-                pioneer_keystore::MemorySecretStore::new(),
-            ))),
+            gateway_secrets,
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),

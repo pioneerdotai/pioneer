@@ -75,38 +75,6 @@ impl MessageProcessor {
         let mut response_items = Vec::new();
         let mut changed = Vec::new();
         let mut events_written = 0usize;
-        let secrets_to_save = plan
-            .items
-            .iter()
-            .filter(|item| item.is_valid())
-            .flat_map(|item| item.secrets.iter())
-            .collect::<Vec<_>>();
-        if !secrets_to_save.is_empty() {
-            let save_result = {
-                let mut settings = self
-                    .gateway_settings
-                    .write()
-                    .expect("gateway settings lock poisoned");
-                for secret in &secrets_to_save {
-                    settings.set_mcp_secret(secret.ref_id.as_str(), secret.value.clone());
-                }
-                save_gateway_settings(&self.settings_path, &settings)
-            };
-            if let Err(error) = save_result {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to save MCP secrets",
-                        json!({"error": format!("{error:#}")}),
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
 
         for item in plan.items {
             let diagnostics = item
@@ -150,6 +118,65 @@ impl MessageProcessor {
                     return;
                 }
             };
+
+            let old_secret_ref_ids = match existing.as_ref() {
+                Some(existing) => {
+                    match parse_mcp_secret_ref_ids(existing.secret_refs_json.as_str()) {
+                        Ok(ref_ids) => ref_ids,
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                mcp_error(
+                                    Some(request_id.clone()),
+                                    INVALID_REQUEST_CODE,
+                                    MCP_ERROR_INTERNAL,
+                                    "failed to decode existing MCP secret refs",
+                                    json!({"error": format!("{error:#}")}),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                None => std::collections::BTreeSet::new(),
+            };
+            let new_secret_ref_ids = mcp_secret_ref_ids(&installation.secret_refs);
+            let mut written_secret_ref_ids = std::collections::BTreeSet::new();
+            for secret in &item.secrets {
+                let label = mcp_secret_label(
+                    installation.name.as_str(),
+                    installation.secret_refs.as_slice(),
+                    secret.ref_id.as_str(),
+                );
+                if let Err(error) = self.gateway_secrets.put_mcp_secret(
+                    secret.ref_id.as_str(),
+                    secret.value.as_str(),
+                    Some(label),
+                ) {
+                    let cleanup_refs = written_secret_ref_ids
+                        .difference(&old_secret_ref_ids)
+                        .map(String::as_str);
+                    let cleanup_report = self.gateway_secrets.delete_mcp_secrets(cleanup_refs);
+                    warn_mcp_secret_delete_report(
+                        "mcp_install_keystore_write_failure",
+                        &cleanup_report,
+                    );
+                    self.send_error(
+                        connection_id,
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INTERNAL,
+                            "failed to save MCP secrets",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                written_secret_ref_ids.insert(secret.ref_id.clone());
+            }
 
             let mut record = match installation_record_from_domain(&installation) {
                 Ok(record) => record,
@@ -209,6 +236,11 @@ impl MessageProcessor {
             {
                 Ok(id) => id,
                 Err(error) => {
+                    let cleanup_refs = written_secret_ref_ids
+                        .difference(&old_secret_ref_ids)
+                        .map(String::as_str);
+                    let cleanup_report = self.gateway_secrets.delete_mcp_secrets(cleanup_refs);
+                    warn_mcp_secret_delete_report("mcp_install_db_failure", &cleanup_report);
                     self.send_error(
                         connection_id,
                         mcp_error(
@@ -225,6 +257,12 @@ impl MessageProcessor {
             };
             record.id = Some(installation_id);
             events_written = events_written.saturating_add(1);
+
+            let stale_refs = old_secret_ref_ids
+                .difference(&new_secret_ref_ids)
+                .map(String::as_str);
+            let stale_delete_report = self.gateway_secrets.delete_mcp_secrets(stale_refs);
+            warn_mcp_secret_delete_report("mcp_install_stale_refs", &stale_delete_report);
 
             changed.push(McpChangedItem {
                 name: record.name.clone(),

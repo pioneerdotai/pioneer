@@ -570,18 +570,16 @@ impl Provider for SequencedToolProvider {
     }
 }
 
-fn test_gateway_settings() -> Arc<std::sync::RwLock<crate::settings::GatewaySettings>> {
-    Arc::new(std::sync::RwLock::new(
-        crate::settings::GatewaySettings::default_for_tests(),
-    ))
-}
-
-fn test_settings_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/pioneer-test-settings.toml")
-}
-
 fn test_gateway_secrets() -> Arc<GatewaySecrets> {
     Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())))
+}
+
+fn test_gateway_secrets_with_store() -> (Arc<GatewaySecrets>, Arc<MemorySecretStore>) {
+    let secret_store = Arc::new(MemorySecretStore::new());
+    (
+        Arc::new(GatewaySecrets::new(secret_store.clone())),
+        secret_store,
+    )
 }
 
 async fn setup_provider_api_key_processor(
@@ -609,8 +607,6 @@ async fn setup_provider_api_key_processor(
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        settings_path.clone(),
         gateway_secrets,
         test_summary_config(),
         test_context_budget(),
@@ -1151,8 +1147,6 @@ async fn setup_progress_delta_harness(
         session_manager.clone(),
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -1550,8 +1544,6 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         summary_config,
         test_context_budget(),
@@ -1626,8 +1618,6 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         summary_config,
         test_context_budget(),
@@ -1708,8 +1698,6 @@ async fn title_generation_retries_after_transient_failure() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         summary_config,
         test_context_budget(),
@@ -1789,8 +1777,6 @@ async fn child_thread_scope_skips_auto_title_generation() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         summary_config,
         test_context_budget(),
@@ -1983,8 +1969,6 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2093,8 +2077,6 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2158,8 +2140,6 @@ async fn task_depth_limit_rejects_subtask_creation() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2211,8 +2191,6 @@ async fn task_detach_updates_lifecycle_policy() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2282,8 +2260,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2358,8 +2334,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2426,8 +2400,6 @@ async fn task_create_tool_persists_anchor_and_composed_timeline() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2777,8 +2749,6 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -2973,8 +2943,6 @@ async fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion()
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3074,8 +3042,6 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3133,8 +3099,6 @@ async fn thread_start_returns_response_and_started_notification() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3189,8 +3153,6 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3586,8 +3548,6 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3682,8 +3642,6 @@ async fn thread_start_rejects_unknown_workspace_id() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3728,8 +3686,6 @@ async fn thread_start_rejects_missing_thread_id() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3781,8 +3737,6 @@ async fn thread_start_rejects_missing_workspace_id() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3834,8 +3788,6 @@ async fn workspace_list_returns_existing_workspaces() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3875,8 +3827,6 @@ async fn workspace_default_returns_single_active_workspace() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3916,8 +3866,6 @@ async fn workspace_create_creates_new_workspace() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -3962,8 +3910,6 @@ async fn workspace_create_rejects_missing_workspace_id() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4011,8 +3957,6 @@ async fn turn_start_returns_response_and_started_notification() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4111,8 +4055,6 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4192,8 +4134,6 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4236,8 +4176,6 @@ async fn agent_skill_audit_event_persists_audit_rows() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4310,8 +4248,6 @@ async fn prompt_manifest_event_updates_turn_state_and_persists() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4602,8 +4538,6 @@ async fn turn_get_returns_turn_snapshot() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4668,6 +4602,7 @@ async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+    let thread_manager_for_assert = thread_manager.clone();
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
@@ -4683,8 +4618,6 @@ async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4726,6 +4659,14 @@ async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
         .process_request(connection_id, &turn_start_request.to_string())
         .await;
     let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    wait_for_thread_manager_turn_status(
+        thread_manager_for_assert.as_ref(),
+        "thr_000000000000000022",
+        "turn_000000000000000022",
+        TurnStatus::InProgress,
+    )
+    .await;
 
     let turn_cancel_request_id = generate_test_request_id("turncancel", "stop1");
     let turn_cancel_request = json!({
@@ -4821,8 +4762,6 @@ async fn turn_cancel_rejects_non_subscribed_connection() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4898,8 +4837,6 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -4978,8 +4915,6 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5087,8 +5022,6 @@ async fn folder_delete_promotes_nested_contents_to_parent() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5258,8 +5191,6 @@ async fn thread_and_folder_move_support_root_target() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5425,8 +5356,6 @@ async fn thread_tree_changed_is_broadcast_to_other_connections() {
         session_manager.clone(),
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5487,8 +5416,6 @@ async fn thread_history_returns_materialized_history() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5608,8 +5535,6 @@ async fn turn_items_returns_stream_events_for_resume() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5704,8 +5629,6 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5814,8 +5737,6 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
         session_manager,
         workspace_manager,
         crud_store.clone(),
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -5905,8 +5826,6 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6133,8 +6052,6 @@ Gateway skill body"#,
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6243,8 +6160,6 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6445,8 +6360,6 @@ Gateway HTTP skill body"#
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6602,8 +6515,6 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6692,8 +6603,6 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -6809,8 +6718,6 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7022,8 +6929,6 @@ async fn skills_health_returns_dependency_diagnostics() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7087,8 +6992,6 @@ async fn skills_install_rejects_relative_path_with_structured_error_code() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7160,8 +7063,6 @@ async fn skills_upload_abort_is_connection_bound() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7276,8 +7177,6 @@ async fn skills_upload_chunk_digest_mismatch_aborts_session() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7380,8 +7279,6 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7502,8 +7399,6 @@ async fn skills_install_blocks_dependency_failure_under_default_policy() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        test_settings_path(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -7555,11 +7450,23 @@ struct FakeMcpRuntimeConnector;
 impl pioneer_mcp::McpRuntimeConnector for FakeMcpRuntimeConnector {
     async fn connect(
         &self,
-        _installation: pioneer_mcp::McpServerInstallation,
+        installation: pioneer_mcp::McpServerInstallation,
         installation_id: String,
-        _resolver: Arc<dyn pioneer_mcp::McpSecretResolver>,
+        resolver: Arc<dyn pioneer_mcp::McpSecretResolver>,
         now_unix: i64,
     ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, pioneer_mcp::McpRuntimeError> {
+        for secret_ref in &installation.secret_refs {
+            if resolver
+                .resolve_mcp_secret(secret_ref.ref_id.as_str())
+                .is_none()
+            {
+                return Err(pioneer_mcp::McpRuntimeError::auth_required(format!(
+                    "missing fake MCP secret `{}`",
+                    secret_ref.ref_id
+                )));
+            }
+        }
+
         let catalog = pioneer_mcp::McpCatalogSnapshot::from_json_values(
             installation_id,
             json!({"name":"fake-mcp","version":"test"}),
@@ -7623,7 +7530,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     let base_dir = unique_temp_dir("mcp_stdio_install");
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
     let settings_path = base_dir.join("gateway-settings.toml");
-    let settings = test_gateway_settings();
+    let (gateway_secrets, secret_store) = test_gateway_secrets_with_store();
 
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -7638,9 +7545,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         session_manager,
         workspace_manager,
         crud_store,
-        settings.clone(),
-        settings_path,
-        test_gateway_secrets(),
+        gateway_secrets.clone(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -7765,12 +7670,25 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
             .expect("secret refs should decode");
     assert_eq!(secret_refs.len(), 1);
     assert_eq!(
-        settings
-            .read()
-            .expect("settings lock")
-            .mcp_secret(secret_refs[0].ref_id.as_str()),
-        Some(secret)
+        gateway_secrets
+            .get_mcp_secret(secret_refs[0].ref_id.as_str())
+            .expect("MCP secret should read from keystore"),
+        Some(secret.to_owned())
     );
+    assert_eq!(
+        secret_store
+            .list(SecretFilter::Kind(SecretKind::McpSecret))
+            .expect("MCP secret metadata should list")
+            .len(),
+        1
+    );
+    if settings_path.exists() {
+        let settings_content =
+            std::fs::read_to_string(&settings_path).expect("read gateway settings");
+        assert!(!settings_content.contains(secret));
+        assert!(!settings_content.contains("[mcp]"));
+        assert!(!settings_content.contains("[mcp.secrets]"));
+    }
 
     let audit_rows = crud_store_for_assert
         .list_recent_mcp_audit_event_records("resend", 16)
@@ -7885,7 +7803,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
     let base_dir = unique_temp_dir("mcp_http_disabled");
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
     let settings_path = base_dir.join("gateway-settings.toml");
-    let settings = test_gateway_settings();
+    let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
 
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -7900,9 +7818,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         session_manager,
         workspace_manager,
         crud_store,
-        settings,
-        settings_path,
-        test_gateway_secrets(),
+        gateway_secrets.clone(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -7962,8 +7878,26 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         .expect("resend MCP installation should exist");
     assert!(!row.transport_json.contains(secret));
     assert!(!row.source_ref.contains(secret));
+    assert!(!row.secret_refs_json.contains(secret));
     assert!(!row.enabled);
     assert!(row.allow_implicit_invocation);
+    let secret_refs =
+        serde_json::from_str::<Vec<pioneer_mcp::McpSecretRef>>(row.secret_refs_json.as_str())
+            .expect("secret refs should decode");
+    assert_eq!(secret_refs.len(), 1);
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(secret_refs[0].ref_id.as_str())
+            .expect("MCP header secret should read from keystore"),
+        Some(secret.to_owned())
+    );
+    if settings_path.exists() {
+        let settings_content =
+            std::fs::read_to_string(&settings_path).expect("read gateway settings");
+        assert!(!settings_content.contains(secret));
+        assert!(!settings_content.contains("[mcp]"));
+        assert!(!settings_content.contains("[mcp.secrets]"));
+    }
 
     let list_request = json!({
         "jsonrpc": "2.0",
@@ -7987,10 +7921,11 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
-    let base_dir = unique_temp_dir("mcp_details_uninstall");
+async fn mcp_update_deletes_stale_keystore_refs_after_success() {
+    let base_dir = unique_temp_dir("mcp_update_secret_cleanup");
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
     let settings_path = base_dir.join("gateway-settings.toml");
+    let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
 
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -8005,9 +7940,153 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        settings_path,
-        test_gateway_secrets(),
+        gateway_secrets.clone(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
+
+    let old_secret = "old_resend_secret";
+    let install_config = json!({
+        "mcpServers": {
+            "resend": {
+                "command": "npx",
+                "env": {"RESEND_API_KEY": old_secret},
+                "disabled": true
+            }
+        }
+    });
+    let install_request = json!({
+        "jsonrpc": "2.0",
+        "id": "mcp_update_install001",
+        "method": "mcp/install",
+        "params": {
+            "workspace_id": workspace_id,
+            "config_json": install_config.to_string()
+        }
+    });
+    processor
+        .process_request(connection_id, &install_request.to_string())
+        .await;
+    let install_response = recv_response_by_id(&mut rx, "mcp_update_install001").await;
+    let install_response_json =
+        serde_json::to_string(&install_response).expect("install response serialize");
+    assert!(!install_response_json.contains(old_secret));
+    let _changed = recv_notification_by_method(&mut rx, events::MCP_CHANGED).await;
+
+    let row = crud_store_for_assert
+        .find_mcp_server_installation("workspace", workspace_id.as_str(), "resend")
+        .await
+        .expect("MCP installation find should succeed")
+        .expect("resend MCP installation should exist");
+    let old_refs =
+        serde_json::from_str::<Vec<pioneer_mcp::McpSecretRef>>(row.secret_refs_json.as_str())
+            .expect("old refs should decode");
+    assert_eq!(old_refs.len(), 1);
+    let old_ref_id = old_refs[0].ref_id.clone();
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(old_ref_id.as_str())
+            .expect("old secret should read"),
+        Some(old_secret.to_owned())
+    );
+
+    let new_secret = "new_resend_secret";
+    let update_config = json!({
+        "mcpServers": {
+            "resend": {
+                "command": "npx",
+                "env": {"RESEND_TOKEN": new_secret}
+            }
+        }
+    });
+    let update_request = json!({
+        "jsonrpc": "2.0",
+        "id": "mcp_update_update0001",
+        "method": "mcp/install",
+        "params": {
+            "workspace_id": workspace_id,
+            "config_json": update_config.to_string()
+        }
+    });
+    processor
+        .process_request(connection_id, &update_request.to_string())
+        .await;
+    let update_response = recv_response_by_id(&mut rx, "mcp_update_update0001").await;
+    let update_response_json =
+        serde_json::to_string(&update_response).expect("update response serialize");
+    assert!(!update_response_json.contains(old_secret));
+    assert!(!update_response_json.contains(new_secret));
+    let update_payload: McpInstallResponse =
+        serde_json::from_value(update_response.result).expect("update payload decode");
+    assert_eq!(update_payload.status, McpInstallStatus::Ok);
+    assert_eq!(
+        update_payload.servers[0].status,
+        McpInstallResultStatus::Updated
+    );
+
+    let row = crud_store_for_assert
+        .find_mcp_server_installation("workspace", workspace_id.as_str(), "resend")
+        .await
+        .expect("MCP installation find should succeed")
+        .expect("resend MCP installation should exist");
+    let new_refs =
+        serde_json::from_str::<Vec<pioneer_mcp::McpSecretRef>>(row.secret_refs_json.as_str())
+            .expect("new refs should decode");
+    assert_eq!(new_refs.len(), 1);
+    let new_ref_id = new_refs[0].ref_id.clone();
+    assert_ne!(old_ref_id, new_ref_id);
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(old_ref_id.as_str())
+            .expect("old secret should be deleted"),
+        None
+    );
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(new_ref_id.as_str())
+            .expect("new secret should read"),
+        Some(new_secret.to_owned())
+    );
+    assert!(!row.transport_json.contains(old_secret));
+    assert!(!row.transport_json.contains(new_secret));
+    assert!(!row.source_ref.contains(old_secret));
+    assert!(!row.source_ref.contains(new_secret));
+    assert!(!row.secret_refs_json.contains(old_secret));
+    assert!(!row.secret_refs_json.contains(new_secret));
+    if settings_path.exists() {
+        let settings_content =
+            std::fs::read_to_string(&settings_path).expect("read gateway settings");
+        assert!(!settings_content.contains(old_secret));
+        assert!(!settings_content.contains(new_secret));
+        assert!(!settings_content.contains("[mcp]"));
+        assert!(!settings_content.contains("[mcp.secrets]"));
+    }
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
+    let base_dir = unique_temp_dir("mcp_details_uninstall");
+    std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
+    let (gateway_secrets, _secret_store) = test_gateway_secrets_with_store();
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        gateway_secrets.clone(),
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -8132,6 +8211,23 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
             .any(|binding| { binding.server_name == "resend" && binding.raw_tool_name == "send" })
     );
 
+    let row_before_uninstall = crud_store_for_assert
+        .find_mcp_server_installation("workspace", workspace_id.as_str(), "resend")
+        .await
+        .expect("MCP installation find before uninstall should succeed")
+        .expect("resend MCP installation should exist before uninstall");
+    let secret_refs_before_uninstall = serde_json::from_str::<Vec<pioneer_mcp::McpSecretRef>>(
+        row_before_uninstall.secret_refs_json.as_str(),
+    )
+    .expect("secret refs should decode before uninstall");
+    assert_eq!(secret_refs_before_uninstall.len(), 1);
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(secret_refs_before_uninstall[0].ref_id.as_str())
+            .expect("secret should exist before uninstall"),
+        Some(secret.to_owned())
+    );
+
     let uninstall_request = json!({
         "jsonrpc": "2.0",
         "id": "mcp_uninstall_0000001",
@@ -8172,6 +8268,24 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         .await
         .expect("MCP catalog lookup after uninstall should succeed");
     assert!(catalog.is_none());
+    assert_eq!(
+        gateway_secrets
+            .get_mcp_secret(secret_refs_before_uninstall[0].ref_id.as_str())
+            .expect("secret should be deleted after uninstall"),
+        None
+    );
+    let uninstall_response_json =
+        serde_json::to_string(&uninstall_payload).expect("uninstall payload serialize");
+    assert!(!uninstall_response_json.contains(secret));
+    let audit_rows = crud_store_for_assert
+        .list_recent_mcp_audit_event_records("resend", 16)
+        .await
+        .expect("MCP audit list after uninstall should succeed");
+    assert!(
+        audit_rows
+            .iter()
+            .all(|row| !row.details_json.contains(secret))
+    );
 
     let missing_details_request = json!({
         "jsonrpc": "2.0",
@@ -8202,7 +8316,6 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
 async fn mcp_install_itemizes_valid_and_invalid_servers() {
     let base_dir = unique_temp_dir("mcp_itemized_install");
     std::fs::create_dir_all(&base_dir).expect("must create test settings dir");
-    let settings_path = base_dir.join("gateway-settings.toml");
 
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -8217,8 +8330,6 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
         session_manager,
         workspace_manager,
         crud_store,
-        test_gateway_settings(),
-        settings_path,
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -8497,6 +8608,30 @@ async fn wait_for_thread_name_equals(
     panic!(
         "timed out waiting for thread `{thread_id}` name `{expected_name}`, last={:?}",
         model.name
+    );
+}
+
+async fn wait_for_thread_manager_turn_status(
+    thread_manager: &ThreadManager,
+    thread_id: &str,
+    turn_id: &str,
+    expected_status: TurnStatus,
+) -> Turn {
+    for _ in 0..100 {
+        if let Some((_workspace_id, turn)) = thread_manager.turn_get(thread_id, turn_id).await
+            && turn.status == expected_status
+        {
+            return turn;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let last = thread_manager
+        .turn_get(thread_id, turn_id)
+        .await
+        .map(|(_workspace_id, turn)| turn.status);
+    panic!(
+        "timed out waiting for turn `{turn_id}` in thread `{thread_id}` status `{expected_status:?}`, last={last:?}"
     );
 }
 

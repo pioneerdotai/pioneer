@@ -4,12 +4,15 @@ use pioneer_crud::{
     McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
 };
 use pioneer_mcp::{
-    InstallParseContext, McpScopeKind, McpServerInstallation, McpTransportConfig,
+    InstallParseContext, McpScopeKind, McpSecretRef, McpServerInstallation, McpTransportConfig,
     parse_install_config,
 };
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use tracing::warn;
+
+use crate::secrets::McpSecretDeleteReport;
 
 const MCP_ERROR_INVALID_REQUEST: &str = "mcp.invalid_request";
 const MCP_ERROR_NOT_FOUND: &str = "mcp.not_found";
@@ -117,6 +120,43 @@ fn installation_record_from_domain(
         fingerprint: installation.fingerprint.clone(),
         updated_at_unix: 0,
     })
+}
+
+fn parse_mcp_secret_ref_ids(secret_refs_json: &str) -> Result<BTreeSet<String>> {
+    let refs = serde_json::from_str::<Vec<McpSecretRef>>(secret_refs_json)
+        .context("failed to decode MCP secret refs")?;
+    Ok(refs
+        .into_iter()
+        .map(|secret_ref| secret_ref.ref_id)
+        .collect())
+}
+
+fn mcp_secret_ref_ids(refs: &[McpSecretRef]) -> BTreeSet<String> {
+    refs.iter()
+        .map(|secret_ref| secret_ref.ref_id.clone())
+        .collect()
+}
+
+fn mcp_secret_label(server_name: &str, refs: &[McpSecretRef], ref_id: &str) -> String {
+    refs.iter()
+        .find(|secret_ref| secret_ref.ref_id == ref_id)
+        .map(|secret_ref| format!("{server_name}:{}:{}", secret_ref.source, secret_ref.name))
+        .unwrap_or_else(|| ref_id.to_owned())
+}
+
+fn warn_mcp_secret_delete_report(context: &str, report: &McpSecretDeleteReport) {
+    if report.failed.is_empty() {
+        return;
+    }
+
+    warn!(
+        cleanup_context = context,
+        attempted = report.attempted,
+        deleted = report.deleted,
+        missing = report.missing,
+        failed = ?report.failed,
+        "failed to delete MCP secrets"
+    );
 }
 
 fn list_item_from_record(record: &McpServerInstallationRecord) -> McpListItem {

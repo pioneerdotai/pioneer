@@ -101,6 +101,24 @@ impl MessageProcessor {
             }
         };
 
+        let secret_ref_ids = match parse_mcp_secret_ref_ids(row.secret_refs_json.as_str()) {
+            Ok(ref_ids) => ref_ids,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        "failed to decode MCP secret refs",
+                        json!({"error": format!("{error:#}")}),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
         let now = now_timestamp_secs();
         let server_id = row.id.clone().unwrap_or_default();
         let audit = McpAuditEventRecord {
@@ -174,7 +192,6 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to send mcp/uninstall response"
             );
-            return;
         }
 
         self.notify_mcp_changed(
@@ -199,5 +216,10 @@ impl MessageProcessor {
                 "failed to reload MCP runtime after uninstall"
             );
         }
+
+        let cleanup_report = self
+            .gateway_secrets
+            .delete_mcp_secrets(secret_ref_ids.iter().map(String::as_str));
+        warn_mcp_secret_delete_report("mcp_uninstall", &cleanup_report);
     }
 }

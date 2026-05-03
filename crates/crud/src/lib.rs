@@ -1818,6 +1818,17 @@ impl CrudStore {
             .collect())
     }
 
+    pub async fn list_all_mcp_server_installations(
+        &self,
+    ) -> Result<Vec<McpServerInstallationRecord>> {
+        let rows =
+            mcp_server_installation::list_all_mcp_server_installations(&self.connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(mcp_server_installation_record_from_model)
+            .collect())
+    }
+
     pub async fn find_mcp_server_installation(
         &self,
         scope_kind: &str,

@@ -91,6 +91,18 @@ pub async fn list_mcp_server_installations<C: ConnectionTrait>(
         })
 }
 
+pub async fn list_all_mcp_server_installations<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<mcp_server_installation::Model>> {
+    mcp_server_installation::Entity::find()
+        .order_by_asc(mcp_server_installation::Column::ScopeKind)
+        .order_by_asc(mcp_server_installation::Column::ScopeKey)
+        .order_by_asc(mcp_server_installation::Column::Name)
+        .all(db)
+        .await
+        .context("failed to query all MCP server installations")
+}
+
 pub async fn find_mcp_server_installation<C: ConnectionTrait>(
     db: &C,
     scope_kind: &str,

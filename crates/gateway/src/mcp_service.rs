@@ -29,8 +29,8 @@ use tokio::time::{Duration, sleep};
 use tracing::warn;
 
 use crate::message::now_timestamp_secs;
+use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
-use crate::settings::GatewaySettings;
 
 #[derive(Clone)]
 pub(crate) struct McpService {
@@ -40,7 +40,7 @@ pub(crate) struct McpService {
 struct McpServiceInner {
     crud_store: Arc<CrudStore>,
     session_manager: Arc<SessionManager>,
-    gateway_settings: Arc<RwLock<GatewaySettings>>,
+    gateway_secrets: Arc<GatewaySecrets>,
     snapshot_version: Arc<AtomicU64>,
     connector: RwLock<Arc<dyn McpRuntimeConnector>>,
     tasks: Mutex<HashMap<String, McpServerTaskHandle>>,
@@ -63,7 +63,7 @@ struct McpServerCallCommand {
 }
 
 struct GatewayMcpSecretResolver {
-    gateway_settings: Arc<RwLock<GatewaySettings>>,
+    gateway_secrets: Arc<GatewaySecrets>,
 }
 
 #[derive(Default)]
@@ -76,10 +76,17 @@ struct WorkspaceMcpToolState {
 
 impl McpSecretResolver for GatewayMcpSecretResolver {
     fn resolve_mcp_secret(&self, ref_id: &str) -> Option<String> {
-        self.gateway_settings
-            .read()
-            .ok()
-            .and_then(|settings| settings.mcp_secret(ref_id).map(str::to_owned))
+        match self.gateway_secrets.get_mcp_secret(ref_id) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    ref_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve MCP secret"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -87,14 +94,14 @@ impl McpService {
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
         session_manager: Arc<SessionManager>,
-        gateway_settings: Arc<RwLock<GatewaySettings>>,
+        gateway_secrets: Arc<GatewaySecrets>,
         snapshot_version: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Arc::new(McpServiceInner {
                 crud_store,
                 session_manager,
-                gateway_settings,
+                gateway_secrets,
                 snapshot_version,
                 connector: RwLock::new(Arc::new(RmcpRuntimeConnector::new())),
                 tasks: Mutex::new(HashMap::new()),
@@ -666,7 +673,7 @@ impl McpService {
         mut call_rx: mpsc::Receiver<McpServerCallCommand>,
     ) {
         let resolver = Arc::new(GatewayMcpSecretResolver {
-            gateway_settings: self.inner.gateway_settings.clone(),
+            gateway_secrets: self.inner.gateway_secrets.clone(),
         });
         let mut retry_attempt = 0_u32;
 

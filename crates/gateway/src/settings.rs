@@ -10,8 +10,6 @@ use crate::helpers::normalize_non_empty;
 pub(crate) struct GatewaySettings {
     version: u32,
     secrets: GatewaySecretsSettings,
-    #[serde(default, skip_serializing_if = "McpSecretSettings::is_empty")]
-    mcp: McpSecretSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,13 +24,6 @@ pub(crate) enum GatewaySecretsBackend {
     Keystore,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct McpSecretSettings {
-    #[serde(default)]
-    secrets: std::collections::HashMap<String, String>,
-}
-
 impl Default for GatewaySecretsSettings {
     fn default() -> Self {
         Self {
@@ -44,25 +35,6 @@ impl Default for GatewaySecretsSettings {
 impl GatewaySettings {
     pub(crate) fn secrets_backend(&self) -> GatewaySecretsBackend {
         self.secrets.backend
-    }
-
-    pub(crate) fn set_mcp_secret(&mut self, ref_id: &str, value: String) {
-        self.mcp.secrets.insert(ref_id.to_owned(), value);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn mcp_secret(&self, ref_id: &str) -> Option<&str> {
-        self.mcp
-            .secrets
-            .get(ref_id)
-            .map(String::as_str)
-            .filter(|value| !value.is_empty())
-    }
-}
-
-impl McpSecretSettings {
-    fn is_empty(&self) -> bool {
-        self.secrets.is_empty()
     }
 }
 
@@ -93,7 +65,6 @@ pub(crate) fn load_or_create_gateway_settings(
     let settings = GatewaySettings {
         version: expected_version,
         secrets: GatewaySecretsSettings::default(),
-        mcp: McpSecretSettings::default(),
     };
 
     save_gateway_settings(path, &settings)?;
@@ -190,17 +161,6 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 }
 
 #[cfg(test)]
-impl GatewaySettings {
-    pub(crate) fn default_for_tests() -> Self {
-        Self {
-            version: 1,
-            secrets: GatewaySecretsSettings::default(),
-            mcp: McpSecretSettings::default(),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::load_or_create_gateway_settings;
     use std::fs;
@@ -223,6 +183,8 @@ mod tests {
         assert!(!content.contains("jwt_secret"));
         assert!(!content.contains("[providers]"));
         assert!(!content.contains("[providers.keys]"));
+        assert!(!content.contains("[mcp]"));
+        assert!(!content.contains("[mcp.secrets]"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -235,11 +197,11 @@ mod tests {
         fs::write(
             &path,
             r#"
-version = 2
+            version = 2
 
-[secrets]
-backend = "keystore"
-"#,
+            [secrets]
+            backend = "keystore"
+            "#,
         )
         .expect("write unsupported-version settings");
 
@@ -261,12 +223,12 @@ backend = "keystore"
         fs::write(
             &path,
             r#"
-version = 1
-jwt_secret = "abcd"
+            version = 1
+            jwt_secret = "abcd"
 
-[secrets]
-backend = "keystore"
-"#,
+            [secrets]
+            backend = "keystore"
+            "#,
         )
         .expect("write settings with removed jwt field");
 
@@ -288,14 +250,14 @@ backend = "keystore"
         fs::write(
             &path,
             r#"
-version = 1
+            version = 1
 
-[secrets]
-backend = "keystore"
+            [secrets]
+            backend = "keystore"
 
-[providers.keys]
-openrouter = "sk-test"
-"#,
+            [providers.keys]
+            openrouter = "sk-test"
+            "#,
         )
         .expect("write settings with removed providers field");
 
@@ -310,6 +272,63 @@ openrouter = "sk-test"
     }
 
     #[test]
+    fn rejects_gateway_settings_with_removed_mcp_field() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+            version = 1
+
+            [secrets]
+            backend = "keystore"
+
+            [mcp]
+            "#,
+        )
+        .expect("write settings with removed mcp field");
+
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("removed mcp field should be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `mcp`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn rejects_gateway_settings_with_removed_mcp_secrets_field() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+            version = 1
+
+            [secrets]
+            backend = "keystore"
+
+            [mcp.secrets]
+            token = "secret"
+            "#,
+        )
+        .expect("write settings with removed mcp secrets field");
+
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("removed mcp secrets field should be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `mcp`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn rejects_gateway_settings_with_unsupported_secret_backend() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -317,11 +336,11 @@ openrouter = "sk-test"
         fs::write(
             &path,
             r#"
-version = 1
+            version = 1
 
-[secrets]
-backend = "db-keystore"
-"#,
+            [secrets]
+            backend = "db-keystore"
+            "#,
         )
         .expect("write settings with unsupported backend");
 

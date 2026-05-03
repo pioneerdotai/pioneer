@@ -3,6 +3,7 @@ mod auth;
 mod bootstrap;
 mod database;
 mod helpers;
+mod mcp_secrets;
 mod mcp_service;
 mod message;
 mod resilience;
@@ -31,13 +32,14 @@ use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
 use std::path::Path;
-use std::sync::{Arc, RwLock};
-use tracing::info;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::auth::initialize as initialize_jwt_auth;
 use crate::auth::issue_superuser_token as issue_superuser_token_internal;
 use crate::bootstrap::bootstrap as run_bootstrap;
 use crate::database::initialize as initialize_database;
+use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::message::MessageProcessor;
 use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
@@ -60,7 +62,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         "runtime home directory is ready"
     );
 
-    let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
+    load_gateway_settings(&runtime_home, &config)?;
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     let jwt_material = gateway_secrets
         .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
@@ -74,21 +76,48 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let crud_store = Arc::new(CrudStore::new(database.clone()));
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
+    match garbage_collection_orphan_mcp_secrets(
+        crud_store.as_ref(),
+        gateway_secrets.as_ref(),
+        false,
+    )
+    .await
+    {
+        Ok(report) if !report.failed_deletes.is_empty() => {
+            warn!(
+                active_refs = report.active_refs,
+                stored_refs = report.stored_refs,
+                orphan_refs = report.orphan_refs,
+                deleted_refs = report.deleted_refs,
+                failed_deletes = ?report.failed_deletes,
+                "MCP secret orphan cleanup completed with delete failures"
+            );
+        }
+        Ok(report) => {
+            info!(
+                active_refs = report.active_refs,
+                stored_refs = report.stored_refs,
+                orphan_refs = report.orphan_refs,
+                deleted_refs = report.deleted_refs,
+                "MCP secret orphan cleanup completed"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "MCP secret orphan cleanup failed during startup"
+            );
+        }
+    }
+
     set_attachment_upload_registry_backend(Arc::new(CrudAttachmentUploadRegistryBackend::new(
         crud_store.clone(),
     )));
-
-    let gateway_settings = Arc::new(RwLock::new(gateway_settings));
 
     let provider_registry = Arc::new(ProviderRegistry::new({
         let gateway_secrets = gateway_secrets.clone();
         move |provider_name| gateway_secrets.resolve_provider_api_key(provider_name)
     }));
-
-    let settings_path = runtime_home.join(
-        normalize_settings_file_name(config.gateway.settings_file_name.as_str())
-            .unwrap_or_else(|_| config.gateway.settings_file_name.clone()),
-    );
 
     let summary_config = SummaryConfig {
         summary_model: config.gateway.thread.summary_model.clone(),
@@ -296,8 +325,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         session_manager.clone(),
         workspace_manager,
         crud_store,
-        gateway_settings,
-        settings_path,
         gateway_secrets,
         summary_config,
         context_budget,
