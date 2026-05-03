@@ -4,6 +4,7 @@ members = [
   "crates/agent",
   "crates/promt",
   "crates/config",
+  "crates/keystore",
   "crates/gateway",
   "crates/desktop",
   "crates/cli",
@@ -28,6 +29,7 @@ authors = ["Pioneer Contributors"]
 [workspace.dependencies]
 # Local
 pioneer-agent = { path = "crates/agent" }
+pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
 pioneer-config = { path = "crates/config" }
 pioneer-desktop = { path = "crates/desktop" }

@@ -1,0 +1,385 @@
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+use db_keystore::{DbKeyStore as RawDbKeyStore, DbKeyStoreConfig as RawDbKeyStoreConfig};
+use keyring_core::api::CredentialStoreApi;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    KeystoreError, Result, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
+    SecretStore, ensure_keystore_sqlite_files, ensure_private_runtime_dir, id::filter_matches,
+};
+
+const METADATA_SCHEMA: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbKeyStoreConfig {
+    pub path: PathBuf,
+}
+
+impl DbKeyStoreConfig {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn for_runtime_home(runtime_home: impl Into<PathBuf>) -> Self {
+        Self {
+            path: runtime_home.into().join("keystore.db"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DbKeyStore {
+    db: Arc<RawDbKeyStore>,
+}
+
+impl DbKeyStore {
+    pub fn open(config: DbKeyStoreConfig) -> Result<Self> {
+        if let Some(parent) = config
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            ensure_private_runtime_dir(parent)?;
+        }
+
+        let db = RawDbKeyStore::new(RawDbKeyStoreConfig {
+            path: config.path.clone(),
+            encryption_opts: None,
+            allow_ambiguity: false,
+            vfs: None,
+            index_always: false,
+        })
+        .map_err(|err| KeystoreError::OpenFailed(err.to_string()))?;
+
+        ensure_keystore_sqlite_files(&config.path)?;
+
+        Ok(Self { db })
+    }
+
+    fn entry(&self, id: &SecretId) -> Result<keyring_core::Entry> {
+        self.db
+            .build(id.service(), id.user(), None)
+            .map_err(|err| KeystoreError::ReadFailed(err.to_string()))
+    }
+}
+
+impl SecretStore for DbKeyStore {
+    fn get_string(&self, id: &SecretId) -> Result<Option<String>> {
+        let entry = self.entry(id)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(KeystoreError::ReadFailed(err.to_string())),
+        }
+    }
+
+    fn put_string(&self, id: &SecretId, value: &str, meta: SecretMeta) -> Result<()> {
+        let comment = encode_meta(&meta)?;
+        let entry = self
+            .db
+            .build(id.service(), id.user(), None)
+            .map_err(|err| KeystoreError::WriteFailed(err.to_string()))?;
+
+        entry
+            .set_password(value)
+            .map_err(|err| KeystoreError::WriteFailed(err.to_string()))?;
+
+        let attrs = HashMap::from([("comment", comment.as_str())]);
+        entry
+            .update_attributes(&attrs)
+            .map_err(|err| KeystoreError::WriteFailed(err.to_string()))
+    }
+
+    fn delete(&self, id: &SecretId) -> Result<bool> {
+        let entry = self
+            .db
+            .build(id.service(), id.user(), None)
+            .map_err(|err| KeystoreError::DeleteFailed(err.to_string()))?;
+
+        match entry.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(err) if is_not_found(&err) => Ok(false),
+            Err(err) => Err(KeystoreError::DeleteFailed(err.to_string())),
+        }
+    }
+
+    fn exists(&self, id: &SecretId) -> Result<bool> {
+        let entry = self.entry(id)?;
+        match entry.get_attributes() {
+            Ok(_) => Ok(true),
+            Err(err) if is_not_found(&err) => Ok(false),
+            Err(err) => Err(KeystoreError::ReadFailed(err.to_string())),
+        }
+    }
+
+    fn list(&self, filter: SecretFilter) -> Result<Vec<SecretEntryMeta>> {
+        let entries = self
+            .db
+            .search(&HashMap::new())
+            .map_err(|err| KeystoreError::ListFailed(err.to_string()))?;
+
+        let mut metas = Vec::new();
+        for entry in entries {
+            let Some((service, user)) = entry.get_specifiers() else {
+                continue;
+            };
+            let id = SecretId::from_service_user(service, user)
+                .map_err(|err| KeystoreError::ListFailed(err.to_string()))?;
+            let attrs = entry
+                .get_attributes()
+                .map_err(|err| KeystoreError::ListFailed(err.to_string()))?;
+            let meta = decode_meta(attrs.get("comment").map(String::as_str))?;
+            let kind = meta
+                .as_ref()
+                .map(|meta| meta.kind)
+                .or_else(|| SecretKind::from_service(id.service()));
+
+            if !filter_matches(&id, kind, &filter) {
+                continue;
+            }
+
+            metas.push(match meta {
+                Some(meta) => SecretEntryMeta::from_meta(id, meta),
+                None => SecretEntryMeta {
+                    id,
+                    kind,
+                    label: None,
+                    created_at_unix: None,
+                    updated_at_unix: None,
+                },
+            });
+        }
+
+        metas.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(metas)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredSecretMeta {
+    schema: u8,
+    kind: SecretKind,
+    label: Option<String>,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+}
+
+impl From<SecretMeta> for StoredSecretMeta {
+    fn from(value: SecretMeta) -> Self {
+        Self {
+            schema: METADATA_SCHEMA,
+            kind: value.kind,
+            label: value.label,
+            created_at_unix: value.created_at_unix,
+            updated_at_unix: value.updated_at_unix,
+        }
+    }
+}
+
+impl From<StoredSecretMeta> for SecretMeta {
+    fn from(value: StoredSecretMeta) -> Self {
+        Self {
+            kind: value.kind,
+            label: value.label,
+            created_at_unix: value.created_at_unix,
+            updated_at_unix: value.updated_at_unix,
+        }
+    }
+}
+
+fn encode_meta(meta: &SecretMeta) -> Result<String> {
+    serde_json::to_string(&StoredSecretMeta::from(meta.clone()))
+        .map_err(|err| KeystoreError::MetadataDecodeFailed(err.to_string()))
+}
+
+fn decode_meta(comment: Option<&str>) -> Result<Option<SecretMeta>> {
+    let Some(comment) = comment.filter(|comment| !comment.is_empty()) else {
+        return Ok(None);
+    };
+
+    let meta = serde_json::from_str::<StoredSecretMeta>(comment)
+        .map_err(|err| KeystoreError::MetadataDecodeFailed(err.to_string()))?;
+    if meta.schema != METADATA_SCHEMA {
+        return Err(KeystoreError::MetadataDecodeFailed(format!(
+            "unsupported metadata schema {}",
+            meta.schema
+        )));
+    }
+
+    Ok(Some(meta.into()))
+}
+
+fn is_not_found(err: &keyring_core::Error) -> bool {
+    matches!(err, keyring_core::Error::NoEntry)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{SecretKind, SecretStore};
+
+    use super::*;
+
+    fn meta(kind: SecretKind, label: &str, created_at: i64, updated_at: i64) -> SecretMeta {
+        SecretMeta {
+            kind,
+            label: Some(label.to_owned()),
+            created_at_unix: created_at,
+            updated_at_unix: updated_at,
+        }
+    }
+
+    fn open_temp_store() -> (tempfile::TempDir, DbKeyStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(dir.path())).expect("open store");
+        (dir, store)
+    }
+
+    #[test]
+    fn open_temp_keystore_db() {
+        let (dir, _store) = open_temp_store();
+
+        assert!(dir.path().join("keystore.db").exists());
+    }
+
+    #[test]
+    fn put_get_overwrite_and_exists() {
+        let (_dir, store) = open_temp_store();
+        let id = SecretId::provider_api_key("openrouter").expect("id");
+
+        assert_eq!(store.get_string(&id).expect("read missing"), None);
+        assert!(!store.exists(&id).expect("missing exists"));
+
+        store
+            .put_string(
+                &id,
+                "first-secret",
+                meta(SecretKind::ProviderApiKey, "first", 1, 1),
+            )
+            .expect("put first");
+        assert_eq!(
+            store.get_string(&id).expect("read first"),
+            Some("first-secret".to_owned())
+        );
+        assert!(store.exists(&id).expect("exists"));
+
+        store
+            .put_string(
+                &id,
+                "second-secret",
+                meta(SecretKind::ProviderApiKey, "second", 1, 2),
+            )
+            .expect("put second");
+        assert_eq!(
+            store.get_string(&id).expect("read second"),
+            Some("second-secret".to_owned())
+        );
+
+        let entries = store.list(SecretFilter::All).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label.as_deref(), Some("second"));
+        assert_eq!(entries[0].updated_at_unix, Some(2));
+    }
+
+    #[test]
+    fn delete_existing_and_missing() {
+        let (_dir, store) = open_temp_store();
+        let id = SecretId::superuser_jwt_token();
+
+        assert!(!store.delete(&id).expect("delete missing"));
+
+        store
+            .put_string(
+                &id,
+                "jwt-secret",
+                meta(SecretKind::SuperuserJwtToken, "superuser jwt", 1, 1),
+            )
+            .expect("put");
+
+        assert!(store.delete(&id).expect("delete existing"));
+        assert!(!store.delete(&id).expect("delete missing again"));
+        assert_eq!(store.get_string(&id).expect("read deleted"), None);
+    }
+
+    #[test]
+    fn list_round_trips_metadata_without_values() {
+        let (_dir, store) = open_temp_store();
+        let provider_id = SecretId::provider_api_key("openrouter").expect("provider id");
+        let mcp_id = SecretId::mcp_secret("gateway_settings:mcp:server:token").expect("mcp id");
+
+        store
+            .put_string(
+                &provider_id,
+                "provider-secret-value",
+                meta(SecretKind::ProviderApiKey, "openrouter", 10, 11),
+            )
+            .expect("put provider");
+        store
+            .put_string(
+                &mcp_id,
+                "mcp-secret-value",
+                meta(SecretKind::McpSecret, "mcp token", 20, 21),
+            )
+            .expect("put mcp");
+
+        let all = store.list(SecretFilter::All).expect("list all");
+        assert_eq!(all.len(), 2);
+        assert!(!format!("{all:?}").contains("provider-secret-value"));
+        assert!(!format!("{all:?}").contains("mcp-secret-value"));
+
+        let provider = store
+            .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
+            .expect("list provider");
+        assert_eq!(provider.len(), 1);
+        assert_eq!(provider[0].id, provider_id);
+        assert_eq!(provider[0].kind, Some(SecretKind::ProviderApiKey));
+        assert_eq!(provider[0].label.as_deref(), Some("openrouter"));
+        assert_eq!(provider[0].created_at_unix, Some(10));
+        assert_eq!(provider[0].updated_at_unix, Some(11));
+
+        let mcp = store
+            .list(SecretFilter::Service(
+                "pioneer.gateway.mcp_secret".to_owned(),
+            ))
+            .expect("list mcp service");
+        assert_eq!(mcp.len(), 1);
+        assert_eq!(mcp[0].id, mcp_id);
+    }
+
+    #[test]
+    fn reopening_db_preserves_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = DbKeyStoreConfig::for_runtime_home(dir.path());
+        let id = SecretId::desktop_gateway_auth_token("endpoint").expect("id");
+
+        {
+            let store = DbKeyStore::open(config.clone()).expect("open first");
+            store
+                .put_string(
+                    &id,
+                    "desktop-token",
+                    meta(SecretKind::DesktopGatewayAuthToken, "endpoint", 30, 30),
+                )
+                .expect("put");
+        }
+
+        let reopened = DbKeyStore::open(config).expect("open second");
+        assert_eq!(
+            reopened.get_string(&id).expect("read reopened"),
+            Some("desktop-token".to_owned())
+        );
+        let entries = reopened.list(SecretFilter::All).expect("list reopened");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Some(SecretKind::DesktopGatewayAuthToken));
+    }
+
+    #[test]
+    fn metadata_json_schema_round_trips() {
+        let meta = meta(SecretKind::ProviderApiKey, "openrouter", 1, 2);
+        let comment = encode_meta(&meta).expect("encode");
+
+        assert!(comment.contains("\"schema\":1"));
+        assert_eq!(decode_meta(Some(&comment)).expect("decode"), Some(meta));
+    }
+}
