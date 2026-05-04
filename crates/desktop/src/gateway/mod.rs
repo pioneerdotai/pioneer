@@ -2,6 +2,7 @@ mod connectivity;
 mod control;
 mod registry;
 mod runtime;
+mod secrets;
 mod timings;
 mod types;
 mod ws;

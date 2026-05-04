@@ -27,12 +27,14 @@ use super::thread_list::{
     TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
 };
 use super::{
-    default_user_command_bin_dir_label, is_transient_thread_start_error, normalize_workspace_id,
-    should_apply_gateway_operation_result, should_apply_ws_event,
+    build_ws_connect_spec, default_user_command_bin_dir_label, is_transient_thread_start_error,
+    normalize_workspace_id, should_apply_gateway_operation_result, should_apply_ws_event,
     should_refresh_workspace_bound_data, thread_start_retry_delay, turn_resume_retry_delay,
     warning_notification_messages,
 };
-use crate::gateway::{GatewayEndpointKind, GatewayInstallWarning, GatewayWsEvent};
+use crate::gateway::{
+    GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning, GatewayRuntime, GatewayWsEvent,
+};
 use pioneer_protocol::{
     GatewayNotification, RecoveryAction, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
@@ -54,6 +56,27 @@ fn ws_event_fencing_ignores_stale_connection_id() {
     assert!(should_apply_ws_event(Some(42), &event));
     assert!(!should_apply_ws_event(Some(7), &event));
     assert!(!should_apply_ws_event(None, &event));
+}
+
+#[test]
+fn ws_connect_spec_uses_resolved_in_memory_auth_token() {
+    let runtime = GatewayRuntime::for_ws_spec_tests();
+    runtime
+        .store_gateway_auth_token_for_tests("remote-123", "resolved-token")
+        .expect("store test token");
+    let endpoint = GatewayEndpoint {
+        id: "remote-123".to_owned(),
+        name: "Remote".to_owned(),
+        address: "127.0.0.1:22000".to_owned(),
+        kind: GatewayEndpointKind::Remote,
+        auth_token_ref: Some("remote-123".to_owned()),
+        workspace_id: None,
+        service_name: None,
+    };
+
+    let spec = build_ws_connect_spec(&runtime, &endpoint).expect("build ws spec");
+
+    assert_eq!(spec.auth_token.as_deref(), Some("resolved-token"));
 }
 
 #[test]

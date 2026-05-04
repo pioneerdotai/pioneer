@@ -3,15 +3,15 @@ use super::*;
 pub(crate) fn build_ws_connect_spec(
     runtime: &GatewayRuntime,
     endpoint: &GatewayEndpoint,
-) -> GatewayWsConnectSpec {
-    GatewayWsConnectSpec {
+) -> anyhow::Result<GatewayWsConnectSpec> {
+    Ok(GatewayWsConnectSpec {
         endpoint_id: endpoint.id.clone(),
         endpoint_name: endpoint.name.clone(),
         endpoint_kind: endpoint.kind,
         address: endpoint.address.clone(),
-        auth_token: endpoint.auth_token.clone(),
+        auth_token: runtime.gateway_auth_token_for_endpoint(endpoint)?,
         timings: runtime.ws_timings(),
-    }
+    })
 }
 
 pub(crate) fn event_connection_id(event: &GatewayWsEvent) -> u64 {

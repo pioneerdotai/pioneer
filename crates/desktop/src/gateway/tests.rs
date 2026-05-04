@@ -1,6 +1,8 @@
 use super::ActiveGatewayState;
 use super::connectivity::normalize_address;
-use super::registry::{default_registry, load_registry, normalize_registry, setup_required};
+use super::registry::{
+    default_registry, load_registry, normalize_registry, save_registry, setup_required,
+};
 use super::runtime::{classify_local_gateway_state, is_same_gateway_version};
 use super::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
 use pioneer_config::{
@@ -37,7 +39,7 @@ fn normalize_registry_enforces_local_and_deduplicates_remotes() {
             name: "Old Local".to_owned(),
             address: "127.0.0.1:9999".to_owned(),
             kind: GatewayEndpointKind::Remote,
-            auth_token: None,
+            auth_token_ref: None,
             workspace_id: None,
             service_name: None,
         },
@@ -47,7 +49,7 @@ fn normalize_registry_enforces_local_and_deduplicates_remotes() {
                 name: " ".to_owned(),
                 address: "127.0.0.1:22000".to_owned(),
                 kind: GatewayEndpointKind::Local,
-                auth_token: Some("  secret  ".to_owned()),
+                auth_token_ref: Some(" remote-a ".to_owned()),
                 workspace_id: Some("  ws_remote_a  ".to_owned()),
                 service_name: Some("should-be-cleared".to_owned()),
             },
@@ -56,7 +58,7 @@ fn normalize_registry_enforces_local_and_deduplicates_remotes() {
                 name: "Remote Duplicate".to_owned(),
                 address: "127.0.0.1:22000".to_owned(),
                 kind: GatewayEndpointKind::Remote,
-                auth_token: None,
+                auth_token_ref: None,
                 workspace_id: None,
                 service_name: None,
             },
@@ -65,18 +67,22 @@ fn normalize_registry_enforces_local_and_deduplicates_remotes() {
                 name: "Unique".to_owned(),
                 address: "127.0.0.1:22001".to_owned(),
                 kind: GatewayEndpointKind::Remote,
-                auth_token: None,
+                auth_token_ref: None,
                 workspace_id: Some("   ".to_owned()),
                 service_name: None,
             },
         ],
     };
 
-    normalize_registry(&mut registry, &config);
+    normalize_registry(&mut registry, &config).expect("normalize registry");
 
     assert_eq!(registry.local.id, config.desktop.gateway.local_gateway_id);
     assert_eq!(registry.local.kind, GatewayEndpointKind::Local);
     assert_eq!(registry.local.address, "0.0.0.0:17878");
+    assert_eq!(
+        registry.local.auth_token_ref.as_deref(),
+        Some(config.desktop.gateway.local_gateway_id.as_str())
+    );
     assert_eq!(registry.remotes.len(), 2);
     assert!(
         registry
@@ -94,22 +100,25 @@ fn normalize_registry_enforces_local_and_deduplicates_remotes() {
         registry.remotes[0].workspace_id.as_deref(),
         Some("ws_remote_a")
     );
+    assert_eq!(
+        registry.remotes[0].auth_token_ref.as_deref(),
+        Some(registry.remotes[0].id.as_str())
+    );
     assert!(registry.remotes[1].workspace_id.is_none());
     assert!(registry.active_gateway_id.is_none());
 }
 
 #[test]
-fn normalize_registry_preserves_local_auth_token() {
+fn normalize_registry_preserves_local_ref_and_workspace() {
     let config = test_config();
-    let mut registry = default_registry(&config);
-    registry.local.auth_token = Some("  local-superuser-jwt  ".to_owned());
+    let mut registry = default_registry(&config).expect("default registry");
     registry.local.workspace_id = Some("  ws_local_001  ".to_owned());
 
-    normalize_registry(&mut registry, &config);
+    normalize_registry(&mut registry, &config).expect("normalize registry");
 
     assert_eq!(
-        registry.local.auth_token.as_deref(),
-        Some("local-superuser-jwt")
+        registry.local.auth_token_ref.as_deref(),
+        Some(config.desktop.gateway.local_gateway_id.as_str())
     );
     assert_eq!(registry.local.workspace_id.as_deref(), Some("ws_local_001"));
 }
@@ -117,7 +126,7 @@ fn normalize_registry_preserves_local_auth_token() {
 #[test]
 fn startup_flow_is_required_only_without_active_gateway() {
     let config = test_config();
-    let mut registry = default_registry(&config);
+    let mut registry = default_registry(&config).expect("default registry");
 
     assert!(setup_required(&registry));
 
@@ -166,7 +175,26 @@ fn load_registry_creates_file_and_persists_default_state() {
     assert!(registry_path.exists());
     assert_eq!(registry.version, config.desktop.gateway.registry_version);
     assert_eq!(registry.local.id, config.desktop.gateway.local_gateway_id);
+    assert_eq!(
+        registry.local.auth_token_ref.as_deref(),
+        Some(config.desktop.gateway.local_gateway_id.as_str())
+    );
     assert!(registry.active_gateway_id.is_none());
+    let content = fs::read_to_string(&registry_path).expect("read registry");
+    assert!(content.contains("auth_token_ref"));
+    assert!(!content.contains("auth_token ="));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(&registry_path)
+            .expect("registry metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -241,7 +269,182 @@ service_name = "com.pioneer.gateway"
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
-fn test_config() -> AppConfig {
+#[test]
+fn registry_serialization_contains_auth_token_ref_only() {
+    let endpoint = GatewayEndpoint {
+        id: "remote-123".to_owned(),
+        name: "Remote".to_owned(),
+        address: "127.0.0.1:22000".to_owned(),
+        kind: GatewayEndpointKind::Remote,
+        auth_token_ref: Some("remote-123".to_owned()),
+        workspace_id: None,
+        service_name: None,
+    };
+
+    let content = toml::to_string_pretty(&endpoint).expect("serialize endpoint");
+
+    assert!(content.contains("auth_token_ref"));
+    assert!(!content.contains("auth_token ="));
+}
+
+#[test]
+fn registry_deserialization_rejects_legacy_auth_token_field() {
+    let content = r#"
+id = "remote-123"
+name = "Remote"
+address = "127.0.0.1:22000"
+kind = "remote"
+auth_token = "secret-token"
+"#;
+
+    let error = toml::from_str::<GatewayEndpoint>(content)
+        .expect_err("legacy auth_token field should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown field"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn registry_deserialization_accepts_auth_token_ref_field() {
+    let content = r#"
+id = "remote-123"
+name = "Remote"
+address = "127.0.0.1:22000"
+kind = "remote"
+auth_token_ref = "remote-123"
+"#;
+
+    let endpoint = toml::from_str::<GatewayEndpoint>(content)
+        .expect("auth_token_ref registry field should be accepted");
+
+    assert_eq!(endpoint.auth_token_ref.as_deref(), Some("remote-123"));
+}
+
+#[test]
+fn load_registry_preserves_auth_token_ref_without_resolving_secret() {
+    let config = test_config();
+    let temp_dir = unique_temp_dir();
+    fs::create_dir_all(&temp_dir).expect("failed to create test temp dir");
+    let registry_path = temp_dir.join(config.desktop.gateway.registry_file_name.as_str());
+    fs::write(
+        &registry_path,
+        r#"
+version = 1
+active_gateway_id = "remote-123"
+
+[local]
+id = "local"
+name = "Local Gateway"
+address = "0.0.0.0:17878"
+kind = "local"
+auth_token_ref = "local"
+service_name = "com.pioneer.gateway"
+
+[[remotes]]
+id = "remote-123"
+name = "Remote"
+address = "127.0.0.1:22000"
+kind = "remote"
+auth_token_ref = "remote-123"
+"#,
+    )
+    .expect("write registry");
+    let registry = load_registry(&registry_path, &config).expect("load registry with ref");
+
+    assert_eq!(registry.remotes.len(), 1);
+    assert_eq!(
+        registry.remotes[0].auth_token_ref.as_deref(),
+        Some("remote-123")
+    );
+    let content = fs::read_to_string(&registry_path).expect("read registry");
+    assert!(content.contains("auth_token_ref = \"remote-123\""));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn load_registry_preserves_auth_token_ref_without_keystore_value() {
+    let config = test_config();
+    let temp_dir = unique_temp_dir();
+    fs::create_dir_all(&temp_dir).expect("failed to create test temp dir");
+    let registry_path = temp_dir.join(config.desktop.gateway.registry_file_name.as_str());
+    fs::write(
+        &registry_path,
+        r#"
+version = 1
+active_gateway_id = "remote-123"
+
+[local]
+id = "local"
+name = "Local Gateway"
+address = "0.0.0.0:17878"
+kind = "local"
+auth_token_ref = "local"
+service_name = "com.pioneer.gateway"
+
+[[remotes]]
+id = "remote-123"
+name = "Remote"
+address = "127.0.0.1:22000"
+kind = "remote"
+auth_token_ref = "remote-123"
+"#,
+    )
+    .expect("write registry");
+    let registry = load_registry(&registry_path, &config).expect("load registry with token ref");
+
+    assert_eq!(registry.remotes.len(), 1);
+    assert_eq!(
+        registry.remotes[0].auth_token_ref.as_deref(),
+        Some("remote-123")
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn normalize_registry_rejects_invalid_auth_token_ref() {
+    let config = test_config();
+    let mut registry = default_registry(&config).expect("default registry");
+    registry.remotes.push(GatewayEndpoint {
+        id: "remote-123".to_owned(),
+        name: "Remote".to_owned(),
+        address: "127.0.0.1:22000".to_owned(),
+        kind: GatewayEndpointKind::Remote,
+        auth_token_ref: Some("../remote-123".to_owned()),
+        workspace_id: None,
+        service_name: None,
+    });
+
+    let error = normalize_registry(&mut registry, &config)
+        .expect_err("invalid auth token ref should be rejected");
+
+    assert!(
+        format!("{error:#}").contains("path separators"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn save_registry_serializes_only_auth_token_ref() {
+    let config = test_config();
+    let temp_dir = unique_temp_dir();
+    fs::create_dir_all(&temp_dir).expect("failed to create test temp dir");
+    let registry_path = temp_dir.join(config.desktop.gateway.registry_file_name.as_str());
+    let registry = default_registry(&config).expect("default registry");
+
+    save_registry(&registry_path, &registry).expect("save registry");
+
+    let content = fs::read_to_string(&registry_path).expect("read registry");
+    assert!(content.contains("auth_token_ref = \"local\""));
+    assert!(!content.contains("auth_token ="));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+pub(crate) fn test_config() -> AppConfig {
     AppConfig {
         home_directory: ".pioneer.test".to_owned(),
         install_state_file_name: "install-state.toml".to_owned(),
@@ -320,7 +523,7 @@ fn test_config() -> AppConfig {
     }
 }
 
-fn unique_temp_dir() -> PathBuf {
+pub(crate) fn unique_temp_dir() -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

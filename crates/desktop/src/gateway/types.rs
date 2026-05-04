@@ -8,19 +8,21 @@ pub enum GatewayEndpointKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayEndpoint {
     pub id: String,
     pub name: String,
     pub address: String,
     pub kind: GatewayEndpointKind,
-    #[serde(default)]
-    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_ref: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
     pub service_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayRegistry {
     pub version: u32,
     pub active_gateway_id: Option<String>,

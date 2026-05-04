@@ -15,6 +15,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 pioneer-config.workspace = true
 pioneer-gateway.workspace = true
+pioneer-keystore.workspace = true
 pioneer-protocol.workspace = true
 pioneer-skills.workspace = true
 pioneer-tools.workspace = true

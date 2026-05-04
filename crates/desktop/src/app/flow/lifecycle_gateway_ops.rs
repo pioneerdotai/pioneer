@@ -43,7 +43,7 @@ impl PioneerDesktop {
                             address.as_str(),
                             Some(token.as_str()),
                         )?;
-                        let spec = build_ws_connect_spec(&runtime, &endpoint);
+                        let spec = build_ws_connect_spec(&runtime, &endpoint)?;
                         let connection_id = ws_sender.connect_and_wait(spec)?;
                         runtime.activate_gateway(endpoint.id.as_str())?;
 
@@ -117,7 +117,7 @@ impl PioneerDesktop {
                             }
                             let mut runtime = GatewayRuntime::load()?;
                             let local_start = runtime.ensure_local_gateway_started()?;
-                            let spec = build_ws_connect_spec(&runtime, &local_start.endpoint);
+                            let spec = build_ws_connect_spec(&runtime, &local_start.endpoint)?;
                             let connection_id = ws_sender.connect_and_wait(spec)?;
                             runtime.activate_gateway(local_start.endpoint.id.as_str())?;
 
@@ -194,7 +194,7 @@ impl PioneerDesktop {
                                 t!("errors.gateway.id_not_found", id = gateway_id.as_str())
                             )
                         })?;
-                        let spec = build_ws_connect_spec(&runtime, &endpoint);
+                        let spec = build_ws_connect_spec(&runtime, &endpoint)?;
                         let connection_id = ws_sender.connect_and_wait(spec)?;
                         runtime.activate_gateway(gateway_id.as_str())?;
 
