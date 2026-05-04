@@ -2,10 +2,32 @@
   <img src="assets/pioneer.png" alt="Pioneer" width="50">
 </p>
 
+<h1 align="center">Pioneer — Personal AI Assistant</h1>
+
+<p align="center">
+  <strong>You own the assistant. You own the data. You choose where the gateway runs.</strong>
+</p>
+
 <p align="center">
   <a href="https://github.com/pioneerdotai/pioneer/actions/workflows/ci.yml"><img src="https://github.com/pioneerdotai/pioneer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/pioneerdotai/pioneer/releases"><img src="https://img.shields.io/github/v/release/pioneerdotai/pioneer?include_prereleases&label=release" alt="Release"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/rust-edition%202024-orange.svg" alt="Rust edition 2024">
 </p>
+
+<p align="center">
+  <a href="https://docs.getpioneer.dev">Docs</a>
+  ·
+  <a href="https://docs.getpioneer.dev/getting-started/quickstart">Quick start</a>
+  ·
+  <a href="https://docs.getpioneer.dev/architecture/overview">Architecture</a>
+  ·
+  <a href="https://docs.getpioneer.dev/protocol/introduction">Protocol reference</a>
+  ·
+  <a href="https://github.com/pioneerdotai/pioneer/releases">Releases</a>
+</p>
+
+---
 
 **Pioneer** is a local-first AI workspace for running an assistant on your own machine or on infrastructure you control. It combines a persistent gateway, a native desktop app, a JSON-RPC protocol, provider adapters, durable threads, task automation, MCP servers, and real local tools.
 
@@ -34,7 +56,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
 - **Multi-language desktop** - desktop UI locales are available for English, German, Spanish, French, Hindi, Japanese, Russian, and Chinese.
 
-## Rust Native
+## 100% Rust
 
 Pioneer is built in Rust all the way through the product: gateway, CLI, desktop app, protocol, tools, tasks, MCP, skills, and provider integrations.
 
@@ -51,29 +73,6 @@ Pioneer is split into two parts:
 For a single-machine setup, install the desktop app and let it start the local gateway for you. On macOS, that means downloading the `.dmg`, moving Pioneer to Applications, launching it, and pressing `Start local gateway` when prompted.
 
 For a multi-environment setup, install gateways wherever the work should live: a laptop, a workstation, a home server, or a remote machine. Then connect to each gateway from the same desktop app. You can keep separate gateways for work, study, home, experiments, or clients without mixing their state, settings, tools, and histories.
-
-## Multi-Agent Workflows
-
-Pioneer is designed for more than one long-running chat thread. The gateway can coordinate subagents automatically as part of the task system: a parent task can create an agent spec, start a child thread, run that subagent with its own model and instructions, and link the result back to the parent task.
-
-Each subagent can be scoped independently:
-
-- **Role and identity** - give the agent a role and nickname so its work is understandable in task history.
-- **Model choice** - choose the model and provider per agent, instead of forcing every subtask through the same model.
-- **Context policy** - inherit parent context, pass only recent turns, use a summary, start empty, or provide custom context.
-- **Tool policy** - allow or deny tools, choose read-only or write-capable modes, restrict paths, and control network access.
-- **Result contract** - ask for text, Markdown, JSON, or artifacts with required outputs.
-- **Depth and lineage** - nested agent work is tracked through child threads and task lineage, so delegated work can be audited and recovered.
-
-This makes the gateway useful as a coordinator: one agent can break work into subtasks, specialized subagents can handle pieces in isolated threads, and the desktop app can still show the full task tree from one place. Users can shape this with goals and policies, but the orchestration is handled by Pioneer.
-
-## MCP Servers
-
-The gateway is also the MCP runtime. It installs MCP servers, stores redacted configuration in `gateway.db`, stores secret values in `keystore.db`, validates definitions, starts and restarts runtimes, tracks health, and keeps a catalog of exposed tools, resources, resource templates, and prompts.
-
-MCP is scoped by gateway and workspace, so different gateways and workspaces can have different external capabilities. A work gateway can connect to work systems, a home gateway can connect to personal automations, and experimental gateways can run separate MCP servers without leaking tools or secrets across environments.
-
-Agents do not talk to MCP servers directly. They call gateway tools, and the gateway proxies MCP tool calls through its runtime, policy, audit, and redaction layers.
 
 ## Gateway Install
 
@@ -180,42 +179,6 @@ pioneer install --source release --channel stable
 
 The same options are available through `pioneer update`. Release-based install/update requires a published gateway asset and matching `SHA256SUMS` for the current OS and architecture.
 
-## Secret Storage
-
-Pioneer stores runtime secret values in `keystore.db` under the runtime home, next to `gateway.db`. The gateway uses it for provider API keys, MCP env/header secret values, and the current singleton superuser JWT signing material. The desktop app also uses the same keystore backend for gateway bearer tokens; `gateway-registry.toml` stores only `auth_token_ref` values.
-
-The generated `gateway-settings.toml` contains only:
-
-```toml
-[secrets]
-backend = "keystore"
-```
-
-It does not contain `jwt_secret`, provider key tables, or MCP secret tables. `gateway.db` stores normal domain state, redacted MCP transport/source data, and secret refs, not raw secret values.
-
-Current keystore storage is intentionally unencrypted. Pioneer hardens the runtime directory and SQLite files with private filesystem permissions, but any OS user or process that can read the runtime home can read `keystore.db`. Encryption at rest is planned separately.
-
-Useful maintenance commands:
-
-```bash
-pioneer secrets status [--json]
-pioneer secrets garbage-collection [--dry-run] [--json]
-pioneer secrets rotate-jwt-token superuser [--json]
-```
-
-`secrets status` prints counts, permission health, encryption status, and MCP orphan status without printing secret values. `secrets garbage-collection` only removes orphaned MCP secret values. `secrets rotate-jwt-token superuser` rotates the superuser JWT signing material and invalidates existing superuser bearer tokens; run `pioneer issue-superuser-token` afterwards to issue a fresh bearer token.
-
-## Installer Notes
-
-- Native install/update flow is centralized in the CLI: stop service, atomically replace binary, optionally restart, run health check, rollback on failure.
-- Production install path is user-local: `~/.local/share/pioneer/managed` on Linux, `~/.local/share/Pioneer/managed` on macOS, `%LOCALAPPDATA%\Pioneer\managed` on Windows.
-- Development install path uses `config/local.toml`: `~/.local/share/pioneer-dev/managed-dev` on Linux, `~/.local/share/PioneerDev/managed-dev` on macOS, `%LOCALAPPDATA%\PioneerDev\managed-dev` on Windows.
-- Production links `pioneer`; development links `pioneer-dev` (`~/.local/bin/pioneer-dev` on Unix, user `Path` on Windows).
-- Production service name: `com.pioneer.gateway`.
-- Development service name: `com.pioneer.gateway.dev`.
-- Production listens on `0.0.0.0:17878` by default.
-- Development listens on `0.0.0.0:18778` by default.
-
 ## Security Note
 
 Pioneer tools can execute commands, read and write files, use the network, and control the desktop when enabled. Treat the gateway as a privileged local service.
@@ -269,38 +232,6 @@ Windows signing secrets:
 - `WINDOWS_SIGNING_SUBJECT_NAME` (optional alternative to cert file)
 
 If Windows signing secrets are absent, Windows artifacts are built unsigned and the release still succeeds.
-
-## Repository Map
-
-| Path | Purpose |
-| --- | --- |
-| `crates/gateway` | Long-running gateway service, transport, auth, bootstrap, sessions, workspaces, threads, MCP, skills, tasks, secrets orchestration, and message dispatch. |
-| `crates/desktop` | Native GPUI desktop app (`pioneer-app`). |
-| `crates/cli` | `pioneer` and `pioneer-dev` binaries, installer, updater, service manager, status, token issuance, and keystore maintenance commands. |
-| `crates/agent` | Agent turn execution and tool orchestration. |
-| `crates/keystore` | Secret storage facade backed by `db-keystore`, stable secret ids, metadata, test memory store, and filesystem permission hardening. |
-| `crates/protocol` | JSON-RPC request, response, notification, thread, turn, task, MCP, skill, provider, and workspace types. |
-| `crates/provider` | LLM provider abstraction, adapters, model listing, streaming, tool calls, and attachment handling. |
-| `crates/tools` | Built-in tool specs, runtime, routing, output policy, recovery, and handlers. |
-| `crates/mcp` | MCP client runtime, catalog, validation, policies, secrets, and redaction. |
-| `crates/skills` | Skill installation, validation, provenance, runtime tool registration, trust, and dependency checks. |
-| `crates/tasks` | Task scheduler, executor, triggers, delivery, reconciliation, notifications, and event projection. |
-| `crates/crud`, `crates/entity`, `crates/migration`, `crates/sqlite` | Persistence layer backed by SQLite/libSQL and SeaORM. |
-| `crates/config` | Layered configuration loader and runtime path conventions. |
-| `crates/promt` | Prompt bundle compilation, source budgeting, sanitization, rendering, diagnostics, and snapshots. |
-| `schemas` | Generated JSON Schemas for the public protocol. |
-| `scripts` | Packaging helpers, schema export, and development environment reset. |
-
-## Checks
-
-The CI workflow runs the core checks below:
-
-```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo test -p pioneer-cli
-cargo test -p pioneer-desktop gateway::
-```
 
 ## License
 
