@@ -308,6 +308,100 @@ fn item_delta_streams_text_until_completion() {
 }
 
 #[test]
+fn late_item_delta_does_not_reopen_completed_item() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let item_id = "item_late_delta_after_completion";
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: String::new(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: "done".to_owned(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: item_id.to_owned(),
+        delta: " late".to_owned(),
+        stream: None,
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    });
+
+    let item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert!(item.completed_at_unix_ms.is_some());
+    assert!(item.partial_text.contains("late"));
+}
+
+#[test]
+fn late_item_started_does_not_reopen_completed_item() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let item_id = "item_late_start_after_completion";
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: String::new(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: "done".to_owned(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: String::new(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+
+    let item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert_eq!(item.final_text.as_deref(), Some("done"));
+    assert_eq!(item.partial_text, "done");
+}
+
+#[test]
 fn web_fetch_delta_hides_raw_content_but_keeps_progress_updates() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_web_fetch_1";
@@ -694,7 +788,7 @@ fn item_delta_without_started_item_does_not_break_view_state() {
 }
 
 #[test]
-fn timeout_event_adds_recovery_context_to_running_item() {
+fn timeout_event_terminalizes_running_item_with_recovery_context() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_tool_timeout_1";
 
@@ -735,11 +829,32 @@ fn timeout_event_adds_recovery_context_to_running_item() {
         .iter()
         .find(|value| value.id == item_id)
         .expect("timed out item should exist");
-    assert_eq!(item.status, TimelineEntryStatus::Running);
+    assert_eq!(item.status, TimelineEntryStatus::Failed);
+    assert!(item.completed_at_unix_ms.is_some());
     assert!(
         item.partial_text
             .contains("[timeout] attempt #2 idle deadline exceeded")
     );
+
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: item_id.to_owned(),
+        delta: "\nlate output".to_owned(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    });
+
+    let item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|value| value.id == item_id)
+        .expect("timed out item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Failed);
+    assert!(item.partial_text.contains("late output"));
 }
 
 #[test]
@@ -773,6 +888,7 @@ fn timeout_event_without_recovery_job_marks_no_automatic_recovery() {
         .iter()
         .find(|value| value.id == item_id)
         .expect("timed out item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Failed);
     assert!(item.partial_text.contains("no automatic recovery"));
 }
 

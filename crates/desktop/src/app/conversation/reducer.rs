@@ -286,6 +286,7 @@ impl ConversationProjector {
             .unwrap_or_else(|| recovery_message.clone());
 
         self.append_item_delta(item_id, timeout_delta.as_str(), None, ts_unix_ms);
+        self.mark_item_terminal(item_id, TimelineEntryStatus::Failed, ts_unix_ms);
 
         let system_message = if recovery_job_id.is_some() {
             t!("timeline.system.timeout_with_recovery").to_string()
@@ -656,17 +657,27 @@ impl ConversationProjector {
         let item_index = if let Some(index) = self.item_index.get(item_id).copied()
             && let Some(item) = self.view_state.items.get_mut(index)
         {
-            item.status = status;
+            let preserve_terminal =
+                is_terminal_timeline_status(item.status) && status == TimelineEntryStatus::Running;
+            if !preserve_terminal {
+                item.status = status;
+            }
             item.started_at_unix_ms = item.started_at_unix_ms.or(Some(ts_unix_ms));
-            item.updated_at_unix_ms = Some(ts_unix_ms);
-            if !text.is_empty() {
+            if !preserve_terminal {
+                item.updated_at_unix_ms = Some(ts_unix_ms);
+            }
+            if !text.is_empty() && (!preserve_terminal || item.partial_text.is_empty()) {
                 item.partial_text = text.clone();
             }
-            if let Some(markdown) = markdown.clone() {
+            if let Some(markdown) = markdown.clone()
+                && (!preserve_terminal || item.partial_markdown.is_none())
+            {
                 item.partial_markdown = Some(markdown);
             }
-            item.item_type = item_type.to_owned();
-            item.item = item_payload.clone();
+            if !preserve_terminal {
+                item.item_type = item_type.to_owned();
+                item.item = item_payload.clone();
+            }
             merge_item_opaque_meta(&mut item.opaque_meta, opaque_meta.clone());
             index
         } else {
@@ -720,8 +731,11 @@ impl ConversationProjector {
         if let Some(index) = self.item_index.get(item_id).copied()
             && let Some(item) = self.view_state.items.get_mut(index)
         {
+            let preserve_terminal = is_terminal_timeline_status(item.status);
             item.partial_text.push_str(delta);
-            item.status = TimelineEntryStatus::Running;
+            if !preserve_terminal {
+                item.status = TimelineEntryStatus::Running;
+            }
             item.updated_at_unix_ms = Some(ts_unix_ms);
             if let Some(markdown) = markdown.clone() {
                 item.partial_markdown = Some(markdown);
@@ -803,6 +817,22 @@ impl ConversationProjector {
             if matches!(item.status, TimelineEntryStatus::Running) {
                 item.status = terminal_status;
             }
+        }
+    }
+
+    fn mark_item_terminal(
+        &mut self,
+        item_id: &str,
+        terminal_status: TimelineEntryStatus,
+        ts_unix_ms: i64,
+    ) {
+        if let Some(index) = self.item_index.get(item_id).copied()
+            && let Some(item) = self.view_state.items.get_mut(index)
+            && item.status == TimelineEntryStatus::Running
+        {
+            item.status = terminal_status;
+            item.updated_at_unix_ms = Some(ts_unix_ms);
+            item.completed_at_unix_ms = Some(ts_unix_ms);
         }
     }
 
@@ -914,6 +944,10 @@ fn item_sort_at(item: &ItemView) -> i64 {
         .or(item.updated_at_unix_ms)
         .or(item.completed_at_unix_ms)
         .unwrap_or(i64::MAX)
+}
+
+fn is_terminal_timeline_status(status: TimelineEntryStatus) -> bool {
+    !matches!(status, TimelineEntryStatus::Running)
 }
 
 fn timeout_reason_label(reason: TurnItemTimeoutReason) -> &'static str {
