@@ -8,9 +8,18 @@ impl PioneerDesktop {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         window::install_window_state_persistence(window, cx);
 
-        let gateway_name_input_state = cx.new(|cx| InputState::new(window, cx));
-        let gateway_address_input_state = cx.new(|cx| InputState::new(window, cx));
-        let gateway_token_input_state = cx.new(|cx| InputState::new(window, cx));
+        let gateway_setup_form_state = cx.new(|cx| {
+            GatewaySetupFormState::new(
+                window,
+                cx,
+                GatewaySetupDialogState::new(
+                    true,
+                    None,
+                    None,
+                    t!("gateway.status.connecting").to_string(),
+                ),
+            )
+        });
         let composer_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -112,9 +121,7 @@ impl PioneerDesktop {
             ready_turn_resume_threads: VecDeque::new(),
             ready_turn_resume_thread_set: HashSet::new(),
             turn_timeline_refresh: HashMap::new(),
-            gateway_name_input_state,
-            gateway_address_input_state,
-            gateway_token_input_state,
+            gateway_setup_form_state,
             show_sidebar: true,
             sidebar_panel_width: px(320.),
             gateway: GatewayCoordinator {

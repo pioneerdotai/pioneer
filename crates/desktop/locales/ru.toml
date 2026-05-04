@@ -86,8 +86,14 @@ watch_dir_failed = "не удалось отслеживать директор�
 open_failed = "не удалось открыть окно настольного приложения"
 
 [gateway.action]
+add = "Добавить шлюз"
 connect_remote = "Подключить удалённый шлюз"
 start_local = "Запустить локальный шлюз"
+
+[gateway.add]
+description = "Подключите удалённый шлюз или запустите локальный."
+description_remote_only = "Подключите удалённый шлюз."
+title = "Добавление шлюза"
 
 [gateway.endpoint]
 local_name = "Локальный шлюз"

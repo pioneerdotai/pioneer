@@ -14,6 +14,51 @@ pub(crate) fn build_ws_connect_spec(
     })
 }
 
+pub(crate) fn build_remote_candidate_ws_connect_spec(
+    runtime: &GatewayRuntime,
+    name: &str,
+    address: &str,
+    token: &str,
+) -> GatewayWsConnectSpec {
+    let endpoint_name = if name.trim().is_empty() {
+        t!("gateway.endpoint.remote_name", index = 1).to_string()
+    } else {
+        name.trim().to_owned()
+    };
+
+    GatewayWsConnectSpec {
+        endpoint_id: format!("candidate-{}", generate_id(ID_LEN)),
+        endpoint_name,
+        endpoint_kind: GatewayEndpointKind::Remote,
+        address: address.trim().to_owned(),
+        auth_token: {
+            let token = token.trim();
+            if token.is_empty() {
+                None
+            } else {
+                Some(token.to_owned())
+            }
+        },
+        timings: runtime.ws_timings(),
+    }
+}
+
+pub(crate) fn validate_remote_candidate_gateway_connection(
+    runtime: &GatewayRuntime,
+    name: &str,
+    address: &str,
+    token: &str,
+) -> anyhow::Result<()> {
+    let address = crate::gateway::normalize_address(address)?;
+
+    let validation_client = GatewayWsClient::new();
+    let validation_sender = validation_client.command_sender();
+    let spec = build_remote_candidate_ws_connect_spec(runtime, name, address.as_str(), token);
+    let result = validation_sender.connect_and_wait(spec);
+    let _ = validation_sender.shutdown();
+    result.map(|_| ())
+}
+
 pub(crate) fn event_connection_id(event: &GatewayWsEvent) -> u64 {
     match event {
         GatewayWsEvent::Connecting { connection_id, .. }
@@ -66,6 +111,12 @@ pub(crate) fn should_apply_gateway_operation_result(
     operation_epoch: u64,
 ) -> bool {
     current_epoch == operation_epoch
+}
+
+pub(crate) fn gateway_activation_requires_local_start(
+    endpoint_kind: Option<GatewayEndpointKind>,
+) -> bool {
+    endpoint_kind == Some(GatewayEndpointKind::Local)
 }
 
 pub(crate) fn warning_notification_messages(warnings: &[GatewayInstallWarning]) -> Vec<String> {

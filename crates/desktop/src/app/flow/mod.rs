@@ -18,17 +18,20 @@ mod ws_events_notifications;
 mod ws_events_pump;
 
 use super::root::{
-    GatewayConnectionState, GatewaySetupAction, GatewayStatusLevel, MainContentView, PioneerDesktop,
+    GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
+    MainContentView, PioneerDesktop,
 };
+use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{
     ActiveGatewayState, GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning,
-    GatewayRuntime, GatewayWsConnectSpec, GatewayWsEvent,
+    GatewayRuntime, GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent,
 };
 use anyhow::anyhow;
 use gpui::{prelude::*, *};
 use gpui_component::{
     WindowExt,
     button::*,
+    divider::Divider,
     h_flex,
     notification::{Notification, NotificationType},
     popover::{Popover, PopoverState},

@@ -86,8 +86,14 @@ watch_dir_failed = "无法监视主题目录"
 open_failed = "无法打开桌面窗口"
 
 [gateway.action]
+add = "添加网关"
 connect_remote = "连接远程网关"
 start_local = "启动本地网关"
+
+[gateway.add]
+description = "连接远程网关或启动本地网关。"
+description_remote_only = "连接远程网关。"
+title = "添加网关"
 
 [gateway.endpoint]
 local_name = "本地网关"

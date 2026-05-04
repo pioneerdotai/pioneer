@@ -1,6 +1,7 @@
 mod bottom_bar;
 mod conversation;
 mod flow;
+mod gateway_setup;
 mod initial;
 mod mcp;
 mod providers;

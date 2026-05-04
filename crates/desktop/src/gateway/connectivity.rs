@@ -1,19 +1,32 @@
 use anyhow::{Context, Result, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
+use url::Url;
+
+const DEFAULT_GATEWAY_PORT: u16 = 17878;
 
 pub(crate) fn normalize_address(address: &str) -> Result<String> {
-    let normalized = address.trim();
+    let trimmed = address.trim();
 
-    if normalized.is_empty() {
+    if trimmed.is_empty() {
         bail!("{}", t!("errors.gateway.address_empty"));
     }
 
-    resolve_addrs(normalized).with_context(|| {
-        t!("errors.gateway.invalid_address", normalized = normalized).to_string()
-    })?;
+    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        return normalize_ws_address(trimmed).with_context(|| {
+            t!("errors.gateway.invalid_address", normalized = trimmed).to_string()
+        });
+    }
 
-    Ok(normalized.to_owned())
+    if trimmed.contains("://") {
+        bail!(
+            "{}",
+            t!("errors.gateway.invalid_address", normalized = trimmed)
+        );
+    }
+
+    normalize_host_port_address(trimmed)
+        .with_context(|| t!("errors.gateway.invalid_address", normalized = trimmed).to_string())
 }
 
 pub(crate) fn is_gateway_reachable(listen_addr: &str, connect_timeout: Duration) -> Result<bool> {
@@ -29,8 +42,58 @@ pub(crate) fn is_gateway_reachable(listen_addr: &str, connect_timeout: Duration)
     Ok(false)
 }
 
+fn normalize_ws_address(address: &str) -> Result<String> {
+    let url = Url::parse(address)?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        _ => bail!("unsupported websocket gateway scheme"),
+    }
+
+    if url.host_str().is_none() {
+        bail!("websocket gateway address must include a host");
+    }
+
+    Ok(address.to_owned())
+}
+
+fn normalize_host_port_address(address: &str) -> Result<String> {
+    if let Ok(ip) = address.parse::<IpAddr>() {
+        let host = ip.to_string();
+        return Ok(format_host_port(host.as_str(), DEFAULT_GATEWAY_PORT));
+    }
+
+    if let Some(ip) = address
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|value| value.parse::<IpAddr>().ok())
+    {
+        let host = ip.to_string();
+        return Ok(format_host_port(host.as_str(), DEFAULT_GATEWAY_PORT));
+    }
+
+    let url = Url::parse(format!("ws://{address}").as_str())?;
+
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("gateway address must be a host or host:port");
+    }
+
+    let host = url
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gateway address must include a host"))?;
+    let port = url.port().unwrap_or(DEFAULT_GATEWAY_PORT);
+
+    Ok(format_host_port(host, port))
+}
+
 fn resolve_addrs(listen_addr: &str) -> Result<Vec<SocketAddr>> {
-    let addrs: Vec<SocketAddr> = listen_addr
+    let socket_addr = resolve_socket_address_input(listen_addr)?;
+    let addrs: Vec<SocketAddr> = socket_addr
         .to_socket_addrs()
         .with_context(|| {
             t!("errors.gateway.resolve_failed", listen_addr = listen_addr).to_string()
@@ -45,6 +108,47 @@ fn resolve_addrs(listen_addr: &str) -> Result<Vec<SocketAddr>> {
     }
 
     Ok(addrs)
+}
+
+fn resolve_socket_address_input(address: &str) -> Result<String> {
+    let trimmed = address.trim();
+
+    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        let url = Url::parse(trimmed)?;
+        let host = url
+            .host_str()
+            .filter(|host| !host.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("websocket gateway address must include a host"))?;
+        let port = url
+            .port()
+            .or_else(|| default_port_for_ws_scheme(url.scheme()));
+
+        let Some(port) = port else {
+            bail!("websocket gateway address must include a port");
+        };
+
+        return Ok(format_host_port(host, port));
+    }
+
+    normalize_host_port_address(trimmed)
+}
+
+fn default_port_for_ws_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "ws" => Some(80),
+        "wss" => Some(443),
+        _ => None,
+    }
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn normalize_unspecified_addr(addr: SocketAddr) -> SocketAddr {

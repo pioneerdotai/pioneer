@@ -105,10 +105,11 @@ impl PioneerDesktop {
         }
 
         self.refresh_gateway_status();
+        self.sync_gateway_setup_form_state(Some(&self.gateway_setup_form_state), cx);
         cx.notify();
     }
 
-    fn refresh_gateway_status(&mut self) {
+    pub(in crate::app::flow) fn refresh_gateway_status(&mut self) {
         if self.gateway.connecting {
             if self.gateway.status.is_empty() {
                 self.gateway.status = t!("gateway.status.connecting").to_string();

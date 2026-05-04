@@ -33,6 +33,7 @@ futures-util.workspace = true
 chrono.workspace = true
 sys-locale.workspace = true
 rust-embed.workspace = true
+url.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 flate2.workspace = true
 tar.workspace = true

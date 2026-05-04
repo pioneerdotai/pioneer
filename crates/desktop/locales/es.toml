@@ -86,8 +86,14 @@ watch_dir_failed = "No se pudo observar el directorio de temas"
 open_failed = "no se pudo abrir la ventana de escritorio"
 
 [gateway.action]
+add = "Añadir pasarela"
 connect_remote = "Conectar pasarela remota"
 start_local = "Iniciar pasarela local"
+
+[gateway.add]
+description = "Conecta una pasarela remota o inicia la pasarela local."
+description_remote_only = "Conecta una pasarela remota."
+title = "Añadir pasarela"
 
 [gateway.endpoint]
 local_name = "Pasarela local"

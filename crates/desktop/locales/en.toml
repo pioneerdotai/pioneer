@@ -86,8 +86,14 @@ watch_dir_failed = "Failed to watch themes directory"
 open_failed = "failed to open desktop window"
 
 [gateway.action]
+add = "Add gateway"
 connect_remote = "Connect remote"
 start_local = "Start local gateway"
+
+[gateway.add]
+description = "Connect a remote gateway or start the local gateway."
+description_remote_only = "Connect a remote gateway."
+title = "Add gateway"
 
 [gateway.endpoint]
 local_name = "Local Gateway"

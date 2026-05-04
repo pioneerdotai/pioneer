@@ -86,8 +86,14 @@ watch_dir_failed = "テーマディレクトリの監視に失敗しました"
 open_failed = "デスクトップウィンドウを開けませんでした"
 
 [gateway.action]
+add = "ゲートウェイを追加"
 connect_remote = "リモートに接続"
 start_local = "ローカルゲートウェイを起動"
+
+[gateway.add]
+description = "リモートゲートウェイに接続するか、ローカルゲートウェイを起動します。"
+description_remote_only = "リモートゲートウェイに接続します。"
+title = "ゲートウェイを追加"
 
 [gateway.endpoint]
 local_name = "ローカルゲートウェイ"

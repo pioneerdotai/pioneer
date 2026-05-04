@@ -86,8 +86,14 @@ watch_dir_failed = "Theme-Verzeichnis konnte nicht überwacht werden"
 open_failed = "Desktop-Fenster konnte nicht geöffnet werden"
 
 [gateway.action]
+add = "Gateway hinzufügen"
 connect_remote = "Entferntes Gateway verbinden"
 start_local = "Lokales Gateway starten"
+
+[gateway.add]
+description = "Verbinde ein entferntes Gateway oder starte das lokale Gateway."
+description_remote_only = "Verbinde ein entferntes Gateway."
+title = "Gateway hinzufügen"
 
 [gateway.endpoint]
 local_name = "Lokales Gateway"

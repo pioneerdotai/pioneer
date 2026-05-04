@@ -87,6 +87,30 @@ impl GatewayRuntime {
         discovery::managed_gateway_requires_install()
     }
 
+    pub fn local_gateway_provisioned(&self) -> Result<bool> {
+        if self
+            .gateway_auth_token_for_endpoint(&self.registry.local)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+
+        if !Self::local_gateway_install_required() {
+            return Ok(true);
+        }
+
+        if crate::gateway::control::is_configured_service_active(
+            self.config.gateway.service_name.as_str(),
+        )? {
+            return Ok(true);
+        }
+
+        crate::gateway::connectivity::is_gateway_reachable(
+            self.config.gateway.listen_addr.as_str(),
+            self.timings.connect_timeout,
+        )
+    }
+
     pub fn active_gateway_id(&self) -> Option<&str> {
         self.registry.active_gateway_id.as_deref()
     }
@@ -579,6 +603,29 @@ mod tests {
             !runtime
                 .store_local_auth_token("local-token".to_owned())
                 .expect("store same local token")
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn local_gateway_provisioned_uses_saved_local_token() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path, secrets);
+
+        assert!(
+            runtime
+                .store_local_auth_token("local-token".to_owned())
+                .expect("store local token")
+        );
+
+        assert!(
+            runtime
+                .local_gateway_provisioned()
+                .expect("check local provisioned")
         );
 
         let _ = fs::remove_dir_all(&temp_dir);

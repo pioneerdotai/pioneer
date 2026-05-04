@@ -19,13 +19,53 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[test]
 fn normalize_address_rejects_empty_and_invalid_values() {
     assert!(normalize_address(" ").is_err());
-    assert!(normalize_address("localhost").is_err());
+    assert!(normalize_address("http://gateway.example.com").is_err());
+    assert!(normalize_address("gateway.example.com/path").is_err());
+    assert!(normalize_address("gateway.example.com:not-a-port").is_err());
 }
 
 #[test]
 fn normalize_address_trims_value() {
     let value = normalize_address(" 0.0.0.0:17878 ").expect("address should be valid");
     assert_eq!(value, "0.0.0.0:17878");
+}
+
+#[test]
+fn normalize_address_accepts_host_only_and_domains() {
+    assert_eq!(
+        normalize_address("127.0.0.1").expect("ip without port should be valid"),
+        "127.0.0.1:17878"
+    );
+    assert_eq!(
+        normalize_address("localhost").expect("localhost without port should be valid"),
+        "localhost:17878"
+    );
+    assert_eq!(
+        normalize_address("gateway.example.com").expect("domain without port should be valid"),
+        "gateway.example.com:17878"
+    );
+    assert_eq!(
+        normalize_address("edge.gateway.example.co.uk:443")
+            .expect("subdomain with port should be valid"),
+        "edge.gateway.example.co.uk:443"
+    );
+}
+
+#[test]
+fn normalize_address_accepts_websocket_urls_and_ipv6() {
+    assert_eq!(
+        normalize_address("wss://gateway.example.com/socket")
+            .expect("websocket url should be valid"),
+        "wss://gateway.example.com/socket"
+    );
+    assert_eq!(
+        normalize_address("::1").expect("ipv6 without port should be valid"),
+        "[::1]:17878"
+    );
+    assert_eq!(
+        normalize_address("[::1]:22000").expect("ipv6 with port should be valid"),
+        "[::1]:22000"
+    );
 }
 
 #[test]

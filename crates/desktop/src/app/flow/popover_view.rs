@@ -68,6 +68,7 @@ impl PioneerDesktop {
 
         Popover::new("gateway-switcher-popover")
             .anchor(Corner::TopRight)
+            .p_0()
             .trigger(
                 Button::new("gateway-switcher-button")
                     .ghost()
@@ -147,7 +148,7 @@ impl PioneerDesktop {
                 let gateway_option_active_style = gateway_option_active_style;
                 let active_indicator_color = active_indicator_color;
 
-                move |_, _, popover_cx| {
+                move |_, _window, popover_cx| {
                     let popover_entity = popover_cx.entity();
 
                     v_flex()
@@ -163,22 +164,66 @@ impl PioneerDesktop {
                             )
                         })
                         .when(!gateway_endpoints.is_empty(), |this| {
-                            this.children(gateway_endpoints.iter().enumerate().map(
-                                |(index, endpoint)| {
-                                    Self::render_gateways_popover_option(
-                                        index,
-                                        endpoint,
-                                        active_gateway_id.as_deref(),
-                                        gateway_selection_locked,
-                                        gateway_option_style,
-                                        gateway_option_active_style,
-                                        active_indicator_color,
-                                        desktop_entity.clone(),
-                                        popover_entity.clone(),
-                                    )
-                                },
-                            ))
+                            this.child(
+                                div().w_full().p_2().pb_0().children(
+                                    gateway_endpoints.iter().enumerate().map(
+                                        |(index, endpoint)| {
+                                            Self::render_gateways_popover_option(
+                                                index,
+                                                endpoint,
+                                                active_gateway_id.as_deref(),
+                                                gateway_selection_locked,
+                                                gateway_option_style,
+                                                gateway_option_active_style,
+                                                active_indicator_color,
+                                                desktop_entity.clone(),
+                                                popover_entity.clone(),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            )
                         })
+                        .child(Divider::horizontal())
+                        .child(h_flex().p_2().pt_0().justify_start().child(
+                            Self::render_add_gateway_popover_action(
+                                gateway_selection_locked,
+                                desktop_entity.clone(),
+                                popover_entity.clone(),
+                            ),
+                        ))
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_add_gateway_popover_action(
+        gateway_selection_locked: bool,
+        desktop_entity: Entity<Self>,
+        popover_entity: Entity<PopoverState>,
+    ) -> AnyElement {
+        Button::new("add-gateway")
+            .ghost()
+            .xsmall()
+            .compact()
+            .disabled(gateway_selection_locked)
+            .child(div().opacity(0.6).child(IconName::Plus))
+            .child(
+                div()
+                    .opacity(0.6)
+                    .child(t!("gateway.action.add").to_string()),
+            )
+            .on_click({
+                let desktop_entity = desktop_entity.clone();
+                let popover_entity = popover_entity.clone();
+
+                move |_, window, cx| {
+                    let _ = popover_entity.update(cx, |state, cx| {
+                        state.dismiss(window, cx);
+                    });
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.open_add_gateway_dialog(window, cx);
+                    });
                 }
             })
             .into_any_element()
@@ -235,6 +280,7 @@ impl PioneerDesktop {
                         view.activate_gateway(
                             endpoint_id_for_click.clone(),
                             endpoint_name_for_click.clone(),
+                            window,
                             cx,
                         )
                     });

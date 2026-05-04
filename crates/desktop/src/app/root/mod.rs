@@ -6,6 +6,7 @@ mod view;
 use crate::{
     app::{
         conversation::Conversation,
+        gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         skills::details::table::SkillDiagnosticsTableDelegate,
         thread::{ThreadCoordinator, view::timeline::model::TimelineRow},
     },
@@ -33,6 +34,53 @@ use std::{
 pub(super) enum GatewaySetupAction {
     ConnectRemote,
     StartLocal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GatewayOperationSource {
+    InitialSetup,
+    AddGatewayDialog,
+}
+
+impl GatewayOperationSource {
+    pub(super) fn close_dialog_on_success(self) -> bool {
+        matches!(self, Self::AddGatewayDialog)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GatewaySetupFormMode {
+    Initial { allow_local: bool },
+    AddGateway { allow_local: bool },
+}
+
+impl GatewaySetupFormMode {
+    pub(super) fn allow_local(self) -> bool {
+        match self {
+            Self::Initial { allow_local } | Self::AddGateway { allow_local } => allow_local,
+        }
+    }
+
+    pub(super) fn operation_source(self) -> GatewayOperationSource {
+        match self {
+            Self::Initial { .. } => GatewayOperationSource::InitialSetup,
+            Self::AddGateway { .. } => GatewayOperationSource::AddGatewayDialog,
+        }
+    }
+
+    pub(super) fn remote_button_id(self) -> &'static str {
+        match self {
+            Self::Initial { .. } => "connect-remote-gateway",
+            Self::AddGateway { .. } => "add-connect-remote-gateway",
+        }
+    }
+
+    pub(super) fn local_button_id(self) -> &'static str {
+        match self {
+            Self::Initial { .. } => "start-local-gateway",
+            Self::AddGateway { .. } => "add-start-local-gateway",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,9 +285,7 @@ pub struct PioneerDesktop {
     pub(super) ready_turn_resume_threads: VecDeque<String>,
     pub(super) ready_turn_resume_thread_set: HashSet<String>,
     pub(super) turn_timeline_refresh: HashMap<(String, String), TurnTimelineRefreshState>,
-    pub(super) gateway_name_input_state: Entity<InputState>,
-    pub(super) gateway_address_input_state: Entity<InputState>,
-    pub(super) gateway_token_input_state: Entity<InputState>,
+    pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,
     pub(super) show_sidebar: bool,
     pub(super) sidebar_panel_width: Pixels,

@@ -27,7 +27,8 @@ use super::thread_list::{
     TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
 };
 use super::{
-    build_ws_connect_spec, default_user_command_bin_dir_label, is_transient_thread_start_error,
+    build_ws_connect_spec, default_user_command_bin_dir_label,
+    gateway_activation_requires_local_start, is_transient_thread_start_error,
     normalize_workspace_id, should_apply_gateway_operation_result, should_apply_ws_event,
     should_refresh_workspace_bound_data, thread_start_retry_delay, turn_resume_retry_delay,
     warning_notification_messages,
@@ -83,6 +84,17 @@ fn ws_connect_spec_uses_resolved_in_memory_auth_token() {
 fn operation_epoch_fencing_ignores_stale_async_results() {
     assert!(should_apply_gateway_operation_result(3, 3));
     assert!(!should_apply_gateway_operation_result(4, 3));
+}
+
+#[test]
+fn gateway_activation_requires_local_start_only_for_local_endpoint() {
+    assert!(gateway_activation_requires_local_start(Some(
+        GatewayEndpointKind::Local
+    )));
+    assert!(!gateway_activation_requires_local_start(Some(
+        GatewayEndpointKind::Remote
+    )));
+    assert!(!gateway_activation_requires_local_start(None));
 }
 
 #[test]

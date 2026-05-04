@@ -86,8 +86,14 @@ watch_dir_failed = "Impossible de surveiller le dossier des thèmes"
 open_failed = "impossible d'ouvrir la fenêtre de l'application de bureau"
 
 [gateway.action]
+add = "Ajouter une passerelle"
 connect_remote = "Connecter une passerelle distante"
 start_local = "Démarrer la passerelle locale"
+
+[gateway.add]
+description = "Connectez une passerelle distante ou démarrez la passerelle locale."
+description_remote_only = "Connectez une passerelle distante."
+title = "Ajouter une passerelle"
 
 [gateway.endpoint]
 local_name = "Passerelle locale"

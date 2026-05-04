@@ -86,8 +86,14 @@ watch_dir_failed = "थीम डायरेक्टरी को वॉच �
 open_failed = "डेस्कटॉप विंडो खोलने में विफल"
 
 [gateway.action]
+add = "गेटवे जोड़ें"
 connect_remote = "दूरस्थ गेटवे से कनेक्ट करें"
 start_local = "स्थानीय गेटवे शुरू करें"
+
+[gateway.add]
+description = "दूरस्थ गेटवे से कनेक्ट करें या स्थानीय गेटवे शुरू करें।"
+description_remote_only = "दूरस्थ गेटवे से कनेक्ट करें।"
+title = "गेटवे जोड़ें"
 
 [gateway.endpoint]
 local_name = "स्थानीय गेटवे"
