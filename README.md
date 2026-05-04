@@ -18,6 +18,8 @@
 <p align="center">
   <a href="https://docs.getpioneer.dev">Docs</a>
   ·
+  <a href="https://docs.getpioneer.dev/getting-started/installation">Installation</a>
+  ·
   <a href="https://docs.getpioneer.dev/getting-started/quickstart">Quick start</a>
   ·
   <a href="https://docs.getpioneer.dev/architecture/overview">Architecture</a>
