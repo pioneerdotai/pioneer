@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_task_run_task_number")]
+    #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub task_id: String,
     pub trigger_id: Option<String>,
     pub parent_run_id: Option<String>,
+    #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub run_group_id: String,
+    #[sea_orm(unique_key = "uidx_task_run_group_attempt")]
     pub attempt_number: i64,
     pub retry_of_run_id: Option<String>,
     pub ready_at: Option<DateTimeWithTimeZone>,

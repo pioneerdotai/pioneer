@@ -2,6 +2,12 @@
 
 pub mod prelude;
 
+pub mod agent_memory;
+pub mod agent_memory_candidate;
+pub mod agent_memory_capsule;
+pub mod agent_memory_event;
+pub mod agent_memory_policy_decision;
+pub mod agent_memory_repair_job;
 pub mod attachment_upload_registry;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
