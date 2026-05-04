@@ -69,6 +69,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         runtime_home = %runtime_home.display(),
         "runtime home directory is ready"
     );
+    let identity_files_report = pioneer_promt::ensure_runtime_identity_files(&runtime_home)
+        .context("failed to prepare runtime identity files")?;
+    info!(
+        created = identity_files_report.created.len(),
+        existing = identity_files_report.existing.len(),
+        "runtime identity files are ready"
+    );
 
     load_gateway_settings(&runtime_home, &config)?;
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);

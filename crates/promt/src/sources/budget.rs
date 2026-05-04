@@ -84,7 +84,12 @@ pub fn apply_budgets(
 
         total_used += content.chars().count();
 
-        if remaining_before_total == 0 || content.is_empty() {
+        let preserve_empty_identity_file = matches!(
+            file.kind,
+            BootstrapFileKind::Soul | BootstrapFileKind::Identity
+        ) && original_count == 0;
+
+        if remaining_before_total == 0 || (content.is_empty() && !preserve_empty_identity_file) {
             continue;
         }
 

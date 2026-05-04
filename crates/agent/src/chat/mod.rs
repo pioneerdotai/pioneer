@@ -16,6 +16,7 @@ use crate::{
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
+use pioneer_config::AppConfig;
 use pioneer_promt::{
     CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptLimits, PromptProfile,
     PromptSectionId, ToolRetryInstructionKind, compile_prompt, render_tool_retry_instruction,
@@ -165,7 +166,33 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
 }
 
 fn compile_agent_prompt_bundle(
-    workspace_root: &std::path::Path,
+    skills_prompt: Option<String>,
+    retry_instruction: Option<String>,
+    include_task_orchestration_policy: bool,
+    continue_generation_hint: bool,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<CompiledPromptBundle, ChatTurnError> {
+    let prompt_root = AppConfig::load()
+        .map_err(|error| ChatTurnError::Terminal(format!("failed to load app config: {error}")))?
+        .runtime_home_dir()
+        .map_err(|error| {
+            ChatTurnError::Terminal(format!("failed to resolve runtime home: {error:#}"))
+        })?;
+
+    compile_agent_prompt_bundle_with_prompt_root(
+        prompt_root.as_path(),
+        skills_prompt,
+        retry_instruction,
+        include_task_orchestration_policy,
+        continue_generation_hint,
+        thread_id,
+        turn_id,
+    )
+}
+
+fn compile_agent_prompt_bundle_with_prompt_root(
+    prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     include_task_orchestration_policy: bool,
@@ -182,7 +209,7 @@ fn compile_agent_prompt_bundle(
     );
 
     let bundle = compile_prompt(PromptCompileInput {
-        workspace_root: workspace_root.to_path_buf(),
+        workspace_root: prompt_root.to_path_buf(),
         profile: PromptProfile::AssistantFull,
         skills_prompt,
         retry_instruction,
@@ -958,7 +985,6 @@ async fn execute_agent_provider_response(
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
     let initial_prompt_bundle = compile_agent_prompt_bundle(
-        workdir.as_path(),
         skills_prompt.clone(),
         None,
         include_task_orchestration_policy,
@@ -1237,7 +1263,6 @@ async fn execute_agent_provider_response(
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
                 if next_retry_instruction != applied_retry_instruction {
                     let refreshed_prompt_bundle = compile_agent_prompt_bundle(
-                        workdir.as_path(),
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
                         include_task_orchestration_policy,
@@ -1342,7 +1367,6 @@ async fn execute_agent_provider_response(
                         normalize_optional_prompt(Some(instruction.clone()));
                     if pending_retry_instruction != applied_retry_instruction {
                         let refreshed_prompt_bundle = compile_agent_prompt_bundle(
-                            workdir.as_path(),
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
                             include_task_orchestration_policy,
@@ -1989,7 +2013,6 @@ async fn execute_agent_provider_response(
 
             if next_retry_instruction != applied_retry_instruction {
                 let refreshed_prompt_bundle = compile_agent_prompt_bundle(
-                    workdir.as_path(),
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
                     include_task_orchestration_policy,
@@ -2320,7 +2343,8 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_recovered_tool_llm_context, build_user_message, retain_agent_attachment_messages,
+        append_recovered_tool_llm_context, build_user_message,
+        compile_agent_prompt_bundle_with_prompt_root, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
     };
     use crate::RetainedToolLlmContext;
@@ -2328,6 +2352,22 @@ mod tests {
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Role,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "pioneer_agent_chat_{name}_{}_{}",
+            std::process::id(),
+            now_nanos
+        ));
+        let _ = std::fs::remove_dir_all(root.as_path());
+        std::fs::create_dir_all(root.as_path()).expect("create temp dir");
+        root
+    }
 
     fn image_part(path: &str, size_bytes: Option<u64>) -> MessageContentPart {
         MessageContentPart::image(MessageAttachment {
@@ -2368,6 +2408,35 @@ mod tests {
             name: Some("computer_use".to_owned()),
             tool_calls: None,
         }
+    }
+
+    #[test]
+    fn prompt_bundle_uses_runtime_home_root_not_workspace_root() {
+        let workspace_root = temp_dir("workspace_root");
+        let runtime_home = temp_dir("runtime_home");
+        std::fs::write(workspace_root.join("SOUL.md"), "workspace soul")
+            .expect("write workspace SOUL");
+        std::fs::write(workspace_root.join("IDENTITY.md"), "workspace identity")
+            .expect("write workspace IDENTITY");
+        std::fs::write(runtime_home.join("SOUL.md"), "runtime soul").expect("write runtime SOUL");
+        std::fs::write(runtime_home.join("IDENTITY.md"), "runtime identity")
+            .expect("write runtime IDENTITY");
+
+        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+            runtime_home.as_path(),
+            None,
+            None,
+            false,
+            false,
+            "thread_test",
+            "turn_test",
+        )
+        .expect("compile prompt bundle");
+
+        assert!(bundle.full_system_text.contains("runtime soul"));
+        assert!(bundle.full_system_text.contains("runtime identity"));
+        assert!(!bundle.full_system_text.contains("workspace soul"));
+        assert!(!bundle.full_system_text.contains("workspace identity"));
     }
 
     #[test]

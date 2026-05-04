@@ -53,8 +53,8 @@ fn build_task_orchestration_policy_section() -> PromptSection {
     }
 }
 
-fn format_file_block(file: &BudgetedBootstrapFile) -> String {
-    content::IDENTITY_FILE_BLOCK_TEMPLATE
+fn format_file_block(file: &BudgetedBootstrapFile, include_evolution_note: bool) -> String {
+    let mut block = content::IDENTITY_FILE_BLOCK_TEMPLATE
         .replace(content::IDENTITY_FILE_BLOCK_NAME_TOKEN, file.name.as_str())
         .replace(
             content::IDENTITY_FILE_BLOCK_PATH_TOKEN,
@@ -63,7 +63,18 @@ fn format_file_block(file: &BudgetedBootstrapFile) -> String {
         .replace(
             content::IDENTITY_FILE_BLOCK_CONTENT_TOKEN,
             file.content.trim(),
-        )
+        );
+
+    if include_evolution_note {
+        if file.content.trim().is_empty() {
+            block.push('\n');
+        } else {
+            block.push_str("\n\n");
+        }
+        block.push_str(content::IDENTITY_FILE_EVOLUTION_NOTE_TEMPLATE);
+    }
+
+    block
 }
 
 fn build_identity_file_section(
@@ -71,37 +82,27 @@ fn build_identity_file_section(
     title: &str,
     file: &BudgetedBootstrapFile,
 ) -> Option<PromptSection> {
-    if file.content.trim().is_empty() {
+    if file.content.trim().is_empty()
+        && !matches!(
+            id,
+            PromptSectionId::SoulCore | PromptSectionId::IdentityCore
+        )
+    {
         return None;
     }
+
+    let include_evolution_note = matches!(
+        id,
+        PromptSectionId::SoulCore | PromptSectionId::IdentityCore
+    );
 
     Some(PromptSection {
         id,
         stability: PromptStability::Stable,
         title: title.to_owned(),
-        content: format_file_block(file),
+        content: format_file_block(file, include_evolution_note),
         sources: vec![file.path.display().to_string()],
     })
-}
-
-fn build_default_soul_core_section() -> PromptSection {
-    PromptSection {
-        id: PromptSectionId::SoulCore,
-        stability: PromptStability::Stable,
-        title: content::SECTION_TITLE_SOUL_CORE.to_owned(),
-        content: content::DEFAULT_SOUL_CORE_PROMPT.to_owned(),
-        sources: Vec::new(),
-    }
-}
-
-fn build_default_identity_core_section() -> PromptSection {
-    PromptSection {
-        id: PromptSectionId::IdentityCore,
-        stability: PromptStability::Stable,
-        title: content::SECTION_TITLE_IDENTITY_CORE.to_owned(),
-        content: content::DEFAULT_IDENTITY_CORE_PROMPT.to_owned(),
-        sources: Vec::new(),
-    }
 }
 
 fn diagnostic_matches_file(diagnostic: &PromptDiagnostic, canonical_name: &str) -> bool {
@@ -316,8 +317,6 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
             )
         {
             sections.push(section);
-        } else {
-            sections.push(build_default_soul_core_section());
         }
 
         if let Some(file) = identity_file.as_ref()
@@ -328,8 +327,6 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
             )
         {
             sections.push(section);
-        } else {
-            sections.push(build_default_identity_core_section());
         }
 
         if let Some(file) = user_file.as_ref()
@@ -720,8 +717,8 @@ mod tests {
             .iter()
             .map(|section| section.id)
             .collect::<Vec<_>>();
-        assert!(section_ids.contains(&PromptSectionId::SoulCore));
-        assert!(section_ids.contains(&PromptSectionId::IdentityCore));
+        assert!(!section_ids.contains(&PromptSectionId::SoulCore));
+        assert!(!section_ids.contains(&PromptSectionId::IdentityCore));
         assert!(!section_ids.contains(&PromptSectionId::UserPersona));
 
         let source_manifest = &compiled.source_manifest;
@@ -741,10 +738,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_identity_file_is_ignored_without_failure() {
+    fn empty_runtime_identity_files_are_kept_without_default_fallback() {
         let root = temp_workspace("empty_identity");
         std::fs::write(root.join("SOUL.md"), "\n \n").expect("write empty SOUL");
-        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("IDENTITY.md"), "").expect("write empty IDENTITY");
         std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
 
         let compiled = compile_prompt(PromptCompileInput {
@@ -769,6 +766,8 @@ mod tests {
         assert!(section_ids.contains(&PromptSectionId::SoulCore));
         assert!(section_ids.contains(&PromptSectionId::IdentityCore));
         assert!(section_ids.contains(&PromptSectionId::UserPersona));
+        assert!(!compiled.full_system_text.contains("## Core Truths"));
+        assert!(!compiled.full_system_text.contains("### Who Am I?"));
     }
 
     #[test]
@@ -807,8 +806,35 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_used_when_soul_and_identity_are_missing() {
+    fn runtime_identity_files_include_evolution_note() {
+        let root = temp_workspace("runtime_identity_note");
+        std::fs::write(root.join("SOUL.md"), "Voice: exact and serious").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer Custom").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root.clone(),
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let note = "This file is yours to evolve. As you learn who you are, update it.";
+        assert_eq!(compiled.full_system_text.matches(note).count(), 2);
+        assert!(!compiled.full_system_text.contains("File path:"));
+    }
+
+    #[test]
+    fn seed_files_are_used_after_runtime_identity_files_are_created() {
         let root = temp_workspace("defaults_missing_soul_identity");
+        crate::ensure_runtime_identity_files(root.as_path()).expect("ensure runtime identity");
         std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
 
         let compiled = compile_prompt(PromptCompileInput {

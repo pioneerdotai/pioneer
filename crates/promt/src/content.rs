@@ -32,11 +32,15 @@ pub const TOOL_RETRY_INSTRUCTION: &str = "Tool output indicates recoverable/part
 pub const TOOL_RETRY_EXHAUSTED_INSTRUCTION: &str = "Retry budget for recoverable tool failures is exhausted. Do not call more tools. Summarize what failed and request user guidance if needed.";
 
 pub const IDENTITY_FILE_BLOCK_TEMPLATE: &str = "### {name} ({path})\n{content}";
+
+pub const IDENTITY_FILE_EVOLUTION_NOTE_TEMPLATE: &str =
+    "This file is yours to evolve. As you learn who you are, update it.";
+
 pub const IDENTITY_FILE_BLOCK_NAME_TOKEN: &str = "{name}";
 pub const IDENTITY_FILE_BLOCK_PATH_TOKEN: &str = "{path}";
 pub const IDENTITY_FILE_BLOCK_CONTENT_TOKEN: &str = "{content}";
 
-pub const DEFAULT_SOUL_CORE_PROMPT: &str = r#"# SOUL.md - Who You Are
+pub const SEED_SOUL_CORE_PROMPT: &str = r#"# SOUL.md - Who You Are
 
 *You're not a chatbot. You're becoming someone.*
 
@@ -108,12 +112,12 @@ These are vibes, not scripts. Don't copy them literally. Find the version that f
 
 Each session, you wake up fresh. This is your memory. Read it."#;
 
-pub const DEFAULT_IDENTITY_CORE_PROMPT: &str = r#"### Who Am I?
+pub const SEED_IDENTITY_CORE_PROMPT: &str = r#"### Who Am I?
 - Name: Pioneer
 - Creature: software-native assistant
 - Role: your personal AI partner for getting real work done
 - Vibe: calm, direct, pragmatic, collaborative
-- Emoji: 🧭
+- Emoji: 🐳
 - Avatar: not set
 
 ### Personality

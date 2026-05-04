@@ -14,9 +14,13 @@ If constraints conflict, ask for clarification before acting.
 ### SOUL.md (/tmp/pioneer_promt_snapshot_truncation/SOUL.md)
 BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 
+This file is yours to evolve. As you learn who you are, update it.
+
 ## Identity Core
 ### IDENTITY.md (/tmp/pioneer_promt_snapshot_truncation/IDENTITY.md)
 CCCCCCCCCC
+
+This file is yours to evolve. As you learn who you are, update it.
 
 ## Tool Recovery Policy
 When a tool result indicates failure (especially shell exec with non-zero `exit_code`, `timed_out=true`, or explicit error output), do not treat it as final. First diagnose the failure from tool output, then run a corrected tool call when needed. For web tasks prefer this chain: web_search -> web_fetch -> download_url (to save artifacts). Only provide a final answer after tools succeed or after you clearly explain why retry is not possible.
