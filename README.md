@@ -83,19 +83,19 @@ Use the gateway bootstrap scripts when you want to install or update the gateway
 macOS and Linux:
 
 ```bash
-curl -fsSL https://pioneer.ai/install.sh | bash
+curl -fsSL https://getpioneer.dev/install.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-iwr -useb https://pioneer.ai/install.ps1 | iex
+iwr -useb https://getpioneer.dev/install.ps1 | iex
 ```
 
 Windows CMD:
 
 ```cmd
-curl -fsSL https://pioneer.ai/install.cmd -o install.cmd && install.cmd && del install.cmd
+curl -fsSL https://getpioneer.dev/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
 The bootstrap scripts download a release asset, verify checksums, and then run the native installer path through `pioneer install --source local`. The installer registers a user-level gateway service and exposes the `pioneer` command.

@@ -351,7 +351,7 @@ try {
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
   <Bundle Name="Pioneer" Manufacturer="Pioneer" Version="`$(var.Version)" UpgradeCode="`$(var.BundleUpgradeCode)" IconSourceFile="`$(var.AppIconPath)">
     <BootstrapperApplication>
-      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="https://pioneer.ai/license" />
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="https://getpioneer.dev/license" />
     </BootstrapperApplication>
     <Chain>
       <MsiPackage SourceFile="`$(var.MsiPath)" />

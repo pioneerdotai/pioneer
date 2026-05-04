@@ -2,7 +2,7 @@
 setlocal
 
 set "SCRIPT_URL=%PIONEER_INSTALL_POWERSHELL_URL%"
-if "%SCRIPT_URL%"=="" set "SCRIPT_URL=https://pioneer.ai/install.ps1"
+if "%SCRIPT_URL%"=="" set "SCRIPT_URL=https://getpioneer.dev/install.ps1"
 
 set "TMP_PS1=%TEMP%\pioneer-install-%RANDOM%%RANDOM%.ps1"
 
