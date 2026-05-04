@@ -66,7 +66,7 @@ fn parse_garbage_collection_command(args: impl Iterator<Item = String>) -> Resul
         match arg.as_str() {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
-            flag => bail!("unexpected argument for secrets gc: {flag}"),
+            flag => bail!("unexpected argument for secrets garbage-collection: {flag}"),
         }
     }
     Ok(SecretsCommand::Gc { dry_run, json })
@@ -244,7 +244,7 @@ fn permission_status_label(status: SecretPermissionHealthStatus) -> &'static str
 fn secrets_help_text() -> &'static str {
     "Usage:
   pioneer secrets status [--json]
-  pioneer secrets gc [--dry-run] [--json]
+  pioneer secrets garbage-collection [--dry-run] [--json]
   pioneer secrets rotate-jwt-token superuser [--json]"
 }
 
@@ -274,25 +274,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_gc_command_with_flexible_flag_order() {
+    fn parses_garbage_collection_command_with_flexible_flag_order() {
         assert_eq!(
-            parse_secrets_command(["gc"].into_iter().map(str::to_owned)).expect("parse"),
+            parse_secrets_command(["garbage-collection"].into_iter().map(str::to_owned))
+                .expect("parse"),
             SecretsCommand::Gc {
                 dry_run: false,
                 json: false,
             }
         );
         assert_eq!(
-            parse_secrets_command(["gc", "--dry-run"].into_iter().map(str::to_owned))
-                .expect("parse"),
+            parse_secrets_command(
+                ["garbage-collection", "--dry-run"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .expect("parse"),
             SecretsCommand::Gc {
                 dry_run: true,
                 json: false,
             }
         );
         assert_eq!(
-            parse_secrets_command(["gc", "--json", "--dry-run"].into_iter().map(str::to_owned))
-                .expect("parse"),
+            parse_secrets_command(
+                ["garbage-collection", "--json", "--dry-run"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .expect("parse"),
             SecretsCommand::Gc {
                 dry_run: true,
                 json: true,
@@ -331,7 +340,14 @@ mod tests {
         assert!(
             parse_secrets_command(["status", "--dry-run"].into_iter().map(str::to_owned)).is_err()
         );
-        assert!(parse_secrets_command(["gc", "--force"].into_iter().map(str::to_owned)).is_err());
+        assert!(
+            parse_secrets_command(
+                ["garbage-collection", "--force"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]

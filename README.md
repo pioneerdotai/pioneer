@@ -25,6 +25,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
 - **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
 - **Bring your own model** - built-in providers for OpenAI, Anthropic, OpenRouter, Gemini, Azure OpenAI, Bedrock, Ollama, Copilot, Claude Code, Gemini CLI, Kilo CLI, and many OpenAI-compatible endpoints.
+- **Keystore-backed secrets** - provider API keys, MCP env/header secrets, superuser JWT signing material, and desktop gateway bearer tokens are stored in `keystore.db` instead of ordinary TOML or domain tables.
 - **Real tools** - shell sessions, file reads and edits, patch application, grep, web search/fetch, URL downloads, computer use, MCP tool proxying, and dynamic skill tools.
 - **MCP servers** - install and manage servers compatible with [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.
 - **Skills** - compatible with the [Agent Skills specification](https://agentskills.io/home), with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
@@ -68,7 +69,7 @@ This makes the gateway useful as a coordinator: one agent can break work into su
 
 ## MCP Servers
 
-The gateway is also the MCP runtime. It installs MCP servers, stores their configuration and secrets, validates definitions, starts and restarts runtimes, tracks health, and keeps a catalog of exposed tools, resources, resource templates, and prompts.
+The gateway is also the MCP runtime. It installs MCP servers, stores redacted configuration in `gateway.db`, stores secret values in `keystore.db`, validates definitions, starts and restarts runtimes, tracks health, and keeps a catalog of exposed tools, resources, resource templates, and prompts.
 
 MCP is scoped by gateway and workspace, so different gateways and workspaces can have different external capabilities. A work gateway can connect to work systems, a home gateway can connect to personal automations, and experimental gateways can run separate MCP servers without leaking tools or secrets across environments.
 
@@ -161,6 +162,9 @@ Useful commands after installation:
 pioneer status                  # check service status and gateway reachability
 pioneer start                   # start the gateway service
 pioneer issue-superuser-token   # print a JWT for privileged clients
+pioneer secrets status          # inspect keystore status without printing secret values
+pioneer secrets garbage-collection --dry-run
+pioneer secrets rotate-jwt-token superuser
 pioneer update                  # update using the configured release source
 pioneer stop                    # stop and unregister the gateway service
 pioneer version
@@ -175,6 +179,31 @@ pioneer install --source release --channel stable
 ```
 
 The same options are available through `pioneer update`. Release-based install/update requires a published gateway asset and matching `SHA256SUMS` for the current OS and architecture.
+
+## Secret Storage
+
+Pioneer stores runtime secret values in `keystore.db` under the runtime home, next to `gateway.db`. The gateway uses it for provider API keys, MCP env/header secret values, and the current singleton superuser JWT signing material. The desktop app also uses the same keystore backend for gateway bearer tokens; `gateway-registry.toml` stores only `auth_token_ref` values.
+
+The generated `gateway-settings.toml` contains only:
+
+```toml
+[secrets]
+backend = "keystore"
+```
+
+It does not contain `jwt_secret`, provider key tables, or MCP secret tables. `gateway.db` stores normal domain state, redacted MCP transport/source data, and secret refs, not raw secret values.
+
+Current keystore storage is intentionally unencrypted. Pioneer hardens the runtime directory and SQLite files with private filesystem permissions, but any OS user or process that can read the runtime home can read `keystore.db`. Encryption at rest is planned separately.
+
+Useful maintenance commands:
+
+```bash
+pioneer secrets status [--json]
+pioneer secrets garbage-collection [--dry-run] [--json]
+pioneer secrets rotate-jwt-token superuser [--json]
+```
+
+`secrets status` prints counts, permission health, encryption status, and MCP orphan status without printing secret values. `secrets garbage-collection` only removes orphaned MCP secret values. `secrets rotate-jwt-token superuser` rotates the superuser JWT signing material and invalidates existing superuser bearer tokens; run `pioneer issue-superuser-token` afterwards to issue a fresh bearer token.
 
 ## Installer Notes
 
@@ -245,10 +274,11 @@ If Windows signing secrets are absent, Windows artifacts are built unsigned and 
 
 | Path | Purpose |
 | --- | --- |
-| `crates/gateway` | Long-running gateway service, transport, auth, bootstrap, sessions, workspaces, threads, MCP, skills, tasks, and message dispatch. |
+| `crates/gateway` | Long-running gateway service, transport, auth, bootstrap, sessions, workspaces, threads, MCP, skills, tasks, secrets orchestration, and message dispatch. |
 | `crates/desktop` | Native GPUI desktop app (`pioneer-app`). |
-| `crates/cli` | `pioneer` and `pioneer-dev` binaries, installer, updater, service manager, status, and token issuance. |
+| `crates/cli` | `pioneer` and `pioneer-dev` binaries, installer, updater, service manager, status, token issuance, and keystore maintenance commands. |
 | `crates/agent` | Agent turn execution and tool orchestration. |
+| `crates/keystore` | Secret storage facade backed by `db-keystore`, stable secret ids, metadata, test memory store, and filesystem permission hardening. |
 | `crates/protocol` | JSON-RPC request, response, notification, thread, turn, task, MCP, skill, provider, and workspace types. |
 | `crates/provider` | LLM provider abstraction, adapters, model listing, streaming, tool calls, and attachment handling. |
 | `crates/tools` | Built-in tool specs, runtime, routing, output policy, recovery, and handlers. |

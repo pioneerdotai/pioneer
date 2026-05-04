@@ -423,7 +423,7 @@ fn help_text() -> String {
   {command} status [--json]     Show gateway service status
   {command} issue-superuser-token  Generate a superuser JWT and print it
   {command} secrets status [--json]  Show keystore status without secret values
-  {command} secrets gc [--dry-run] [--json]  Clean orphan MCP secret values
+  {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} secrets rotate-jwt-token superuser [--json]  Rotate superuser JWT signing material
   {command} stop                Stop and uninstall the persistent gateway service
   {command} version [--json]    Show {command} version
