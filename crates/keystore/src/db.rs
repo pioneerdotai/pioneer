@@ -30,7 +30,7 @@ impl DbKeyStoreConfig {
 
 #[derive(Clone)]
 pub struct DbKeyStore {
-    db: Arc<RawDbKeyStore>,
+    config: DbKeyStoreConfig,
 }
 
 impl DbKeyStore {
@@ -43,30 +43,38 @@ impl DbKeyStore {
             ensure_private_runtime_dir(parent)?;
         }
 
-        let db = RawDbKeyStore::new(RawDbKeyStoreConfig {
-            path: config.path.clone(),
-            encryption_opts: None,
-            allow_ambiguity: false,
-            vfs: None,
-            index_always: false,
-        })
-        .map_err(|err| KeystoreError::OpenFailed(err.to_string()))?;
+        let _db = open_raw_store(&config)?;
 
         ensure_keystore_sqlite_files(&config.path)?;
 
-        Ok(Self { db })
+        Ok(Self { config })
     }
 
-    fn entry(&self, id: &SecretId) -> Result<keyring_core::Entry> {
-        self.db
-            .build(id.service(), id.user(), None)
+    fn raw_store(&self) -> Result<Arc<RawDbKeyStore>> {
+        open_raw_store(&self.config)
+    }
+
+    fn read_entry(&self, db: &RawDbKeyStore, id: &SecretId) -> Result<keyring_core::Entry> {
+        db.build(id.service(), id.user(), None)
             .map_err(|err| KeystoreError::ReadFailed(err.to_string()))
     }
 }
 
+fn open_raw_store(config: &DbKeyStoreConfig) -> Result<Arc<RawDbKeyStore>> {
+    RawDbKeyStore::new(RawDbKeyStoreConfig {
+        path: config.path.clone(),
+        encryption_opts: None,
+        allow_ambiguity: false,
+        vfs: None,
+        index_always: false,
+    })
+    .map_err(|err| KeystoreError::OpenFailed(err.to_string()))
+}
+
 impl SecretStore for DbKeyStore {
     fn get_string(&self, id: &SecretId) -> Result<Option<String>> {
-        let entry = self.entry(id)?;
+        let db = self.raw_store()?;
+        let entry = self.read_entry(&db, id)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(err) if is_not_found(&err) => Ok(None),
@@ -75,9 +83,9 @@ impl SecretStore for DbKeyStore {
     }
 
     fn put_string(&self, id: &SecretId, value: &str, meta: SecretMeta) -> Result<()> {
+        let db = self.raw_store()?;
         let comment = encode_meta(&meta)?;
-        let entry = self
-            .db
+        let entry = db
             .build(id.service(), id.user(), None)
             .map_err(|err| KeystoreError::WriteFailed(err.to_string()))?;
 
@@ -92,8 +100,8 @@ impl SecretStore for DbKeyStore {
     }
 
     fn delete(&self, id: &SecretId) -> Result<bool> {
-        let entry = self
-            .db
+        let db = self.raw_store()?;
+        let entry = db
             .build(id.service(), id.user(), None)
             .map_err(|err| KeystoreError::DeleteFailed(err.to_string()))?;
 
@@ -105,7 +113,8 @@ impl SecretStore for DbKeyStore {
     }
 
     fn exists(&self, id: &SecretId) -> Result<bool> {
-        let entry = self.entry(id)?;
+        let db = self.raw_store()?;
+        let entry = self.read_entry(&db, id)?;
         match entry.get_attributes() {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
@@ -114,8 +123,8 @@ impl SecretStore for DbKeyStore {
     }
 
     fn list(&self, filter: SecretFilter) -> Result<Vec<SecretEntryMeta>> {
-        let entries = self
-            .db
+        let db = self.raw_store()?;
+        let entries = db
             .search(&HashMap::new())
             .map_err(|err| KeystoreError::ListFailed(err.to_string()))?;
 
@@ -241,6 +250,28 @@ mod tests {
         let (dir, _store) = open_temp_store();
 
         assert!(dir.path().join("keystore.db").exists());
+    }
+
+    #[test]
+    fn live_handles_do_not_hold_the_keystore_file_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = DbKeyStoreConfig::for_runtime_home(dir.path());
+        let first = DbKeyStore::open(config.clone()).expect("open first");
+        let second = DbKeyStore::open(config).expect("open second");
+        let id = SecretId::provider_api_key("openrouter").expect("id");
+
+        first
+            .put_string(
+                &id,
+                "shared-secret",
+                meta(SecretKind::ProviderApiKey, "openrouter", 1, 1),
+            )
+            .expect("write through first handle");
+
+        assert_eq!(
+            second.get_string(&id).expect("read through second handle"),
+            Some("shared-secret".to_owned())
+        );
     }
 
     #[test]
