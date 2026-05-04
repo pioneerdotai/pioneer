@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemoryActorKind",
+  "type": "string",
+  "enum": [
+    "user",
+    "assistant",
+    "extractor",
+    "system",
+    "tool"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemoryCategory",
+  "type": "string",
+  "enum": [
+    "identity",
+    "preference",
+    "biography",
+    "relationship",
+    "project_fact",
+    "project_decision",
+    "procedure",
+    "todo",
+    "constraint",
+    "communication_style",
+    "custom"
+  ]
+}

@@ -5,6 +5,7 @@ mod id;
 mod jsonrpc;
 mod markdown;
 mod mcp;
+mod memory;
 mod notification;
 mod provider;
 mod schema;
@@ -40,6 +41,16 @@ pub use mcp::{
     McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
+};
+pub use memory::{
+    MemoryActor, MemoryActorKind, MemoryCandidate, MemoryCandidateCreatedNotification,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
+    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
+    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryRecord,
+    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use provider::{

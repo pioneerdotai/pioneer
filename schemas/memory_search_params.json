@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemorySearchParams",
+  "type": "object",
+  "required": [
+    "query"
+  ],
+  "properties": {
+    "categories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MemoryCategory"
+      }
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "include_provenance": {
+      "default": false,
+      "type": "boolean"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "query": {
+      "type": "string"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MemoryScope"
+      }
+    },
+    "statuses": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MemoryStatus"
+      }
+    }
+  },
+  "definitions": {
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
+      ]
+    },
+    "MemoryScope": {
+      "type": "object",
+      "required": [
+        "key",
+        "kind"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryScopeKind"
+        }
+      }
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    },
+    "MemoryStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "superseded",
+        "deleted",
+        "expired"
+      ]
+    }
+  }
+}

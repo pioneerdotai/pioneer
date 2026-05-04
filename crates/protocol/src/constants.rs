@@ -49,6 +49,13 @@ pub mod methods {
     pub const TASK_RESUME: &str = "task/resume";
     pub const TASK_AGENDA: &str = "task/agenda";
     pub const TASK_DELIVERIES: &str = "task/deliveries";
+    pub const MEMORY_SEARCH: &str = "memory/search";
+    pub const MEMORY_GET: &str = "memory/get";
+    pub const MEMORY_LIST: &str = "memory/list";
+    pub const MEMORY_REMEMBER: &str = "memory/remember";
+    pub const MEMORY_FORGET: &str = "memory/forget";
+    pub const MEMORY_CANDIDATES_LIST: &str = "memory/candidates/list";
+    pub const MEMORY_CANDIDATES_DECIDE: &str = "memory/candidates/decide";
 }
 
 pub mod events {
@@ -114,4 +121,7 @@ pub mod events {
     pub const TASK_WRITE_LOCK_RELEASED: &str = "task/write_lock/released";
     pub const TASK_WRITE_LOCK_BLOCKED: &str = "task/write_lock/blocked";
     pub const TASK_WRITE_LOCK_EXPIRED: &str = "task/write_lock/expired";
+    pub const MEMORY_CHANGED: &str = "memory/changed";
+    pub const MEMORY_CANDIDATE_CREATED: &str = "memory/candidate_created";
+    pub const MEMORY_FORGOTTEN: &str = "memory/forgotten";
 }

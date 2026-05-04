@@ -22,7 +22,15 @@ use crate::{
     McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
     McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
-    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, ProgressCoalescingKey,
+    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, MemoryActor,
+    MemoryActorKind, MemoryCandidate, MemoryCandidateCreatedNotification, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryProvenance, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
+    MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus, ProgressCoalescingKey,
     PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
     ProviderFailureDetails, ProviderFailureStage, ProviderSetApiKeyParams,
@@ -118,6 +126,60 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("workspace_create_response.json", WorkspaceCreateResponse),
         schema_doc!("workspace_default_params.json", WorkspaceDefaultParams),
         schema_doc!("workspace_default_response.json", WorkspaceDefaultResponse),
+        schema_doc!("memory_scope_kind.json", MemoryScopeKind),
+        schema_doc!("memory_scope.json", MemoryScope),
+        schema_doc!("memory_category.json", MemoryCategory),
+        schema_doc!("memory_status.json", MemoryStatus),
+        schema_doc!("memory_sensitivity.json", MemorySensitivity),
+        schema_doc!("memory_source_kind.json", MemorySourceKind),
+        schema_doc!("memory_actor_kind.json", MemoryActorKind),
+        schema_doc!("memory_actor.json", MemoryActor),
+        schema_doc!("memory_provenance.json", MemoryProvenance),
+        schema_doc!("memory_record.json", MemoryRecord),
+        schema_doc!("memory_search_params.json", MemorySearchParams),
+        schema_doc!("memory_search_hit.json", MemorySearchHit),
+        schema_doc!("memory_search_response.json", MemorySearchResponse),
+        schema_doc!("memory_get_params.json", MemoryGetParams),
+        schema_doc!("memory_get_response.json", MemoryGetResponse),
+        schema_doc!("memory_list_params.json", MemoryListParams),
+        schema_doc!("memory_list_response.json", MemoryListResponse),
+        schema_doc!("memory_remember_params.json", MemoryRememberParams),
+        schema_doc!("memory_remember_response.json", MemoryRememberResponse),
+        schema_doc!("memory_forget_target.json", MemoryForgetTarget),
+        schema_doc!("memory_forget_params.json", MemoryForgetParams),
+        schema_doc!("memory_forget_response.json", MemoryForgetResponse),
+        schema_doc!("memory_candidate_status.json", MemoryCandidateStatus),
+        schema_doc!("memory_candidate.json", MemoryCandidate),
+        schema_doc!("memory_candidate_decision.json", MemoryCandidateDecision),
+        schema_doc!(
+            "memory_candidates_list_params.json",
+            MemoryCandidatesListParams
+        ),
+        schema_doc!(
+            "memory_candidates_list_response.json",
+            MemoryCandidatesListResponse
+        ),
+        schema_doc!(
+            "memory_candidates_decide_params.json",
+            MemoryCandidatesDecideParams
+        ),
+        schema_doc!(
+            "memory_candidates_decide_response.json",
+            MemoryCandidatesDecideResponse
+        ),
+        schema_doc!("memory_change_kind.json", MemoryChangeKind),
+        schema_doc!(
+            "memory_changed_notification.json",
+            MemoryChangedNotification
+        ),
+        schema_doc!(
+            "memory_candidate_created_notification.json",
+            MemoryCandidateCreatedNotification
+        ),
+        schema_doc!(
+            "memory_forgotten_notification.json",
+            MemoryForgottenNotification
+        ),
         schema_doc!("thread.json", Thread),
         schema_doc!("thread_status.json", ThreadStatus),
         schema_doc!("thread_mode.json", ThreadMode),

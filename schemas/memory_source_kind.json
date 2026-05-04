@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemorySourceKind",
+  "type": "string",
+  "enum": [
+    "explicit_user_request",
+    "user_correction",
+    "assistant_inference",
+    "background_extractor",
+    "tool_observation",
+    "import",
+    "system"
+  ]
+}

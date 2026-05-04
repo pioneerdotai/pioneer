@@ -1,0 +1,281 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemorySearchHit",
+  "type": "object",
+  "required": [
+    "record"
+  ],
+  "properties": {
+    "matched_terms": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "record": {
+      "$ref": "#/definitions/MemoryRecord"
+    },
+    "score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "snippet": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "MemoryActor": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryActorKind"
+        }
+      }
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    },
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
+      ]
+    },
+    "MemoryProvenance": {
+      "type": "object",
+      "required": [
+        "source_kind"
+      ],
+      "properties": {
+        "created_by": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MemoryActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_kind": {
+          "$ref": "#/definitions/MemorySourceKind"
+        },
+        "source_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "MemoryRecord": {
+      "type": "object",
+      "required": [
+        "category",
+        "confidence",
+        "content",
+        "created_at",
+        "id",
+        "importance",
+        "provenance",
+        "scope",
+        "sensitivity",
+        "status",
+        "updated_at"
+      ],
+      "properties": {
+        "access_count": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "category": {
+          "$ref": "#/definitions/MemoryCategory"
+        },
+        "confidence": {
+          "type": "number",
+          "format": "float"
+        },
+        "content": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "delete_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deleted_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "expires_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "importance": {
+          "type": "number",
+          "format": "float"
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_accessed_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/MemoryProvenance"
+        },
+        "scope": {
+          "$ref": "#/definitions/MemoryScope"
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/MemorySensitivity"
+        },
+        "status": {
+          "$ref": "#/definitions/MemoryStatus"
+        },
+        "superseded_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "MemoryScope": {
+      "type": "object",
+      "required": [
+        "key",
+        "kind"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryScopeKind"
+        }
+      }
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    },
+    "MemorySensitivity": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "personal",
+        "secret_like",
+        "regulated"
+      ]
+    },
+    "MemorySourceKind": {
+      "type": "string",
+      "enum": [
+        "explicit_user_request",
+        "user_correction",
+        "assistant_inference",
+        "background_extractor",
+        "tool_observation",
+        "import",
+        "system"
+      ]
+    },
+    "MemoryStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "superseded",
+        "deleted",
+        "expired"
+      ]
+    }
+  }
+}

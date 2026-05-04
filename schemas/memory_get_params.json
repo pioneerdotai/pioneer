@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemoryGetParams",
+  "type": "object",
+  "required": [
+    "memory_id"
+  ],
+  "properties": {
+    "include_deleted": {
+      "default": false,
+      "type": "boolean"
+    },
+    "memory_id": {
+      "type": "string"
+    }
+  }
+}

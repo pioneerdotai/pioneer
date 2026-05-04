@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemoryForgetParams",
+  "type": "object",
+  "required": [
+    "target"
+  ],
+  "properties": {
+    "actor": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MemoryActor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "dry_run": {
+      "default": false,
+      "type": "boolean"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target": {
+      "$ref": "#/definitions/MemoryForgetTarget"
+    }
+  },
+  "definitions": {
+    "MemoryActor": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryActorKind"
+        }
+      }
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    },
+    "MemoryForgetTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "memory_id"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "id"
+              ]
+            },
+            "memory_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "key",
+            "kind",
+            "scope"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "scoped_key"
+              ]
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/MemoryScope"
+            }
+          }
+        }
+      ]
+    },
+    "MemoryScope": {
+      "type": "object",
+      "required": [
+        "key",
+        "kind"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryScopeKind"
+        }
+      }
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    }
+  }
+}

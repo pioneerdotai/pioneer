@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MemoryProvenance",
+  "type": "object",
+  "required": [
+    "source_kind"
+  ],
+  "properties": {
+    "created_by": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MemoryActor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source_item_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_kind": {
+      "$ref": "#/definitions/MemorySourceKind"
+    },
+    "source_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "MemoryActor": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/MemoryActorKind"
+        }
+      }
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    },
+    "MemorySourceKind": {
+      "type": "string",
+      "enum": [
+        "explicit_user_request",
+        "user_correction",
+        "assistant_inference",
+        "background_extractor",
+        "tool_observation",
+        "import",
+        "system"
+      ]
+    }
+  }
+}
