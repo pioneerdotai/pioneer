@@ -3,6 +3,7 @@ use pioneer_config::{
     AppConfig, InstallManagedBy, InstallState, load_install_state, save_install_state,
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
@@ -62,6 +63,27 @@ pub fn issue_superuser_token() -> Result<()> {
     Ok(())
 }
 
+pub fn secrets_status() -> Result<pioneer_gateway::SecretsStatusReport> {
+    let (config, runtime_home) = load_config_and_runtime_home()?;
+    block_on_gateway_operation(pioneer_gateway::secrets_status(&config, &runtime_home))
+}
+
+pub fn secrets_garbage_collection(
+    dry_run: bool,
+) -> Result<pioneer_gateway::McpSecretGarbageCollectionReport> {
+    let (config, runtime_home) = load_config_and_runtime_home()?;
+    block_on_gateway_operation(pioneer_gateway::secrets_garbage_collection(
+        &config,
+        &runtime_home,
+        dry_run,
+    ))
+}
+
+pub fn rotate_superuser_jwt_token() -> Result<pioneer_gateway::SuperuserJwtRotationReport> {
+    let (config, runtime_home) = load_config_and_runtime_home()?;
+    pioneer_gateway::rotate_superuser_jwt_token(&config, &runtime_home)
+}
+
 pub fn gateway_service_status() -> Result<GatewayServiceStatus> {
     let config = AppConfig::load().context("failed to load app config")?;
     let settings = load_service_settings_from_config(&config)?;
@@ -82,6 +104,26 @@ pub fn gateway_service_status() -> Result<GatewayServiceStatus> {
         runtime_home: runtime_home.display().to_string(),
         install_state,
     })
+}
+
+fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
+    let config = AppConfig::load().context("failed to load app config")?;
+    let runtime_home = config
+        .ensure_runtime_home_dir()
+        .context("failed to prepare runtime home directory")?;
+    Ok((config, runtime_home))
+}
+
+fn block_on_gateway_operation<F, T>(future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(future)
 }
 
 fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettings> {

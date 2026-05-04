@@ -9,7 +9,9 @@ pub use crate::error::{KeystoreError, Result};
 pub use crate::id::{SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta};
 pub use crate::memory::MemorySecretStore;
 pub use crate::permissions::{
-    ensure_keystore_sqlite_files, ensure_private_file, ensure_private_runtime_dir,
+    SecretPermissionHealthReport, SecretPermissionHealthStatus, ensure_keystore_sqlite_files,
+    ensure_private_file, ensure_private_runtime_dir, inspect_keystore_sqlite_files,
+    inspect_private_file, inspect_private_runtime_dir,
 };
 
 pub trait SecretStore: Send + Sync {

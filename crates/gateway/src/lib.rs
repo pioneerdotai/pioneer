@@ -6,6 +6,7 @@ mod helpers;
 mod mcp_secrets;
 mod mcp_service;
 mod message;
+mod operations;
 mod resilience;
 mod secrets;
 mod session;
@@ -51,6 +52,13 @@ use crate::settings::{
 use crate::thread::ThreadManager;
 use crate::transport::spawn_server;
 use crate::workspace::WorkspaceManager;
+
+pub use crate::operations::{
+    KeystoreEncryptionReport, McpSecretGarbageCollectionFailure, McpSecretGarbageCollectionReport,
+    McpSecretOrphanStatusReport, SecretKindCounts, SecretPermissionHealthReport,
+    SecretPermissionHealthStatus, SecretsStatusReport, SuperuserJwtRotationReport,
+    rotate_superuser_jwt_token, secrets_garbage_collection, secrets_status,
+};
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
 

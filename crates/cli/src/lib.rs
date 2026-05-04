@@ -1,4 +1,5 @@
 mod installer;
+mod secrets;
 mod service;
 
 use anyhow::{Context, Result, bail};
@@ -59,6 +60,7 @@ fn run() -> Result<()> {
             ensure_no_extra_args(args)?;
             service::issue_superuser_token()
         }
+        Some("secrets") => secrets::run(args),
         Some("status") => {
             let json_output = parse_optional_json_flag(args)?;
             print_status(json_output)
@@ -420,6 +422,9 @@ fn help_text() -> String {
   {command} start [--json]      Install and start the persistent gateway service
   {command} status [--json]     Show gateway service status
   {command} issue-superuser-token  Generate a superuser JWT and print it
+  {command} secrets status [--json]  Show keystore status without secret values
+  {command} secrets gc [--dry-run] [--json]  Clean orphan MCP secret values
+  {command} secrets rotate-jwt-token superuser [--json]  Rotate superuser JWT signing material
   {command} stop                Stop and uninstall the persistent gateway service
   {command} version [--json]    Show {command} version
   {command} help                Show this help"

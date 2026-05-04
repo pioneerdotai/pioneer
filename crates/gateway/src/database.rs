@@ -7,7 +7,7 @@ use pioneer_sqlite::{
     sqlite_connection_url,
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::info;
 
@@ -107,6 +107,26 @@ pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<D
     );
 
     Ok(connection)
+}
+
+pub(crate) fn gateway_database_path(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<PathBuf> {
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    Ok(runtime_home.join(config.file_name.as_str()))
+}
+
+pub(crate) async fn initialize_existing_for_operations(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<DatabaseConnection>> {
+    let database_path = gateway_database_path(runtime_home, app_config)?;
+    if !database_path.exists() {
+        return Ok(None);
+    }
+
+    initialize(runtime_home, app_config).await.map(Some)
 }
 
 #[cfg(test)]

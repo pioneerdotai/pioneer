@@ -30,6 +30,12 @@ pub(crate) struct McpSecretDeleteFailure {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SuperuserJwtMaterialRotation {
+    pub material_existed: bool,
+    pub rotated_at_unix: i64,
+}
+
 impl GatewaySecrets {
     pub(crate) fn open(runtime_home: &Path) -> Result<Self> {
         let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(runtime_home))
@@ -166,6 +172,60 @@ impl GatewaySecrets {
         Ok(material)
     }
 
+    pub(crate) fn rotate_superuser_jwt_material(
+        &self,
+        size_bytes: usize,
+    ) -> Result<SuperuserJwtMaterialRotation> {
+        if size_bytes < 32 {
+            bail!("gateway.auth.secret_size_bytes must be at least 32 bytes");
+        }
+
+        let id = SecretId::superuser_jwt_token();
+        let material_existed = self
+            .store
+            .exists(&id)
+            .context("failed to check superuser jwt material in keystore")?;
+        let now = current_unix_i64()?;
+        let created_at = match self.existing_superuser_jwt_meta(&id) {
+            Ok(Some(entry)) => entry.created_at_unix.unwrap_or(now),
+            Ok(None) => now,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to read superuser jwt metadata before rotation; replacing metadata"
+                );
+                now
+            }
+        };
+
+        let mut material = vec![0u8; size_bytes];
+        OsRng.fill_bytes(material.as_mut_slice());
+
+        self.store
+            .put_string(
+                &id,
+                encode_hex(material.as_slice()).as_str(),
+                SecretMeta {
+                    kind: SecretKind::SuperuserJwtToken,
+                    label: Some("superuser".to_owned()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now.max(created_at),
+                },
+            )
+            .context("failed to rotate superuser jwt material in keystore")?;
+
+        Ok(SuperuserJwtMaterialRotation {
+            material_existed,
+            rotated_at_unix: now,
+        })
+    }
+
+    pub(crate) fn list_secret_entries(&self) -> Result<Vec<SecretEntryMeta>> {
+        self.store
+            .list(SecretFilter::All)
+            .context("failed to list secrets from keystore")
+    }
+
     pub(crate) fn get_mcp_secret(&self, ref_id: &str) -> Result<Option<String>> {
         let id = SecretId::mcp_secret(ref_id).context("invalid MCP secret ref id")?;
         self.store
@@ -275,6 +335,14 @@ impl GatewaySecrets {
             .store
             .list(SecretFilter::Kind(SecretKind::McpSecret))
             .context("failed to read MCP secret metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
+    fn existing_superuser_jwt_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::SuperuserJwtToken))
+            .context("failed to read superuser jwt metadata from keystore")?;
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
 }
