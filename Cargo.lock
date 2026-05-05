@@ -6757,6 +6757,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "pioneer-crud",
+ "pioneer-migration",
+ "pioneer-protocol",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pioneer-migration"
 version = "0.1.0"
 dependencies = [

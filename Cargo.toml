@@ -12,6 +12,7 @@ members = [
   "crates/entity",
   "crates/migration",
   "crates/mcp",
+  "crates/memory",
   "crates/protocol",
   "crates/provider",
   "crates/skills",
@@ -38,6 +39,7 @@ pioneer-crud = { path = "crates/crud" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
 pioneer-mcp = { path = "crates/mcp" }
+pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
 pioneer-provider = { path = "crates/provider" }
 pioneer-skills = { path = "crates/skills" }
