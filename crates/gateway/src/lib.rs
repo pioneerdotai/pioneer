@@ -3,6 +3,7 @@ mod auth;
 mod bootstrap;
 mod database;
 mod helpers;
+mod hook_run_store;
 mod mcp_secrets;
 mod mcp_service;
 mod memory_policy;

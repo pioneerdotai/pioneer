@@ -2,9 +2,12 @@ use crate::{
     HookAwaitPolicy, HookContext, HookContribution, HookContributionHash, HookDiagnostic,
     HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
     HookDiagnosticRedactionPolicy, HookDiagnosticSeverity, HookError, HookFailurePolicy,
-    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookMetadata,
-    HookPhase, HookPolicySet, HookPromptContextSet, HookRegistry, HookRegistryError,
-    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry,
+    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookInputPayload,
+    HookMetadata, HookPhase, HookPolicySet, HookPromptContextSet, HookRegistry, HookRegistryError,
+    HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunIdempotencyKey, HookRunScope,
+    HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreRecord, HookSubscription,
+    HookSubscriptionId, HookSubscriptionRegistry, NewHookRunAttemptStoreRecord,
+    NewHookRunStoreRecord,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
@@ -14,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type HookRuntimeResult<T> = Result<T, HookRuntimeError>;
 
@@ -304,6 +307,7 @@ pub struct HookRuntime {
     subscriptions: Arc<HookSubscriptionRegistry>,
     options: HookRuntimeOptions,
     queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    run_store: Option<Arc<dyn HookRunStore>>,
 }
 
 impl HookRuntime {
@@ -316,12 +320,58 @@ impl HookRuntime {
         subscriptions: Arc<HookSubscriptionRegistry>,
         options: HookRuntimeOptions,
     ) -> Self {
+        Self::with_options_and_optional_run_store(handlers, subscriptions, options, None)
+    }
+
+    pub fn with_run_store(
+        handlers: Arc<HookRegistry>,
+        subscriptions: Arc<HookSubscriptionRegistry>,
+        run_store: Arc<dyn HookRunStore>,
+    ) -> Self {
+        Self::with_options_and_optional_run_store(
+            handlers,
+            subscriptions,
+            HookRuntimeOptions::default(),
+            Some(run_store),
+        )
+    }
+
+    pub fn with_options_and_run_store(
+        handlers: Arc<HookRegistry>,
+        subscriptions: Arc<HookSubscriptionRegistry>,
+        options: HookRuntimeOptions,
+        run_store: Arc<dyn HookRunStore>,
+    ) -> Self {
+        Self::with_options_and_optional_run_store(handlers, subscriptions, options, Some(run_store))
+    }
+
+    pub fn with_options_and_optional_run_store(
+        handlers: Arc<HookRegistry>,
+        subscriptions: Arc<HookSubscriptionRegistry>,
+        options: HookRuntimeOptions,
+        run_store: Option<Arc<dyn HookRunStore>>,
+    ) -> Self {
         Self {
             handlers,
             subscriptions,
             options: options.normalized(),
             queued_background: Arc::new(Mutex::new(VecDeque::new())),
+            run_store,
         }
+    }
+
+    pub fn clone_with_optional_run_store(&self, run_store: Option<Arc<dyn HookRunStore>>) -> Self {
+        Self {
+            handlers: self.handlers.clone(),
+            subscriptions: self.subscriptions.clone(),
+            options: self.options.clone(),
+            queued_background: self.queued_background.clone(),
+            run_store,
+        }
+    }
+
+    pub fn clone_with_run_store(&self, run_store: Arc<dyn HookRunStore>) -> Self {
+        self.clone_with_optional_run_store(Some(run_store))
     }
 
     pub fn handlers(&self) -> &Arc<HookRegistry> {
@@ -334,6 +384,14 @@ impl HookRuntime {
 
     pub fn options(&self) -> &HookRuntimeOptions {
         &self.options
+    }
+
+    pub fn run_store(&self) -> Option<&Arc<dyn HookRunStore>> {
+        self.run_store.as_ref()
+    }
+
+    pub fn has_run_store(&self) -> bool {
+        self.run_store.is_some()
     }
 
     pub fn queued_background_len(&self) -> HookRuntimeResult<usize> {
@@ -358,6 +416,7 @@ impl HookRuntime {
                     request.clone(),
                     self.queued_background.clone(),
                     self.options.clone(),
+                    self.run_store.clone(),
                 )
             }))
             .await;
@@ -700,13 +759,443 @@ async fn execute_node(
     request: HookPhaseRequest,
     queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
     options: HookRuntimeOptions,
+    run_store: Option<Arc<dyn HookRunStore>>,
 ) -> NodeExecutionResult {
-    let outcome = execute_node_with_policy(&node, request, queued_background, &options).await;
+    let outcome =
+        execute_node_with_persistence(&node, request, queued_background, &options, run_store).await;
     NodeExecutionResult {
         order_index: node.order_index,
         subscription: node.subscription,
         outcome,
     }
+}
+
+async fn execute_node_with_persistence(
+    node: &HookExecutionNode,
+    request: HookPhaseRequest,
+    queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    options: &HookRuntimeOptions,
+    run_store: Option<Arc<dyn HookRunStore>>,
+) -> HookRuntimeResult<HookNodeOutcome> {
+    let mut persistence = HookRunPersistence::start(run_store, node, &request).await;
+
+    if node.subscription.failure_policy == HookFailurePolicy::Skip {
+        persistence
+            .complete_run(
+                HookRunStatus::Skipped,
+                Vec::new(),
+                Vec::new(),
+                None,
+                current_unix_ms(),
+            )
+            .await;
+        return Ok(HookNodeOutcome::Skipped);
+    }
+
+    let executes_inline = matches!(
+        node.subscription.execution_policy.await_policy,
+        HookAwaitPolicy::Blocking | HookAwaitPolicy::Deadline
+    );
+    if executes_inline {
+        persistence.start_attempt().await;
+    }
+
+    let outcome = execute_node_with_policy(node, request.clone(), queued_background, options).await;
+    if let Ok(outcome) = &outcome {
+        persistence
+            .complete_for_outcome(&node.subscription, request.phase, outcome, options)
+            .await;
+    }
+    outcome
+}
+
+struct HookRunPersistence {
+    store: Option<Arc<dyn HookRunStore>>,
+    run: Option<HookRunStoreRecord>,
+    attempt: Option<HookRunAttemptStoreRecord>,
+    attempt_started_instant: Option<Instant>,
+}
+
+impl HookRunPersistence {
+    async fn start(
+        store: Option<Arc<dyn HookRunStore>>,
+        node: &HookExecutionNode,
+        request: &HookPhaseRequest,
+    ) -> Self {
+        let Some(store) = store else {
+            return Self::disabled();
+        };
+        let queued_at_unix_ms = current_unix_ms();
+        let run = store
+            .create_or_load_run(NewHookRunStoreRecord {
+                idempotency_key: hook_run_idempotency_key(
+                    request.phase,
+                    &request.context,
+                    &request.input,
+                    &node.subscription,
+                ),
+                subscription_id: node.subscription.subscription_id.clone(),
+                hook_id: node.subscription.hook_id.clone(),
+                phase: request.phase,
+                status: HookRunStatus::Queued,
+                scope: hook_run_scope_from_context(&request.context),
+                context: request.context.clone(),
+                contribution_hashes: Vec::new(),
+                diagnostic_previews: Vec::new(),
+                error: None,
+                queued_at_unix_ms: Some(queued_at_unix_ms),
+                started_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                deadline_at_unix_ms: node.subscription.execution_policy.timeout_ms.map(
+                    |timeout_ms| {
+                        queued_at_unix_ms.saturating_add(u64_to_i64_saturating(timeout_ms))
+                    },
+                ),
+            })
+            .await
+            .ok();
+
+        Self {
+            store: Some(store),
+            run,
+            attempt: None,
+            attempt_started_instant: None,
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            store: None,
+            run: None,
+            attempt: None,
+            attempt_started_instant: None,
+        }
+    }
+
+    async fn start_attempt(&mut self) {
+        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
+            return;
+        };
+        let started_at_unix_ms = current_unix_ms();
+        if let Ok(updated) = store.mark_run_running(&run.id, started_at_unix_ms).await {
+            self.run = Some(updated);
+        }
+
+        let Some(run) = self.run.as_ref() else {
+            return;
+        };
+        let run_id = run.id.clone();
+        let attempt_number = run.attempt_count.saturating_add(1).max(1);
+        self.attempt_started_instant = Some(Instant::now());
+        let new_attempt = |run: &HookRunStoreRecord, attempt_number| NewHookRunAttemptStoreRecord {
+            hook_run_id: run.id.clone(),
+            attempt_number,
+            status: HookRunStatus::Running,
+            contribution_hashes: Vec::new(),
+            diagnostic_previews: Vec::new(),
+            error: None,
+            started_at_unix_ms: Some(started_at_unix_ms),
+            completed_at_unix_ms: None,
+            duration_ms: None,
+        };
+        match store.append_attempt(new_attempt(run, attempt_number)).await {
+            Ok(attempt) => {
+                self.attempt = Some(attempt);
+            }
+            Err(crate::HookRunStoreError::Conflict { .. }) => {
+                if let Ok(updated) = store.mark_run_running(&run_id, started_at_unix_ms).await {
+                    self.run = Some(updated);
+                }
+                let Some(run) = self.run.as_ref() else {
+                    return;
+                };
+                let retry_attempt_number = run
+                    .attempt_count
+                    .saturating_add(1)
+                    .max(attempt_number.saturating_add(1));
+                if retry_attempt_number != attempt_number {
+                    if let Ok(attempt) = store
+                        .append_attempt(new_attempt(run, retry_attempt_number))
+                        .await
+                    {
+                        self.attempt = Some(attempt);
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    async fn complete_for_outcome(
+        &mut self,
+        subscription: &HookSubscription,
+        phase: HookPhase,
+        outcome: &HookNodeOutcome,
+        options: &HookRuntimeOptions,
+    ) {
+        match outcome {
+            HookNodeOutcome::Succeeded(response) => {
+                let policy = options.diagnostic_redaction_policy();
+                let contribution_hashes = hash_contributions(&response.contributions);
+                let diagnostic_previews = diagnostic_previews(&response.diagnostics, &policy);
+                self.complete_attempt_and_run(
+                    HookRunStatus::Succeeded,
+                    contribution_hashes,
+                    diagnostic_previews,
+                    None,
+                    current_unix_ms(),
+                )
+                .await;
+            }
+            HookNodeOutcome::Failed(error) => {
+                self.complete_error_outcome(
+                    subscription,
+                    phase,
+                    HookRunStatus::Failed,
+                    error.clone(),
+                    options,
+                )
+                .await;
+            }
+            HookNodeOutcome::TimedOut { timeout_ms } => {
+                self.complete_error_outcome(
+                    subscription,
+                    phase,
+                    HookRunStatus::TimedOut,
+                    timeout_error(*timeout_ms),
+                    options,
+                )
+                .await;
+            }
+            HookNodeOutcome::Skipped => {
+                self.complete_run(
+                    HookRunStatus::Skipped,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    current_unix_ms(),
+                )
+                .await;
+            }
+            HookNodeOutcome::Queued => {}
+        }
+    }
+
+    async fn complete_error_outcome(
+        &mut self,
+        subscription: &HookSubscription,
+        _phase: HookPhase,
+        status: HookRunStatus,
+        error: HookError,
+        options: &HookRuntimeOptions,
+    ) {
+        let policy = options.diagnostic_redaction_policy();
+        let diagnostic = diagnostic_from_error(&error, status);
+        let diagnostic_preview = diagnostic.preview(&policy);
+        let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+        let run_contribution_hashes = if subscription.failure_policy == HookFailurePolicy::Fallback
+        {
+            hash_contributions(&subscription.fallback_contributions)
+        } else {
+            Vec::new()
+        };
+        self.complete_attempt(
+            status,
+            Vec::new(),
+            vec![diagnostic_preview.clone()],
+            Some(error_summary.clone()),
+            current_unix_ms(),
+        )
+        .await;
+        self.complete_run(
+            status,
+            run_contribution_hashes,
+            vec![diagnostic_preview],
+            Some(error_summary),
+            current_unix_ms(),
+        )
+        .await;
+    }
+
+    async fn complete_attempt_and_run(
+        &mut self,
+        status: HookRunStatus,
+        contribution_hashes: Vec<HookContributionHash>,
+        diagnostic_previews: Vec<HookDiagnosticPreview>,
+        error: Option<HookRunErrorSummary>,
+        completed_at_unix_ms: i64,
+    ) {
+        self.complete_attempt(
+            status,
+            contribution_hashes.clone(),
+            diagnostic_previews.clone(),
+            error.clone(),
+            completed_at_unix_ms,
+        )
+        .await;
+        self.complete_run(
+            status,
+            contribution_hashes,
+            diagnostic_previews,
+            error,
+            completed_at_unix_ms,
+        )
+        .await;
+    }
+
+    async fn complete_attempt(
+        &mut self,
+        status: HookRunStatus,
+        contribution_hashes: Vec<HookContributionHash>,
+        diagnostic_previews: Vec<HookDiagnosticPreview>,
+        error: Option<HookRunErrorSummary>,
+        completed_at_unix_ms: i64,
+    ) {
+        let (Some(store), Some(attempt)) = (self.store.as_ref(), self.attempt.as_ref()) else {
+            return;
+        };
+        let duration_ms = self
+            .attempt_started_instant
+            .map(|instant| u128_to_i64_saturating(instant.elapsed().as_millis()));
+        if let Ok(updated) = store
+            .complete_attempt(
+                &attempt.id,
+                HookRunAttemptStoreCompletion {
+                    status,
+                    contribution_hashes,
+                    diagnostic_previews,
+                    error,
+                    completed_at_unix_ms,
+                    duration_ms,
+                },
+            )
+            .await
+        {
+            self.attempt = Some(updated);
+        }
+    }
+
+    async fn complete_run(
+        &mut self,
+        status: HookRunStatus,
+        contribution_hashes: Vec<HookContributionHash>,
+        diagnostic_previews: Vec<HookDiagnosticPreview>,
+        error: Option<HookRunErrorSummary>,
+        completed_at_unix_ms: i64,
+    ) {
+        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
+            return;
+        };
+        if let Ok(updated) = store
+            .complete_run(
+                &run.id,
+                HookRunStoreCompletion {
+                    status,
+                    contribution_hashes,
+                    diagnostic_previews,
+                    error,
+                    completed_at_unix_ms,
+                },
+            )
+            .await
+        {
+            self.run = Some(updated);
+        }
+    }
+}
+
+fn hook_run_idempotency_key(
+    phase: HookPhase,
+    context: &HookContext,
+    input: &HookInput,
+    subscription: &HookSubscription,
+) -> HookRunIdempotencyKey {
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, "phase", phase.as_str());
+    hash_segment(&mut hasher, "input_kind", input.kind.as_str());
+    hash_segment(
+        &mut hasher,
+        "subscription_id",
+        subscription.subscription_id.as_str(),
+    );
+    hash_segment(&mut hasher, "hook_id", subscription.hook_id.as_str());
+    if let Some(workspace_id) = &context.workspace_id {
+        hash_segment(&mut hasher, "workspace_id", workspace_id.as_str());
+    }
+    if let Some(thread_id) = &context.thread_id {
+        hash_segment(&mut hasher, "thread_id", thread_id.as_str());
+    }
+    if let Some(turn_id) = &context.turn_id {
+        hash_segment(&mut hasher, "turn_id", turn_id.as_str());
+    }
+    if let Some(task_id) = &context.task_id {
+        hash_segment(&mut hasher, "task_id", task_id.as_str());
+    }
+    if let Some(agent_id) = &context.agent_id {
+        hash_segment(&mut hasher, "agent_id", agent_id.as_str());
+    }
+    if let Some(mode) = &context.mode {
+        hash_segment(&mut hasher, "context_mode", mode.as_str());
+    }
+    if let Some(actor) = &context.actor {
+        hash_segment(&mut hasher, "actor_kind", actor.kind.as_str());
+        if let Some(actor_id) = &actor.id {
+            hash_segment(&mut hasher, "actor_id", actor_id.as_str());
+        }
+    }
+    if let HookInputPayload::TurnPreCompaction(payload) = &input.payload {
+        hash_segment(&mut hasher, "compaction_id", payload.compaction_id.as_str());
+    }
+    let key = format!("sha256:{}", hex::encode(hasher.finalize()));
+    HookRunIdempotencyKey::new(key).expect("sha256 hook run idempotency key is valid")
+}
+
+fn hash_segment(hasher: &mut Sha256, key: &str, value: &str) {
+    hasher.update(key.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    hasher.update([0xff]);
+}
+
+fn hook_run_scope_from_context(context: &HookContext) -> Option<HookRunScope> {
+    if let Some(turn_id) = &context.turn_id {
+        return hook_run_scope(HookRunScopeKind::Turn, turn_id.as_str());
+    }
+    if let Some(task_id) = &context.task_id {
+        return hook_run_scope(HookRunScopeKind::Task, task_id.as_str());
+    }
+    if let Some(thread_id) = &context.thread_id {
+        return hook_run_scope(HookRunScopeKind::Thread, thread_id.as_str());
+    }
+    if let Some(workspace_id) = &context.workspace_id {
+        return hook_run_scope(HookRunScopeKind::Workspace, workspace_id.as_str());
+    }
+    if let Some(agent_id) = &context.agent_id {
+        return hook_run_scope(HookRunScopeKind::Agent, agent_id.as_str());
+    }
+    None
+}
+
+fn hook_run_scope(kind: HookRunScopeKind, id: &str) -> Option<HookRunScope> {
+    Some(HookRunScope {
+        kind,
+        id: crate::HookRunScopeId::new(id.to_owned()).ok()?,
+    })
+}
+
+fn current_unix_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u128_to_i64_saturating(duration.as_millis()),
+        Err(_) => 0,
+    }
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u128_to_i64_saturating(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 async fn execute_node_with_policy(
@@ -1008,8 +1497,9 @@ mod tests {
     use super::*;
     use crate::{
         HookDiagnosticMessage, HookDomain, HookError, HookFilterKey, HookHandler, HookKind,
-        HookPromptContent, HookPromptSectionTitle, HookResult, HookSectionId, HookSubscription,
-        HookSubscriptionDependencies, HookValue,
+        HookPromptContent, HookPromptSectionTitle, HookResult, HookRunAttemptId, HookRunId,
+        HookRunStoreResult, HookSectionId, HookSubscription, HookSubscriptionDependencies,
+        HookValue,
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -3241,5 +3731,616 @@ mod tests {
             block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
 
         assert_eq!(response.runs[0].contribution_hashes, vec![expected_hash]);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StoreEvent {
+        CreateRun {
+            status: HookRunStatus,
+            contribution_hashes: Vec<HookContributionHash>,
+        },
+        MarkRunRunning,
+        AppendAttempt {
+            status: HookRunStatus,
+            attempt_number: u16,
+            contribution_hashes: Vec<HookContributionHash>,
+        },
+        CompleteAttempt {
+            status: HookRunStatus,
+            contribution_hashes: Vec<HookContributionHash>,
+        },
+        CompleteRun {
+            status: HookRunStatus,
+            contribution_hashes: Vec<HookContributionHash>,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingHookRunStore {
+        events: Mutex<Vec<StoreEvent>>,
+        fail_all: bool,
+        append_attempt_conflicts_remaining: AtomicUsize,
+    }
+
+    impl RecordingHookRunStore {
+        fn events(&self) -> Vec<StoreEvent> {
+            self.events.lock().expect("events lock").clone()
+        }
+
+        fn with_append_attempt_conflicts(count: usize) -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                fail_all: false,
+                append_attempt_conflicts_remaining: AtomicUsize::new(count),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HookRunStore for RecordingHookRunStore {
+        async fn create_or_load_run(
+            &self,
+            run: NewHookRunStoreRecord,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::CreateRun {
+                    status: run.status,
+                    contribution_hashes: run.contribution_hashes.clone(),
+                });
+            Ok(HookRunStoreRecord {
+                id: HookRunId::new("run.phase15").expect("valid run id"),
+                idempotency_key: run.idempotency_key,
+                subscription_id: run.subscription_id,
+                hook_id: run.hook_id,
+                phase: run.phase,
+                status: run.status,
+                scope: run.scope,
+                context: run.context,
+                attempt_count: 0,
+                contribution_count: run.contribution_hashes.len(),
+                diagnostic_count: run.diagnostic_previews.len(),
+                contribution_hashes: run.contribution_hashes,
+                diagnostic_previews: run.diagnostic_previews,
+                error: run.error,
+                queued_at_unix_ms: run.queued_at_unix_ms,
+                started_at_unix_ms: run.started_at_unix_ms,
+                completed_at_unix_ms: run.completed_at_unix_ms,
+                deadline_at_unix_ms: run.deadline_at_unix_ms,
+            })
+        }
+
+        async fn mark_run_running(
+            &self,
+            run_id: &HookRunId,
+            started_at_unix_ms: i64,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::MarkRunRunning);
+            Ok(HookRunStoreRecord {
+                id: run_id.clone(),
+                idempotency_key: HookRunIdempotencyKey::new("phase15.running").expect("valid key"),
+                subscription_id: subscription_id("sub.persistence"),
+                hook_id: hook_id("test.persistence"),
+                phase: HookPhase::TurnPrePromptCompile,
+                status: HookRunStatus::Running,
+                scope: None,
+                context: HookContext::default(),
+                attempt_count: 0,
+                contribution_count: 0,
+                diagnostic_count: 0,
+                contribution_hashes: Vec::new(),
+                diagnostic_previews: Vec::new(),
+                error: None,
+                queued_at_unix_ms: None,
+                started_at_unix_ms: Some(started_at_unix_ms),
+                completed_at_unix_ms: None,
+                deadline_at_unix_ms: None,
+            })
+        }
+
+        async fn complete_run(
+            &self,
+            run_id: &HookRunId,
+            completion: HookRunStoreCompletion,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::CompleteRun {
+                    status: completion.status,
+                    contribution_hashes: completion.contribution_hashes.clone(),
+                });
+            Ok(HookRunStoreRecord {
+                id: run_id.clone(),
+                idempotency_key: HookRunIdempotencyKey::new("phase15.completed")
+                    .expect("valid key"),
+                subscription_id: subscription_id("sub.persistence"),
+                hook_id: hook_id("test.persistence"),
+                phase: HookPhase::TurnPrePromptCompile,
+                status: completion.status,
+                scope: None,
+                context: HookContext::default(),
+                attempt_count: 1,
+                contribution_count: completion.contribution_hashes.len(),
+                diagnostic_count: completion.diagnostic_previews.len(),
+                contribution_hashes: completion.contribution_hashes,
+                diagnostic_previews: completion.diagnostic_previews,
+                error: completion.error,
+                queued_at_unix_ms: None,
+                started_at_unix_ms: None,
+                completed_at_unix_ms: Some(completion.completed_at_unix_ms),
+                deadline_at_unix_ms: None,
+            })
+        }
+
+        async fn append_attempt(
+            &self,
+            attempt: NewHookRunAttemptStoreRecord,
+        ) -> HookRunStoreResult<HookRunAttemptStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::AppendAttempt {
+                    status: attempt.status,
+                    attempt_number: attempt.attempt_number,
+                    contribution_hashes: attempt.contribution_hashes.clone(),
+                });
+            if self
+                .append_attempt_conflicts_remaining
+                .load(Ordering::SeqCst)
+                > 0
+            {
+                self.append_attempt_conflicts_remaining
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(crate::HookRunStoreError::conflict(
+                    "attempt number already exists",
+                ));
+            }
+            Ok(HookRunAttemptStoreRecord {
+                id: HookRunAttemptId::new("attempt.phase15").expect("valid attempt id"),
+                hook_run_id: attempt.hook_run_id,
+                attempt_number: attempt.attempt_number,
+                status: attempt.status,
+                contribution_count: attempt.contribution_hashes.len(),
+                diagnostic_count: attempt.diagnostic_previews.len(),
+                contribution_hashes: attempt.contribution_hashes,
+                diagnostic_previews: attempt.diagnostic_previews,
+                error: attempt.error,
+                started_at_unix_ms: attempt.started_at_unix_ms,
+                completed_at_unix_ms: attempt.completed_at_unix_ms,
+                duration_ms: attempt.duration_ms,
+            })
+        }
+
+        async fn complete_attempt(
+            &self,
+            attempt_id: &HookRunAttemptId,
+            completion: HookRunAttemptStoreCompletion,
+        ) -> HookRunStoreResult<HookRunAttemptStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::CompleteAttempt {
+                    status: completion.status,
+                    contribution_hashes: completion.contribution_hashes.clone(),
+                });
+            Ok(HookRunAttemptStoreRecord {
+                id: attempt_id.clone(),
+                hook_run_id: HookRunId::new("run.phase15").expect("valid run id"),
+                attempt_number: 1,
+                status: completion.status,
+                contribution_count: completion.contribution_hashes.len(),
+                diagnostic_count: completion.diagnostic_previews.len(),
+                contribution_hashes: completion.contribution_hashes,
+                diagnostic_previews: completion.diagnostic_previews,
+                error: completion.error,
+                started_at_unix_ms: None,
+                completed_at_unix_ms: Some(completion.completed_at_unix_ms),
+                duration_ms: completion.duration_ms,
+            })
+        }
+    }
+
+    fn runtime_with_recording_store(
+        handlers: Arc<HookRegistry>,
+        subscriptions: Arc<HookSubscriptionRegistry>,
+        store: Arc<RecordingHookRunStore>,
+    ) -> HookRuntime {
+        HookRuntime::with_run_store(handlers, subscriptions, store)
+    }
+
+    #[test]
+    fn phase_15_runtime_without_store_preserves_current_behavior() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.no_store",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.phase15.no_store", "context")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.no_store",
+            "test.phase15.no_store",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        assert!(!runtime.has_run_store());
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+        assert_eq!(
+            contribution_section_ids(&response),
+            vec![HookSectionId::new("section.phase15.no_store").expect("valid section id")]
+        );
+    }
+
+    #[test]
+    fn phase_15_run_store_records_success_lifecycle_without_raw_output() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let secret = "SECRET_PROMPT_SECTION_SHOULD_NOT_BE_STORED";
+        let prompt_contribution = contribution("section.phase15.success", secret);
+        let expected_hash = HookContributionHash::from_contribution(&prompt_contribution)
+            .expect("hash should be produced");
+        register_handler(
+            &handlers,
+            "test.phase15.success",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![prompt_contribution],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.success",
+            "test.phase15.success",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+        let events = store.events();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events[0],
+            StoreEvent::CreateRun {
+                status: HookRunStatus::Queued,
+                contribution_hashes: Vec::new(),
+            }
+        );
+        assert_eq!(events[1], StoreEvent::MarkRunRunning);
+        assert_eq!(
+            events[2],
+            StoreEvent::AppendAttempt {
+                status: HookRunStatus::Running,
+                attempt_number: 1,
+                contribution_hashes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            events[3],
+            StoreEvent::CompleteAttempt {
+                status: HookRunStatus::Succeeded,
+                contribution_hashes: vec![expected_hash.clone()],
+            }
+        );
+        assert_eq!(
+            events[4],
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::Succeeded,
+                contribution_hashes: vec![expected_hash],
+            }
+        );
+        assert!(
+            !format!("{events:?}").contains(secret),
+            "store events must not carry raw prompt-critical content"
+        );
+    }
+
+    #[test]
+    fn phase_15_run_store_retries_attempt_conflict_once() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.conflict",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.phase15.conflict", "ok")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.conflict",
+            "test.phase15.conflict",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::with_append_attempt_conflicts(1));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+        let attempt_numbers = store
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                StoreEvent::AppendAttempt { attempt_number, .. } => Some(attempt_number),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(attempt_numbers, vec![1, 2]);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteAttempt {
+                status: HookRunStatus::Succeeded,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn phase_15_run_store_records_best_effort_failure_lifecycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.failure",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error("hook.failed", "failure"))],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.failure",
+            "test.phase15.failure",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Failed);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::Failed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn phase_15_run_store_records_required_failure_before_returning_error() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.required",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error("hook.required_failed", "required failure"))],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.required",
+            "test.phase15.required",
+            0,
+            HookFailurePolicy::Required,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let error = block_on_ready(runtime.run_phase(phase_request())).unwrap_err();
+
+        assert!(matches!(error, HookRuntimeError::HookFailed { .. }));
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::Failed,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn phase_15_run_store_records_deadline_timeout_lifecycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        handlers
+            .register_handler(Arc::new(DelayedHookHandler {
+                id: hook_id("test.phase15.timeout"),
+                delay: Duration::from_millis(50),
+                contribution: contribution("section.phase15.timeout", "late"),
+            }))
+            .expect("handler registers");
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.timeout",
+            "test.phase15.timeout",
+            0,
+            HookAwaitPolicy::Deadline,
+            Some(1),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = HookRuntime::with_options_and_run_store(
+            handlers,
+            subscriptions,
+            HookRuntimeOptions {
+                default_deadline_timeout_ms: 1,
+                ..HookRuntimeOptions::default()
+            },
+            store.clone(),
+        );
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::TimedOut,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn phase_15_run_store_records_skip_and_background_without_attempt() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.skip",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.skip",
+            "test.phase15.skip",
+            0,
+            HookFailurePolicy::Skip,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Skipped);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::Skipped,
+                ..
+            }
+        )));
+        assert!(
+            !store
+                .events()
+                .iter()
+                .any(|event| matches!(event, StoreEvent::AppendAttempt { .. }))
+        );
+
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.background",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.background",
+            "test.phase15.background",
+            0,
+            HookAwaitPolicy::Background,
+            None,
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert_eq!(store.events().len(), 1);
+        assert!(matches!(store.events()[0], StoreEvent::CreateRun { .. }));
+    }
+
+    #[test]
+    fn phase_15_store_failure_does_not_change_hook_result() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase15.store_failure",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.phase15.store_failure", "context")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase15.store_failure",
+            "test.phase15.store_failure",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore {
+            events: Mutex::new(Vec::new()),
+            fail_all: true,
+            append_attempt_conflicts_remaining: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(
+            contribution_section_ids(&response),
+            vec![HookSectionId::new("section.phase15.store_failure").expect("valid section id")]
+        );
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
     }
 }

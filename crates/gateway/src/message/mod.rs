@@ -21,6 +21,7 @@ mod workspace_handlers;
 
 pub use summary::SummaryConfig;
 
+use crate::hook_run_store::CrudHookRunStore;
 use crate::tokenizer::count_tokens;
 use pioneer_agent::{AgentManager, ToolLoopConfig};
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
@@ -223,6 +224,16 @@ impl MessageProcessor {
 
     #[allow(dead_code)]
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
+        let runtime =
+            runtime.map(|runtime| {
+                if runtime.has_run_store() {
+                    runtime
+                } else {
+                    Arc::new(runtime.clone_with_run_store(Arc::new(CrudHookRunStore::new(
+                        self.crud_store.clone(),
+                    ))))
+                }
+            });
         *self.hook_runtime.write().await = runtime.clone();
         self.agent_manager.set_hook_runtime(runtime).await;
     }

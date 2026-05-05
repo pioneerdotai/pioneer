@@ -706,6 +706,30 @@ fn phase_13_hook_runtime_with_fallback(
     ))
 }
 
+#[tokio::test]
+async fn phase_15_message_processor_set_hook_runtime_attaches_crud_store() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    let runtime = phase_13_empty_hook_runtime();
+    assert!(!runtime.has_run_store());
+
+    harness
+        .processor
+        .set_hook_runtime(Some(runtime.clone()))
+        .await;
+
+    let stored = harness
+        .processor
+        .hook_runtime
+        .read()
+        .await
+        .clone()
+        .expect("message processor should store hook runtime");
+    assert!(stored.has_run_store());
+    assert!(!Arc::ptr_eq(&stored, &runtime));
+    assert!(harness.processor.agent_manager.has_hook_runtime().await);
+}
+
 impl SequencedToolProvider {
     fn new(first_tool_calls: Vec<ProviderToolCall>, second_text: impl Into<String>) -> Self {
         Self {

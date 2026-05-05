@@ -12,6 +12,7 @@ mod prompt_section_set;
 mod registry;
 mod request;
 mod runtime;
+mod store;
 mod subscription;
 mod text;
 mod value;
@@ -66,6 +67,11 @@ pub use request::{
 pub use runtime::{
     HookAttemptSummary, HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus,
     HookRunSummary, HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
+};
+pub use store::{
+    HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunScope, HookRunScopeKind,
+    HookRunStore, HookRunStoreCompletion, HookRunStoreError, HookRunStoreRecord,
+    HookRunStoreResult, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,
