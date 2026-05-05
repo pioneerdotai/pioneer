@@ -3,6 +3,7 @@ mod binary;
 mod dispatch;
 mod markdown;
 mod mcp;
+mod memory_handlers;
 mod notifications;
 mod provider_handlers;
 mod skills;
@@ -73,6 +74,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
 
 use crate::mcp_service::McpService;
+use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::resilience::{
     RecoveryCoordinator, RecoveryPolicyRegistry, RecoveryTerminalOutcome, TimeoutPolicyRegistry,
     TimeoutSupervisor,
@@ -138,10 +140,11 @@ pub struct MessageProcessor {
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
+    memory_runtime: Arc<GatewayMemoryRuntime>,
 }
 
 impl MessageProcessor {
-    pub fn new(
+    pub fn new_with_memory_runtime(
         thread_manager: Arc<ThreadManager>,
         provider_registry: Arc<ProviderRegistry>,
         session_manager: Arc<SessionManager>,
@@ -151,6 +154,7 @@ impl MessageProcessor {
         summary_config: summary::SummaryConfig,
         context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
+        memory_runtime: Arc<GatewayMemoryRuntime>,
     ) -> Self {
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
@@ -188,7 +192,7 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             workspace_manager,
-            crud_store,
+            crud_store: crud_store.clone(),
             gateway_secrets,
             summary_config: Arc::new(summary_config),
             context_budget,
@@ -209,6 +213,7 @@ impl MessageProcessor {
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,
+            memory_runtime,
         }
     }
 
@@ -478,6 +483,32 @@ fn fallback_title_from_first_user_text(user_text: &str) -> Option<String> {
 
 #[cfg(test)]
 impl MessageProcessor {
+    pub fn new(
+        thread_manager: Arc<ThreadManager>,
+        provider_registry: Arc<ProviderRegistry>,
+        session_manager: Arc<SessionManager>,
+        workspace_manager: Arc<WorkspaceManager>,
+        crud_store: Arc<CrudStore>,
+        gateway_secrets: Arc<GatewaySecrets>,
+        summary_config: summary::SummaryConfig,
+        context_budget: ContextBudget,
+        tool_loop_config: ToolLoopConfig,
+    ) -> Self {
+        let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
+        Self::new_with_memory_runtime(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store,
+            gateway_secrets,
+            summary_config,
+            context_budget,
+            tool_loop_config,
+            memory_runtime,
+        )
+    }
+
     pub(crate) fn set_mcp_runtime_connector_for_tests(
         &self,
         connector: Arc<dyn pioneer_mcp::McpRuntimeConnector>,
@@ -524,6 +555,7 @@ impl MessageProcessor {
         ));
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new(crud_store.clone()));
+        let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
         Self {
             thread_manager,
             agent_manager,
@@ -632,6 +664,7 @@ impl MessageProcessor {
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,
+            memory_runtime,
         }
     }
 }

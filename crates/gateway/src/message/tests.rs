@@ -1,5 +1,6 @@
 use super::MessageProcessor;
 use crate::bootstrap::bootstrap;
+use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
@@ -8,8 +9,11 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::{AgentManager, AgentMcpToolProvider, SkillsLoopConfig, ToolLoopConfig};
-use pioneer_config::GatewayWebToolsConfig;
-use pioneer_crud::CrudStore;
+use pioneer_config::{GatewayMemoryConfig, GatewayWebToolsConfig};
+use pioneer_crud::{
+    AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
+    global_agent_memory_scope_key,
+};
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_protocol::{
@@ -19,11 +23,18 @@ use pioneer_protocol::{
     McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
     McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState,
     McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
-    McpUninstallResponse, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-    PromptManifestProfile, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction,
-    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
-    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger,
+    SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
+    SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
     SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
@@ -8422,6 +8433,712 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
         Arc::new(CrudStore::new(connection)),
         workspace_id,
     )
+}
+
+struct MemoryGatewayHarness {
+    processor: MessageProcessor,
+    crud_store: Arc<CrudStore>,
+    workspace_manager: Arc<WorkspaceManager>,
+    session_manager: Arc<SessionManager>,
+    rx: mpsc::Receiver<Message>,
+    connection_id: u64,
+    workspace_id: String,
+    runtime_home: std::path::PathBuf,
+}
+
+async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, rx) = mpsc::channel(32);
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
+    std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
+    let memory_runtime = Arc::new(
+        GatewayMemoryRuntime::from_config(
+            crud_store.clone(),
+            runtime_home.as_path(),
+            &GatewayMemoryConfig {
+                enabled,
+                capsules_dir: "memory/capsules".to_owned(),
+                allow_global_user_by_default: true,
+                allow_global_agent_by_default: false,
+            },
+        )
+        .expect("memory runtime should initialize"),
+    );
+
+    if enabled {
+        assert!(memory_runtime.is_enabled());
+        assert!(
+            memory_runtime
+                .capsules_root()
+                .expect("enabled runtime should expose capsules root")
+                .starts_with(runtime_home.as_path())
+        );
+    }
+
+    let processor = MessageProcessor::new_with_memory_runtime(
+        thread_manager,
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager.clone(),
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+        memory_runtime,
+    );
+
+    MemoryGatewayHarness {
+        processor,
+        crud_store,
+        workspace_manager,
+        session_manager,
+        rx,
+        connection_id,
+        workspace_id,
+        runtime_home,
+    }
+}
+
+fn workspace_memory_scope(workspace_id: &str) -> MemoryScope {
+    MemoryScope {
+        kind: MemoryScopeKind::Workspace,
+        key: workspace_id.to_owned(),
+    }
+}
+
+fn user_memory_scope() -> MemoryScope {
+    MemoryScope {
+        kind: MemoryScopeKind::User,
+        key: "default".to_owned(),
+    }
+}
+
+fn agent_global_memory_scope(agent_id: &str) -> MemoryScope {
+    MemoryScope {
+        kind: MemoryScopeKind::Agent,
+        key: global_agent_memory_scope_key(agent_id),
+    }
+}
+
+fn memory_remember_params(
+    scope: MemoryScope,
+    category: MemoryCategory,
+    key: Option<&str>,
+    content: &str,
+) -> MemoryRememberParams {
+    MemoryRememberParams {
+        scope,
+        category,
+        namespace: None,
+        key: key.map(str::to_owned),
+        content: content.to_owned(),
+        sensitivity: Some(MemorySensitivity::Normal),
+        confidence: Some(0.9),
+        importance: Some(0.7),
+        provenance: None,
+        idempotency_key: None,
+        supersedes: None,
+        metadata: Default::default(),
+    }
+}
+
+fn memory_request_id(prefix: &str) -> pioneer_protocol::RequestId {
+    pioneer_protocol::RequestId::new(generate_test_request_id("mem", prefix))
+        .expect("valid memory request id")
+}
+
+#[tokio::test]
+async fn memory_remember_get_list_roundtrip() {
+    let mut harness = setup_memory_gateway_harness("roundtrip", true).await;
+    let remember_id = memory_request_id("rememberroundtrip");
+    let scope = workspace_memory_scope(harness.workspace_id.as_str());
+
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            remember_id.clone(),
+            memory_remember_params(
+                scope.clone(),
+                MemoryCategory::Identity,
+                Some("favorite_city"),
+                "The user likes Porto for quiet working trips.",
+            ),
+        )
+        .await;
+
+    let (remember_response, changed_notification) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        remember_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+    let remember_payload: MemoryRememberResponse =
+        serde_json::from_value(remember_response.result).expect("memory remember response");
+    assert!(remember_payload.created);
+    assert_eq!(remember_payload.record.scope, scope);
+    assert_eq!(
+        remember_payload.record.content,
+        "The user likes Porto for quiet working trips."
+    );
+    let changed_payload: MemoryChangedNotification = serde_json::from_value(
+        changed_notification
+            .params
+            .expect("memory changed params should be present"),
+    )
+    .expect("memory changed notification");
+    assert_eq!(changed_payload.memory_id, remember_payload.record.id);
+    assert_eq!(changed_payload.change_kind, MemoryChangeKind::Created);
+
+    let get_id = memory_request_id("getroundtrip");
+    harness
+        .processor
+        .memory_get(
+            harness.connection_id,
+            get_id.clone(),
+            MemoryGetParams {
+                memory_id: remember_payload.record.id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await;
+    let get_response = recv_response_by_id(&mut harness.rx, get_id.as_str()).await;
+    let get_payload: MemoryGetResponse =
+        serde_json::from_value(get_response.result).expect("memory get response");
+    assert_eq!(
+        get_payload
+            .record
+            .expect("memory get should return record")
+            .id,
+        remember_payload.record.id
+    );
+
+    let list_id = memory_request_id("listroundtrip");
+    harness
+        .processor
+        .memory_list(
+            harness.connection_id,
+            list_id.clone(),
+            MemoryListParams {
+                scopes: vec![workspace_memory_scope(harness.workspace_id.as_str())],
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                query: None,
+                limit: Some(10),
+                cursor: None,
+            },
+        )
+        .await;
+    let list_response = recv_response_by_id(&mut harness.rx, list_id.as_str()).await;
+    let list_payload: MemoryListResponse =
+        serde_json::from_value(list_response.result).expect("memory list response");
+    assert!(
+        list_payload
+            .records
+            .iter()
+            .any(|record| record.id == remember_payload.record.id)
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_search_returns_memvid_backed_hits_filtered_by_control_plane() {
+    let mut harness = setup_memory_gateway_harness("search_filter", true).await;
+    let scope = workspace_memory_scope(harness.workspace_id.as_str());
+    let unique_phrase = "phase06 violet mango recall target";
+
+    let target_id = memory_request_id("searchtarget");
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            target_id.clone(),
+            memory_remember_params(
+                scope.clone(),
+                MemoryCategory::Preference,
+                Some("search_target"),
+                unique_phrase,
+            ),
+        )
+        .await;
+    let (target_response, _) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        target_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+    let target_payload: MemoryRememberResponse =
+        serde_json::from_value(target_response.result).expect("target remember response");
+
+    let other_id = memory_request_id("searchother");
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            other_id.clone(),
+            memory_remember_params(
+                scope.clone(),
+                MemoryCategory::Preference,
+                Some("search_other"),
+                "The user prefers compact keyboard layouts.",
+            ),
+        )
+        .await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        other_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+
+    let search_id = memory_request_id("searchbefore");
+    harness
+        .processor
+        .memory_search(
+            harness.connection_id,
+            search_id.clone(),
+            MemorySearchParams {
+                query: "violet mango".to_owned(),
+                scopes: vec![scope.clone()],
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                limit: Some(10),
+                cursor: None,
+                include_provenance: true,
+            },
+        )
+        .await;
+    let search_response = recv_response_by_id(&mut harness.rx, search_id.as_str()).await;
+    let search_payload: MemorySearchResponse =
+        serde_json::from_value(search_response.result).expect("memory search response");
+    assert!(
+        search_payload
+            .hits
+            .iter()
+            .any(|hit| hit.record.id == target_payload.record.id)
+    );
+
+    let forget_id = memory_request_id("forgettarget");
+    harness
+        .processor
+        .memory_forget(
+            harness.connection_id,
+            forget_id.clone(),
+            MemoryForgetParams {
+                target: MemoryForgetTarget::Id {
+                    memory_id: target_payload.record.id.clone(),
+                },
+                reason: Some("test cleanup".to_owned()),
+                actor: None,
+                dry_run: false,
+            },
+        )
+        .await;
+    let (forget_response, forgotten_notification) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        forget_id.as_str(),
+        events::MEMORY_FORGOTTEN,
+    )
+    .await;
+    let forget_payload: MemoryForgetResponse =
+        serde_json::from_value(forget_response.result).expect("memory forget response");
+    assert_eq!(
+        forget_payload.forgotten_memory_ids,
+        vec![target_payload.record.id.clone()]
+    );
+    let forgotten_payload: MemoryForgottenNotification = serde_json::from_value(
+        forgotten_notification
+            .params
+            .expect("memory forgotten params should be present"),
+    )
+    .expect("memory forgotten notification");
+    assert_eq!(
+        forgotten_payload.memory_ids,
+        vec![target_payload.record.id.clone()]
+    );
+
+    let search_after_id = memory_request_id("searchafter");
+    harness
+        .processor
+        .memory_search(
+            harness.connection_id,
+            search_after_id.clone(),
+            MemorySearchParams {
+                query: "violet mango".to_owned(),
+                scopes: vec![scope],
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                limit: Some(10),
+                cursor: None,
+                include_provenance: true,
+            },
+        )
+        .await;
+    let search_after_response =
+        recv_response_by_id(&mut harness.rx, search_after_id.as_str()).await;
+    let search_after_payload: MemorySearchResponse =
+        serde_json::from_value(search_after_response.result).expect("memory search response");
+    assert!(
+        !search_after_payload
+            .hits
+            .iter()
+            .any(|hit| hit.record.id == target_payload.record.id),
+        "deleted memory must not leak through memvid search"
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_search_respects_connection_workspace() {
+    let mut harness = setup_memory_gateway_harness("workspace_isolation", true).await;
+    let workspace_a = harness.workspace_id.clone();
+    let scope_a = workspace_memory_scope(workspace_a.as_str());
+    let remember_id = memory_request_id("isoremember");
+
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            remember_id.clone(),
+            memory_remember_params(
+                scope_a.clone(),
+                MemoryCategory::ProjectFact,
+                Some("workspace_secret"),
+                "workspace alpha owns the phase06 isolation phrase",
+            ),
+        )
+        .await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        remember_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+
+    let workspace_b = harness
+        .workspace_manager
+        .create_workspace("phase06_workspace_b", Some("Phase 06 Workspace B"))
+        .await
+        .expect("create workspace B");
+    harness
+        .session_manager
+        .set_connection_workspace(harness.connection_id, Some(workspace_b.id.clone()))
+        .await;
+
+    let empty_scope_search_id = memory_request_id("isoempty");
+    harness
+        .processor
+        .memory_search(
+            harness.connection_id,
+            empty_scope_search_id.clone(),
+            MemorySearchParams {
+                query: "phase06 isolation phrase".to_owned(),
+                scopes: Vec::new(),
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                limit: Some(10),
+                cursor: None,
+                include_provenance: false,
+            },
+        )
+        .await;
+    let empty_scope_response =
+        recv_response_by_id(&mut harness.rx, empty_scope_search_id.as_str()).await;
+    let empty_scope_payload: MemorySearchResponse =
+        serde_json::from_value(empty_scope_response.result).expect("memory search response");
+    assert!(empty_scope_payload.hits.is_empty());
+
+    let explicit_scope_search_id = memory_request_id("isoexplicit");
+    harness
+        .processor
+        .memory_search(
+            harness.connection_id,
+            explicit_scope_search_id.clone(),
+            MemorySearchParams {
+                query: "phase06 isolation phrase".to_owned(),
+                scopes: vec![scope_a],
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                limit: Some(10),
+                cursor: None,
+                include_provenance: false,
+            },
+        )
+        .await;
+    let explicit_scope_response =
+        recv_response_by_id(&mut harness.rx, explicit_scope_search_id.as_str()).await;
+    let explicit_scope_payload: MemorySearchResponse =
+        serde_json::from_value(explicit_scope_response.result).expect("memory search response");
+    assert!(explicit_scope_payload.hits.is_empty());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_empty_scopes_use_user_default_and_connection_workspace() {
+    let mut harness = setup_memory_gateway_harness("default_scopes", true).await;
+    let workspace_scope = workspace_memory_scope(harness.workspace_id.as_str());
+    let user_scope = user_memory_scope();
+    let agent_scope = agent_global_memory_scope("phase06-agent");
+
+    for (request_suffix, scope, key, content) in [
+        (
+            "defaultuser",
+            user_scope.clone(),
+            "default_user",
+            "phase06 default scope user memory",
+        ),
+        (
+            "defaultworkspace",
+            workspace_scope.clone(),
+            "default_workspace",
+            "phase06 default scope workspace memory",
+        ),
+        (
+            "defaultagent",
+            agent_scope.clone(),
+            "default_agent",
+            "phase06 default scope global agent memory",
+        ),
+    ] {
+        let request_id = memory_request_id(request_suffix);
+        harness
+            .processor
+            .memory_remember(
+                harness.connection_id,
+                request_id.clone(),
+                memory_remember_params(scope, MemoryCategory::Preference, Some(key), content),
+            )
+            .await;
+        let _ = recv_response_and_notification_by_id_method(
+            &mut harness.rx,
+            request_id.as_str(),
+            events::MEMORY_CHANGED,
+        )
+        .await;
+    }
+
+    let list_id = memory_request_id("defaultlist");
+    harness
+        .processor
+        .memory_list(
+            harness.connection_id,
+            list_id.clone(),
+            MemoryListParams {
+                scopes: Vec::new(),
+                categories: Vec::new(),
+                statuses: Vec::new(),
+                query: None,
+                limit: Some(20),
+                cursor: None,
+            },
+        )
+        .await;
+    let list_response = recv_response_by_id(&mut harness.rx, list_id.as_str()).await;
+    let list_payload: MemoryListResponse =
+        serde_json::from_value(list_response.result).expect("memory list response");
+    let contents = list_payload
+        .records
+        .iter()
+        .map(|record| record.content.as_str())
+        .collect::<Vec<_>>();
+    assert!(contents.contains(&"phase06 default scope user memory"));
+    assert!(contents.contains(&"phase06 default scope workspace memory"));
+    assert!(!contents.contains(&"phase06 default scope global agent memory"));
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_forget_dry_run_does_not_emit_forgotten_notification() {
+    let mut harness = setup_memory_gateway_harness("dry_run", true).await;
+    let remember_id = memory_request_id("dryremember");
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            remember_id.clone(),
+            memory_remember_params(
+                workspace_memory_scope(harness.workspace_id.as_str()),
+                MemoryCategory::Preference,
+                Some("dry_run"),
+                "phase06 dry-run forget memory",
+            ),
+        )
+        .await;
+    let (remember_response, _) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        remember_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+    let remember_payload: MemoryRememberResponse =
+        serde_json::from_value(remember_response.result).expect("memory remember response");
+
+    let forget_id = memory_request_id("dryforget");
+    harness
+        .processor
+        .memory_forget(
+            harness.connection_id,
+            forget_id.clone(),
+            MemoryForgetParams {
+                target: MemoryForgetTarget::Id {
+                    memory_id: remember_payload.record.id,
+                },
+                reason: Some("dry run".to_owned()),
+                actor: None,
+                dry_run: true,
+            },
+        )
+        .await;
+    let forget_response = recv_response_by_id(&mut harness.rx, forget_id.as_str()).await;
+    let forget_payload: MemoryForgetResponse =
+        serde_json::from_value(forget_response.result).expect("memory forget response");
+    assert!(forget_payload.dry_run);
+    assert!(
+        timeout(Duration::from_millis(100), harness.rx.recv())
+            .await
+            .is_err(),
+        "dry-run forget must not emit memory/forgotten"
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_methods_fail_when_runtime_disabled() {
+    let mut harness = setup_memory_gateway_harness("disabled", false).await;
+    let remember_id = memory_request_id("disabledremember");
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            remember_id.clone(),
+            memory_remember_params(
+                workspace_memory_scope(harness.workspace_id.as_str()),
+                MemoryCategory::Preference,
+                Some("disabled"),
+                "this should not be stored",
+            ),
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut harness.rx, remember_id.as_str()).await;
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+    assert!(error.error.message.contains("memory runtime is disabled"));
+    let rows = harness
+        .crud_store
+        .list_agent_memory_records(AgentMemoryListFilter::default())
+        .await
+        .expect("list memory records");
+    assert!(rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_candidates_list_and_decide_use_service_boundary() {
+    let mut harness = setup_memory_gateway_harness("candidates", true).await;
+    let now = super::now_timestamp_secs();
+    let candidate_ids = [
+        ("candidate_reject", MemoryCandidateDecision::Reject),
+        ("candidate_expire", MemoryCandidateDecision::Expire),
+        ("candidate_approve", MemoryCandidateDecision::Approve),
+    ];
+
+    for (candidate_id_suffix, _) in candidate_ids {
+        harness
+            .crud_store
+            .insert_agent_memory_candidate(
+                NewAgentMemoryCandidate {
+                    id: Some(generate_test_request_id("cand", candidate_id_suffix)),
+                    scope: workspace_memory_scope(harness.workspace_id.as_str()),
+                    namespace: None,
+                    category: MemoryCategory::Preference,
+                    key: Some(candidate_id_suffix.to_owned()),
+                    candidate_text: format!("phase06 candidate text {candidate_id_suffix}"),
+                    confidence: 0.82,
+                    reason: "test candidate".to_owned(),
+                    source_kind: MemorySourceKind::ExplicitUserRequest,
+                    source_thread_id: None,
+                    source_turn_id: None,
+                    source_item_id: None,
+                    created_by: Some(MemoryActorRecord {
+                        kind: MemoryActorKind::User,
+                        id: Some("tester".to_owned()),
+                    }),
+                    dedupe_key: None,
+                    metadata_json: None,
+                },
+                now,
+            )
+            .await
+            .expect("insert candidate");
+    }
+
+    let list_id = memory_request_id("candidatelist");
+    harness
+        .processor
+        .memory_candidates_list(
+            harness.connection_id,
+            list_id.clone(),
+            MemoryCandidatesListParams {
+                scopes: Vec::new(),
+                statuses: Vec::new(),
+                limit: Some(10),
+                cursor: None,
+            },
+        )
+        .await;
+    let list_response = recv_response_by_id(&mut harness.rx, list_id.as_str()).await;
+    let list_payload: MemoryCandidatesListResponse =
+        serde_json::from_value(list_response.result).expect("candidate list response");
+    assert_eq!(list_payload.candidates.len(), 3);
+
+    for (candidate_id_suffix, decision) in candidate_ids {
+        let candidate_id = generate_test_request_id("cand", candidate_id_suffix);
+        let decide_id = memory_request_id(candidate_id_suffix);
+        harness
+            .processor
+            .memory_candidates_decide(
+                harness.connection_id,
+                decide_id.clone(),
+                MemoryCandidatesDecideParams {
+                    candidate_id: candidate_id.clone(),
+                    decision,
+                    reason: Some(format!("test {decision:?}")),
+                    actor: Some(MemoryActor {
+                        kind: MemoryActorKind::User,
+                        id: Some("tester".to_owned()),
+                    }),
+                },
+            )
+            .await;
+        let decide_response = recv_response_by_id(&mut harness.rx, decide_id.as_str()).await;
+        let decide_payload: MemoryCandidatesDecideResponse =
+            serde_json::from_value(decide_response.result).expect("candidate decide response");
+        assert_eq!(decide_payload.candidate.id, candidate_id);
+        assert_eq!(
+            decide_payload.candidate.status,
+            match decision {
+                MemoryCandidateDecision::Approve => MemoryCandidateStatus::Approved,
+                MemoryCandidateDecision::Reject => MemoryCandidateStatus::Rejected,
+                MemoryCandidateDecision::Expire => MemoryCandidateStatus::Expired,
+            }
+        );
+        assert!(
+            decide_payload.record.is_none(),
+            "Phase 06 candidate approve is status-only; promotion belongs to a later extractor/review phase"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
 async fn start_thread_and_turn(

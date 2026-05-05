@@ -5,6 +5,7 @@ mod database;
 mod helpers;
 mod mcp_secrets;
 mod mcp_service;
+mod memory_runtime;
 mod message;
 mod operations;
 mod resilience;
@@ -41,6 +42,7 @@ use crate::auth::issue_superuser_token as issue_superuser_token_internal;
 use crate::bootstrap::bootstrap as run_bootstrap;
 use crate::database::initialize as initialize_database;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
+use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::message::MessageProcessor;
 use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
@@ -334,7 +336,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         },
     };
 
-    let message_processor = Arc::new(MessageProcessor::new(
+    let memory_runtime = Arc::new(GatewayMemoryRuntime::from_config(
+        crud_store.clone(),
+        runtime_home.as_path(),
+        &config.gateway.memory,
+    )?);
+
+    let message_processor = Arc::new(MessageProcessor::new_with_memory_runtime(
         thread_manager,
         provider_registry,
         session_manager.clone(),
@@ -344,6 +352,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         summary_config,
         context_budget,
         tool_loop_config,
+        memory_runtime,
     ));
 
     message_processor.bind_task_bridge().await;

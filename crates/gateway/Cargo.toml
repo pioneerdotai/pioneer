@@ -14,6 +14,7 @@ pioneer-crud.workspace = true
 pioneer-keystore.workspace = true
 pioneer-migration.workspace = true
 pioneer-mcp.workspace = true
+pioneer-memory.workspace = true
 pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true

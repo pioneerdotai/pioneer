@@ -8,7 +8,8 @@ use crate::{
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
     ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
     McpChangedNotification, McpServerCatalogChangedNotification,
-    McpServerStatusChangedNotification, SkillsChangedNotification,
+    McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
+    MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
     TaskCreatedNotification, TaskDeliveryCancelledNotification, TaskDeliveryDeliveredNotification,
     TaskDeliveryFailedNotification, TaskDeliveryQueuedNotification,
@@ -96,6 +97,9 @@ pub enum GatewayNotification {
     TaskDeliveryCancelled(TaskDeliveryCancelledNotification),
     TaskTreeChanged(TaskTreeChangedTaskNotification),
     TaskRecovered(TaskRecoveredNotification),
+    MemoryChanged(MemoryChangedNotification),
+    MemoryCandidateCreated(MemoryCandidateCreatedNotification),
+    MemoryForgotten(MemoryForgottenNotification),
     Unknown(UnknownGatewayNotification),
 }
 
@@ -355,10 +359,29 @@ impl GatewayNotification {
             events::TASK_RECOVERED => serde_json::from_value::<TaskRecoveredNotification>(params)
                 .ok()
                 .map(Self::TaskRecovered),
+            events::MEMORY_CHANGED => {
+                match serde_json::from_value::<MemoryChangedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::MemoryChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::MEMORY_CANDIDATE_CREATED => {
+                match serde_json::from_value::<MemoryCandidateCreatedNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::MemoryCandidateCreated(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::MEMORY_FORGOTTEN => {
+                match serde_json::from_value::<MemoryForgottenNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::MemoryForgotten(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             _ if method.starts_with("item/")
                 || method.starts_with("turn/")
                 || method.starts_with("context/")
-                || method.starts_with("task/") =>
+                || method.starts_with("task/")
+                || method.starts_with("memory/") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
             }
@@ -435,8 +458,9 @@ fn extract_workspace_thread_turn_item(
 mod tests {
     use super::GatewayNotification;
     use crate::{
-        ItemDeltaStream, JsonRpcNotification, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-        ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
+        ItemDeltaStream, JsonRpcNotification, MemoryCandidateCreatedNotification,
+        MemoryChangedNotification, MemoryForgottenNotification, RecoveryAction, RecoveryJobStatus,
+        RecoveryTrigger, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
         ToolRetryExhaustionKind, ToolRetryResolution, TurnItemType,
     };
     use serde_json::json;
@@ -460,6 +484,71 @@ mod tests {
         let mapped =
             GatewayNotification::from_jsonrpc(notification).expect("known notification should map");
         assert!(matches!(mapped, GatewayNotification::TurnStarted(_)));
+    }
+
+    #[test]
+    fn maps_memory_notifications() {
+        let changed = JsonRpcNotification::from_params(
+            "memory/changed",
+            &json!({
+                "memory_id": "mem_1",
+                "scope": {
+                    "kind": "workspace",
+                    "key": "ws_1"
+                },
+                "change_kind": "created"
+            }),
+        )
+        .expect("memory changed notification should encode");
+        let mapped = GatewayNotification::from_jsonrpc(changed).expect("memory changed should map");
+        assert!(matches!(
+            mapped,
+            GatewayNotification::MemoryChanged(MemoryChangedNotification { .. })
+        ));
+
+        let candidate_created = JsonRpcNotification::from_params(
+            "memory/candidate_created",
+            &json!({
+                "candidate": {
+                    "id": "cand_1",
+                    "scope": {
+                        "kind": "workspace",
+                        "key": "ws_1"
+                    },
+                    "category": "preference",
+                    "candidate_text": "The user likes compact summaries.",
+                    "confidence": 0.8,
+                    "reason": "explicit statement",
+                    "provenance": {
+                        "source_kind": "explicit_user_request"
+                    },
+                    "status": "pending",
+                    "created_at": 1700000000
+                }
+            }),
+        )
+        .expect("candidate created notification should encode");
+        let mapped = GatewayNotification::from_jsonrpc(candidate_created)
+            .expect("candidate created should map");
+        assert!(matches!(
+            mapped,
+            GatewayNotification::MemoryCandidateCreated(MemoryCandidateCreatedNotification { .. })
+        ));
+
+        let forgotten = JsonRpcNotification::from_params(
+            "memory/forgotten",
+            &json!({
+                "memory_ids": ["mem_1"],
+                "reason": "user request"
+            }),
+        )
+        .expect("memory forgotten notification should encode");
+        let mapped =
+            GatewayNotification::from_jsonrpc(forgotten).expect("memory forgotten should map");
+        assert!(matches!(
+            mapped,
+            GatewayNotification::MemoryForgotten(MemoryForgottenNotification { .. })
+        ));
     }
 
     #[test]

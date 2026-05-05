@@ -219,9 +219,9 @@ mod tests {
 
     use pioneer_config::{
         AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
-        GatewayDatabaseConfig, GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig,
-        GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
-        GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
+        GatewayDatabaseConfig, GatewayMemoryConfig, GatewayProviderConfig, GatewayRuntimeConfig,
+        GatewaySkillsConfig, GatewayThreadConfig, GatewayToolLoopBudgetConfig,
+        GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
     };
     use pioneer_crud::{McpAuditEventRecord, McpServerInstallationRecord};
     use pioneer_keystore::{DbKeyStore, SecretFilter, SecretKind, SecretMeta, SecretStore};
@@ -581,6 +581,7 @@ mod tests {
                     sqlx_logging: false,
                     run_migrations_on_startup: true,
                 },
+                memory: GatewayMemoryConfig::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),

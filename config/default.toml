@@ -154,6 +154,12 @@ idle_timeout_ms = 30000
 sqlx_logging = false
 run_migrations_on_startup = true
 
+[gateway.memory]
+enabled = true
+capsules_dir = "memory/capsules"
+allow_global_user_by_default = true
+allow_global_agent_by_default = false
+
 [gateway.auth]
 jwt_issuer = "pioneer"
 jwt_audience = "pioneer-clients"

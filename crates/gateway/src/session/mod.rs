@@ -63,6 +63,14 @@ impl SessionManager {
             .collect::<Vec<_>>()
     }
 
+    pub async fn connection_workspace_id(&self, connection_id: ConnectionId) -> Option<String> {
+        self.connections
+            .read()
+            .await
+            .get(&connection_id)
+            .and_then(|connection| connection.workspace_id.clone())
+    }
+
     pub async fn set_connection_workspace(
         &self,
         connection_id: ConnectionId,
@@ -156,6 +164,27 @@ mod tests {
         assert!(
             ids.is_empty(),
             "unknown workspace should not fan out to unrelated connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_workspace_id_returns_current_workspace() {
+        let manager = SessionManager::new();
+        let (tx, _rx) = mpsc::channel(2);
+        let connection_id = manager.register_connection(tx).await;
+
+        assert_eq!(manager.connection_workspace_id(connection_id).await, None);
+
+        manager
+            .set_connection_workspace(connection_id, Some("ws_a".to_owned()))
+            .await;
+
+        assert_eq!(
+            manager
+                .connection_workspace_id(connection_id)
+                .await
+                .as_deref(),
+            Some("ws_a")
         );
     }
 }

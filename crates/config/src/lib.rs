@@ -46,7 +46,40 @@ pub struct GatewayConfig {
     pub skills: GatewaySkillsConfig,
     pub provider: GatewayProviderConfig,
     pub database: GatewayDatabaseConfig,
+    #[serde(default)]
+    pub memory: GatewayMemoryConfig,
     pub auth: GatewayAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayMemoryConfig {
+    #[serde(default = "default_gateway_memory_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gateway_memory_capsules_dir")]
+    pub capsules_dir: String,
+    #[serde(default = "default_gateway_memory_allow_global_user")]
+    pub allow_global_user_by_default: bool,
+    #[serde(default = "default_gateway_memory_allow_global_agent")]
+    pub allow_global_agent_by_default: bool,
+}
+
+impl Default for GatewayMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gateway_memory_enabled(),
+            capsules_dir: default_gateway_memory_capsules_dir(),
+            allow_global_user_by_default: default_gateway_memory_allow_global_user(),
+            allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
+        }
+    }
+}
+
+impl GatewayMemoryConfig {
+    pub fn resolve_capsules_root(&self, runtime_home: &Path) -> Result<PathBuf> {
+        let capsules_dir =
+            normalize_runtime_dir_path(self.capsules_dir.as_str(), "gateway.memory.capsules_dir")?;
+        Ok(runtime_home.join(capsules_dir))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -608,6 +641,22 @@ const fn default_computer_use_run_max_steps_default() -> u32 {
     300
 }
 
+const fn default_gateway_memory_enabled() -> bool {
+    true
+}
+
+fn default_gateway_memory_capsules_dir() -> String {
+    "memory/capsules".to_owned()
+}
+
+const fn default_gateway_memory_allow_global_user() -> bool {
+    true
+}
+
+const fn default_gateway_memory_allow_global_agent() -> bool {
+    false
+}
+
 const fn default_computer_use_snapshot_transport_max_bytes() -> usize {
     8 * 1024 * 1024
 }
@@ -1052,6 +1101,32 @@ fn normalize_runtime_file_name(value: &str, field_name: &str) -> Result<String> 
     }
 
     Ok(trimmed.to_owned())
+}
+
+fn normalize_runtime_dir_path(value: &str, field_name: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field_name} in config must not be empty");
+    }
+    if trimmed.contains('\\') {
+        bail!("{field_name} in config must use `/` as path separator");
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        bail!("{field_name} in config must be relative");
+    }
+    if path.components().any(is_disallowed_component) {
+        bail!("{field_name} in config must not contain parent or root components");
+    }
+    if !path
+        .components()
+        .any(|component| matches!(component, Component::Normal(_)))
+    {
+        bail!("{field_name} in config must contain at least one directory component");
+    }
+
+    Ok(path.to_path_buf())
 }
 
 fn normalize_runtime_leaf_name(value: &str, field_name: &str) -> Result<String> {
@@ -1584,6 +1659,35 @@ service_name = "com.pioneer.gateway.env"
             config.gateway.provider.attachments.url_fetch_max_bytes,
             20 * 1024 * 1024
         );
+        assert!(config.gateway.memory.enabled);
+        assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
+        assert!(config.gateway.memory.allow_global_user_by_default);
+        assert!(!config.gateway.memory.allow_global_agent_by_default);
+        assert_eq!(
+            config
+                .gateway
+                .memory
+                .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
+                .expect("memory capsules root should resolve"),
+            PathBuf::from("/tmp/pioneer-runtime/memory/capsules")
+        );
+    }
+
+    #[test]
+    fn gateway_memory_config_rejects_unsafe_capsule_dirs() {
+        for capsules_dir in ["", "/tmp/memory", "../memory", "memory/../capsules", "."] {
+            let config = super::GatewayMemoryConfig {
+                capsules_dir: capsules_dir.to_owned(),
+                ..super::GatewayMemoryConfig::default()
+            };
+
+            assert!(
+                config
+                    .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
+                    .is_err(),
+                "capsules_dir `{capsules_dir}` must be rejected"
+            );
+        }
     }
 
     fn write_file(path: &PathBuf, content: &str) {

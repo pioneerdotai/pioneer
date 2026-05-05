@@ -325,7 +325,10 @@ impl PioneerDesktop {
             | GatewayNotification::TaskDeliveryFailed(_)
             | GatewayNotification::TaskDeliveryCancelled(_)
             | GatewayNotification::TaskTreeChanged(_)
-            | GatewayNotification::TaskRecovered(_) => {}
+            | GatewayNotification::TaskRecovered(_)
+            | GatewayNotification::MemoryChanged(_)
+            | GatewayNotification::MemoryCandidateCreated(_)
+            | GatewayNotification::MemoryForgotten(_) => {}
         }
     }
 

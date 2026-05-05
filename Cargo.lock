@@ -7359,6 +7359,7 @@ dependencies = [
  "pioneer-entity",
  "pioneer-keystore",
  "pioneer-mcp",
+ "pioneer-memory",
  "pioneer-migration",
  "pioneer-promt",
  "pioneer-protocol",

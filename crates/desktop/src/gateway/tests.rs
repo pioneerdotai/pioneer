@@ -7,9 +7,9 @@ use super::runtime::{classify_local_gateway_state, is_same_gateway_version};
 use super::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
 use pioneer_config::{
     AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
-    GatewayDatabaseConfig, GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig,
-    GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
-    GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
+    GatewayDatabaseConfig, GatewayMemoryConfig, GatewayProviderConfig, GatewayRuntimeConfig,
+    GatewaySkillsConfig, GatewayThreadConfig, GatewayToolLoopBudgetConfig,
+    GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -522,6 +522,7 @@ pub(crate) fn test_config() -> AppConfig {
                 retry: GatewayToolRetryBudgetConfig::default(),
             },
             skills: GatewaySkillsConfig::default(),
+            memory: GatewayMemoryConfig::default(),
             provider: GatewayProviderConfig {
                 default_timeout_secs: 120,
                 attachments: Default::default(),

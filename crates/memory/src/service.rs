@@ -6,8 +6,8 @@ use crate::backend::{
 use crate::config::MemoryServiceConfig;
 use crate::context::MemoryOperationContext;
 use crate::convert::{
-    content_preview, crud_record_to_protocol, effective_provenance, metadata_with_idempotency,
-    protocol_actor_to_crud,
+    content_preview, crud_candidate_to_protocol, crud_record_to_protocol, effective_provenance,
+    metadata_with_idempotency, protocol_actor_to_crud,
 };
 use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
@@ -15,14 +15,17 @@ use crate::policy::{
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
-    AgentMemoryControlRecord, AgentMemoryListFilter, AgentMemoryRepairJobRecord, CrudStore,
-    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
+    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryControlRecord,
+    AgentMemoryListFilter, AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryControlRecord,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
-    MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRecord, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
-    MemorySearchResponse, MemoryStatus, generate_id,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
+    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemoryStatus,
+    generate_id,
 };
 use std::sync::Arc;
 
@@ -456,6 +459,82 @@ impl MemoryService {
         Ok(MemoryForgetResponse {
             forgotten_memory_ids: memory_ids,
             dry_run: false,
+        })
+    }
+
+    pub async fn list_candidates(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesListParams,
+    ) -> Result<MemoryCandidatesListResponse> {
+        let rows = self
+            .store
+            .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
+                scopes: context.effective_scopes(&params.scopes),
+                workspace_guard: context.workspace_guard(),
+                statuses: params.statuses.clone(),
+                limit: Some(u64::from(self.normalized_limit(params.limit))),
+            })
+            .await?;
+
+        let candidates = rows
+            .into_iter()
+            .map(crud_candidate_to_protocol)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MemoryCandidatesListResponse {
+            candidates,
+            next_cursor: None,
+        })
+    }
+
+    pub async fn decide_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesDecideParams,
+    ) -> Result<MemoryCandidatesDecideResponse> {
+        let visible_pending = self
+            .store
+            .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
+                scopes: Vec::new(),
+                workspace_guard: context.workspace_guard(),
+                statuses: vec![MemoryCandidateStatus::Pending],
+                limit: None,
+            })
+            .await?;
+        if !visible_pending
+            .iter()
+            .any(|candidate| candidate.id == params.candidate_id)
+        {
+            bail!(
+                "memory candidate `{}` was not found or is not pending",
+                params.candidate_id
+            );
+        }
+
+        let now = context.now_or(current_unix());
+        let actor = params.actor.clone().or_else(|| context.actor.clone());
+        let decided = self
+            .store
+            .decide_agent_memory_candidate(AgentMemoryCandidateDecisionRecord {
+                candidate_id: params.candidate_id.clone(),
+                decision: params.decision,
+                decided_by: protocol_actor_to_crud(actor),
+                decision_reason: params.reason.clone(),
+                promoted_memory_id: None,
+                decided_at_unix: now,
+            })
+            .await?
+            .with_context(|| {
+                format!(
+                    "memory candidate `{}` was not found or is not pending",
+                    params.candidate_id
+                )
+            })?;
+
+        Ok(MemoryCandidatesDecideResponse {
+            candidate: crud_candidate_to_protocol(decided)?,
+            record: None,
         })
     }
 

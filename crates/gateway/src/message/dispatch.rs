@@ -1,6 +1,8 @@
 use super::*;
 use pioneer_protocol::{
-    McpInstallParams, McpListParams, McpPolicySetParams, SkillListParams, SkillsHealthParams,
+    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesDecideParams,
+    MemoryCandidatesListParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
+    MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
     TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
@@ -119,6 +121,143 @@ impl MessageProcessor {
                                 format!(
                                     "invalid params for `{}`: {error}",
                                     methods::WORKSPACE_DEFAULT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_SEARCH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemorySearchParams>(params_value) {
+                    Ok(params) => self.memory_search(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MEMORY_SEARCH),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryGetParams>(params_value) {
+                    Ok(params) => self.memory_get(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MEMORY_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryListParams>(params_value) {
+                    Ok(params) => self.memory_list(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MEMORY_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_REMEMBER => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryRememberParams>(params_value) {
+                    Ok(params) => {
+                        self.memory_remember(connection_id, request.id, params)
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MEMORY_REMEMBER
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_FORGET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryForgetParams>(params_value) {
+                    Ok(params) => self.memory_forget(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::MEMORY_FORGET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_CANDIDATES_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryCandidatesListParams>(params_value) {
+                    Ok(params) => {
+                        self.memory_candidates_list(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MEMORY_CANDIDATES_LIST
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::MEMORY_CANDIDATES_DECIDE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<MemoryCandidatesDecideParams>(params_value) {
+                    Ok(params) => {
+                        self.memory_candidates_decide(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::MEMORY_CANDIDATES_DECIDE
                                 ),
                             ),
                         )
