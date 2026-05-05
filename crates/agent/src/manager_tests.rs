@@ -11,9 +11,10 @@ use pioneer_hooks::{
     HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity,
     HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
     HookHandlerResponse, HookId, HookInputKind, HookKind, HookPhase, HookPolicyKey, HookPolicySet,
-    HookPromptContent, HookPromptSectionTitle, HookRegistry, HookRuntime, HookSectionId,
-    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
-    PromptManifestDiagnosticContribution, PromptSectionContribution,
+    HookPromptContent, HookPromptContextSet, HookPromptSectionTitle, HookRegistry, HookRuntime,
+    HookSectionId, HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue,
+    PolicyContribution, PromptContextContribution, PromptManifestDiagnosticContribution,
+    PromptSectionContribution,
 };
 use pioneer_protocol::{
     AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, RecoveryAction,
@@ -187,13 +188,14 @@ struct RecordedHookCall {
     mode: Option<HookContextMode>,
     actor_kind: Option<HookActorKind>,
     policy_set: HookPolicySet,
+    prompt_context_set: HookPromptContextSet,
 }
 
 struct RecordingHookHandler {
     hook_id: HookId,
     calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
     contributions: Vec<HookContribution>,
-    fail: bool,
+    fail_phases: Vec<HookPhase>,
 }
 
 #[async_trait::async_trait]
@@ -243,9 +245,10 @@ impl HookHandler for RecordingHookHandler {
                     .as_ref()
                     .map(|actor| actor.kind.clone()),
                 policy_set: request.policy_set.clone(),
+                prompt_context_set: request.prompt_context_set.clone(),
             });
 
-        if self.fail {
+        if self.fail_phases.contains(&request.phase) {
             return Err(HookError::new(
                 HookDiagnosticCode::new("test.phase07_failed").expect("valid diagnostic code"),
                 HookDiagnosticMessage::new("phase 07 hook failed").expect("valid diagnostic"),
@@ -275,11 +278,47 @@ fn recording_hook_runtime(
     recording_hook_runtime_with_fallback(calls, contributions, failure_policy, fail, Vec::new())
 }
 
+fn recording_hook_runtime_with_phase_failures(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    contributions: Vec<HookContribution>,
+    failure_policy: HookFailurePolicy,
+    fail_phases: Vec<HookPhase>,
+) -> Arc<HookRuntime> {
+    recording_hook_runtime_with_phase_failures_and_fallback(
+        calls,
+        contributions,
+        failure_policy,
+        fail_phases,
+        Vec::new(),
+    )
+}
+
 fn recording_hook_runtime_with_fallback(
     calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
     contributions: Vec<HookContribution>,
     failure_policy: HookFailurePolicy,
     fail: bool,
+    fallback_contributions: Vec<HookContribution>,
+) -> Arc<HookRuntime> {
+    let fail_phases = if fail {
+        PHASE_07_HOOK_PHASES.to_vec()
+    } else {
+        Vec::new()
+    };
+    recording_hook_runtime_with_phase_failures_and_fallback(
+        calls,
+        contributions,
+        failure_policy,
+        fail_phases,
+        fallback_contributions,
+    )
+}
+
+fn recording_hook_runtime_with_phase_failures_and_fallback(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    contributions: Vec<HookContribution>,
+    failure_policy: HookFailurePolicy,
+    fail_phases: Vec<HookPhase>,
     fallback_contributions: Vec<HookContribution>,
 ) -> Arc<HookRuntime> {
     let handlers = Arc::new(HookRegistry::new());
@@ -290,7 +329,7 @@ fn recording_hook_runtime_with_fallback(
             hook_id: hook_id.clone(),
             calls,
             contributions,
-            fail,
+            fail_phases,
         }))
         .expect("recording hook registers");
 
@@ -326,6 +365,41 @@ fn policy_contribution(
         priority,
         diagnostics: Vec::new(),
     })
+}
+
+fn prompt_context_contribution(
+    contribution_id: &str,
+    domain: &str,
+    priority: i32,
+    content: &str,
+) -> HookContribution {
+    HookContribution::PromptContext(PromptContextContribution {
+        contribution_id: pioneer_hooks::HookContributionId::new(contribution_id)
+            .expect("valid contribution id"),
+        domain: HookDomain::new(domain).expect("valid domain"),
+        priority,
+        content: HookPromptContent::new(content).expect("valid prompt content"),
+        max_chars: None,
+        source_refs: Vec::new(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+}
+
+fn prompt_context_contribution_with_max_chars(
+    contribution_id: &str,
+    domain: &str,
+    priority: i32,
+    content: &str,
+    max_chars: usize,
+) -> HookContribution {
+    let HookContribution::PromptContext(mut contribution) =
+        prompt_context_contribution(contribution_id, domain, priority, content)
+    else {
+        unreachable!("helper returns prompt context contribution");
+    };
+    contribution.max_chars = Some(max_chars);
+    HookContribution::PromptContext(contribution)
 }
 
 fn policy_value(policy_set: &HookPolicySet, domain: &str, key: &str) -> Option<HookValue> {
@@ -1512,6 +1586,7 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
         assert_eq!(call.mode, Some(HookContextMode::Agent));
         assert_eq!(call.actor_kind, Some(HookActorKind::Agent));
         assert!(call.policy_set.is_empty());
+        assert!(call.prompt_context_set.is_empty());
     }
     assert_eq!(provider.snapshot_requests().len(), 1);
 }
@@ -2018,6 +2093,456 @@ async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
     assert_eq!(
         policy_value(&pre_prompt_context.policy_set, "test", "memory_disabled"),
         Some(HookValue::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn phase_09_one_context_contribution_reaches_pre_prompt_compile() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![prompt_context_contribution(
+                "test.context.one",
+                "test",
+                10,
+                "context one",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_one",
+        "ws_phase09_context_one",
+        "turn_phase09_context_one",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context aggregation",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    assert!(pre_prompt_context.prompt_context_set.is_empty());
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    assert_eq!(pre_prompt_compile.prompt_context_set.entries.len(), 1);
+    let entry = &pre_prompt_compile.prompt_context_set.entries[0];
+    assert_eq!(entry.contribution_id.as_str(), "test.context.one");
+    assert_eq!(entry.domain.as_str(), "test");
+    assert_eq!(entry.content.as_str(), "context one");
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("context one"));
+}
+
+#[tokio::test]
+async fn phase_09_multiple_context_contributions_order_deterministically() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![
+                prompt_context_contribution("test.context.low", "test", 0, "low"),
+                prompt_context_contribution("test.context.same_b", "test.b", 5, "same b"),
+                prompt_context_contribution("test.context.high", "test", 10, "high"),
+                prompt_context_contribution("test.context.same_a", "test.a", 5, "same a"),
+            ],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_order",
+        "ws_phase09_context_order",
+        "turn_phase09_context_order",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context ordering",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    let ordered_ids = pre_prompt_compile
+        .prompt_context_set
+        .entries
+        .iter()
+        .map(|entry| entry.contribution_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordered_ids,
+        vec![
+            "test.context.high".to_owned(),
+            "test.context.same_a".to_owned(),
+            "test.context.same_b".to_owned(),
+            "test.context.low".to_owned(),
+        ]
+    );
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_09_context_budget_truncates_predictably() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![prompt_context_contribution_with_max_chars(
+                "test.context.long",
+                "test",
+                10,
+                "0123456789abcdef",
+                8,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_truncate",
+        "ws_phase09_context_truncate",
+        "turn_phase09_context_truncate",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context truncation",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    let set = &pre_prompt_compile.prompt_context_set;
+    assert_eq!(set.entries.len(), 1);
+    assert_eq!(set.entries[0].content.as_str(), "01234567");
+    assert!(set.entries[0].truncated);
+    assert!(set.truncated);
+    assert!(set.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "prompt_context.truncated"
+            && diagnostic.safe_for_user
+            && !diagnostic.message.as_str().contains("0123456789abcdef")
+    }));
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::Required,
+            vec![HookPhase::TurnPrePromptContext],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_failure",
+        "ws_phase09_context_failure",
+        "turn_phase09_context_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context failure",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    let set = &pre_prompt_compile.prompt_context_set;
+    assert!(set.entries.is_empty());
+    assert!(set.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "prompt_context.runtime_failed" && diagnostic.safe_for_user
+    }));
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("phase 07 hook failed"));
+}
+
+#[tokio::test]
+async fn phase_09_context_contribution_does_not_change_provider_prompt_yet() {
+    let baseline_provider = Arc::new(CaptureAgentProvider::default());
+    let baseline_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        baseline_provider.clone(),
+    ));
+    let baseline_manager = AgentManager::new(baseline_registry, test_tool_loop_config());
+    baseline_manager
+        .set_hook_runtime(Some(empty_hook_runtime()))
+        .await;
+
+    let baseline_observed = start_simple_turn(
+        &baseline_manager,
+        "thr_phase09_prompt_baseline",
+        "ws_phase09_prompt",
+        "turn_phase09_prompt_baseline",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 prompt stability",
+    )
+    .await;
+    assert_turn_completed(&baseline_observed);
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook_provider = Arc::new(CaptureAgentProvider::default());
+    let hook_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        hook_provider.clone(),
+    ));
+    let hook_manager = AgentManager::new(hook_registry, test_tool_loop_config());
+    hook_manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![prompt_context_contribution(
+                "test.context.hidden",
+                "test",
+                10,
+                "HOOK PROMPT CONTEXT MUST NOT APPEAR",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let hook_observed = start_simple_turn(
+        &hook_manager,
+        "thr_phase09_prompt_hook",
+        "ws_phase09_prompt",
+        "turn_phase09_prompt_hook",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 prompt stability",
+    )
+    .await;
+    assert_turn_completed(&hook_observed);
+
+    let baseline_requests = baseline_provider.snapshot_requests();
+    let hook_requests = hook_provider.snapshot_requests();
+    assert_eq!(baseline_requests.len(), 1);
+    assert_eq!(hook_requests.len(), 1);
+    assert_stable_requests_eq(&baseline_requests[0], &hook_requests[0]);
+    let prompt = hook_requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("HOOK PROMPT CONTEXT MUST NOT APPEAR")
+    );
+}
+
+#[tokio::test]
+async fn phase_09_no_context_hooks_preserve_agent_request() {
+    let baseline_provider = Arc::new(CaptureAgentProvider::default());
+    let baseline_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        baseline_provider.clone(),
+    ));
+    let baseline_manager = AgentManager::new(baseline_registry, test_tool_loop_config());
+
+    let baseline_observed = start_simple_turn(
+        &baseline_manager,
+        "thr_phase09_no_context_baseline",
+        "ws_phase09_no_context",
+        "turn_phase09_no_context_baseline",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 no context hooks",
+    )
+    .await;
+    assert_turn_completed(&baseline_observed);
+
+    let empty_provider = Arc::new(CaptureAgentProvider::default());
+    let empty_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        empty_provider.clone(),
+    ));
+    let empty_manager = AgentManager::new(empty_registry, test_tool_loop_config());
+    empty_manager
+        .set_hook_runtime(Some(empty_hook_runtime()))
+        .await;
+
+    let empty_observed = start_simple_turn(
+        &empty_manager,
+        "thr_phase09_no_context_empty",
+        "ws_phase09_no_context",
+        "turn_phase09_no_context_empty",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 no context hooks",
+    )
+    .await;
+    assert_turn_completed(&empty_observed);
+
+    let baseline_requests = baseline_provider.snapshot_requests();
+    let empty_requests = empty_provider.snapshot_requests();
+    assert_eq!(baseline_requests.len(), 1);
+    assert_eq!(empty_requests.len(), 1);
+    assert_stable_requests_eq(&baseline_requests[0], &empty_requests[0]);
+}
+
+#[tokio::test]
+async fn phase_09_chat_mode_still_does_not_call_turn_hooks() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "capture-standard",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![prompt_context_contribution(
+                "test.context.chat",
+                "test",
+                10,
+                "CHAT HOOK CONTEXT MUST NOT RUN",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_chat_context",
+        "ws_phase09_chat_context",
+        "turn_phase09_chat_context",
+        ThreadMode::Chat,
+        "capture-standard",
+        "phase 09 chat mode should not call hooks",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert!(snapshot_hook_calls(&calls).is_empty());
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].compiled_prompt.is_none());
+}
+
+#[tokio::test]
+async fn phase_09_memory_path_remains_unchanged() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_phase09_context_isolation",
+                MemoryCategory::Preference,
+                Some("city"),
+                "User likes Porto.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::explicit_remember(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![prompt_context_contribution(
+                "test.context.memory",
+                "test",
+                10,
+                "HOOK MEMORY CONTEXT MUST NOT APPEAR",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_memory_not_migrated",
+        "ws_phase09_memory_not_migrated",
+        "turn_phase09_memory_not_migrated",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 memory remains on existing path",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(policy_provider.contexts().len(), 1);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("User likes Porto."));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("HOOK MEMORY CONTEXT MUST NOT APPEAR")
     );
 }
 

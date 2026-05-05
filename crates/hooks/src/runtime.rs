@@ -3,8 +3,8 @@ use crate::{
     HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
     HookDiagnosticRedactionPolicy, HookDiagnosticSeverity, HookError, HookFailurePolicy,
     HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookMetadata,
-    HookPhase, HookPolicySet, HookRegistry, HookRegistryError, HookSubscription,
-    HookSubscriptionId, HookSubscriptionRegistry,
+    HookPhase, HookPolicySet, HookPromptContextSet, HookRegistry, HookRegistryError,
+    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
@@ -236,6 +236,8 @@ pub struct HookPhaseRequest {
     pub input: HookInput,
     #[serde(default, skip_serializing_if = "HookPolicySet::is_empty")]
     pub policy_set: HookPolicySet,
+    #[serde(default, skip_serializing_if = "HookPromptContextSet::is_empty")]
+    pub prompt_context_set: HookPromptContextSet,
 }
 
 impl HookPhaseRequest {
@@ -245,11 +247,17 @@ impl HookPhaseRequest {
             context,
             input,
             policy_set: HookPolicySet::empty(),
+            prompt_context_set: HookPromptContextSet::empty(),
         }
     }
 
     pub fn with_policy_set(mut self, policy_set: HookPolicySet) -> Self {
         self.policy_set = policy_set;
+        self
+    }
+
+    pub fn with_prompt_context_set(mut self, prompt_context_set: HookPromptContextSet) -> Self {
+        self.prompt_context_set = prompt_context_set;
         self
     }
 }
@@ -763,6 +771,7 @@ fn handler_request(node: &HookExecutionNode, request: HookPhaseRequest) -> HookH
         context: request.context,
         input: request.input,
         policy_set: request.policy_set,
+        prompt_context_set: request.prompt_context_set,
     }
 }
 
@@ -1105,6 +1114,7 @@ mod tests {
     struct PolicySetRecordingHookHandler {
         id: HookId,
         captured_policy_sets: Arc<Mutex<Vec<HookPolicySet>>>,
+        captured_prompt_context_sets: Arc<Mutex<Vec<HookPromptContextSet>>>,
     }
 
     #[async_trait]
@@ -1126,6 +1136,10 @@ mod tests {
                 .lock()
                 .expect("policy sets lock")
                 .push(request.policy_set);
+            self.captured_prompt_context_sets
+                .lock()
+                .expect("prompt context sets lock")
+                .push(request.prompt_context_set);
             Ok(HookHandlerResponse::default())
         }
     }
@@ -1714,15 +1728,22 @@ mod tests {
     }
 
     #[test]
+    fn hook_phase_request_defaults_to_empty_prompt_context_set() {
+        assert!(phase_request().prompt_context_set.is_empty());
+    }
+
+    #[test]
     fn hook_phase_request_with_policy_set_reaches_handler_request() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let captured_policy_sets = Arc::new(Mutex::new(Vec::new()));
+        let captured_prompt_context_sets = Arc::new(Mutex::new(Vec::new()));
         let hook_id = hook_id("test.policy_receiver");
         handlers
             .register_handler(Arc::new(PolicySetRecordingHookHandler {
                 id: hook_id.clone(),
                 captured_policy_sets: captured_policy_sets.clone(),
+                captured_prompt_context_sets: captured_prompt_context_sets.clone(),
             }))
             .expect("handler registers");
         subscriptions
@@ -1750,6 +1771,69 @@ mod tests {
         assert_eq!(
             *captured_policy_sets.lock().expect("policy sets lock"),
             vec![policy_set]
+        );
+        assert_eq!(
+            *captured_prompt_context_sets
+                .lock()
+                .expect("prompt context sets lock"),
+            vec![HookPromptContextSet::empty()]
+        );
+    }
+
+    #[test]
+    fn hook_phase_request_with_prompt_context_set_reaches_handler_request() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let captured_policy_sets = Arc::new(Mutex::new(Vec::new()));
+        let captured_prompt_context_sets = Arc::new(Mutex::new(Vec::new()));
+        let hook_id = hook_id("test.prompt_context_receiver");
+        handlers
+            .register_handler(Arc::new(PolicySetRecordingHookHandler {
+                id: hook_id.clone(),
+                captured_policy_sets: captured_policy_sets.clone(),
+                captured_prompt_context_sets: captured_prompt_context_sets.clone(),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                &handlers,
+                HookSubscription::new(
+                    subscription_id("sub.prompt_context_receiver"),
+                    hook_id,
+                    HookPhase::TurnPrePromptCompile,
+                ),
+            )
+            .expect("subscription registers");
+        let runtime = runtime(handlers, subscriptions);
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [crate::PromptContextContribution {
+                contribution_id: crate::HookContributionId::new("test.context.one")
+                    .expect("valid contribution id"),
+                domain: HookDomain::new("test").expect("valid domain"),
+                priority: 10,
+                content: crate::HookPromptContent::new("context").expect("valid content"),
+                max_chars: None,
+                source_refs: Vec::new(),
+                diagnostics: Vec::new(),
+                truncated: false,
+            }],
+            crate::HookPromptContextLimits::default(),
+        );
+
+        block_on_ready(
+            runtime.run_phase(phase_request().with_prompt_context_set(prompt_context_set.clone())),
+        )
+        .expect("phase execution succeeds");
+
+        assert_eq!(
+            *captured_policy_sets.lock().expect("policy sets lock"),
+            vec![HookPolicySet::empty()]
+        );
+        assert_eq!(
+            *captured_prompt_context_sets
+                .lock()
+                .expect("prompt context sets lock"),
+            vec![prompt_context_set]
         );
     }
 

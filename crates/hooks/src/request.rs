@@ -1,6 +1,6 @@
 use crate::{
     HookContext, HookContribution, HookDiagnostic, HookId, HookMetadata, HookPhase, HookPolicySet,
-    HookValue,
+    HookPromptContextSet, HookValue,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -111,6 +111,8 @@ pub struct HookHandlerRequest {
     pub input: HookInput,
     #[serde(default, skip_serializing_if = "HookPolicySet::is_empty")]
     pub policy_set: HookPolicySet,
+    #[serde(default, skip_serializing_if = "HookPromptContextSet::is_empty")]
+    pub prompt_context_set: HookPromptContextSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -152,6 +154,7 @@ mod tests {
                 ])),
             },
             policy_set: HookPolicySet::empty(),
+            prompt_context_set: HookPromptContextSet::empty(),
         };
 
         let value = serde_json::to_value(&request).expect("request should serialize");

@@ -1,7 +1,8 @@
 use pioneer_hooks::{
     HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookDiagnostic,
-    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet, HookRuntime,
-    HookRuntimeError, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
+    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
+    HookPromptContextLimits, HookPromptContextSet, HookRuntime, HookRuntimeError, HookThreadId,
+    HookTurnId, HookValue, HookWorkspaceId,
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,6 +44,25 @@ impl EffectiveTurnPolicySet {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct EffectiveTurnPromptContextSet {
+    contexts: HookPromptContextSet,
+}
+
+impl EffectiveTurnPromptContextSet {
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn from_hook_prompt_context_set(contexts: HookPromptContextSet) -> Self {
+        Self { contexts }
+    }
+
+    pub(super) fn clone_hook_prompt_context_set(&self) -> HookPromptContextSet {
+        self.contexts.clone()
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum AgentTurnHookError {
     InvalidContext(HookIdError),
@@ -77,8 +97,14 @@ pub(super) async fn run_agent_turn_policy_hook_phase(
     };
 
     let empty_policy_set = EffectiveTurnPolicySet::empty();
-    let request = build_phase_request(context, HookPhase::TurnPrePolicy, &empty_policy_set)
-        .map_err(AgentTurnHookError::InvalidContext)?;
+    let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
+    let request = build_phase_request(
+        context,
+        HookPhase::TurnPrePolicy,
+        &empty_policy_set,
+        &empty_prompt_context_set,
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
 
     match runtime.run_phase(request).await {
         Ok(response) => {
@@ -98,17 +124,66 @@ pub(super) async fn run_agent_turn_policy_hook_phase(
     }
 }
 
+pub(super) async fn run_agent_turn_prompt_context_hook_phase(
+    runtime: Option<&Arc<HookRuntime>>,
+    context: &AgentTurnHookContext,
+    policy_set: &EffectiveTurnPolicySet,
+) -> EffectiveTurnPromptContextSet {
+    let Some(runtime) = runtime else {
+        return EffectiveTurnPromptContextSet::empty();
+    };
+
+    let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
+    let request = match build_phase_request(
+        context,
+        HookPhase::TurnPrePromptContext,
+        policy_set,
+        &empty_prompt_context_set,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(
+                phase = %HookPhase::TurnPrePromptContext,
+                error = %error,
+                "agent turn prompt context hook phase failed to build request; continuing with empty context"
+            );
+            return runtime_failed_prompt_context_set();
+        }
+    };
+
+    match runtime.run_phase(request).await {
+        Ok(mut response) => {
+            for diagnostic in &response.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePromptContext, diagnostic);
+            }
+            let phase_diagnostics = std::mem::take(&mut response.diagnostics);
+            let mut prompt_context_set =
+                prompt_context_set_from_contributions(response.contributions);
+            prompt_context_set.diagnostics.extend(phase_diagnostics);
+            for diagnostic in &prompt_context_set.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePromptContext, diagnostic);
+            }
+            EffectiveTurnPromptContextSet::from_hook_prompt_context_set(prompt_context_set)
+        }
+        Err(error) => {
+            warn_hook_prompt_context_runtime_error(HookPhase::TurnPrePromptContext, &error);
+            runtime_failed_prompt_context_set()
+        }
+    }
+}
+
 pub(super) async fn run_noop_agent_turn_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
     phase: HookPhase,
     policy_set: &EffectiveTurnPolicySet,
+    prompt_context_set: &EffectiveTurnPromptContextSet,
 ) {
     let Some(runtime) = runtime else {
         return;
     };
 
-    let request = match build_phase_request(context, phase, policy_set) {
+    let request = match build_phase_request(context, phase, policy_set, prompt_context_set) {
         Ok(request) => request,
         Err(error) => {
             warn!(
@@ -134,6 +209,7 @@ fn build_phase_request(
     context: &AgentTurnHookContext,
     phase: HookPhase,
     policy_set: &EffectiveTurnPolicySet,
+    prompt_context_set: &EffectiveTurnPromptContextSet,
 ) -> Result<HookPhaseRequest, HookIdError> {
     let request = HookPhaseRequest::new(
         phase,
@@ -154,12 +230,28 @@ fn build_phase_request(
             payload: HookValue::Null,
         },
     )
-    .with_policy_set(policy_set.clone_hook_policy_set());
+    .with_policy_set(policy_set.clone_hook_policy_set())
+    .with_prompt_context_set(prompt_context_set.clone_hook_prompt_context_set());
     Ok(request)
 }
 
 fn policy_set_from_contributions(contributions: Vec<HookContribution>) -> HookPolicySet {
     HookPolicySet::merge_hook_contributions(contributions)
+}
+
+fn prompt_context_set_from_contributions(
+    contributions: Vec<HookContribution>,
+) -> HookPromptContextSet {
+    HookPromptContextSet::aggregate_hook_contributions(
+        contributions,
+        HookPromptContextLimits::default(),
+    )
+}
+
+fn runtime_failed_prompt_context_set() -> EffectiveTurnPromptContextSet {
+    EffectiveTurnPromptContextSet::from_hook_prompt_context_set(
+        HookPromptContextSet::runtime_failed(),
+    )
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -292,6 +384,124 @@ fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
                 "agent turn policy hook phase failed; failing turn"
+            );
+        }
+    }
+}
+
+fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
+    match error {
+        HookRuntimeError::Registry(_) => {
+            warn!(
+                phase = %phase,
+                error_kind = "registry",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::MissingHandler {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_handler",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::HookFailed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::HookTimedOut {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            timeout_ms,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                timeout_ms = *timeout_ms,
+                error_kind = "hook_timed_out",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::HookFailedClosed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed_closed",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::MissingFallbackContribution {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_fallback_contribution",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::MissingDependency {
+            subscription_id,
+            dependency_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                dependency_id = %dependency_id,
+                error_kind = "missing_dependency",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::DependencyCycle {
+            phase: error_phase,
+            subscription_ids,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_count = subscription_ids.len(),
+                error_kind = "dependency_cycle",
+                "agent turn prompt context hook phase failed; continuing with empty context"
             );
         }
     }

@@ -10,7 +10,8 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use crate::hooks::{
-    AgentTurnHookContext, run_agent_turn_policy_hook_phase, run_noop_agent_turn_hook_phase,
+    AgentTurnHookContext, run_agent_turn_policy_hook_phase,
+    run_agent_turn_prompt_context_hook_phase, run_noop_agent_turn_hook_phase,
 };
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
@@ -1056,10 +1057,9 @@ async fn execute_agent_provider_response(
         );
     }
 
-    run_noop_agent_turn_hook_phase(
+    let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
-        HookPhase::TurnPrePromptContext,
         &effective_policy_set,
     )
     .await;
@@ -1157,6 +1157,7 @@ async fn execute_agent_provider_response(
             &hook_context,
             HookPhase::TurnPrePromptCompile,
             &effective_policy_set,
+            &effective_prompt_context_set,
         )
         .await;
 
@@ -1175,6 +1176,7 @@ async fn execute_agent_provider_response(
             &hook_context,
             HookPhase::TurnPostPromptCompile,
             &effective_policy_set,
+            &effective_prompt_context_set,
         )
         .await;
 
@@ -1214,6 +1216,7 @@ async fn execute_agent_provider_response(
                 &hook_context,
                 HookPhase::TurnPostTurn,
                 &effective_policy_set,
+                &effective_prompt_context_set,
             )
             .await;
         }
@@ -1385,6 +1388,7 @@ async fn execute_agent_provider_response(
         &hook_context,
         HookPhase::TurnPrePromptCompile,
         &effective_policy_set,
+        &effective_prompt_context_set,
     )
     .await;
 
@@ -1403,6 +1407,7 @@ async fn execute_agent_provider_response(
         &hook_context,
         HookPhase::TurnPostPromptCompile,
         &effective_policy_set,
+        &effective_prompt_context_set,
     )
     .await;
 
@@ -2369,6 +2374,7 @@ async fn execute_agent_provider_response(
             &hook_context,
             HookPhase::TurnPostTurn,
             &effective_policy_set,
+            &effective_prompt_context_set,
         )
         .await;
     }

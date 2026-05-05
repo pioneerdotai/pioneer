@@ -7,6 +7,7 @@ mod id;
 mod phase;
 mod policy;
 mod policy_set;
+mod prompt_context_set;
 mod registry;
 mod request;
 mod runtime;
@@ -35,6 +36,10 @@ pub use policy::{
     HookAwaitPolicy, HookExecutionPolicy, HookFailurePolicy, HookRetryBackoff, HookRetryPolicy,
 };
 pub use policy_set::{HookPolicyEntry, HookPolicyKeyRef, HookPolicySet};
+pub use prompt_context_set::{
+    DEFAULT_PROMPT_CONTEXT_MAX_ENTRIES, DEFAULT_PROMPT_CONTEXT_MAX_TOTAL_CHARS,
+    HookPromptContextEntry, HookPromptContextLimits, HookPromptContextSet,
+};
 pub use registry::{HookRegistry, HookSubscriptionRegistry};
 pub use request::{HookHandlerRequest, HookHandlerResponse, HookInput, HookInputKind};
 pub use runtime::{
