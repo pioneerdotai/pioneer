@@ -9,12 +9,16 @@ authors.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+hex.workspace = true
+memvid-core.workspace = true
 pioneer-crud.workspace = true
 pioneer-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 pioneer-migration.workspace = true
 sea-orm.workspace = true
+tempfile.workspace = true

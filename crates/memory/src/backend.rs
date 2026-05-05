@@ -1,15 +1,17 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use pioneer_protocol::{MemoryCategory, MemoryScope, MemorySensitivity};
+use pioneer_protocol::{
+    MemoryActorKind, MemoryCategory, MemoryScope, MemorySensitivity, MemorySourceKind, MemoryStatus,
+};
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
     async fn put(&self, request: BackendPutRequest) -> Result<BackendPutResult>;
-    async fn get(&self, memory_id: &str) -> Result<Option<BackendPayload>>;
+    async fn get(&self, request: BackendGetRequest) -> Result<Option<BackendPayload>>;
     async fn search(&self, request: BackendSearchRequest) -> Result<Vec<BackendSearchHit>>;
-    async fn delete(&self, memory_id: &str) -> Result<BackendDeleteResult>;
+    async fn delete(&self, request: BackendDeleteRequest) -> Result<BackendDeleteResult>;
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +24,15 @@ pub struct BackendPutRequest {
     pub content: String,
     pub sensitivity: MemorySensitivity,
     pub metadata_json: Option<String>,
+    pub source_kind: MemorySourceKind,
+    pub source_thread_id: Option<String>,
+    pub source_turn_id: Option<String>,
+    pub source_item_id: Option<String>,
+    pub created_by_kind: Option<MemoryActorKind>,
+    pub created_by_id: Option<String>,
+    pub policy_version: String,
+    pub status: MemoryStatus,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +46,17 @@ pub struct BackendPutResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackendGetRequest {
+    pub memory_id: String,
+    pub scope: MemoryScope,
+    pub scope_key_hash: Option<String>,
+    pub capsule_id: Option<String>,
+    pub capsule_ref: Option<String>,
+    pub frame_id: Option<i64>,
+    pub frame_uri: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendPayload {
     pub memory_id: String,
     pub content: String,
@@ -43,9 +65,18 @@ pub struct BackendPayload {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackendSearchScope {
+    pub scope: MemoryScope,
+    pub scope_key_hash: String,
+    pub workspace_id: Option<String>,
+    pub capsule_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendSearchRequest {
     pub query: String,
     pub scopes: Vec<MemoryScope>,
+    pub resolved_scopes: Vec<BackendSearchScope>,
     pub limit: u32,
 }
 
@@ -55,6 +86,17 @@ pub struct BackendSearchHit {
     pub score: Option<f32>,
     pub snippet: Option<String>,
     pub matched_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendDeleteRequest {
+    pub memory_id: String,
+    pub scope: MemoryScope,
+    pub scope_key_hash: Option<String>,
+    pub capsule_id: Option<String>,
+    pub capsule_ref: Option<String>,
+    pub frame_id: Option<i64>,
+    pub frame_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,7 +113,7 @@ impl MemoryBackend for NoopMemoryBackend {
         bail!("memory backend is not configured");
     }
 
-    async fn get(&self, _memory_id: &str) -> Result<Option<BackendPayload>> {
+    async fn get(&self, _request: BackendGetRequest) -> Result<Option<BackendPayload>> {
         bail!("memory backend is not configured");
     }
 
@@ -79,7 +121,7 @@ impl MemoryBackend for NoopMemoryBackend {
         bail!("memory backend is not configured");
     }
 
-    async fn delete(&self, _memory_id: &str) -> Result<BackendDeleteResult> {
+    async fn delete(&self, _request: BackendDeleteRequest) -> Result<BackendDeleteResult> {
         bail!("memory backend is not configured");
     }
 }
@@ -189,13 +231,13 @@ impl MemoryBackend for InMemoryMemoryBackend {
         })
     }
 
-    async fn get(&self, memory_id: &str) -> Result<Option<BackendPayload>> {
+    async fn get(&self, request: BackendGetRequest) -> Result<Option<BackendPayload>> {
         Ok(self
             .inner
             .read()
             .await
             .records
-            .get(memory_id)
+            .get(request.memory_id.as_str())
             .map(|record| BackendPayload {
                 memory_id: record.memory_id.clone(),
                 content: record.content.clone(),
@@ -220,10 +262,7 @@ impl MemoryBackend for InMemoryMemoryBackend {
             .await
             .records
             .values()
-            .filter(|record| {
-                request.scopes.is_empty()
-                    || request.scopes.iter().any(|scope| scope == &record.scope)
-            })
+            .filter(|record| in_search_scope(record, &request))
             .filter_map(|record| score_record(record, query.as_str(), &query_terms))
             .collect::<Vec<_>>();
 
@@ -238,7 +277,7 @@ impl MemoryBackend for InMemoryMemoryBackend {
         Ok(hits)
     }
 
-    async fn delete(&self, memory_id: &str) -> Result<BackendDeleteResult> {
+    async fn delete(&self, request: BackendDeleteRequest) -> Result<BackendDeleteResult> {
         let mut state = self.inner.write().await;
         if let Some(error) = state.delete_error.clone() {
             bail!(error);
@@ -247,9 +286,20 @@ impl MemoryBackend for InMemoryMemoryBackend {
             return Ok(BackendDeleteResult { deleted: false });
         }
         Ok(BackendDeleteResult {
-            deleted: state.records.remove(memory_id).is_some(),
+            deleted: state.records.remove(request.memory_id.as_str()).is_some(),
         })
     }
+}
+
+fn in_search_scope(record: &StoredMemoryPayload, request: &BackendSearchRequest) -> bool {
+    if !request.resolved_scopes.is_empty() {
+        return request
+            .resolved_scopes
+            .iter()
+            .any(|scope| scope.scope == record.scope);
+    }
+
+    request.scopes.is_empty() || request.scopes.iter().any(|scope| scope == &record.scope)
 }
 
 fn score_record(

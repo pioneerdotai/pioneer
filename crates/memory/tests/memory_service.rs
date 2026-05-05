@@ -277,6 +277,7 @@ async fn forget_tombstone_suppresses_stale_backend_search_hit() {
         .raw_search(BackendSearchRequest {
             query: "Tbilisi".to_owned(),
             scopes: vec![scope(MemoryScopeKind::User, "default")],
+            resolved_scopes: Vec::new(),
             limit: 10,
         })
         .await
@@ -660,6 +661,15 @@ async fn stale_backend_payload_without_control_plane_row_creates_repair_diagnost
             content: "Backend-only stale memory.".to_owned(),
             sensitivity: MemorySensitivity::Normal,
             metadata_json: None,
+            source_kind: pioneer_protocol::MemorySourceKind::ExplicitUserRequest,
+            source_thread_id: None,
+            source_turn_id: None,
+            source_item_id: None,
+            created_by_kind: None,
+            created_by_id: None,
+            policy_version: "test".to_owned(),
+            status: MemoryStatus::Active,
+            idempotency_key: None,
         })
         .await;
 

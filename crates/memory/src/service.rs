@@ -1,5 +1,8 @@
 use crate::NoopMemoryBackend;
-use crate::backend::{BackendPutRequest, BackendSearchRequest, MemoryBackend};
+use crate::backend::{
+    BackendDeleteRequest, BackendGetRequest, BackendPutRequest, BackendSearchRequest,
+    BackendSearchScope, MemoryBackend,
+};
 use crate::config::MemoryServiceConfig;
 use crate::context::MemoryOperationContext;
 use crate::convert::{
@@ -124,6 +127,18 @@ impl MemoryService {
             content: prepared.content.clone(),
             sensitivity: prepared.sensitivity,
             metadata_json: metadata_json.clone(),
+            source_kind: provenance.source_kind,
+            source_thread_id: provenance.source_thread_id.clone(),
+            source_turn_id: provenance.source_turn_id.clone(),
+            source_item_id: provenance.source_item_id.clone(),
+            created_by_kind: provenance.created_by.as_ref().map(|actor| actor.kind),
+            created_by_id: provenance
+                .created_by
+                .as_ref()
+                .and_then(|actor| actor.id.clone()),
+            policy_version: self.config.policy_version.clone(),
+            status: MemoryStatus::Active,
+            idempotency_key: params.idempotency_key.clone(),
         };
         let backend_result = match self.backend.put(backend_request).await {
             Ok(result) => result,
@@ -202,10 +217,11 @@ impl MemoryService {
         )
         .await?;
 
-        let payload =
-            self.backend.get(row.id.as_str()).await?.with_context(|| {
-                format!("backend payload missing after memory `{}` write", row.id)
-            })?;
+        let payload = self
+            .backend
+            .get(backend_get_request(&row))
+            .await?
+            .with_context(|| format!("backend payload missing after memory `{}` write", row.id))?;
         Ok(MemoryRememberResponse {
             record: crud_record_to_protocol(row, payload)?,
             created,
@@ -319,12 +335,14 @@ impl MemoryService {
 
         let now = context.now_or(current_unix());
         let scopes = context.effective_scopes(&params.scopes);
+        let resolved_scopes = self.resolve_backend_search_scopes(&scopes).await?;
         let limit = self.normalized_limit(params.limit);
         let backend_hits = self
             .backend
             .search(BackendSearchRequest {
                 query: query.to_owned(),
                 scopes: scopes.clone(),
+                resolved_scopes,
                 limit: self.config.max_limit,
             })
             .await
@@ -397,7 +415,7 @@ impl MemoryService {
                 )
                 .await?
                 .with_context(|| format!("memory `{}` disappeared during forget", row.id))?;
-            match self.backend.delete(row.id.as_str()).await {
+            match self.backend.delete(backend_delete_request(&deleted)).await {
                 Ok(_) => {
                     self.record_policy_decision(
                         POLICY_ACTION_FORGET,
@@ -543,7 +561,7 @@ impl MemoryService {
             return Ok(None);
         }
 
-        let Some(payload) = self.backend.get(row.id.as_str()).await? else {
+        let Some(payload) = self.backend.get(backend_get_request(&row)).await? else {
             self.mark_missing_backend_payload(&row, now).await?;
             return Ok(None);
         };
@@ -684,6 +702,22 @@ impl MemoryService {
         .await
     }
 
+    async fn resolve_backend_search_scopes(
+        &self,
+        scopes: &[MemoryScope],
+    ) -> Result<Vec<BackendSearchScope>> {
+        let resolved = self.store.resolve_memory_scopes(scopes.to_vec()).await?;
+        Ok(resolved
+            .into_iter()
+            .map(|scope| BackendSearchScope {
+                scope: scope.scope,
+                scope_key_hash: scope.scope_key_hash,
+                workspace_id: scope.workspace_id,
+                capsule_ref: None,
+            })
+            .collect())
+    }
+
     async fn record_policy_decision(
         &self,
         action: &str,
@@ -736,6 +770,30 @@ fn category_matches(
     categories: &[pioneer_protocol::MemoryCategory],
 ) -> bool {
     categories.is_empty() || categories.contains(&category)
+}
+
+fn backend_get_request(row: &AgentMemoryControlRecord) -> BackendGetRequest {
+    BackendGetRequest {
+        memory_id: row.id.clone(),
+        scope: row.scope.clone(),
+        scope_key_hash: Some(row.scope_key_hash.clone()),
+        capsule_id: row.capsule_id.clone(),
+        capsule_ref: row.capsule_ref.clone(),
+        frame_id: row.frame_id,
+        frame_uri: row.frame_uri.clone(),
+    }
+}
+
+fn backend_delete_request(row: &AgentMemoryControlRecord) -> BackendDeleteRequest {
+    BackendDeleteRequest {
+        memory_id: row.id.clone(),
+        scope: row.scope.clone(),
+        scope_key_hash: Some(row.scope_key_hash.clone()),
+        capsule_id: row.capsule_id.clone(),
+        capsule_ref: row.capsule_ref.clone(),
+        frame_id: row.frame_id,
+        frame_uri: row.frame_uri.clone(),
+    }
 }
 
 fn workspace_visible(row: &AgentMemoryControlRecord, context: &MemoryOperationContext) -> bool {
