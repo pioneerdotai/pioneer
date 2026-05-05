@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryScopeKind, MemorySensitivity,
     MemorySourceKind, MemoryStatus, PromptManifestProfile, ProviderFailureClass,
@@ -60,6 +61,36 @@ pub const MEMORY_REPAIR_JOB_STATUS_PENDING: &str = "pending";
 pub const MEMORY_REPAIR_JOB_STATUS_RUNNING: &str = "running";
 pub const MEMORY_REPAIR_JOB_STATUS_COMPLETED: &str = "completed";
 pub const MEMORY_REPAIR_JOB_STATUS_FAILED: &str = "failed";
+
+pub const HOOK_RUN_STATUS_QUEUED: &str = "queued";
+pub const HOOK_RUN_STATUS_RUNNING: &str = "running";
+pub const HOOK_RUN_STATUS_SUCCEEDED: &str = "succeeded";
+pub const HOOK_RUN_STATUS_FAILED: &str = "failed";
+pub const HOOK_RUN_STATUS_TIMED_OUT: &str = "timed_out";
+pub const HOOK_RUN_STATUS_SKIPPED: &str = "skipped";
+
+pub fn hook_run_status_to_db(status: HookRunStatus) -> &'static str {
+    match status {
+        HookRunStatus::Queued => HOOK_RUN_STATUS_QUEUED,
+        HookRunStatus::Running => HOOK_RUN_STATUS_RUNNING,
+        HookRunStatus::Succeeded => HOOK_RUN_STATUS_SUCCEEDED,
+        HookRunStatus::Failed => HOOK_RUN_STATUS_FAILED,
+        HookRunStatus::TimedOut => HOOK_RUN_STATUS_TIMED_OUT,
+        HookRunStatus::Skipped => HOOK_RUN_STATUS_SKIPPED,
+    }
+}
+
+pub fn hook_run_status_from_db(value: &str) -> Result<HookRunStatus> {
+    match value {
+        HOOK_RUN_STATUS_QUEUED => Ok(HookRunStatus::Queued),
+        HOOK_RUN_STATUS_RUNNING => Ok(HookRunStatus::Running),
+        HOOK_RUN_STATUS_SUCCEEDED => Ok(HookRunStatus::Succeeded),
+        HOOK_RUN_STATUS_FAILED => Ok(HookRunStatus::Failed),
+        HOOK_RUN_STATUS_TIMED_OUT => Ok(HookRunStatus::TimedOut),
+        HOOK_RUN_STATUS_SKIPPED => Ok(HookRunStatus::Skipped),
+        _ => bail!("unknown hook run status `{value}`"),
+    }
+}
 
 pub fn memory_scope_kind_to_db(kind: MemoryScopeKind) -> &'static str {
     match kind {

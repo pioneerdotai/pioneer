@@ -29,9 +29,9 @@ pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
     HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookCompactionId,
     HookContributionHash, HookContributionId, HookDiagnosticCode, HookDomain, HookFeatureFlag,
-    HookFilterKey, HookId, HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunId,
-    HookSectionId, HookSourceId, HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId,
-    HookWorkspaceId,
+    HookFilterKey, HookId, HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunAttemptId,
+    HookRunId, HookRunIdempotencyKey, HookRunScopeId, HookSectionId, HookSourceId,
+    HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId, HookWorkspaceId,
 };
 pub use phase::{HookPhase, ParseHookPhaseError};
 pub use policy::{

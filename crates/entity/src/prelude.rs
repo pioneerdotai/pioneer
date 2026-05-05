@@ -7,6 +7,8 @@ pub use super::agent_memory_event::Entity as AgentMemoryEvent;
 pub use super::agent_memory_policy_decision::Entity as AgentMemoryPolicyDecision;
 pub use super::agent_memory_repair_job::Entity as AgentMemoryRepairJob;
 pub use super::attachment_upload_registry::Entity as AttachmentUploadRegistry;
+pub use super::hook_run::Entity as HookRun;
+pub use super::hook_run_attempt::Entity as HookRunAttempt;
 pub use super::mcp_audit_event::Entity as McpAuditEvent;
 pub use super::mcp_server_catalog_snapshot::Entity as McpServerCatalogSnapshot;
 pub use super::mcp_server_installation::Entity as McpServerInstallation;

@@ -7293,6 +7293,7 @@ dependencies = [
  "chrono",
  "hex",
  "pioneer-entity",
+ "pioneer-hooks",
  "pioneer-migration",
  "pioneer-protocol",
  "pioneer-sqlite",

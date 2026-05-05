@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 pioneer-entity.workspace = true
+pioneer-hooks.workspace = true
 pioneer-protocol.workspace = true
 pioneer-sqlite.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }

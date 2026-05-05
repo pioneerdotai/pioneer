@@ -2350,10 +2350,212 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_run")
+                    .if_not_exists()
+                    .col(string("id").string_len(21).primary_key())
+                    .col(string("idempotency_key").string_len(255))
+                    .col(string("subscription_id").string_len(255))
+                    .col(string("hook_id").string_len(255))
+                    .col(string("phase").string_len(96))
+                    .col(string("status").string_len(32))
+                    .col(string("scope_kind").string_len(64).null())
+                    .col(string("scope_id").string_len(255).null())
+                    .col(string("workspace_id").string_len(21).null())
+                    .col(string("thread_id").string_len(21).null())
+                    .col(string("turn_id").string_len(21).null())
+                    .col(string("task_id").string_len(21).null())
+                    .col(string("agent_id").string_len(255).null())
+                    .col(string("actor_kind").string_len(64).null())
+                    .col(string("actor_id").string_len(255).null())
+                    .col(string("context_mode").string_len(64).null())
+                    .col(integer("attempt_count").default(0))
+                    .col(integer("contribution_count").default(0))
+                    .col(integer("diagnostic_count").default(0))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
+                    .col(string("error_code").string_len(255).null())
+                    .col(text("error_message_preview").null())
+                    .col(boolean("error_retryable").default(false))
+                    .col(boolean("error_safe_for_user").default(true))
+                    .col(text("metadata_json").default("{}"))
+                    .col(timestamp_with_time_zone("created_at").default(Expr::current_timestamp()))
+                    .col(timestamp_with_time_zone("updated_at").default(Expr::current_timestamp()))
+                    .col(timestamp_with_time_zone("queued_at").null())
+                    .col(timestamp_with_time_zone("started_at").null())
+                    .col(timestamp_with_time_zone("completed_at").null())
+                    .col(timestamp_with_time_zone("deadline_at").null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_hook_run_idempotency_key")
+                    .table("hook_run")
+                    .col("idempotency_key")
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_phase_status")
+                    .table("hook_run")
+                    .col("phase")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_workspace_phase")
+                    .table("hook_run")
+                    .col("workspace_id")
+                    .col("phase")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_thread_turn")
+                    .table("hook_run")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_task_id")
+                    .table("hook_run")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_agent_id")
+                    .table("hook_run")
+                    .col("agent_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_status_deadline")
+                    .table("hook_run")
+                    .col("status")
+                    .col("deadline_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_created_at")
+                    .table("hook_run")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_run_attempt")
+                    .if_not_exists()
+                    .col(string("id").string_len(21).primary_key())
+                    .col(string("hook_run_id").string_len(21))
+                    .col(integer("attempt_number"))
+                    .col(string("status").string_len(32))
+                    .col(integer("contribution_count").default(0))
+                    .col(integer("diagnostic_count").default(0))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
+                    .col(string("error_code").string_len(255).null())
+                    .col(text("error_message_preview").null())
+                    .col(boolean("error_retryable").default(false))
+                    .col(boolean("error_safe_for_user").default(true))
+                    .col(timestamp_with_time_zone("created_at").default(Expr::current_timestamp()))
+                    .col(timestamp_with_time_zone("updated_at").default(Expr::current_timestamp()))
+                    .col(timestamp_with_time_zone("started_at").null())
+                    .col(timestamp_with_time_zone("completed_at").null())
+                    .col(integer("duration_ms").null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_hook_run_attempt_run_number")
+                    .table("hook_run_attempt")
+                    .col("hook_run_id")
+                    .col("attempt_number")
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_run_id")
+                    .table("hook_run_attempt")
+                    .col("hook_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_status")
+                    .table("hook_run_attempt")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_created_at")
+                    .table("hook_run_attempt")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table("hook_run_attempt").to_owned())
+            .await?;
+
+        manager
+            .drop_table(Table::drop().table("hook_run").to_owned())
+            .await?;
+
         manager
             .drop_table(Table::drop().table("agent_memory_repair_job").to_owned())
             .await?;

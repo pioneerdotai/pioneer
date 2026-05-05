@@ -9,6 +9,8 @@ pub mod agent_memory_event;
 pub mod agent_memory_policy_decision;
 pub mod agent_memory_repair_job;
 pub mod attachment_upload_registry;
+pub mod hook_run;
+pub mod hook_run_attempt;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;

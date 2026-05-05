@@ -51,7 +51,7 @@ use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
-    agent_memory_policy_decision, agent_memory_repair_job, attachment_upload_registry,
+    agent_memory_policy_decision, agent_memory_repair_job, attachment_upload_registry, hook_run,
     mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
     skill_audit_event, skill_dependency_snapshot, skill_installation, skill_upload_session,
     skill_workspace_policy, task as task_repository, task_agent_spec, task_delivery,
@@ -74,10 +74,18 @@ pub use crate::memory::{
     NewAgentMemoryRepairJob, global_agent_memory_scope_key, memory_scope_key_hash,
     workspace_agent_memory_scope_key,
 };
+pub use crate::repositories::hook_run::{
+    HOOK_RUN_CONTRIBUTION_HASH_MAX_COUNT, HOOK_RUN_DIAGNOSTIC_MESSAGE_MAX_CHARS,
+    HOOK_RUN_DIAGNOSTIC_PREVIEW_MAX_COUNT, HOOK_RUN_ERROR_MESSAGE_MAX_CHARS,
+    HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookRunAttemptCompletionRecord, HookRunAttemptRecord,
+    HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
+    NewHookRunAttemptRecord, NewHookRunRecord,
+};
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{
     optional_typed_json_from_db, typed_json_from_db, unix_ms_to_datetime, unix_to_datetime,
 };
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 /// A single turn's conversation content: user input + assistant reply.
 #[derive(Debug, Clone)]
@@ -364,6 +372,96 @@ impl CrudStore {
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
         turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
+    }
+
+    pub async fn create_hook_run(
+        &self,
+        run: NewHookRunRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<HookRunRecord> {
+        self.run_serialized_write(|| {
+            let run = run.clone();
+            let now = now.clone();
+            async move { hook_run::create_hook_run(&self.connection, run, now).await }
+        })
+        .await
+    }
+
+    pub async fn find_hook_run(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+    ) -> Result<Option<HookRunRecord>> {
+        hook_run::find_hook_run_by_id(&self.connection, run_id).await
+    }
+
+    pub async fn find_hook_run_by_idempotency_key(
+        &self,
+        idempotency_key: &pioneer_hooks::HookRunIdempotencyKey,
+    ) -> Result<Option<HookRunRecord>> {
+        hook_run::find_hook_run_by_idempotency_key(&self.connection, idempotency_key).await
+    }
+
+    pub async fn mark_hook_run_running(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunRecord>> {
+        self.run_serialized_write(|| {
+            let now = now.clone();
+            async move { hook_run::mark_hook_run_running(&self.connection, run_id, now).await }
+        })
+        .await
+    }
+
+    pub async fn complete_hook_run(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+        completion: HookRunCompletionRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunRecord>> {
+        self.run_serialized_write(|| {
+            let completion = completion.clone();
+            let now = now.clone();
+            async move { hook_run::complete_hook_run(&self.connection, run_id, completion, now).await }
+        })
+        .await
+    }
+
+    pub async fn append_hook_run_attempt(
+        &self,
+        attempt: NewHookRunAttemptRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<HookRunAttemptRecord> {
+        self.run_serialized_write(|| {
+            let attempt = attempt.clone();
+            let now = now.clone();
+            async move { hook_run::append_hook_run_attempt(&self.connection, attempt, now).await }
+        })
+        .await
+    }
+
+    pub async fn complete_hook_run_attempt(
+        &self,
+        attempt_id: &pioneer_hooks::HookRunAttemptId,
+        completion: HookRunAttemptCompletionRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunAttemptRecord>> {
+        self.run_serialized_write(|| {
+            let completion = completion.clone();
+            let now = now.clone();
+            async move {
+                hook_run::complete_hook_run_attempt(&self.connection, attempt_id, completion, now)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn list_hook_run_attempts(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+    ) -> Result<Vec<HookRunAttemptRecord>> {
+        hook_run::list_hook_run_attempts(&self.connection, run_id).await
     }
 
     pub async fn resolve_memory_scope(&self, scope: MemoryScope) -> Result<MemoryScopeResolution> {
