@@ -6,6 +6,15 @@ use super::{
     TurnExecutionControl,
 };
 use futures_util::StreamExt;
+use pioneer_hooks::{
+    AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookContextMode,
+    HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity,
+    HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
+    HookHandlerResponse, HookId, HookInputKind, HookKind, HookPhase, HookPolicyKey,
+    HookPromptContent, HookPromptSectionTitle, HookRegistry, HookRuntime, HookSectionId,
+    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
+    PromptManifestDiagnosticContribution, PromptSectionContribution,
+};
 use pioneer_protocol::{
     AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, RecoveryAction,
     RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
@@ -157,6 +166,226 @@ impl CaptureAgentProvider {
             .expect("capture provider lock poisoned")
             .clone()
     }
+}
+
+const PHASE_07_HOOK_PHASES: [HookPhase; 5] = [
+    HookPhase::TurnPrePolicy,
+    HookPhase::TurnPrePromptContext,
+    HookPhase::TurnPrePromptCompile,
+    HookPhase::TurnPostPromptCompile,
+    HookPhase::TurnPostTurn,
+];
+
+#[derive(Debug, Clone, PartialEq)]
+struct RecordedHookCall {
+    phase: HookPhase,
+    input_kind: HookInputKind,
+    payload: HookValue,
+    workspace_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    mode: Option<HookContextMode>,
+    actor_kind: Option<HookActorKind>,
+}
+
+struct RecordingHookHandler {
+    hook_id: HookId,
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    contributions: Vec<HookContribution>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl HookHandler for RecordingHookHandler {
+    fn id(&self) -> HookId {
+        self.hook_id.clone()
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("test").expect("valid hook kind")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        PHASE_07_HOOK_PHASES.to_vec()
+    }
+
+    async fn execute(
+        &self,
+        request: HookHandlerRequest,
+    ) -> pioneer_hooks::HookResult<HookHandlerResponse> {
+        self.calls
+            .lock()
+            .expect("recording hook calls lock poisoned")
+            .push(RecordedHookCall {
+                phase: request.phase,
+                input_kind: request.input.kind.clone(),
+                payload: request.input.payload.clone(),
+                workspace_id: request
+                    .context
+                    .workspace_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                thread_id: request
+                    .context
+                    .thread_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                turn_id: request
+                    .context
+                    .turn_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                mode: request.context.mode.clone(),
+                actor_kind: request
+                    .context
+                    .actor
+                    .as_ref()
+                    .map(|actor| actor.kind.clone()),
+            });
+
+        if self.fail {
+            return Err(HookError::new(
+                HookDiagnosticCode::new("test.phase07_failed").expect("valid diagnostic code"),
+                HookDiagnosticMessage::new("phase 07 hook failed").expect("valid diagnostic"),
+            ));
+        }
+
+        Ok(HookHandlerResponse {
+            contributions: self.contributions.clone(),
+            ..HookHandlerResponse::default()
+        })
+    }
+}
+
+fn empty_hook_runtime() -> Arc<HookRuntime> {
+    Arc::new(HookRuntime::new(
+        Arc::new(HookRegistry::new()),
+        Arc::new(HookSubscriptionRegistry::new()),
+    ))
+}
+
+fn recording_hook_runtime(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    contributions: Vec<HookContribution>,
+    failure_policy: HookFailurePolicy,
+    fail: bool,
+) -> Arc<HookRuntime> {
+    let handlers = Arc::new(HookRegistry::new());
+    let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+    let hook_id = HookId::new("test.phase07_recorder").expect("valid hook id");
+    handlers
+        .register_handler(Arc::new(RecordingHookHandler {
+            hook_id: hook_id.clone(),
+            calls,
+            contributions,
+            fail,
+        }))
+        .expect("recording hook registers");
+
+    for phase in PHASE_07_HOOK_PHASES {
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(phase_07_subscription_id(phase), hook_id.clone(), phase)
+                    .with_execution_policy(HookExecutionPolicy {
+                        await_policy: HookAwaitPolicy::Blocking,
+                        timeout_ms: None,
+                        max_parallelism: None,
+                    })
+                    .with_failure_policy(failure_policy),
+            )
+            .expect("recording hook subscription registers");
+    }
+
+    Arc::new(HookRuntime::new(handlers, subscriptions))
+}
+
+fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
+    let value = match phase {
+        HookPhase::TurnPrePolicy => "test.phase07.pre_policy",
+        HookPhase::TurnPrePromptContext => "test.phase07.pre_prompt_context",
+        HookPhase::TurnPrePromptCompile => "test.phase07.pre_prompt_compile",
+        HookPhase::TurnPostPromptCompile => "test.phase07.post_prompt_compile",
+        HookPhase::TurnPostTurn => "test.phase07.post_turn",
+        HookPhase::TurnPreCompaction => "test.phase07.pre_compaction",
+    };
+    HookSubscriptionId::new(value).expect("valid subscription id")
+}
+
+fn phase_07_ignored_contributions() -> Vec<HookContribution> {
+    vec![
+        HookContribution::Policy(PolicyContribution {
+            domain: HookDomain::new("test").expect("valid domain"),
+            key: HookPolicyKey::new("ignored_policy").expect("valid policy key"),
+            value: HookValue::Bool(true),
+            priority: 10_000,
+            diagnostics: Vec::new(),
+        }),
+        HookContribution::PromptSection(PromptSectionContribution {
+            section_id: HookSectionId::new("test.phase07_ignored_section")
+                .expect("valid section id"),
+            title: Some(
+                HookPromptSectionTitle::new("Ignored Phase 07 Hook Section")
+                    .expect("valid section title"),
+            ),
+            domain: HookDomain::new("test").expect("valid domain"),
+            priority: 10_000,
+            content: HookPromptContent::new("HOOK OUTPUT MUST NOT APPEAR")
+                .expect("valid prompt content"),
+            max_chars: None,
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        HookContribution::PromptManifestDiagnostic(PromptManifestDiagnosticContribution {
+            code: HookDiagnosticCode::new("test.phase07_manifest_ignored")
+                .expect("valid diagnostic code"),
+            message: HookDiagnosticMessage::new("HOOK MANIFEST DIAGNOSTIC MUST NOT APPEAR")
+                .expect("valid diagnostic message"),
+            severity: HookDiagnosticSeverity::Warning,
+            hook_id: None,
+            subscription_id: None,
+        }),
+        HookContribution::Audit(AuditContribution {
+            event_kind: HookAuditEventKind::new("test.phase07_audit_ignored")
+                .expect("valid audit event kind"),
+            details: HookValue::Text("HOOK AUDIT MUST NOT APPEAR".to_owned()),
+            safe_for_user: true,
+        }),
+    ]
+}
+
+fn snapshot_hook_calls(
+    calls: &Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+) -> Vec<RecordedHookCall> {
+    calls
+        .lock()
+        .expect("recording hook calls lock poisoned")
+        .clone()
+}
+
+fn stable_request_projection(request: &ChatRequest) -> serde_json::Value {
+    serde_json::json!({
+        "model": request.model.clone(),
+        "messages": serde_json::to_value(&request.messages).expect("messages serialize"),
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "tools": serde_json::to_value(&request.tools).expect("tools serialize"),
+        "tool_choice": serde_json::to_value(&request.tool_choice).expect("tool choice serializes"),
+        "parallel_tool_calls": request.parallel_tool_calls,
+        "compiled_prompt": request.compiled_prompt.as_ref().map(|prompt| {
+            serde_json::json!({
+                "stable_system_text": prompt.stable_system_text.clone(),
+                "boundary_marker": prompt.boundary_marker.clone(),
+            })
+        }),
+    })
+}
+
+fn assert_stable_requests_eq(left: &ChatRequest, right: &ChatRequest) {
+    assert_eq!(
+        stable_request_projection(left),
+        stable_request_projection(right)
+    );
 }
 
 #[derive(Default)]
@@ -1143,6 +1372,305 @@ async fn start_simple_turn(
         .expect("turn should start");
 
     recv_events_until_terminal(&mut events).await
+}
+
+#[tokio::test]
+async fn phase_07_no_and_empty_hook_runtime_preserve_agent_request() {
+    let no_runtime_provider = Arc::new(CaptureAgentProvider::default());
+    let no_runtime_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        no_runtime_provider.clone(),
+    ));
+    let no_runtime_manager = AgentManager::new(no_runtime_registry, test_tool_loop_config());
+    assert!(!no_runtime_manager.has_hook_runtime().await);
+
+    let no_runtime_observed = start_simple_turn(
+        &no_runtime_manager,
+        "thr_phase07_no_runtime",
+        "ws_phase07_request",
+        "turn_phase07_no_runtime",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 request baseline",
+    )
+    .await;
+    assert_turn_completed(&no_runtime_observed);
+
+    let empty_runtime_provider = Arc::new(CaptureAgentProvider::default());
+    let empty_runtime_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        empty_runtime_provider.clone(),
+    ));
+    let empty_runtime_manager = AgentManager::new(empty_runtime_registry, test_tool_loop_config());
+    empty_runtime_manager
+        .set_hook_runtime(Some(empty_hook_runtime()))
+        .await;
+    assert!(empty_runtime_manager.has_hook_runtime().await);
+
+    let empty_runtime_observed = start_simple_turn(
+        &empty_runtime_manager,
+        "thr_phase07_empty_runtime",
+        "ws_phase07_request",
+        "turn_phase07_empty_runtime",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 request baseline",
+    )
+    .await;
+    assert_turn_completed(&empty_runtime_observed);
+
+    let no_runtime_requests = no_runtime_provider.snapshot_requests();
+    let empty_runtime_requests = empty_runtime_provider.snapshot_requests();
+    assert_eq!(no_runtime_requests.len(), 1);
+    assert_eq!(empty_runtime_requests.len(), 1);
+    assert_stable_requests_eq(&no_runtime_requests[0], &empty_runtime_requests[0]);
+}
+
+#[tokio::test]
+async fn phase_07_agent_mode_calls_each_hook_phase_once() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase07_agent_hooks",
+        "ws_phase07_agent_hooks",
+        "turn_phase07_agent_hooks",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 agent hook phases",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    assert_eq!(calls.len(), PHASE_07_HOOK_PHASES.len());
+    assert_eq!(
+        calls.iter().map(|call| call.phase).collect::<Vec<_>>(),
+        PHASE_07_HOOK_PHASES
+    );
+    for call in calls {
+        assert_eq!(call.input_kind, HookInputKind::from(call.phase));
+        assert_eq!(call.payload, HookValue::Null);
+        assert_eq!(call.workspace_id.as_deref(), Some("ws_phase07_agent_hooks"));
+        assert_eq!(call.thread_id.as_deref(), Some("thr_phase07_agent_hooks"));
+        assert_eq!(call.turn_id.as_deref(), Some("turn_phase07_agent_hooks"));
+        assert_eq!(call.mode, Some(HookContextMode::Agent));
+        assert_eq!(call.actor_kind, Some(HookActorKind::Agent));
+    }
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_07_agent_mode_without_tool_calling_calls_each_hook_phase_once() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "capture-standard",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase07_agent_no_tools",
+        "ws_phase07_agent_no_tools",
+        "turn_phase07_agent_no_tools",
+        ThreadMode::Agent,
+        "capture-standard",
+        "phase 07 agent hook phases without provider tool calling",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    assert_eq!(calls.len(), PHASE_07_HOOK_PHASES.len());
+    assert_eq!(
+        calls.iter().map(|call| call.phase).collect::<Vec<_>>(),
+        PHASE_07_HOOK_PHASES
+    );
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_07_chat_mode_does_not_call_turn_hooks() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "capture-standard",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase07_chat_hooks",
+        "ws_phase07_chat_hooks",
+        "turn_phase07_chat_hooks",
+        ThreadMode::Chat,
+        "capture-standard",
+        "phase 07 chat hook phases",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert!(snapshot_hook_calls(&calls).is_empty());
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].compiled_prompt.is_none());
+}
+
+#[tokio::test]
+async fn phase_07_hook_contributions_do_not_affect_agent_request() {
+    let baseline_provider = Arc::new(CaptureAgentProvider::default());
+    let baseline_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        baseline_provider.clone(),
+    ));
+    let baseline_manager = AgentManager::new(baseline_registry, test_tool_loop_config());
+    baseline_manager
+        .set_hook_runtime(Some(empty_hook_runtime()))
+        .await;
+
+    let baseline_observed = start_simple_turn(
+        &baseline_manager,
+        "thr_phase07_contrib_baseline",
+        "ws_phase07_contrib",
+        "turn_phase07_contrib_baseline",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 ignored contributions",
+    )
+    .await;
+    assert_turn_completed(&baseline_observed);
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook_provider = Arc::new(CaptureAgentProvider::default());
+    let hook_registry = Arc::new(ProviderRegistry::with_provider(
+        "capture",
+        hook_provider.clone(),
+    ));
+    let hook_manager = AgentManager::new(hook_registry, test_tool_loop_config());
+    hook_manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls,
+            phase_07_ignored_contributions(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let hook_observed = start_simple_turn(
+        &hook_manager,
+        "thr_phase07_contrib_hook",
+        "ws_phase07_contrib",
+        "turn_phase07_contrib_hook",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 ignored contributions",
+    )
+    .await;
+    assert_turn_completed(&hook_observed);
+
+    let baseline_requests = baseline_provider.snapshot_requests();
+    let hook_requests = hook_provider.snapshot_requests();
+    assert_eq!(baseline_requests.len(), 1);
+    assert_eq!(hook_requests.len(), 1);
+    assert_stable_requests_eq(&baseline_requests[0], &hook_requests[0]);
+    let prompt = hook_requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("HOOK OUTPUT MUST NOT APPEAR")
+    );
+
+    let hook_manifest = hook_observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    assert!(
+        !hook_manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "test.phase07_ignored_section")
+    );
+    assert!(!hook_manifest.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("HOOK MANIFEST DIAGNOSTIC MUST NOT APPEAR")
+    }));
+    assert!(
+        !hook_observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SkillAuditEvents { .. }))
+    );
+}
+
+#[tokio::test]
+async fn phase_07_required_hook_failure_does_not_fail_turn() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::Required,
+            true,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase07_required_failure",
+        "ws_phase07_required_failure",
+        "turn_phase07_required_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 07 required hook failure",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(provider.snapshot_requests().len(), 1);
+    assert_eq!(
+        snapshot_hook_calls(&calls).len(),
+        PHASE_07_HOOK_PHASES.len()
+    );
 }
 
 #[tokio::test]

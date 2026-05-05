@@ -4,6 +4,7 @@ use super::{
     ToolLoopConfig, TurnExecutionControl, TurnTaskFailure,
 };
 use crate::chat;
+use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{AgentDurableEvent, RecoveryAttemptContext, ThreadMode, UserInput};
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ pub(super) async fn run_agent_loop(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
@@ -99,6 +101,7 @@ pub(super) async fn run_agent_loop(
                     task_tool_provider.clone(),
                     memory_provider.clone(),
                     memory_turn_policy_provider.clone(),
+                    hook_runtime.clone(),
                     provider,
                     turn_request,
                     turn_control,
@@ -343,6 +346,7 @@ pub(super) async fn run_agent_loop(
                         task_tool_provider.clone(),
                         memory_provider.clone(),
                         memory_turn_policy_provider.clone(),
+                        hook_runtime.clone(),
                         provider,
                         turn_request,
                         turn_control,
@@ -432,6 +436,7 @@ pub(super) async fn run_agent_loop(
                     task_tool_provider.clone(),
                     memory_provider.clone(),
                     memory_turn_policy_provider.clone(),
+                    hook_runtime.clone(),
                     provider,
                     turn_request,
                     turn_control,
@@ -461,6 +466,7 @@ fn spawn_turn_task(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
     provider: Arc<dyn Provider>,
     turn_request: ActiveTurnRequest,
     turn_control: TurnExecutionControl,
@@ -486,6 +492,7 @@ fn spawn_turn_task(
             task_tool_provider,
             memory_provider,
             memory_turn_policy_provider,
+            hook_runtime,
             turn_control,
             recovery,
             event_hub,
@@ -530,6 +537,7 @@ async fn execute_turn_flow(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_hub: Arc<AgentEventHub>,
@@ -553,6 +561,7 @@ async fn execute_turn_flow(
             task_tool_provider,
             memory_provider,
             memory_turn_policy_provider,
+            hook_runtime,
             turn_control,
             recovery,
             event_hub,

@@ -1,10 +1,12 @@
 mod agent_loop;
 mod chat;
+mod hooks;
 mod manager_recovery;
 #[cfg(test)]
 mod manager_tests;
 mod memory;
 
+use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream,
     ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnItemType, UserInput,
@@ -1342,6 +1344,7 @@ pub struct AgentManager {
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
+    hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
 }
 
 impl AgentManager {
@@ -1371,6 +1374,7 @@ impl AgentManager {
             task_tool_provider: RwLock::new(None),
             memory_provider: RwLock::new(memory_provider),
             memory_turn_policy_provider: RwLock::new(None),
+            hook_runtime: RwLock::new(None),
         }
     }
 
@@ -1389,8 +1393,17 @@ impl AgentManager {
         *self.memory_turn_policy_provider.write().await = provider;
     }
 
+    pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
+        // Existing loops keep the runtime snapshot captured by ensure_thread.
+        *self.hook_runtime.write().await = runtime;
+    }
+
     pub async fn has_memory_provider(&self) -> bool {
         self.memory_provider.read().await.is_some()
+    }
+
+    pub async fn has_hook_runtime(&self) -> bool {
+        self.hook_runtime.read().await.is_some()
     }
 
     pub async fn ensure_thread(
@@ -1430,6 +1443,7 @@ impl AgentManager {
             self.task_tool_provider.read().await.clone(),
             self.memory_provider.read().await.clone(),
             self.memory_turn_policy_provider.read().await.clone(),
+            self.hook_runtime.read().await.clone(),
             command_tx.clone(),
             command_rx,
             event_hub.clone(),

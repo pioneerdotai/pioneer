@@ -7241,6 +7241,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures-util",
  "pioneer-config",
+ "pioneer-hooks",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",

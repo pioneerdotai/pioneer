@@ -9,6 +9,7 @@ use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
 };
+use crate::hooks::{AgentTurnHookContext, run_noop_agent_turn_hook_phase};
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
     resolve_memory_turn_policy,
@@ -23,6 +24,7 @@ use crate::{
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
+use pioneer_hooks::{HookPhase, HookRuntime};
 use pioneer_promt::{
     CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptLimits, PromptProfile,
     PromptSectionId, ToolRetryInstructionKind, compile_prompt, render_memory_recall_prompt,
@@ -462,6 +464,7 @@ pub(super) async fn execute_chat_turn_flow(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
@@ -505,6 +508,7 @@ pub(super) async fn execute_chat_turn_flow(
                 task_tool_provider,
                 memory_provider,
                 memory_turn_policy_provider,
+                hook_runtime,
                 turn_control.clone(),
                 recovery,
                 &workspace_id,
@@ -990,6 +994,7 @@ async fn execute_agent_provider_response(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
     workspace_id: &str,
@@ -1004,6 +1009,14 @@ async fn execute_agent_provider_response(
 
     let tool_loop_config = tool_loop_config.normalized();
     let provider_tool_calling = provider.capabilities().tool_calling;
+    let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
+
+    run_noop_agent_turn_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        HookPhase::TurnPrePolicy,
+    )
+    .await;
 
     let memory_context = memory_turn_context(
         workspace_id,
@@ -1034,6 +1047,13 @@ async fn execute_agent_provider_response(
             "memory turn policy reported diagnostic"
         );
     }
+
+    run_noop_agent_turn_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        HookPhase::TurnPrePromptContext,
+    )
+    .await;
 
     let mcp_availability =
         load_mcp_availability(mcp_tool_provider.as_ref(), workspace_id, thread_id, turn_id).await;
@@ -1123,6 +1143,13 @@ async fn execute_agent_provider_response(
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
     if !provider_tool_calling {
+        run_noop_agent_turn_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            HookPhase::TurnPrePromptCompile,
+        )
+        .await;
+
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
             None,
@@ -1132,6 +1159,13 @@ async fn execute_agent_provider_response(
             thread_id,
             turn_id,
         )?;
+
+        run_noop_agent_turn_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            HookPhase::TurnPostPromptCompile,
+        )
+        .await;
 
         emit_durable_event(
             event_tx.as_ref(),
@@ -1164,6 +1198,12 @@ async fn execute_agent_provider_response(
             turn_control
                 .succeed_recovery_attempt(turn_id, recovery.take())
                 .await;
+            run_noop_agent_turn_hook_phase(
+                hook_runtime.as_ref(),
+                &hook_context,
+                HookPhase::TurnPostTurn,
+            )
+            .await;
         }
 
         return result;
@@ -1328,6 +1368,13 @@ async fn execute_agent_provider_response(
             None
         };
 
+    run_noop_agent_turn_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        HookPhase::TurnPrePromptCompile,
+    )
+    .await;
+
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
         None,
@@ -1337,6 +1384,13 @@ async fn execute_agent_provider_response(
         thread_id,
         turn_id,
     )?;
+
+    run_noop_agent_turn_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        HookPhase::TurnPostPromptCompile,
+    )
+    .await;
 
     emit_durable_event(
         event_tx.as_ref(),
@@ -2284,6 +2338,7 @@ async fn execute_agent_provider_response(
         }
     }
     .await;
+    let turn_succeeded = turn_result.is_ok();
 
     skill_tool_materialization
         .clear_function_proxy_runtime()
@@ -2293,6 +2348,15 @@ async fn execute_agent_provider_response(
     drop(tools);
 
     let _ = tool_event_forwarder.await;
+
+    if turn_succeeded {
+        run_noop_agent_turn_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            HookPhase::TurnPostTurn,
+        )
+        .await;
+    }
 
     match turn_result {
         Ok(()) => Ok(()),

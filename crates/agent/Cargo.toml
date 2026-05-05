@@ -10,6 +10,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 pioneer-config.workspace = true
+pioneer-hooks.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
 pioneer-skills.workspace = true
