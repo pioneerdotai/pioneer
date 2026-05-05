@@ -6,6 +6,7 @@ members = [
   "crates/config",
   "crates/keystore",
   "crates/gateway",
+  "crates/hooks",
   "crates/desktop",
   "crates/cli",
   "crates/crud",
@@ -32,6 +33,7 @@ authors = ["Pioneer Contributors"]
 pioneer-agent = { path = "crates/agent" }
 pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
+pioneer-hooks = { path = "crates/hooks" }
 pioneer-config = { path = "crates/config" }
 pioneer-desktop = { path = "crates/desktop" }
 pioneer-cli = { path = "crates/cli" }

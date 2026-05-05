@@ -7384,6 +7384,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-hooks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pioneer-keystore"
 version = "0.1.0"
 dependencies = [
