@@ -1,54 +1,36 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "PromptManifestDiagnostic",
+  "title": "PromptManifestHookSourceEntry",
   "type": "object",
   "required": [
-    "code",
-    "message"
+    "contribution_kind",
+    "source",
+    "truncation"
   ],
   "properties": {
-    "code": {
-      "$ref": "#/definitions/PromptManifestDiagnosticCode"
-    },
-    "file": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "hook_source": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/PromptManifestHookSource"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "message": {
-      "type": "string"
+    "contribution_kind": {
+      "$ref": "#/definitions/PromptManifestHookContributionKind"
     },
     "section_id": {
       "type": [
         "string",
         "null"
       ]
+    },
+    "source": {
+      "$ref": "#/definitions/PromptManifestHookSource"
+    },
+    "truncation": {
+      "$ref": "#/definitions/PromptManifestHookTruncation"
     }
   },
   "definitions": {
-    "PromptManifestDiagnosticCode": {
+    "PromptManifestHookContributionKind": {
       "type": "string",
       "enum": [
-        "missing_file",
-        "file_read_error",
-        "file_truncated",
-        "total_budget_truncated",
-        "file_filtered_by_profile",
-        "dynamic_section_truncated",
-        "dynamic_section_omitted",
-        "hook_diagnostic",
-        "hook_best_effort_failed"
+        "prompt_section",
+        "prompt_manifest_diagnostic",
+        "runtime_failure"
       ]
     },
     "PromptManifestHookPhase": {
@@ -87,6 +69,16 @@
           "type": "string"
         }
       }
+    },
+    "PromptManifestHookTruncation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "hook",
+        "prompt",
+        "hook_and_prompt",
+        "unknown"
+      ]
     }
   }
 }

@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PromptManifestHookTruncation",
+  "type": "string",
+  "enum": [
+    "none",
+    "hook",
+    "prompt",
+    "hook_and_prompt",
+    "unknown"
+  ]
+}

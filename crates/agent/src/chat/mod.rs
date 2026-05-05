@@ -10,9 +10,11 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use crate::hooks::{
-    AgentTurnHookContext, EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
-    run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
-    run_noop_agent_turn_hook_phase,
+    AgentTurnHookContext, EffectiveTurnPromptManifestHookContributionKind,
+    EffectiveTurnPromptManifestHookDiagnosticCode, EffectiveTurnPromptManifestHookMetadata,
+    EffectiveTurnPromptManifestHookSource, EffectiveTurnPromptSectionSet,
+    run_agent_turn_policy_hook_phase, run_agent_turn_prompt_compile_hook_phase,
+    run_agent_turn_prompt_context_hook_phase, run_noop_agent_turn_hook_phase,
 };
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
@@ -37,9 +39,10 @@ use pioneer_promt::{
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
     ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestProfile, ProviderFailureDetails,
-    RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot, TurnItem, TurnItemType,
-    UserInput, generate_id,
+    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
+    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
+    PromptManifestProfile, ProviderFailureDetails, RecoveryAttemptContext, ThreadMode,
+    ToolRecoveryPolicySnapshot, TurnItem, TurnItemType, UserInput, generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
@@ -53,7 +56,7 @@ use pioneer_tools::{
     classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
@@ -390,7 +393,23 @@ fn prompt_diagnostic_code(code: PromptDiagnosticCode) -> PromptManifestDiagnosti
     }
 }
 
-fn prompt_manifest_from_bundle(bundle: &CompiledPromptBundle) -> PromptManifest {
+fn prompt_manifest_from_bundle(
+    bundle: &CompiledPromptBundle,
+    hook_metadata: &EffectiveTurnPromptManifestHookMetadata,
+) -> PromptManifest {
+    let mut diagnostics = bundle
+        .diagnostics
+        .iter()
+        .map(|diagnostic| PromptManifestDiagnostic {
+            code: prompt_diagnostic_code(diagnostic.code),
+            message: diagnostic.message.clone(),
+            file: diagnostic.file.clone(),
+            section_id: diagnostic.section_id.clone(),
+            hook_source: None,
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(prompt_manifest_hook_diagnostics(hook_metadata));
+
     PromptManifest {
         compiler_version: bundle.compiler_version.to_owned(),
         profile: prompt_manifest_profile(bundle.profile),
@@ -402,16 +421,132 @@ fn prompt_manifest_from_bundle(bundle: &CompiledPromptBundle) -> PromptManifest 
         fingerprint_stable: bundle.fingerprint_stable.clone(),
         fingerprint_dynamic: bundle.fingerprint_dynamic.clone(),
         fingerprint_full: bundle.fingerprint_full.clone(),
-        diagnostics: bundle
-            .diagnostics
-            .iter()
-            .map(|diagnostic| PromptManifestDiagnostic {
-                code: prompt_diagnostic_code(diagnostic.code),
-                message: diagnostic.message.clone(),
-                file: diagnostic.file.clone(),
-                section_id: diagnostic.section_id.clone(),
+        diagnostics,
+        hook_sources: prompt_manifest_hook_sources(bundle, hook_metadata),
+    }
+}
+
+fn prompt_manifest_hook_sources(
+    bundle: &CompiledPromptBundle,
+    hook_metadata: &EffectiveTurnPromptManifestHookMetadata,
+) -> Vec<PromptManifestHookSourceEntry> {
+    let section_content_chars = bundle
+        .sections
+        .iter()
+        .map(|section| (section.id.manifest_id(), section.content.chars().count()))
+        .collect::<BTreeMap<_, _>>();
+
+    hook_metadata
+        .sources
+        .iter()
+        .filter_map(|entry| {
+            let source = prompt_manifest_hook_source(&entry.source)?;
+            let section_id = entry
+                .section_id
+                .as_ref()
+                .map(|section_id| section_id.as_str().to_owned());
+            let prompt_truncated = prompt_manifest_source_prompt_truncated(
+                section_id.as_deref(),
+                entry.hook_content_chars,
+                &section_content_chars,
+            );
+            Some(PromptManifestHookSourceEntry {
+                source,
+                section_id,
+                contribution_kind: prompt_manifest_hook_contribution_kind(entry.contribution_kind),
+                truncation: prompt_manifest_hook_truncation(entry.hook_truncated, prompt_truncated),
             })
-            .collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+fn prompt_manifest_hook_diagnostics(
+    hook_metadata: &EffectiveTurnPromptManifestHookMetadata,
+) -> Vec<PromptManifestDiagnostic> {
+    hook_metadata
+        .diagnostics
+        .iter()
+        .map(|diagnostic| PromptManifestDiagnostic {
+            code: match diagnostic.code {
+                EffectiveTurnPromptManifestHookDiagnosticCode::HookDiagnostic => {
+                    PromptManifestDiagnosticCode::HookDiagnostic
+                }
+                EffectiveTurnPromptManifestHookDiagnosticCode::HookBestEffortFailed => {
+                    PromptManifestDiagnosticCode::HookBestEffortFailed
+                }
+            },
+            message: diagnostic.message.clone(),
+            file: None,
+            section_id: None,
+            hook_source: diagnostic
+                .source
+                .as_ref()
+                .and_then(prompt_manifest_hook_source),
+        })
+        .collect()
+}
+
+fn prompt_manifest_hook_source(
+    source: &EffectiveTurnPromptManifestHookSource,
+) -> Option<PromptManifestHookSource> {
+    Some(PromptManifestHookSource {
+        hook_id: source.hook_id.as_str().to_owned(),
+        subscription_id: source.subscription_id.as_str().to_owned(),
+        phase: prompt_manifest_hook_phase(source.phase)?,
+        contribution_id: None,
+        contribution_hash: source
+            .contribution_hash
+            .as_ref()
+            .map(|hash| hash.as_str().to_owned()),
+    })
+}
+
+fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhase> {
+    match phase {
+        HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
+        HookPhase::TurnPrePolicy
+        | HookPhase::TurnPrePromptContext
+        | HookPhase::TurnPostPromptCompile
+        | HookPhase::TurnPostTurn
+        | HookPhase::TurnPreCompaction => None,
+    }
+}
+
+fn prompt_manifest_hook_contribution_kind(
+    kind: EffectiveTurnPromptManifestHookContributionKind,
+) -> PromptManifestHookContributionKind {
+    match kind {
+        EffectiveTurnPromptManifestHookContributionKind::PromptSection => {
+            PromptManifestHookContributionKind::PromptSection
+        }
+    }
+}
+
+fn prompt_manifest_source_prompt_truncated(
+    section_id: Option<&str>,
+    hook_content_chars: Option<usize>,
+    section_content_chars: &BTreeMap<String, usize>,
+) -> bool {
+    let Some(section_id) = section_id else {
+        return false;
+    };
+    match (hook_content_chars, section_content_chars.get(section_id)) {
+        (Some(hook_chars), Some(compiled_chars)) => *compiled_chars < hook_chars,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => false,
+    }
+}
+
+fn prompt_manifest_hook_truncation(
+    hook_truncated: bool,
+    prompt_truncated: bool,
+) -> PromptManifestHookTruncation {
+    match (hook_truncated, prompt_truncated) {
+        (false, false) => PromptManifestHookTruncation::None,
+        (true, false) => PromptManifestHookTruncation::Hook,
+        (false, true) => PromptManifestHookTruncation::Prompt,
+        (true, true) => PromptManifestHookTruncation::HookAndPrompt,
     }
 }
 
@@ -1218,7 +1353,10 @@ async fn execute_agent_provider_response(
             AgentDurableEvent::PromptManifestCompiled {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                manifest: prompt_manifest_from_bundle(&initial_prompt_bundle),
+                manifest: prompt_manifest_from_bundle(
+                    &initial_prompt_bundle,
+                    effective_prompt_section_set.manifest_metadata(),
+                ),
             },
         )
         .await?;
@@ -1460,7 +1598,10 @@ async fn execute_agent_provider_response(
         AgentDurableEvent::PromptManifestCompiled {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
-            manifest: prompt_manifest_from_bundle(&initial_prompt_bundle),
+            manifest: prompt_manifest_from_bundle(
+                &initial_prompt_bundle,
+                effective_prompt_section_set.manifest_metadata(),
+            ),
         },
     )
     .await?;
@@ -1606,7 +1747,10 @@ async fn execute_agent_provider_response(
                         AgentDurableEvent::PromptManifestCompiled {
                             thread_id: thread_id.to_owned(),
                             turn_id: turn_id.to_owned(),
-                            manifest: prompt_manifest_from_bundle(&refreshed_prompt_bundle),
+                            manifest: prompt_manifest_from_bundle(
+                                &refreshed_prompt_bundle,
+                                effective_prompt_section_set.manifest_metadata(),
+                            ),
                         },
                     )
                     .await
@@ -1655,7 +1799,10 @@ async fn execute_agent_provider_response(
                     AgentDurableEvent::PromptManifestCompiled {
                         thread_id: thread_id.to_owned(),
                         turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(&prompt_without_memory),
+                        manifest: prompt_manifest_from_bundle(
+                            &prompt_without_memory,
+                            effective_prompt_section_set.manifest_metadata(),
+                        ),
                     },
                 )
                 .await
@@ -1740,7 +1887,10 @@ async fn execute_agent_provider_response(
                             AgentDurableEvent::PromptManifestCompiled {
                                 thread_id: thread_id.to_owned(),
                                 turn_id: turn_id.to_owned(),
-                                manifest: prompt_manifest_from_bundle(&refreshed_prompt_bundle),
+                                manifest: prompt_manifest_from_bundle(
+                                    &refreshed_prompt_bundle,
+                                    effective_prompt_section_set.manifest_metadata(),
+                                ),
                             },
                         )
                         .await
@@ -2388,7 +2538,10 @@ async fn execute_agent_provider_response(
                     AgentDurableEvent::PromptManifestCompiled {
                         thread_id: thread_id.to_owned(),
                         turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(&refreshed_prompt_bundle),
+                        manifest: prompt_manifest_from_bundle(
+                            &refreshed_prompt_bundle,
+                            effective_prompt_section_set.manifest_metadata(),
+                        ),
                     },
                 )
                 .await

@@ -156,6 +156,8 @@ pub struct PromptManifestDiagnosticContribution {
     pub code: HookDiagnosticCode,
     pub message: HookDiagnosticMessage,
     pub severity: HookDiagnosticSeverity,
+    #[serde(default)]
+    pub safe_for_user: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_id: Option<HookId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,5 +230,38 @@ mod tests {
         let decoded: HookContribution =
             serde_json::from_value(value).expect("audit should deserialize");
         assert_eq!(decoded, contribution);
+    }
+
+    #[test]
+    fn phase_11_prompt_manifest_diagnostic_safe_for_user_defaults_false() {
+        let value = serde_json::json!({
+            "code": "test.diagnostic",
+            "message": "diagnostic",
+            "severity": "warning"
+        });
+
+        let decoded: PromptManifestDiagnosticContribution =
+            serde_json::from_value(value).expect("diagnostic contribution should deserialize");
+
+        assert!(!decoded.safe_for_user);
+    }
+
+    #[test]
+    fn phase_11_prompt_manifest_diagnostic_can_opt_into_safe_message() {
+        let contribution = PromptManifestDiagnosticContribution {
+            code: HookDiagnosticCode::new("test.safe_diagnostic").expect("valid code"),
+            message: HookDiagnosticMessage::new("safe diagnostic").expect("valid message"),
+            severity: HookDiagnosticSeverity::Warning,
+            safe_for_user: true,
+            hook_id: None,
+            subscription_id: None,
+        };
+
+        let value = serde_json::to_value(&contribution).expect("diagnostic should serialize");
+        assert_eq!(value["safe_for_user"], true);
+        let decoded: PromptManifestDiagnosticContribution =
+            serde_json::from_value(value).expect("diagnostic should deserialize");
+
+        assert!(decoded.safe_for_user);
     }
 }

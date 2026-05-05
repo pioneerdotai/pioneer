@@ -31,7 +31,9 @@ use crate::{
     MemoryListResponse, MemoryProvenance, MemoryRecord, MemoryRememberParams,
     MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
     MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus, ProgressCoalescingKey,
-    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
     ProviderFailureDetails, ProviderFailureStage, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTransportKind, SandboxMode, SandboxPolicy,
@@ -423,6 +425,20 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "prompt_manifest_diagnostic_code.json",
             PromptManifestDiagnosticCode
+        ),
+        schema_doc!(
+            "prompt_manifest_hook_contribution_kind.json",
+            PromptManifestHookContributionKind
+        ),
+        schema_doc!("prompt_manifest_hook_phase.json", PromptManifestHookPhase),
+        schema_doc!("prompt_manifest_hook_source.json", PromptManifestHookSource),
+        schema_doc!(
+            "prompt_manifest_hook_source_entry.json",
+            PromptManifestHookSourceEntry
+        ),
+        schema_doc!(
+            "prompt_manifest_hook_truncation.json",
+            PromptManifestHookTruncation
         ),
         schema_doc!("prompt_manifest_profile.json", PromptManifestProfile),
         schema_doc!("turn_status.json", TurnStatus),

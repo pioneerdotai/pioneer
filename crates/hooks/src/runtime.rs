@@ -764,6 +764,14 @@ async fn execute_node_with_policy(
     }
 }
 
+impl HookContributionHash {
+    pub fn from_contribution(contribution: &HookContribution) -> Option<Self> {
+        let bytes = serde_json::to_vec(contribution).ok()?;
+        let digest = Sha256::digest(bytes);
+        Self::new(format!("sha256:{}", hex::encode(digest))).ok()
+    }
+}
+
 fn handler_request(node: &HookExecutionNode, request: HookPhaseRequest) -> HookHandlerRequest {
     HookHandlerRequest {
         hook_id: node.subscription.hook_id.clone(),
@@ -992,9 +1000,7 @@ fn hash_contributions(contributions: &[HookContribution]) -> Vec<HookContributio
 }
 
 fn hash_contribution(contribution: &HookContribution) -> Option<HookContributionHash> {
-    let bytes = serde_json::to_vec(contribution).ok()?;
-    let digest = Sha256::digest(bytes);
-    HookContributionHash::new(format!("sha256:{}", hex::encode(digest))).ok()
+    HookContributionHash::from_contribution(contribution)
 }
 
 #[cfg(test)]
@@ -3195,12 +3201,48 @@ mod tests {
         let second = contribution("section.hash", "hash me");
         let different = contribution("section.hash", "different");
 
-        let first_hash = hash_contribution(&first).expect("hash should be produced");
-        let second_hash = hash_contribution(&second).expect("hash should be produced");
-        let different_hash = hash_contribution(&different).expect("hash should be produced");
+        let first_hash =
+            HookContributionHash::from_contribution(&first).expect("hash should be produced");
+        let second_hash =
+            HookContributionHash::from_contribution(&second).expect("hash should be produced");
+        let different_hash =
+            HookContributionHash::from_contribution(&different).expect("hash should be produced");
 
         assert_eq!(first_hash, second_hash);
         assert_ne!(first_hash, different_hash);
         assert!(first_hash.as_str().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn phase_11_contribution_hash_helper_matches_runtime_summary() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let contribution = contribution("section.hash_summary", "hash summary");
+        let expected_hash = HookContributionHash::from_contribution(&contribution)
+            .expect("hash should be produced");
+        register_handler(
+            &handlers,
+            "test.hash.summary",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.hash.summary",
+            "test.hash.summary",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].contribution_hashes, vec![expected_hash]);
     }
 }

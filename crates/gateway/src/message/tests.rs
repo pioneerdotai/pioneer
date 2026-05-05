@@ -33,7 +33,9 @@ use pioneer_protocol::{
     MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
     MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
     MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus,
-    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListResponse,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger,
     SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
@@ -4546,7 +4548,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_manifest_event_updates_turn_state_and_persists() {
+async fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -4616,6 +4618,25 @@ async fn prompt_manifest_event_updates_turn_state_and_persists() {
             message: "bootstrap file `SOUL.md` is missing".to_owned(),
             file: Some("/tmp/SOUL.md".to_owned()),
             section_id: None,
+            hook_source: Some(PromptManifestHookSource {
+                hook_id: "test.prompt_manifest_hook".to_owned(),
+                subscription_id: "test.prompt_manifest_subscription".to_owned(),
+                phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                contribution_id: None,
+                contribution_hash: Some("sha256:gatewaydiagnostic".to_owned()),
+            }),
+        }],
+        hook_sources: vec![PromptManifestHookSourceEntry {
+            source: PromptManifestHookSource {
+                hook_id: "test.prompt_manifest_hook".to_owned(),
+                subscription_id: "test.prompt_manifest_subscription".to_owned(),
+                phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                contribution_id: None,
+                contribution_hash: Some("sha256:gatewaysource".to_owned()),
+            },
+            section_id: Some("identity_base".to_owned()),
+            contribution_kind: PromptManifestHookContributionKind::PromptSection,
+            truncation: PromptManifestHookTruncation::None,
         }],
     };
 

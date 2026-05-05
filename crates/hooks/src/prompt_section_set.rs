@@ -647,6 +647,7 @@ mod tests {
                     code: HookDiagnosticCode::new("test.diagnostic").expect("valid code"),
                     message: HookDiagnosticMessage::new("diagnostic").expect("valid message"),
                     severity: HookDiagnosticSeverity::Info,
+                    safe_for_user: false,
                     hook_id: None,
                     subscription_id: None,
                 }),

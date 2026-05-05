@@ -18,6 +18,7 @@ use pioneer_hooks::{
 };
 use pioneer_protocol::{
     AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookTruncation,
     RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
     ToolRetryResolution, ToolStoragePayload, TurnItem, TurnItemType, UserInput,
@@ -438,6 +439,21 @@ fn prompt_section_contribution_with_max_chars(
     HookContribution::PromptSection(contribution)
 }
 
+fn prompt_manifest_diagnostic_contribution(
+    code: &str,
+    message: &str,
+    safe_for_user: bool,
+) -> HookContribution {
+    HookContribution::PromptManifestDiagnostic(PromptManifestDiagnosticContribution {
+        code: HookDiagnosticCode::new(code).expect("valid diagnostic code"),
+        message: HookDiagnosticMessage::new(message).expect("valid diagnostic message"),
+        severity: HookDiagnosticSeverity::Warning,
+        safe_for_user,
+        hook_id: None,
+        subscription_id: None,
+    })
+}
+
 fn policy_value(policy_set: &HookPolicySet, domain: &str, key: &str) -> Option<HookValue> {
     policy_set
         .get(
@@ -474,6 +490,7 @@ fn phase_07_ignored_contributions() -> Vec<HookContribution> {
             message: HookDiagnosticMessage::new("HOOK MANIFEST DIAGNOSTIC MUST NOT APPEAR")
                 .expect("valid diagnostic message"),
             severity: HookDiagnosticSeverity::Warning,
+            safe_for_user: false,
             hook_id: None,
             subscription_id: None,
         }),
@@ -2780,6 +2797,238 @@ async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest(
             && diagnostic.section_id.as_deref() == Some("test.phase10.truncated")
             && !diagnostic.message.contains("0123456789abcdef")
     }));
+}
+
+#[tokio::test]
+async fn phase_11_hook_prompt_section_is_manifest_observable() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_section_contribution(
+                "test.phase11.manifest_source",
+                "Manifest Source Hook",
+                "test",
+                10,
+                "phase 11 manifest source content",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_manifest_source",
+        "ws_phase11_manifest_source",
+        "turn_phase11_manifest_source",
+        ThreadMode::Agent,
+        "capture",
+        "phase 11 manifest source",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| source.section_id.as_deref() == Some("test.phase11.manifest_source"))
+        .expect("hook source should be recorded for hook prompt section");
+
+    assert_eq!(
+        source.contribution_kind,
+        PromptManifestHookContributionKind::PromptSection
+    );
+    assert_eq!(source.truncation, PromptManifestHookTruncation::None);
+    assert_eq!(source.source.hook_id, "test.phase07_recorder");
+    assert_eq!(
+        source.source.subscription_id,
+        "test.phase07.pre_prompt_compile"
+    );
+    assert_eq!(
+        source.source.phase,
+        PromptManifestHookPhase::TurnPrePromptCompile
+    );
+    assert!(
+        source
+            .source
+            .contribution_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+}
+
+#[tokio::test]
+async fn phase_11_failed_best_effort_hook_diagnostic_is_manifest_observable() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            vec![HookPhase::TurnPrePromptCompile],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_best_effort_failed",
+        "ws_phase11_best_effort_failed",
+        "turn_phase11_best_effort_failed",
+        ThreadMode::Agent,
+        "capture",
+        "phase 11 best effort failed",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let diagnostic = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == PromptManifestDiagnosticCode::HookBestEffortFailed)
+        .expect("best-effort hook failure should be recorded in prompt manifest");
+    let hook_source = diagnostic
+        .hook_source
+        .as_ref()
+        .expect("best-effort failure diagnostic should include hook source");
+
+    assert_eq!(hook_source.hook_id, "test.phase07_recorder");
+    assert_eq!(
+        hook_source.subscription_id,
+        "test.phase07.pre_prompt_compile"
+    );
+    assert_eq!(
+        hook_source.phase,
+        PromptManifestHookPhase::TurnPrePromptCompile
+    );
+    assert_eq!(diagnostic.message, "diagnostic redacted");
+}
+
+#[tokio::test]
+async fn phase_11_sensitive_diagnostic_content_is_redacted() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_manifest_diagnostic_contribution(
+                "test.phase11_sensitive",
+                "sk-test-secret-123 password=hunter2 Authorization: Bearer token",
+                false,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_sensitive",
+        "ws_phase11_sensitive",
+        "turn_phase11_sensitive",
+        ThreadMode::Agent,
+        "capture",
+        "phase 11 sensitive diagnostic",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let serialized = serde_json::to_string(manifest).expect("manifest should serialize");
+
+    assert!(manifest.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == PromptManifestDiagnosticCode::HookDiagnostic
+            && diagnostic.message == "Hook diagnostic redacted."
+            && diagnostic.hook_source.is_some()
+    }));
+    for secret in [
+        "sk-test-secret-123",
+        "password=hunter2",
+        "Authorization: Bearer token",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "manifest must not contain sensitive diagnostic fragment `{secret}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_11_hook_prompt_section_truncation_status_is_manifest_observable() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_section_contribution_with_max_chars(
+                "test.phase11.truncated_source",
+                "Truncated Source Hook",
+                "test",
+                10,
+                "0123456789abcdef",
+                8,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_truncated_source",
+        "ws_phase11_truncated_source",
+        "turn_phase11_truncated_source",
+        ThreadMode::Agent,
+        "capture",
+        "phase 11 truncated source",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| source.section_id.as_deref() == Some("test.phase11.truncated_source"))
+        .expect("hook source should be recorded for truncated section");
+
+    assert_eq!(source.truncation, PromptManifestHookTruncation::Hook);
 }
 
 #[tokio::test]

@@ -1222,6 +1222,13 @@
         "fingerprint_stable": {
           "type": "string"
         },
+        "hook_sources": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PromptManifestHookSourceEntry"
+          }
+        },
         "profile": {
           "$ref": "#/definitions/PromptManifestProfile"
         },
@@ -1250,8 +1257,24 @@
             "null"
           ]
         },
+        "hook_source": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PromptManifestHookSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "message": {
           "type": "string"
+        },
+        "section_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -1262,7 +1285,91 @@
         "file_read_error",
         "file_truncated",
         "total_budget_truncated",
-        "file_filtered_by_profile"
+        "file_filtered_by_profile",
+        "dynamic_section_truncated",
+        "dynamic_section_omitted",
+        "hook_diagnostic",
+        "hook_best_effort_failed"
+      ]
+    },
+    "PromptManifestHookContributionKind": {
+      "type": "string",
+      "enum": [
+        "prompt_section",
+        "prompt_manifest_diagnostic",
+        "runtime_failure"
+      ]
+    },
+    "PromptManifestHookPhase": {
+      "type": "string",
+      "enum": [
+        "turn_pre_prompt_compile"
+      ]
+    },
+    "PromptManifestHookSource": {
+      "type": "object",
+      "required": [
+        "hook_id",
+        "phase",
+        "subscription_id"
+      ],
+      "properties": {
+        "contribution_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contribution_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_id": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/PromptManifestHookPhase"
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      }
+    },
+    "PromptManifestHookSourceEntry": {
+      "type": "object",
+      "required": [
+        "contribution_kind",
+        "source",
+        "truncation"
+      ],
+      "properties": {
+        "contribution_kind": {
+          "$ref": "#/definitions/PromptManifestHookContributionKind"
+        },
+        "section_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/PromptManifestHookSource"
+        },
+        "truncation": {
+          "$ref": "#/definitions/PromptManifestHookTruncation"
+        }
+      }
+    },
+    "PromptManifestHookTruncation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "hook",
+        "prompt",
+        "hook_and_prompt",
+        "unknown"
       ]
     },
     "PromptManifestProfile": {

@@ -711,6 +711,8 @@ pub struct PromptManifest {
     pub fingerprint_full: String,
     #[serde(default)]
     pub diagnostics: Vec<PromptManifestDiagnostic>,
+    #[serde(default)]
+    pub hook_sources: Vec<PromptManifestHookSourceEntry>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +731,8 @@ pub struct PromptManifestDiagnostic {
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_source: Option<PromptManifestHookSource>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,6 +745,52 @@ pub enum PromptManifestDiagnosticCode {
     FileFilteredByProfile,
     DynamicSectionTruncated,
     DynamicSectionOmitted,
+    HookDiagnostic,
+    HookBestEffortFailed,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct PromptManifestHookSourceEntry {
+    pub source: PromptManifestHookSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    pub contribution_kind: PromptManifestHookContributionKind,
+    pub truncation: PromptManifestHookTruncation,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct PromptManifestHookSource {
+    pub hook_id: String,
+    pub subscription_id: String,
+    pub phase: PromptManifestHookPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_hash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptManifestHookContributionKind {
+    PromptSection,
+    PromptManifestDiagnostic,
+    RuntimeFailure,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptManifestHookTruncation {
+    None,
+    Hook,
+    Prompt,
+    HookAndPrompt,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptManifestHookPhase {
+    TurnPrePromptCompile,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]

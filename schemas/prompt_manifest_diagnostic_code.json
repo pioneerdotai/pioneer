@@ -7,6 +7,10 @@
     "file_read_error",
     "file_truncated",
     "total_budget_truncated",
-    "file_filtered_by_profile"
+    "file_filtered_by_profile",
+    "dynamic_section_truncated",
+    "dynamic_section_omitted",
+    "hook_diagnostic",
+    "hook_best_effort_failed"
   ]
 }

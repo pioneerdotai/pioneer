@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PromptManifestHookSource",
+  "type": "object",
+  "required": [
+    "hook_id",
+    "phase",
+    "subscription_id"
+  ],
+  "properties": {
+    "contribution_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "contribution_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hook_id": {
+      "type": "string"
+    },
+    "phase": {
+      "$ref": "#/definitions/PromptManifestHookPhase"
+    },
+    "subscription_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "PromptManifestHookPhase": {
+      "type": "string",
+      "enum": [
+        "turn_pre_prompt_compile"
+      ]
+    }
+  }
+}

@@ -1,12 +1,19 @@
 use pioneer_hooks::{
-    HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookDiagnostic,
-    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
-    HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits, HookPromptSectionSet,
-    HookRuntime, HookRuntimeError, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
+    HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookContributionHash,
+    HookDiagnostic, HookId, HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest,
+    HookPolicySet, HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits,
+    HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError,
+    HookSectionId, HookSubscriptionId, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
+    PromptManifestDiagnosticContribution,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
+const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
+const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 
 #[derive(Debug, Clone)]
 pub(super) struct AgentTurnHookContext {
@@ -66,6 +73,7 @@ impl EffectiveTurnPromptContextSet {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct EffectiveTurnPromptSectionSet {
     sections: HookPromptSectionSet,
+    manifest: EffectiveTurnPromptManifestHookMetadata,
 }
 
 impl EffectiveTurnPromptSectionSet {
@@ -73,17 +81,71 @@ impl EffectiveTurnPromptSectionSet {
         Self::default()
     }
 
-    pub(super) fn from_hook_prompt_section_set(sections: HookPromptSectionSet) -> Self {
-        Self { sections }
+    pub(super) fn from_hook_prompt_section_set_and_manifest(
+        sections: HookPromptSectionSet,
+        manifest: EffectiveTurnPromptManifestHookMetadata,
+    ) -> Self {
+        Self { sections, manifest }
     }
 
     pub(super) fn clone_hook_prompt_section_set(&self) -> HookPromptSectionSet {
         self.sections.clone()
     }
 
+    pub(super) fn manifest_metadata(&self) -> &EffectiveTurnPromptManifestHookMetadata {
+        &self.manifest
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.sections.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct EffectiveTurnPromptManifestHookMetadata {
+    pub(super) sources: Vec<EffectiveTurnPromptManifestHookSourceEntry>,
+    pub(super) diagnostics: Vec<EffectiveTurnPromptManifestHookDiagnostic>,
+}
+
+impl EffectiveTurnPromptManifestHookMetadata {
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
+    pub(super) source: EffectiveTurnPromptManifestHookSource,
+    pub(super) section_id: Option<HookSectionId>,
+    pub(super) contribution_kind: EffectiveTurnPromptManifestHookContributionKind,
+    pub(super) hook_truncated: bool,
+    pub(super) hook_content_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveTurnPromptManifestHookSource {
+    pub(super) hook_id: HookId,
+    pub(super) subscription_id: HookSubscriptionId,
+    pub(super) phase: HookPhase,
+    pub(super) contribution_hash: Option<HookContributionHash>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
+    PromptSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveTurnPromptManifestHookDiagnostic {
+    pub(super) code: EffectiveTurnPromptManifestHookDiagnosticCode,
+    pub(super) message: String,
+    pub(super) source: Option<EffectiveTurnPromptManifestHookSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectiveTurnPromptManifestHookDiagnosticCode {
+    HookDiagnostic,
+    HookBestEffortFailed,
 }
 
 #[derive(Debug)]
@@ -218,21 +280,303 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
             for diagnostic in &response.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
             }
+            let contributions = response.contributions;
             let phase_diagnostics = std::mem::take(&mut response.diagnostics);
             let mut prompt_section_set =
-                prompt_section_set_from_contributions(response.contributions);
+                prompt_section_set_from_contributions(contributions.clone());
             prompt_section_set.diagnostics.extend(phase_diagnostics);
             for diagnostic in &prompt_section_set.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
             }
-            Ok(EffectiveTurnPromptSectionSet::from_hook_prompt_section_set(
-                prompt_section_set,
-            ))
+            let manifest = prompt_manifest_hook_metadata_from_phase_response(
+                &contributions,
+                &response.runs,
+                &prompt_section_set,
+            );
+            Ok(
+                EffectiveTurnPromptSectionSet::from_hook_prompt_section_set_and_manifest(
+                    prompt_section_set,
+                    manifest,
+                ),
+            )
         }
         Err(error) => {
             warn_hook_prompt_section_runtime_error(HookPhase::TurnPrePromptCompile, &error);
             Err(AgentTurnHookError::Runtime(error))
         }
+    }
+}
+
+fn prompt_manifest_hook_metadata_from_phase_response(
+    contributions: &[HookContribution],
+    runs: &[HookRunSummary],
+    prompt_section_set: &HookPromptSectionSet,
+) -> EffectiveTurnPromptManifestHookMetadata {
+    let run_sources_by_hash = run_sources_by_hash(runs);
+    let mut metadata = EffectiveTurnPromptManifestHookMetadata::empty();
+    let section_entries = prompt_section_entries_by_id(prompt_section_set);
+
+    for contribution in contributions {
+        match contribution {
+            HookContribution::PromptSection(section) => {
+                let hash = HookContributionHash::from_contribution(contribution);
+                let Some(hash) = hash else {
+                    continue;
+                };
+                let Some(run_sources) = run_sources_by_hash.get(&hash) else {
+                    continue;
+                };
+                let entry = section_entries.get(&section.section_id);
+                let hook_truncated =
+                    section.truncated || entry.is_none() || entry.is_some_and(|entry| entry.0);
+                let hook_content_chars = entry.map(|entry| entry.1);
+                for run_source in run_sources {
+                    metadata
+                        .sources
+                        .push(EffectiveTurnPromptManifestHookSourceEntry {
+                            source: run_source.clone(),
+                            section_id: Some(section.section_id.clone()),
+                            contribution_kind:
+                                EffectiveTurnPromptManifestHookContributionKind::PromptSection,
+                            hook_truncated,
+                            hook_content_chars,
+                        });
+                }
+            }
+            HookContribution::PromptManifestDiagnostic(diagnostic) => {
+                let hash = HookContributionHash::from_contribution(contribution);
+                let sources = hash
+                    .as_ref()
+                    .and_then(|hash| run_sources_by_hash.get(hash))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        prompt_manifest_diagnostic_contribution_source(diagnostic, hash)
+                            .into_iter()
+                            .collect()
+                    });
+                let message = safe_prompt_manifest_diagnostic_message(diagnostic);
+                if sources.is_empty() {
+                    metadata
+                        .diagnostics
+                        .push(EffectiveTurnPromptManifestHookDiagnostic {
+                            code: EffectiveTurnPromptManifestHookDiagnosticCode::HookDiagnostic,
+                            message,
+                            source: None,
+                        });
+                } else {
+                    for source in sources {
+                        metadata
+                            .diagnostics
+                            .push(EffectiveTurnPromptManifestHookDiagnostic {
+                                code: EffectiveTurnPromptManifestHookDiagnosticCode::HookDiagnostic,
+                                message: message.clone(),
+                                source: Some(source),
+                            });
+                    }
+                }
+            }
+            HookContribution::Policy(_)
+            | HookContribution::PromptContext(_)
+            | HookContribution::Audit(_)
+            | HookContribution::Noop => {}
+        }
+    }
+
+    for run in runs {
+        if is_failed_prompt_compile_run(run.status) {
+            metadata
+                .diagnostics
+                .push(EffectiveTurnPromptManifestHookDiagnostic {
+                    code: EffectiveTurnPromptManifestHookDiagnosticCode::HookBestEffortFailed,
+                    message: best_effort_failure_message(run),
+                    source: Some(run_source_without_contribution(run)),
+                });
+        } else if run.status == HookRunStatus::Succeeded {
+            for preview in &run.diagnostic_previews {
+                metadata
+                    .diagnostics
+                    .push(EffectiveTurnPromptManifestHookDiagnostic {
+                        code: EffectiveTurnPromptManifestHookDiagnosticCode::HookDiagnostic,
+                        message: bounded_hook_manifest_message(preview.message.as_str()),
+                        source: Some(run_source_without_contribution(run)),
+                    });
+            }
+        }
+    }
+
+    metadata.sources.sort_by(|left, right| {
+        left.section_id
+            .cmp(&right.section_id)
+            .then_with(|| left.source.hook_id.cmp(&right.source.hook_id))
+            .then_with(|| {
+                left.source
+                    .subscription_id
+                    .cmp(&right.source.subscription_id)
+            })
+            .then_with(|| left.source.phase.cmp(&right.source.phase))
+            .then_with(|| {
+                left.source
+                    .contribution_hash
+                    .cmp(&right.source.contribution_hash)
+            })
+            .then_with(|| {
+                prompt_manifest_hook_contribution_kind_order(left.contribution_kind).cmp(
+                    &prompt_manifest_hook_contribution_kind_order(right.contribution_kind),
+                )
+            })
+    });
+    metadata.diagnostics.sort_by(|left, right| {
+        prompt_manifest_hook_diagnostic_code_order(left.code)
+            .cmp(&prompt_manifest_hook_diagnostic_code_order(right.code))
+            .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| {
+                left.source
+                    .as_ref()
+                    .map(prompt_manifest_hook_source_sort_key)
+                    .cmp(
+                        &right
+                            .source
+                            .as_ref()
+                            .map(prompt_manifest_hook_source_sort_key),
+                    )
+            })
+    });
+
+    metadata
+}
+
+fn run_sources_by_hash(
+    runs: &[HookRunSummary],
+) -> BTreeMap<HookContributionHash, Vec<EffectiveTurnPromptManifestHookSource>> {
+    let mut sources =
+        BTreeMap::<HookContributionHash, Vec<EffectiveTurnPromptManifestHookSource>>::new();
+    for run in runs {
+        for hash in &run.contribution_hashes {
+            sources
+                .entry(hash.clone())
+                .or_default()
+                .push(EffectiveTurnPromptManifestHookSource {
+                    hook_id: run.hook_id.clone(),
+                    subscription_id: run.subscription_id.clone(),
+                    phase: run.phase,
+                    contribution_hash: Some(hash.clone()),
+                });
+        }
+    }
+    for values in sources.values_mut() {
+        values.sort_by(|left, right| {
+            left.hook_id
+                .cmp(&right.hook_id)
+                .then_with(|| left.subscription_id.cmp(&right.subscription_id))
+                .then_with(|| left.phase.cmp(&right.phase))
+                .then_with(|| left.contribution_hash.cmp(&right.contribution_hash))
+        });
+    }
+    sources
+}
+
+fn prompt_section_entries_by_id(
+    prompt_section_set: &HookPromptSectionSet,
+) -> BTreeMap<HookSectionId, (bool, usize)> {
+    prompt_section_set
+        .entries()
+        .map(|entry| {
+            (
+                entry.section_id.clone(),
+                (entry.truncated, entry.content.as_str().chars().count()),
+            )
+        })
+        .collect()
+}
+
+fn prompt_manifest_diagnostic_contribution_source(
+    diagnostic: &PromptManifestDiagnosticContribution,
+    contribution_hash: Option<HookContributionHash>,
+) -> Option<EffectiveTurnPromptManifestHookSource> {
+    Some(EffectiveTurnPromptManifestHookSource {
+        hook_id: diagnostic.hook_id.clone()?,
+        subscription_id: diagnostic.subscription_id.clone()?,
+        phase: HookPhase::TurnPrePromptCompile,
+        contribution_hash,
+    })
+}
+
+fn safe_prompt_manifest_diagnostic_message(
+    diagnostic: &PromptManifestDiagnosticContribution,
+) -> String {
+    if diagnostic.safe_for_user {
+        bounded_hook_manifest_message(diagnostic.message.as_str())
+    } else {
+        REDACTED_HOOK_DIAGNOSTIC_MESSAGE.to_owned()
+    }
+}
+
+fn best_effort_failure_message(run: &HookRunSummary) -> String {
+    if let Some(error) = run.error.as_ref() {
+        return bounded_hook_manifest_message(error.message.as_str());
+    }
+    if let Some(preview) = run.diagnostic_previews.first() {
+        return bounded_hook_manifest_message(preview.message.as_str());
+    }
+    HOOK_BEST_EFFORT_FAILED_MESSAGE.to_owned()
+}
+
+fn run_source_without_contribution(run: &HookRunSummary) -> EffectiveTurnPromptManifestHookSource {
+    EffectiveTurnPromptManifestHookSource {
+        hook_id: run.hook_id.clone(),
+        subscription_id: run.subscription_id.clone(),
+        phase: run.phase,
+        contribution_hash: None,
+    }
+}
+
+fn is_failed_prompt_compile_run(status: HookRunStatus) -> bool {
+    matches!(status, HookRunStatus::Failed | HookRunStatus::TimedOut)
+}
+
+fn bounded_hook_manifest_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let bounded = chars
+        .by_ref()
+        .take(HOOK_MANIFEST_MESSAGE_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
+fn prompt_manifest_hook_source_sort_key(
+    source: &EffectiveTurnPromptManifestHookSource,
+) -> (
+    HookId,
+    HookSubscriptionId,
+    HookPhase,
+    Option<HookContributionHash>,
+) {
+    (
+        source.hook_id.clone(),
+        source.subscription_id.clone(),
+        source.phase,
+        source.contribution_hash.clone(),
+    )
+}
+
+fn prompt_manifest_hook_contribution_kind_order(
+    kind: EffectiveTurnPromptManifestHookContributionKind,
+) -> u8 {
+    match kind {
+        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 0,
+    }
+}
+
+fn prompt_manifest_hook_diagnostic_code_order(
+    code: EffectiveTurnPromptManifestHookDiagnosticCode,
+) -> u8 {
+    match code {
+        EffectiveTurnPromptManifestHookDiagnosticCode::HookDiagnostic => 0,
+        EffectiveTurnPromptManifestHookDiagnosticCode::HookBestEffortFailed => 1,
     }
 }
 
