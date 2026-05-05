@@ -15,6 +15,7 @@ pub struct Model {
     pub scope_key: String,
     #[sea_orm(unique_key = "uidx_agent_memory_capsule_scope_slot")]
     pub scope_key_hash: String,
+    pub workspace_id: Option<String>,
     #[sea_orm(unique_key = "uidx_agent_memory_capsule_scope_slot")]
     pub scope_slot: String,
     #[sea_orm(column_type = "Text", unique)]

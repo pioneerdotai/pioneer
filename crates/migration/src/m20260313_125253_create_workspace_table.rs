@@ -1743,6 +1743,7 @@ impl MigrationTrait for Migration {
                     .col(string("scope_kind").string_len(32))
                     .col(text("scope_key"))
                     .col(string("scope_key_hash").string_len(128))
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("scope_slot").string_len(64).default("primary"))
                     .col(text("capsule_ref"))
                     .col(text("storage_uri"))
@@ -1820,6 +1821,17 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_capsule_workspace_status")
+                    .table("agent_memory_capsule")
+                    .col("workspace_id")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("agent_memory")
@@ -1828,6 +1840,7 @@ impl MigrationTrait for Migration {
                     .col(string("scope_kind").string_len(32))
                     .col(text("scope_key"))
                     .col(string("scope_key_hash").string_len(128))
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("namespace").string_len(128).default("default"))
                     .col(string("category").string_len(64))
                     .col(string("key").string_len(256).null())
@@ -1964,6 +1977,17 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_workspace_status")
+                    .table("agent_memory")
+                    .col("workspace_id")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("agent_memory_event")
@@ -1971,6 +1995,7 @@ impl MigrationTrait for Migration {
                     .col(string("id").string_len(21).primary_key())
                     .col(string("memory_id").string_len(21).null())
                     .col(string("candidate_id").string_len(21).null())
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("event_kind").string_len(64))
                     .col(string("actor_kind").string_len(32).null())
                     .col(string("actor_id").string_len(128).null())
@@ -2027,6 +2052,17 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_event_workspace_created")
+                    .table("agent_memory_event")
+                    .col("workspace_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("agent_memory_candidate")
@@ -2035,6 +2071,7 @@ impl MigrationTrait for Migration {
                     .col(string("scope_kind").string_len(32))
                     .col(text("scope_key"))
                     .col(string("scope_key_hash").string_len(128))
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("namespace").string_len(128).default("default"))
                     .col(string("category").string_len(64))
                     .col(string("key").string_len(256).null())
@@ -2118,6 +2155,17 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_candidate_workspace_status")
+                    .table("agent_memory_candidate")
+                    .col("workspace_id")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("agent_memory_policy_decision")
@@ -2125,6 +2173,7 @@ impl MigrationTrait for Migration {
                     .col(string("id").string_len(21).primary_key())
                     .col(string("memory_id").string_len(21).null())
                     .col(string("candidate_id").string_len(21).null())
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("action").string_len(64))
                     .col(string("decision").string_len(32))
                     .col(string("reason_code").string_len(64).null())
@@ -2195,6 +2244,17 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_policy_workspace_created")
+                    .table("agent_memory_policy_decision")
+                    .col("workspace_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_table(
                 Table::create()
                     .table("agent_memory_repair_job")
@@ -2202,6 +2262,7 @@ impl MigrationTrait for Migration {
                     .col(string("id").string_len(21).primary_key())
                     .col(string("job_kind").string_len(64))
                     .col(string("status").string_len(32).default("pending"))
+                    .col(string("workspace_id").string_len(21).null())
                     .col(string("scope_kind").string_len(32).null())
                     .col(string("scope_key_hash").string_len(128).null())
                     .col(string("memory_id").string_len(21).null())
@@ -2274,6 +2335,17 @@ impl MigrationTrait for Migration {
                     .table("agent_memory_repair_job")
                     .col("scope_kind")
                     .col("scope_key_hash")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_agent_memory_repair_workspace_status")
+                    .table("agent_memory_repair_job")
+                    .col("workspace_id")
+                    .col("status")
                     .to_owned(),
             )
             .await?;

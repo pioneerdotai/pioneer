@@ -1,12 +1,16 @@
+use anyhow::{Result, bail};
 use pioneer_protocol::{
-    PromptManifestProfile, ProviderFailureClass, ProviderFailureStage, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
-    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
-    TaskOwnerKind, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
+    MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryScopeKind, MemorySensitivity,
+    MemorySourceKind, MemoryStatus, PromptManifestProfile, ProviderFailureClass,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
+    TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus,
+    TaskExecutorKind, TaskOwnerKind, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
     TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
     TurnItemType, TurnStatus, UserInput,
 };
+
+pub const DB_ID_LEN: usize = 21;
 
 pub const TURN_ITEM_STATUS_IN_PROGRESS: &str = "in_progress";
 pub const TURN_ITEM_STATUS_COMPLETED: &str = "completed";
@@ -29,6 +33,190 @@ pub const RECOVERY_STATUS_SUCCEEDED: &str = "succeeded";
 pub const RECOVERY_STATUS_FAILED: &str = "failed";
 pub const RECOVERY_STATUS_EXHAUSTED: &str = "exhausted";
 pub const RECOVERY_STATUS_CANCELLED: &str = "cancelled";
+
+pub const MEMORY_NAMESPACE_DEFAULT: &str = "default";
+pub const MEMORY_SCOPE_SLOT_PRIMARY: &str = "primary";
+pub const MEMORY_REPAIR_STATUS_OK: &str = "ok";
+pub const MEMORY_REPAIR_STATUS_REPAIR_NEEDED: &str = "repair_needed";
+pub const MEMORY_REPAIR_STATUS_FAILED: &str = "failed";
+
+pub const MEMORY_EVENT_CREATED: &str = "created";
+pub const MEMORY_EVENT_UPDATED: &str = "updated";
+pub const MEMORY_EVENT_FORGOTTEN: &str = "forgotten";
+pub const MEMORY_EVENT_SUPERSEDED: &str = "superseded";
+pub const MEMORY_EVENT_EXPIRED: &str = "expired";
+pub const MEMORY_EVENT_ACCESSED: &str = "accessed";
+pub const MEMORY_EVENT_REPAIR_STATUS_CHANGED: &str = "repair_status_changed";
+pub const MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED: &str = "capsule_repair_status_changed";
+pub const MEMORY_EVENT_CANDIDATE_CREATED: &str = "candidate_created";
+pub const MEMORY_EVENT_CANDIDATE_APPROVED: &str = "candidate_approved";
+pub const MEMORY_EVENT_CANDIDATE_REJECTED: &str = "candidate_rejected";
+pub const MEMORY_EVENT_CANDIDATE_EXPIRED: &str = "candidate_expired";
+
+pub const MEMORY_CAPSULE_STATUS_MISSING: &str = "missing";
+pub const MEMORY_CAPSULE_STATUS_REPAIR_NEEDED: &str = "repair_needed";
+
+pub const MEMORY_REPAIR_JOB_STATUS_PENDING: &str = "pending";
+pub const MEMORY_REPAIR_JOB_STATUS_RUNNING: &str = "running";
+pub const MEMORY_REPAIR_JOB_STATUS_COMPLETED: &str = "completed";
+pub const MEMORY_REPAIR_JOB_STATUS_FAILED: &str = "failed";
+
+pub fn memory_scope_kind_to_db(kind: MemoryScopeKind) -> &'static str {
+    match kind {
+        MemoryScopeKind::User => "user",
+        MemoryScopeKind::Workspace => "workspace",
+        MemoryScopeKind::Thread => "thread",
+        MemoryScopeKind::Agent => "agent",
+        MemoryScopeKind::Task => "task",
+    }
+}
+
+pub fn memory_scope_kind_from_db(value: &str) -> Result<MemoryScopeKind> {
+    match value {
+        "user" => Ok(MemoryScopeKind::User),
+        "workspace" => Ok(MemoryScopeKind::Workspace),
+        "thread" => Ok(MemoryScopeKind::Thread),
+        "agent" => Ok(MemoryScopeKind::Agent),
+        "task" => Ok(MemoryScopeKind::Task),
+        _ => bail!("unknown memory scope kind `{value}`"),
+    }
+}
+
+pub fn memory_category_to_db(category: MemoryCategory) -> &'static str {
+    match category {
+        MemoryCategory::Identity => "identity",
+        MemoryCategory::Preference => "preference",
+        MemoryCategory::Biography => "biography",
+        MemoryCategory::Relationship => "relationship",
+        MemoryCategory::ProjectFact => "project_fact",
+        MemoryCategory::ProjectDecision => "project_decision",
+        MemoryCategory::Procedure => "procedure",
+        MemoryCategory::Todo => "todo",
+        MemoryCategory::Constraint => "constraint",
+        MemoryCategory::CommunicationStyle => "communication_style",
+        MemoryCategory::Custom => "custom",
+    }
+}
+
+pub fn memory_category_from_db(value: &str) -> Result<MemoryCategory> {
+    match value {
+        "identity" => Ok(MemoryCategory::Identity),
+        "preference" => Ok(MemoryCategory::Preference),
+        "biography" => Ok(MemoryCategory::Biography),
+        "relationship" => Ok(MemoryCategory::Relationship),
+        "project_fact" => Ok(MemoryCategory::ProjectFact),
+        "project_decision" => Ok(MemoryCategory::ProjectDecision),
+        "procedure" => Ok(MemoryCategory::Procedure),
+        "todo" => Ok(MemoryCategory::Todo),
+        "constraint" => Ok(MemoryCategory::Constraint),
+        "communication_style" => Ok(MemoryCategory::CommunicationStyle),
+        "custom" => Ok(MemoryCategory::Custom),
+        _ => bail!("unknown memory category `{value}`"),
+    }
+}
+
+pub fn memory_status_to_db(status: MemoryStatus) -> &'static str {
+    match status {
+        MemoryStatus::Active => "active",
+        MemoryStatus::Superseded => "superseded",
+        MemoryStatus::Deleted => "deleted",
+        MemoryStatus::Expired => "expired",
+    }
+}
+
+pub fn memory_status_from_db(value: &str) -> Result<MemoryStatus> {
+    match value {
+        "active" => Ok(MemoryStatus::Active),
+        "superseded" => Ok(MemoryStatus::Superseded),
+        "deleted" => Ok(MemoryStatus::Deleted),
+        "expired" => Ok(MemoryStatus::Expired),
+        _ => bail!("unknown memory status `{value}`"),
+    }
+}
+
+pub fn memory_sensitivity_to_db(sensitivity: MemorySensitivity) -> &'static str {
+    match sensitivity {
+        MemorySensitivity::Normal => "normal",
+        MemorySensitivity::Personal => "personal",
+        MemorySensitivity::SecretLike => "secret_like",
+        MemorySensitivity::Regulated => "regulated",
+    }
+}
+
+pub fn memory_sensitivity_from_db(value: &str) -> Result<MemorySensitivity> {
+    match value {
+        "normal" => Ok(MemorySensitivity::Normal),
+        "personal" => Ok(MemorySensitivity::Personal),
+        "secret_like" => Ok(MemorySensitivity::SecretLike),
+        "regulated" => Ok(MemorySensitivity::Regulated),
+        _ => bail!("unknown memory sensitivity `{value}`"),
+    }
+}
+
+pub fn memory_source_kind_to_db(kind: MemorySourceKind) -> &'static str {
+    match kind {
+        MemorySourceKind::ExplicitUserRequest => "explicit_user_request",
+        MemorySourceKind::UserCorrection => "user_correction",
+        MemorySourceKind::AssistantInference => "assistant_inference",
+        MemorySourceKind::BackgroundExtractor => "background_extractor",
+        MemorySourceKind::ToolObservation => "tool_observation",
+        MemorySourceKind::Import => "import",
+        MemorySourceKind::System => "system",
+    }
+}
+
+pub fn memory_source_kind_from_db(value: &str) -> Result<MemorySourceKind> {
+    match value {
+        "explicit_user_request" => Ok(MemorySourceKind::ExplicitUserRequest),
+        "user_correction" => Ok(MemorySourceKind::UserCorrection),
+        "assistant_inference" => Ok(MemorySourceKind::AssistantInference),
+        "background_extractor" => Ok(MemorySourceKind::BackgroundExtractor),
+        "tool_observation" => Ok(MemorySourceKind::ToolObservation),
+        "import" => Ok(MemorySourceKind::Import),
+        "system" => Ok(MemorySourceKind::System),
+        _ => bail!("unknown memory source kind `{value}`"),
+    }
+}
+
+pub fn memory_actor_kind_to_db(kind: MemoryActorKind) -> &'static str {
+    match kind {
+        MemoryActorKind::User => "user",
+        MemoryActorKind::Assistant => "assistant",
+        MemoryActorKind::Extractor => "extractor",
+        MemoryActorKind::System => "system",
+        MemoryActorKind::Tool => "tool",
+    }
+}
+
+pub fn memory_actor_kind_from_db(value: &str) -> Result<MemoryActorKind> {
+    match value {
+        "user" => Ok(MemoryActorKind::User),
+        "assistant" => Ok(MemoryActorKind::Assistant),
+        "extractor" => Ok(MemoryActorKind::Extractor),
+        "system" => Ok(MemoryActorKind::System),
+        "tool" => Ok(MemoryActorKind::Tool),
+        _ => bail!("unknown memory actor kind `{value}`"),
+    }
+}
+
+pub fn memory_candidate_status_to_db(status: MemoryCandidateStatus) -> &'static str {
+    match status {
+        MemoryCandidateStatus::Pending => "pending",
+        MemoryCandidateStatus::Approved => "approved",
+        MemoryCandidateStatus::Rejected => "rejected",
+        MemoryCandidateStatus::Expired => "expired",
+    }
+}
+
+pub fn memory_candidate_status_from_db(value: &str) -> Result<MemoryCandidateStatus> {
+    match value {
+        "pending" => Ok(MemoryCandidateStatus::Pending),
+        "approved" => Ok(MemoryCandidateStatus::Approved),
+        "rejected" => Ok(MemoryCandidateStatus::Rejected),
+        "expired" => Ok(MemoryCandidateStatus::Expired),
+        _ => bail!("unknown memory candidate status `{value}`"),
+    }
+}
 
 pub fn sandbox_mode_to_db(mode: SandboxMode) -> &'static str {
     match mode {

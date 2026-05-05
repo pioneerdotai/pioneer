@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     pub memory_id: Option<String>,
     pub candidate_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub action: String,
     pub decision: String,
     pub reason_code: Option<String>,

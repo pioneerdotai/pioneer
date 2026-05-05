@@ -1,5 +1,6 @@
 mod convention;
 mod events;
+mod memory;
 mod projector;
 mod repositories;
 mod task_events;
@@ -9,15 +10,16 @@ mod util;
 
 use anyhow::{Context, Result};
 use pioneer_protocol::{
-    PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams,
-    TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
-    TaskDeliveryAttempt, TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams,
-    TaskRun, TaskRunStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage,
-    ThreadPlacement, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
-    Turn, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, UserInput, generate_id,
+    MemoryCandidateDecision, MemoryScope, MemoryScopeKind, PromptManifest, ProviderFailureClass,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
+    StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams, TaskRun, TaskRunStatus,
+    TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
+    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
+    UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
@@ -27,11 +29,16 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::convention::{
-    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, TURN_ITEM_STATUS_CANCELLED,
-    TURN_ITEM_STATUS_COMPLETED, TURN_ITEM_STATUS_FAILED, TURN_ITEM_STATUS_TIMED_OUT,
-    is_terminal_task_run_status_db, is_terminal_task_status_db, prompt_manifest_profile_to_db,
-    provider_failure_class_from_db, provider_failure_stage_from_db, recovery_action_from_db,
-    recovery_action_to_db, recovery_job_status_from_db, recovery_trigger_from_db,
+    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, MEMORY_EVENT_ACCESSED,
+    MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
+    MEMORY_EVENT_CANDIDATE_EXPIRED, MEMORY_EVENT_CANDIDATE_REJECTED,
+    MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED, MEMORY_EVENT_CREATED, MEMORY_EVENT_EXPIRED,
+    MEMORY_EVENT_FORGOTTEN, MEMORY_EVENT_REPAIR_STATUS_CHANGED, MEMORY_EVENT_SUPERSEDED,
+    MEMORY_EVENT_UPDATED, TURN_ITEM_STATUS_CANCELLED, TURN_ITEM_STATUS_COMPLETED,
+    TURN_ITEM_STATUS_FAILED, TURN_ITEM_STATUS_TIMED_OUT, is_terminal_task_run_status_db,
+    is_terminal_task_status_db, prompt_manifest_profile_to_db, provider_failure_class_from_db,
+    provider_failure_stage_from_db, recovery_action_from_db, recovery_action_to_db,
+    recovery_job_status_from_db, recovery_trigger_from_db,
     task_concurrency_conflict_policy_from_db, task_delivery_attempt_status_from_db,
     task_delivery_mode_from_db, task_delivery_status_from_db, task_executor_kind_from_db,
     task_owner_kind_from_db, task_owner_kind_to_db, task_run_status_from_db, task_status_from_db,
@@ -43,12 +50,14 @@ use crate::convention::{
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
 use crate::repositories::{
-    attachment_upload_registry, mcp_audit_event, mcp_server_catalog_snapshot,
-    mcp_server_installation, policy, recovery_job, skill_audit_event, skill_dependency_snapshot,
-    skill_installation, skill_upload_session, skill_workspace_policy, task as task_repository,
-    task_agent_spec, task_delivery, task_dependency, task_event, task_run, task_trigger,
-    task_write_lock, thread, thread_lineage, thread_tree, turn, turn_event, turn_item_attempt,
-    turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
+    agent_memory_policy_decision, agent_memory_repair_job, attachment_upload_registry,
+    mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
+    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_upload_session,
+    skill_workspace_policy, task as task_repository, task_agent_spec, task_delivery,
+    task_dependency, task_event, task_run, task_trigger, task_write_lock, thread, thread_lineage,
+    thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding,
+    turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -56,6 +65,15 @@ use crate::turn_item_terminal::{
     TurnItemTerminalState, terminalize_turn_item_payload, tool_call_status,
 };
 
+pub use crate::memory::{
+    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
+    AgentMemoryCapsuleRecord, AgentMemoryControlRecord, AgentMemoryEventRecord,
+    AgentMemoryListFilter, AgentMemoryPolicyDecisionRecord, AgentMemoryRepairJobRecord,
+    MemoryActorRecord, MemoryScopeResolution, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
+    NewAgentMemoryControlRecord, NewAgentMemoryEvent, NewAgentMemoryPolicyDecision,
+    NewAgentMemoryRepairJob, global_agent_memory_scope_key, memory_scope_key_hash,
+    workspace_agent_memory_scope_key,
+};
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{
     optional_typed_json_from_db, typed_json_from_db, unix_ms_to_datetime, unix_to_datetime,
@@ -346,6 +364,910 @@ impl CrudStore {
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
         turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
+    }
+
+    pub async fn resolve_memory_scope(&self, scope: MemoryScope) -> Result<MemoryScopeResolution> {
+        let key = crate::memory::normalized_scope_key(scope.key.as_str())?;
+        let normalized_scope = MemoryScope {
+            kind: scope.kind,
+            key: key.clone(),
+        };
+        let scope_key_hash = memory_scope_key_hash(scope.kind, key.as_str())?;
+        let workspace_id = match scope.kind {
+            MemoryScopeKind::User => None,
+            MemoryScopeKind::Workspace => Some(key),
+            MemoryScopeKind::Thread => {
+                let thread = pioneer_entity::thread::Entity::find_by_id(key.clone())
+                    .one(&self.connection)
+                    .await
+                    .with_context(|| format!("failed to resolve thread memory scope `{key}`"))?
+                    .with_context(|| format!("thread memory scope `{key}` does not exist"))?;
+                Some(thread.workspace_id)
+            }
+            MemoryScopeKind::Task => {
+                let task = pioneer_entity::task::Entity::find_by_id(key.clone())
+                    .one(&self.connection)
+                    .await
+                    .with_context(|| format!("failed to resolve task memory scope `{key}`"))?
+                    .with_context(|| format!("task memory scope `{key}` does not exist"))?;
+                Some(task.workspace_id)
+            }
+            MemoryScopeKind::Agent => {
+                if let Some(workspace_id) = crate::memory::parse_workspace_agent_scope_key(&key) {
+                    Some(workspace_id)
+                } else if crate::memory::is_global_agent_scope_key(&key) {
+                    None
+                } else {
+                    anyhow::bail!(
+                        "agent memory scope `{key}` must be `workspace:{{workspace_id}}:agent:{{agent_id}}` or `global:agent:{{agent_id}}`"
+                    );
+                }
+            }
+        };
+
+        Ok(MemoryScopeResolution {
+            scope: normalized_scope,
+            scope_key_hash,
+            workspace_id,
+        })
+    }
+
+    pub async fn resolve_memory_scopes(
+        &self,
+        scopes: impl IntoIterator<Item = MemoryScope>,
+    ) -> Result<Vec<MemoryScopeResolution>> {
+        let mut resolved = Vec::new();
+        for scope in scopes {
+            resolved.push(self.resolve_memory_scope(scope).await?);
+        }
+        Ok(resolved)
+    }
+
+    pub async fn insert_agent_memory_record(
+        &self,
+        record: NewAgentMemoryControlRecord,
+        event: Option<NewAgentMemoryEvent>,
+        event_timestamp_secs: i64,
+    ) -> Result<AgentMemoryControlRecord> {
+        self.run_serialized_write(|| {
+            let record = record.clone();
+            let event = event.clone();
+            async move {
+                let resolved = self.resolve_memory_scope(record.scope.clone()).await?;
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent memory insert transaction")?;
+                let now = unix_to_datetime(event_timestamp_secs);
+                let row =
+                    agent_memory::insert_memory_record(&transaction, record, resolved, now).await?;
+                let event = memory_event_for_record(
+                    event,
+                    row.id.clone(),
+                    row.workspace_id.clone(),
+                    MEMORY_EVENT_CREATED,
+                    event_timestamp_secs,
+                );
+                agent_memory_event::append_memory_event(&transaction, event).await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit agent memory insert transaction")?;
+                crate::memory::agent_memory_control_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn upsert_active_agent_memory_record(
+        &self,
+        record: NewAgentMemoryControlRecord,
+        event: Option<NewAgentMemoryEvent>,
+        event_timestamp_secs: i64,
+    ) -> Result<AgentMemoryControlRecord> {
+        self.run_serialized_write(|| {
+            let record = record.clone();
+            let event = event.clone();
+            async move {
+                let resolved = self.resolve_memory_scope(record.scope.clone()).await?;
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent memory upsert transaction")?;
+                let now = unix_to_datetime(event_timestamp_secs);
+                let row =
+                    agent_memory::upsert_active_memory_record(&transaction, record, resolved, now)
+                        .await?;
+                let event = memory_event_for_record(
+                    event,
+                    row.id.clone(),
+                    row.workspace_id.clone(),
+                    MEMORY_EVENT_UPDATED,
+                    event_timestamp_secs,
+                );
+                agent_memory_event::append_memory_event(&transaction, event).await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit agent memory upsert transaction")?;
+                crate::memory::agent_memory_control_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn get_agent_memory_record(
+        &self,
+        memory_id: &str,
+        include_non_active: bool,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        Ok(
+            agent_memory::find_memory_by_id(&self.connection, memory_id, include_non_active)
+                .await?
+                .map(crate::memory::agent_memory_control_record_from_model)
+                .transpose()?,
+        )
+    }
+
+    pub async fn get_active_agent_memory_by_key(
+        &self,
+        scope: MemoryScope,
+        namespace: Option<&str>,
+        key: &str,
+        workspace_guard: Option<MemoryWorkspaceGuard>,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scope(scope).await?;
+        let namespace = crate::memory::normalized_memory_namespace(namespace)?;
+        let Some(row) = agent_memory::find_active_memory_by_scoped_key(
+            &self.connection,
+            &resolved,
+            namespace.as_str(),
+            key,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let record = crate::memory::agent_memory_control_record_from_model(row)?;
+        if let Some(guard) = workspace_guard
+            && !crate::memory::workspace_allowed_by_guard(
+                record.scope.kind,
+                &record.workspace_id,
+                &guard,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    pub async fn list_agent_memory_records(
+        &self,
+        filter: AgentMemoryListFilter,
+    ) -> Result<Vec<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scopes(filter.scopes.clone()).await?;
+        let rows = agent_memory::list_memory_records(
+            &self.connection,
+            filter,
+            resolved,
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await?;
+        rows.into_iter()
+            .map(crate::memory::agent_memory_control_record_from_model)
+            .collect()
+    }
+
+    pub async fn mark_agent_memory_deleted(
+        &self,
+        memory_id: &str,
+        actor: Option<MemoryActorRecord>,
+        reason: Option<String>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        self.run_serialized_write(|| {
+            let actor = actor.clone();
+            let reason = reason.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent memory delete transaction")?;
+                let now = unix_to_datetime(event_timestamp_secs);
+                let Some(row) = agent_memory::mark_memory_deleted(
+                    &transaction,
+                    memory_id,
+                    actor.clone(),
+                    reason.clone(),
+                    now,
+                )
+                .await?
+                else {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit empty agent memory delete transaction")?;
+                    return Ok(None);
+                };
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: Some(row.id.clone()),
+                        candidate_id: None,
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: MEMORY_EVENT_FORGOTTEN.to_owned(),
+                        actor,
+                        thread_id: row.source_thread_id.clone(),
+                        turn_id: row.source_turn_id.clone(),
+                        item_id: row.source_item_id.clone(),
+                        details_json: reason
+                            .map(|reason| serde_json::json!({ "reason": reason }).to_string()),
+                        created_at_unix: event_timestamp_secs,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit agent memory delete transaction")?;
+                Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                    row,
+                )?))
+            }
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_superseded(
+        &self,
+        memory_id: &str,
+        superseded_by: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin agent memory supersede transaction")?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            let Some(row) =
+                agent_memory::mark_memory_superseded(&transaction, memory_id, superseded_by, now)
+                    .await?
+            else {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit empty agent memory supersede transaction")?;
+                return Ok(None);
+            };
+            agent_memory_event::append_memory_event(
+                &transaction,
+                NewAgentMemoryEvent {
+                    memory_id: Some(row.id.clone()),
+                    candidate_id: None,
+                    workspace_id: row.workspace_id.clone(),
+                    event_kind: MEMORY_EVENT_SUPERSEDED.to_owned(),
+                    actor: None,
+                    thread_id: row.source_thread_id.clone(),
+                    turn_id: row.source_turn_id.clone(),
+                    item_id: row.source_item_id.clone(),
+                    details_json: Some(
+                        serde_json::json!({ "superseded_by": superseded_by }).to_string(),
+                    ),
+                    created_at_unix: event_timestamp_secs,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit agent memory supersede transaction")?;
+            Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                row,
+            )?))
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_expired(
+        &self,
+        memory_id: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin agent memory expire transaction")?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            let Some(row) = agent_memory::mark_memory_expired(&transaction, memory_id, now).await?
+            else {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit empty agent memory expire transaction")?;
+                return Ok(None);
+            };
+            agent_memory_event::append_memory_event(
+                &transaction,
+                NewAgentMemoryEvent {
+                    memory_id: Some(row.id.clone()),
+                    candidate_id: None,
+                    workspace_id: row.workspace_id.clone(),
+                    event_kind: MEMORY_EVENT_EXPIRED.to_owned(),
+                    actor: None,
+                    thread_id: row.source_thread_id.clone(),
+                    turn_id: row.source_turn_id.clone(),
+                    item_id: row.source_item_id.clone(),
+                    details_json: None,
+                    created_at_unix: event_timestamp_secs,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit agent memory expire transaction")?;
+            Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                row,
+            )?))
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_repair_status(
+        &self,
+        memory_id: &str,
+        repair_status: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin agent memory repair status transaction")?;
+            let row = agent_memory::mark_memory_repair_status(
+                &transaction,
+                memory_id,
+                repair_status,
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?;
+            let Some(row) = row else {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit empty agent memory repair status transaction")?;
+                return Ok(None);
+            };
+            agent_memory_event::append_memory_event(
+                &transaction,
+                NewAgentMemoryEvent {
+                    memory_id: Some(row.id.clone()),
+                    candidate_id: None,
+                    workspace_id: row.workspace_id.clone(),
+                    event_kind: MEMORY_EVENT_REPAIR_STATUS_CHANGED.to_owned(),
+                    actor: None,
+                    thread_id: row.source_thread_id.clone(),
+                    turn_id: row.source_turn_id.clone(),
+                    item_id: row.source_item_id.clone(),
+                    details_json: Some(
+                        serde_json::json!({ "repair_status": repair_status }).to_string(),
+                    ),
+                    created_at_unix: event_timestamp_secs,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit agent memory repair status transaction")?;
+            Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                row,
+            )?))
+        })
+        .await
+    }
+
+    pub async fn record_agent_memory_access(
+        &self,
+        memory_id: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin agent memory access transaction")?;
+            let now = unix_to_datetime(event_timestamp_secs);
+            let updated =
+                agent_memory::increment_memory_access(&transaction, memory_id, now).await?;
+            if updated {
+                let row = agent_memory::find_memory_by_id(&transaction, memory_id, true)
+                    .await?
+                    .context("accessed memory row missing after update")?;
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: Some(row.id),
+                        candidate_id: None,
+                        workspace_id: row.workspace_id,
+                        event_kind: MEMORY_EVENT_ACCESSED.to_owned(),
+                        actor: None,
+                        thread_id: None,
+                        turn_id: None,
+                        item_id: None,
+                        details_json: None,
+                        created_at_unix: event_timestamp_secs,
+                    },
+                )
+                .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit agent memory access transaction")?;
+            Ok(updated)
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_events(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryEventRecord>> {
+        agent_memory_event::list_memory_events(&self.connection, memory_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_event_record_from_model)
+            .collect()
+    }
+
+    pub async fn list_agent_memory_candidate_events(
+        &self,
+        candidate_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryEventRecord>> {
+        agent_memory_event::list_candidate_events(&self.connection, candidate_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_event_record_from_model)
+            .collect()
+    }
+
+    pub async fn list_workspace_agent_memory_events(
+        &self,
+        workspace_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryEventRecord>> {
+        agent_memory_event::list_workspace_memory_events(&self.connection, workspace_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_event_record_from_model)
+            .collect()
+    }
+
+    pub async fn insert_agent_memory_candidate(
+        &self,
+        candidate: NewAgentMemoryCandidate,
+        event_timestamp_secs: i64,
+    ) -> Result<AgentMemoryCandidateRecord> {
+        self.run_serialized_write(|| {
+            let candidate = candidate.clone();
+            async move {
+                let resolved = self.resolve_memory_scope(candidate.scope.clone()).await?;
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory candidate insert transaction")?;
+                let row = agent_memory_candidate::insert_candidate(
+                    &transaction,
+                    candidate,
+                    resolved,
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await?;
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: None,
+                        candidate_id: Some(row.id.clone()),
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: MEMORY_EVENT_CANDIDATE_CREATED.to_owned(),
+                        actor: None,
+                        thread_id: row.source_thread_id.clone(),
+                        turn_id: row.source_turn_id.clone(),
+                        item_id: row.source_item_id.clone(),
+                        details_json: None,
+                        created_at_unix: event_timestamp_secs,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory candidate insert transaction")?;
+                crate::memory::agent_memory_candidate_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_candidates(
+        &self,
+        filter: AgentMemoryCandidateListFilter,
+    ) -> Result<Vec<AgentMemoryCandidateRecord>> {
+        let resolved = self.resolve_memory_scopes(filter.scopes.clone()).await?;
+        agent_memory_candidate::list_candidates(&self.connection, filter, resolved)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_candidate_record_from_model)
+            .collect()
+    }
+
+    pub async fn decide_agent_memory_candidate(
+        &self,
+        decision: AgentMemoryCandidateDecisionRecord,
+    ) -> Result<Option<AgentMemoryCandidateRecord>> {
+        self.run_serialized_write(|| {
+            let decision = decision.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory candidate decision transaction")?;
+                let Some(row) =
+                    agent_memory_candidate::decide_candidate(&transaction, decision.clone())
+                        .await?
+                else {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit empty memory candidate decision transaction")?;
+                    return Ok(None);
+                };
+                let event_kind = match decision.decision {
+                    MemoryCandidateDecision::Approve => MEMORY_EVENT_CANDIDATE_APPROVED,
+                    MemoryCandidateDecision::Reject => MEMORY_EVENT_CANDIDATE_REJECTED,
+                    MemoryCandidateDecision::Expire => MEMORY_EVENT_CANDIDATE_EXPIRED,
+                };
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: decision.promoted_memory_id.clone(),
+                        candidate_id: Some(row.id.clone()),
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: event_kind.to_owned(),
+                        actor: decision.decided_by.clone(),
+                        thread_id: row.source_thread_id.clone(),
+                        turn_id: row.source_turn_id.clone(),
+                        item_id: row.source_item_id.clone(),
+                        details_json: decision
+                            .decision_reason
+                            .clone()
+                            .map(|reason| serde_json::json!({ "reason": reason }).to_string()),
+                        created_at_unix: decision.decided_at_unix,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory candidate decision transaction")?;
+                Ok(Some(
+                    crate::memory::agent_memory_candidate_record_from_model(row)?,
+                ))
+            }
+        })
+        .await
+    }
+
+    pub async fn upsert_agent_memory_capsule(
+        &self,
+        capsule: AgentMemoryCapsuleRecord,
+        event_timestamp_secs: i64,
+    ) -> Result<AgentMemoryCapsuleRecord> {
+        self.run_serialized_write(|| {
+            let capsule = capsule.clone();
+            async move {
+                let resolved = self.resolve_memory_scope(capsule.scope.clone()).await?;
+                let row = agent_memory_capsule::upsert_capsule(
+                    &self.connection,
+                    capsule,
+                    resolved,
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await?;
+                crate::memory::agent_memory_capsule_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn find_primary_agent_memory_capsule(
+        &self,
+        scope: MemoryScope,
+    ) -> Result<Option<AgentMemoryCapsuleRecord>> {
+        let resolved = self.resolve_memory_scope(scope).await?;
+        Ok(
+            agent_memory_capsule::find_primary_capsule(&self.connection, &resolved)
+                .await?
+                .map(crate::memory::agent_memory_capsule_record_from_model)
+                .transpose()?,
+        )
+    }
+
+    pub async fn find_agent_memory_capsule_by_ref(
+        &self,
+        capsule_ref: &str,
+    ) -> Result<Option<AgentMemoryCapsuleRecord>> {
+        Ok(
+            agent_memory_capsule::find_capsule_by_ref(&self.connection, capsule_ref)
+                .await?
+                .map(crate::memory::agent_memory_capsule_record_from_model)
+                .transpose()?,
+        )
+    }
+
+    pub async fn mark_agent_memory_capsule_repair_status(
+        &self,
+        capsule_id: &str,
+        repair_status: &str,
+        last_error: Option<String>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryCapsuleRecord>> {
+        let last_error_value = last_error.clone();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin agent memory capsule repair status transaction")?;
+            let row = agent_memory_capsule::mark_capsule_repair_status(
+                &transaction,
+                capsule_id,
+                repair_status,
+                last_error_value.clone(),
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?;
+            let Some(row) = row else {
+                transaction.commit().await.context(
+                    "failed to commit empty agent memory capsule repair status transaction",
+                )?;
+                return Ok(None);
+            };
+            agent_memory_event::append_memory_event(
+                &transaction,
+                NewAgentMemoryEvent {
+                    memory_id: None,
+                    candidate_id: None,
+                    workspace_id: row.workspace_id.clone(),
+                    event_kind: MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED.to_owned(),
+                    actor: None,
+                    thread_id: None,
+                    turn_id: None,
+                    item_id: None,
+                    details_json: Some(
+                        serde_json::json!({
+                            "capsule_id": row.id.clone(),
+                            "repair_status": repair_status,
+                            "last_error": last_error_value.clone(),
+                        })
+                        .to_string(),
+                    ),
+                    created_at_unix: event_timestamp_secs,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit agent memory capsule repair status transaction")?;
+            crate::memory::agent_memory_capsule_record_from_model(row).map(Some)
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_capsules_needing_repair(
+        &self,
+        workspace_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryCapsuleRecord>> {
+        agent_memory_capsule::list_capsules_needing_repair(&self.connection, workspace_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_capsule_record_from_model)
+            .collect()
+    }
+
+    pub async fn insert_agent_memory_policy_decision(
+        &self,
+        decision: NewAgentMemoryPolicyDecision,
+    ) -> Result<AgentMemoryPolicyDecisionRecord> {
+        self.run_serialized_write(|| {
+            let decision = decision.clone();
+            async move {
+                let row = agent_memory_policy_decision::insert_policy_decision(
+                    &self.connection,
+                    decision,
+                )
+                .await?;
+                crate::memory::agent_memory_policy_decision_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_policy_decisions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryPolicyDecisionRecord>> {
+        agent_memory_policy_decision::list_policy_decisions_for_memory(
+            &self.connection,
+            memory_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_policy_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_agent_memory_policy_decisions_for_candidate(
+        &self,
+        candidate_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryPolicyDecisionRecord>> {
+        agent_memory_policy_decision::list_policy_decisions_for_candidate(
+            &self.connection,
+            candidate_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_policy_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_agent_memory_policy_decisions_for_thread(
+        &self,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryPolicyDecisionRecord>> {
+        agent_memory_policy_decision::list_policy_decisions_for_thread(
+            &self.connection,
+            thread_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_policy_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn enqueue_agent_memory_repair_job(
+        &self,
+        job: NewAgentMemoryRepairJob,
+        event_timestamp_secs: i64,
+    ) -> Result<AgentMemoryRepairJobRecord> {
+        self.run_serialized_write(|| {
+            let job = job.clone();
+            async move {
+                let row = agent_memory_repair_job::enqueue_repair_job(
+                    &self.connection,
+                    job,
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await?;
+                crate::memory::agent_memory_repair_job_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn claim_due_agent_memory_repair_jobs(
+        &self,
+        now_unix: i64,
+        lock_ttl_secs: i64,
+        locked_by: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryRepairJobRecord>> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            let lock_expires_at = unix_to_datetime(now_unix.saturating_add(lock_ttl_secs));
+            agent_memory_repair_job::claim_due_repair_jobs(
+                &self.connection,
+                now,
+                lock_expires_at,
+                locked_by,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .collect()
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_repair_job_running(
+        &self,
+        job_id: &str,
+        locked_by: &str,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryRepairJobRecord>> {
+        self.run_serialized_write(|| async {
+            agent_memory_repair_job::mark_repair_job_running(
+                &self.connection,
+                job_id,
+                locked_by,
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_repair_job_completed(
+        &self,
+        job_id: &str,
+        locked_by: &str,
+        result_json: Option<String>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryRepairJobRecord>> {
+        let result_json_value = result_json.clone();
+        self.run_serialized_write(|| async {
+            agent_memory_repair_job::mark_repair_job_completed(
+                &self.connection,
+                job_id,
+                locked_by,
+                result_json_value.clone(),
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn mark_agent_memory_repair_job_failed(
+        &self,
+        job_id: &str,
+        locked_by: &str,
+        last_error: String,
+        retry_at_unix: Option<i64>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryRepairJobRecord>> {
+        let last_error_value = last_error.clone();
+        self.run_serialized_write(|| async {
+            agent_memory_repair_job::mark_repair_job_failed(
+                &self.connection,
+                job_id,
+                locked_by,
+                last_error_value.clone(),
+                retry_at_unix.map(unix_to_datetime),
+                unix_to_datetime(event_timestamp_secs),
+            )
+            .await?
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .transpose()
+        })
+        .await
     }
 
     /// Persists the full turn/start write-set atomically through append-only events + projection.
@@ -3794,6 +4716,38 @@ impl CrudStore {
         self.write_coordinator
             .run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
             .await
+    }
+}
+
+fn memory_event_for_record(
+    event: Option<NewAgentMemoryEvent>,
+    memory_id: String,
+    workspace_id: Option<String>,
+    default_event_kind: &str,
+    created_at_unix: i64,
+) -> NewAgentMemoryEvent {
+    match event {
+        Some(mut event) => {
+            if event.memory_id.is_none() {
+                event.memory_id = Some(memory_id);
+            }
+            if event.workspace_id.is_none() {
+                event.workspace_id = workspace_id;
+            }
+            event
+        }
+        None => NewAgentMemoryEvent {
+            memory_id: Some(memory_id),
+            candidate_id: None,
+            workspace_id,
+            event_kind: default_event_kind.to_owned(),
+            actor: None,
+            thread_id: None,
+            turn_id: None,
+            item_id: None,
+            details_json: None,
+            created_at_unix,
+        },
     }
 }
 

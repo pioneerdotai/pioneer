@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     pub job_kind: String,
     pub status: String,
+    pub workspace_id: Option<String>,
     pub scope_kind: Option<String>,
     pub scope_key_hash: Option<String>,
     pub memory_id: Option<String>,

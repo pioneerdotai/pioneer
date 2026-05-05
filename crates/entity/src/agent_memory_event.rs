@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     pub memory_id: Option<String>,
     pub candidate_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub event_kind: String,
     pub actor_kind: Option<String>,
     pub actor_id: Option<String>,
