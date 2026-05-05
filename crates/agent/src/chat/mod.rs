@@ -9,7 +9,9 @@ use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
 };
-use crate::hooks::{AgentTurnHookContext, run_noop_agent_turn_hook_phase};
+use crate::hooks::{
+    AgentTurnHookContext, run_agent_turn_policy_hook_phase, run_noop_agent_turn_hook_phase,
+};
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
     resolve_memory_turn_policy,
@@ -1011,12 +1013,18 @@ async fn execute_agent_provider_response(
     let provider_tool_calling = provider.capabilities().tool_calling;
     let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
 
-    run_noop_agent_turn_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        HookPhase::TurnPrePolicy,
-    )
-    .await;
+    let effective_policy_set =
+        run_agent_turn_policy_hook_phase(hook_runtime.as_ref(), &hook_context)
+            .await
+            .map_err(|error| {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error_kind = error.kind(),
+                    "turn policy hook failed before prompt construction"
+                );
+                ChatTurnError::Terminal(error.safe_message().to_owned())
+            })?;
 
     let memory_context = memory_turn_context(
         workspace_id,
@@ -1052,6 +1060,7 @@ async fn execute_agent_provider_response(
         hook_runtime.as_ref(),
         &hook_context,
         HookPhase::TurnPrePromptContext,
+        &effective_policy_set,
     )
     .await;
 
@@ -1147,6 +1156,7 @@ async fn execute_agent_provider_response(
             hook_runtime.as_ref(),
             &hook_context,
             HookPhase::TurnPrePromptCompile,
+            &effective_policy_set,
         )
         .await;
 
@@ -1164,6 +1174,7 @@ async fn execute_agent_provider_response(
             hook_runtime.as_ref(),
             &hook_context,
             HookPhase::TurnPostPromptCompile,
+            &effective_policy_set,
         )
         .await;
 
@@ -1202,6 +1213,7 @@ async fn execute_agent_provider_response(
                 hook_runtime.as_ref(),
                 &hook_context,
                 HookPhase::TurnPostTurn,
+                &effective_policy_set,
             )
             .await;
         }
@@ -1372,6 +1384,7 @@ async fn execute_agent_provider_response(
         hook_runtime.as_ref(),
         &hook_context,
         HookPhase::TurnPrePromptCompile,
+        &effective_policy_set,
     )
     .await;
 
@@ -1389,6 +1402,7 @@ async fn execute_agent_provider_response(
         hook_runtime.as_ref(),
         &hook_context,
         HookPhase::TurnPostPromptCompile,
+        &effective_policy_set,
     )
     .await;
 
@@ -2354,6 +2368,7 @@ async fn execute_agent_provider_response(
             hook_runtime.as_ref(),
             &hook_context,
             HookPhase::TurnPostTurn,
+            &effective_policy_set,
         )
         .await;
     }

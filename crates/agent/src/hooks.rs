@@ -1,7 +1,7 @@
 use pioneer_hooks::{
-    HookActor, HookActorKind, HookContext, HookContextMode, HookDiagnostic, HookIdError, HookInput,
-    HookInputKind, HookPhase, HookPhaseRequest, HookRuntime, HookRuntimeError, HookThreadId,
-    HookTurnId, HookValue, HookWorkspaceId,
+    HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookDiagnostic,
+    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet, HookRuntime,
+    HookRuntimeError, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,16 +24,91 @@ impl AgentTurnHookContext {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct EffectiveTurnPolicySet {
+    policies: HookPolicySet,
+}
+
+impl EffectiveTurnPolicySet {
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn from_hook_policy_set(policies: HookPolicySet) -> Self {
+        Self { policies }
+    }
+
+    pub(super) fn clone_hook_policy_set(&self) -> HookPolicySet {
+        self.policies.clone()
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum AgentTurnHookError {
+    InvalidContext(HookIdError),
+    Runtime(HookRuntimeError),
+}
+
+impl AgentTurnHookError {
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidContext(error) => {
+                let _ = error;
+                "invalid_context"
+            }
+            Self::Runtime(error) => {
+                let _ = error;
+                "runtime"
+            }
+        }
+    }
+
+    pub(super) fn safe_message(&self) -> &'static str {
+        "turn policy hook failed"
+    }
+}
+
+pub(super) async fn run_agent_turn_policy_hook_phase(
+    runtime: Option<&Arc<HookRuntime>>,
+    context: &AgentTurnHookContext,
+) -> Result<EffectiveTurnPolicySet, AgentTurnHookError> {
+    let Some(runtime) = runtime else {
+        return Ok(EffectiveTurnPolicySet::empty());
+    };
+
+    let empty_policy_set = EffectiveTurnPolicySet::empty();
+    let request = build_phase_request(context, HookPhase::TurnPrePolicy, &empty_policy_set)
+        .map_err(AgentTurnHookError::InvalidContext)?;
+
+    match runtime.run_phase(request).await {
+        Ok(response) => {
+            for diagnostic in &response.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePolicy, diagnostic);
+            }
+            let policy_set = policy_set_from_contributions(response.contributions);
+            for diagnostic in &policy_set.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePolicy, diagnostic);
+            }
+            Ok(EffectiveTurnPolicySet::from_hook_policy_set(policy_set))
+        }
+        Err(error) => {
+            warn_hook_policy_runtime_error(HookPhase::TurnPrePolicy, &error);
+            Err(AgentTurnHookError::Runtime(error))
+        }
+    }
+}
+
 pub(super) async fn run_noop_agent_turn_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
     phase: HookPhase,
+    policy_set: &EffectiveTurnPolicySet,
 ) {
     let Some(runtime) = runtime else {
         return;
     };
 
-    let request = match build_phase_request(context, phase) {
+    let request = match build_phase_request(context, phase, policy_set) {
         Ok(request) => request,
         Err(error) => {
             warn!(
@@ -58,8 +133,9 @@ pub(super) async fn run_noop_agent_turn_hook_phase(
 fn build_phase_request(
     context: &AgentTurnHookContext,
     phase: HookPhase,
+    policy_set: &EffectiveTurnPolicySet,
 ) -> Result<HookPhaseRequest, HookIdError> {
-    Ok(HookPhaseRequest::new(
+    let request = HookPhaseRequest::new(
         phase,
         HookContext {
             workspace_id: Some(HookWorkspaceId::new(context.workspace_id.clone())?),
@@ -77,7 +153,13 @@ fn build_phase_request(
             kind: HookInputKind::from(phase),
             payload: HookValue::Null,
         },
-    ))
+    )
+    .with_policy_set(policy_set.clone_hook_policy_set());
+    Ok(request)
+}
+
+fn policy_set_from_contributions(contributions: Vec<HookContribution>) -> HookPolicySet {
+    HookPolicySet::merge_hook_contributions(contributions)
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -95,6 +177,124 @@ fn warn_hook_diagnostic(phase: HookPhase, diagnostic: &HookDiagnostic) {
         safe_for_user = diagnostic.safe_for_user,
         "agent turn hook diagnostic reported; continuing"
     );
+}
+
+fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
+    match error {
+        HookRuntimeError::Registry(_) => {
+            warn!(
+                phase = %phase,
+                error_kind = "registry",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingHandler {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_handler",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookFailed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookTimedOut {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            timeout_ms,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                timeout_ms = *timeout_ms,
+                error_kind = "hook_timed_out",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookFailedClosed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed_closed",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingFallbackContribution {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_fallback_contribution",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingDependency {
+            subscription_id,
+            dependency_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                dependency_id = %dependency_id,
+                error_kind = "missing_dependency",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::DependencyCycle {
+            phase: error_phase,
+            subscription_ids,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_count = subscription_ids.len(),
+                error_kind = "dependency_cycle",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+    }
 }
 
 fn warn_hook_runtime_error(phase: HookPhase, error: &HookRuntimeError) {

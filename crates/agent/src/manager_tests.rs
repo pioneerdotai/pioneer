@@ -10,7 +10,7 @@ use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookContextMode,
     HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity,
     HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
-    HookHandlerResponse, HookId, HookInputKind, HookKind, HookPhase, HookPolicyKey,
+    HookHandlerResponse, HookId, HookInputKind, HookKind, HookPhase, HookPolicyKey, HookPolicySet,
     HookPromptContent, HookPromptSectionTitle, HookRegistry, HookRuntime, HookSectionId,
     HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
     PromptManifestDiagnosticContribution, PromptSectionContribution,
@@ -186,6 +186,7 @@ struct RecordedHookCall {
     turn_id: Option<String>,
     mode: Option<HookContextMode>,
     actor_kind: Option<HookActorKind>,
+    policy_set: HookPolicySet,
 }
 
 struct RecordingHookHandler {
@@ -241,6 +242,7 @@ impl HookHandler for RecordingHookHandler {
                     .actor
                     .as_ref()
                     .map(|actor| actor.kind.clone()),
+                policy_set: request.policy_set.clone(),
             });
 
         if self.fail {
@@ -270,6 +272,16 @@ fn recording_hook_runtime(
     failure_policy: HookFailurePolicy,
     fail: bool,
 ) -> Arc<HookRuntime> {
+    recording_hook_runtime_with_fallback(calls, contributions, failure_policy, fail, Vec::new())
+}
+
+fn recording_hook_runtime_with_fallback(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    contributions: Vec<HookContribution>,
+    failure_policy: HookFailurePolicy,
+    fail: bool,
+    fallback_contributions: Vec<HookContribution>,
+) -> Arc<HookRuntime> {
     let handlers = Arc::new(HookRegistry::new());
     let subscriptions = Arc::new(HookSubscriptionRegistry::new());
     let hook_id = HookId::new("test.phase07_recorder").expect("valid hook id");
@@ -292,12 +304,37 @@ fn recording_hook_runtime(
                         timeout_ms: None,
                         max_parallelism: None,
                     })
-                    .with_failure_policy(failure_policy),
+                    .with_failure_policy(failure_policy)
+                    .with_fallback_contributions(fallback_contributions.clone()),
             )
             .expect("recording hook subscription registers");
     }
 
     Arc::new(HookRuntime::new(handlers, subscriptions))
+}
+
+fn policy_contribution(
+    domain: &str,
+    key: &str,
+    value: HookValue,
+    priority: i32,
+) -> HookContribution {
+    HookContribution::Policy(PolicyContribution {
+        domain: HookDomain::new(domain).expect("valid domain"),
+        key: HookPolicyKey::new(key).expect("valid policy key"),
+        value,
+        priority,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn policy_value(policy_set: &HookPolicySet, domain: &str, key: &str) -> Option<HookValue> {
+    policy_set
+        .get(
+            &HookDomain::new(domain).expect("valid domain"),
+            &HookPolicyKey::new(key).expect("valid policy key"),
+        )
+        .map(|entry| entry.value.clone())
 }
 
 fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
@@ -1340,6 +1377,13 @@ fn assert_turn_completed(observed: &[AgentEvent]) {
     );
 }
 
+fn assert_turn_failed(observed: &[AgentEvent], expected_error: &str) {
+    let Some(AgentEvent::TurnFailed { error, .. }) = observed.last() else {
+        panic!("expected terminal turn failure, observed {observed:?}");
+    };
+    assert_eq!(error, expected_error);
+}
+
 async fn start_simple_turn(
     manager: &AgentManager,
     thread_id: &str,
@@ -1467,6 +1511,7 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
         assert_eq!(call.turn_id.as_deref(), Some("turn_phase07_agent_hooks"));
         assert_eq!(call.mode, Some(HookContextMode::Agent));
         assert_eq!(call.actor_kind, Some(HookActorKind::Agent));
+        assert!(call.policy_set.is_empty());
     }
     assert_eq!(provider.snapshot_requests().len(), 1);
 }
@@ -1640,7 +1685,7 @@ async fn phase_07_hook_contributions_do_not_affect_agent_request() {
 }
 
 #[tokio::test]
-async fn phase_07_required_hook_failure_does_not_fail_turn() {
+async fn phase_08_required_policy_hook_failure_fails_turn() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -1664,12 +1709,315 @@ async fn phase_07_required_hook_failure_does_not_fail_turn() {
         "phase 07 required hook failure",
     )
     .await;
+    assert_turn_failed(&observed, "turn policy hook failed");
+
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].phase, HookPhase::TurnPrePolicy);
+}
+
+#[tokio::test]
+async fn phase_08_policy_hook_contribution_reaches_later_phase_policy_set() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![policy_contribution(
+                "test",
+                "mode",
+                HookValue::Text("strict".to_owned()),
+                10,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_policy_reaches_later",
+        "ws_phase08_policy_reaches_later",
+        "turn_phase08_policy_reaches_later",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 policy contribution",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_policy = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePolicy)
+        .expect("pre-policy hook called");
+    assert!(pre_policy.policy_set.is_empty());
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    assert_eq!(
+        policy_value(&pre_prompt_context.policy_set, "test", "mode"),
+        Some(HookValue::Text("strict".to_owned()))
+    );
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_08_multiple_policy_contributions_merge_deterministically() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![
+                policy_contribution("test", "mode", HookValue::Text("weak".to_owned()), 0),
+                policy_contribution("test", "mode", HookValue::Text("strong".to_owned()), 10),
+                policy_contribution("test", "allowed", HookValue::Bool(true), 5),
+            ],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_policy_merge",
+        "ws_phase08_policy_merge",
+        "turn_phase08_policy_merge",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 policy merge",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    assert_eq!(
+        policy_value(&pre_prompt_context.policy_set, "test", "mode"),
+        Some(HookValue::Text("strong".to_owned()))
+    );
+    assert_eq!(
+        policy_value(&pre_prompt_context.policy_set, "test", "allowed"),
+        Some(HookValue::Bool(true))
+    );
+    let ordered_keys = pre_prompt_context
+        .policy_set
+        .entries
+        .keys()
+        .map(|key| (key.domain.as_str().to_owned(), key.key.as_str().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordered_keys,
+        vec![
+            ("test".to_owned(), "allowed".to_owned()),
+            ("test".to_owned(), "mode".to_owned())
+        ]
+    );
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_08_best_effort_policy_hook_failure_does_not_fail_turn() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            true,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_best_effort_policy_failure",
+        "ws_phase08_best_effort_policy_failure",
+        "turn_phase08_best_effort_policy_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 best effort policy failure",
+    )
+    .await;
     assert_turn_completed(&observed);
 
     assert_eq!(provider.snapshot_requests().len(), 1);
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    assert!(pre_prompt_context.policy_set.is_empty());
+}
+
+#[tokio::test]
+async fn phase_08_fallback_policy_hook_failure_returns_fallback_policy_and_continues() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_fallback(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::Fallback,
+            true,
+            vec![policy_contribution(
+                "test",
+                "mode",
+                HookValue::Text("fallback".to_owned()),
+                1,
+            )],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_fallback_policy_failure",
+        "ws_phase08_fallback_policy_failure",
+        "turn_phase08_fallback_policy_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 fallback policy failure",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
     assert_eq!(
-        snapshot_hook_calls(&calls).len(),
-        PHASE_07_HOOK_PHASES.len()
+        policy_value(&pre_prompt_context.policy_set, "test", "mode"),
+        Some(HookValue::Text("fallback".to_owned()))
+    );
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_08_fail_closed_policy_hook_failure_fails_turn() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::FailClosed,
+            true,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_fail_closed_policy_failure",
+        "ws_phase08_fail_closed_policy_failure",
+        "turn_phase08_fail_closed_policy_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 fail closed policy failure",
+    )
+    .await;
+    assert_turn_failed(&observed, "turn policy hook failed");
+
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].phase, HookPhase::TurnPrePolicy);
+}
+
+#[tokio::test]
+async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_phase08_policy_isolation",
+                MemoryCategory::Preference,
+                Some("city"),
+                "User likes Porto.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::explicit_remember(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![policy_contribution(
+                "test",
+                "memory_disabled",
+                HookValue::Bool(true),
+                100,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase08_memory_not_migrated",
+        "ws_phase08_memory_not_migrated",
+        "turn_phase08_memory_not_migrated",
+        ThreadMode::Agent,
+        "capture",
+        "phase 08 memory remains on existing path",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(policy_provider.contexts().len(), 1);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("User likes Porto."));
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    assert_eq!(
+        policy_value(&pre_prompt_context.policy_set, "test", "memory_disabled"),
+        Some(HookValue::Bool(true))
     );
 }
 

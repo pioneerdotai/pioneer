@@ -3,8 +3,8 @@ use crate::{
     HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
     HookDiagnosticRedactionPolicy, HookDiagnosticSeverity, HookError, HookFailurePolicy,
     HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookMetadata,
-    HookPhase, HookRegistry, HookRegistryError, HookSubscription, HookSubscriptionId,
-    HookSubscriptionRegistry,
+    HookPhase, HookPolicySet, HookRegistry, HookRegistryError, HookSubscription,
+    HookSubscriptionId, HookSubscriptionRegistry,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
@@ -234,6 +234,8 @@ pub struct HookPhaseRequest {
     pub phase: HookPhase,
     pub context: HookContext,
     pub input: HookInput,
+    #[serde(default, skip_serializing_if = "HookPolicySet::is_empty")]
+    pub policy_set: HookPolicySet,
 }
 
 impl HookPhaseRequest {
@@ -242,7 +244,13 @@ impl HookPhaseRequest {
             phase,
             context,
             input,
+            policy_set: HookPolicySet::empty(),
         }
+    }
+
+    pub fn with_policy_set(mut self, policy_set: HookPolicySet) -> Self {
+        self.policy_set = policy_set;
+        self
     }
 }
 
@@ -754,6 +762,7 @@ fn handler_request(node: &HookExecutionNode, request: HookPhaseRequest) -> HookH
         phase: request.phase,
         context: request.context,
         input: request.input,
+        policy_set: request.policy_set,
     }
 }
 
@@ -1090,6 +1099,34 @@ mod tests {
                 diagnostics: Vec::new(),
                 metadata: HookMetadata::default(),
             })
+        }
+    }
+
+    struct PolicySetRecordingHookHandler {
+        id: HookId,
+        captured_policy_sets: Arc<Mutex<Vec<HookPolicySet>>>,
+    }
+
+    #[async_trait]
+    impl HookHandler for PolicySetRecordingHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            self.captured_policy_sets
+                .lock()
+                .expect("policy sets lock")
+                .push(request.policy_set);
+            Ok(HookHandlerResponse::default())
         }
     }
 
@@ -1669,6 +1706,51 @@ mod tests {
             serde_json::from_value(value).expect("request deserializes");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn hook_phase_request_defaults_to_empty_policy_set() {
+        assert!(phase_request().policy_set.is_empty());
+    }
+
+    #[test]
+    fn hook_phase_request_with_policy_set_reaches_handler_request() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let captured_policy_sets = Arc::new(Mutex::new(Vec::new()));
+        let hook_id = hook_id("test.policy_receiver");
+        handlers
+            .register_handler(Arc::new(PolicySetRecordingHookHandler {
+                id: hook_id.clone(),
+                captured_policy_sets: captured_policy_sets.clone(),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                &handlers,
+                HookSubscription::new(
+                    subscription_id("sub.policy_receiver"),
+                    hook_id,
+                    HookPhase::TurnPrePromptCompile,
+                ),
+            )
+            .expect("subscription registers");
+        let runtime = runtime(handlers, subscriptions);
+        let policy_set = HookPolicySet::merge_contributions([crate::PolicyContribution {
+            domain: HookDomain::new("test").expect("valid domain"),
+            key: crate::HookPolicyKey::new("mode").expect("valid key"),
+            value: HookValue::Text("strict".to_owned()),
+            priority: 10,
+            diagnostics: Vec::new(),
+        }]);
+
+        block_on_ready(runtime.run_phase(phase_request().with_policy_set(policy_set.clone())))
+            .expect("phase execution succeeds");
+
+        assert_eq!(
+            *captured_policy_sets.lock().expect("policy sets lock"),
+            vec![policy_set]
+        );
     }
 
     #[test]
