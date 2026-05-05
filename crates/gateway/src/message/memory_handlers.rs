@@ -488,6 +488,61 @@ impl MessageProcessor {
             .await;
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn send_memory_changed_after_tool_remember(
+        &self,
+        context: &MemoryOperationContext,
+        response: &MemoryRememberResponse,
+    ) {
+        let Some(workspace_id) = context.workspace_id.as_deref() else {
+            return;
+        };
+        let notification = MemoryChangedNotification {
+            memory_id: response.record.id.clone(),
+            scope: response.record.scope.clone(),
+            change_kind: if response.created {
+                MemoryChangeKind::Created
+            } else {
+                MemoryChangeKind::Updated
+            },
+            record: Some(response.record.clone()),
+        };
+
+        self.send_notification_to_workspace_connections(
+            workspace_id,
+            events::MEMORY_CHANGED,
+            &notification,
+        )
+        .await;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn send_memory_forgotten_after_tool_forget(
+        &self,
+        context: &MemoryOperationContext,
+        reason: Option<String>,
+        dry_run: bool,
+        response: &MemoryForgetResponse,
+    ) {
+        if dry_run || response.forgotten_memory_ids.is_empty() {
+            return;
+        }
+        let Some(workspace_id) = context.workspace_id.as_deref() else {
+            return;
+        };
+
+        let notification = MemoryForgottenNotification {
+            memory_ids: response.forgotten_memory_ids.clone(),
+            reason,
+        };
+        self.send_notification_to_workspace_connections(
+            workspace_id,
+            events::MEMORY_FORGOTTEN,
+            &notification,
+        )
+        .await;
+    }
+
     async fn send_memory_changed_notification(
         &self,
         connection_id: ConnectionId,

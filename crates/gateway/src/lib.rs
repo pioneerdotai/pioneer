@@ -6,6 +6,8 @@ mod helpers;
 mod mcp_secrets;
 mod mcp_service;
 mod memory_runtime;
+#[allow(dead_code)]
+mod memory_tools;
 mod message;
 mod operations;
 mod resilience;

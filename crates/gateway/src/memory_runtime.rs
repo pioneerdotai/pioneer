@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use pioneer_agent::MemoryTurnContext;
 use pioneer_config::GatewayMemoryConfig;
 use pioneer_crud::CrudStore;
 use pioneer_memory::{
@@ -94,6 +95,24 @@ impl GatewayMemoryRuntime {
     ) -> MemoryOperationContext {
         MemoryOperationContext {
             workspace_id,
+            actor,
+            allow_global_user: self.context_defaults.allow_global_user,
+            allow_global_agent: self.context_defaults.allow_global_agent,
+            ..MemoryOperationContext::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn operation_context_for_turn(
+        &self,
+        turn: &MemoryTurnContext,
+        actor: Option<MemoryActor>,
+    ) -> MemoryOperationContext {
+        MemoryOperationContext {
+            workspace_id: Some(turn.workspace_id.clone()),
+            thread_id: Some(turn.thread_id.clone()),
+            task_id: turn.task_id.clone(),
+            agent_id: turn.agent_id.clone(),
             actor,
             allow_global_user: self.context_defaults.allow_global_user,
             allow_global_agent: self.context_defaults.allow_global_agent,

@@ -265,6 +265,37 @@ impl MemoryService {
         })
     }
 
+    pub async fn get_by_key(
+        &self,
+        context: MemoryOperationContext,
+        scope: MemoryScope,
+        namespace: Option<String>,
+        key: String,
+    ) -> Result<MemoryGetResponse> {
+        let now = context.now_or(current_unix());
+        let Some(row) = self
+            .store
+            .get_active_agent_memory_by_key(
+                scope,
+                namespace.as_deref(),
+                key.as_str(),
+                context.workspace_guard(),
+            )
+            .await?
+        else {
+            return Ok(MemoryGetResponse { record: None });
+        };
+        let Some(record) = self
+            .hydrate_visible_row(row, &context, &[], now, true)
+            .await?
+        else {
+            return Ok(MemoryGetResponse { record: None });
+        };
+        Ok(MemoryGetResponse {
+            record: Some(record),
+        })
+    }
+
     pub async fn list(
         &self,
         context: MemoryOperationContext,

@@ -1376,6 +1376,10 @@ impl AgentManager {
         *self.memory_provider.write().await = provider;
     }
 
+    pub async fn has_memory_provider(&self) -> bool {
+        self.memory_provider.read().await.is_some()
+    }
+
     pub async fn ensure_thread(
         &self,
         thread_id: &str,

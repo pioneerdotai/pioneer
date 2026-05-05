@@ -229,6 +229,20 @@ impl MessageProcessor {
             .await;
     }
 
+    #[allow(dead_code)]
+    pub async fn bind_memory_bridge(self: &Arc<Self>) {
+        self.agent_manager
+            .set_memory_provider(Some(Arc::new(
+                crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(self)),
+            )))
+            .await;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn memory_runtime(&self) -> Arc<GatewayMemoryRuntime> {
+        self.memory_runtime.clone()
+    }
+
     pub async fn start_resilience_workers(self: &Arc<Self>) {
         self.bind_task_bridge().await;
         match self

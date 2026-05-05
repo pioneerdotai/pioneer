@@ -8,7 +8,10 @@ use crate::workspace::WorkspaceManager;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use migration::{Migrator, MigratorTrait};
-use pioneer_agent::{AgentManager, AgentMcpToolProvider, SkillsLoopConfig, ToolLoopConfig};
+use pioneer_agent::{
+    AgentManager, AgentMcpToolProvider, AgentMemoryProvider, MemoryRecallRequest,
+    MemoryTurnContext, SkillsLoopConfig, ToolLoopConfig,
+};
 use pioneer_config::{GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
@@ -61,7 +64,8 @@ use pioneer_provider::{
 };
 use pioneer_skills::SkillTrustLevel;
 use pioneer_tools::{
-    ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+    BuiltinTools, ComputerUseToolsConfig, RawToolCall, ToolError, ToolLoopBudgetConfig,
+    ToolRetryBudgetConfig, WebToolsConfig, build_tools,
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter};
@@ -8436,7 +8440,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
 }
 
 struct MemoryGatewayHarness {
-    processor: MessageProcessor,
+    processor: Arc<MessageProcessor>,
     crud_store: Arc<CrudStore>,
     workspace_manager: Arc<WorkspaceManager>,
     session_manager: Arc<SessionManager>,
@@ -8452,6 +8456,9 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
     let runtime_home = unique_temp_dir(&format!("memory_{case_id}"));
     std::fs::create_dir_all(runtime_home.as_path()).expect("create memory runtime home");
     let memory_runtime = Arc::new(
@@ -8478,7 +8485,7 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         );
     }
 
-    let processor = MessageProcessor::new_with_memory_runtime(
+    let processor = Arc::new(MessageProcessor::new_with_memory_runtime(
         thread_manager,
         test_provider(),
         session_manager.clone(),
@@ -8489,7 +8496,7 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         test_context_budget(),
         test_tool_loop_config(),
         memory_runtime,
-    );
+    ));
 
     MemoryGatewayHarness {
         processor,
@@ -8549,6 +8556,86 @@ fn memory_remember_params(
 fn memory_request_id(prefix: &str) -> pioneer_protocol::RequestId {
     pioneer_protocol::RequestId::new(generate_test_request_id("mem", prefix))
         .expect("valid memory request id")
+}
+
+fn memory_tool_context(harness: &MemoryGatewayHarness, turn_suffix: &str) -> MemoryTurnContext {
+    MemoryTurnContext {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: generate_test_request_id("thread", turn_suffix),
+        turn_id: generate_test_request_id("turn", turn_suffix),
+        mode: pioneer_protocol::ThreadMode::Agent,
+        input_text: "phase09 memory tool test".to_owned(),
+        task_id: None,
+        agent_id: Some("phase09-agent".to_owned()),
+    }
+}
+
+async fn materialize_memory_tools_for_context(
+    harness: &MemoryGatewayHarness,
+    context: MemoryTurnContext,
+) -> pioneer_agent::MemoryToolMaterialization {
+    let provider =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+    provider
+        .materialize_memory_tools(context)
+        .await
+        .expect("memory provider should materialize")
+}
+
+async fn built_memory_tools(harness: &MemoryGatewayHarness, turn_suffix: &str) -> BuiltinTools {
+    let context = memory_tool_context(harness, turn_suffix);
+    let materialization = materialize_memory_tools_for_context(harness, context.clone()).await;
+    let tool_loop_config = test_tool_loop_config();
+    build_tools(
+        harness.runtime_home.clone(),
+        context.turn_id,
+        tool_loop_config.web,
+        tool_loop_config.computer_use,
+        materialization.bundles,
+    )
+    .expect("memory tools should build")
+}
+
+async fn execute_memory_tool_payload(
+    tools: &BuiltinTools,
+    tool_name: &str,
+    call_id: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let call = tools
+        .router
+        .build_tool_call(RawToolCall {
+            call_id: call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments: arguments.to_string(),
+        })
+        .expect("memory tool call should parse");
+    let result = tools
+        .runtime
+        .execute_tool_call(call)
+        .await
+        .expect("memory tool should execute");
+    result.output.raw_json()
+}
+
+async fn execute_memory_tool_error(
+    tools: &BuiltinTools,
+    tool_name: &str,
+    call_id: &str,
+    arguments: serde_json::Value,
+) -> ToolError {
+    let call = tools
+        .router
+        .build_tool_call(RawToolCall {
+            call_id: call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments: arguments.to_string(),
+        })
+        .expect("memory tool call should parse");
+    match tools.runtime.execute_tool_call(call).await {
+        Ok(_) => panic!("memory tool should reject invalid args"),
+        Err(error) => error,
+    }
 }
 
 #[tokio::test]
@@ -9038,6 +9125,566 @@ async fn memory_methods_fail_when_runtime_disabled() {
         .await
         .expect("list memory records");
     assert!(rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_provider_materializes_four_memory_tools_when_runtime_enabled() {
+    let harness = setup_memory_gateway_harness("tools_materialize", true).await;
+    let materialization =
+        materialize_memory_tools_for_context(&harness, memory_tool_context(&harness, "mat")).await;
+
+    assert!(materialization.diagnostics.is_empty());
+    assert_eq!(materialization.bundles.len(), 1);
+    let bundle = materialization.bundles.first().expect("memory tool bundle");
+    let names = bundle
+        .specs
+        .iter()
+        .map(|configured| configured.spec.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from([
+            "memory_forget",
+            "memory_get",
+            "memory_remember",
+            "memory_search",
+        ])
+    );
+    for configured in &bundle.specs {
+        assert_eq!(
+            configured.spec.payload_kind,
+            pioneer_tools::PayloadKind::Function
+        );
+        assert_eq!(
+            configured.output_projection,
+            pioneer_tools::ToolOutputProjectionKind::DynamicGeneric
+        );
+        assert!(configured.spec.parameters.is_object());
+        assert!(!configured.spec.description.trim().is_empty());
+    }
+    let search = bundle
+        .specs
+        .iter()
+        .find(|configured| configured.spec.name == "memory_search")
+        .expect("search spec");
+    assert_eq!(
+        search.spec.recovery.idempotency_mode,
+        pioneer_tools::ToolIdempotencyMode::Safe
+    );
+    assert!(search.spec.recovery.can_resume);
+    let remember = bundle
+        .specs
+        .iter()
+        .find(|configured| configured.spec.name == "memory_remember")
+        .expect("remember spec");
+    assert_eq!(
+        remember.spec.recovery.idempotency_mode,
+        pioneer_tools::ToolIdempotencyMode::RequiresKey
+    );
+    assert_eq!(remember.spec.recovery.max_attempts, 1);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_provider_disabled_runtime_materializes_no_tools() {
+    let harness = setup_memory_gateway_harness("tools_disabled", false).await;
+    let materialization =
+        materialize_memory_tools_for_context(&harness, memory_tool_context(&harness, "disabled"))
+            .await;
+
+    assert!(materialization.bundles.is_empty());
+    assert!(
+        materialization
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("memory runtime is disabled"))
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_provider_recall_calls_memory_service() {
+    let mut harness = setup_memory_gateway_harness("provider_recall", true).await;
+    let remember_id = memory_request_id("providerrecall");
+    harness
+        .processor
+        .memory_remember(
+            harness.connection_id,
+            remember_id.clone(),
+            memory_remember_params(
+                user_memory_scope(),
+                MemoryCategory::Preference,
+                Some("phase09_provider_recall"),
+                "phase09 provider recall should find the green papaya preference",
+            ),
+        )
+        .await;
+    let (remember_response, _) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        remember_id.as_str(),
+        events::MEMORY_CHANGED,
+    )
+    .await;
+    let remember_payload: MemoryRememberResponse =
+        serde_json::from_value(remember_response.result).expect("memory remember response");
+
+    let provider =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+    let recall_context = memory_tool_context(&harness, "provider_recall");
+    let thread_start_id = memory_request_id("providerthread");
+    harness
+        .processor
+        .thread_start(
+            harness.connection_id,
+            thread_start_id.clone(),
+            ThreadStartParams {
+                thread_id: recall_context.thread_id.clone(),
+                workspace_id: harness.workspace_id.clone(),
+                name: None,
+                model: Some("test-model".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: None,
+                mode: Some(pioneer_protocol::ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await;
+    let (thread_response, _) = recv_response_and_notification_by_id_method(
+        &mut harness.rx,
+        thread_start_id.as_str(),
+        events::THREAD_STARTED,
+    )
+    .await;
+    let thread_payload: ThreadStartResponse =
+        serde_json::from_value(thread_response.result).expect("thread start response");
+    harness
+        .crud_store
+        .materialize_turn_start(
+            &thread_payload.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: recall_context.turn_id.clone(),
+                status: TurnStatus::InProgress,
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist for recall scope");
+    let snapshot = provider
+        .recall_memory(
+            recall_context,
+            MemoryRecallRequest {
+                query: "green papaya".to_owned(),
+                categories: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(500),
+            },
+        )
+        .await
+        .expect("provider recall should succeed");
+
+    assert!(snapshot.diagnostics.is_empty());
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.memory_id == remember_payload.record.id)
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_bridge_is_not_bound_by_default_before_phase_10() {
+    let harness = setup_memory_gateway_harness("bridge_default", true).await;
+
+    assert!(!harness.processor.agent_manager.has_memory_provider().await);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_bridge_can_be_bound_explicitly_for_phase_09_tests() {
+    let harness = setup_memory_gateway_harness("bridge_explicit", true).await;
+
+    harness.processor.bind_memory_bridge().await;
+
+    assert!(harness.processor.agent_manager.has_memory_provider().await);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_remember_writes_memory_with_turn_provenance() {
+    let mut harness = setup_memory_gateway_harness("tool_remember", true).await;
+    let tools = built_memory_tools(&harness, "remember").await;
+    let output = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_remember",
+        json!({
+            "content": "phase09 remember tool stores a durable user preference",
+            "category": "preference",
+            "scope": "user",
+            "key": "phase09_remember_preference",
+            "source": "explicit_user_request"
+        }),
+    )
+    .await;
+
+    let memory_id = output
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember output should include memoryId")
+        .to_owned();
+    assert_eq!(
+        output
+            .get("scope")
+            .and_then(|scope| scope.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("user")
+    );
+    assert_eq!(
+        output.get("category").and_then(serde_json::Value::as_str),
+        Some("preference")
+    );
+    assert!(output.get("provenance").is_some());
+    assert_eq!(
+        output
+            .get("provenance")
+            .and_then(|provenance| provenance.get("source_turn_id"))
+            .and_then(serde_json::Value::as_str),
+        Some(generate_test_request_id("turn", "remember").as_str())
+    );
+
+    let notification = recv_notification_by_method(&mut harness.rx, events::MEMORY_CHANGED).await;
+    let changed_payload: MemoryChangedNotification = serde_json::from_value(
+        notification
+            .params
+            .expect("memory changed params should be present"),
+    )
+    .expect("memory changed notification");
+    assert_eq!(changed_payload.memory_id, memory_id);
+    assert_eq!(changed_payload.change_kind, MemoryChangeKind::Created);
+
+    let get = harness
+        .processor
+        .memory_runtime()
+        .service()
+        .get(
+            harness
+                .processor
+                .memory_runtime()
+                .operation_context(Some(harness.workspace_id.clone()), None),
+            MemoryGetParams {
+                memory_id,
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("service get should succeed");
+    assert!(get.record.is_some());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
+    let harness = setup_memory_gateway_harness("tool_search", true).await;
+    let tools = built_memory_tools(&harness, "search").await;
+    let remember = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_search_seed",
+        json!({
+            "content": "phase09 search tool finds the silver apricot preference",
+            "category": "preference",
+            "scope": "user",
+            "key": "phase09_search_preference"
+        }),
+    )
+    .await;
+    let memory_id = remember
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember output should include id")
+        .to_owned();
+
+    let search = execute_memory_tool_payload(
+        &tools,
+        "memory_search",
+        "call_memory_search",
+        json!({
+            "query": "silver apricot",
+            "scopes": ["user"],
+            "categories": ["preference"],
+            "limit": 5,
+            "includeProvenance": true
+        }),
+    )
+    .await;
+    let hits = search
+        .get("hits")
+        .and_then(serde_json::Value::as_array)
+        .expect("search output should include hits");
+    let hit = hits
+        .iter()
+        .find(|hit| hit.get("memoryId").and_then(serde_json::Value::as_str) == Some(&memory_id))
+        .expect("search should return seeded memory");
+    assert_eq!(
+        hit.get("scope")
+            .and_then(|scope| scope.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("user")
+    );
+    assert_eq!(
+        hit.get("category").and_then(serde_json::Value::as_str),
+        Some("preference")
+    );
+    assert!(hit.get("provenance").is_some());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_get_returns_exact_record_with_provenance() {
+    let harness = setup_memory_gateway_harness("tool_get", true).await;
+    let tools = built_memory_tools(&harness, "get").await;
+    let remember = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_get_seed",
+        json!({
+            "content": "phase09 get tool exact detail target",
+            "category": "project_fact",
+            "scope": "workspace",
+            "key": "phase09_get_fact"
+        }),
+    )
+    .await;
+    let memory_id = remember
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember output should include id")
+        .to_owned();
+
+    let get = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "call_memory_get",
+        json!({
+            "memoryId": memory_id
+        }),
+    )
+    .await;
+    let record = get.get("record").expect("get output should include record");
+    assert_eq!(
+        record.get("memoryId").and_then(serde_json::Value::as_str),
+        remember.get("memoryId").and_then(serde_json::Value::as_str)
+    );
+    assert_eq!(
+        record.get("key").and_then(serde_json::Value::as_str),
+        Some("phase09_get_fact")
+    );
+    assert!(record.get("provenance").is_some());
+
+    let get_by_key = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "call_memory_get_key",
+        json!({
+            "key": "phase09_get_fact",
+            "scope": "workspace"
+        }),
+    )
+    .await;
+    assert_eq!(
+        get_by_key
+            .get("record")
+            .and_then(|record| record.get("memoryId"))
+            .and_then(serde_json::Value::as_str),
+        remember.get("memoryId").and_then(serde_json::Value::as_str)
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_forget_tombstones_memory_and_suppresses_future_search() {
+    let mut harness = setup_memory_gateway_harness("tool_forget", true).await;
+    let tools = built_memory_tools(&harness, "forget").await;
+    let remember = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_forget_seed",
+        json!({
+            "content": "phase09 forget tool removes the amber pear target",
+            "category": "preference",
+            "scope": "user",
+            "key": "phase09_forget_target"
+        }),
+    )
+    .await;
+    let memory_id = remember
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember output should include id")
+        .to_owned();
+
+    let forget = execute_memory_tool_payload(
+        &tools,
+        "memory_forget",
+        "call_memory_forget",
+        json!({
+            "memoryId": memory_id,
+            "reason": "phase09 forget test"
+        }),
+    )
+    .await;
+    assert_eq!(
+        forget
+            .get("forgottenMemoryIds")
+            .and_then(serde_json::Value::as_array)
+            .expect("forget output ids")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec![memory_id.as_str()]
+    );
+
+    let forgotten = recv_notification_by_method(&mut harness.rx, events::MEMORY_FORGOTTEN).await;
+    let forgotten_payload: MemoryForgottenNotification = serde_json::from_value(
+        forgotten
+            .params
+            .expect("memory forgotten params should be present"),
+    )
+    .expect("memory forgotten notification");
+    assert_eq!(forgotten_payload.memory_ids, vec![memory_id.clone()]);
+
+    let search = execute_memory_tool_payload(
+        &tools,
+        "memory_search",
+        "call_memory_forget_search",
+        json!({
+            "query": "amber pear",
+            "scopes": ["user"],
+            "limit": 5
+        }),
+    )
+    .await;
+    let hits = search
+        .get("hits")
+        .and_then(serde_json::Value::as_array)
+        .expect("search output should include hits");
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.get("memoryId").and_then(serde_json::Value::as_str) == Some(&memory_id))
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_invalid_args_return_tool_error() {
+    let harness = setup_memory_gateway_harness("tool_invalid", true).await;
+    let tools = built_memory_tools(&harness, "invalid").await;
+
+    for (tool_name, call_id, args) in [
+        (
+            "memory_search",
+            "call_invalid_search",
+            json!({ "query": " " }),
+        ),
+        ("memory_get", "call_invalid_get", json!({})),
+        (
+            "memory_get",
+            "call_invalid_get_key",
+            json!({ "key": "phase09_missing_scope" }),
+        ),
+        (
+            "memory_remember",
+            "call_invalid_remember",
+            json!({ "content": "missing category" }),
+        ),
+        (
+            "memory_forget",
+            "call_invalid_forget",
+            json!({ "key": "phase09_missing_scope" }),
+        ),
+        (
+            "memory_search",
+            "call_invalid_unknown",
+            json!({ "query": "x", "unknown": true }),
+        ),
+    ] {
+        let error = execute_memory_tool_error(&tools, tool_name, call_id, args).await;
+        assert!(
+            matches!(error, ToolError::InvalidArguments(_)),
+            "expected invalid arguments for {tool_name}, got {error:?}"
+        );
+    }
+
+    let rows = harness
+        .crud_store
+        .list_agent_memory_records(AgentMemoryListFilter::default())
+        .await
+        .expect("list memory records");
+    assert!(rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_duplicate_remember_retry_is_idempotent() {
+    let harness = setup_memory_gateway_harness("tool_retry", true).await;
+    let tools = built_memory_tools(&harness, "retry").await;
+    let args = json!({
+        "content": "phase09 duplicate remember retry stores one logical memory",
+        "category": "preference",
+        "scope": "user"
+    });
+
+    let first =
+        execute_memory_tool_payload(&tools, "memory_remember", "call_memory_retry", args.clone())
+            .await;
+    let second =
+        execute_memory_tool_payload(&tools, "memory_remember", "call_memory_retry", args).await;
+
+    assert_eq!(
+        first.get("memoryId").and_then(serde_json::Value::as_str),
+        second.get("memoryId").and_then(serde_json::Value::as_str)
+    );
+    assert_eq!(
+        first.get("created").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        second.get("created").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        first
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    );
+
+    let rows = harness
+        .crud_store
+        .list_agent_memory_records(AgentMemoryListFilter::default())
+        .await
+        .expect("list memory records");
+    assert_eq!(rows.len(), 1);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
