@@ -35,7 +35,7 @@ pub use registry::{HookRegistry, HookSubscriptionRegistry};
 pub use request::{HookHandlerRequest, HookHandlerResponse, HookInput, HookInputKind};
 pub use runtime::{
     HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus, HookRunSummary,
-    HookRuntime, HookRuntimeError, HookRuntimeResult,
+    HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,

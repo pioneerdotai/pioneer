@@ -83,6 +83,7 @@ tiktoken-rs = "0.6"
 # Utils
 nanoid = "0.4"
 futures-util = "0.3"
+futures-timer = "3"
 async-trait = "0.1"
 tokio-stream = "0.1"
 config = "0.15"

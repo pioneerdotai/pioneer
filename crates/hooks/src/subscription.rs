@@ -1,6 +1,6 @@
 use crate::{
-    HookExecutionPolicy, HookFailurePolicy, HookFilterKey, HookId, HookMetadata, HookPhase,
-    HookRetryPolicy, HookSubscriptionId, HookValue,
+    HookContribution, HookExecutionPolicy, HookFailurePolicy, HookFilterKey, HookId, HookMetadata,
+    HookPhase, HookRetryPolicy, HookSubscriptionId, HookValue,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +48,8 @@ pub struct HookSubscription {
     pub dependencies: HookSubscriptionDependencies,
     pub execution_policy: HookExecutionPolicy,
     pub failure_policy: HookFailurePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_contributions: Vec<HookContribution>,
     pub retry_policy: HookRetryPolicy,
     pub visibility: HookSubscriptionVisibility,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -66,6 +68,7 @@ impl HookSubscription {
             dependencies: HookSubscriptionDependencies::default(),
             execution_policy: HookExecutionPolicy::default(),
             failure_policy: HookFailurePolicy::BestEffort,
+            fallback_contributions: Vec::new(),
             retry_policy: HookRetryPolicy::default(),
             visibility: HookSubscriptionVisibility::Internal,
             metadata: HookMetadata::default(),
@@ -99,6 +102,14 @@ impl HookSubscription {
 
     pub fn with_failure_policy(mut self, failure_policy: HookFailurePolicy) -> Self {
         self.failure_policy = failure_policy;
+        self
+    }
+
+    pub fn with_fallback_contributions(
+        mut self,
+        fallback_contributions: impl IntoIterator<Item = HookContribution>,
+    ) -> Self {
+        self.fallback_contributions = fallback_contributions.into_iter().collect();
         self
     }
 
@@ -148,6 +159,7 @@ mod tests {
         assert!(subscription.enabled);
         assert_eq!(subscription.priority, 0);
         assert!(subscription.filters.is_empty());
+        assert!(subscription.fallback_contributions.is_empty());
         assert_eq!(subscription.failure_policy, HookFailurePolicy::BestEffort);
         assert_eq!(
             subscription.visibility,
@@ -185,5 +197,21 @@ mod tests {
         let decoded: HookSubscriptionDependencies =
             serde_json::from_value(value).expect("dependencies deserialize");
         assert_eq!(decoded, dependencies);
+    }
+
+    #[test]
+    fn subscription_fallback_contributions_roundtrip() {
+        let subscription = HookSubscription::new(
+            subscription_id("sub.fallback"),
+            hook_id(),
+            HookPhase::TurnPrePolicy,
+        )
+        .with_failure_policy(HookFailurePolicy::Fallback)
+        .with_fallback_contributions([HookContribution::Noop]);
+
+        let value = serde_json::to_value(&subscription).expect("subscription serializes");
+        let decoded: HookSubscription =
+            serde_json::from_value(value).expect("subscription deserializes");
+        assert_eq!(decoded.fallback_contributions, vec![HookContribution::Noop]);
     }
 }

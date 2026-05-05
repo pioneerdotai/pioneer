@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-timer.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
