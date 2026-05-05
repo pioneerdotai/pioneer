@@ -7396,8 +7396,10 @@ dependencies = [
  "async-trait",
  "futures-timer",
  "futures-util",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

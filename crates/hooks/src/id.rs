@@ -103,6 +103,7 @@ hook_id_type!(HookMetadataKey);
 hook_id_type!(HookDomain);
 hook_id_type!(HookPolicyKey);
 hook_id_type!(HookContributionId);
+hook_id_type!(HookContributionHash);
 hook_id_type!(HookSectionId);
 hook_id_type!(HookSourceId);
 hook_id_type!(HookDiagnosticCode);

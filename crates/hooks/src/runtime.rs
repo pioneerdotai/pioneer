@@ -1,13 +1,15 @@
 use crate::{
-    HookAwaitPolicy, HookContext, HookContribution, HookDiagnostic, HookDiagnosticCode,
-    HookDiagnosticMessage, HookDiagnosticSeverity, HookError, HookFailurePolicy, HookHandler,
-    HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookMetadata, HookPhase,
-    HookRegistry, HookRegistryError, HookSubscription, HookSubscriptionId,
+    HookAwaitPolicy, HookContext, HookContribution, HookContributionHash, HookDiagnostic,
+    HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
+    HookDiagnosticRedactionPolicy, HookDiagnosticSeverity, HookError, HookFailurePolicy,
+    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookMetadata,
+    HookPhase, HookRegistry, HookRegistryError, HookSubscription, HookSubscriptionId,
     HookSubscriptionRegistry,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -160,6 +162,7 @@ impl From<HookRegistryError> for HookRuntimeError {
 #[serde(rename_all = "snake_case")]
 pub enum HookRunStatus {
     Queued,
+    Running,
     Succeeded,
     Failed,
     TimedOut,
@@ -174,15 +177,37 @@ pub struct HookRunErrorSummary {
     pub safe_for_user: bool,
 }
 
-impl From<&HookError> for HookRunErrorSummary {
-    fn from(error: &HookError) -> Self {
-        Self {
+impl HookRunErrorSummary {
+    pub fn from_error(error: &HookError, policy: &HookDiagnosticRedactionPolicy) -> Self {
+        let diagnostic = HookDiagnostic {
             code: error.code.clone(),
             message: error.message.clone(),
-            retryable: error.retryable,
+            severity: HookDiagnosticSeverity::Error,
             safe_for_user: error.safe_for_user,
+            metadata: HookMetadata::default(),
+        };
+        let preview = diagnostic.preview(policy);
+        Self {
+            code: error.code.clone(),
+            message: preview.message,
+            retryable: error.retryable,
+            safe_for_user: preview.safe_for_user,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookAttemptSummary {
+    pub attempt_number: u16,
+    pub status: HookRunStatus,
+    pub contribution_count: usize,
+    pub diagnostic_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contribution_hashes: Vec<HookContributionHash>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_previews: Vec<HookDiagnosticPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HookRunErrorSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +219,12 @@ pub struct HookRunSummary {
     pub attempt_count: u16,
     pub contribution_count: usize,
     pub diagnostic_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contribution_hashes: Vec<HookContributionHash>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_previews: Vec<HookDiagnosticPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<HookAttemptSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<HookRunErrorSummary>,
 }
@@ -244,6 +275,10 @@ impl HookRuntimeOptions {
     fn normalized(mut self) -> Self {
         self.error_preview_max_chars = self.error_preview_max_chars.max(3);
         self
+    }
+
+    fn diagnostic_redaction_policy(&self) -> HookDiagnosticRedactionPolicy {
+        HookDiagnosticRedactionPolicy::new(self.error_preview_max_chars, false)
     }
 }
 
@@ -326,6 +361,7 @@ impl HookRuntime {
                             subscription.hook_id,
                             request.phase,
                             handler_response,
+                            &self.options,
                         );
                     }
                     HookNodeOutcome::Failed(error) => match subscription.failure_policy {
@@ -727,15 +763,30 @@ fn append_success(
     hook_id: HookId,
     phase: HookPhase,
     handler_response: HookHandlerResponse,
+    options: &HookRuntimeOptions,
 ) {
-    let contribution_count = handler_response.contributions.len();
-    let diagnostic_count = handler_response.diagnostics.len();
-    phase_response
-        .contributions
-        .extend(handler_response.contributions);
-    phase_response
-        .diagnostics
-        .extend(handler_response.diagnostics);
+    let HookHandlerResponse {
+        contributions,
+        diagnostics,
+        ..
+    } = handler_response;
+    let policy = options.diagnostic_redaction_policy();
+    let contribution_hashes = hash_contributions(&contributions);
+    let diagnostic_previews = diagnostic_previews(&diagnostics, &policy);
+    let redacted_diagnostics = redacted_diagnostics(diagnostics, &policy);
+    let contribution_count = contributions.len();
+    let diagnostic_count = redacted_diagnostics.len();
+    let attempt = HookAttemptSummary {
+        attempt_number: 1,
+        status: HookRunStatus::Succeeded,
+        contribution_count,
+        diagnostic_count,
+        contribution_hashes: contribution_hashes.clone(),
+        diagnostic_previews: diagnostic_previews.clone(),
+        error: None,
+    };
+    phase_response.contributions.extend(contributions);
+    phase_response.diagnostics.extend(redacted_diagnostics);
     phase_response.runs.push(HookRunSummary {
         subscription_id,
         hook_id,
@@ -744,6 +795,9 @@ fn append_success(
         attempt_count: 1,
         contribution_count,
         diagnostic_count,
+        contribution_hashes,
+        diagnostic_previews,
+        attempts: vec![attempt],
         error: None,
     });
 }
@@ -757,15 +811,21 @@ fn append_best_effort_failure(
     error: HookError,
     options: &HookRuntimeOptions,
 ) {
-    let error = bounded_error(error, options);
-    let diagnostic = HookDiagnostic {
-        code: error.code.clone(),
-        message: error.message.clone(),
-        severity: HookDiagnosticSeverity::Warning,
-        safe_for_user: error.safe_for_user,
-        metadata: HookMetadata::default(),
+    let policy = options.diagnostic_redaction_policy();
+    let diagnostic = diagnostic_from_error(&error, status);
+    let redacted_diagnostic = diagnostic.redacted(&policy);
+    let diagnostic_preview = diagnostic.preview(&policy);
+    let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+    let attempt = HookAttemptSummary {
+        attempt_number: 1,
+        status,
+        contribution_count: 0,
+        diagnostic_count: 1,
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: vec![diagnostic_preview.clone()],
+        error: Some(error_summary.clone()),
     };
-    phase_response.diagnostics.push(diagnostic);
+    phase_response.diagnostics.push(redacted_diagnostic);
     phase_response.runs.push(HookRunSummary {
         subscription_id,
         hook_id,
@@ -774,7 +834,10 @@ fn append_best_effort_failure(
         attempt_count: 1,
         contribution_count: 0,
         diagnostic_count: 1,
-        error: Some(HookRunErrorSummary::from(&error)),
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: vec![diagnostic_preview],
+        attempts: vec![attempt],
+        error: Some(error_summary),
     });
 }
 
@@ -786,22 +849,39 @@ fn append_fallback_failure(
     error: HookError,
     options: &HookRuntimeOptions,
 ) {
+    let policy = options.diagnostic_redaction_policy();
+    let contribution_hashes = hash_contributions(&subscription.fallback_contributions);
     let contribution_count = subscription.fallback_contributions.len();
+    let diagnostic = diagnostic_from_error(&error, status);
+    let redacted_diagnostic = diagnostic.redacted(&policy);
+    let diagnostic_preview = diagnostic.preview(&policy);
+    let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+    let attempt = HookAttemptSummary {
+        attempt_number: 1,
+        status,
+        contribution_count: 0,
+        diagnostic_count: 1,
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: vec![diagnostic_preview.clone()],
+        error: Some(error_summary.clone()),
+    };
     phase_response
         .contributions
         .extend(subscription.fallback_contributions.clone());
-    append_best_effort_failure(
-        phase_response,
-        subscription.subscription_id.clone(),
-        subscription.hook_id.clone(),
+    phase_response.diagnostics.push(redacted_diagnostic);
+    phase_response.runs.push(HookRunSummary {
+        subscription_id: subscription.subscription_id.clone(),
+        hook_id: subscription.hook_id.clone(),
         phase,
         status,
-        error,
-        options,
-    );
-    if let Some(run) = phase_response.runs.last_mut() {
-        run.contribution_count = contribution_count;
-    }
+        attempt_count: 1,
+        contribution_count,
+        diagnostic_count: 1,
+        contribution_hashes,
+        diagnostic_previews: vec![diagnostic_preview],
+        attempts: vec![attempt],
+        error: Some(error_summary),
+    });
 }
 
 fn append_skipped(
@@ -817,6 +897,9 @@ fn append_skipped(
         attempt_count: 0,
         contribution_count: 0,
         diagnostic_count: 0,
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: Vec::new(),
+        attempts: Vec::new(),
         error: None,
     });
 }
@@ -835,6 +918,9 @@ fn append_queued(
         attempt_count: 0,
         contribution_count: 0,
         diagnostic_count: 0,
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: Vec::new(),
+        attempts: Vec::new(),
         error: None,
     });
 }
@@ -847,31 +933,50 @@ fn timeout_error(timeout_ms: u64) -> HookError {
     )
 }
 
-fn bounded_error(error: HookError, options: &HookRuntimeOptions) -> HookError {
-    HookError {
-        code: error.code,
-        message: bounded_message(&error.message, options.error_preview_max_chars),
-        retryable: error.retryable,
+fn diagnostic_from_error(error: &HookError, status: HookRunStatus) -> HookDiagnostic {
+    HookDiagnostic {
+        code: error.code.clone(),
+        message: error.message.clone(),
+        severity: match status {
+            HookRunStatus::Queued
+            | HookRunStatus::Running
+            | HookRunStatus::Succeeded
+            | HookRunStatus::Skipped => HookDiagnosticSeverity::Info,
+            HookRunStatus::Failed | HookRunStatus::TimedOut => HookDiagnosticSeverity::Warning,
+        },
         safe_for_user: error.safe_for_user,
+        metadata: HookMetadata::default(),
     }
 }
 
-fn bounded_message(
-    message: &HookDiagnosticMessage,
-    error_preview_max_chars: usize,
-) -> HookDiagnosticMessage {
-    let limit = error_preview_max_chars;
-    let value = message.as_str();
-    if value.chars().count() <= limit {
-        return message.clone();
-    }
+fn redacted_diagnostics(
+    diagnostics: Vec<HookDiagnostic>,
+    policy: &HookDiagnosticRedactionPolicy,
+) -> Vec<HookDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.redacted(policy))
+        .collect()
+}
 
-    let truncated = value
-        .chars()
-        .take(limit.saturating_sub(3))
-        .chain("...".chars())
-        .collect::<String>();
-    HookDiagnosticMessage::new(truncated).expect("bounded diagnostic message is not empty")
+fn diagnostic_previews(
+    diagnostics: &[HookDiagnostic],
+    policy: &HookDiagnosticRedactionPolicy,
+) -> Vec<HookDiagnosticPreview> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.preview(policy))
+        .collect()
+}
+
+fn hash_contributions(contributions: &[HookContribution]) -> Vec<HookContributionHash> {
+    contributions.iter().filter_map(hash_contribution).collect()
+}
+
+fn hash_contribution(contribution: &HookContribution) -> Option<HookContributionHash> {
+    let bytes = serde_json::to_vec(contribution).ok()?;
+    let digest = Sha256::digest(bytes);
+    HookContributionHash::new(format!("sha256:{}", hex::encode(digest))).ok()
 }
 
 #[cfg(test)]
@@ -1226,6 +1331,23 @@ mod tests {
         assert_eq!(response.runs.len(), 1);
         assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
         assert_eq!(response.runs[0].contribution_count, 1);
+        assert_eq!(response.runs[0].attempt_count, 1);
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].attempt_number, 1);
+        assert_eq!(
+            response.runs[0].attempts[0].status,
+            HookRunStatus::Succeeded
+        );
+        assert_eq!(response.runs[0].contribution_hashes.len(), 1);
+        assert!(
+            response.runs[0].contribution_hashes[0]
+                .as_str()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            response.runs[0].attempts[0].contribution_hashes,
+            response.runs[0].contribution_hashes
+        );
         assert_eq!(
             *calls.lock().expect("calls lock"),
             vec![hook_id("test.one")]
@@ -1354,6 +1476,17 @@ mod tests {
         assert!(response.diagnostics[0].safe_for_user);
         assert_eq!(response.runs[0].status, HookRunStatus::Failed);
         assert_eq!(response.runs[0].diagnostic_count, 1);
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::Failed);
+        assert_eq!(
+            response.runs[0]
+                .error
+                .as_ref()
+                .expect("run error")
+                .message
+                .as_str(),
+            "failed"
+        );
         assert_eq!(response.runs[1].status, HookRunStatus::Succeeded);
     }
 
@@ -1547,10 +1680,19 @@ mod tests {
 
     #[test]
     fn run_status_serializes_stably() {
-        assert_eq!(
-            serde_json::to_value(HookRunStatus::Succeeded).expect("status serializes"),
-            serde_json::json!("succeeded")
-        );
+        for (status, expected) in [
+            (HookRunStatus::Queued, "queued"),
+            (HookRunStatus::Running, "running"),
+            (HookRunStatus::Succeeded, "succeeded"),
+            (HookRunStatus::Failed, "failed"),
+            (HookRunStatus::TimedOut, "timed_out"),
+            (HookRunStatus::Skipped, "skipped"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("status serializes"),
+                serde_json::json!(expected)
+            );
+        }
     }
 
     #[test]
@@ -1993,6 +2135,12 @@ mod tests {
                 HookSectionId::new("section.fast").expect("valid section id")
             ]
         );
+        assert_eq!(response.runs[0].contribution_hashes.len(), 1);
+        assert_eq!(response.runs[1].contribution_hashes.len(), 1);
+        assert_ne!(
+            response.runs[0].contribution_hashes,
+            response.runs[1].contribution_hashes
+        );
     }
 
     #[test]
@@ -2150,6 +2298,10 @@ mod tests {
         assert_eq!(response.diagnostics.len(), 1);
         assert_eq!(response.runs[0].status, HookRunStatus::Failed);
         assert_eq!(response.runs[0].contribution_count, 1);
+        assert_eq!(response.runs[0].contribution_hashes.len(), 1);
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::Failed);
+        assert!(response.runs[0].attempts[0].contribution_hashes.is_empty());
     }
 
     #[test]
@@ -2272,6 +2424,8 @@ mod tests {
         assert_eq!(response.diagnostics.len(), 1);
         assert_eq!(response.diagnostics[0].code.as_str(), "hook.timeout");
         assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::TimedOut);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2306,6 +2460,7 @@ mod tests {
 
         assert!(response.contributions.is_empty());
         assert_eq!(response.runs[0].contribution_count, 0);
+        assert!(response.runs[0].contribution_hashes.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2400,6 +2555,10 @@ mod tests {
         );
         assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
         assert_eq!(response.runs[0].contribution_count, 1);
+        assert_eq!(response.runs[0].contribution_hashes.len(), 1);
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::TimedOut);
+        assert!(response.runs[0].attempts[0].contribution_hashes.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2447,8 +2606,10 @@ mod tests {
                 .expect("run error")
                 .message
                 .as_str(),
-            "hook exceeded deadline of 5 ms"
+            "diagnostic redacted"
         );
+        assert_eq!(response.runs[0].attempts.len(), 1);
+        assert_eq!(response.runs[0].attempts[0].status, HookRunStatus::TimedOut);
     }
 
     #[test]
@@ -2478,6 +2639,7 @@ mod tests {
         assert!(calls.lock().expect("calls lock").is_empty());
         assert_eq!(response.runs[0].status, HookRunStatus::Skipped);
         assert_eq!(response.runs[0].attempt_count, 0);
+        assert!(response.runs[0].attempts.is_empty());
     }
 
     #[test]
@@ -2546,6 +2708,7 @@ mod tests {
         assert!(calls.lock().expect("calls lock").is_empty());
         assert!(response.contributions.is_empty());
         assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert!(response.runs[0].attempts.is_empty());
         assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
     }
 
@@ -2583,6 +2746,7 @@ mod tests {
         assert!(calls.lock().expect("calls lock").is_empty());
         assert!(response.contributions.is_empty());
         assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert!(response.runs[0].attempts.is_empty());
         assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
     }
 
@@ -2725,7 +2889,8 @@ mod tests {
             vec![Err(hook_error(
                 "hook.failed",
                 "this diagnostic message is intentionally long",
-            ))],
+            )
+            .with_safe_for_user(true))],
         );
         register_subscription(
             &handlers,
@@ -2757,5 +2922,119 @@ mod tests {
                 .as_str(),
             "this diag..."
         );
+    }
+
+    #[test]
+    fn diagnostics_do_not_include_raw_sensitive_payload_in_summary() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let sensitive_payload = "password=super-secret-token";
+        register_handler(
+            &handlers,
+            "test.sensitive",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: Vec::new(),
+                diagnostics: vec![diagnostic("hook.sensitive", sensitive_payload)],
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.sensitive",
+            "test.sensitive",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(
+            response.diagnostics[0].message.as_str(),
+            "diagnostic redacted"
+        );
+        assert!(
+            !serde_json::to_string(&response.runs[0])
+                .expect("run summary serializes")
+                .contains(sensitive_payload)
+        );
+        assert_eq!(
+            response.runs[0].diagnostic_previews[0].message.as_str(),
+            "diagnostic redacted"
+        );
+        assert_eq!(
+            response.runs[0].attempts[0].diagnostic_previews[0]
+                .message
+                .as_str(),
+            "diagnostic redacted"
+        );
+    }
+
+    #[test]
+    fn failed_hook_returns_safe_error_preview() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let sensitive_payload = "password=super-secret-token";
+        register_handler(
+            &handlers,
+            "test.unsafe.error",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error("hook.failed", sensitive_payload))],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.unsafe.error",
+            "test.unsafe.error",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+        let run = &response.runs[0];
+
+        assert_eq!(run.status, HookRunStatus::Failed);
+        assert_eq!(
+            run.error.as_ref().expect("run error").message.as_str(),
+            "diagnostic redacted"
+        );
+        assert_eq!(
+            run.diagnostic_previews[0].message.as_str(),
+            "diagnostic redacted"
+        );
+        assert_eq!(
+            run.attempts[0]
+                .error
+                .as_ref()
+                .expect("attempt error")
+                .message
+                .as_str(),
+            "diagnostic redacted"
+        );
+        assert!(
+            !serde_json::to_string(run)
+                .expect("run summary serializes")
+                .contains(sensitive_payload)
+        );
+    }
+
+    #[test]
+    fn contribution_hash_is_stable_for_same_contribution() {
+        let first = contribution("section.hash", "hash me");
+        let second = contribution("section.hash", "hash me");
+        let different = contribution("section.hash", "different");
+
+        let first_hash = hash_contribution(&first).expect("hash should be produced");
+        let second_hash = hash_contribution(&second).expect("hash should be produced");
+        let different_hash = hash_contribution(&different).expect("hash should be produced");
+
+        assert_eq!(first_hash, second_hash);
+        assert_ne!(first_hash, different_hash);
+        assert!(first_hash.as_str().starts_with("sha256:"));
     }
 }

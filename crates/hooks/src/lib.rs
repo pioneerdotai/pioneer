@@ -18,14 +18,16 @@ pub use contribution::{
     AuditContribution, HookContribution, HookSourceKind, HookSourceRef, PolicyContribution,
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
 };
-pub use diagnostic::{HookDiagnostic, HookDiagnosticSeverity};
+pub use diagnostic::{
+    HookDiagnostic, HookDiagnosticPreview, HookDiagnosticRedactionPolicy, HookDiagnosticSeverity,
+};
 pub use error::{HookError, HookRegistryError, HookResult};
 pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
-    HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookContributionId,
-    HookDiagnosticCode, HookDomain, HookFeatureFlag, HookFilterKey, HookId, HookIdError, HookKind,
-    HookMetadataKey, HookPolicyKey, HookRunId, HookSectionId, HookSourceId, HookSubscriptionId,
-    HookTaskId, HookThreadId, HookTurnId, HookWorkspaceId,
+    HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookContributionHash,
+    HookContributionId, HookDiagnosticCode, HookDomain, HookFeatureFlag, HookFilterKey, HookId,
+    HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunId, HookSectionId, HookSourceId,
+    HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId, HookWorkspaceId,
 };
 pub use phase::{HookPhase, ParseHookPhaseError};
 pub use policy::{
@@ -34,8 +36,8 @@ pub use policy::{
 pub use registry::{HookRegistry, HookSubscriptionRegistry};
 pub use request::{HookHandlerRequest, HookHandlerResponse, HookInput, HookInputKind};
 pub use runtime::{
-    HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus, HookRunSummary,
-    HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
+    HookAttemptSummary, HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus,
+    HookRunSummary, HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,
