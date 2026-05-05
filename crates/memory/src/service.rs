@@ -1,7 +1,7 @@
 use crate::NoopMemoryBackend;
 use crate::backend::{
-    BackendDeleteRequest, BackendGetRequest, BackendPutRequest, BackendSearchRequest,
-    BackendSearchScope, MemoryBackend,
+    BackendDeleteRequest, BackendGetRequest, BackendPayload, BackendPutRequest,
+    BackendSearchRequest, BackendSearchScope, MemoryBackend,
 };
 use crate::config::MemoryServiceConfig;
 use crate::context::MemoryOperationContext;
@@ -25,12 +25,13 @@ use pioneer_crud::{
 };
 use pioneer_protocol::{
     MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryForgetParams,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryForgetParams,
     MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryListParams,
     MemoryListResponse, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
     MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemoryStatus,
     generate_id,
 };
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 const ID_LEN: usize = 21;
@@ -367,7 +368,8 @@ impl MemoryService {
         params: MemorySearchParams,
     ) -> Result<MemorySearchResponse> {
         let query = params.query.trim();
-        if query.is_empty() {
+        let backend_query = normalize_backend_search_query(query);
+        if backend_query.is_empty() {
             bail!("memory search query cannot be empty");
         }
 
@@ -381,7 +383,7 @@ impl MemoryService {
         let backend_hits = self
             .backend
             .search(BackendSearchRequest {
-                query: query.to_owned(),
+                query: backend_query,
                 scopes: active_scopes.scopes.clone(),
                 resolved_scopes,
                 limit: backend_limit,
@@ -389,8 +391,11 @@ impl MemoryService {
             .await
             .context("failed to search memory backend")?;
 
+        let backend_returned_any = !backend_hits.is_empty();
         let mut candidates = Vec::new();
+        let mut seen_memory_ids = BTreeSet::new();
         for hit in backend_hits {
+            seen_memory_ids.insert(hit.memory_id.clone());
             let Some(row) = self
                 .store
                 .get_agent_memory_record(hit.memory_id.as_str(), true)
@@ -423,6 +428,50 @@ impl MemoryService {
                 backend_score,
                 recency_anchor_unix,
             });
+        }
+        if candidates.is_empty() && !backend_returned_any {
+            let fallback_rows = self
+                .store
+                .list_agent_memory_records(AgentMemoryListFilter {
+                    scopes: active_scopes.scopes.clone(),
+                    workspace_guard: context.workspace_guard(),
+                    namespace: None,
+                    categories: params.categories.clone(),
+                    statuses: params.statuses.clone(),
+                    include_expired: params.statuses.contains(&MemoryStatus::Expired),
+                    include_deleted: params.statuses.contains(&MemoryStatus::Deleted),
+                    include_superseded: params.statuses.contains(&MemoryStatus::Superseded),
+                    limit: Some(backend_limit as u64),
+                })
+                .await?;
+            for row in fallback_rows {
+                if seen_memory_ids.contains(row.id.as_str()) {
+                    continue;
+                }
+                let Some(fallback_hit) =
+                    control_plane_fallback_hit(&row, query, &params.categories)
+                else {
+                    continue;
+                };
+                let recency_anchor_unix = recency_anchor_unix(&row);
+                let Some(record) = self
+                    .hydrate_visible_row(row, &context, &params.statuses, now, true)
+                    .await?
+                else {
+                    continue;
+                };
+                let backend_score = fallback_hit.score;
+                candidates.push(MemoryRankingCandidate {
+                    hit: MemorySearchHit {
+                        record,
+                        score: backend_score,
+                        snippet: fallback_hit.snippet,
+                        matched_terms: fallback_hit.matched_terms,
+                    },
+                    backend_score,
+                    recency_anchor_unix,
+                });
+            }
         }
         let hits = rank_memory_search_hits(
             candidates,
@@ -742,9 +791,18 @@ impl MemoryService {
             return Ok(None);
         }
 
-        let Some(payload) = self.backend.get(backend_get_request(&row)).await? else {
-            self.mark_missing_backend_payload(&row, now).await?;
-            return Ok(None);
+        let payload = match self.backend.get(backend_get_request(&row)).await? {
+            Some(payload) => payload,
+            None if row.status == MemoryStatus::Deleted => BackendPayload {
+                memory_id: row.id.clone(),
+                content: row.content_preview.clone().unwrap_or_default(),
+                snippet: row.content_preview.clone(),
+                metadata_json: None,
+            },
+            None => {
+                self.mark_missing_backend_payload(&row, now).await?;
+                return Ok(None);
+            }
         };
 
         let row = if record_access && row.status == MemoryStatus::Active {
@@ -961,6 +1019,101 @@ impl MemoryService {
             .min(self.config.max_limit)
             .max(final_limit)
     }
+}
+
+fn normalize_backend_search_query(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            normalized.push(ch);
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn control_plane_fallback_hit(
+    row: &AgentMemoryControlRecord,
+    query: &str,
+    requested_categories: &[MemoryCategory],
+) -> Option<MemorySearchHit> {
+    let normalized_query = normalize_lexical_text(query);
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let query_terms = normalized_query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    let haystack = normalize_lexical_text(
+        format!(
+            "{} {} {:?} {:?} {}",
+            row.content_preview.as_deref().unwrap_or_default(),
+            row.key.as_deref().unwrap_or_default(),
+            row.category,
+            row.sensitivity,
+            row.namespace
+        )
+        .as_str(),
+    );
+    let matched_terms = query_terms
+        .iter()
+        .filter(|term| haystack.contains(**term))
+        .map(|term| (*term).to_owned())
+        .collect::<Vec<_>>();
+    let category_match =
+        !requested_categories.is_empty() && requested_categories.contains(&row.category);
+    let key_match = row
+        .key
+        .as_deref()
+        .map(normalize_lexical_text)
+        .is_some_and(|key| {
+            !key.is_empty()
+                && (normalized_query == key
+                    || normalized_query
+                        .split_whitespace()
+                        .any(|token| token == key))
+        });
+    let score = if haystack.contains(normalized_query.as_str()) {
+        0.45
+    } else if !query_terms.is_empty() && matched_terms.len() == query_terms.len() {
+        0.35
+    } else if !matched_terms.is_empty() || category_match || key_match {
+        0.25
+    } else {
+        return None;
+    };
+
+    Some(MemorySearchHit {
+        record: crud_record_to_protocol(
+            row.clone(),
+            BackendPayload {
+                memory_id: row.id.clone(),
+                content: row.content_preview.clone().unwrap_or_default(),
+                snippet: row.content_preview.clone(),
+                metadata_json: None,
+            },
+        )
+        .ok()?,
+        score: Some(score),
+        snippet: row.content_preview.clone(),
+        matched_terms,
+    })
+}
+
+fn normalize_lexical_text(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                normalized.push(lower);
+            }
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn current_unix() -> i64 {

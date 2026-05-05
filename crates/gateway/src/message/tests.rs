@@ -32,8 +32,8 @@ use pioneer_protocol::{
     MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
     MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, PromptManifest,
-    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListResponse,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger,
     SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
@@ -60,7 +60,7 @@ use pioneer_protocol::{
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderToolCall, StreamChunk,
+    ProviderToolCall, Role, StreamChunk,
 };
 use pioneer_skills::SkillTrustLevel;
 use pioneer_tools::{
@@ -132,6 +132,23 @@ struct SequencedToolProvider {
     first_tool_calls: Vec<ProviderToolCall>,
     second_text: String,
     next_index: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum MemoryAgentE2eScript {
+    RememberName,
+    RecallOnly,
+    RememberBirthday,
+    ForgetBirthdayBySearch,
+    ChatCapture,
+}
+
+struct MemoryAgentE2eProvider {
+    name: &'static str,
+    script: MemoryAgentE2eScript,
+    policy_requests: std::sync::Mutex<Vec<ChatRequest>>,
+    main_requests: std::sync::Mutex<Vec<ChatRequest>>,
+    next_main_index: AtomicUsize,
 }
 
 struct DelayedProvider {
@@ -501,6 +518,284 @@ impl SequencedToolProvider {
             .expect("sequenced tool provider lock poisoned")
             .clone()
     }
+}
+
+impl MemoryAgentE2eProvider {
+    fn new(name: &'static str, script: MemoryAgentE2eScript) -> Self {
+        Self {
+            name,
+            script,
+            policy_requests: std::sync::Mutex::new(Vec::new()),
+            main_requests: std::sync::Mutex::new(Vec::new()),
+            next_main_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn snapshot_main_requests(&self) -> Vec<ChatRequest> {
+        self.main_requests
+            .lock()
+            .expect("memory e2e provider main requests lock poisoned")
+            .clone()
+    }
+
+    fn snapshot_policy_requests(&self) -> Vec<ChatRequest> {
+        self.policy_requests
+            .lock()
+            .expect("memory e2e provider policy requests lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MemoryAgentE2eProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: !matches!(self.script, MemoryAgentE2eScript::ChatCapture),
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_memory_policy_classifier_request(&request) {
+            self.policy_requests
+                .lock()
+                .expect("memory e2e provider policy requests lock poisoned")
+                .push(request);
+            return Ok(ChatResponse {
+                text: memory_policy_json_for_script(self.script),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        if is_background_title_or_summary_request(&request)
+            && !matches!(self.script, MemoryAgentE2eScript::ChatCapture)
+        {
+            return Ok(ChatResponse {
+                text: "Тестовая память".to_owned(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        self.main_requests
+            .lock()
+            .expect("memory e2e provider main requests lock poisoned")
+            .push(request.clone());
+        let round = self.next_main_index.fetch_add(1, Ordering::SeqCst);
+        Ok(memory_agent_e2e_response(self.script, round, &request))
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk()));
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+fn is_memory_policy_classifier_request(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .contains("Pioneer memory turn policy classifier")
+    })
+}
+
+fn is_background_title_or_summary_request(request: &ChatRequest) -> bool {
+    request.compiled_prompt.is_none()
+        && request.tools.as_ref().map(Vec::is_empty).unwrap_or(true)
+        && request.messages.iter().any(|message| {
+            message.content.contains("Generate a concise")
+                || message.content.contains("Summarize")
+                || message.content.contains("context compression")
+        })
+}
+
+fn memory_policy_json_for_script(script: MemoryAgentE2eScript) -> String {
+    let value = match script {
+        MemoryAgentE2eScript::RememberName | MemoryAgentE2eScript::RememberBirthday => json!({
+            "intent": "explicit_remember",
+            "recall": "allow",
+            "prompt": "full",
+            "readTools": "allow",
+            "rememberTool": "allow",
+            "forgetTool": "allow",
+            "postTurnExtraction": "disabled",
+            "activeMemory": "disabled",
+            "explicitRemember": true,
+            "explicitForget": false,
+            "forgetTargetHint": null,
+            "language": "ru",
+            "confidence": 0.98,
+            "reasonCode": "explicit_remember"
+        }),
+        MemoryAgentE2eScript::ForgetBirthdayBySearch => json!({
+            "intent": "explicit_forget",
+            "recall": "disabled",
+            "prompt": "forget_only",
+            "readTools": "forget_only",
+            "rememberTool": "disabled",
+            "forgetTool": "allow",
+            "postTurnExtraction": "disabled",
+            "activeMemory": "disabled",
+            "explicitRemember": false,
+            "explicitForget": true,
+            "forgetTargetHint": "день рождения",
+            "language": "ru",
+            "confidence": 0.98,
+            "reasonCode": "explicit_forget"
+        }),
+        MemoryAgentE2eScript::RecallOnly | MemoryAgentE2eScript::ChatCapture => json!({
+            "intent": "normal",
+            "recall": "allow",
+            "prompt": "full",
+            "readTools": "allow",
+            "rememberTool": "allow",
+            "forgetTool": "allow",
+            "postTurnExtraction": "disabled",
+            "activeMemory": "disabled",
+            "explicitRemember": false,
+            "explicitForget": false,
+            "forgetTargetHint": null,
+            "language": "ru",
+            "confidence": 0.9,
+            "reasonCode": "default_allow_read"
+        }),
+    };
+    serde_json::to_string(&value).expect("policy json should serialize")
+}
+
+fn memory_agent_e2e_response(
+    script: MemoryAgentE2eScript,
+    round: usize,
+    request: &ChatRequest,
+) -> ChatResponse {
+    match script {
+        MemoryAgentE2eScript::RememberName => {
+            if round == 0 {
+                tool_call_response(ProviderToolCall {
+                    id: "call_memory_remember_name".to_owned(),
+                    name: "memory_remember".to_owned(),
+                    arguments: json!({
+                        "content": "Пользователя зовут Александр.",
+                        "category": "identity",
+                        "scope": "user",
+                        "key": "name",
+                        "source": "explicit_user_request"
+                    })
+                    .to_string(),
+                })
+            } else {
+                text_response("Запомнил.")
+            }
+        }
+        MemoryAgentE2eScript::RememberBirthday => {
+            if round == 0 {
+                tool_call_response(ProviderToolCall {
+                    id: "call_memory_remember_birthday".to_owned(),
+                    name: "memory_remember".to_owned(),
+                    arguments: json!({
+                        "content": "День рождения пользователя: 5 мая.",
+                        "category": "biography",
+                        "scope": "user",
+                        "key": "birthday",
+                        "source": "explicit_user_request"
+                    })
+                    .to_string(),
+                })
+            } else {
+                text_response("Запомнил.")
+            }
+        }
+        MemoryAgentE2eScript::ForgetBirthdayBySearch => match round {
+            0 => tool_call_response(ProviderToolCall {
+                id: "call_memory_search_birthday".to_owned(),
+                name: "memory_search".to_owned(),
+                arguments: json!({
+                    "query": "день рождения",
+                    "scopes": ["user"],
+                    "categories": ["biography"],
+                    "limit": 5,
+                    "includeProvenance": true
+                })
+                .to_string(),
+            }),
+            1 => {
+                let memory_id = extract_memory_id_from_tool_messages(&request.messages)
+                    .expect("memory_search tool result should include memoryId");
+                tool_call_response(ProviderToolCall {
+                    id: "call_memory_forget_birthday".to_owned(),
+                    name: "memory_forget".to_owned(),
+                    arguments: json!({
+                        "memoryId": memory_id,
+                        "reason": "explicit user request"
+                    })
+                    .to_string(),
+                })
+            }
+            _ => text_response("Забыл."),
+        },
+        MemoryAgentE2eScript::RecallOnly => text_response("Готово."),
+        MemoryAgentE2eScript::ChatCapture => text_response("Ок."),
+    }
+}
+
+fn text_response(text: impl Into<String>) -> ChatResponse {
+    ChatResponse {
+        text: text.into(),
+        usage: None,
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+fn tool_call_response(tool_call: ProviderToolCall) -> ChatResponse {
+    ChatResponse {
+        text: String::new(),
+        usage: None,
+        reasoning_content: None,
+        tool_calls: vec![tool_call],
+    }
+}
+
+fn extract_memory_id_from_tool_messages(
+    messages: &[pioneer_provider::ChatMessage],
+) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Tool)
+        .find_map(|message| {
+            serde_json::from_str::<serde_json::Value>(message.content.as_str())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("hits")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|hits| hits.first())
+                        .and_then(|hit| hit.get("memoryId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+        })
 }
 
 fn extract_task_id_from_messages(messages: &[pioneer_provider::ChatMessage]) -> Option<String> {
@@ -8450,6 +8745,16 @@ struct MemoryGatewayHarness {
     runtime_home: std::path::PathBuf,
 }
 
+struct MemoryAgentE2eHarness {
+    processor: Arc<MessageProcessor>,
+    crud_store: Arc<CrudStore>,
+    workspace_id: String,
+    connection_id: u64,
+    rx: mpsc::Receiver<Message>,
+    runtime_home: std::path::PathBuf,
+    _provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+}
+
 async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGatewayHarness {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(32);
@@ -8510,6 +8815,60 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
     }
 }
 
+async fn setup_memory_agent_e2e_harness(
+    case_id: &str,
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+) -> MemoryAgentE2eHarness {
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, rx) = mpsc::channel(128);
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+
+    let runtime_home = unique_temp_dir(&format!("memory_agent_e2e_{case_id}"));
+    std::fs::create_dir_all(runtime_home.as_path()).expect("create memory e2e runtime home");
+    let memory_runtime = Arc::new(
+        GatewayMemoryRuntime::from_config(
+            crud_store.clone(),
+            runtime_home.as_path(),
+            &GatewayMemoryConfig {
+                enabled: true,
+                capsules_dir: "memory/capsules".to_owned(),
+                allow_global_user_by_default: true,
+                allow_global_agent_by_default: false,
+            },
+        )
+        .expect("memory runtime should initialize"),
+    );
+
+    let processor = Arc::new(MessageProcessor::new_with_memory_runtime(
+        thread_manager,
+        provider_registry.clone(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+        memory_runtime,
+    ));
+    processor.bind_memory_bridge_if_enabled().await;
+
+    MemoryAgentE2eHarness {
+        processor,
+        crud_store,
+        workspace_id,
+        connection_id,
+        rx,
+        runtime_home,
+        _provider_registry: provider_registry,
+    }
+}
+
 fn workspace_memory_scope(workspace_id: &str) -> MemoryScope {
     MemoryScope {
         kind: MemoryScopeKind::Workspace,
@@ -8556,6 +8915,243 @@ fn memory_remember_params(
 fn memory_request_id(prefix: &str) -> pioneer_protocol::RequestId {
     pioneer_protocol::RequestId::new(generate_test_request_id("mem", prefix))
         .expect("valid memory request id")
+}
+
+async fn start_memory_e2e_thread(
+    harness: &mut MemoryAgentE2eHarness,
+    thread_id: &str,
+    mode: &str,
+    model_provider: &str,
+) {
+    let request_id = generate_test_request_id("thstart", thread_id);
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": thread_id,
+            "workspace_id": harness.workspace_id,
+            "mode": mode,
+            "model": "test-model",
+            "model_provider": model_provider
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &thread_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut harness.rx, events::THREAD_STARTED).await;
+}
+
+async fn start_memory_e2e_turn(
+    harness: &mut MemoryAgentE2eHarness,
+    thread_id: &str,
+    turn_id: &str,
+    mode: &str,
+    model_provider: &str,
+    text: &str,
+) {
+    let request_id = generate_test_request_id("tustart", turn_id);
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "mode": mode,
+            "model": "test-model",
+            "model_provider": model_provider,
+            "input": [
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ]
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_STARTED).await;
+}
+
+async fn run_memory_e2e_turn(
+    harness: &mut MemoryAgentE2eHarness,
+    thread_id: &str,
+    turn_id: &str,
+    mode: &str,
+    model_provider: &str,
+    text: &str,
+) {
+    start_memory_e2e_turn(harness, thread_id, turn_id, mode, model_provider, text).await;
+    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
+}
+
+async fn run_memory_e2e_thread_turn(
+    harness: &mut MemoryAgentE2eHarness,
+    thread_id: &str,
+    turn_id: &str,
+    mode: &str,
+    model_provider: &str,
+    text: &str,
+) {
+    start_memory_e2e_thread(harness, thread_id, mode, model_provider).await;
+    run_memory_e2e_turn(harness, thread_id, turn_id, mode, model_provider, text).await;
+}
+
+async fn persisted_prompt_manifest(
+    harness: &MemoryAgentE2eHarness,
+    thread_id: &str,
+    turn_id: &str,
+) -> PromptManifest {
+    let (_, turn) = harness
+        .crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    turn.prompt_manifest
+        .expect("turn should persist prompt manifest")
+}
+
+fn assert_memory_recall_manifest(manifest: &PromptManifest) {
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "memory_recall"),
+        "prompt manifest should include memory_recall, got {:?}",
+        manifest.section_ids
+    );
+}
+
+async fn service_search_memory(
+    harness: &MemoryAgentE2eHarness,
+    query: &str,
+    categories: Vec<MemoryCategory>,
+    statuses: Vec<MemoryStatus>,
+) -> MemorySearchResponse {
+    harness
+        .processor
+        .memory_runtime()
+        .service()
+        .search(
+            harness
+                .processor
+                .memory_runtime()
+                .operation_context(Some(harness.workspace_id.clone()), None),
+            MemorySearchParams {
+                query: query.to_owned(),
+                scopes: vec![user_memory_scope()],
+                categories,
+                statuses,
+                limit: Some(8),
+                cursor: None,
+                include_provenance: true,
+            },
+        )
+        .await
+        .expect("memory service search should succeed")
+}
+
+async fn service_get_memory(
+    harness: &MemoryAgentE2eHarness,
+    memory_id: &str,
+    include_deleted: bool,
+) -> MemoryGetResponse {
+    harness
+        .processor
+        .memory_runtime()
+        .service()
+        .get(
+            harness
+                .processor
+                .memory_runtime()
+                .operation_context(Some(harness.workspace_id.clone()), None),
+            MemoryGetParams {
+                memory_id: memory_id.to_owned(),
+                include_deleted,
+            },
+        )
+        .await
+        .expect("memory service get should succeed")
+}
+
+async fn assert_dynamic_tool_completed_in_history(
+    crud_store: Arc<CrudStore>,
+    thread_id: &str,
+    tool_name: &str,
+) {
+    let history = crud_store
+        .get_thread_history(thread_id, Some(128))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    assert!(
+        history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::ItemCompleted {
+                item: TurnItem::DynamicToolCall {
+                    tool_name: completed_tool,
+                    status: ToolCallStatus::Completed,
+                    ..
+                },
+                ..
+            } if completed_tool == tool_name
+        )),
+        "expected completed dynamic tool `{tool_name}` in persisted history"
+    );
+}
+
+fn request_tool_names(request: &ChatRequest) -> Vec<String> {
+    request
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn assert_request_has_tool(request: &ChatRequest, tool_name: &str) {
+    let tool_names = request_tool_names(request);
+    assert!(
+        tool_names.iter().any(|name| name == tool_name),
+        "expected request tools to include `{tool_name}`, got {tool_names:?}"
+    );
+}
+
+fn assert_request_lacks_tool(request: &ChatRequest, tool_name: &str) {
+    let tool_names = request_tool_names(request);
+    assert!(
+        !tool_names.iter().any(|name| name == tool_name),
+        "expected request tools not to include `{tool_name}`, got {tool_names:?}"
+    );
+}
+
+fn compiled_prompt_text(request: &ChatRequest) -> &str {
+    request
+        .compiled_prompt
+        .as_ref()
+        .expect("request should include compiled prompt")
+        .full_system_text
+        .as_str()
+}
+
+fn has_tool_message_containing(request: &ChatRequest, needle: &str) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| message.role == Role::Tool && message.content.contains(needle))
+}
+
+fn memory_e2e_provider_registry() -> Arc<pioneer_provider::ProviderRegistry> {
+    Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "echo",
+        Arc::new(EchoProvider::new()),
+    ))
 }
 
 fn memory_tool_context(harness: &MemoryGatewayHarness, turn_suffix: &str) -> MemoryTurnContext {
@@ -9321,6 +9917,347 @@ async fn memory_bridge_not_bound_when_runtime_disabled() {
     harness.processor.bind_memory_bridge_if_enabled().await;
 
     assert!(!harness.processor.agent_manager.has_memory_provider().await);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
+    let remember_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-remember-name",
+        MemoryAgentE2eScript::RememberName,
+    ));
+    let recall_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-recall-name",
+        MemoryAgentE2eScript::RecallOnly,
+    ));
+    let provider_registry = memory_e2e_provider_registry();
+    provider_registry.insert("memory-remember-name", remember_provider.clone());
+    provider_registry.insert("memory-recall-name", recall_provider.clone());
+    let mut harness = setup_memory_agent_e2e_harness("remember_name", provider_registry).await;
+
+    let remember_thread_id = generate_test_request_id("thr", "memremembername");
+    let remember_turn_id = generate_test_request_id("turn", "memremembername");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        remember_thread_id.as_str(),
+        remember_turn_id.as_str(),
+        "Agent",
+        "memory-remember-name",
+        "Запомни: меня зовут Александр",
+    )
+    .await;
+
+    assert_eq!(remember_provider.snapshot_policy_requests().len(), 1);
+    let remember_requests = remember_provider.snapshot_main_requests();
+    assert!(
+        remember_requests.len() >= 2,
+        "remember flow should call provider with tool result in a later round"
+    );
+    let first_remember_request = &remember_requests[0];
+    assert_request_has_tool(first_remember_request, "memory_search");
+    assert_request_has_tool(first_remember_request, "memory_remember");
+    let first_prompt = compiled_prompt_text(first_remember_request);
+    assert!(first_prompt.contains("## Memory Recall"));
+    assert!(first_prompt.contains("memory_remember"));
+    assert!(first_prompt.contains("Call memory_remember proactively"));
+    assert!(
+        has_tool_message_containing(&remember_requests[1], "memoryId"),
+        "memory_remember result should be sent back to the next provider round"
+    );
+
+    assert_dynamic_tool_completed_in_history(
+        harness.crud_store.clone(),
+        remember_thread_id.as_str(),
+        "memory_remember",
+    )
+    .await;
+    let remember_manifest = persisted_prompt_manifest(
+        &harness,
+        remember_thread_id.as_str(),
+        remember_turn_id.as_str(),
+    )
+    .await;
+    assert_memory_recall_manifest(&remember_manifest);
+
+    let name_search = service_search_memory(
+        &harness,
+        "Александр",
+        vec![MemoryCategory::Identity],
+        Vec::new(),
+    )
+    .await;
+    let name_memory = name_search
+        .hits
+        .iter()
+        .find(|hit| hit.record.key.as_deref() == Some("name"))
+        .expect("remembered name should be searchable through memory service");
+    assert_eq!(name_memory.record.content, "Пользователя зовут Александр.");
+    assert_eq!(name_memory.record.status, MemoryStatus::Active);
+
+    let recall_thread_id = generate_test_request_id("thr", "memrecallname");
+    let recall_turn_id = generate_test_request_id("turn", "memrecallname");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        recall_thread_id.as_str(),
+        recall_turn_id.as_str(),
+        "Agent",
+        "memory-recall-name",
+        "Как меня зовут?",
+    )
+    .await;
+
+    assert_eq!(recall_provider.snapshot_policy_requests().len(), 1);
+    let recall_requests = recall_provider.snapshot_main_requests();
+    assert_eq!(recall_requests.len(), 1);
+    let recall_request = &recall_requests[0];
+    assert_request_has_tool(recall_request, "memory_search");
+    let recall_prompt = compiled_prompt_text(recall_request);
+    assert!(recall_prompt.contains("## Memory Recall"));
+    assert!(recall_prompt.contains("Пользователя зовут Александр."));
+    let recall_manifest =
+        persisted_prompt_manifest(&harness, recall_thread_id.as_str(), recall_turn_id.as_str())
+            .await;
+    assert_memory_recall_manifest(&recall_manifest);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
+    let seed_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-seed-birthday",
+        MemoryAgentE2eScript::RememberBirthday,
+    ));
+    let forget_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-forget-birthday",
+        MemoryAgentE2eScript::ForgetBirthdayBySearch,
+    ));
+    let recall_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-recall-birthday",
+        MemoryAgentE2eScript::RecallOnly,
+    ));
+    let provider_registry = memory_e2e_provider_registry();
+    provider_registry.insert("memory-seed-birthday", seed_provider.clone());
+    provider_registry.insert("memory-forget-birthday", forget_provider.clone());
+    provider_registry.insert("memory-recall-birthday", recall_provider.clone());
+    let mut harness = setup_memory_agent_e2e_harness("forget_birthday", provider_registry).await;
+
+    let seed_thread_id = generate_test_request_id("thr", "memseedbirthday");
+    let seed_turn_id = generate_test_request_id("turn", "memseedbirthday");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        seed_thread_id.as_str(),
+        seed_turn_id.as_str(),
+        "Agent",
+        "memory-seed-birthday",
+        "Запомни: мой день рождения 5 мая",
+    )
+    .await;
+    assert_dynamic_tool_completed_in_history(
+        harness.crud_store.clone(),
+        seed_thread_id.as_str(),
+        "memory_remember",
+    )
+    .await;
+    let seed_manifest =
+        persisted_prompt_manifest(&harness, seed_thread_id.as_str(), seed_turn_id.as_str()).await;
+    assert_memory_recall_manifest(&seed_manifest);
+
+    let birthday_search = service_search_memory(
+        &harness,
+        "день рождения",
+        vec![MemoryCategory::Biography],
+        Vec::new(),
+    )
+    .await;
+    let birthday_memory = birthday_search
+        .hits
+        .iter()
+        .find(|hit| hit.record.key.as_deref() == Some("birthday"))
+        .expect("birthday memory should be searchable after agent remember");
+    let birthday_memory_id = birthday_memory.record.id.clone();
+    assert_eq!(
+        birthday_memory.record.content,
+        "День рождения пользователя: 5 мая."
+    );
+
+    let forget_thread_id = generate_test_request_id("thr", "memforgetbirthday");
+    let forget_turn_id = generate_test_request_id("turn", "memforgetbirthday");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        forget_thread_id.as_str(),
+        forget_turn_id.as_str(),
+        "Agent",
+        "memory-forget-birthday",
+        "Забудь мой день рождения",
+    )
+    .await;
+
+    assert_eq!(forget_provider.snapshot_policy_requests().len(), 1);
+    let forget_requests = forget_provider.snapshot_main_requests();
+    assert!(
+        forget_requests.len() >= 3,
+        "forget flow should search, forget, then produce final answer"
+    );
+    let first_forget_request = &forget_requests[0];
+    assert_request_has_tool(first_forget_request, "memory_search");
+    assert_request_has_tool(first_forget_request, "memory_get");
+    assert_request_has_tool(first_forget_request, "memory_forget");
+    assert_request_lacks_tool(first_forget_request, "memory_remember");
+    assert!(compiled_prompt_text(first_forget_request).contains("## Memory Recall"));
+    assert!(compiled_prompt_text(first_forget_request).contains("only to identify and forget"));
+    assert!(
+        has_tool_message_containing(&forget_requests[1], birthday_memory_id.as_str()),
+        "memory_search result should reach the provider round that resolves forget target"
+    );
+    assert!(
+        has_tool_message_containing(&forget_requests[2], "forgottenMemoryIds"),
+        "memory_forget result should reach the final provider round"
+    );
+
+    assert_dynamic_tool_completed_in_history(
+        harness.crud_store.clone(),
+        forget_thread_id.as_str(),
+        "memory_search",
+    )
+    .await;
+    assert_dynamic_tool_completed_in_history(
+        harness.crud_store.clone(),
+        forget_thread_id.as_str(),
+        "memory_forget",
+    )
+    .await;
+    let forget_manifest =
+        persisted_prompt_manifest(&harness, forget_thread_id.as_str(), forget_turn_id.as_str())
+            .await;
+    assert_memory_recall_manifest(&forget_manifest);
+
+    let active_get = service_get_memory(&harness, birthday_memory_id.as_str(), false).await;
+    assert!(active_get.record.is_none());
+    let deleted_get = service_get_memory(&harness, birthday_memory_id.as_str(), true).await;
+    let deleted_record = deleted_get
+        .record
+        .expect("include_deleted get should expose tombstoned memory");
+    assert_eq!(deleted_record.status, MemoryStatus::Deleted);
+    assert_eq!(
+        deleted_record.delete_reason.as_deref(),
+        Some("explicit user request")
+    );
+    let after_forget_search = service_search_memory(
+        &harness,
+        "день рождения",
+        vec![MemoryCategory::Biography],
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        !after_forget_search
+            .hits
+            .iter()
+            .any(|hit| hit.record.id == birthday_memory_id),
+        "active search must suppress forgotten memory"
+    );
+
+    let recall_thread_id = generate_test_request_id("thr", "memafterforget");
+    let recall_turn_id = generate_test_request_id("turn", "memafterforget");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        recall_thread_id.as_str(),
+        recall_turn_id.as_str(),
+        "Agent",
+        "memory-recall-birthday",
+        "Когда у меня день рождения?",
+    )
+    .await;
+    let recall_requests = recall_provider.snapshot_main_requests();
+    assert_eq!(recall_requests.len(), 1);
+    let recall_prompt = compiled_prompt_text(&recall_requests[0]);
+    assert!(recall_prompt.contains("## Memory Recall"));
+    assert!(!recall_prompt.contains("День рождения пользователя: 5 мая."));
+    let recall_manifest =
+        persisted_prompt_manifest(&harness, recall_thread_id.as_str(), recall_turn_id.as_str())
+            .await;
+    assert_memory_recall_manifest(&recall_manifest);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_mode_russian_remember_does_not_mutate_agent_memory() {
+    let chat_provider = Arc::new(MemoryAgentE2eProvider::new(
+        "memory-chat",
+        MemoryAgentE2eScript::ChatCapture,
+    ));
+    let provider_registry = memory_e2e_provider_registry();
+    provider_registry.insert("memory-chat", chat_provider.clone());
+    let mut harness = setup_memory_agent_e2e_harness("chat_no_memory", provider_registry).await;
+
+    let chat_thread_id = generate_test_request_id("thr", "memchatnomutate");
+    let chat_turn_id = generate_test_request_id("turn", "memchatnomutate");
+    run_memory_e2e_thread_turn(
+        &mut harness,
+        chat_thread_id.as_str(),
+        chat_turn_id.as_str(),
+        "Chat",
+        "memory-chat",
+        "Запомни: меня зовут Александр",
+    )
+    .await;
+
+    assert!(
+        chat_provider.snapshot_policy_requests().is_empty(),
+        "chat mode should not run memory policy classifier"
+    );
+    let chat_requests = chat_provider.snapshot_main_requests();
+    assert!(
+        chat_requests.iter().any(|request| request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Запомни: меня зовут Александр"))),
+        "chat provider should receive the user chat request"
+    );
+    for request in &chat_requests {
+        assert!(
+            request
+                .tools
+                .as_ref()
+                .map(|tools| !tools.iter().any(|tool| tool.name.starts_with("memory_")))
+                .unwrap_or(true),
+            "chat request should not expose memory tools"
+        );
+        assert!(
+            request
+                .compiled_prompt
+                .as_ref()
+                .map(|prompt| !prompt.full_system_text.contains("## Memory Recall"))
+                .unwrap_or(true),
+            "chat request should not include memory recall prompt"
+        );
+    }
+
+    let records = harness
+        .crud_store
+        .list_agent_memory_records(AgentMemoryListFilter::default())
+        .await
+        .expect("memory records should list");
+    assert!(records.is_empty());
+    let history = harness
+        .crud_store
+        .get_thread_history(chat_thread_id.as_str(), Some(64))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    assert!(
+        !history.events.iter().any(|event| matches!(
+            &event.payload,
+            ThreadHistoryEventPayload::ItemCompleted {
+                item: TurnItem::DynamicToolCall { tool_name, .. },
+                ..
+            } if tool_name.starts_with("memory_")
+        )),
+        "chat mode must not persist memory dynamic tool calls"
+    );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
