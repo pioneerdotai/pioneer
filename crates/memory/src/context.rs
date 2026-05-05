@@ -23,6 +23,29 @@ pub struct MemoryResolvedScopes {
     pub workspace_guard: Option<MemoryWorkspaceGuard>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryActiveScopes {
+    pub scopes: Vec<MemoryScope>,
+    pub primary_scope: Option<MemoryScope>,
+    pub priorities: Vec<MemoryScopePriority>,
+    pub explicit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryScopePriority {
+    pub scope: MemoryScope,
+    pub rank: u32,
+}
+
+impl MemoryActiveScopes {
+    pub fn rank_for(&self, scope: &MemoryScope) -> Option<u32> {
+        self.priorities
+            .iter()
+            .find(|priority| priority.scope == *scope)
+            .map(|priority| priority.rank)
+    }
+}
+
 impl MemoryOperationContext {
     pub fn now_or(&self, fallback: i64) -> i64 {
         self.now_unix.unwrap_or(fallback)
@@ -86,10 +109,134 @@ impl MemoryOperationContext {
         scopes
     }
 
+    pub fn active_scopes(&self, explicit_scopes: &[MemoryScope]) -> MemoryActiveScopes {
+        let scopes = self.effective_scopes(explicit_scopes);
+        let explicit = !explicit_scopes.is_empty();
+        let priority_scopes = if explicit {
+            scopes.clone()
+        } else {
+            self.default_active_scope_priority(&scopes)
+        };
+        let primary_scope = priority_scopes.first().cloned();
+        let priorities = priority_scopes
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| MemoryScopePriority {
+                scope,
+                rank: (index + 1) as u32,
+            })
+            .collect();
+
+        MemoryActiveScopes {
+            scopes,
+            primary_scope,
+            priorities,
+            explicit,
+        }
+    }
+
     pub fn resolved_scopes(&self, explicit_scopes: &[MemoryScope]) -> MemoryResolvedScopes {
         MemoryResolvedScopes {
             scopes: self.effective_scopes(explicit_scopes),
             workspace_guard: self.workspace_guard(),
         }
+    }
+
+    fn default_active_scope_priority(&self, searchable_scopes: &[MemoryScope]) -> Vec<MemoryScope> {
+        let mut priority_scopes = Vec::new();
+
+        if let Some(thread_id) = &self.thread_id {
+            push_scope_if_searchable(
+                &mut priority_scopes,
+                searchable_scopes,
+                MemoryScope {
+                    kind: MemoryScopeKind::Thread,
+                    key: thread_id.clone(),
+                },
+            );
+        }
+
+        if let Some(task_id) = &self.task_id {
+            push_scope_if_searchable(
+                &mut priority_scopes,
+                searchable_scopes,
+                MemoryScope {
+                    kind: MemoryScopeKind::Task,
+                    key: task_id.clone(),
+                },
+            );
+        }
+
+        if let Some(agent_id) = &self.agent_id {
+            if let Some(workspace_id) = &self.workspace_id {
+                push_scope_if_searchable(
+                    &mut priority_scopes,
+                    searchable_scopes,
+                    MemoryScope {
+                        kind: MemoryScopeKind::Agent,
+                        key: workspace_agent_memory_scope_key(workspace_id, agent_id),
+                    },
+                );
+            }
+        }
+
+        if let Some(workspace_id) = &self.workspace_id {
+            push_scope_if_searchable(
+                &mut priority_scopes,
+                searchable_scopes,
+                MemoryScope {
+                    kind: MemoryScopeKind::Workspace,
+                    key: workspace_id.clone(),
+                },
+            );
+        }
+
+        push_scope_if_searchable(
+            &mut priority_scopes,
+            searchable_scopes,
+            MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".to_owned(),
+            },
+        );
+
+        if let Some(agent_id) = &self.agent_id
+            && self.workspace_id.is_none()
+            && self.allow_global_agent
+        {
+            push_scope_if_searchable(
+                &mut priority_scopes,
+                searchable_scopes,
+                MemoryScope {
+                    kind: MemoryScopeKind::Agent,
+                    key: global_agent_memory_scope_key(agent_id),
+                },
+            );
+        }
+
+        for scope in searchable_scopes {
+            push_unique_scope(&mut priority_scopes, scope.clone());
+        }
+
+        priority_scopes
+    }
+}
+
+fn push_scope_if_searchable(
+    priority_scopes: &mut Vec<MemoryScope>,
+    searchable_scopes: &[MemoryScope],
+    scope: MemoryScope,
+) {
+    if searchable_scopes
+        .iter()
+        .any(|candidate| candidate == &scope)
+    {
+        push_unique_scope(priority_scopes, scope);
+    }
+}
+
+fn push_unique_scope(scopes: &mut Vec<MemoryScope>, scope: MemoryScope) {
+    if !scopes.iter().any(|candidate| candidate == &scope) {
+        scopes.push(scope);
     }
 }

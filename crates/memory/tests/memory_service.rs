@@ -4,8 +4,10 @@ use pioneer_crud::{
     workspace_agent_memory_scope_key,
 };
 use pioneer_memory::{
-    BackendPutRequest, BackendSearchRequest, InMemoryMemoryBackend, MemoryBackend,
-    MemoryOperationContext, MemoryReadPolicy, MemoryService, MemoryServiceConfig,
+    BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
+    BackendPutRequest, BackendPutResult, BackendSearchHit, BackendSearchRequest,
+    InMemoryMemoryBackend, MemoryBackend, MemoryOperationContext, MemoryReadPolicy,
+    MemoryRecallParams, MemoryService, MemoryServiceConfig,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
@@ -15,8 +17,47 @@ use pioneer_protocol::{
 use sea_orm::Database;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Debug, Default)]
+struct RecordingMemoryBackend {
+    inner: InMemoryMemoryBackend,
+    search_limits: Mutex<Vec<u32>>,
+}
+
+impl RecordingMemoryBackend {
+    async fn search_limits(&self) -> Vec<u32> {
+        self.search_limits.lock().await.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for RecordingMemoryBackend {
+    async fn put(&self, request: BackendPutRequest) -> anyhow::Result<BackendPutResult> {
+        self.inner.put(request).await
+    }
+
+    async fn get(&self, request: BackendGetRequest) -> anyhow::Result<Option<BackendPayload>> {
+        self.inner.get(request).await
+    }
+
+    async fn search(&self, request: BackendSearchRequest) -> anyhow::Result<Vec<BackendSearchHit>> {
+        self.search_limits.lock().await.push(request.limit);
+        self.inner.search(request).await
+    }
+
+    async fn delete(&self, request: BackendDeleteRequest) -> anyhow::Result<BackendDeleteResult> {
+        self.inner.delete(request).await
+    }
+}
 
 async fn setup_service() -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryService) {
+    setup_service_with_config(MemoryServiceConfig::default()).await
+}
+
+async fn setup_service_with_config(
+    config: MemoryServiceConfig,
+) -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryService) {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("connect sqlite");
@@ -24,11 +65,7 @@ async fn setup_service() -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryS
     let store = Arc::new(CrudStore::new(connection));
     let backend = Arc::new(InMemoryMemoryBackend::default());
     let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
-    let service = MemoryService::new(
-        store.clone(),
-        backend_for_service,
-        MemoryServiceConfig::default(),
-    );
+    let service = MemoryService::new(store.clone(), backend_for_service, config);
     (store, backend, service)
 }
 
@@ -244,6 +281,44 @@ async fn remember_with_supersedes_marks_old_row_superseded() {
 }
 
 #[tokio::test]
+async fn search_suppresses_superseded_backend_hits() {
+    let (_store, _backend, service) = setup_service().await;
+    let old = service
+        .remember(
+            user_context(350),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("project.style"),
+                "Superseded stale search token should not be visible.",
+            ),
+        )
+        .await
+        .expect("old remember");
+    let mut replacement_params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("project.style"),
+        "Replacement style memory is authoritative.",
+    );
+    replacement_params.supersedes = Some(old.record.id.clone());
+    service
+        .remember(user_context(351), replacement_params)
+        .await
+        .expect("replacement remember");
+
+    let search = service
+        .search(
+            user_context(352),
+            MemorySearchParams {
+                query: "Superseded stale search token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+}
+
+#[tokio::test]
 async fn forget_tombstone_suppresses_stale_backend_search_hit() {
     let (_store, backend, service) = setup_service().await;
     let remembered = service
@@ -419,6 +494,415 @@ async fn search_filters_sensitivity_by_default() {
         .await
         .expect("allow all search");
     assert_eq!(allow_all_search.hits.len(), 4);
+}
+
+#[tokio::test]
+async fn search_exact_key_match_beats_body_only_match() {
+    let (_store, _backend, service) = setup_service().await;
+    let exact = service
+        .remember(
+            user_context(650),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("user.birthday"),
+                "The birthday memory says September 12.",
+            ),
+        )
+        .await
+        .expect("remember exact");
+    let body_only = service
+        .remember(
+            user_context(651),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("user.note"),
+                "The literal user.birthday token appears in this unrelated note.",
+            ),
+        )
+        .await
+        .expect("remember body-only");
+
+    let search = service
+        .search(
+            user_context(652),
+            MemorySearchParams {
+                query: "user.birthday".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 2);
+    assert_eq!(search.hits[0].record.id, exact.record.id);
+    assert_eq!(search.hits[1].record.id, body_only.record.id);
+    assert!(search.hits[0].score > search.hits[1].score);
+}
+
+#[tokio::test]
+async fn search_backend_score_contributes_to_final_ranking() {
+    let (_store, _backend, service) = setup_service().await;
+    let full_match = service
+        .remember(
+            user_context(653),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("backend.full"),
+                "Backend score alpha beta gamma appears as a full phrase.",
+            ),
+        )
+        .await
+        .expect("remember full match");
+    let partial_match = service
+        .remember(
+            user_context(654),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("backend.partial"),
+                "Backend score alpha appears without the other query terms.",
+            ),
+        )
+        .await
+        .expect("remember partial match");
+
+    let search = service
+        .search(
+            user_context(655),
+            MemorySearchParams {
+                query: "Backend score alpha beta gamma".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 2);
+    assert_eq!(search.hits[0].record.id, full_match.record.id);
+    assert_eq!(search.hits[1].record.id, partial_match.record.id);
+    assert!(search.hits[0].score > search.hits[1].score);
+}
+
+#[tokio::test]
+async fn search_category_match_boost_contributes_to_final_score() {
+    let mut config = MemoryServiceConfig::default();
+    config.ranking.backend_score_weight = 0.0;
+    config.ranking.exact_key_boost = 0.0;
+    config.ranking.primary_scope_boost = 0.0;
+    config.ranking.scope_rank_boost = 0.0;
+    config.ranking.recency_boost_max = 0.0;
+    config.ranking.importance_weight = 0.0;
+    config.ranking.confidence_weight = 0.0;
+    config.ranking.category_match_boost = 0.5;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+    let remembered = service
+        .remember(
+            user_context(656),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("category.boost"),
+                "Category boost isolated token.",
+            ),
+        )
+        .await
+        .expect("remember");
+
+    let unboosted = service
+        .search(
+            user_context(657),
+            MemorySearchParams {
+                query: "Category boost isolated token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("unboosted search");
+    let boosted = service
+        .search(
+            user_context(658),
+            MemorySearchParams {
+                query: "Category boost isolated token".to_owned(),
+                categories: vec![MemoryCategory::Identity],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("boosted search");
+    assert_eq!(unboosted.hits[0].record.id, remembered.record.id);
+    assert_eq!(boosted.hits[0].record.id, remembered.record.id);
+    assert_eq!(unboosted.hits[0].score, Some(0.0));
+    assert_eq!(boosted.hits[0].score, Some(0.5));
+}
+
+#[tokio::test]
+async fn search_scope_boost_prefers_workspace_over_user_fallback() {
+    let (_store, _backend, service) = setup_service().await;
+    let user = service
+        .remember(
+            user_context(660),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("scope.user"),
+                "Scope boost shared token from user memory.",
+            ),
+        )
+        .await
+        .expect("remember user");
+    let workspace = service
+        .remember(
+            workspace_context("ws_scope_boost", 661),
+            remember_params(
+                scope(MemoryScopeKind::Workspace, "ws_scope_boost"),
+                Some("scope.workspace"),
+                "Scope boost shared token from workspace memory.",
+            ),
+        )
+        .await
+        .expect("remember workspace");
+
+    let search = service
+        .search(
+            MemoryOperationContext {
+                allow_global_user: true,
+                ..workspace_context("ws_scope_boost", 662)
+            },
+            MemorySearchParams {
+                query: "Scope boost shared token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 2);
+    assert_eq!(search.hits[0].record.id, workspace.record.id);
+    assert_eq!(search.hits[1].record.id, user.record.id);
+}
+
+#[tokio::test]
+async fn search_importance_and_recency_boosts_are_deterministic() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut important_params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("rank.important"),
+        "Ranking importance shared token from important memory.",
+    );
+    important_params.importance = Some(1.0);
+    let important = service
+        .remember(user_context(665), important_params)
+        .await
+        .expect("remember important");
+
+    let mut less_important_params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("rank.less_important"),
+        "Ranking importance shared token from less important memory.",
+    );
+    less_important_params.importance = Some(0.0);
+    let less_important = service
+        .remember(user_context(666), less_important_params)
+        .await
+        .expect("remember less important");
+
+    let importance_search = service
+        .search(
+            user_context(667),
+            MemorySearchParams {
+                query: "Ranking importance shared token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("importance search");
+    assert_eq!(importance_search.hits.len(), 2);
+    assert_eq!(importance_search.hits[0].record.id, important.record.id);
+    assert_eq!(
+        importance_search.hits[1].record.id,
+        less_important.record.id
+    );
+
+    let older = service
+        .remember(
+            user_context(668),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("rank.older"),
+                "Ranking recency shared token from older memory.",
+            ),
+        )
+        .await
+        .expect("remember older");
+    let newer = service
+        .remember(
+            user_context(698),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("rank.newer"),
+                "Ranking recency shared token from newer memory.",
+            ),
+        )
+        .await
+        .expect("remember newer");
+
+    let recency_search = service
+        .search(
+            user_context(699),
+            MemorySearchParams {
+                query: "Ranking recency shared token".to_owned(),
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recency search");
+    assert_eq!(recency_search.hits.len(), 2);
+    assert_eq!(recency_search.hits[0].record.id, newer.record.id);
+    assert_eq!(recency_search.hits[1].record.id, older.record.id);
+}
+
+#[tokio::test]
+async fn search_empty_scopes_use_user_scope_fallback_when_allowed() {
+    let (_store, _backend, service) = setup_service().await;
+    let remembered = service
+        .remember(
+            user_context(670),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("fallback.user"),
+                "User scope fallback token should be found.",
+            ),
+        )
+        .await
+        .expect("remember user fallback");
+
+    let search = service
+        .search(
+            MemoryOperationContext {
+                allow_global_user: true,
+                ..workspace_context("ws_user_fallback", 671)
+            },
+            MemorySearchParams {
+                query: "User scope fallback token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 1);
+    assert_eq!(search.hits[0].record.id, remembered.record.id);
+}
+
+#[tokio::test]
+async fn search_uses_tool_search_limit_when_limit_is_missing() {
+    let mut config = MemoryServiceConfig::default();
+    config.recall.tool_search_limit = 2;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+
+    for index in 0..3 {
+        service
+            .remember(
+                user_context(680 + index),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some(format!("tool.limit.{index}").as_str()),
+                    format!("Tool default limit shared token {index}.").as_str(),
+                ),
+            )
+            .await
+            .expect("remember");
+    }
+
+    let search = service
+        .search(
+            user_context(690),
+            MemorySearchParams {
+                query: "Tool default limit shared token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 2);
+}
+
+#[tokio::test]
+async fn search_backend_limit_overfetches_before_final_ranking_limit() {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect sqlite");
+    Migrator::up(&connection, None).await.expect("migrate");
+    let store = Arc::new(CrudStore::new(connection));
+    let backend = Arc::new(RecordingMemoryBackend::default());
+    let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
+    let mut config = MemoryServiceConfig::default();
+    config.recall.tool_search_limit = 3;
+    config.ranking.backend_candidate_multiplier = 4;
+    config.ranking.max_backend_candidates = 100;
+    let service = MemoryService::new(store, backend_for_service, config);
+
+    let search = service
+        .search(
+            user_context(695),
+            MemorySearchParams {
+                query: "overfetch token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+    assert_eq!(backend.search_limits().await, vec![12]);
+}
+
+#[tokio::test]
+async fn recall_for_prompt_uses_prompt_top_k_and_char_budgets() {
+    let mut config = MemoryServiceConfig::default();
+    config.recall.prompt_top_k = 2;
+    config.recall.max_item_chars = 18;
+    config.recall.max_prompt_chars = 30;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+
+    for index in 0..3 {
+        service
+            .remember(
+                user_context(700 + index),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some(format!("recall.prompt.{index}").as_str()),
+                    format!("Recall prompt shared token with    extra whitespace line {index}.")
+                        .as_str(),
+                ),
+            )
+            .await
+            .expect("remember");
+    }
+
+    let recall = service
+        .recall_for_prompt(
+            user_context(710),
+            MemoryRecallParams {
+                query: "Recall prompt shared token".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recall");
+
+    assert_eq!(recall.items.len(), 2);
+    assert!(
+        recall
+            .items
+            .iter()
+            .all(|item| item.content.chars().count() <= 18)
+    );
+    let total_chars = recall
+        .items
+        .iter()
+        .map(|item| item.content.chars().count())
+        .sum::<usize>();
+    assert!(total_chars <= 30);
+    assert!(
+        recall
+            .items
+            .iter()
+            .all(|item| !item.content.contains("  ") && !item.content.contains('\n'))
+    );
 }
 
 #[tokio::test]

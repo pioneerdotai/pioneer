@@ -307,6 +307,47 @@ async fn deleted_control_plane_row_suppresses_stale_memvid_hit() {
 }
 
 #[tokio::test]
+async fn superseded_control_plane_row_suppresses_stale_memvid_hit() {
+    let harness = ServiceHarness::new().await;
+    let old = harness
+        .service
+        .remember(
+            user_context(350),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("memvid.superseded"),
+                "Memvid superseded stale hit should be hidden.",
+            ),
+        )
+        .await
+        .expect("remember old");
+    let mut replacement_params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("memvid.superseded"),
+        "Memvid replacement memory is authoritative.",
+    );
+    replacement_params.supersedes = Some(old.record.id.clone());
+    harness
+        .service
+        .remember(user_context(351), replacement_params)
+        .await
+        .expect("remember replacement");
+
+    let search = harness
+        .service
+        .search(
+            user_context(352),
+            MemorySearchParams {
+                query: "Memvid superseded stale hit".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+}
+
+#[tokio::test]
 async fn missing_capsule_creates_memvid_and_payload_repair_diagnostics() {
     let harness = ServiceHarness::new().await;
     let remembered = harness

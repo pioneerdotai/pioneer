@@ -13,6 +13,10 @@ use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
     POLICY_DECISION_ERROR,
 };
+use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
+use crate::recall::{
+    MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse, compact_recall_content,
+};
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryControlRecord,
@@ -337,25 +341,25 @@ impl MemoryService {
         }
 
         let now = context.now_or(current_unix());
-        let scopes = context.effective_scopes(&params.scopes);
-        let resolved_scopes = self.resolve_backend_search_scopes(&scopes).await?;
-        let limit = self.normalized_limit(params.limit);
+        let active_scopes = context.active_scopes(&params.scopes);
+        let resolved_scopes = self
+            .resolve_backend_search_scopes(&active_scopes.scopes)
+            .await?;
+        let limit = self.normalized_tool_search_limit(params.limit);
+        let backend_limit = self.backend_candidate_limit(limit);
         let backend_hits = self
             .backend
             .search(BackendSearchRequest {
                 query: query.to_owned(),
-                scopes: scopes.clone(),
+                scopes: active_scopes.scopes.clone(),
                 resolved_scopes,
-                limit: self.config.max_limit,
+                limit: backend_limit,
             })
             .await
             .context("failed to search memory backend")?;
 
-        let mut hits = Vec::new();
+        let mut candidates = Vec::new();
         for hit in backend_hits {
-            if hits.len() >= limit as usize {
-                break;
-            }
             let Some(row) = self
                 .store
                 .get_agent_memory_record(hit.memory_id.as_str(), true)
@@ -365,29 +369,96 @@ impl MemoryService {
                     .await?;
                 continue;
             };
-            if !scope_matches(&row.scope, &scopes)
+            if !scope_matches(&row.scope, &active_scopes.scopes)
                 || !category_matches(row.category, &params.categories)
             {
                 continue;
             }
+            let recency_anchor_unix = recency_anchor_unix(&row);
             let Some(record) = self
                 .hydrate_visible_row(row, &context, &params.statuses, now, true)
                 .await?
             else {
                 continue;
             };
-            hits.push(MemorySearchHit {
-                record,
-                score: hit.score,
-                snippet: hit.snippet,
-                matched_terms: hit.matched_terms,
+            let backend_score = hit.score;
+            candidates.push(MemoryRankingCandidate {
+                hit: MemorySearchHit {
+                    record,
+                    score: backend_score,
+                    snippet: hit.snippet,
+                    matched_terms: hit.matched_terms,
+                },
+                backend_score,
+                recency_anchor_unix,
             });
         }
+        let hits = rank_memory_search_hits(
+            candidates,
+            query,
+            &params.categories,
+            &active_scopes,
+            &self.config.ranking,
+            now,
+            limit,
+        );
 
         Ok(MemorySearchResponse {
             hits,
             next_cursor: None,
         })
+    }
+
+    pub async fn recall_for_prompt(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryRecallParams,
+    ) -> Result<MemoryRecallResponse> {
+        let top_k = self.normalized_prompt_top_k(params.top_k);
+        let max_chars = params
+            .max_chars
+            .unwrap_or(self.config.recall.max_prompt_chars)
+            .min(self.config.recall.max_prompt_chars);
+        let search = self
+            .search(
+                context,
+                MemorySearchParams {
+                    query: params.query,
+                    scopes: params.scopes,
+                    categories: params.categories,
+                    statuses: Vec::new(),
+                    limit: Some(top_k),
+                    cursor: None,
+                    include_provenance: false,
+                },
+            )
+            .await?;
+
+        let mut remaining_chars = max_chars;
+        let item_max_chars = self.config.recall.max_item_chars.max(1);
+        let mut items = Vec::new();
+        for hit in search.hits {
+            if remaining_chars == 0 {
+                break;
+            }
+            let content =
+                compact_recall_content(&hit.record.content, item_max_chars.min(remaining_chars));
+            if content.is_empty() {
+                continue;
+            }
+            remaining_chars = remaining_chars.saturating_sub(content.chars().count());
+            items.push(MemoryRecallItem {
+                memory_id: hit.record.id,
+                scope: hit.record.scope,
+                category: hit.record.category,
+                key: hit.record.key,
+                content,
+                score: hit.score,
+                updated_at: hit.record.updated_at,
+            });
+        }
+
+        Ok(MemoryRecallResponse { items })
     }
 
     pub async fn forget(
@@ -833,6 +904,31 @@ impl MemoryService {
         limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit)
+            .max(1)
+    }
+
+    fn normalized_tool_search_limit(&self, limit: Option<u32>) -> u32 {
+        limit
+            .unwrap_or(self.config.recall.tool_search_limit)
+            .min(self.config.max_limit)
+            .max(1)
+    }
+
+    fn normalized_prompt_top_k(&self, top_k: Option<u32>) -> u32 {
+        top_k
+            .unwrap_or(self.config.recall.prompt_top_k)
+            .min(self.config.recall.prompt_top_k)
+            .min(self.config.max_limit)
+            .max(1)
+    }
+
+    fn backend_candidate_limit(&self, final_limit: u32) -> u32 {
+        let multiplier = self.config.ranking.backend_candidate_multiplier.max(1);
+        final_limit
+            .saturating_mul(multiplier)
+            .min(self.config.ranking.max_backend_candidates.max(final_limit))
+            .min(self.config.max_limit)
+            .max(final_limit)
     }
 }
 
@@ -849,6 +945,13 @@ fn category_matches(
     categories: &[pioneer_protocol::MemoryCategory],
 ) -> bool {
     categories.is_empty() || categories.contains(&category)
+}
+
+fn recency_anchor_unix(row: &AgentMemoryControlRecord) -> i64 {
+    row.last_accessed_at_unix
+        .unwrap_or(row.updated_at_unix)
+        .max(row.updated_at_unix)
+        .max(row.created_at_unix)
 }
 
 fn backend_get_request(row: &AgentMemoryControlRecord) -> BackendGetRequest {
