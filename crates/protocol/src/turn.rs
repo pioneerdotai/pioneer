@@ -727,6 +727,8 @@ pub struct PromptManifestDiagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,6 +739,8 @@ pub enum PromptManifestDiagnosticCode {
     FileTruncated,
     TotalBudgetTruncated,
     FileFilteredByProfile,
+    DynamicSectionTruncated,
+    DynamicSectionOmitted,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]

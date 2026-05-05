@@ -8,6 +8,7 @@ mod phase;
 mod policy;
 mod policy_set;
 mod prompt_context_set;
+mod prompt_section_set;
 mod registry;
 mod request;
 mod runtime;
@@ -39,6 +40,11 @@ pub use policy_set::{HookPolicyEntry, HookPolicyKeyRef, HookPolicySet};
 pub use prompt_context_set::{
     DEFAULT_PROMPT_CONTEXT_MAX_ENTRIES, DEFAULT_PROMPT_CONTEXT_MAX_TOTAL_CHARS,
     HookPromptContextEntry, HookPromptContextLimits, HookPromptContextSet,
+};
+pub use prompt_section_set::{
+    DEFAULT_PROMPT_SECTION_MAX_CHARS_PER_SECTION, DEFAULT_PROMPT_SECTION_MAX_SECTIONS,
+    DEFAULT_PROMPT_SECTION_MAX_TOTAL_CHARS, HookPromptSectionEntry, HookPromptSectionLimits,
+    HookPromptSectionSet,
 };
 pub use registry::{HookRegistry, HookSubscriptionRegistry};
 pub use request::{HookHandlerRequest, HookHandlerResponse, HookInput, HookInputKind};

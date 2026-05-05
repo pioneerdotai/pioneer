@@ -17,8 +17,8 @@ use pioneer_hooks::{
     PromptSectionContribution,
 };
 use pioneer_protocol::{
-    AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, RecoveryAction,
-    RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
+    AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode,
+    RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
     ToolRetryResolution, ToolStoragePayload, TurnItem, TurnItemType, UserInput,
 };
@@ -402,6 +402,42 @@ fn prompt_context_contribution_with_max_chars(
     HookContribution::PromptContext(contribution)
 }
 
+fn prompt_section_contribution(
+    section_id: &str,
+    title: &str,
+    domain: &str,
+    priority: i32,
+    content: &str,
+) -> HookContribution {
+    HookContribution::PromptSection(PromptSectionContribution {
+        section_id: HookSectionId::new(section_id).expect("valid section id"),
+        title: Some(HookPromptSectionTitle::new(title).expect("valid section title")),
+        domain: HookDomain::new(domain).expect("valid domain"),
+        priority,
+        content: HookPromptContent::new(content).expect("valid prompt content"),
+        max_chars: None,
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+}
+
+fn prompt_section_contribution_with_max_chars(
+    section_id: &str,
+    title: &str,
+    domain: &str,
+    priority: i32,
+    content: &str,
+    max_chars: usize,
+) -> HookContribution {
+    let HookContribution::PromptSection(mut contribution) =
+        prompt_section_contribution(section_id, title, domain, priority, content)
+    else {
+        unreachable!("helper returns prompt section contribution");
+    };
+    contribution.max_chars = Some(max_chars);
+    HookContribution::PromptSection(contribution)
+}
+
 fn policy_value(policy_set: &HookPolicySet, domain: &str, key: &str) -> Option<HookValue> {
     policy_set
         .get(
@@ -431,21 +467,6 @@ fn phase_07_ignored_contributions() -> Vec<HookContribution> {
             value: HookValue::Bool(true),
             priority: 10_000,
             diagnostics: Vec::new(),
-        }),
-        HookContribution::PromptSection(PromptSectionContribution {
-            section_id: HookSectionId::new("test.phase07_ignored_section")
-                .expect("valid section id"),
-            title: Some(
-                HookPromptSectionTitle::new("Ignored Phase 07 Hook Section")
-                    .expect("valid section title"),
-            ),
-            domain: HookDomain::new("test").expect("valid domain"),
-            priority: 10_000,
-            content: HookPromptContent::new("HOOK OUTPUT MUST NOT APPEAR")
-                .expect("valid prompt content"),
-            max_chars: None,
-            diagnostics: Vec::new(),
-            truncated: false,
         }),
         HookContribution::PromptManifestDiagnostic(PromptManifestDiagnosticContribution {
             code: HookDiagnosticCode::new("test.phase07_manifest_ignored")
@@ -1667,7 +1688,7 @@ async fn phase_07_chat_mode_does_not_call_turn_hooks() {
 }
 
 #[tokio::test]
-async fn phase_07_hook_contributions_do_not_affect_agent_request() {
+async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request() {
     let baseline_provider = Arc::new(CaptureAgentProvider::default());
     let baseline_registry = Arc::new(ProviderRegistry::with_provider(
         "capture",
@@ -1727,11 +1748,7 @@ async fn phase_07_hook_contributions_do_not_affect_agent_request() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(
-        !prompt
-            .full_system_text
-            .contains("HOOK OUTPUT MUST NOT APPEAR")
-    );
+    assert!(!prompt.full_system_text.contains("ignored_policy"));
 
     let hook_manifest = hook_observed
         .iter()
@@ -1741,12 +1758,6 @@ async fn phase_07_hook_contributions_do_not_affect_agent_request() {
         })
         .next()
         .expect("prompt manifest should be emitted");
-    assert!(
-        !hook_manifest
-            .section_ids
-            .iter()
-            .any(|section_id| section_id == "test.phase07_ignored_section")
-    );
     assert!(!hook_manifest.diagnostics.iter().any(|diagnostic| {
         diagnostic
             .message
@@ -2544,6 +2555,414 @@ async fn phase_09_memory_path_remains_unchanged() {
             .full_system_text
             .contains("HOOK MEMORY CONTEXT MUST NOT APPEAR")
     );
+}
+
+#[tokio::test]
+async fn phase_10_hook_prompt_section_appears_in_compiled_prompt() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_section_contribution(
+                "test.phase10.alpha",
+                "Alpha Hook Section",
+                "test",
+                10,
+                "alpha hook section content",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_prompt_section",
+        "ws_phase10_prompt_section",
+        "turn_phase10_prompt_section",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 prompt section",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Alpha Hook Section"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("alpha hook section content")
+    );
+}
+
+#[tokio::test]
+async fn phase_10_hook_prompt_section_ordering_is_deterministic() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![
+                prompt_section_contribution("test.phase10.low", "Low Hook", "test", 0, "low hook"),
+                prompt_section_contribution(
+                    "test.phase10.same_b",
+                    "Same B Hook",
+                    "test.b",
+                    5,
+                    "same b hook",
+                ),
+                prompt_section_contribution(
+                    "test.phase10.high",
+                    "High Hook",
+                    "test",
+                    10,
+                    "high hook",
+                ),
+                prompt_section_contribution(
+                    "test.phase10.same_a",
+                    "Same A Hook",
+                    "test.a",
+                    5,
+                    "same a hook",
+                ),
+            ],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_prompt_order",
+        "ws_phase10_prompt_order",
+        "turn_phase10_prompt_order",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 prompt section order",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    let high = prompt
+        .full_system_text
+        .find("high hook")
+        .expect("high hook appears");
+    let same_a = prompt
+        .full_system_text
+        .find("same a hook")
+        .expect("same a hook appears");
+    let same_b = prompt
+        .full_system_text
+        .find("same b hook")
+        .expect("same b hook appears");
+    let low = prompt
+        .full_system_text
+        .find("low hook")
+        .expect("low hook appears");
+    assert!(high < same_a);
+    assert!(same_a < same_b);
+    assert!(same_b < low);
+}
+
+#[tokio::test]
+async fn phase_10_hook_prompt_section_id_appears_in_prompt_manifest() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_section_contribution(
+                "test.phase10.manifest",
+                "Manifest Hook Section",
+                "test",
+                10,
+                "manifest hook section content",
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_manifest_id",
+        "ws_phase10_manifest_id",
+        "turn_phase10_manifest_id",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 manifest id",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "test.phase10.manifest")
+    );
+}
+
+#[tokio::test]
+async fn phase_10_hook_prompt_section_truncation_is_recorded_in_prompt_manifest() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            vec![prompt_section_contribution_with_max_chars(
+                "test.phase10.truncated",
+                "Truncated Hook Section",
+                "test",
+                10,
+                "0123456789abcdef",
+                8,
+            )],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_manifest_truncation",
+        "ws_phase10_manifest_truncation",
+        "turn_phase10_manifest_truncation",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 manifest truncation",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("01234567"));
+    assert!(!prompt.full_system_text.contains("89abcdef"));
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    assert!(manifest.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == PromptManifestDiagnosticCode::DynamicSectionTruncated
+            && diagnostic.section_id.as_deref() == Some("test.phase10.truncated")
+            && !diagnostic.message.contains("0123456789abcdef")
+    }));
+}
+
+#[tokio::test]
+async fn phase_10_pre_prompt_compile_receives_policy_and_prompt_context_sets() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            vec![
+                policy_contribution("test", "prompt_section_allowed", HookValue::Bool(true), 10),
+                prompt_context_contribution("test.context.phase10", "test", 10, "context one"),
+                prompt_section_contribution(
+                    "test.phase10.with_context",
+                    "Context-Aware Hook",
+                    "test",
+                    10,
+                    "context-aware hook section",
+                ),
+            ],
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_context_sets",
+        "ws_phase10_context_sets",
+        "turn_phase10_context_sets",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 context sets",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    assert_eq!(
+        policy_value(
+            &pre_prompt_compile.policy_set,
+            "test",
+            "prompt_section_allowed"
+        ),
+        Some(HookValue::Bool(true))
+    );
+    assert_eq!(pre_prompt_compile.prompt_context_set.entries.len(), 1);
+    assert_eq!(
+        pre_prompt_compile.prompt_context_set.entries[0]
+            .contribution_id
+            .as_str(),
+        "test.context.phase10"
+    );
+
+    let requests = provider.snapshot_requests();
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("context-aware hook section")
+    );
+}
+
+#[tokio::test]
+async fn phase_10_best_effort_hook_failure_continues_without_section() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls,
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            vec![HookPhase::TurnPrePromptCompile],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_best_effort_failure",
+        "ws_phase10_best_effort_failure",
+        "turn_phase10_best_effort_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 best effort failure",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("phase 07 hook failed"));
+}
+
+#[tokio::test]
+async fn phase_10_fallback_prompt_section_is_rendered() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(
+            recording_hook_runtime_with_phase_failures_and_fallback(
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                Vec::new(),
+                HookFailurePolicy::Fallback,
+                vec![HookPhase::TurnPrePromptCompile],
+                vec![prompt_section_contribution(
+                    "test.phase10.fallback",
+                    "Fallback Hook Section",
+                    "test",
+                    10,
+                    "fallback hook section content",
+                )],
+            ),
+        ))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_fallback",
+        "ws_phase10_fallback",
+        "turn_phase10_fallback",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 fallback",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Fallback Hook Section"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("fallback hook section content")
+    );
+}
+
+#[tokio::test]
+async fn phase_10_required_prompt_section_failure_fails_turn() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Vec::new(),
+            HookFailurePolicy::Required,
+            vec![HookPhase::TurnPrePromptCompile],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_required_failure",
+        "ws_phase10_required_failure",
+        "turn_phase10_required_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 10 required failure",
+    )
+    .await;
+
+    assert_turn_failed(&observed, "turn prompt section hook failed");
+    assert!(provider.snapshot_requests().is_empty());
 }
 
 #[tokio::test]

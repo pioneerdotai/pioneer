@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -7,7 +8,51 @@ pub enum PromptStability {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSectionIdError {
+    reason: &'static str,
+}
+
+impl PromptSectionIdError {
+    fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+impl fmt::Display for PromptSectionIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for PromptSectionIdError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PromptDynamicSectionId(String);
+
+impl PromptDynamicSectionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, PromptSectionIdError> {
+        let value = value.into();
+        validate_dynamic_section_id(value.as_str())?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for PromptDynamicSectionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptSectionId {
     IdentityBase,
@@ -23,6 +68,60 @@ pub enum PromptSectionId {
     RetryRuntimeInstruction,
     DynamicContext,
     ExtraSystem,
+    Dynamic(PromptDynamicSectionId),
+}
+
+impl PromptSectionId {
+    pub fn manifest_id(&self) -> String {
+        let id = match self {
+            Self::IdentityBase => "identity_base",
+            Self::AssistantSafety => "assistant_safety",
+            Self::SoulCore => "soul_core",
+            Self::IdentityCore => "identity_core",
+            Self::UserPersona => "user_persona",
+            Self::ToolRecoveryPolicy => "tool_recovery_policy",
+            Self::TaskOrchestrationPolicy => "task_orchestration_policy",
+            Self::MemoryRecall => "memory_recall",
+            Self::RecoveryContinuation => "recovery_continuation",
+            Self::SkillsRuntimePrompt => "skills_runtime_prompt",
+            Self::RetryRuntimeInstruction => "retry_runtime_instruction",
+            Self::DynamicContext => "dynamic_context",
+            Self::ExtraSystem => "extra_system",
+            Self::Dynamic(id) => return id.as_str().to_owned(),
+        };
+        id.to_owned()
+    }
+
+    pub fn is_builtin_manifest_id(value: &str) -> bool {
+        matches!(
+            value,
+            "identity_base"
+                | "assistant_safety"
+                | "soul_core"
+                | "identity_core"
+                | "user_persona"
+                | "tool_recovery_policy"
+                | "task_orchestration_policy"
+                | "memory_recall"
+                | "recovery_continuation"
+                | "skills_runtime_prompt"
+                | "retry_runtime_instruction"
+                | "dynamic_context"
+                | "extra_system"
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicPromptSectionInput {
+    pub id: PromptDynamicSectionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,5 +140,50 @@ impl PromptSection {
             return String::new();
         }
         format!("## {}\n{}", self.title.trim(), self.content.trim())
+    }
+}
+
+fn validate_dynamic_section_id(value: &str) -> Result<(), PromptSectionIdError> {
+    if value.is_empty() {
+        return Err(PromptSectionIdError::new(
+            "dynamic prompt section id cannot be empty",
+        ));
+    }
+    if value.trim() != value {
+        return Err(PromptSectionIdError::new(
+            "dynamic prompt section id cannot contain leading or trailing whitespace",
+        ));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(PromptSectionIdError::new(
+            "dynamic prompt section id cannot contain whitespace",
+        ));
+    }
+    if PromptSectionId::is_builtin_manifest_id(value) {
+        return Err(PromptSectionIdError::new(
+            "dynamic prompt section id cannot collide with a built-in prompt section id",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_section_id_rejects_builtin_collision() {
+        assert!(PromptDynamicSectionId::new("memory_recall").is_err());
+        assert!(PromptDynamicSectionId::new("identity_base").is_err());
+    }
+
+    #[test]
+    fn dynamic_section_id_accepts_domain_qualified_id() {
+        let id = PromptDynamicSectionId::new("memory.recall").expect("valid dynamic id");
+        assert_eq!(id.as_str(), "memory.recall");
+        assert_eq!(
+            PromptSectionId::Dynamic(id).manifest_id(),
+            "memory.recall".to_owned()
+        );
     }
 }

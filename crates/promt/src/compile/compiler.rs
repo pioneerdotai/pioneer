@@ -9,9 +9,13 @@ use crate::diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
 use crate::fingerprint::sha256_hex;
 use crate::profile::PromptProfile;
 use crate::render::text::render_sections;
-use crate::section::{PromptSection, PromptSectionId, PromptStability};
+use crate::section::{DynamicPromptSectionInput, PromptSection, PromptSectionId, PromptStability};
 use crate::sources::budget::{BudgetedBootstrapFile, apply_budgets};
 use crate::sources::files::load_bootstrap_files;
+
+const DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS: usize = 8_000;
+const DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_TOTAL_CHARS: usize = 16_000;
+const DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT: usize = 16;
 
 fn build_identity_section() -> PromptSection {
     PromptSection {
@@ -207,7 +211,109 @@ fn build_source_manifest(
     manifest
 }
 
-fn build_runtime_dynamic_sections(input: &PromptCompileInput) -> Vec<PromptSection> {
+fn build_dynamic_prompt_section(
+    input: &DynamicPromptSectionInput,
+    diagnostics: &mut Vec<PromptDiagnostic>,
+    remaining_total_chars: &mut usize,
+) -> Option<PromptSection> {
+    let section_id = input.id.as_str();
+    let content = input.content.trim();
+    if content.is_empty() {
+        diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
+            section_id,
+            "content was empty",
+        ));
+        return None;
+    }
+
+    if *remaining_total_chars == 0 {
+        diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
+            section_id,
+            "dynamic section budget was exhausted",
+        ));
+        return None;
+    }
+
+    let section_limit = input
+        .max_chars
+        .unwrap_or(DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS)
+        .min(DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS)
+        .min(*remaining_total_chars);
+
+    if section_limit == 0 {
+        diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
+            section_id,
+            "section character limit was zero",
+        ));
+        return None;
+    }
+
+    let content_chars = content.chars().count();
+    let mut truncated = input.truncated;
+    let content = if content_chars > section_limit {
+        truncated = true;
+        content.chars().take(section_limit).collect::<String>()
+    } else {
+        content.to_owned()
+    };
+
+    if truncated {
+        diagnostics.push(PromptDiagnostic::dynamic_section_truncated(
+            section_id,
+            content_chars,
+            content.chars().count(),
+        ));
+    }
+
+    *remaining_total_chars = remaining_total_chars.saturating_sub(content.chars().count());
+
+    let title = input
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Dynamic: {section_id}"));
+
+    Some(PromptSection {
+        id: PromptSectionId::Dynamic(input.id.clone()),
+        stability: PromptStability::Dynamic,
+        title,
+        content,
+        sources: Vec::new(),
+    })
+}
+
+fn build_dynamic_prompt_sections(
+    dynamic_sections: &[DynamicPromptSectionInput],
+    diagnostics: &mut Vec<PromptDiagnostic>,
+) -> Vec<PromptSection> {
+    let mut sections = Vec::new();
+    let mut remaining_total_chars = DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_TOTAL_CHARS;
+
+    for input in dynamic_sections {
+        if sections.len() >= DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT {
+            diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
+                input.id.as_str(),
+                "dynamic section count limit was reached",
+            ));
+            continue;
+        }
+
+        if let Some(section) =
+            build_dynamic_prompt_section(input, diagnostics, &mut remaining_total_chars)
+        {
+            sections.push(section);
+        }
+    }
+
+    sections
+}
+
+fn build_runtime_dynamic_sections(
+    input: &PromptCompileInput,
+    diagnostics: &mut Vec<PromptDiagnostic>,
+) -> Vec<PromptSection> {
     let mut sections = Vec::new();
 
     if let Some(memory_recall) = input.memory_recall.as_deref().map(str::trim)
@@ -215,6 +321,11 @@ fn build_runtime_dynamic_sections(input: &PromptCompileInput) -> Vec<PromptSecti
     {
         sections.push(build_memory_recall_section(memory_recall));
     }
+
+    sections.extend(build_dynamic_prompt_sections(
+        input.dynamic_sections.as_slice(),
+        diagnostics,
+    ));
 
     if input.continue_generation_hint {
         sections.push(PromptSection {
@@ -364,7 +475,7 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         sections.push(build_task_orchestration_policy_section());
     }
 
-    sections.extend(build_runtime_dynamic_sections(&input));
+    sections.extend(build_runtime_dynamic_sections(&input, &mut diagnostics));
 
     if profile == PromptProfile::AssistantNone {
         sections.retain(|section| section.id == PromptSectionId::IdentityBase);
@@ -418,7 +529,7 @@ mod tests {
     use crate::bundle::{PromptCompileInput, PromptLimits};
     use crate::diagnostics::PromptDiagnosticCode;
     use crate::profile::PromptProfile;
-    use crate::section::PromptSectionId;
+    use crate::section::{DynamicPromptSectionInput, PromptDynamicSectionId, PromptSectionId};
 
     fn temp_workspace(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -428,6 +539,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp workspace");
         root
+    }
+
+    fn dynamic_section(id: &str, title: Option<&str>, content: &str) -> DynamicPromptSectionInput {
+        DynamicPromptSectionInput {
+            id: PromptDynamicSectionId::new(id).expect("valid dynamic section id"),
+            title: title.map(str::to_owned),
+            content: content.to_owned(),
+            max_chars: None,
+            truncated: false,
+        }
     }
 
     #[test]
@@ -446,6 +567,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: None,
             limits: PromptLimits::default(),
@@ -471,6 +593,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: Some("extra".to_owned()),
             limits: PromptLimits::default(),
@@ -497,6 +620,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: Some("ctx".to_owned()),
             extra_system: Some("extra".to_owned()),
             limits: PromptLimits::default(),
@@ -506,7 +630,7 @@ mod tests {
         let section_ids = compiled
             .sections
             .iter()
-            .map(|section| section.id)
+            .map(|section| section.id.clone())
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -542,6 +666,7 @@ mod tests {
             include_task_orchestration_policy: true,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -581,6 +706,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: Some("Available memory tools: memory_search".to_owned()),
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -605,6 +731,247 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_prompt_section_appears_in_compiled_prompt() {
+        let root = temp_workspace("dynamic_prompt_section");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: vec![dynamic_section(
+                "test.phase10.alpha",
+                Some("Alpha Hook Section"),
+                "alpha hook section content",
+            )],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("## Alpha Hook Section")
+        );
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("alpha hook section content")
+        );
+        assert!(
+            compiled
+                .sections
+                .iter()
+                .any(|section| { section.id.manifest_id() == "test.phase10.alpha" })
+        );
+    }
+
+    #[test]
+    fn dynamic_prompt_sections_preserve_input_order_and_slot() {
+        let root = temp_workspace("dynamic_prompt_section_order");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: Some("[Skills]\n- skill-a".to_owned()),
+            retry_instruction: Some("retry".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            memory_recall: Some("memory recall content".to_owned()),
+            dynamic_sections: vec![
+                dynamic_section("test.phase10.first", Some("First Hook"), "first content"),
+                dynamic_section("test.phase10.second", Some("Second Hook"), "second content"),
+            ],
+            dynamic_context: Some("ctx".to_owned()),
+            extra_system: Some("extra".to_owned()),
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id.manifest_id())
+            .collect::<Vec<_>>();
+        let memory_index = section_ids
+            .iter()
+            .position(|id| id == "memory_recall")
+            .expect("memory recall section present");
+        let first_index = section_ids
+            .iter()
+            .position(|id| id == "test.phase10.first")
+            .expect("first dynamic section present");
+        let second_index = section_ids
+            .iter()
+            .position(|id| id == "test.phase10.second")
+            .expect("second dynamic section present");
+        let recovery_index = section_ids
+            .iter()
+            .position(|id| id == "recovery_continuation")
+            .expect("recovery continuation section present");
+
+        assert!(memory_index < first_index);
+        assert!(first_index < second_index);
+        assert!(second_index < recovery_index);
+    }
+
+    #[test]
+    fn dynamic_prompt_section_changes_dynamic_fingerprint_only() {
+        let root = temp_workspace("dynamic_prompt_fingerprint");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "Name: Alex").expect("write USER");
+
+        let baseline = compile_prompt(PromptCompileInput {
+            workspace_root: root.clone(),
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile baseline");
+
+        let changed = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: vec![dynamic_section(
+                "test.phase10.dynamic",
+                Some("Dynamic Hook"),
+                "dynamic hook content",
+            )],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile changed");
+
+        assert_eq!(baseline.fingerprint_stable, changed.fingerprint_stable);
+        assert_ne!(baseline.fingerprint_dynamic, changed.fingerprint_dynamic);
+        assert_ne!(baseline.fingerprint_full, changed.fingerprint_full);
+    }
+
+    #[test]
+    fn dynamic_prompt_section_truncation_records_diagnostic() {
+        let root = temp_workspace("dynamic_prompt_section_truncation");
+        let mut section = dynamic_section(
+            "test.phase10.truncated",
+            Some("Truncated Hook"),
+            "0123456789abcdef",
+        );
+        section.max_chars = Some(8);
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: vec![section],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(compiled.dynamic_system_text.contains("01234567"));
+        assert!(!compiled.dynamic_system_text.contains("89abcdef"));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::DynamicSectionTruncated
+                && diagnostic.section_id.as_deref() == Some("test.phase10.truncated")
+                && !diagnostic.message.contains("0123456789abcdef")
+        }));
+    }
+
+    #[test]
+    fn dynamic_prompt_section_omission_records_diagnostic() {
+        let root = temp_workspace("dynamic_prompt_section_omission");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: vec![dynamic_section("test.phase10.empty", Some("Empty"), "   ")],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(!compiled.dynamic_system_text.contains("## Empty"));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::DynamicSectionOmitted
+                && diagnostic.section_id.as_deref() == Some("test.phase10.empty")
+        }));
+    }
+
+    #[test]
+    fn assistant_none_filters_dynamic_prompt_sections() {
+        let root = temp_workspace("assistant_none_dynamic_sections");
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantNone,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: None,
+            dynamic_sections: vec![dynamic_section(
+                "test.phase10.filtered",
+                Some("Filtered Hook"),
+                "filtered hook content",
+            )],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(!compiled.full_system_text.contains("Filtered Hook"));
+        assert!(!compiled.full_system_text.contains("filtered hook content"));
+        assert_eq!(
+            compiled
+                .sections
+                .iter()
+                .map(|section| section.id.manifest_id())
+                .collect::<Vec<_>>(),
+            vec!["identity_base".to_owned()]
+        );
+    }
+
+    #[test]
     fn non_identity_files_are_ignored_in_identity_only_mode() {
         let root = temp_workspace("identity_only_mode");
         std::fs::write(root.join("AGENTS.md"), "Agent rules").expect("write AGENTS");
@@ -625,6 +992,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -634,7 +1002,7 @@ mod tests {
         let section_ids = compiled
             .sections
             .iter()
-            .map(|section| section.id)
+            .map(|section| section.id.clone())
             .collect::<Vec<_>>();
         assert!(section_ids.contains(&PromptSectionId::SoulCore));
         assert!(section_ids.contains(&PromptSectionId::IdentityCore));
@@ -668,6 +1036,7 @@ mod tests {
                 include_task_orchestration_policy: false,
                 continue_generation_hint: false,
                 memory_recall: None,
+                dynamic_sections: Vec::new(),
                 dynamic_context: None,
                 extra_system: None,
                 limits: PromptLimits::default(),
@@ -714,6 +1083,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -729,6 +1099,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: Some("session dynamic context".to_owned()),
             extra_system: Some("runtime override".to_owned()),
             limits: PromptLimits::default(),
@@ -759,6 +1130,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -778,7 +1150,7 @@ mod tests {
         let section_ids = compiled
             .sections
             .iter()
-            .map(|section| section.id)
+            .map(|section| section.id.clone())
             .collect::<Vec<_>>();
         assert!(!section_ids.contains(&PromptSectionId::SoulCore));
         assert!(!section_ids.contains(&PromptSectionId::IdentityCore));
@@ -816,6 +1188,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -825,7 +1198,7 @@ mod tests {
         let section_ids = compiled
             .sections
             .iter()
-            .map(|section| section.id)
+            .map(|section| section.id.clone())
             .collect::<Vec<_>>();
         assert!(section_ids.contains(&PromptSectionId::SoulCore));
         assert!(section_ids.contains(&PromptSectionId::IdentityCore));
@@ -850,6 +1223,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -886,6 +1260,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -912,6 +1287,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -952,6 +1328,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -990,6 +1367,7 @@ mod tests {
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
             memory_recall: None,
+            dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits {

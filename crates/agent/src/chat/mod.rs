@@ -10,8 +10,9 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use crate::hooks::{
-    AgentTurnHookContext, run_agent_turn_policy_hook_phase,
-    run_agent_turn_prompt_context_hook_phase, run_noop_agent_turn_hook_phase,
+    AgentTurnHookContext, EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
+    run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
+    run_noop_agent_turn_hook_phase,
 };
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
@@ -29,9 +30,9 @@ use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{HookPhase, HookRuntime};
 use pioneer_promt::{
-    CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptLimits, PromptProfile,
-    PromptSectionId, ToolRetryInstructionKind, compile_prompt, render_memory_recall_prompt,
-    render_tool_retry_instruction, tool_loop_final_answer_instruction,
+    CompiledPromptBundle, DynamicPromptSectionInput, PromptCompileInput, PromptDiagnosticCode,
+    PromptDynamicSectionId, PromptLimits, PromptProfile, ToolRetryInstructionKind, compile_prompt,
+    render_memory_recall_prompt, render_tool_retry_instruction, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
@@ -176,10 +177,39 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
     })
 }
 
+fn dynamic_prompt_sections_from_hook_sections(
+    section_set: &EffectiveTurnPromptSectionSet,
+) -> Result<Vec<DynamicPromptSectionInput>, ChatTurnError> {
+    if section_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sections = section_set.clone_hook_prompt_section_set();
+
+    sections
+        .entries()
+        .map(|entry| {
+            let id = PromptDynamicSectionId::new(entry.section_id.as_str()).map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to convert hook prompt section `{}`: {error}",
+                    entry.section_id
+                ))
+            })?;
+            Ok(DynamicPromptSectionInput {
+                id,
+                title: entry.title.as_ref().map(|title| title.as_str().to_owned()),
+                content: entry.content.as_str().to_owned(),
+                max_chars: None,
+                truncated: entry.truncated,
+            })
+        })
+        .collect()
+}
+
 fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     memory_recall: Option<String>,
+    dynamic_sections: &[DynamicPromptSectionInput],
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -197,6 +227,7 @@ fn compile_agent_prompt_bundle(
         skills_prompt,
         retry_instruction,
         memory_recall,
+        dynamic_sections,
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -209,6 +240,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     memory_recall: Option<String>,
+    dynamic_sections: &[DynamicPromptSectionInput],
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -231,6 +263,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         include_task_orchestration_policy,
         continue_generation_hint,
         memory_recall,
+        dynamic_sections: dynamic_sections.to_vec(),
         dynamic_context: None,
         extra_system: Some(extra_system),
         limits: PromptLimits::default(),
@@ -337,24 +370,6 @@ fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
     }
 }
 
-fn prompt_section_id(section_id: PromptSectionId) -> &'static str {
-    match section_id {
-        PromptSectionId::IdentityBase => "identity_base",
-        PromptSectionId::AssistantSafety => "assistant_safety",
-        PromptSectionId::SoulCore => "soul_core",
-        PromptSectionId::IdentityCore => "identity_core",
-        PromptSectionId::UserPersona => "user_persona",
-        PromptSectionId::ToolRecoveryPolicy => "tool_recovery_policy",
-        PromptSectionId::TaskOrchestrationPolicy => "task_orchestration_policy",
-        PromptSectionId::MemoryRecall => "memory_recall",
-        PromptSectionId::RecoveryContinuation => "recovery_continuation",
-        PromptSectionId::SkillsRuntimePrompt => "skills_runtime_prompt",
-        PromptSectionId::RetryRuntimeInstruction => "retry_runtime_instruction",
-        PromptSectionId::DynamicContext => "dynamic_context",
-        PromptSectionId::ExtraSystem => "extra_system",
-    }
-}
-
 fn prompt_diagnostic_code(code: PromptDiagnosticCode) -> PromptManifestDiagnosticCode {
     match code {
         PromptDiagnosticCode::MissingFile => PromptManifestDiagnosticCode::MissingFile,
@@ -366,6 +381,12 @@ fn prompt_diagnostic_code(code: PromptDiagnosticCode) -> PromptManifestDiagnosti
         PromptDiagnosticCode::FileFilteredByProfile => {
             PromptManifestDiagnosticCode::FileFilteredByProfile
         }
+        PromptDiagnosticCode::DynamicSectionTruncated => {
+            PromptManifestDiagnosticCode::DynamicSectionTruncated
+        }
+        PromptDiagnosticCode::DynamicSectionOmitted => {
+            PromptManifestDiagnosticCode::DynamicSectionOmitted
+        }
     }
 }
 
@@ -376,7 +397,7 @@ fn prompt_manifest_from_bundle(bundle: &CompiledPromptBundle) -> PromptManifest 
         section_ids: bundle
             .sections
             .iter()
-            .map(|section| prompt_section_id(section.id).to_owned())
+            .map(|section| section.id.manifest_id())
             .collect::<Vec<_>>(),
         fingerprint_stable: bundle.fingerprint_stable.clone(),
         fingerprint_dynamic: bundle.fingerprint_dynamic.clone(),
@@ -388,6 +409,7 @@ fn prompt_manifest_from_bundle(bundle: &CompiledPromptBundle) -> PromptManifest 
                 code: prompt_diagnostic_code(diagnostic.code),
                 message: diagnostic.message.clone(),
                 file: diagnostic.file.clone(),
+                section_id: diagnostic.section_id.clone(),
             })
             .collect::<Vec<_>>(),
     }
@@ -1152,19 +1174,30 @@ async fn execute_agent_provider_response(
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
     if !provider_tool_calling {
-        run_noop_agent_turn_hook_phase(
+        let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
-            HookPhase::TurnPrePromptCompile,
             &effective_policy_set,
             &effective_prompt_context_set,
         )
-        .await;
+        .await
+        .map_err(|error| {
+            warn!(
+                thread_id,
+                turn_id,
+                error_kind = error.kind(),
+                "turn prompt section hook failed before prompt construction"
+            );
+            ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
+        })?;
+        let dynamic_prompt_sections =
+            dynamic_prompt_sections_from_hook_sections(&effective_prompt_section_set)?;
 
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
             None,
             None,
+            dynamic_prompt_sections.as_slice(),
             include_task_orchestration_policy,
             continue_generation_hint,
             thread_id,
@@ -1383,19 +1416,30 @@ async fn execute_agent_provider_response(
             None
         };
 
-    run_noop_agent_turn_hook_phase(
+    let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
-        HookPhase::TurnPrePromptCompile,
         &effective_policy_set,
         &effective_prompt_context_set,
     )
-    .await;
+    .await
+    .map_err(|error| {
+        warn!(
+            thread_id,
+            turn_id,
+            error_kind = error.kind(),
+            "turn prompt section hook failed before prompt construction"
+        );
+        ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
+    })?;
+    let dynamic_prompt_sections =
+        dynamic_prompt_sections_from_hook_sections(&effective_prompt_section_set)?;
 
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
         None,
         memory_recall_prompt.clone(),
+        dynamic_prompt_sections.as_slice(),
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -1546,6 +1590,7 @@ async fn execute_agent_provider_response(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
                         memory_recall_prompt.clone(),
+                        dynamic_prompt_sections.as_slice(),
                         include_task_orchestration_policy,
                         continue_generation_hint,
                         thread_id,
@@ -1598,6 +1643,7 @@ async fn execute_agent_provider_response(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
                     None,
+                    dynamic_prompt_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -1678,6 +1724,7 @@ async fn execute_agent_provider_response(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
                             memory_recall_prompt.clone(),
+                            dynamic_prompt_sections.as_slice(),
                             include_task_orchestration_policy,
                             continue_generation_hint,
                             thread_id,
@@ -2325,6 +2372,7 @@ async fn execute_agent_provider_response(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
                     memory_recall_prompt.clone(),
+                    dynamic_prompt_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -2749,6 +2797,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             false,
             false,
             "thread_test",

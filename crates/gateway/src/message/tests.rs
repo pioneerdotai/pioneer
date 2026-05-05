@@ -4615,6 +4615,7 @@ async fn prompt_manifest_event_updates_turn_state_and_persists() {
             code: PromptManifestDiagnosticCode::MissingFile,
             message: "bootstrap file `SOUL.md` is missing".to_owned(),
             file: Some("/tmp/SOUL.md".to_owned()),
+            section_id: None,
         }],
     };
 

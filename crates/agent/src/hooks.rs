@@ -1,8 +1,8 @@
 use pioneer_hooks::{
     HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookDiagnostic,
     HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
-    HookPromptContextLimits, HookPromptContextSet, HookRuntime, HookRuntimeError, HookThreadId,
-    HookTurnId, HookValue, HookWorkspaceId,
+    HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits, HookPromptSectionSet,
+    HookRuntime, HookRuntimeError, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +60,29 @@ impl EffectiveTurnPromptContextSet {
 
     pub(super) fn clone_hook_prompt_context_set(&self) -> HookPromptContextSet {
         self.contexts.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct EffectiveTurnPromptSectionSet {
+    sections: HookPromptSectionSet,
+}
+
+impl EffectiveTurnPromptSectionSet {
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn from_hook_prompt_section_set(sections: HookPromptSectionSet) -> Self {
+        Self { sections }
+    }
+
+    pub(super) fn clone_hook_prompt_section_set(&self) -> HookPromptSectionSet {
+        self.sections.clone()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.sections.is_empty()
     }
 }
 
@@ -172,6 +195,47 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     }
 }
 
+pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
+    runtime: Option<&Arc<HookRuntime>>,
+    context: &AgentTurnHookContext,
+    policy_set: &EffectiveTurnPolicySet,
+    prompt_context_set: &EffectiveTurnPromptContextSet,
+) -> Result<EffectiveTurnPromptSectionSet, AgentTurnHookError> {
+    let Some(runtime) = runtime else {
+        return Ok(EffectiveTurnPromptSectionSet::empty());
+    };
+
+    let request = build_phase_request(
+        context,
+        HookPhase::TurnPrePromptCompile,
+        policy_set,
+        prompt_context_set,
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
+
+    match runtime.run_phase(request).await {
+        Ok(mut response) => {
+            for diagnostic in &response.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
+            }
+            let phase_diagnostics = std::mem::take(&mut response.diagnostics);
+            let mut prompt_section_set =
+                prompt_section_set_from_contributions(response.contributions);
+            prompt_section_set.diagnostics.extend(phase_diagnostics);
+            for diagnostic in &prompt_section_set.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
+            }
+            Ok(EffectiveTurnPromptSectionSet::from_hook_prompt_section_set(
+                prompt_section_set,
+            ))
+        }
+        Err(error) => {
+            warn_hook_prompt_section_runtime_error(HookPhase::TurnPrePromptCompile, &error);
+            Err(AgentTurnHookError::Runtime(error))
+        }
+    }
+}
+
 pub(super) async fn run_noop_agent_turn_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
@@ -245,6 +309,15 @@ fn prompt_context_set_from_contributions(
     HookPromptContextSet::aggregate_hook_contributions(
         contributions,
         HookPromptContextLimits::default(),
+    )
+}
+
+fn prompt_section_set_from_contributions(
+    contributions: Vec<HookContribution>,
+) -> HookPromptSectionSet {
+    HookPromptSectionSet::aggregate_hook_contributions(
+        contributions,
+        HookPromptSectionLimits::default(),
     )
 }
 
@@ -502,6 +575,124 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
                 "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+    }
+}
+
+fn warn_hook_prompt_section_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
+    match error {
+        HookRuntimeError::Registry(_) => {
+            warn!(
+                phase = %phase,
+                error_kind = "registry",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingHandler {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_handler",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookFailed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookTimedOut {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            timeout_ms,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                timeout_ms = *timeout_ms,
+                error_kind = "hook_timed_out",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::HookFailedClosed {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            error,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                hook_error_code = %error.code,
+                retryable = error.retryable,
+                safe_for_user = error.safe_for_user,
+                error_kind = "hook_failed_closed",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingFallbackContribution {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                error_kind = "missing_fallback_contribution",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::MissingDependency {
+            subscription_id,
+            dependency_id,
+            phase: error_phase,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                dependency_id = %dependency_id,
+                error_kind = "missing_dependency",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::DependencyCycle {
+            phase: error_phase,
+            subscription_ids,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_count = subscription_ids.len(),
+                error_kind = "dependency_cycle",
+                "agent turn prompt section hook phase failed; failing turn"
             );
         }
     }

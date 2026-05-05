@@ -30,4 +30,7 @@ pub use render::{
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
-pub use section::{PromptSection, PromptSectionId, PromptStability};
+pub use section::{
+    DynamicPromptSectionInput, PromptDynamicSectionId, PromptSection, PromptSectionId,
+    PromptSectionIdError, PromptStability,
+};
