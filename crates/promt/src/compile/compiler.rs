@@ -53,6 +53,16 @@ fn build_task_orchestration_policy_section() -> PromptSection {
     }
 }
 
+fn build_memory_recall_section(memory_recall: &str) -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::MemoryRecall,
+        stability: PromptStability::Dynamic,
+        title: content::SECTION_TITLE_MEMORY_RECALL.to_owned(),
+        content: memory_recall.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 fn format_file_block(file: &BudgetedBootstrapFile, include_evolution_note: bool) -> String {
     let mut block = content::IDENTITY_FILE_BLOCK_TEMPLATE
         .replace(content::IDENTITY_FILE_BLOCK_NAME_TOKEN, file.name.as_str())
@@ -199,6 +209,12 @@ fn build_source_manifest(
 
 fn build_runtime_dynamic_sections(input: &PromptCompileInput) -> Vec<PromptSection> {
     let mut sections = Vec::new();
+
+    if let Some(memory_recall) = input.memory_recall.as_deref().map(str::trim)
+        && !memory_recall.is_empty()
+    {
+        sections.push(build_memory_recall_section(memory_recall));
+    }
 
     if input.continue_generation_hint {
         sections.push(PromptSection {
@@ -429,6 +445,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
+            memory_recall: None,
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: None,
             limits: PromptLimits::default(),
@@ -453,6 +470,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
+            memory_recall: None,
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: Some("extra".to_owned()),
             limits: PromptLimits::default(),
@@ -478,6 +496,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
+            memory_recall: None,
             dynamic_context: Some("ctx".to_owned()),
             extra_system: Some("extra".to_owned()),
             limits: PromptLimits::default(),
@@ -522,6 +541,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: true,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -547,6 +567,44 @@ mod tests {
     }
 
     #[test]
+    fn memory_recall_section_is_dynamic_and_opt_in() {
+        let root = temp_workspace("memory_recall");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            memory_recall: Some("Available memory tools: memory_search".to_owned()),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let memory_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::MemoryRecall)
+            .expect("memory recall section should be present");
+        assert_eq!(
+            memory_section.stability,
+            crate::section::PromptStability::Dynamic
+        );
+        assert!(compiled.dynamic_system_text.contains("## Memory Recall"));
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("Available memory tools: memory_search")
+        );
+    }
+
+    #[test]
     fn non_identity_files_are_ignored_in_identity_only_mode() {
         let root = temp_workspace("identity_only_mode");
         std::fs::write(root.join("AGENTS.md"), "Agent rules").expect("write AGENTS");
@@ -566,6 +624,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -608,6 +667,7 @@ mod tests {
                 include_tool_recovery_policy: true,
                 include_task_orchestration_policy: false,
                 continue_generation_hint: false,
+                memory_recall: None,
                 dynamic_context: None,
                 extra_system: None,
                 limits: PromptLimits::default(),
@@ -653,6 +713,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -667,6 +728,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
+            memory_recall: None,
             dynamic_context: Some("session dynamic context".to_owned()),
             extra_system: Some("runtime override".to_owned()),
             limits: PromptLimits::default(),
@@ -696,6 +758,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -752,6 +815,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -785,6 +849,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -820,6 +885,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -845,6 +911,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -884,6 +951,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits::default(),
@@ -921,6 +989,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
+            memory_recall: None,
             dynamic_context: None,
             extra_system: None,
             limits: PromptLimits {

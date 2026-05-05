@@ -32,8 +32,12 @@ use tracing::debug;
 
 use manager_recovery::apply_recovery_adjustments;
 pub use memory::{
-    AgentMemoryProvider, MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext,
+    AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryActiveContextPolicy,
+    MemoryClassifierFallbackPolicy, MemoryExtractionPolicy, MemoryMutationToolPolicy,
+    MemoryPolicyReasonCode, MemoryPolicySource, MemoryPromptPolicy, MemoryReadToolPolicy,
+    MemoryRecallItem, MemoryRecallPolicy, MemoryRecallRequest, MemoryRecallSnapshot,
+    MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext,
+    MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
@@ -1337,6 +1341,7 @@ pub struct AgentManager {
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
+    memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
 }
 
 impl AgentManager {
@@ -1365,6 +1370,7 @@ impl AgentManager {
             mcp_tool_provider,
             task_tool_provider: RwLock::new(None),
             memory_provider: RwLock::new(memory_provider),
+            memory_turn_policy_provider: RwLock::new(None),
         }
     }
 
@@ -1374,6 +1380,13 @@ impl AgentManager {
 
     pub async fn set_memory_provider(&self, provider: Option<Arc<dyn AgentMemoryProvider>>) {
         *self.memory_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_turn_policy_provider(
+        &self,
+        provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    ) {
+        *self.memory_turn_policy_provider.write().await = provider;
     }
 
     pub async fn has_memory_provider(&self) -> bool {
@@ -1416,6 +1429,7 @@ impl AgentManager {
             self.mcp_tool_provider.clone(),
             self.task_tool_provider.read().await.clone(),
             self.memory_provider.read().await.clone(),
+            self.memory_turn_policy_provider.read().await.clone(),
             command_tx.clone(),
             command_rx,
             event_hub.clone(),

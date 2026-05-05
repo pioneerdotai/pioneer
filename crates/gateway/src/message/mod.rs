@@ -229,13 +229,25 @@ impl MessageProcessor {
             .await;
     }
 
-    #[allow(dead_code)]
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
         self.agent_manager
             .set_memory_provider(Some(Arc::new(
                 crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(self)),
             )))
             .await;
+        self.agent_manager
+            .set_memory_turn_policy_provider(Some(Arc::new(
+                crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
+                    self.provider_registry.clone(),
+                ),
+            )))
+            .await;
+    }
+
+    pub async fn bind_memory_bridge_if_enabled(self: &Arc<Self>) {
+        if self.memory_runtime.is_enabled() {
+            self.bind_memory_bridge().await;
+        }
     }
 
     #[allow(dead_code)]

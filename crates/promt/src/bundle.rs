@@ -13,6 +13,7 @@ pub struct PromptCompileInput {
     pub include_tool_recovery_policy: bool,
     pub include_task_orchestration_policy: bool,
     pub continue_generation_hint: bool,
+    pub memory_recall: Option<String>,
     pub dynamic_context: Option<String>,
     pub extra_system: Option<String>,
     pub limits: PromptLimits,

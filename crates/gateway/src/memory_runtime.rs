@@ -88,6 +88,10 @@ impl GatewayMemoryRuntime {
         self.service.clone()
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub(crate) fn operation_context(
         &self,
         workspace_id: Option<String>,
@@ -134,11 +138,6 @@ impl GatewayMemoryRuntime {
             capsules_root: None,
         }
     }
-
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     pub(crate) fn capsules_root(&self) -> Option<&Path> {
         self.capsules_root.as_deref()
     }

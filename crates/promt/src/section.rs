@@ -17,6 +17,7 @@ pub enum PromptSectionId {
     UserPersona,
     ToolRecoveryPolicy,
     TaskOrchestrationPolicy,
+    MemoryRecall,
     RecoveryContinuation,
     SkillsRuntimePrompt,
     RetryRuntimeInstruction,

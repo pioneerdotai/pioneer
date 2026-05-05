@@ -1,14 +1,16 @@
 use super::{
-    AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentStartError,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
-    RecoveryAttemptRequest, ToolLoopConfig, TurnExecutionControl,
+    AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
+    AgentStartError, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
+    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest, ToolLoopConfig,
+    TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_protocol::{
-    AgentDurableEvent, RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy, ThreadMode,
-    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode,
-    ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload, TurnItem, TurnItemType,
-    UserInput,
+    AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, RecoveryAction,
+    RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
+    ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
+    ToolRetryResolution, ToolStoragePayload, TurnItem, TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -19,7 +21,7 @@ use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind,
     ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolLoopBudgetConfig,
-    ToolRetryBudgetConfig, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
+    ToolPayload, ToolRetryBudgetConfig, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -359,6 +361,63 @@ impl AgentMemoryProvider for RecordingMemoryProvider {
     }
 }
 
+struct FakeMemoryTurnPolicyProvider {
+    contexts: std::sync::Mutex<Vec<MemoryTurnPolicyContext>>,
+    requests: std::sync::Mutex<Vec<MemoryTurnPolicyRequest>>,
+    result: Result<MemoryTurnPolicy, String>,
+}
+
+impl FakeMemoryTurnPolicyProvider {
+    fn new(policy: MemoryTurnPolicy) -> Self {
+        Self {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            requests: std::sync::Mutex::new(Vec::new()),
+            result: Ok(policy),
+        }
+    }
+
+    fn failing(error: impl Into<String>) -> Self {
+        Self {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            requests: std::sync::Mutex::new(Vec::new()),
+            result: Err(error.into()),
+        }
+    }
+
+    fn contexts(&self) -> Vec<MemoryTurnPolicyContext> {
+        self.contexts
+            .lock()
+            .expect("memory policy contexts lock poisoned")
+            .clone()
+    }
+
+    fn requests(&self) -> Vec<MemoryTurnPolicyRequest> {
+        self.requests
+            .lock()
+            .expect("memory policy requests lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryTurnPolicyProvider for FakeMemoryTurnPolicyProvider {
+    async fn resolve_memory_turn_policy(
+        &self,
+        context: MemoryTurnPolicyContext,
+        request: MemoryTurnPolicyRequest,
+    ) -> Result<MemoryTurnPolicy, String> {
+        self.contexts
+            .lock()
+            .expect("memory policy contexts lock poisoned")
+            .push(context);
+        self.requests
+            .lock()
+            .expect("memory policy requests lock poisoned")
+            .push(request);
+        self.result.clone()
+    }
+}
+
 struct MemoryFakeHandler;
 
 #[async_trait::async_trait]
@@ -372,10 +431,29 @@ impl ToolHandler for MemoryFakeHandler {
     }
 }
 
-fn fake_memory_tool_bundle() -> ToolExtensionBundle {
-    let spec = ConfiguredToolSpec::new(
+struct RecordingMemoryToolHandler {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for RecordingMemoryToolHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.calls
+            .lock()
+            .expect("memory tool calls lock poisoned")
+            .push(invocation.tool_name);
+        Ok(Box::new(FunctionToolOutput::new("memory-ok", true)))
+    }
+}
+
+fn fake_memory_tool_spec(name: &str) -> ConfiguredToolSpec {
+    ConfiguredToolSpec::new(
         ToolSpec::new(
-            "memory_fake",
+            name,
             "test-only memory tool",
             serde_json::json!({
                 "type": "object",
@@ -386,11 +464,167 @@ fn fake_memory_tool_bundle() -> ToolExtensionBundle {
         ),
         ExecutionClass::Shared,
         dynamic_unknown_output_policy(),
-    );
-    let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
+    )
+}
+
+fn fake_memory_tool_bundle_for_names(
+    names: &[&str],
+    handler: Arc<dyn ToolHandler>,
+) -> ToolExtensionBundle {
     ToolExtensionBundle {
-        specs: vec![spec],
-        handlers: vec![("memory_fake".to_owned(), handler)],
+        specs: names
+            .iter()
+            .map(|name| fake_memory_tool_spec(name))
+            .collect(),
+        handlers: names
+            .iter()
+            .map(|name| ((*name).to_owned(), handler.clone()))
+            .collect(),
+    }
+}
+
+fn fake_standard_memory_tool_bundle() -> ToolExtensionBundle {
+    let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
+    fake_memory_tool_bundle_for_names(
+        &[
+            "memory_search",
+            "memory_get",
+            "memory_remember",
+            "memory_forget",
+        ],
+        handler,
+    )
+}
+
+fn recording_standard_memory_tool_bundle()
+-> (ToolExtensionBundle, Arc<std::sync::Mutex<Vec<String>>>) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler: Arc<dyn ToolHandler> = Arc::new(RecordingMemoryToolHandler {
+        calls: calls.clone(),
+    });
+    (
+        fake_memory_tool_bundle_for_names(
+            &[
+                "memory_search",
+                "memory_get",
+                "memory_remember",
+                "memory_forget",
+            ],
+            handler,
+        ),
+        calls,
+    )
+}
+
+fn memory_recall_item(
+    memory_id: &str,
+    category: MemoryCategory,
+    key: Option<&str>,
+    content: &str,
+) -> MemoryRecallItem {
+    MemoryRecallItem {
+        memory_id: memory_id.to_owned(),
+        scope: MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "global".to_owned(),
+        },
+        category,
+        key: key.map(str::to_owned),
+        content: content.to_owned(),
+        score: Some(1.0),
+        updated_at: 1_714_867_200,
+    }
+}
+
+#[derive(Default)]
+struct StatefulMemoryProvider {
+    stored_content: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryProvider for StatefulMemoryProvider {
+    async fn recall_memory(
+        &self,
+        _context: MemoryTurnContext,
+        _request: MemoryRecallRequest,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        let Some(content) = self
+            .stored_content
+            .lock()
+            .expect("stateful memory lock poisoned")
+            .clone()
+        else {
+            return Ok(MemoryRecallSnapshot::empty());
+        };
+
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_stateful_name",
+                MemoryCategory::Identity,
+                Some("name"),
+                content.as_str(),
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    async fn materialize_memory_tools(
+        &self,
+        _context: MemoryTurnContext,
+    ) -> Result<MemoryToolMaterialization, String> {
+        let handler: Arc<dyn ToolHandler> = Arc::new(StatefulMemoryToolHandler {
+            stored_content: self.stored_content.clone(),
+        });
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_memory_tool_bundle_for_names(
+                &[
+                    "memory_search",
+                    "memory_get",
+                    "memory_remember",
+                    "memory_forget",
+                ],
+                handler,
+            )],
+            diagnostics: Vec::new(),
+        })
+    }
+}
+
+struct StatefulMemoryToolHandler {
+    stored_content: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for StatefulMemoryToolHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        match invocation.tool_name.as_str() {
+            "memory_remember" => {
+                let content = match &invocation.payload {
+                    ToolPayload::Function { arguments } => arguments
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("User's name is Alexander."),
+                    _ => "User's name is Alexander.",
+                };
+                *self
+                    .stored_content
+                    .lock()
+                    .expect("stateful memory lock poisoned") = Some(content.to_owned());
+            }
+            "memory_forget" => {
+                *self
+                    .stored_content
+                    .lock()
+                    .expect("stateful memory lock poisoned") = None;
+            }
+            _ => {}
+        }
+        Ok(Box::new(FunctionToolOutput::new("memory-ok", true)))
     }
 }
 
@@ -976,7 +1210,10 @@ async fn memory_provider_recall_error_degrades_gracefully() {
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
         Err("recall unavailable".to_owned()),
-        Ok(MemoryToolMaterialization::default()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
     ));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
@@ -996,7 +1233,14 @@ async fn memory_provider_recall_error_degrades_gracefully() {
     assert_turn_completed(&observed);
 
     assert_eq!(memory_provider.recall_contexts().len(), 1);
-    assert_eq!(provider.snapshot_requests().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(!prompt.full_system_text.contains("recall unavailable"));
 }
 
 #[tokio::test]
@@ -1033,6 +1277,12 @@ async fn memory_provider_tool_materialization_error_degrades_gracefully() {
         .as_ref()
         .expect("agent request should include built-in tools");
     assert!(!tools.iter().any(|tool| tool.name == "memory_fake"));
+    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("## Memory Recall"));
 }
 
 #[tokio::test]
@@ -1040,7 +1290,13 @@ async fn memory_provider_receives_turn_context_for_agent_mode() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let memory_provider = Arc::new(RecordingMemoryProvider::ok());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
     let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
     manager
         .set_memory_provider(Some(memory_trait_provider))
@@ -1090,6 +1346,13 @@ async fn chat_mode_does_not_call_memory_provider_by_default() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::explicit_remember(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
 
     let observed = start_simple_turn(
         &manager,
@@ -1106,6 +1369,7 @@ async fn chat_mode_does_not_call_memory_provider_by_default() {
     assert!(memory_provider.recall_contexts().is_empty());
     assert!(memory_provider.recall_requests().is_empty());
     assert!(memory_provider.tool_contexts().is_empty());
+    assert!(policy_provider.contexts().is_empty());
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_none());
@@ -1120,7 +1384,7 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
         Ok(MemoryRecallSnapshot::empty()),
         Ok(MemoryToolMaterialization {
-            bundles: vec![fake_memory_tool_bundle()],
+            bundles: vec![fake_standard_memory_tool_bundle()],
             diagnostics: vec!["test memory tool diagnostic".to_owned()],
         }),
     ));
@@ -1149,16 +1413,773 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
         .tools
         .as_ref()
         .expect("agent request should include tools");
-    assert!(tools.iter().any(|tool| tool.name == "memory_fake"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
     let prompt = requests[0]
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(!prompt.full_system_text.contains("Memory Recall"));
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains(
+        "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+    ));
     assert!(
         !prompt
             .full_system_text
             .contains("test memory tool diagnostic")
+    );
+}
+
+#[tokio::test]
+async fn identity_recall_prompt_contains_relevant_memory() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_identity_name",
+                MemoryCategory::Identity,
+                Some("name"),
+                "User's name is Alexander.",
+            )],
+            diagnostics: vec!["internal recall diagnostic".to_owned()],
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_identity_recall",
+        "ws_memory_identity_recall",
+        "turn_memory_identity_recall",
+        ThreadMode::Agent,
+        "capture",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include memory tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("User's name is Alexander.")
+    );
+    assert!(prompt.full_system_text.contains("mem_identity_name"));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("internal recall diagnostic")
+    );
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|section| section == "memory_recall")
+    );
+}
+
+#[tokio::test]
+async fn memory_provider_without_tools_has_no_policy_or_recall() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_should_not_render",
+                MemoryCategory::Identity,
+                Some("name"),
+                "User's name is Alexander.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization::default()),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_no_tools",
+        "ws_memory_no_tools",
+        "turn_memory_no_tools",
+        ThreadMode::Agent,
+        "capture",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert!(memory_provider.recall_contexts().is_empty());
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include built-in tools");
+    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("## Memory Recall"));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("User's name is Alexander.")
+    );
+}
+
+#[tokio::test]
+async fn memory_policy_classifier_no_use_disables_recall_without_phrase_matching() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_ignore",
+                MemoryCategory::Preference,
+                Some("city"),
+                "User likes Porto.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(MemoryTurnPolicy::no_use()));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_ignore",
+        "ws_memory_ignore",
+        "turn_memory_ignore",
+        ThreadMode::Agent,
+        "capture",
+        "No uses la memoria para esta respuesta; responde directamente.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(policy_provider.contexts().len(), 1);
+    assert!(memory_provider.tool_contexts().is_empty());
+    assert!(memory_provider.recall_contexts().is_empty());
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include built-in tools");
+    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("## Memory Recall"));
+    assert!(!prompt.full_system_text.contains("User likes Porto."));
+}
+
+#[tokio::test]
+async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_russian_ignore",
+                MemoryCategory::Preference,
+                Some("city"),
+                "User likes Porto.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::no_save(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_no_save",
+        "ws_memory_no_save",
+        "turn_memory_no_save",
+        ThreadMode::Agent,
+        "capture",
+        "Speichere das nicht, aber nutze vorhandenen Kontext falls hilfreich.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(policy_provider.contexts().len(), 1);
+    let policy_requests = policy_provider.requests();
+    assert_eq!(policy_requests.len(), 1);
+    assert_eq!(
+        policy_requests[0].default_policy.post_turn_extraction,
+        MemoryExtractionPolicy::Disabled
+    );
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
+    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Memory writes are disabled for this turn")
+    );
+    assert!(prompt.full_system_text.contains("User likes Porto."));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Do not store, update, infer, or extract new memories")
+    );
+}
+
+#[tokio::test]
+async fn memory_policy_invalid_classifier_json_uses_default_allow_fallback() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_fallback",
+                MemoryCategory::Preference,
+                Some("city"),
+                "User likes Porto.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::failing(
+        "classifier_invalid_json",
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_policy_fallback",
+        "ws_memory_policy_fallback",
+        "turn_memory_policy_fallback",
+        ThreadMode::Agent,
+        "capture",
+        "Ayudame con el proyecto.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(policy_provider.contexts().len(), 1);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include memory tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("User likes Porto."));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Call memory_remember proactively")
+    );
+}
+
+#[tokio::test]
+async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insufficient() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_search_policy",
+        "ws_memory_search_policy",
+        "turn_memory_search_policy",
+        ThreadMode::Agent,
+        "capture",
+        "do you remember my birthday?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include memory tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("If unsure on a non-trivial task, do one lightweight memory_search")
+    );
+    assert!(!prompt.full_system_text.contains("Relevant memories:"));
+}
+
+#[tokio::test]
+async fn memory_policy_default_allows_proactive_remember_tool() {
+    let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_memory_remember_proactive".to_owned(),
+            name: "memory_remember".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+        "remembered",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![memory_bundle],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::proactive_write_allowed(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_proactive_remember_tool",
+        "ws_memory_proactive_remember_tool",
+        "turn_memory_proactive_remember_tool",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "I prefer concise answers for architecture proposals.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("memory tool calls lock poisoned")
+            .as_slice(),
+        &["memory_remember".to_owned()]
+    );
+    assert_eq!(policy_provider.contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert!(requests.len() >= 2);
+    let first_request = &requests[0];
+    let tools = first_request
+        .tools
+        .as_ref()
+        .expect("first request should include memory tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
+    let first_prompt = first_request
+        .compiled_prompt
+        .as_ref()
+        .expect("first request should include prompt");
+    assert!(
+        first_prompt
+            .full_system_text
+            .contains("Call memory_remember proactively")
+    );
+}
+
+#[tokio::test]
+async fn explicit_remember_request_can_trigger_memory_remember() {
+    let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_memory_remember".to_owned(),
+            name: "memory_remember".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+        "remembered",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![memory_bundle],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::explicit_remember(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_remember_tool",
+        "ws_memory_remember_tool",
+        "turn_memory_remember_tool",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "remember that my name is Alexander",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("memory tool calls lock poisoned")
+            .as_slice(),
+        &["memory_remember".to_owned()]
+    );
+    assert_eq!(policy_provider.contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert!(requests.len() >= 2);
+    let first_prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("first request should include prompt");
+    assert!(
+        first_prompt
+            .full_system_text
+            .contains("Call memory_remember proactively")
+    );
+}
+
+#[tokio::test]
+async fn explicit_forget_request_can_trigger_memory_forget() {
+    let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_memory_forget".to_owned(),
+            name: "memory_forget".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+        "forgotten",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![memory_bundle],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned())),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_forget_tool",
+        "ws_memory_forget_tool",
+        "turn_memory_forget_tool",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "forget my birthday",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("memory tool calls lock poisoned")
+            .as_slice(),
+        &["memory_forget".to_owned()]
+    );
+    assert_eq!(policy_provider.contexts().len(), 1);
+    assert!(memory_provider.recall_contexts().is_empty());
+    let requests = provider.snapshot_requests();
+    assert!(requests.len() >= 2);
+    let first_request = &requests[0];
+    let tools = first_request
+        .tools
+        .as_ref()
+        .expect("first request should include memory tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
+    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
+    let first_prompt = first_request
+        .compiled_prompt
+        .as_ref()
+        .expect("first request should include prompt");
+    assert!(
+        first_prompt
+            .full_system_text
+            .contains("If the user asks you to forget something, call memory_forget.")
+    );
+    assert!(
+        first_prompt
+            .full_system_text
+            .contains("only to identify and forget")
+    );
+    assert!(!first_prompt.full_system_text.contains("Relevant memories:"));
+}
+
+#[tokio::test]
+async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() {
+    let remember_provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_stateful_memory_remember".to_owned(),
+            name: "memory_remember".to_owned(),
+            arguments: serde_json::json!({
+                "content": "User's name is Alexander.",
+                "category": "identity",
+                "scope": "user",
+                "key": "name",
+                "source": "explicit_user_request"
+            })
+            .to_string(),
+        }],
+        "remembered",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-remember",
+        remember_provider.clone(),
+    ));
+    let manager = AgentManager::new(registry.clone(), test_tool_loop_config());
+    let memory_provider = Arc::new(StatefulMemoryProvider::default());
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider;
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_stateful_memory_remember",
+        "ws_stateful_memory",
+        "turn_stateful_memory_remember",
+        ThreadMode::Agent,
+        "sequenced-remember",
+        "remember that my name is Alexander",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let recall_provider = Arc::new(CaptureAgentProvider::default());
+    registry.insert("capture-recall", recall_provider.clone());
+    let observed = start_simple_turn(
+        &manager,
+        "thr_stateful_memory_recall_new",
+        "ws_stateful_memory",
+        "turn_stateful_memory_recall_new",
+        ThreadMode::Agent,
+        "capture-recall",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let recall_requests = recall_provider.snapshot_requests();
+    assert_eq!(recall_requests.len(), 1);
+    let recall_prompt = recall_requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("recall turn should include prompt");
+    assert!(recall_prompt.full_system_text.contains("## Memory Recall"));
+    assert!(
+        recall_prompt
+            .full_system_text
+            .contains("User's name is Alexander.")
+    );
+
+    let forget_provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_stateful_memory_forget".to_owned(),
+            name: "memory_forget".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+        "forgotten",
+    ));
+    registry.insert("sequenced-forget", forget_provider);
+    let observed = start_simple_turn(
+        &manager,
+        "thr_stateful_memory_forget",
+        "ws_stateful_memory",
+        "turn_stateful_memory_forget",
+        ThreadMode::Agent,
+        "sequenced-forget",
+        "forget my name",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let after_forget_provider = Arc::new(CaptureAgentProvider::default());
+    registry.insert("capture-after-forget", after_forget_provider.clone());
+    let observed = start_simple_turn(
+        &manager,
+        "thr_stateful_memory_after_forget",
+        "ws_stateful_memory",
+        "turn_stateful_memory_after_forget",
+        ThreadMode::Agent,
+        "capture-after-forget",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let after_forget_requests = after_forget_provider.snapshot_requests();
+    assert_eq!(after_forget_requests.len(), 1);
+    let after_forget_prompt = after_forget_requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("after-forget turn should include prompt");
+    assert!(
+        after_forget_prompt
+            .full_system_text
+            .contains("## Memory Recall")
+    );
+    assert!(
+        !after_forget_prompt
+            .full_system_text
+            .contains("User's name is Alexander.")
+    );
+    assert!(
+        !after_forget_prompt
+            .full_system_text
+            .contains("Relevant memories:")
     );
 }
 
@@ -1263,6 +2284,81 @@ async fn tool_loop_provider_round_budget_requests_final_no_tools_round() {
         tool_result_message_count(&requests[2]),
         2,
         "only tool calls from the two tool-capable rounds should reach model history"
+    );
+}
+
+#[tokio::test]
+async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    config.budget.max_agent_rounds_per_turn = 2;
+    config.budget.max_tool_calls_per_turn = 16;
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_loop_budget",
+                MemoryCategory::Identity,
+                Some("name"),
+                "User's name is Alexander.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let mut events = start_loop_budget_turn(
+        &manager,
+        "thr_loop_budget_memory_policy",
+        "turn_loop_budget_memory_policy",
+    )
+    .await;
+
+    let observed_events = recv_events_until_terminal(&mut events).await;
+    assert!(matches!(
+        observed_events.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0]
+            .tools
+            .as_ref()
+            .expect("first round should include tools")
+            .iter()
+            .any(|tool| tool.name == "memory_search")
+    );
+    assert!(
+        requests[0]
+            .compiled_prompt
+            .as_ref()
+            .expect("first round should include prompt")
+            .full_system_text
+            .contains("## Memory Recall")
+    );
+    assert!(requests[2].tools.is_none());
+    assert!(
+        !requests[2]
+            .compiled_prompt
+            .as_ref()
+            .expect("final no-tools round should include prompt")
+            .full_system_text
+            .contains("## Memory Recall")
     );
 }
 

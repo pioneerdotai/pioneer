@@ -5,6 +5,7 @@ mod database;
 mod helpers;
 mod mcp_secrets;
 mod mcp_service;
+mod memory_policy;
 mod memory_runtime;
 #[allow(dead_code)]
 mod memory_tools;
@@ -358,6 +359,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     ));
 
     message_processor.bind_task_bridge().await;
+    message_processor.bind_memory_bridge_if_enabled().await;
     message_processor
         .cleanup_stale_skill_uploads(now_timestamp_secs())
         .await;

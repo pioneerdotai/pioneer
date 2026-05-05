@@ -9304,21 +9304,23 @@ async fn memory_provider_recall_calls_memory_service() {
 }
 
 #[tokio::test]
-async fn memory_bridge_is_not_bound_by_default_before_phase_10() {
-    let harness = setup_memory_gateway_harness("bridge_default", true).await;
+async fn memory_bridge_binds_when_runtime_enabled_for_phase_10() {
+    let harness = setup_memory_gateway_harness("bridge_explicit", true).await;
 
-    assert!(!harness.processor.agent_manager.has_memory_provider().await);
+    harness.processor.bind_memory_bridge_if_enabled().await;
+
+    assert!(harness.processor.agent_manager.has_memory_provider().await);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
 #[tokio::test]
-async fn memory_bridge_can_be_bound_explicitly_for_phase_09_tests() {
-    let harness = setup_memory_gateway_harness("bridge_explicit", true).await;
+async fn memory_bridge_not_bound_when_runtime_disabled() {
+    let harness = setup_memory_gateway_harness("bridge_disabled", false).await;
 
-    harness.processor.bind_memory_bridge().await;
+    harness.processor.bind_memory_bridge_if_enabled().await;
 
-    assert!(harness.processor.agent_manager.has_memory_provider().await);
+    assert!(!harness.processor.agent_manager.has_memory_provider().await);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }

@@ -19,6 +19,13 @@ pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
 pub use profile::PromptProfile;
 pub use render::{
+    memory_recall::{
+        MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
+        render_memory_recall_prompt,
+    },
+    memory_turn_policy::{
+        MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,
+    },
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
 };

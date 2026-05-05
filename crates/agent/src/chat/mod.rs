@@ -9,20 +9,24 @@ use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
 };
+use crate::memory::{
+    filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
+    resolve_memory_turn_policy,
+};
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, AgentMemoryProvider, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext, RetainedToolLlmContext, TaskToolMaterialization,
-    TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
-    TurnExecutionControl,
+    AgentMcpToolProvider, AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicyContext,
+    MemoryTurnPolicyRequest, RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider,
+    TaskTurnContext, TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_promt::{
     CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptLimits, PromptProfile,
-    PromptSectionId, ToolRetryInstructionKind, compile_prompt, render_tool_retry_instruction,
-    tool_loop_final_answer_instruction,
+    PromptSectionId, ToolRetryInstructionKind, compile_prompt, render_memory_recall_prompt,
+    render_tool_retry_instruction, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
@@ -170,6 +174,7 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
 fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
+    memory_recall: Option<String>,
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -186,6 +191,7 @@ fn compile_agent_prompt_bundle(
         prompt_root.as_path(),
         skills_prompt,
         retry_instruction,
+        memory_recall,
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -197,6 +203,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
+    memory_recall: Option<String>,
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -218,6 +225,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         include_tool_recovery_policy: true,
         include_task_orchestration_policy,
         continue_generation_hint,
+        memory_recall,
         dynamic_context: None,
         extra_system: Some(extra_system),
         limits: PromptLimits::default(),
@@ -333,6 +341,7 @@ fn prompt_section_id(section_id: PromptSectionId) -> &'static str {
         PromptSectionId::UserPersona => "user_persona",
         PromptSectionId::ToolRecoveryPolicy => "tool_recovery_policy",
         PromptSectionId::TaskOrchestrationPolicy => "task_orchestration_policy",
+        PromptSectionId::MemoryRecall => "memory_recall",
         PromptSectionId::RecoveryContinuation => "recovery_continuation",
         PromptSectionId::SkillsRuntimePrompt => "skills_runtime_prompt",
         PromptSectionId::RetryRuntimeInstruction => "retry_runtime_instruction",
@@ -452,6 +461,7 @@ pub(super) async fn execute_chat_turn_flow(
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
+    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
@@ -494,6 +504,7 @@ pub(super) async fn execute_chat_turn_flow(
                 mcp_tool_provider,
                 task_tool_provider,
                 memory_provider,
+                memory_turn_policy_provider,
                 turn_control.clone(),
                 recovery,
                 &workspace_id,
@@ -717,8 +728,8 @@ fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
     MemoryRecallRequest {
         query: input_text.to_owned(),
         categories: Vec::new(),
-        top_k: None,
-        max_chars: None,
+        top_k: Some(5),
+        max_chars: Some(1_500),
     }
 }
 
@@ -978,6 +989,7 @@ async fn execute_agent_provider_response(
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
+    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
     workspace_id: &str,
@@ -991,6 +1003,7 @@ async fn execute_agent_provider_response(
         .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
 
     let tool_loop_config = tool_loop_config.normalized();
+    let provider_tool_calling = provider.capabilities().tool_calling;
 
     let memory_context = memory_turn_context(
         workspace_id,
@@ -999,12 +1012,28 @@ async fn execute_agent_provider_response(
         ThreadMode::Agent,
         user_message.text_content_lossy(),
     );
-    let _memory_recall_snapshot = load_memory_recall_snapshot(
-        memory_provider.as_ref(),
-        memory_context.clone(),
-        memory_recall_request(memory_context.input_text.as_str()),
+    let memory_turn_policy = resolve_memory_turn_policy(
+        memory_turn_policy_provider.as_ref(),
+        MemoryTurnPolicyContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            mode: ThreadMode::Agent,
+            input_text: memory_context.input_text.clone(),
+            model: Some(model.clone()),
+            model_provider: Some(provider.name().to_owned()),
+        },
+        MemoryTurnPolicyRequest::default(),
     )
     .await;
+    for diagnostic in &memory_turn_policy.diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            diagnostic = diagnostic.as_str(),
+            "memory turn policy reported diagnostic"
+        );
+    }
 
     let mcp_availability =
         load_mcp_availability(mcp_tool_provider.as_ref(), workspace_id, thread_id, turn_id).await;
@@ -1072,7 +1101,7 @@ async fn execute_agent_provider_response(
 
     let skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
 
-    let task_materialization = if provider.capabilities().tool_calling {
+    let task_materialization = if provider_tool_calling {
         materialize_task_tooling(
             task_tool_provider.as_ref(),
             workspace_id,
@@ -1093,26 +1122,27 @@ async fn execute_agent_provider_response(
     }
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
-    let initial_prompt_bundle = compile_agent_prompt_bundle(
-        skills_prompt.clone(),
-        None,
-        include_task_orchestration_policy,
-        continue_generation_hint,
-        thread_id,
-        turn_id,
-    )?;
+    if !provider_tool_calling {
+        let initial_prompt_bundle = compile_agent_prompt_bundle(
+            skills_prompt.clone(),
+            None,
+            None,
+            include_task_orchestration_policy,
+            continue_generation_hint,
+            thread_id,
+            turn_id,
+        )?;
 
-    emit_durable_event(
-        event_tx.as_ref(),
-        AgentDurableEvent::PromptManifestCompiled {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            manifest: prompt_manifest_from_bundle(&initial_prompt_bundle),
-        },
-    )
-    .await?;
+        emit_durable_event(
+            event_tx.as_ref(),
+            AgentDurableEvent::PromptManifestCompiled {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                manifest: prompt_manifest_from_bundle(&initial_prompt_bundle),
+            },
+        )
+        .await?;
 
-    if !provider.capabilities().tool_calling {
         let result = execute_standard_provider_response(
             provider,
             model,
@@ -1139,6 +1169,22 @@ async fn execute_agent_provider_response(
         return result;
     }
 
+    let memory_tool_materialization = if memory_turn_policy.allows_any_memory_tool() {
+        let raw_materialization =
+            materialize_memory_tooling(memory_provider.as_ref(), memory_context.clone()).await;
+        filter_memory_tool_materialization(raw_materialization, &memory_turn_policy)
+    } else {
+        MemoryToolMaterialization::default()
+    };
+    for diagnostic in &memory_tool_materialization.diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            diagnostic = diagnostic.as_str(),
+            "memory tool materialization reported diagnostic"
+        );
+    }
+
     let mcp_materialization =
         materialize_mcp_tooling(mcp_tool_provider.as_ref(), workspace_id, turn_id, thread_id).await;
     for diagnostic in &mcp_materialization.diagnostics {
@@ -1149,8 +1195,6 @@ async fn execute_agent_provider_response(
             "MCP dynamic tool materialization reported diagnostic"
         );
     }
-    let memory_tool_materialization =
-        materialize_memory_tooling(memory_provider.as_ref(), memory_context.clone()).await;
     let skill_tool_materialization = skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
         &tool_loop_config.skills,
@@ -1252,6 +1296,57 @@ async fn execute_agent_provider_response(
         .into_iter()
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
+    let all_tool_name_set = all_tool_names.iter().cloned().collect::<BTreeSet<_>>();
+    let available_memory_tool_names = memory_tool_names(&memory_tool_materialization)
+        .into_iter()
+        .filter(|name| all_tool_name_set.contains(name))
+        .collect::<Vec<_>>();
+    let memory_recall_snapshot =
+        if memory_turn_policy.allow_pre_turn_recall() && !available_memory_tool_names.is_empty() {
+            load_memory_recall_snapshot(
+                memory_provider.as_ref(),
+                memory_context.clone(),
+                memory_recall_request(memory_context.input_text.as_str()),
+            )
+            .await
+        } else {
+            MemoryRecallSnapshot::empty()
+        };
+    let memory_recall_prompt =
+        if memory_turn_policy.allow_memory_prompt() && !available_memory_tool_names.is_empty() {
+            if let Some(prompt_policy) = memory_turn_policy.recall_prompt_policy() {
+                let prompt_input = memory_recall_prompt_input(
+                    available_memory_tool_names,
+                    prompt_policy,
+                    memory_recall_snapshot,
+                );
+                render_memory_recall_prompt(&prompt_input)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let initial_prompt_bundle = compile_agent_prompt_bundle(
+        skills_prompt.clone(),
+        None,
+        memory_recall_prompt.clone(),
+        include_task_orchestration_policy,
+        continue_generation_hint,
+        thread_id,
+        turn_id,
+    )?;
+
+    emit_durable_event(
+        event_tx.as_ref(),
+        AgentDurableEvent::PromptManifestCompiled {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            manifest: prompt_manifest_from_bundle(&initial_prompt_bundle),
+        },
+    )
+    .await?;
 
     let mut visible_tool_names = all_tool_names.clone();
 
@@ -1377,6 +1472,7 @@ async fn execute_agent_provider_response(
                     let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
+                        memory_recall_prompt.clone(),
                         include_task_orchestration_policy,
                         continue_generation_hint,
                         thread_id,
@@ -1421,6 +1517,33 @@ async fn execute_agent_provider_response(
                 None
             };
 
+            let round_compiled_prompt = if round_plan.tools_enabled || memory_recall_prompt.is_none()
+            {
+                active_compiled_prompt.clone()
+            } else {
+                let prompt_without_memory = compile_agent_prompt_bundle(
+                    skills_prompt.clone(),
+                    applied_retry_instruction.clone(),
+                    None,
+                    include_task_orchestration_policy,
+                    continue_generation_hint,
+                    thread_id,
+                    turn_id,
+                )
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                emit_durable_event(
+                    event_tx.as_ref(),
+                    AgentDurableEvent::PromptManifestCompiled {
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        manifest: prompt_manifest_from_bundle(&prompt_without_memory),
+                    },
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                Some(compiled_prompt_payload_from_bundle(&prompt_without_memory))
+            };
+
             let round = provider::request_agent_round(
                 provider,
                 ChatRequest {
@@ -1431,7 +1554,7 @@ async fn execute_agent_provider_response(
                     tools: tool_definitions,
                     tool_choice: None,
                     parallel_tool_calls: round_plan.tools_enabled.then_some(true),
-                    compiled_prompt: active_compiled_prompt.clone(),
+                    compiled_prompt: round_compiled_prompt,
                 },
                 workspace_id,
                 thread_id,
@@ -1481,6 +1604,7 @@ async fn execute_agent_provider_response(
                         let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
+                            memory_recall_prompt.clone(),
                             include_task_orchestration_policy,
                             continue_generation_hint,
                             thread_id,
@@ -2127,6 +2251,7 @@ async fn execute_agent_provider_response(
                 let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
+                    memory_recall_prompt.clone(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -2536,6 +2661,7 @@ mod tests {
 
         let bundle = compile_agent_prompt_bundle_with_prompt_root(
             runtime_home.as_path(),
+            None,
             None,
             None,
             false,

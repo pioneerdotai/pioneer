@@ -5,6 +5,7 @@ pub const SECTION_TITLE_SOUL_CORE: &str = "Soul Core";
 pub const SECTION_TITLE_IDENTITY_CORE: &str = "Identity Core";
 pub const SECTION_TITLE_USER_PERSONA: &str = "User Persona";
 pub const SECTION_TITLE_TASK_ORCHESTRATION_POLICY: &str = "Task Orchestration";
+pub const SECTION_TITLE_MEMORY_RECALL: &str = "Memory Recall";
 pub const SECTION_TITLE_RECOVERY_CONTINUATION: &str = "Recovery Continuation";
 pub const SECTION_TITLE_SKILLS_RUNTIME: &str = "Skills Runtime";
 pub const SECTION_TITLE_RETRY_INSTRUCTION: &str = "Retry Instruction";
