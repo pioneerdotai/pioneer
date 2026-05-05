@@ -1,10 +1,15 @@
 use super::{
     ActiveTurnRequest, AgentCommand, AgentEventHub, AgentMcpToolProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentStartError, TaskToolProvider, TaskTurnContext,
-    ToolLoopConfig, TurnExecutionControl, TurnTaskFailure,
+    ToolLoopConfig, TurnExecutionControl, TurnTaskCompletion, TurnTaskFailure,
 };
 use crate::chat;
-use pioneer_hooks::HookRuntime;
+use crate::hooks::{
+    AgentPostTurnHookDispatchPolicy, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
+    AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+    run_agent_turn_post_turn_hook_phase,
+};
+use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{AgentDurableEvent, RecoveryAttemptContext, ThreadMode, UserInput};
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::sync::Arc;
@@ -25,6 +30,7 @@ pub(super) async fn run_agent_loop(
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
+    post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
@@ -114,7 +120,7 @@ pub(super) async fn run_agent_loop(
             AgentCommand::TurnTaskFinished {
                 turn_id,
                 run_id,
-                result,
+                completion,
             } => {
                 if active_turn_id.as_deref() != Some(turn_id.as_str()) {
                     continue;
@@ -130,6 +136,11 @@ pub(super) async fn run_agent_loop(
                 active_turn_run_id = None;
                 active_recovery = None;
 
+                let TurnTaskCompletion {
+                    result,
+                    post_turn_dispatch,
+                } = completion;
+
                 match result {
                     Ok(()) => {
                         active_turn_id = None;
@@ -143,6 +154,11 @@ pub(super) async fn run_agent_loop(
                             },
                         )
                         .await;
+                        maybe_spawn_post_turn_hook_dispatch(
+                            hook_runtime.clone(),
+                            post_turn_hook_dispatch_policy,
+                            post_turn_dispatch,
+                        );
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
                         active_turn_id = None;
@@ -155,30 +171,52 @@ pub(super) async fn run_agent_loop(
                             format!("parent turn failed: {error}"),
                         )
                         .await;
+                        let error_for_dispatch = error.clone();
                         publish_loop_durable_event(
                             event_hub.as_ref(),
                             AgentDurableEvent::TurnFailed {
                                 thread_id: thread_id.clone(),
-                                turn_id,
+                                turn_id: turn_id.clone(),
                                 error,
                                 recovery,
                             },
                         )
                         .await;
+                        let failure_dispatch = post_turn_dispatch.or_else(|| {
+                            synthesize_post_turn_failure_dispatch(
+                                workspace_id.as_str(),
+                                thread_id.as_str(),
+                                turn_id.as_str(),
+                                turn_request_snapshot.as_ref(),
+                                TurnPostTurnStatus::Failed,
+                                error_for_dispatch,
+                            )
+                        });
+                        maybe_spawn_post_turn_hook_dispatch(
+                            hook_runtime.clone(),
+                            post_turn_hook_dispatch_policy,
+                            failure_dispatch,
+                        );
                     }
                     Err(TurnTaskFailure::ProviderFailure {
                         item_id,
                         item_type,
                         failure,
                     }) => {
-                        last_turn_request = turn_request_snapshot;
+                        last_turn_request = turn_request_snapshot.clone();
                         active_turn_id = None;
                         active_turn_request = None;
+                        let failure_message = failure.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "provider failure: {:?} during {:?}",
+                                failure.class, failure.stage
+                            )
+                        });
                         publish_loop_durable_event(
                             event_hub.as_ref(),
                             AgentDurableEvent::ProviderFailureDetected {
                                 thread_id: thread_id.clone(),
-                                turn_id,
+                                turn_id: turn_id.clone(),
                                 item_id,
                                 item_type,
                                 failure,
@@ -186,6 +224,21 @@ pub(super) async fn run_agent_loop(
                             },
                         )
                         .await;
+                        let failure_dispatch = post_turn_dispatch.or_else(|| {
+                            synthesize_post_turn_failure_dispatch(
+                                workspace_id.as_str(),
+                                thread_id.as_str(),
+                                turn_id.as_str(),
+                                turn_request_snapshot.as_ref(),
+                                TurnPostTurnStatus::ProviderFailure,
+                                failure_message,
+                            )
+                        });
+                        maybe_spawn_post_turn_hook_dispatch(
+                            hook_runtime.clone(),
+                            post_turn_hook_dispatch_policy,
+                            failure_dispatch,
+                        );
                     }
                 }
             }
@@ -269,6 +322,7 @@ pub(super) async fn run_agent_loop(
                         let _ = task.await;
                     }
                 }
+                let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.take();
                 active_turn_id = None;
                 active_turn_control = None;
@@ -284,16 +338,30 @@ pub(super) async fn run_agent_loop(
                     format!("parent turn cancelled: {reason}"),
                 )
                 .await;
+                let reason_for_dispatch = reason.clone();
                 publish_loop_durable_event(
                     event_hub.as_ref(),
                     AgentDurableEvent::TurnInterrupted {
                         thread_id: thread_id.clone(),
-                        turn_id,
+                        turn_id: turn_id.clone(),
                         reason,
                         recovery,
                     },
                 )
                 .await;
+                let interrupted_dispatch = synthesize_post_turn_failure_dispatch(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    turn_request_snapshot.as_ref(),
+                    TurnPostTurnStatus::Interrupted,
+                    reason_for_dispatch,
+                );
+                maybe_spawn_post_turn_hook_dispatch(
+                    hook_runtime.clone(),
+                    post_turn_hook_dispatch_policy,
+                    interrupted_dispatch,
+                );
             }
             AgentCommand::StartRecoveryAttempt { request, ack } => {
                 if active_turn_id.is_none()
@@ -503,7 +571,7 @@ fn spawn_turn_task(
             .send(AgentCommand::TurnTaskFinished {
                 turn_id: turn_request.turn_id,
                 run_id,
-                result,
+                completion: result,
             })
             .await;
     })
@@ -541,7 +609,7 @@ async fn execute_turn_flow(
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_hub: Arc<AgentEventHub>,
-) -> Result<(), TurnTaskFailure> {
+) -> TurnTaskCompletion {
     match mode {
         ThreadMode::Chat | ThreadMode::Agent => chat::execute_chat_turn_flow(
             thread_id,
@@ -567,17 +635,30 @@ async fn execute_turn_flow(
             event_hub,
         )
         .await
-        .map_err(|error| match error {
-            chat::ChatTurnError::Terminal(message) => TurnTaskFailure::Terminal(message),
-            chat::ChatTurnError::ProviderFailure {
-                item_id,
-                item_type,
-                failure,
-            } => TurnTaskFailure::ProviderFailure {
-                item_id,
-                item_type,
-                failure,
-            },
+        .map(|outcome| TurnTaskCompletion {
+            result: Ok(()),
+            post_turn_dispatch: outcome.post_turn_dispatch,
+        })
+        .unwrap_or_else(|error| {
+            let (error, post_turn_dispatch) = error.into_parts();
+            TurnTaskCompletion {
+                result: Err(match error {
+                    chat::ChatTurnError::Terminal(message) => TurnTaskFailure::Terminal(message),
+                    chat::ChatTurnError::ProviderFailure {
+                        item_id,
+                        item_type,
+                        failure,
+                    } => TurnTaskFailure::ProviderFailure {
+                        item_id,
+                        item_type,
+                        failure,
+                    },
+                    chat::ChatTurnError::WithPostTurnDispatch { .. } => {
+                        unreachable!("post-turn dispatch wrapper should be unwrapped")
+                    }
+                }),
+                post_turn_dispatch,
+            }
         }),
     }
 }
@@ -586,6 +667,65 @@ async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurab
     if let Err(error) = event_hub.publish_durable(event).await {
         error!(error = %error, "failed to publish durable agent loop event");
     }
+}
+
+fn maybe_spawn_post_turn_hook_dispatch(
+    hook_runtime: Option<Arc<HookRuntime>>,
+    policy: AgentPostTurnHookDispatchPolicy,
+    dispatch: Option<AgentTurnPostTurnHookDispatch>,
+) {
+    let Some(dispatch) = dispatch else {
+        return;
+    };
+    if !policy.should_dispatch(dispatch.status()) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        run_agent_turn_post_turn_hook_phase(hook_runtime.as_ref(), dispatch).await;
+    });
+}
+
+fn synthesize_post_turn_failure_dispatch(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    turn_request: Option<&ActiveTurnRequest>,
+    status: TurnPostTurnStatus,
+    error: String,
+) -> Option<AgentTurnPostTurnHookDispatch> {
+    let Some(turn_request) = turn_request else {
+        return None;
+    };
+    if turn_request.mode != ThreadMode::Agent {
+        return None;
+    }
+
+    let summary = AgentTurnPostTurnSummary::failed(
+        status,
+        turn_request_user_text(turn_request.input.as_slice()),
+        error,
+    );
+    Some(AgentTurnPostTurnHookDispatch::new(
+        AgentTurnHookContext::new(workspace_id, thread_id, turn_id),
+        EffectiveTurnPolicySet::empty(),
+        EffectiveTurnPromptContextSet::empty(),
+        summary,
+    ))
+}
+
+fn turn_request_user_text(input: &[UserInput]) -> String {
+    let mut parts = Vec::new();
+
+    for item in input {
+        if let UserInput::Text { text, .. } = item
+            && !text.is_empty()
+        {
+            parts.push(text.clone());
+        }
+    }
+
+    parts.join("\n")
 }
 
 async fn cleanup_attached_tasks(

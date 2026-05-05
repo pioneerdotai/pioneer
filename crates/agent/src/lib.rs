@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+pub use hooks::AgentPostTurnHookDispatchPolicy;
 use manager_recovery::apply_recovery_adjustments;
 pub use memory::{
     AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryActiveContextPolicy,
@@ -1176,6 +1177,12 @@ enum TurnTaskFailure {
 }
 
 #[derive(Debug)]
+struct TurnTaskCompletion {
+    result: Result<(), TurnTaskFailure>,
+    post_turn_dispatch: Option<hooks::AgentTurnPostTurnHookDispatch>,
+}
+
+#[derive(Debug)]
 enum AgentCommand {
     StartTurn {
         turn_id: String,
@@ -1190,7 +1197,7 @@ enum AgentCommand {
     TurnTaskFinished {
         turn_id: String,
         run_id: u64,
-        result: Result<(), TurnTaskFailure>,
+        completion: TurnTaskCompletion,
     },
     CancelAttempt {
         turn_id: String,
@@ -1345,6 +1352,7 @@ pub struct AgentManager {
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
+    post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
 }
 
 impl AgentManager {
@@ -1375,6 +1383,7 @@ impl AgentManager {
             memory_provider: RwLock::new(memory_provider),
             memory_turn_policy_provider: RwLock::new(None),
             hook_runtime: RwLock::new(None),
+            post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
         }
     }
 
@@ -1396,6 +1405,14 @@ impl AgentManager {
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
         // Existing loops keep the runtime snapshot captured by ensure_thread.
         *self.hook_runtime.write().await = runtime;
+    }
+
+    pub async fn set_post_turn_hook_dispatch_policy(
+        &self,
+        policy: AgentPostTurnHookDispatchPolicy,
+    ) {
+        // Existing loops keep the policy snapshot captured by ensure_thread.
+        *self.post_turn_hook_dispatch_policy.write().await = policy;
     }
 
     pub async fn has_memory_provider(&self) -> bool {
@@ -1444,6 +1461,7 @@ impl AgentManager {
             self.memory_provider.read().await.clone(),
             self.memory_turn_policy_provider.read().await.clone(),
             self.hook_runtime.read().await.clone(),
+            *self.post_turn_hook_dispatch_policy.read().await,
             command_tx.clone(),
             command_rx,
             event_hub.clone(),

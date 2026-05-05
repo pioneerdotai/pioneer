@@ -1188,10 +1188,7 @@ mod tests {
         HookPhaseRequest::new(
             HookPhase::TurnPrePromptCompile,
             HookContext::default(),
-            HookInput {
-                kind: crate::HookInputKind::TurnPrePromptCompile,
-                payload: crate::HookValue::Null,
-            },
+            HookInput::empty(crate::HookInputKind::TurnPrePromptCompile),
         )
     }
 

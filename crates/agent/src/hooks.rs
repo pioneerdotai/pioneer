@@ -3,8 +3,9 @@ use pioneer_hooks::{
     HookDiagnostic, HookId, HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest,
     HookPolicySet, HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits,
     HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError,
-    HookSectionId, HookSubscriptionId, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
-    PromptManifestDiagnosticContribution,
+    HookSectionId, HookSubscriptionId, HookThreadId, HookTurnId, HookWorkspaceId,
+    PromptManifestDiagnosticContribution, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
+    TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolEventSummary,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
 const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AgentTurnHookContext {
     workspace_id: String,
     thread_id: String,
@@ -29,6 +30,153 @@ impl AgentTurnHookContext {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPostTurnHookDispatchPolicy {
+    pub on_success: bool,
+    pub on_terminal_failure: bool,
+    pub on_provider_failure: bool,
+    pub on_interrupted: bool,
+}
+
+impl Default for AgentPostTurnHookDispatchPolicy {
+    fn default() -> Self {
+        Self {
+            on_success: true,
+            on_terminal_failure: false,
+            on_provider_failure: false,
+            on_interrupted: false,
+        }
+    }
+}
+
+impl AgentPostTurnHookDispatchPolicy {
+    pub fn success_only() -> Self {
+        Self::default()
+    }
+
+    pub fn include_failures(mut self) -> Self {
+        self.on_terminal_failure = true;
+        self.on_provider_failure = true;
+        self
+    }
+
+    pub(crate) fn should_dispatch(self, status: TurnPostTurnStatus) -> bool {
+        match status {
+            TurnPostTurnStatus::Succeeded => self.on_success,
+            TurnPostTurnStatus::Failed => self.on_terminal_failure,
+            TurnPostTurnStatus::ProviderFailure => self.on_provider_failure,
+            TurnPostTurnStatus::Interrupted => self.on_interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AgentTurnPostTurnSummary {
+    status: TurnPostTurnStatus,
+    user_text: String,
+    assistant_text: String,
+    error: Option<String>,
+    tool_events: Vec<TurnPostTurnToolEventSummary>,
+    domain_events: Vec<TurnPostTurnDomainEventSummary>,
+}
+
+impl AgentTurnPostTurnSummary {
+    pub(super) fn succeeded(
+        user_text: String,
+        assistant_text: String,
+        tool_events: Vec<TurnPostTurnToolEventSummary>,
+        domain_events: Vec<TurnPostTurnDomainEventSummary>,
+    ) -> Self {
+        Self {
+            status: TurnPostTurnStatus::Succeeded,
+            user_text,
+            assistant_text,
+            error: None,
+            tool_events,
+            domain_events,
+        }
+    }
+
+    pub(super) fn failed(status: TurnPostTurnStatus, user_text: String, error: String) -> Self {
+        Self::failed_with_events(
+            status,
+            user_text,
+            String::new(),
+            error,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn failed_with_events(
+        status: TurnPostTurnStatus,
+        user_text: String,
+        assistant_text: String,
+        error: String,
+        tool_events: Vec<TurnPostTurnToolEventSummary>,
+        domain_events: Vec<TurnPostTurnDomainEventSummary>,
+    ) -> Self {
+        debug_assert!(matches!(
+            status,
+            TurnPostTurnStatus::Failed
+                | TurnPostTurnStatus::ProviderFailure
+                | TurnPostTurnStatus::Interrupted
+        ));
+        Self {
+            status,
+            user_text,
+            assistant_text,
+            error: Some(error),
+            tool_events,
+            domain_events,
+        }
+    }
+
+    fn status(&self) -> TurnPostTurnStatus {
+        self.status
+    }
+
+    fn into_hook_input(self) -> TurnPostTurnHookInput {
+        TurnPostTurnHookInput::from_parts(
+            self.status,
+            Some(self.user_text.as_str()),
+            Some(self.assistant_text.as_str()),
+            self.error.as_deref(),
+            self.tool_events,
+            self.domain_events,
+            TurnPostTurnHookInputLimits::default(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AgentTurnPostTurnHookDispatch {
+    context: AgentTurnHookContext,
+    policy_set: EffectiveTurnPolicySet,
+    prompt_context_set: EffectiveTurnPromptContextSet,
+    summary: AgentTurnPostTurnSummary,
+}
+
+impl AgentTurnPostTurnHookDispatch {
+    pub(super) fn new(
+        context: AgentTurnHookContext,
+        policy_set: EffectiveTurnPolicySet,
+        prompt_context_set: EffectiveTurnPromptContextSet,
+        summary: AgentTurnPostTurnSummary,
+    ) -> Self {
+        Self {
+            context,
+            policy_set,
+            prompt_context_set,
+            summary,
+        }
+    }
+
+    pub(super) fn status(&self) -> TurnPostTurnStatus {
+        self.summary.status()
     }
 }
 
@@ -613,11 +761,64 @@ pub(super) async fn run_noop_agent_turn_hook_phase(
     }
 }
 
+pub(super) async fn run_agent_turn_post_turn_hook_phase(
+    runtime: Option<&Arc<HookRuntime>>,
+    dispatch: AgentTurnPostTurnHookDispatch,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+
+    let phase = HookPhase::TurnPostTurn;
+    let request = match build_phase_request_with_input(
+        &dispatch.context,
+        phase,
+        &dispatch.policy_set,
+        &dispatch.prompt_context_set,
+        HookInput::turn_post_turn(dispatch.summary.into_hook_input()),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(
+                phase = %phase,
+                error = %error,
+                "skipping agent turn post-turn hook because context could not be built"
+            );
+            return;
+        }
+    };
+
+    match runtime.run_phase(request).await {
+        Ok(response) => {
+            for diagnostic in response.diagnostics {
+                warn_hook_diagnostic(phase, &diagnostic);
+            }
+        }
+        Err(error) => warn_hook_runtime_error(phase, &error),
+    }
+}
+
 fn build_phase_request(
     context: &AgentTurnHookContext,
     phase: HookPhase,
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
+) -> Result<HookPhaseRequest, HookIdError> {
+    build_phase_request_with_input(
+        context,
+        phase,
+        policy_set,
+        prompt_context_set,
+        HookInput::empty(HookInputKind::from(phase)),
+    )
+}
+
+fn build_phase_request_with_input(
+    context: &AgentTurnHookContext,
+    phase: HookPhase,
+    policy_set: &EffectiveTurnPolicySet,
+    prompt_context_set: &EffectiveTurnPromptContextSet,
+    input: HookInput,
 ) -> Result<HookPhaseRequest, HookIdError> {
     let request = HookPhaseRequest::new(
         phase,
@@ -633,10 +834,7 @@ fn build_phase_request(
             now_unix: Some(current_unix_timestamp()),
             ..HookContext::default()
         },
-        HookInput {
-            kind: HookInputKind::from(phase),
-            payload: HookValue::Null,
-        },
+        input,
     )
     .with_policy_set(policy_set.clone_hook_policy_set())
     .with_prompt_context_set(prompt_context_set.clone_hook_prompt_context_set());

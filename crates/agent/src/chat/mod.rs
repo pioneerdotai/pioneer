@@ -10,11 +10,13 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use crate::hooks::{
-    AgentTurnHookContext, EffectiveTurnPromptManifestHookContributionKind,
-    EffectiveTurnPromptManifestHookDiagnosticCode, EffectiveTurnPromptManifestHookMetadata,
-    EffectiveTurnPromptManifestHookSource, EffectiveTurnPromptSectionSet,
-    run_agent_turn_policy_hook_phase, run_agent_turn_prompt_compile_hook_phase,
-    run_agent_turn_prompt_context_hook_phase, run_noop_agent_turn_hook_phase,
+    AgentTurnHookContext, AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary,
+    EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+    EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
+    EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
+    EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
+    run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
+    run_noop_agent_turn_hook_phase,
 };
 use crate::memory::{
     filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
@@ -30,7 +32,11 @@ use crate::{
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
-use pioneer_hooks::{HookPhase, HookRuntime};
+use pioneer_hooks::{
+    HookPhase, HookRuntime, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
+    TurnPostTurnToolErrorClass, TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus,
+    TurnPostTurnToolStatus,
+};
 use pioneer_promt::{
     CompiledPromptBundle, DynamicPromptSectionInput, PromptCompileInput, PromptDiagnosticCode,
     PromptDynamicSectionId, PromptLimits, PromptProfile, ToolRetryInstructionKind, compile_prompt,
@@ -51,9 +57,9 @@ use pioneer_provider::{
 };
 use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
-    RawToolCall, ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolRecoveryView,
-    ToolRetryController, ToolRetryDecision, ToolRetryObservation, build_builtin_tools, build_tools,
-    classify_tool_error,
+    RawToolCall, ToolErrorClass, ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome,
+    ToolOutcomeStatus, ToolRecoveryView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools, build_tools, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -123,6 +129,72 @@ impl ExecutedToolResult {
     }
 }
 
+fn append_text_fragment(target: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(fragment);
+}
+
+fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnToolEventSummary {
+    TurnPostTurnToolEventSummary {
+        item_id: result.item_id.clone(),
+        item_type: format!("{:?}", result.item_type),
+        tool_name: result.tool_name.clone(),
+        attempt_number: result.attempt_number,
+        status: if result.success {
+            TurnPostTurnToolStatus::Succeeded
+        } else {
+            TurnPostTurnToolStatus::Failed
+        },
+        outcome_status: Some(post_turn_tool_outcome_status(result.outcome.status)),
+        error_class: result.outcome.error_class.map(post_turn_tool_error_class),
+    }
+}
+
+fn post_turn_domain_event_summary_from_tool(
+    result: &ExecutedToolResult,
+) -> TurnPostTurnDomainEventSummary {
+    TurnPostTurnDomainEventSummary {
+        domain: TurnPostTurnDomain::Tool,
+        code: Some(if result.success {
+            "tool.succeeded".to_owned()
+        } else {
+            "tool.failed".to_owned()
+        }),
+        item_id: Some(result.item_id.clone()),
+        message: None,
+    }
+}
+
+fn post_turn_tool_outcome_status(status: ToolOutcomeStatus) -> TurnPostTurnToolOutcomeStatus {
+    match status {
+        ToolOutcomeStatus::Ok => TurnPostTurnToolOutcomeStatus::Ok,
+        ToolOutcomeStatus::RecoverableError => TurnPostTurnToolOutcomeStatus::RecoverableError,
+        ToolOutcomeStatus::FatalError => TurnPostTurnToolOutcomeStatus::FatalError,
+        ToolOutcomeStatus::PartialSuccess => TurnPostTurnToolOutcomeStatus::PartialSuccess,
+    }
+}
+
+fn post_turn_tool_error_class(error_class: ToolErrorClass) -> TurnPostTurnToolErrorClass {
+    match error_class {
+        ToolErrorClass::InvalidArguments => TurnPostTurnToolErrorClass::InvalidArguments,
+        ToolErrorClass::NotFound => TurnPostTurnToolErrorClass::NotFound,
+        ToolErrorClass::PermissionDenied => TurnPostTurnToolErrorClass::PermissionDenied,
+        ToolErrorClass::CommandNotFound => TurnPostTurnToolErrorClass::CommandNotFound,
+        ToolErrorClass::Timeout => TurnPostTurnToolErrorClass::Timeout,
+        ToolErrorClass::Cancelled => TurnPostTurnToolErrorClass::Cancelled,
+        ToolErrorClass::ExecutionFailed => TurnPostTurnToolErrorClass::ExecutionFailed,
+        ToolErrorClass::NeedsNarrowing => TurnPostTurnToolErrorClass::NeedsNarrowing,
+        ToolErrorClass::Internal => TurnPostTurnToolErrorClass::Internal,
+        ToolErrorClass::OutputTruncated => TurnPostTurnToolErrorClass::OutputTruncated,
+        ToolErrorClass::Unknown => TurnPostTurnToolErrorClass::Unknown,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {
     Terminal(String),
@@ -131,10 +203,86 @@ pub(super) enum ChatTurnError {
         item_type: TurnItemType,
         failure: ProviderFailureDetails,
     },
+    WithPostTurnDispatch {
+        error: Box<ChatTurnError>,
+        post_turn_dispatch: AgentTurnPostTurnHookDispatch,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ChatTurnOutcome {
+    pub(super) post_turn_dispatch: Option<AgentTurnPostTurnHookDispatch>,
+}
+
+impl ChatTurnError {
+    pub(super) fn into_parts(self) -> (Self, Option<AgentTurnPostTurnHookDispatch>) {
+        match self {
+            Self::WithPostTurnDispatch {
+                error,
+                post_turn_dispatch,
+            } => (*error, Some(post_turn_dispatch)),
+            other => (other, None),
+        }
+    }
 }
 
 fn agent_event_error(error: AgentEventHubError) -> ChatTurnError {
     ChatTurnError::Terminal(format!("failed to publish agent event: {error}"))
+}
+
+fn chat_error_post_turn_status(error: &ChatTurnError) -> pioneer_hooks::TurnPostTurnStatus {
+    match error {
+        ChatTurnError::ProviderFailure { .. } => pioneer_hooks::TurnPostTurnStatus::ProviderFailure,
+        ChatTurnError::Terminal(_) | ChatTurnError::WithPostTurnDispatch { .. } => {
+            pioneer_hooks::TurnPostTurnStatus::Failed
+        }
+    }
+}
+
+fn chat_error_preview(error: &ChatTurnError) -> String {
+    match error {
+        ChatTurnError::Terminal(message) => message.clone(),
+        ChatTurnError::ProviderFailure { failure, .. } => {
+            failure.message.clone().unwrap_or_else(|| {
+                format!(
+                    "provider failure: {:?} during {:?}",
+                    failure.class, failure.stage
+                )
+            })
+        }
+        ChatTurnError::WithPostTurnDispatch { error, .. } => chat_error_preview(error),
+    }
+}
+
+fn with_post_turn_failure_dispatch(
+    error: ChatTurnError,
+    hook_context: AgentTurnHookContext,
+    effective_policy_set: EffectiveTurnPolicySet,
+    effective_prompt_context_set: EffectiveTurnPromptContextSet,
+    user_text: String,
+    assistant_text: String,
+    tool_events: Vec<TurnPostTurnToolEventSummary>,
+    domain_events: Vec<TurnPostTurnDomainEventSummary>,
+) -> ChatTurnError {
+    let status = chat_error_post_turn_status(&error);
+    let error_preview = chat_error_preview(&error);
+    let summary = AgentTurnPostTurnSummary::failed_with_events(
+        status,
+        user_text,
+        assistant_text,
+        error_preview,
+        tool_events,
+        domain_events,
+    );
+    ChatTurnError::WithPostTurnDispatch {
+        error: Box::new(error),
+        post_turn_dispatch: AgentTurnPostTurnHookDispatch::new(
+            hook_context,
+            effective_policy_set,
+            effective_prompt_context_set,
+            summary,
+        ),
+    }
 }
 
 async fn emit_durable_event(
@@ -628,7 +776,7 @@ pub(super) async fn execute_chat_turn_flow(
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
-) -> Result<(), ChatTurnError> {
+) -> Result<ChatTurnOutcome, ChatTurnError> {
     let user_message = build_user_message(input.as_slice());
 
     let thinking_item_id = generate_id(TURN_ITEM_ID_LEN);
@@ -652,34 +800,35 @@ pub(super) async fn execute_chat_turn_flow(
     .await?;
 
     let result = match mode {
-        ThreadMode::Agent => {
-            execute_agent_provider_response(
-                &provider,
-                model,
-                history,
-                user_message.clone(),
-                &input,
-                &workspace_skill_policies,
-                retained_llm_context,
-                force_non_stream,
-                continue_generation_hint,
-                tool_loop_config,
-                mcp_tool_provider,
-                task_tool_provider,
-                memory_provider,
-                memory_turn_policy_provider,
-                hook_runtime,
-                turn_control.clone(),
-                recovery,
-                &workspace_id,
-                &thread_id,
-                &turn_id,
-                thinking_item_id,
-                &message_item_id,
-                event_tx.clone(),
-            )
-            .await
-        }
+        ThreadMode::Agent => execute_agent_provider_response(
+            &provider,
+            model,
+            history,
+            user_message.clone(),
+            &input,
+            &workspace_skill_policies,
+            retained_llm_context,
+            force_non_stream,
+            continue_generation_hint,
+            tool_loop_config,
+            mcp_tool_provider,
+            task_tool_provider,
+            memory_provider,
+            memory_turn_policy_provider,
+            hook_runtime,
+            turn_control.clone(),
+            recovery,
+            &workspace_id,
+            &thread_id,
+            &turn_id,
+            thinking_item_id,
+            &message_item_id,
+            event_tx.clone(),
+        )
+        .await
+        .map(|post_turn_dispatch| ChatTurnOutcome {
+            post_turn_dispatch: Some(post_turn_dispatch),
+        }),
         ThreadMode::Chat => {
             let result = execute_standard_provider_response(
                 &provider,
@@ -723,12 +872,12 @@ pub(super) async fn execute_chat_turn_flow(
                 .await?;
             }
 
-            result
+            result.map(|_| ChatTurnOutcome::default())
         }
     };
 
     match result {
-        Ok(()) => Ok(()),
+        Ok(outcome) => Ok(outcome),
         Err(e) => Err(e),
     }
 }
@@ -747,7 +896,7 @@ async fn execute_standard_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
-) -> Result<(), ChatTurnError> {
+) -> Result<String, ChatTurnError> {
     let mut messages = history;
 
     messages.push(user_message);
@@ -1163,7 +1312,7 @@ async fn execute_agent_provider_response(
     initial_thinking_item_id: String,
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
-) -> Result<(), ChatTurnError> {
+) -> Result<AgentTurnPostTurnHookDispatch, ChatTurnError> {
     let workdir = std::env::current_dir()
         .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
 
@@ -1378,21 +1527,37 @@ async fn execute_agent_provider_response(
         )
         .await;
 
-        if result.is_ok() {
-            turn_control
-                .succeed_recovery_attempt(turn_id, recovery.take())
-                .await;
-            run_noop_agent_turn_hook_phase(
-                hook_runtime.as_ref(),
-                &hook_context,
-                HookPhase::TurnPostTurn,
-                &effective_policy_set,
-                &effective_prompt_context_set,
-            )
-            .await;
+        match result {
+            Ok(assistant_text) => {
+                turn_control
+                    .succeed_recovery_attempt(turn_id, recovery.take())
+                    .await;
+                let summary = AgentTurnPostTurnSummary::succeeded(
+                    extract_user_text(input),
+                    assistant_text,
+                    Vec::new(),
+                    Vec::new(),
+                );
+                return Ok(AgentTurnPostTurnHookDispatch::new(
+                    hook_context,
+                    effective_policy_set,
+                    effective_prompt_context_set,
+                    summary,
+                ));
+            }
+            Err(error) => {
+                return Err(with_post_turn_failure_dispatch(
+                    error,
+                    hook_context,
+                    effective_policy_set,
+                    effective_prompt_context_set,
+                    extract_user_text(input),
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
         }
-
-        return result;
     }
 
     let memory_tool_materialization = if memory_turn_policy.allows_any_memory_tool() {
@@ -1664,6 +1829,9 @@ async fn execute_agent_provider_response(
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
     let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
+    let mut post_turn_assistant_text = String::new();
+    let mut post_turn_tool_events = Vec::new();
+    let mut post_turn_domain_events = Vec::new();
 
     let turn_result: Result<(), (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
@@ -1831,6 +1999,7 @@ async fn execute_agent_provider_response(
             )
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
+            append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
 
             turn_control
                 .succeed_recovery_attempt(turn_id, recovery.take())
@@ -2442,6 +2611,16 @@ async fn execute_agent_provider_response(
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
             }
+            post_turn_tool_events.extend(
+                executed_results
+                    .iter()
+                    .map(post_turn_tool_event_summary),
+            );
+            post_turn_domain_events.extend(
+                executed_results
+                    .iter()
+                    .map(post_turn_domain_event_summary_from_tool),
+            );
 
             tooling::maybe_update_visible_tools_from_suggestions(
                 executed_results.as_slice(),
@@ -2558,8 +2737,6 @@ async fn execute_agent_provider_response(
         }
     }
     .await;
-    let turn_succeeded = turn_result.is_ok();
-
     skill_tool_materialization
         .clear_function_proxy_runtime()
         .await;
@@ -2569,19 +2746,21 @@ async fn execute_agent_provider_response(
 
     let _ = tool_event_forwarder.await;
 
-    if turn_succeeded {
-        run_noop_agent_turn_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
-            HookPhase::TurnPostTurn,
-            &effective_policy_set,
-            &effective_prompt_context_set,
-        )
-        .await;
-    }
-
     match turn_result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let summary = AgentTurnPostTurnSummary::succeeded(
+                extract_user_text(input),
+                post_turn_assistant_text,
+                post_turn_tool_events,
+                post_turn_domain_events,
+            );
+            Ok(AgentTurnPostTurnHookDispatch::new(
+                hook_context,
+                effective_policy_set,
+                effective_prompt_context_set,
+                summary,
+            ))
+        }
         Err((error, thinking_id)) => {
             emit_durable_event(
                 event_tx.as_ref(),
@@ -2599,7 +2778,7 @@ async fn execute_agent_provider_response(
                 },
             )
             .await?;
-            Err(match error {
+            let error = match error {
                 ChatTurnError::ProviderFailure {
                     item_id,
                     item_type,
@@ -2614,7 +2793,17 @@ async fn execute_agent_provider_response(
                     failure,
                 },
                 other => other,
-            })
+            };
+            Err(with_post_turn_failure_dispatch(
+                error,
+                hook_context,
+                effective_policy_set,
+                effective_prompt_context_set,
+                extract_user_text(input),
+                post_turn_assistant_text,
+                post_turn_tool_events,
+                post_turn_domain_events,
+            ))
         }
     }
 }

@@ -172,7 +172,7 @@ pub(super) async fn stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
-) -> Result<(), ChatTurnError> {
+) -> Result<String, ChatTurnError> {
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
@@ -404,6 +404,8 @@ pub(super) async fn stream_provider_response(
         .await?;
     }
 
+    let assistant_text = full_text;
+
     super::emit_durable_event(
         event_tx,
         AgentDurableEvent::ItemCompleted {
@@ -413,7 +415,7 @@ pub(super) async fn stream_provider_response(
                 turn_id: turn_id.to_owned(),
                 item: TurnItem::AgentMessage {
                     id: message_item_id.to_owned(),
-                    text: full_text,
+                    text: assistant_text.clone(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -422,7 +424,7 @@ pub(super) async fn stream_provider_response(
     )
     .await?;
 
-    Ok(())
+    Ok(assistant_text)
 }
 
 pub(super) async fn non_stream_provider_response(
@@ -434,7 +436,7 @@ pub(super) async fn non_stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
-) -> Result<(), ChatTurnError> {
+) -> Result<String, ChatTurnError> {
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
@@ -490,7 +492,9 @@ pub(super) async fn non_stream_provider_response(
     )
     .await?;
 
-    if !response.text.is_empty() {
+    let assistant_text = response.text;
+
+    if !assistant_text.is_empty() {
         super::emit_progress_event(
             event_tx,
             AgentProgressEvent::ItemDelta {
@@ -499,7 +503,7 @@ pub(super) async fn non_stream_provider_response(
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     item_id: message_item_id.to_owned(),
-                    delta: response.text.clone(),
+                    delta: assistant_text.clone(),
                     stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
                     payload: None,
                     markdown: None,
@@ -519,7 +523,7 @@ pub(super) async fn non_stream_provider_response(
                 turn_id: turn_id.to_owned(),
                 item: TurnItem::AgentMessage {
                     id: message_item_id.to_owned(),
-                    text: response.text,
+                    text: assistant_text.clone(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -528,7 +532,7 @@ pub(super) async fn non_stream_provider_response(
     )
     .await?;
 
-    Ok(())
+    Ok(assistant_text)
 }
 
 fn response_stream_target<'a>(

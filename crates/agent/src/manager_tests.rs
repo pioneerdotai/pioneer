@@ -1,27 +1,29 @@
 use super::{
     AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
-    AgentStartError, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest, ToolLoopConfig,
-    TurnExecutionControl,
+    AgentPostTurnHookDispatchPolicy, AgentStartError, MemoryExtractionPolicy, MemoryRecallItem,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
+    ToolLoopConfig, TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookContextMode,
     HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity,
     HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
-    HookHandlerResponse, HookId, HookInputKind, HookKind, HookPhase, HookPolicyKey, HookPolicySet,
-    HookPromptContent, HookPromptContextSet, HookPromptSectionTitle, HookRegistry, HookRuntime,
-    HookSectionId, HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue,
-    PolicyContribution, PromptContextContribution, PromptManifestDiagnosticContribution,
-    PromptSectionContribution,
+    HookHandlerResponse, HookId, HookInputKind, HookInputPayload, HookKind, HookPhase,
+    HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptContextSet, HookPromptSectionTitle,
+    HookRegistry, HookRuntime, HookSectionId, HookSubscription, HookSubscriptionId,
+    HookSubscriptionRegistry, HookValue, PolicyContribution, PromptContextContribution,
+    PromptManifestDiagnosticContribution, PromptSectionContribution, TurnPostTurnStatus,
+    TurnPostTurnToolStatus,
 };
 use pioneer_protocol::{
-    AgentDurableEvent, MemoryCategory, MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode,
-    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookTruncation,
-    RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction,
-    ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
-    ToolRetryResolution, ToolStoragePayload, TurnItem, TurnItemType, UserInput,
+    AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
+    MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookTruncation, RecoveryAction, RecoveryAttemptContext,
+    StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload,
+    TurnItem, TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -156,12 +158,28 @@ impl Provider for PendingProvider {
     }
 }
 
-#[derive(Default)]
 struct CaptureAgentProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
+    response_text: String,
+}
+
+impl Default for CaptureAgentProvider {
+    fn default() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            response_text: "done".to_owned(),
+        }
+    }
 }
 
 impl CaptureAgentProvider {
+    fn with_response_text(response_text: impl Into<String>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            response_text: response_text.into(),
+        }
+    }
+
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
         self.requests
             .lock()
@@ -182,7 +200,7 @@ const PHASE_07_HOOK_PHASES: [HookPhase; 5] = [
 struct RecordedHookCall {
     phase: HookPhase,
     input_kind: HookInputKind,
-    payload: HookValue,
+    payload: HookInputPayload,
     workspace_id: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -353,6 +371,56 @@ fn recording_hook_runtime_with_phase_failures_and_fallback(
     Arc::new(HookRuntime::new(handlers, subscriptions))
 }
 
+fn recording_hook_runtime_for_phase(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    phase: HookPhase,
+    await_policy: HookAwaitPolicy,
+    failure_policy: HookFailurePolicy,
+) -> Arc<HookRuntime> {
+    recording_hook_runtime_for_phase_with_failures(
+        calls,
+        phase,
+        await_policy,
+        failure_policy,
+        Vec::new(),
+    )
+}
+
+fn recording_hook_runtime_for_phase_with_failures(
+    calls: Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    phase: HookPhase,
+    await_policy: HookAwaitPolicy,
+    failure_policy: HookFailurePolicy,
+    fail_phases: Vec<HookPhase>,
+) -> Arc<HookRuntime> {
+    let handlers = Arc::new(HookRegistry::new());
+    let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+    let hook_id = HookId::new("test.phase12_recorder").expect("valid hook id");
+    handlers
+        .register_handler(Arc::new(RecordingHookHandler {
+            hook_id: hook_id.clone(),
+            calls,
+            contributions: Vec::new(),
+            fail_phases,
+        }))
+        .expect("recording hook registers");
+
+    subscriptions
+        .register_subscription(
+            handlers.as_ref(),
+            HookSubscription::new(phase_07_subscription_id(phase), hook_id, phase)
+                .with_execution_policy(HookExecutionPolicy {
+                    await_policy,
+                    timeout_ms: None,
+                    max_parallelism: None,
+                })
+                .with_failure_policy(failure_policy),
+        )
+        .expect("recording hook subscription registers");
+
+    Arc::new(HookRuntime::new(handlers, subscriptions))
+}
+
 fn policy_contribution(
     domain: &str,
     key: &str,
@@ -510,6 +578,60 @@ fn snapshot_hook_calls(
         .lock()
         .expect("recording hook calls lock poisoned")
         .clone()
+}
+
+async fn wait_for_hook_calls(
+    calls: &Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    expected_len: usize,
+) -> Vec<RecordedHookCall> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = snapshot_hook_calls(calls);
+        if snapshot.len() >= expected_len {
+            return snapshot;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {expected_len} hook calls; observed {snapshot:?}");
+        }
+        yield_now().await;
+    }
+}
+
+async fn wait_for_hook_phase(
+    calls: &Arc<std::sync::Mutex<Vec<RecordedHookCall>>>,
+    phase: HookPhase,
+) -> RecordedHookCall {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(call) = snapshot_hook_calls(calls)
+            .into_iter()
+            .find(|call| call.phase == phase)
+        {
+            return call;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for hook phase {phase}");
+        }
+        yield_now().await;
+    }
+}
+
+async fn wait_for_background_hook_queue(runtime: &HookRuntime, expected_len: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let len = runtime
+            .queued_background_len()
+            .expect("background queue len");
+        if len >= expected_len {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {expected_len} queued background hook runs; observed {len}"
+            );
+        }
+        yield_now().await;
+    }
 }
 
 fn stable_request_projection(request: &ChatRequest) -> serde_json::Value {
@@ -1241,7 +1363,7 @@ impl Provider for CaptureAgentProvider {
             .expect("capture provider lock poisoned")
             .push(request);
         Ok(ChatResponse {
-            text: "done".to_owned(),
+            text: self.response_text.clone(),
             usage: None,
             reasoning_content: None,
             tool_calls: Vec::new(),
@@ -1609,7 +1731,7 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
     .await;
     assert_turn_completed(&observed);
 
-    let calls = snapshot_hook_calls(&calls);
+    let calls = wait_for_hook_calls(&calls, PHASE_07_HOOK_PHASES.len()).await;
     assert_eq!(calls.len(), PHASE_07_HOOK_PHASES.len());
     assert_eq!(
         calls.iter().map(|call| call.phase).collect::<Vec<_>>(),
@@ -1617,7 +1739,28 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
     );
     for call in calls {
         assert_eq!(call.input_kind, HookInputKind::from(call.phase));
-        assert_eq!(call.payload, HookValue::Null);
+        if call.phase == HookPhase::TurnPostTurn {
+            let HookInputPayload::TurnPostTurn(payload) = &call.payload else {
+                panic!("post-turn call should receive typed post-turn payload");
+            };
+            assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+            assert_eq!(
+                payload
+                    .user_text
+                    .as_ref()
+                    .map(|preview| preview.text.as_str()),
+                Some("phase 07 agent hook phases")
+            );
+            assert_eq!(
+                payload
+                    .assistant_text
+                    .as_ref()
+                    .map(|preview| preview.text.as_str()),
+                Some("done")
+            );
+        } else {
+            assert_eq!(call.payload, HookInputPayload::Empty);
+        }
         assert_eq!(call.workspace_id.as_deref(), Some("ws_phase07_agent_hooks"));
         assert_eq!(call.thread_id.as_deref(), Some("thr_phase07_agent_hooks"));
         assert_eq!(call.turn_id.as_deref(), Some("turn_phase07_agent_hooks"));
@@ -1659,7 +1802,7 @@ async fn phase_07_agent_mode_without_tool_calling_calls_each_hook_phase_once() {
     .await;
     assert_turn_completed(&observed);
 
-    let calls = snapshot_hook_calls(&calls);
+    let calls = wait_for_hook_calls(&calls, PHASE_07_HOOK_PHASES.len()).await;
     assert_eq!(calls.len(), PHASE_07_HOOK_PHASES.len());
     assert_eq!(
         calls.iter().map(|call| call.phase).collect::<Vec<_>>(),
@@ -1785,6 +1928,332 @@ async fn phase_07_non_prompt_section_contributions_do_not_affect_agent_request()
             .iter()
             .any(|event| matches!(event, AgentEvent::SkillAuditEvents { .. }))
     );
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_runs_after_success_with_summary_input() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_success",
+        "ws_phase12_success",
+        "turn_phase12_success",
+        ThreadMode::Agent,
+        "capture",
+        "phase 12 user text",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
+        panic!("post-turn hook should receive typed post-turn payload");
+    };
+    assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+    assert_eq!(
+        payload
+            .user_text
+            .as_ref()
+            .map(|preview| preview.text.as_str()),
+        Some("phase 12 user text")
+    );
+    assert_eq!(
+        payload
+            .assistant_text
+            .as_ref()
+            .map(|preview| preview.text.as_str()),
+        Some("done")
+    );
+    assert!(payload.error.is_none());
+    assert!(payload.tool_events.is_empty());
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_phase12_tool_summary".to_owned(),
+            name: "tool_suggest".to_owned(),
+            arguments: serde_json::json!({"intent": "find a tool"}).to_string(),
+        }],
+        "final after tool",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_tool_summary",
+        "ws_phase12_tool_summary",
+        "turn_phase12_tool_summary",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "phase 12 tool summary",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
+        panic!("post-turn hook should receive typed post-turn payload");
+    };
+    assert_eq!(
+        payload
+            .assistant_text
+            .as_ref()
+            .map(|preview| preview.text.as_str()),
+        Some("final after tool")
+    );
+    let tool_event = payload
+        .tool_events
+        .iter()
+        .find(|event| event.tool_name == "tool_suggest")
+        .expect("tool_suggest event should be summarized");
+    assert_eq!(tool_event.item_id, "call_phase12_tool_summary");
+    assert_eq!(tool_event.status, TurnPostTurnToolStatus::Succeeded);
+    assert!(!payload.tool_events_truncated);
+    assert!(payload.domain_events.iter().any(|event| {
+        event.item_id.as_deref() == Some("call_phase12_tool_summary")
+            && event.code.as_deref() == Some("tool.succeeded")
+    }));
+    assert_eq!(provider.snapshot_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_receives_bounded_summary_input() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let long_user_text = "u".repeat(4_200);
+    let long_assistant_text = "a".repeat(4_200);
+    let provider = Arc::new(CaptureAgentProvider::with_response_text(
+        long_assistant_text.clone(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_bounded",
+        "ws_phase12_bounded",
+        "turn_phase12_bounded",
+        ThreadMode::Agent,
+        "capture",
+        long_user_text.as_str(),
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
+        panic!("post-turn hook should receive typed post-turn payload");
+    };
+    let user_preview = payload.user_text.as_ref().expect("user preview");
+    assert!(user_preview.truncated);
+    assert_eq!(user_preview.original_chars, 4_200);
+    assert_eq!(user_preview.text.chars().count(), user_preview.max_chars);
+    assert_ne!(user_preview.text, long_user_text);
+
+    let assistant_preview = payload.assistant_text.as_ref().expect("assistant preview");
+    assert!(assistant_preview.truncated);
+    assert_eq!(assistant_preview.original_chars, 4_200);
+    assert_eq!(
+        assistant_preview.text.chars().count(),
+        assistant_preview.max_chars
+    );
+    assert_ne!(assistant_preview.text, long_assistant_text);
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_failure_does_not_change_completed_turn() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase_with_failures(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::Required,
+            vec![HookPhase::TurnPostTurn],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_hook_failure",
+        "ws_phase12_hook_failure",
+        "turn_phase12_hook_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 12 hook failure",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let _ = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    assert!(matches!(
+        observed.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_runs_after_failure_when_configured() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_post_turn_hook_dispatch_policy(
+            AgentPostTurnHookDispatchPolicy::default().include_failures(),
+        )
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::Required,
+            vec![HookPhase::TurnPrePolicy],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_failure",
+        "ws_phase12_failure",
+        "turn_phase12_failure",
+        ThreadMode::Agent,
+        "capture",
+        "phase 12 failure user text",
+    )
+    .await;
+    assert_turn_failed(&observed, "turn policy hook failed");
+
+    let post_turn = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    let HookInputPayload::TurnPostTurn(payload) = post_turn.payload else {
+        panic!("post-turn hook should receive typed post-turn payload");
+    };
+    assert_eq!(payload.status, TurnPostTurnStatus::Failed);
+    assert_eq!(
+        payload
+            .user_text
+            .as_ref()
+            .map(|preview| preview.text.as_str()),
+        Some("phase 12 failure user text")
+    );
+    assert_eq!(
+        payload.error.as_ref().map(|preview| preview.text.as_str()),
+        Some("turn policy hook failed")
+    );
+    assert!(provider.snapshot_requests().is_empty());
+}
+
+#[tokio::test]
+async fn phase_12_background_post_turn_hook_does_not_delay_completion_notification() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runtime = recording_hook_runtime_for_phase(
+        calls.clone(),
+        HookPhase::TurnPostTurn,
+        HookAwaitPolicy::Background,
+        HookFailurePolicy::BestEffort,
+    );
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager.set_hook_runtime(Some(runtime.clone())).await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_background",
+        "ws_phase12_background",
+        "turn_phase12_background",
+        ThreadMode::Agent,
+        "capture",
+        "phase 12 background",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert!(matches!(
+        observed.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+
+    wait_for_background_hook_queue(runtime.as_ref(), 1).await;
+    assert!(snapshot_hook_calls(&calls).is_empty());
+}
+
+#[tokio::test]
+async fn phase_12_post_turn_hook_does_not_create_task_anchor() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_no_anchor",
+        "ws_phase12_no_anchor",
+        "turn_phase12_no_anchor",
+        ThreadMode::Agent,
+        "capture",
+        "phase 12 no task anchor",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let _ = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+
+    assert!(!observed.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ItemStarted(ItemStartedNotification {
+                item: TurnItem::Task { .. },
+                ..
+            }) | AgentEvent::ItemCompleted(ItemCompletedNotification {
+                item: TurnItem::Task { .. },
+                ..
+            })
+        )
+    }));
 }
 
 #[tokio::test]
