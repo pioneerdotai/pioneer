@@ -18,6 +18,15 @@ use pioneer_crud::{
     global_agent_memory_scope_key,
 };
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
+use pioneer_hooks::{
+    HookAwaitPolicy, HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDomain,
+    HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
+    HookHandlerResponse, HookId, HookInputPayload, HookKind, HookPhase, HookPromptContent,
+    HookRegistry, HookRuntime, HookRuntimeOptions, HookSectionId, HookSubscription,
+    HookSubscriptionId, HookSubscriptionRegistry, PromptSectionContribution,
+    TurnPreCompactionRawTurnRetention, TurnPreCompactionSummaryStorage,
+    TurnPreCompactionSummaryStrategy, TurnPreCompactionTrigger,
+};
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, INVALID_REQUEST_CODE, ItemCompletedNotification,
@@ -50,14 +59,15 @@ use pioneer_protocol::{
     TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
     TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadClosedNotification,
     ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMoveResponse, ThreadSidebarVisibility,
-    ThreadStartParams, ThreadStartResponse, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnSkillBinding, TurnStartResponse, TurnStatus,
-    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceCreateResponse,
-    WorkspaceDefaultResponse, WorkspaceListResponse, constants::events,
+    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+    ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineResponse, UserInput,
+    UserMessageAttachment, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -164,6 +174,12 @@ struct CountingDelayedProvider {
     calls: AtomicUsize,
 }
 
+struct CaptureSummaryProvider {
+    text: String,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    calls: AtomicUsize,
+}
+
 struct FlakyTitleProvider {
     failures_before_success: usize,
     text: String,
@@ -267,6 +283,69 @@ impl CountingDelayedProvider {
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl CaptureSummaryProvider {
+    fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            requests: std::sync::Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("capture summary requests lock")
+            .clone()
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CaptureSummaryProvider {
+    fn name(&self) -> &str {
+        "capture-summary"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("capture summary requests lock")
+            .push(request);
+        Ok(ChatResponse {
+            text: self.text.clone(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
     }
 }
 
@@ -502,6 +581,129 @@ impl CreateThenHangProvider {
             next_index: AtomicUsize::new(0),
         }
     }
+}
+
+#[derive(Clone)]
+enum Phase13HookBehavior {
+    Succeed {
+        contributions: Vec<HookContribution>,
+    },
+    Fail,
+    Pending,
+}
+
+struct Phase13RecordingHookHandler {
+    hook_id: HookId,
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    behavior: Phase13HookBehavior,
+}
+
+#[async_trait::async_trait]
+impl HookHandler for Phase13RecordingHookHandler {
+    fn id(&self) -> HookId {
+        self.hook_id.clone()
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("test.phase13").expect("valid hook kind")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPreCompaction]
+    }
+
+    async fn execute(
+        &self,
+        request: HookHandlerRequest,
+    ) -> pioneer_hooks::HookResult<HookHandlerResponse> {
+        self.calls
+            .lock()
+            .expect("phase 13 hook calls lock")
+            .push(request);
+
+        match &self.behavior {
+            Phase13HookBehavior::Succeed { contributions } => Ok(HookHandlerResponse {
+                contributions: contributions.clone(),
+                ..HookHandlerResponse::default()
+            }),
+            Phase13HookBehavior::Fail => Err(HookError::new(
+                HookDiagnosticCode::new("test.phase13_failed").expect("valid diagnostic code"),
+                HookDiagnosticMessage::new("phase 13 hook failed").expect("valid diagnostic"),
+            )),
+            Phase13HookBehavior::Pending => futures_util::future::pending().await,
+        }
+    }
+}
+
+fn phase_13_empty_hook_runtime() -> Arc<HookRuntime> {
+    Arc::new(HookRuntime::new(
+        Arc::new(HookRegistry::new()),
+        Arc::new(HookSubscriptionRegistry::new()),
+    ))
+}
+
+fn phase_13_hook_runtime(
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    behavior: Phase13HookBehavior,
+    await_policy: HookAwaitPolicy,
+    timeout_ms: Option<u64>,
+    failure_policy: HookFailurePolicy,
+) -> Arc<HookRuntime> {
+    phase_13_hook_runtime_with_fallback(
+        calls,
+        behavior,
+        await_policy,
+        timeout_ms,
+        failure_policy,
+        Vec::new(),
+    )
+}
+
+fn phase_13_hook_runtime_with_fallback(
+    calls: Arc<std::sync::Mutex<Vec<HookHandlerRequest>>>,
+    behavior: Phase13HookBehavior,
+    await_policy: HookAwaitPolicy,
+    timeout_ms: Option<u64>,
+    failure_policy: HookFailurePolicy,
+    fallback_contributions: Vec<HookContribution>,
+) -> Arc<HookRuntime> {
+    let handlers = Arc::new(HookRegistry::new());
+    let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+    let hook_id = HookId::new("test.phase13_recorder").expect("valid hook id");
+    handlers
+        .register_handler(Arc::new(Phase13RecordingHookHandler {
+            hook_id: hook_id.clone(),
+            calls,
+            behavior,
+        }))
+        .expect("phase 13 hook registers");
+    subscriptions
+        .register_subscription(
+            handlers.as_ref(),
+            HookSubscription::new(
+                HookSubscriptionId::new("test.phase13_subscription")
+                    .expect("valid subscription id"),
+                hook_id,
+                HookPhase::TurnPreCompaction,
+            )
+            .with_execution_policy(HookExecutionPolicy {
+                await_policy,
+                timeout_ms,
+                max_parallelism: None,
+            })
+            .with_failure_policy(failure_policy)
+            .with_fallback_contributions(fallback_contributions),
+        )
+        .expect("phase 13 hook subscription registers");
+
+    Arc::new(HookRuntime::with_options(
+        handlers,
+        subscriptions,
+        HookRuntimeOptions {
+            default_deadline_timeout_ms: 25,
+            ..HookRuntimeOptions::default()
+        },
+    ))
 }
 
 impl SequencedToolProvider {
@@ -8754,6 +8956,710 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
         Arc::new(CrudStore::new(connection)),
         workspace_id,
     )
+}
+
+struct Phase13CompactionHarness {
+    processor: Arc<MessageProcessor>,
+    crud_store: Arc<CrudStore>,
+    workspace_id: String,
+}
+
+async fn setup_phase_13_compaction_harness(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+) -> Phase13CompactionHarness {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        phase_13_summary_config(),
+        phase_13_context_budget(),
+        test_tool_loop_config(),
+    ));
+
+    Phase13CompactionHarness {
+        processor,
+        crud_store,
+        workspace_id,
+    }
+}
+
+fn phase_13_summary_config() -> super::summary::SummaryConfig {
+    super::summary::SummaryConfig {
+        summary_model: Some("test-model".to_owned()),
+        summary_model_provider: Some("summary-capture".to_owned()),
+        title_model: Some("test-model".to_owned()),
+        title_model_provider: Some("summary-capture".to_owned()),
+    }
+}
+
+fn phase_13_context_budget() -> super::ContextBudget {
+    super::ContextBudget {
+        max_context_tokens: 1_000,
+        response_reserve_tokens: 200,
+    }
+}
+
+fn phase_13_provider_registry(
+    provider: Arc<CaptureSummaryProvider>,
+) -> Arc<pioneer_provider::ProviderRegistry> {
+    Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "summary-capture",
+        provider,
+    ))
+}
+
+fn phase_13_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn phase_13_test_thread(
+    workspace_id: &str,
+    thread_id: &str,
+    timestamp: i64,
+) -> pioneer_protocol::Thread {
+    pioneer_protocol::Thread {
+        workspace_id: workspace_id.to_owned(),
+        id: thread_id.to_owned(),
+        name: Some("Phase 13 Thread".to_owned()),
+        preview: "phase 13 compaction".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "test-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        created_at: timestamp,
+        updated_at: timestamp,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    }
+}
+
+fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
+    Turn {
+        id: turn_id.to_owned(),
+        status,
+        error: None,
+        prompt_manifest: None,
+    }
+}
+
+fn phase_13_long_text(marker: &str) -> String {
+    format!("{marker} {}", "alpha beta gamma delta epsilon ".repeat(60))
+}
+
+async fn seed_phase_13_compaction_thread(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    raw_marker: &str,
+) {
+    let base_timestamp = phase_13_now_secs();
+    for index in 0..2 {
+        let timestamp = base_timestamp + i64::from(index) * 3;
+        let thread = phase_13_test_thread(workspace_id, thread_id, timestamp);
+        let turn_id = format!("{thread_id}turn{index}");
+        let started_turn = phase_13_turn(turn_id.as_str(), TurnStatus::InProgress);
+        let user_text = phase_13_long_text(&format!("{raw_marker}_user_{index}"));
+        let assistant_text = phase_13_long_text(&format!("{raw_marker}_assistant_{index}"));
+
+        crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &started_turn,
+                &[UserInput::Text {
+                    text: user_text,
+                    text_elements: Vec::new(),
+                }],
+            )
+            .await
+            .expect("turn start should materialize");
+
+        crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("agent_message_{index}"),
+                        text: assistant_text,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("assistant item should materialize");
+
+        crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: phase_13_turn(turn_id.as_str(), TurnStatus::Completed),
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("turn completion should materialize");
+    }
+}
+
+fn phase_13_prompt_section_contribution() -> HookContribution {
+    HookContribution::PromptSection(PromptSectionContribution {
+        section_id: HookSectionId::new("phase13.prompt_section").expect("valid section id"),
+        title: None,
+        domain: HookDomain::new("test.phase13").expect("valid hook domain"),
+        priority: 100,
+        content: HookPromptContent::new("this must not enter the summary prompt")
+            .expect("valid prompt content"),
+        max_chars: None,
+        diagnostics: Vec::new(),
+        truncated: false,
+    })
+}
+
+fn phase_13_history_value(messages: &[pioneer_provider::ChatMessage]) -> serde_json::Value {
+    serde_json::to_value(messages).expect("chat history should serialize")
+}
+
+#[tokio::test]
+async fn phase_13_pre_compaction_hook_is_dispatched() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    let thread_id = generate_test_request_id("p13", "dispatch");
+    let turn_id = generate_test_request_id("turn", "dispatch");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_DISPATCH_RAW",
+    )
+    .await;
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Succeed {
+                contributions: Vec::new(),
+            },
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    assert!(harness.processor.has_hook_runtime().await);
+
+    let _history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), turn_id.as_str())
+        .await;
+
+    let calls = calls.lock().expect("phase 13 calls lock");
+    assert_eq!(calls.len(), 1);
+    let request = &calls[0];
+    assert_eq!(request.phase, HookPhase::TurnPreCompaction);
+    assert_eq!(request.input.kind.as_str(), "turn.pre_compaction");
+    assert_eq!(
+        request
+            .context
+            .workspace_id
+            .as_ref()
+            .expect("context workspace")
+            .as_str(),
+        harness.workspace_id.as_str()
+    );
+    assert_eq!(
+        request
+            .context
+            .thread_id
+            .as_ref()
+            .expect("context thread")
+            .as_str(),
+        thread_id.as_str()
+    );
+    assert_eq!(
+        request
+            .context
+            .turn_id
+            .as_ref()
+            .expect("context turn")
+            .as_str(),
+        turn_id.as_str()
+    );
+    assert_eq!(
+        request.context.mode,
+        Some(pioneer_hooks::HookContextMode::System)
+    );
+    assert_eq!(
+        request.context.actor.as_ref().expect("context actor").kind,
+        pioneer_hooks::HookActorKind::Service
+    );
+
+    let HookInputPayload::TurnPreCompaction(payload) = &request.input.payload else {
+        panic!("pre-compaction payload should be typed");
+    };
+    assert_eq!(payload.workspace_id.as_str(), harness.workspace_id.as_str());
+    assert_eq!(payload.thread_id.as_str(), thread_id.as_str());
+    assert_eq!(
+        payload.turn_id.as_ref().expect("payload turn").as_str(),
+        turn_id.as_str()
+    );
+    assert!(payload.compaction_id.as_str().starts_with("cmp_"));
+    assert_eq!(
+        payload.trigger,
+        TurnPreCompactionTrigger::ContextBudgetThreshold
+    );
+    assert_eq!(
+        payload.source_range.source_kind,
+        pioneer_hooks::TurnPreCompactionSourceKind::ConversationHistory
+    );
+    assert_eq!(payload.source_range.loaded_completed_turn_count, 2);
+    assert_eq!(payload.source_range.source_entry_count, 2);
+    assert_eq!(
+        payload.summary_policy.strategy,
+        TurnPreCompactionSummaryStrategy::ProgressiveFullHistorySummary
+    );
+    assert_eq!(
+        payload.retention_policy.raw_turn_retention,
+        TurnPreCompactionRawTurnRetention::RetainOriginalTurns
+    );
+    assert_eq!(
+        payload.retention_policy.summary_storage,
+        TurnPreCompactionSummaryStorage::ThreadSummary
+    );
+}
+
+#[tokio::test]
+async fn phase_13_empty_hook_runtime_preserves_current_compaction_behavior() {
+    let no_runtime_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let no_runtime_harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(no_runtime_provider.clone()))
+            .await;
+    let no_runtime_thread_id = generate_test_request_id("p13", "noruntime");
+    seed_phase_13_compaction_thread(
+        no_runtime_harness.crud_store.as_ref(),
+        no_runtime_harness.workspace_id.as_str(),
+        no_runtime_thread_id.as_str(),
+        "PHASE13_EMPTY_RAW",
+    )
+    .await;
+    let no_runtime_history = no_runtime_harness
+        .processor
+        .load_conversation_history(no_runtime_thread_id.as_str(), "turn_no_runtime")
+        .await;
+    let no_runtime_summary = no_runtime_harness
+        .crud_store
+        .get_thread_summary(no_runtime_thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    let empty_runtime_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let empty_runtime_harness = setup_phase_13_compaction_harness(phase_13_provider_registry(
+        empty_runtime_provider.clone(),
+    ))
+    .await;
+    let empty_runtime_thread_id = generate_test_request_id("p13", "emptyruntime");
+    seed_phase_13_compaction_thread(
+        empty_runtime_harness.crud_store.as_ref(),
+        empty_runtime_harness.workspace_id.as_str(),
+        empty_runtime_thread_id.as_str(),
+        "PHASE13_EMPTY_RAW",
+    )
+    .await;
+    empty_runtime_harness
+        .processor
+        .set_hook_runtime(Some(phase_13_empty_hook_runtime()))
+        .await;
+    let empty_runtime_history = empty_runtime_harness
+        .processor
+        .load_conversation_history(empty_runtime_thread_id.as_str(), "turn_empty_runtime")
+        .await;
+    let empty_runtime_summary = empty_runtime_harness
+        .crud_store
+        .get_thread_summary(empty_runtime_thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    assert_eq!(
+        phase_13_history_value(no_runtime_history.as_slice()),
+        phase_13_history_value(empty_runtime_history.as_slice())
+    );
+    assert_eq!(no_runtime_summary, empty_runtime_summary);
+    assert_eq!(no_runtime_provider.call_count(), 1);
+    assert_eq!(empty_runtime_provider.call_count(), 1);
+}
+
+#[tokio::test]
+async fn phase_13_best_effort_hook_failure_keeps_compaction_behavior() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread_id = generate_test_request_id("p13", "besteffort");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_BESTEFFORT_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Fail,
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_best_effort")
+        .await;
+    let summary = harness
+        .crud_store
+        .get_thread_summary(thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(
+        summary.as_ref().map(|(summary, _)| summary.as_str()),
+        Some("compressed summary")
+    );
+    assert_eq!(history.len(), 1);
+    assert!(history[0].content.contains("compressed summary"));
+}
+
+#[tokio::test]
+async fn phase_13_fallback_hook_failure_keeps_compaction_and_ignores_fallback_contribution() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread_id = generate_test_request_id("p13", "fallback");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_FALLBACK_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime_with_fallback(
+            calls.clone(),
+            Phase13HookBehavior::Fail,
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::Fallback,
+            vec![phase_13_prompt_section_contribution()],
+        )))
+        .await;
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_fallback")
+        .await;
+    let summary = harness
+        .crud_store
+        .get_thread_summary(thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+    let summary_prompt = provider.snapshot_requests()[0].messages[0].content.clone();
+
+    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(
+        summary.as_ref().map(|(summary, _)| summary.as_str()),
+        Some("compressed summary")
+    );
+    assert_eq!(history.len(), 1);
+    assert!(!summary_prompt.contains("this must not enter the summary prompt"));
+}
+
+#[tokio::test]
+async fn phase_13_required_hook_failure_skips_summary_update_and_uses_fallback() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread_id = generate_test_request_id("p13", "requiredfail");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_REQUIRED_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Fail,
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::Required,
+        )))
+        .await;
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_required_failure")
+        .await;
+    let summary = harness
+        .crud_store
+        .get_thread_summary(thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
+    assert_eq!(provider.call_count(), 0);
+    assert!(summary.is_none());
+    assert!(!history.is_empty());
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content.contains("PHASE13_REQUIRED_RAW"))
+    );
+}
+
+#[tokio::test]
+async fn phase_13_fail_closed_hook_failure_skips_summary_update() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread_id = generate_test_request_id("p13", "failclosed");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_FAILCLOSED_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Fail,
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::FailClosed,
+        )))
+        .await;
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_fail_closed")
+        .await;
+    let summary = harness
+        .crud_store
+        .get_thread_summary(thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
+    assert_eq!(provider.call_count(), 0);
+    assert!(summary.is_none());
+    assert!(!history.is_empty());
+}
+
+#[tokio::test]
+async fn phase_13_deadline_required_timeout_skips_summary_update() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread_id = generate_test_request_id("p13", "deadline");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "PHASE13_DEADLINE_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Pending,
+            HookAwaitPolicy::Deadline,
+            Some(5),
+            HookFailurePolicy::Required,
+        )))
+        .await;
+
+    let history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_deadline")
+        .await;
+    let summary = harness
+        .crud_store
+        .get_thread_summary(thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
+    assert_eq!(provider.call_count(), 0);
+    assert!(summary.is_none());
+    assert!(!history.is_empty());
+}
+
+#[tokio::test]
+async fn phase_13_hook_contributions_do_not_mutate_summary() {
+    let baseline_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let baseline_harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(baseline_provider.clone()))
+            .await;
+    let baseline_thread_id = generate_test_request_id("p13", "baseline");
+    seed_phase_13_compaction_thread(
+        baseline_harness.crud_store.as_ref(),
+        baseline_harness.workspace_id.as_str(),
+        baseline_thread_id.as_str(),
+        "PHASE13_NONMUTATION_RAW",
+    )
+    .await;
+    let baseline_history = baseline_harness
+        .processor
+        .load_conversation_history(baseline_thread_id.as_str(), "turn_baseline")
+        .await;
+    let baseline_summary = baseline_harness
+        .crud_store
+        .get_thread_summary(baseline_thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    let hook_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let hook_harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(hook_provider.clone())).await;
+    let hook_thread_id = generate_test_request_id("p13", "withcontrib");
+    seed_phase_13_compaction_thread(
+        hook_harness.crud_store.as_ref(),
+        hook_harness.workspace_id.as_str(),
+        hook_thread_id.as_str(),
+        "PHASE13_NONMUTATION_RAW",
+    )
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    hook_harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls,
+            Phase13HookBehavior::Succeed {
+                contributions: vec![phase_13_prompt_section_contribution()],
+            },
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    let hook_history = hook_harness
+        .processor
+        .load_conversation_history(hook_thread_id.as_str(), "turn_hook_contrib")
+        .await;
+    let hook_summary = hook_harness
+        .crud_store
+        .get_thread_summary(hook_thread_id.as_str())
+        .await
+        .expect("summary lookup succeeds");
+
+    let baseline_prompt = baseline_provider.snapshot_requests()[0].messages[0]
+        .content
+        .clone();
+    let hook_prompt = hook_provider.snapshot_requests()[0].messages[0]
+        .content
+        .clone();
+
+    assert_eq!(baseline_prompt, hook_prompt);
+    assert_eq!(baseline_summary, hook_summary);
+    assert_eq!(
+        phase_13_history_value(baseline_history.as_slice()),
+        phase_13_history_value(hook_history.as_slice())
+    );
+    assert!(!hook_prompt.contains("this must not enter the summary prompt"));
+}
+
+#[tokio::test]
+async fn phase_13_pre_compaction_input_is_bounded() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    let thread_id = generate_test_request_id("p13", "bounded");
+    seed_phase_13_compaction_thread(
+        harness.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        thread_id.as_str(),
+        "VERY_RAW_USER_TEXT_PHASE13",
+    )
+    .await;
+    let omitted_summary_tail = "OMITTED_SUMMARY_TAIL_PHASE13";
+    let long_summary = format!("{}{}", "s".repeat(2_100), omitted_summary_tail);
+    harness
+        .crud_store
+        .update_thread_summary(thread_id.as_str(), long_summary.as_str(), 1)
+        .await
+        .expect("existing summary should update");
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_hook_runtime(
+            calls.clone(),
+            Phase13HookBehavior::Succeed {
+                contributions: Vec::new(),
+            },
+            HookAwaitPolicy::Blocking,
+            None,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    let _history = harness
+        .processor
+        .load_conversation_history(thread_id.as_str(), "turn_bounded")
+        .await;
+
+    let calls = calls.lock().expect("phase 13 calls lock");
+    let request = calls.first().expect("pre-compaction hook should run");
+    let serialized_input =
+        serde_json::to_string(&request.input).expect("input should serialize safely");
+    assert!(!serialized_input.contains("VERY_RAW_USER_TEXT_PHASE13"));
+    assert!(!serialized_input.contains(omitted_summary_tail));
+
+    let HookInputPayload::TurnPreCompaction(payload) = &request.input.payload else {
+        panic!("pre-compaction payload should be typed");
+    };
+    let preview = payload
+        .existing_summary_preview
+        .as_ref()
+        .expect("existing summary preview should be present");
+    assert!(preview.truncated);
+    assert_eq!(preview.max_chars, 2_000);
+    assert_eq!(payload.source_range.existing_summary_turn_count, Some(1));
+    assert_eq!(payload.source_range.max_loaded_turns, 200);
+    assert_eq!(payload.source_range.source_entry_count, 2);
+    assert_eq!(payload.token_budget.max_context_tokens, 1_000);
+    assert_eq!(payload.token_budget.response_reserve_tokens, 200);
+    assert_eq!(payload.summary_policy.compression_threshold_bps, 8_000);
+    assert_eq!(payload.summary_policy.compression_target_bps, 1_000);
 }
 
 struct MemoryGatewayHarness {

@@ -11,6 +11,7 @@ async-trait.workspace = true
 pioneer-agent.workspace = true
 pioneer-config.workspace = true
 pioneer-crud.workspace = true
+pioneer-hooks.workspace = true
 pioneer-keystore.workspace = true
 pioneer-migration.workspace = true
 pioneer-mcp.workspace = true

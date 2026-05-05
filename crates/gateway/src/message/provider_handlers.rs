@@ -396,15 +396,25 @@ impl MessageProcessor {
 
         const MAX_TURNS: usize = 200;
         const MESSAGE_OVERHEAD: usize = 4;
-        const COMPRESSION_THRESHOLD: f64 = 0.8;
-        const COMPRESSION_TARGET: f64 = 0.1;
+        const COMPRESSION_THRESHOLD_BPS: u16 = 8_000;
+        const COMPRESSION_TARGET_BPS: u16 = 1_000;
+        const BPS_DENOMINATOR: usize = 10_000;
 
         let budget = self.context_budget.history_budget();
 
-        let existing_summary = match self.crud_store.get_thread_summary(thread_id).await {
-            Ok(Some((text, _))) => Some(text),
-            _ => None,
-        };
+        let (existing_summary, existing_summary_turn_count) =
+            match self.crud_store.get_thread_summary(thread_id).await {
+                Ok(Some((text, turn_count))) => (Some(text), Some(turn_count)),
+                Ok(None) => (None, None),
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to load existing thread summary"
+                    );
+                    (None, None)
+                }
+            };
 
         let entries = match self
             .crud_store
@@ -450,7 +460,10 @@ impl MessageProcessor {
         let turns_tokens: usize = entry_tokens.iter().sum();
         total_tokens += turns_tokens;
 
-        let threshold = (budget as f64 * COMPRESSION_THRESHOLD) as usize;
+        let threshold =
+            budget.saturating_mul(usize::from(COMPRESSION_THRESHOLD_BPS)) / BPS_DENOMINATOR;
+        let target_tokens =
+            budget.saturating_mul(usize::from(COMPRESSION_TARGET_BPS)) / BPS_DENOMINATOR;
 
         debug!(
             thread_id,
@@ -470,6 +483,95 @@ impl MessageProcessor {
             total_tokens, threshold, "context threshold reached, compressing conversation"
         );
 
+        let hook_runtime = self.hook_runtime.read().await.clone();
+        if let Some(runtime) = hook_runtime.as_ref() {
+            let thread = match self.crud_store.get_thread_by_id(thread_id).await {
+                Ok(Some(thread)) => Some(thread),
+                Ok(None) => {
+                    warn!(
+                        thread_id,
+                        "thread not found while preparing pre-compaction hook input"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to load thread while preparing pre-compaction hook input"
+                    );
+                    None
+                }
+            };
+
+            if let Some(thread) = thread {
+                let compaction_id = format!("cmp_{}", pioneer_protocol::generate_id(21));
+                let dispatch = match hooks::build_pre_compaction_hook_dispatch(
+                    hooks::PreCompactionHookInputParts {
+                        workspace_id: thread.workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        compaction_id,
+                        loaded_completed_turn_count: entries.len(),
+                        source_entry_count: entries.len(),
+                        max_loaded_turns: MAX_TURNS,
+                        existing_summary_turn_count,
+                        max_context_tokens: self.context_budget.max_context_tokens,
+                        response_reserve_tokens: self.context_budget.response_reserve_tokens,
+                        history_budget_tokens: budget,
+                        estimated_current_tokens: total_tokens,
+                        compression_threshold_tokens: threshold,
+                        target_summary_tokens: target_tokens,
+                        compression_threshold_bps: COMPRESSION_THRESHOLD_BPS,
+                        compression_target_bps: COMPRESSION_TARGET_BPS,
+                        existing_summary: existing_summary.as_deref(),
+                    },
+                ) {
+                    Ok(dispatch) => Some(dispatch),
+                    Err(error) => {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %error,
+                            "failed to build typed pre-compaction hook context"
+                        );
+                        None
+                    }
+                };
+
+                if let Some(dispatch) = dispatch {
+                    match hooks::run_pre_compaction_hook_phase(Some(runtime), dispatch).await {
+                        Ok(outcome) => {
+                            if !outcome.diagnostics.is_empty() || !outcome.runs.is_empty() {
+                                debug!(
+                                    thread_id,
+                                    turn_id,
+                                    diagnostic_count = outcome.diagnostics.len(),
+                                    run_count = outcome.runs.len(),
+                                    "pre-compaction hook phase completed"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                thread_id,
+                                turn_id,
+                                error = %error.runtime_error,
+                                message = error.safe_message.as_str(),
+                                "pre-compaction hook phase blocked context compression"
+                            );
+                            return self.build_messages_truncated(
+                                existing_summary.as_deref(),
+                                &entries,
+                                &entry_tokens,
+                                budget,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let compressing_notification = ContextCompressingNotification {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -481,8 +583,6 @@ impl MessageProcessor {
             &compressing_notification,
         )
         .await;
-
-        let target_tokens = (budget as f64 * COMPRESSION_TARGET) as usize;
 
         match summary::compress_context(
             &self.crud_store,

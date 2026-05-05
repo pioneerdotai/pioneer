@@ -1,6 +1,7 @@
 use crate::{
-    HookContext, HookContribution, HookDiagnostic, HookId, HookMetadata, HookPhase, HookPolicySet,
-    HookPromptContextSet, HookValue,
+    HookCompactionId, HookContext, HookContribution, HookDiagnostic, HookId, HookMetadata,
+    HookPhase, HookPolicySet, HookPromptContextSet, HookThreadId, HookTurnId, HookValue,
+    HookWorkspaceId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -124,6 +125,13 @@ impl HookInput {
             payload: HookInputPayload::TurnPostTurn(payload),
         }
     }
+
+    pub fn turn_pre_compaction(payload: TurnPreCompactionHookInput) -> Self {
+        Self {
+            kind: HookInputKind::TurnPreCompaction,
+            payload: HookInputPayload::TurnPreCompaction(payload),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +139,7 @@ impl HookInput {
 pub enum HookInputPayload {
     Empty,
     TurnPostTurn(TurnPostTurnHookInput),
+    TurnPreCompaction(TurnPreCompactionHookInput),
     Custom(HookValue),
 }
 
@@ -146,6 +155,7 @@ pub const DEFAULT_POST_TURN_ERROR_PREVIEW_MAX_CHARS: usize = 1_000;
 pub const DEFAULT_POST_TURN_TOOL_EVENT_MAX_COUNT: usize = 40;
 pub const DEFAULT_POST_TURN_DOMAIN_EVENT_MAX_COUNT: usize = 40;
 pub const DEFAULT_POST_TURN_DOMAIN_EVENT_MESSAGE_MAX_CHARS: usize = 1_000;
+pub const DEFAULT_PRE_COMPACTION_EXISTING_SUMMARY_PREVIEW_MAX_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnPostTurnHookInputLimits {
@@ -155,6 +165,27 @@ pub struct TurnPostTurnHookInputLimits {
     pub tool_event_max_count: usize,
     pub domain_event_max_count: usize,
     pub domain_event_message_max_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionHookInputLimits {
+    pub existing_summary_preview_max_chars: usize,
+}
+
+impl Default for TurnPreCompactionHookInputLimits {
+    fn default() -> Self {
+        Self {
+            existing_summary_preview_max_chars:
+                DEFAULT_PRE_COMPACTION_EXISTING_SUMMARY_PREVIEW_MAX_CHARS,
+        }
+    }
+}
+
+impl TurnPreCompactionHookInputLimits {
+    pub fn normalized(mut self) -> Self {
+        self.existing_summary_preview_max_chars = self.existing_summary_preview_max_chars.max(1);
+        self
+    }
 }
 
 impl Default for TurnPostTurnHookInputLimits {
@@ -188,6 +219,127 @@ pub struct HookTextPreview {
     pub original_chars: usize,
     pub truncated: bool,
     pub max_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPreCompactionTrigger {
+    ContextBudgetThreshold,
+    Manual,
+    Recovery,
+    Scheduled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPreCompactionSourceKind {
+    ConversationHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionSourceRange {
+    pub source_kind: TurnPreCompactionSourceKind,
+    pub loaded_completed_turn_count: usize,
+    pub source_entry_count: usize,
+    pub max_loaded_turns: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_summary_turn_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionTokenBudget {
+    pub max_context_tokens: usize,
+    pub response_reserve_tokens: usize,
+    pub history_budget_tokens: usize,
+    pub estimated_current_tokens: usize,
+    pub compression_threshold_tokens: usize,
+    pub target_summary_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPreCompactionSummaryStrategy {
+    ProgressiveFullHistorySummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionSummaryPolicy {
+    pub strategy: TurnPreCompactionSummaryStrategy,
+    pub compression_threshold_bps: u16,
+    pub compression_target_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPreCompactionRawTurnRetention {
+    RetainOriginalTurns,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPreCompactionSummaryStorage {
+    ThreadSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionRetentionPolicy {
+    pub raw_turn_retention: TurnPreCompactionRawTurnRetention,
+    pub summary_storage: TurnPreCompactionSummaryStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreCompactionHookInput {
+    pub workspace_id: HookWorkspaceId,
+    pub thread_id: HookThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<HookTurnId>,
+    pub compaction_id: HookCompactionId,
+    pub trigger: TurnPreCompactionTrigger,
+    pub source_range: TurnPreCompactionSourceRange,
+    pub token_budget: TurnPreCompactionTokenBudget,
+    pub summary_policy: TurnPreCompactionSummaryPolicy,
+    pub retention_policy: TurnPreCompactionRetentionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_summary_preview: Option<HookTextPreview>,
+    pub limits: TurnPreCompactionHookInputLimits,
+}
+
+impl TurnPreCompactionHookInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        workspace_id: HookWorkspaceId,
+        thread_id: HookThreadId,
+        turn_id: Option<HookTurnId>,
+        compaction_id: HookCompactionId,
+        trigger: TurnPreCompactionTrigger,
+        source_range: TurnPreCompactionSourceRange,
+        token_budget: TurnPreCompactionTokenBudget,
+        summary_policy: TurnPreCompactionSummaryPolicy,
+        retention_policy: TurnPreCompactionRetentionPolicy,
+        existing_summary: Option<impl AsRef<str>>,
+        limits: TurnPreCompactionHookInputLimits,
+    ) -> Self {
+        let limits = limits.normalized();
+        let existing_summary_preview = existing_summary
+            .filter(|summary| !summary.as_ref().is_empty())
+            .map(|summary| {
+                HookTextPreview::from_text(summary, limits.existing_summary_preview_max_chars)
+            });
+
+        Self {
+            workspace_id,
+            thread_id,
+            turn_id,
+            compaction_id,
+            trigger,
+            source_range,
+            token_budget,
+            summary_policy,
+            retention_policy,
+            existing_summary_preview,
+            limits,
+        }
+    }
 }
 
 impl HookTextPreview {
@@ -387,7 +539,7 @@ pub struct HookHandlerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HookMetadataKey, HookThreadId, HookTurnId};
+    use crate::{HookCompactionId, HookMetadataKey, HookThreadId, HookTurnId, HookWorkspaceId};
 
     #[test]
     fn handler_request_response_roundtrip() {
@@ -572,5 +724,153 @@ mod tests {
         assert_eq!(limits.tool_event_max_count, 1);
         assert_eq!(limits.domain_event_max_count, 1);
         assert_eq!(limits.domain_event_message_max_chars, 1);
+    }
+
+    fn phase_13_pre_compaction_input(
+        existing_summary: Option<&str>,
+        limits: TurnPreCompactionHookInputLimits,
+    ) -> TurnPreCompactionHookInput {
+        TurnPreCompactionHookInput::from_parts(
+            HookWorkspaceId::new("workspace-1").expect("valid workspace id"),
+            HookThreadId::new("thread-1").expect("valid thread id"),
+            Some(HookTurnId::new("turn-1").expect("valid turn id")),
+            HookCompactionId::new("cmp-1").expect("valid compaction id"),
+            TurnPreCompactionTrigger::ContextBudgetThreshold,
+            TurnPreCompactionSourceRange {
+                source_kind: TurnPreCompactionSourceKind::ConversationHistory,
+                loaded_completed_turn_count: 3,
+                source_entry_count: 3,
+                max_loaded_turns: 200,
+                existing_summary_turn_count: Some(2),
+            },
+            TurnPreCompactionTokenBudget {
+                max_context_tokens: 1_000,
+                response_reserve_tokens: 100,
+                history_budget_tokens: 900,
+                estimated_current_tokens: 800,
+                compression_threshold_tokens: 720,
+                target_summary_tokens: 90,
+            },
+            TurnPreCompactionSummaryPolicy {
+                strategy: TurnPreCompactionSummaryStrategy::ProgressiveFullHistorySummary,
+                compression_threshold_bps: 8_000,
+                compression_target_bps: 1_000,
+            },
+            TurnPreCompactionRetentionPolicy {
+                raw_turn_retention: TurnPreCompactionRawTurnRetention::RetainOriginalTurns,
+                summary_storage: TurnPreCompactionSummaryStorage::ThreadSummary,
+            },
+            existing_summary,
+            limits,
+        )
+    }
+
+    #[test]
+    fn phase_13_turn_pre_compaction_input_roundtrips() {
+        let input = phase_13_pre_compaction_input(
+            Some("existing summary"),
+            TurnPreCompactionHookInputLimits::default(),
+        );
+
+        let value = serde_json::to_value(&input).expect("pre-compaction input serializes");
+        let decoded: TurnPreCompactionHookInput =
+            serde_json::from_value(value).expect("pre-compaction input deserializes");
+
+        assert_eq!(decoded, input);
+        assert_eq!(decoded.workspace_id.as_str(), "workspace-1");
+        assert_eq!(decoded.thread_id.as_str(), "thread-1");
+        assert_eq!(
+            decoded.turn_id.as_ref().expect("turn id").as_str(),
+            "turn-1"
+        );
+        assert_eq!(decoded.compaction_id.as_str(), "cmp-1");
+    }
+
+    #[test]
+    fn phase_13_hook_input_payload_distinguishes_pre_compaction() {
+        let empty = HookInput::empty(HookInputKind::TurnPrePolicy);
+        assert_eq!(empty.payload, HookInputPayload::Empty);
+
+        let post_turn = HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts(
+            TurnPostTurnStatus::Succeeded,
+            Some("user"),
+            Some("assistant"),
+            Option::<&str>::None,
+            Vec::new(),
+            Vec::new(),
+            TurnPostTurnHookInputLimits::default(),
+        ));
+        assert!(matches!(
+            post_turn.payload,
+            HookInputPayload::TurnPostTurn(_)
+        ));
+
+        let pre_compaction = HookInput::turn_pre_compaction(phase_13_pre_compaction_input(
+            Option::<&str>::None,
+            TurnPreCompactionHookInputLimits::default(),
+        ));
+        assert_eq!(pre_compaction.kind, HookInputKind::TurnPreCompaction);
+        assert!(matches!(
+            pre_compaction.payload,
+            HookInputPayload::TurnPreCompaction(_)
+        ));
+    }
+
+    #[test]
+    fn phase_13_existing_summary_preview_is_bounded() {
+        let input = phase_13_pre_compaction_input(
+            Some("aé日b"),
+            TurnPreCompactionHookInputLimits {
+                existing_summary_preview_max_chars: 3,
+            },
+        );
+
+        let preview = input
+            .existing_summary_preview
+            .expect("summary preview should be present");
+        assert_eq!(preview.text, "aé日");
+        assert_eq!(preview.original_chars, 4);
+        assert!(preview.truncated);
+        assert_eq!(preview.max_chars, 3);
+    }
+
+    #[test]
+    fn phase_13_pre_compaction_limits_normalize_to_nonzero_values() {
+        let limits = TurnPreCompactionHookInputLimits {
+            existing_summary_preview_max_chars: 0,
+        }
+        .normalized();
+
+        assert_eq!(limits.existing_summary_preview_max_chars, 1);
+
+        let input = phase_13_pre_compaction_input(
+            Some("summary"),
+            TurnPreCompactionHookInputLimits {
+                existing_summary_preview_max_chars: 0,
+            },
+        );
+        assert_eq!(input.limits.existing_summary_preview_max_chars, 1);
+    }
+
+    #[test]
+    fn phase_13_pre_compaction_uses_typed_ids() {
+        let input = phase_13_pre_compaction_input(
+            Option::<&str>::None,
+            TurnPreCompactionHookInputLimits::default(),
+        );
+
+        assert_eq!(
+            input.workspace_id,
+            HookWorkspaceId::new("workspace-1").unwrap()
+        );
+        assert_eq!(input.thread_id, HookThreadId::new("thread-1").unwrap());
+        assert_eq!(
+            input.turn_id,
+            Some(HookTurnId::new("turn-1").expect("valid turn id"))
+        );
+        assert_eq!(
+            input.compaction_id,
+            HookCompactionId::new("cmp-1").expect("valid compaction id")
+        );
     }
 }

@@ -1,6 +1,7 @@
 mod agent_runtime;
 mod binary;
 mod dispatch;
+mod hooks;
 mod markdown;
 mod mcp;
 mod memory_handlers;
@@ -23,6 +24,7 @@ pub use summary::SummaryConfig;
 use crate::tokenizer::count_tokens;
 use pioneer_agent::{AgentManager, ToolLoopConfig};
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
+use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ContextCompressedNotification,
     ContextCompressingNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, ItemDeltaStream,
@@ -68,7 +70,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
@@ -141,6 +143,7 @@ pub struct MessageProcessor {
     task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
     memory_runtime: Arc<GatewayMemoryRuntime>,
+    hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
 }
 
 impl MessageProcessor {
@@ -214,7 +217,19 @@ impl MessageProcessor {
             task_agent_executor,
             task_runtime,
             memory_runtime,
+            hook_runtime: Arc::new(RwLock::new(None)),
         }
+    }
+
+    #[allow(dead_code)]
+    pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
+        *self.hook_runtime.write().await = runtime.clone();
+        self.agent_manager.set_hook_runtime(runtime).await;
+    }
+
+    #[allow(dead_code)]
+    pub async fn has_hook_runtime(&self) -> bool {
+        self.hook_runtime.read().await.is_some()
     }
 
     pub async fn bind_task_bridge(self: &Arc<Self>) {
@@ -691,6 +706,7 @@ impl MessageProcessor {
             task_agent_executor,
             task_runtime,
             memory_runtime,
+            hook_runtime: Arc::new(RwLock::new(None)),
         }
     }
 }

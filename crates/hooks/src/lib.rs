@@ -27,10 +27,11 @@ pub use diagnostic::{
 pub use error::{HookError, HookRegistryError, HookResult};
 pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
-    HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookContributionHash,
-    HookContributionId, HookDiagnosticCode, HookDomain, HookFeatureFlag, HookFilterKey, HookId,
-    HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunId, HookSectionId, HookSourceId,
-    HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId, HookWorkspaceId,
+    HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookCompactionId,
+    HookContributionHash, HookContributionId, HookDiagnosticCode, HookDomain, HookFeatureFlag,
+    HookFilterKey, HookId, HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunId,
+    HookSectionId, HookSourceId, HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId,
+    HookWorkspaceId,
 };
 pub use phase::{HookPhase, ParseHookPhaseError};
 pub use policy::{
@@ -51,10 +52,16 @@ pub use request::{
     DEFAULT_POST_TURN_ASSISTANT_TEXT_PREVIEW_MAX_CHARS, DEFAULT_POST_TURN_DOMAIN_EVENT_MAX_COUNT,
     DEFAULT_POST_TURN_DOMAIN_EVENT_MESSAGE_MAX_CHARS, DEFAULT_POST_TURN_ERROR_PREVIEW_MAX_CHARS,
     DEFAULT_POST_TURN_TOOL_EVENT_MAX_COUNT, DEFAULT_POST_TURN_USER_TEXT_PREVIEW_MAX_CHARS,
-    HookHandlerRequest, HookHandlerResponse, HookInput, HookInputKind, HookInputPayload,
-    HookTextPreview, TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
+    DEFAULT_PRE_COMPACTION_EXISTING_SUMMARY_PREVIEW_MAX_CHARS, HookHandlerRequest,
+    HookHandlerResponse, HookInput, HookInputKind, HookInputPayload, HookTextPreview,
+    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
     TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolErrorClass,
     TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus, TurnPostTurnToolStatus,
+    TurnPreCompactionHookInput, TurnPreCompactionHookInputLimits,
+    TurnPreCompactionRawTurnRetention, TurnPreCompactionRetentionPolicy,
+    TurnPreCompactionSourceKind, TurnPreCompactionSourceRange, TurnPreCompactionSummaryPolicy,
+    TurnPreCompactionSummaryStorage, TurnPreCompactionSummaryStrategy,
+    TurnPreCompactionTokenBudget, TurnPreCompactionTrigger,
 };
 pub use runtime::{
     HookAttemptSummary, HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus,

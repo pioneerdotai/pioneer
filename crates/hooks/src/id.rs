@@ -92,6 +92,7 @@ macro_rules! hook_id_type {
 hook_id_type!(HookId);
 hook_id_type!(HookSubscriptionId);
 hook_id_type!(HookRunId);
+hook_id_type!(HookCompactionId);
 hook_id_type!(HookWorkspaceId);
 hook_id_type!(HookThreadId);
 hook_id_type!(HookTurnId);
