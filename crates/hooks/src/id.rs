@@ -107,6 +107,9 @@ hook_id_type!(HookSectionId);
 hook_id_type!(HookSourceId);
 hook_id_type!(HookDiagnosticCode);
 hook_id_type!(HookAuditEventKind);
+hook_id_type!(HookCapability);
+hook_id_type!(HookKind);
+hook_id_type!(HookFilterKey);
 
 fn validate_id_value(type_name: &'static str, value: &str) -> Result<(), HookIdError> {
     if value.is_empty() {
