@@ -3,6 +3,7 @@ mod chat;
 mod manager_recovery;
 #[cfg(test)]
 mod manager_tests;
+mod memory;
 
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream,
@@ -30,6 +31,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use manager_recovery::apply_recovery_adjustments;
+pub use memory::{
+    AgentMemoryProvider, MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
+    MemoryToolMaterialization, MemoryTurnContext,
+};
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
@@ -1331,6 +1336,7 @@ pub struct AgentManager {
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
+    memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
 }
 
 impl AgentManager {
@@ -1343,17 +1349,31 @@ impl AgentManager {
         tool_loop_config: ToolLoopConfig,
         mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     ) -> Self {
+        Self::new_with_mcp_and_memory(provider_registry, tool_loop_config, mcp_tool_provider, None)
+    }
+
+    pub fn new_with_mcp_and_memory(
+        provider_registry: Arc<ProviderRegistry>,
+        tool_loop_config: ToolLoopConfig,
+        mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+        memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
+    ) -> Self {
         Self {
             state: RwLock::new(AgentManagerState::default()),
             provider_registry,
             tool_loop_config: tool_loop_config.normalized(),
             mcp_tool_provider,
             task_tool_provider: RwLock::new(None),
+            memory_provider: RwLock::new(memory_provider),
         }
     }
 
     pub async fn set_task_tool_provider(&self, provider: Option<Arc<dyn TaskToolProvider>>) {
         *self.task_tool_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_provider(&self, provider: Option<Arc<dyn AgentMemoryProvider>>) {
+        *self.memory_provider.write().await = provider;
     }
 
     pub async fn ensure_thread(
@@ -1391,6 +1411,7 @@ impl AgentManager {
             self.tool_loop_config.clone(),
             self.mcp_tool_provider.clone(),
             self.task_tool_provider.read().await.clone(),
+            self.memory_provider.read().await.clone(),
             command_tx.clone(),
             command_rx,
             event_hub.clone(),

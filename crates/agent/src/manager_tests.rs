@@ -1,6 +1,7 @@
 use super::{
-    AgentCommand, AgentEvent, AgentManager, AgentStartError, RecoveryAttemptRequest,
-    ToolLoopConfig, TurnExecutionControl,
+    AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentStartError,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    RecoveryAttemptRequest, ToolLoopConfig, TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_protocol::{
@@ -16,7 +17,9 @@ use pioneer_provider::{
 };
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
-    ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+    ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind,
+    ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolLoopBudgetConfig,
+    ToolRetryBudgetConfig, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -272,6 +275,122 @@ impl ProviderRecoveryBoundaryProvider {
             .lock()
             .expect("provider boundary lock poisoned")
             .clone()
+    }
+}
+
+struct RecordingMemoryProvider {
+    recall_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
+    recall_requests: std::sync::Mutex<Vec<MemoryRecallRequest>>,
+    tool_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
+    recall_result: Result<MemoryRecallSnapshot, String>,
+    tool_result: Result<MemoryToolMaterialization, String>,
+}
+
+impl RecordingMemoryProvider {
+    fn new(
+        recall_result: Result<MemoryRecallSnapshot, String>,
+        tool_result: Result<MemoryToolMaterialization, String>,
+    ) -> Self {
+        Self {
+            recall_contexts: std::sync::Mutex::new(Vec::new()),
+            recall_requests: std::sync::Mutex::new(Vec::new()),
+            tool_contexts: std::sync::Mutex::new(Vec::new()),
+            recall_result,
+            tool_result,
+        }
+    }
+
+    fn ok() -> Self {
+        Self::new(
+            Ok(MemoryRecallSnapshot::empty()),
+            Ok(MemoryToolMaterialization::default()),
+        )
+    }
+
+    fn recall_contexts(&self) -> Vec<MemoryTurnContext> {
+        self.recall_contexts
+            .lock()
+            .expect("memory recall contexts lock poisoned")
+            .clone()
+    }
+
+    fn recall_requests(&self) -> Vec<MemoryRecallRequest> {
+        self.recall_requests
+            .lock()
+            .expect("memory recall requests lock poisoned")
+            .clone()
+    }
+
+    fn tool_contexts(&self) -> Vec<MemoryTurnContext> {
+        self.tool_contexts
+            .lock()
+            .expect("memory tool contexts lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryProvider for RecordingMemoryProvider {
+    async fn recall_memory(
+        &self,
+        context: MemoryTurnContext,
+        request: MemoryRecallRequest,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        self.recall_contexts
+            .lock()
+            .expect("memory recall contexts lock poisoned")
+            .push(context);
+        self.recall_requests
+            .lock()
+            .expect("memory recall requests lock poisoned")
+            .push(request);
+        self.recall_result.clone()
+    }
+
+    async fn materialize_memory_tools(
+        &self,
+        context: MemoryTurnContext,
+    ) -> Result<MemoryToolMaterialization, String> {
+        self.tool_contexts
+            .lock()
+            .expect("memory tool contexts lock poisoned")
+            .push(context);
+        self.tool_result.clone()
+    }
+}
+
+struct MemoryFakeHandler;
+
+#[async_trait::async_trait]
+impl ToolHandler for MemoryFakeHandler {
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        Ok(Box::new(FunctionToolOutput::new("memory-ok", true)))
+    }
+}
+
+fn fake_memory_tool_bundle() -> ToolExtensionBundle {
+    let spec = ConfiguredToolSpec::new(
+        ToolSpec::new(
+            "memory_fake",
+            "test-only memory tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            PayloadKind::Function,
+        ),
+        ExecutionClass::Shared,
+        dynamic_unknown_output_policy(),
+    );
+    let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
+    ToolExtensionBundle {
+        specs: vec![spec],
+        handlers: vec![("memory_fake".to_owned(), handler)],
     }
 }
 
@@ -749,6 +868,298 @@ async fn recv_events_until_terminal(
     }
 
     panic!("terminal agent event not received")
+}
+
+fn assert_turn_completed(observed: &[AgentEvent]) {
+    assert!(
+        matches!(observed.last(), Some(AgentEvent::TurnCompleted { .. })),
+        "expected terminal turn completion, observed {observed:?}"
+    );
+}
+
+async fn start_simple_turn(
+    manager: &AgentManager,
+    thread_id: &str,
+    workspace_id: &str,
+    turn_id: &str,
+    mode: ThreadMode,
+    provider_name: &str,
+    text: &str,
+) -> Vec<AgentEvent> {
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(manager, thread_id).await;
+    manager
+        .start_turn(
+            thread_id,
+            turn_id,
+            mode,
+            "test-model",
+            provider_name,
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: text.to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    recv_events_until_terminal(&mut events).await
+}
+
+#[tokio::test]
+async fn no_memory_provider_keeps_agent_request_unchanged() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_no_provider",
+        "ws_memory_no_provider",
+        "turn_memory_no_provider",
+        ThreadMode::Agent,
+        "capture",
+        "hello without memory",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.messages.len(), 1);
+    assert_eq!(request.messages[0].role, Role::User);
+    assert_eq!(request.messages[0].content, "hello without memory");
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("Memory Recall"));
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include built-in tools");
+    assert!(!tools.iter().any(|tool| tool.name == "memory_fake"));
+    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
+}
+
+#[tokio::test]
+async fn memory_provider_is_optional_and_agent_turn_completes() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager =
+        AgentManager::new_with_mcp_and_memory(registry, test_tool_loop_config(), None, None);
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_optional",
+        "ws_memory_optional",
+        "turn_memory_optional",
+        ThreadMode::Agent,
+        "capture",
+        "run without a memory provider",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn memory_provider_recall_error_degrades_gracefully() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Err("recall unavailable".to_owned()),
+        Ok(MemoryToolMaterialization::default()),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_recall_error",
+        "ws_memory_recall_error",
+        "turn_memory_recall_error",
+        ThreadMode::Agent,
+        "capture",
+        "continue even if recall fails",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn memory_provider_tool_materialization_error_degrades_gracefully() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Err("memory tools unavailable".to_owned()),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_tool_error",
+        "ws_memory_tool_error",
+        "turn_memory_tool_error",
+        ThreadMode::Agent,
+        "capture",
+        "continue even if memory tools fail",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0]
+        .tools
+        .as_ref()
+        .expect("agent request should include built-in tools");
+    assert!(!tools.iter().any(|tool| tool.name == "memory_fake"));
+}
+
+#[tokio::test]
+async fn memory_provider_receives_turn_context_for_agent_mode() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::ok());
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_context",
+        "ws_memory_context",
+        "turn_memory_context",
+        ThreadMode::Agent,
+        "capture",
+        "my birthday is May 5",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let recall_contexts = memory_provider.recall_contexts();
+    assert_eq!(recall_contexts.len(), 1);
+    let context = &recall_contexts[0];
+    assert_eq!(context.workspace_id, "ws_memory_context");
+    assert_eq!(context.thread_id, "thr_memory_context");
+    assert_eq!(context.turn_id, "turn_memory_context");
+    assert_eq!(context.mode, ThreadMode::Agent);
+    assert_eq!(context.input_text, "my birthday is May 5");
+    assert_eq!(context.task_id, None);
+    assert_eq!(context.agent_id, None);
+
+    let recall_requests = memory_provider.recall_requests();
+    assert_eq!(recall_requests.len(), 1);
+    assert_eq!(recall_requests[0].query, "my birthday is May 5");
+
+    let tool_contexts = memory_provider.tool_contexts();
+    assert_eq!(tool_contexts, recall_contexts);
+}
+
+#[tokio::test]
+async fn chat_mode_does_not_call_memory_provider_by_default() {
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "capture-standard",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::ok());
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_chat",
+        "ws_memory_chat",
+        "turn_memory_chat",
+        ThreadMode::Chat,
+        "capture-standard",
+        "plain chat should not touch memory",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert!(memory_provider.recall_contexts().is_empty());
+    assert!(memory_provider.recall_requests().is_empty());
+    assert!(memory_provider.tool_contexts().is_empty());
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].tools.is_none());
+    assert!(requests[0].compiled_prompt.is_none());
+}
+
+#[tokio::test]
+async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_them() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_memory_tool_bundle()],
+            diagnostics: vec!["test memory tool diagnostic".to_owned()],
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_memory_bundle",
+        "ws_memory_bundle",
+        "turn_memory_bundle",
+        ThreadMode::Agent,
+        "capture",
+        "show memory test tool",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0]
+        .tools
+        .as_ref()
+        .expect("agent request should include tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_fake"));
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("Memory Recall"));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("test memory tool diagnostic")
+    );
 }
 
 fn loop_budget_manager(

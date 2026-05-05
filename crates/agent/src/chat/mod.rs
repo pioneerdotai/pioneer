@@ -11,8 +11,10 @@ use self::tool_retry_lifecycle::{
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider,
-    TaskTurnContext, TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl,
+    AgentMcpToolProvider, AgentMemoryProvider, MemoryRecallRequest, MemoryRecallSnapshot,
+    MemoryToolMaterialization, MemoryTurnContext, RetainedToolLlmContext, TaskToolMaterialization,
+    TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
+    TurnExecutionControl,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -449,6 +451,7 @@ pub(super) async fn execute_chat_turn_flow(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
@@ -490,6 +493,7 @@ pub(super) async fn execute_chat_turn_flow(
                 tool_loop_config,
                 mcp_tool_provider,
                 task_tool_provider,
+                memory_provider,
                 turn_control.clone(),
                 recovery,
                 &workspace_id,
@@ -691,6 +695,96 @@ async fn materialize_task_tooling(
     }
 }
 
+fn memory_turn_context(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    mode: ThreadMode,
+    input_text: String,
+) -> MemoryTurnContext {
+    MemoryTurnContext {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        mode,
+        input_text,
+        task_id: None,
+        agent_id: None,
+    }
+}
+
+fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
+    MemoryRecallRequest {
+        query: input_text.to_owned(),
+        categories: Vec::new(),
+        top_k: None,
+        max_chars: None,
+    }
+}
+
+async fn load_memory_recall_snapshot(
+    provider: Option<&Arc<dyn AgentMemoryProvider>>,
+    context: MemoryTurnContext,
+    request: MemoryRecallRequest,
+) -> MemoryRecallSnapshot {
+    let Some(provider) = provider else {
+        return MemoryRecallSnapshot::empty();
+    };
+    match provider.recall_memory(context.clone(), request).await {
+        Ok(snapshot) => {
+            for diagnostic in &snapshot.diagnostics {
+                warn!(
+                    thread_id = context.thread_id.as_str(),
+                    turn_id = context.turn_id.as_str(),
+                    diagnostic = diagnostic.as_str(),
+                    "memory recall provider reported diagnostic"
+                );
+            }
+            snapshot
+        }
+        Err(error) => {
+            warn!(
+                thread_id = context.thread_id.as_str(),
+                turn_id = context.turn_id.as_str(),
+                error = error.as_str(),
+                "memory recall provider failed; continuing without memory recall"
+            );
+            MemoryRecallSnapshot::empty()
+        }
+    }
+}
+
+async fn materialize_memory_tooling(
+    provider: Option<&Arc<dyn AgentMemoryProvider>>,
+    context: MemoryTurnContext,
+) -> MemoryToolMaterialization {
+    let Some(provider) = provider else {
+        return MemoryToolMaterialization::default();
+    };
+    match provider.materialize_memory_tools(context.clone()).await {
+        Ok(materialization) => {
+            for diagnostic in &materialization.diagnostics {
+                warn!(
+                    thread_id = context.thread_id.as_str(),
+                    turn_id = context.turn_id.as_str(),
+                    diagnostic = diagnostic.as_str(),
+                    "memory tool materialization reported diagnostic"
+                );
+            }
+            materialization
+        }
+        Err(error) => {
+            warn!(
+                thread_id = context.thread_id.as_str(),
+                turn_id = context.turn_id.as_str(),
+                error = error.as_str(),
+                "memory tool materialization failed; continuing without memory tools"
+            );
+            MemoryToolMaterialization::default()
+        }
+    }
+}
+
 async fn pending_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -883,6 +977,7 @@ async fn execute_agent_provider_response(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
     workspace_id: &str,
@@ -896,6 +991,20 @@ async fn execute_agent_provider_response(
         .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
 
     let tool_loop_config = tool_loop_config.normalized();
+
+    let memory_context = memory_turn_context(
+        workspace_id,
+        thread_id,
+        turn_id,
+        ThreadMode::Agent,
+        user_message.text_content_lossy(),
+    );
+    let _memory_recall_snapshot = load_memory_recall_snapshot(
+        memory_provider.as_ref(),
+        memory_context.clone(),
+        memory_recall_request(memory_context.input_text.as_str()),
+    )
+    .await;
 
     let mcp_availability =
         load_mcp_availability(mcp_tool_provider.as_ref(), workspace_id, thread_id, turn_id).await;
@@ -1040,6 +1149,8 @@ async fn execute_agent_provider_response(
             "MCP dynamic tool materialization reported diagnostic"
         );
     }
+    let memory_tool_materialization =
+        materialize_memory_tooling(memory_provider.as_ref(), memory_context.clone()).await;
     let skill_tool_materialization = skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
         &tool_loop_config.skills,
@@ -1067,6 +1178,7 @@ async fn execute_agent_provider_response(
     let mut extension_bundles = skill_tool_materialization.bundles.clone();
     extension_bundles.extend(mcp_materialization.bundles.clone());
     extension_bundles.extend(task_materialization.bundles.clone());
+    extension_bundles.extend(memory_tool_materialization.bundles.clone());
 
     let tools = match build_tools(
         workdir.clone(),
