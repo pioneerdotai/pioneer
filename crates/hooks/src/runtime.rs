@@ -1,10 +1,12 @@
 use crate::{
     HookContext, HookContribution, HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage,
-    HookDiagnosticSeverity, HookError, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
-    HookId, HookInput, HookMetadata, HookPhase, HookRegistry, HookRegistryError,
-    HookSubscriptionId, HookSubscriptionRegistry,
+    HookDiagnosticSeverity, HookError, HookFailurePolicy, HookHandler, HookHandlerRequest,
+    HookHandlerResponse, HookId, HookInput, HookMetadata, HookPhase, HookRegistry,
+    HookRegistryError, HookSubscription, HookSubscriptionId, HookSubscriptionRegistry,
 };
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -23,6 +25,15 @@ pub enum HookRuntimeError {
         hook_id: HookId,
         phase: HookPhase,
         error: HookError,
+    },
+    MissingDependency {
+        subscription_id: HookSubscriptionId,
+        dependency_id: HookSubscriptionId,
+        phase: HookPhase,
+    },
+    DependencyCycle {
+        phase: HookPhase,
+        subscription_ids: Vec<HookSubscriptionId>,
     },
 }
 
@@ -49,6 +60,28 @@ impl fmt::Display for HookRuntimeError {
                 "hook subscription `{}` handler `{}` failed for phase `{}`: {}",
                 subscription_id, hook_id, phase, error
             ),
+            Self::MissingDependency {
+                subscription_id,
+                dependency_id,
+                phase,
+            } => write!(
+                formatter,
+                "hook subscription `{}` references missing dependency `{}` for phase `{}`",
+                subscription_id, dependency_id, phase
+            ),
+            Self::DependencyCycle {
+                phase,
+                subscription_ids,
+            } => {
+                write!(formatter, "hook dependency cycle for phase `{}`: ", phase)?;
+                for (index, subscription_id) in subscription_ids.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{}", subscription_id)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -58,7 +91,9 @@ impl std::error::Error for HookRuntimeError {
         match self {
             Self::Registry(error) => Some(error),
             Self::HookFailed { error, .. } => Some(error),
-            Self::MissingHandler { .. } => None,
+            Self::MissingHandler { .. }
+            | Self::MissingDependency { .. }
+            | Self::DependencyCycle { .. } => None,
         }
     }
 }
@@ -163,55 +198,240 @@ impl HookRuntime {
         request: HookPhaseRequest,
     ) -> HookRuntimeResult<HookPhaseResponse> {
         let subscriptions = self.subscriptions.subscriptions_for_phase(request.phase)?;
+        let plan = build_execution_plan(request.phase, subscriptions, self.handlers.as_ref())?;
         let mut response = HookPhaseResponse::default();
 
-        for subscription in subscriptions {
-            let handler = self
-                .handlers
-                .get_handler(&subscription.hook_id)?
-                .ok_or_else(|| HookRuntimeError::MissingHandler {
-                    subscription_id: subscription.subscription_id.clone(),
-                    hook_id: subscription.hook_id.clone(),
-                    phase: request.phase,
-                })?;
-            let handler_request = HookHandlerRequest {
-                hook_id: subscription.hook_id.clone(),
-                phase: request.phase,
-                context: request.context.clone(),
-                input: request.input.clone(),
-            };
+        for batch in plan.batches {
+            let mut results = join_all(
+                batch
+                    .into_iter()
+                    .map(|node| execute_node(node, request.clone())),
+            )
+            .await;
+            results.sort_by_key(|result| result.order_index);
 
-            match handler.execute(handler_request).await {
-                Ok(handler_response) => {
-                    append_success(
-                        &mut response,
-                        subscription.subscription_id,
-                        subscription.hook_id,
-                        request.phase,
-                        handler_response,
-                    );
-                }
-                Err(error) if subscription.failure_policy == HookFailurePolicy::BestEffort => {
-                    append_best_effort_failure(
-                        &mut response,
-                        subscription.subscription_id,
-                        subscription.hook_id,
-                        request.phase,
-                        error,
-                    );
-                }
-                Err(error) => {
-                    return Err(HookRuntimeError::HookFailed {
-                        subscription_id: subscription.subscription_id,
-                        hook_id: subscription.hook_id,
-                        phase: request.phase,
-                        error,
-                    });
+            for result in results {
+                let NodeExecutionResult {
+                    subscription,
+                    handler_response,
+                    ..
+                } = result;
+                match handler_response {
+                    Ok(handler_response) => {
+                        append_success(
+                            &mut response,
+                            subscription.subscription_id,
+                            subscription.hook_id,
+                            request.phase,
+                            handler_response,
+                        );
+                    }
+                    Err(error) if subscription.failure_policy == HookFailurePolicy::BestEffort => {
+                        append_best_effort_failure(
+                            &mut response,
+                            subscription.subscription_id,
+                            subscription.hook_id,
+                            request.phase,
+                            error,
+                        );
+                    }
+                    Err(error) => {
+                        return Err(HookRuntimeError::HookFailed {
+                            subscription_id: subscription.subscription_id,
+                            hook_id: subscription.hook_id,
+                            phase: request.phase,
+                            error,
+                        });
+                    }
                 }
             }
         }
 
         Ok(response)
+    }
+}
+
+#[derive(Clone)]
+struct HookExecutionPlan {
+    batches: Vec<Vec<HookExecutionNode>>,
+}
+
+#[derive(Clone)]
+struct HookExecutionNode {
+    order_index: usize,
+    subscription: HookSubscription,
+    handler: Arc<dyn HookHandler>,
+}
+
+struct NodeExecutionResult {
+    order_index: usize,
+    subscription: HookSubscription,
+    handler_response: Result<HookHandlerResponse, HookError>,
+}
+
+fn build_execution_plan(
+    phase: HookPhase,
+    subscriptions: Vec<HookSubscription>,
+    handlers: &HookRegistry,
+) -> HookRuntimeResult<HookExecutionPlan> {
+    let subscription_indexes = subscriptions
+        .iter()
+        .enumerate()
+        .map(|(index, subscription)| (subscription.subscription_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    validate_dependencies(phase, &subscriptions, &subscription_indexes)?;
+    let batches = build_topological_batches(phase, &subscriptions, &subscription_indexes)?;
+    let mut nodes = Vec::with_capacity(subscriptions.len());
+    for (order_index, subscription) in subscriptions.into_iter().enumerate() {
+        let handler = handlers
+            .get_handler(&subscription.hook_id)?
+            .ok_or_else(|| HookRuntimeError::MissingHandler {
+                subscription_id: subscription.subscription_id.clone(),
+                hook_id: subscription.hook_id.clone(),
+                phase,
+            })?;
+        nodes.push(HookExecutionNode {
+            order_index,
+            subscription,
+            handler,
+        });
+    }
+
+    Ok(HookExecutionPlan {
+        batches: batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(|node_index| nodes[node_index].clone())
+                    .collect()
+            })
+            .collect(),
+    })
+}
+
+fn validate_dependencies(
+    phase: HookPhase,
+    subscriptions: &[HookSubscription],
+    subscription_indexes: &BTreeMap<HookSubscriptionId, usize>,
+) -> HookRuntimeResult<()> {
+    for subscription in subscriptions {
+        for dependency_id in &subscription.dependencies.after {
+            if !subscription_indexes.contains_key(dependency_id) {
+                return Err(HookRuntimeError::MissingDependency {
+                    subscription_id: subscription.subscription_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                    phase,
+                });
+            }
+        }
+        for dependency_id in &subscription.dependencies.before {
+            if !subscription_indexes.contains_key(dependency_id) {
+                return Err(HookRuntimeError::MissingDependency {
+                    subscription_id: subscription.subscription_id.clone(),
+                    dependency_id: dependency_id.clone(),
+                    phase,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_topological_batches(
+    phase: HookPhase,
+    subscriptions: &[HookSubscription],
+    subscription_indexes: &BTreeMap<HookSubscriptionId, usize>,
+) -> HookRuntimeResult<Vec<Vec<usize>>> {
+    let node_count = subscriptions.len();
+    let mut successors = vec![BTreeSet::new(); node_count];
+    let mut indegrees = vec![0usize; node_count];
+
+    for (current_index, subscription) in subscriptions.iter().enumerate() {
+        for dependency_id in &subscription.dependencies.after {
+            let dependency_index = subscription_indexes[dependency_id];
+            add_edge(
+                dependency_index,
+                current_index,
+                &mut successors,
+                &mut indegrees,
+            );
+        }
+        for dependency_id in &subscription.dependencies.before {
+            let target_index = subscription_indexes[dependency_id];
+            add_edge(current_index, target_index, &mut successors, &mut indegrees);
+        }
+    }
+
+    let mut ready = indegrees
+        .iter()
+        .enumerate()
+        .filter_map(|(index, indegree)| (*indegree == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut processed = vec![false; node_count];
+    let mut processed_count = 0usize;
+    let mut batches = Vec::new();
+
+    while !ready.is_empty() {
+        ready.sort_unstable();
+        let batch = ready;
+        ready = Vec::new();
+
+        for &node_index in &batch {
+            if processed[node_index] {
+                continue;
+            }
+            processed[node_index] = true;
+            processed_count += 1;
+        }
+
+        for &node_index in &batch {
+            for &successor_index in &successors[node_index] {
+                indegrees[successor_index] -= 1;
+                if indegrees[successor_index] == 0 {
+                    ready.push(successor_index);
+                }
+            }
+        }
+
+        batches.push(batch);
+    }
+
+    if processed_count != node_count {
+        let subscription_ids = subscriptions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, subscription)| {
+                (!processed[index]).then_some(subscription.subscription_id.clone())
+            })
+            .collect();
+        return Err(HookRuntimeError::DependencyCycle {
+            phase,
+            subscription_ids,
+        });
+    }
+
+    Ok(batches)
+}
+
+fn add_edge(from: usize, to: usize, successors: &mut [BTreeSet<usize>], indegrees: &mut [usize]) {
+    if successors[from].insert(to) {
+        indegrees[to] += 1;
+    }
+}
+
+async fn execute_node(node: HookExecutionNode, request: HookPhaseRequest) -> NodeExecutionResult {
+    let handler_request = HookHandlerRequest {
+        hook_id: node.subscription.hook_id.clone(),
+        phase: request.phase,
+        context: request.context,
+        input: request.input,
+    };
+    let handler_response = node.handler.execute(handler_request).await;
+    NodeExecutionResult {
+        order_index: node.order_index,
+        subscription: node.subscription,
+        handler_response,
     }
 }
 
@@ -283,7 +503,10 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
 
     struct RecordingHookHandler {
         id: HookId,
@@ -320,6 +543,63 @@ mod tests {
                 .expect("responses lock")
                 .pop_front()
                 .expect("test response exists")
+        }
+    }
+
+    struct BarrierHookHandler {
+        id: HookId,
+        barrier: Arc<Barrier>,
+        started_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HookHandler for BarrierHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            self.started_count.fetch_add(1, Ordering::SeqCst);
+            self.barrier.wait().await;
+            Ok(HookHandlerResponse::default())
+        }
+    }
+
+    struct DelayedHookHandler {
+        id: HookId,
+        delay: Duration,
+        contribution: HookContribution,
+    }
+
+    #[async_trait]
+    impl HookHandler for DelayedHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            tokio::time::sleep(self.delay).await;
+            Ok(HookHandlerResponse {
+                contributions: vec![self.contribution.clone()],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })
         }
     }
 
@@ -381,6 +661,17 @@ mod tests {
         })
     }
 
+    fn contribution_section_ids(response: &HookPhaseResponse) -> Vec<HookSectionId> {
+        response
+            .contributions
+            .iter()
+            .map(|contribution| match contribution {
+                HookContribution::PromptSection(section) => section.section_id.clone(),
+                _ => panic!("expected prompt section contribution"),
+            })
+            .collect()
+    }
+
     fn diagnostic(code: &str, message: &str) -> HookDiagnostic {
         HookDiagnostic {
             code: HookDiagnosticCode::new(code).expect("valid code"),
@@ -440,6 +731,28 @@ mod tests {
                 )
                 .with_priority(priority)
                 .with_failure_policy(failure_policy),
+            )
+            .expect("subscription registers");
+    }
+
+    fn register_subscription_with_dependencies(
+        handlers: &HookRegistry,
+        subscriptions: &HookSubscriptionRegistry,
+        subscription_id: &str,
+        hook_id: &str,
+        priority: i32,
+        dependencies: HookSubscriptionDependencies,
+    ) {
+        subscriptions
+            .register_subscription(
+                handlers,
+                HookSubscription::new(
+                    self::subscription_id(subscription_id),
+                    self::hook_id(hook_id),
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_priority(priority)
+                .with_dependencies(dependencies),
             )
             .expect("subscription registers");
     }
@@ -839,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_are_not_evaluated_in_phase_03() {
+    fn filters_still_are_not_evaluated_in_phase_04() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -876,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_do_not_change_order_in_phase_03() {
+    fn dependency_after_order_is_respected() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -888,32 +1201,22 @@ mod tests {
                 vec![Ok(HookHandlerResponse::default())],
             );
         }
-        subscriptions
-            .register_subscription(
-                &handlers,
-                HookSubscription::new(
-                    subscription_id("sub.early"),
-                    hook_id("test.early"),
-                    HookPhase::TurnPrePromptCompile,
-                )
-                .with_priority(0)
-                .with_dependencies(HookSubscriptionDependencies::new(
-                    [subscription_id("sub.late")],
-                    [],
-                )),
-            )
-            .expect("subscription registers");
-        subscriptions
-            .register_subscription(
-                &handlers,
-                HookSubscription::new(
-                    subscription_id("sub.late"),
-                    hook_id("test.late"),
-                    HookPhase::TurnPrePromptCompile,
-                )
-                .with_priority(1),
-            )
-            .expect("subscription registers");
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.early",
+            "test.early",
+            0,
+            HookSubscriptionDependencies::new([subscription_id("sub.late")], []),
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.late",
+            "test.late",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
         let runtime = runtime(handlers, subscriptions);
 
         let response =
@@ -925,7 +1228,445 @@ mod tests {
                 .into_iter()
                 .map(|run| run.subscription_id)
                 .collect::<Vec<_>>(),
-            vec![subscription_id("sub.early"), subscription_id("sub.late")]
+            vec![subscription_id("sub.late"), subscription_id("sub.early")]
+        );
+    }
+
+    #[test]
+    fn dependency_before_order_is_respected() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for id in ["test.before", "test.after"] {
+            register_handler(
+                &handlers,
+                id,
+                calls.clone(),
+                vec![Ok(HookHandlerResponse::default())],
+            );
+        }
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.before",
+            "test.before",
+            10,
+            HookSubscriptionDependencies::new([], [subscription_id("sub.after")]),
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.after",
+            "test.after",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(
+            response
+                .runs
+                .into_iter()
+                .map(|run| run.subscription_id)
+                .collect::<Vec<_>>(),
+            vec![subscription_id("sub.before"), subscription_id("sub.after")]
+        );
+    }
+
+    #[test]
+    fn dependency_cycle_is_rejected() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for id in ["test.a", "test.b"] {
+            register_handler(
+                &handlers,
+                id,
+                calls.clone(),
+                vec![Ok(HookHandlerResponse::default())],
+            );
+        }
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.a",
+            "test.a",
+            0,
+            HookSubscriptionDependencies::new([subscription_id("sub.b")], []),
+        );
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.b",
+            "test.b",
+            1,
+            HookSubscriptionDependencies::new([subscription_id("sub.a")], []),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("cycle should be rejected");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::DependencyCycle { phase, subscription_ids }
+                if phase == HookPhase::TurnPrePromptCompile
+                    && subscription_ids == vec![subscription_id("sub.a"), subscription_id("sub.b")]
+        ));
+        assert!(calls.lock().expect("calls lock").is_empty());
+    }
+
+    #[test]
+    fn self_dependency_is_rejected_as_cycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.self",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.self",
+            "test.self",
+            0,
+            HookSubscriptionDependencies::new([subscription_id("sub.self")], []),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("self dependency should be rejected");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::DependencyCycle { phase, subscription_ids }
+                if phase == HookPhase::TurnPrePromptCompile
+                    && subscription_ids == vec![subscription_id("sub.self")]
+        ));
+    }
+
+    #[test]
+    fn missing_dependency_is_rejected() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.one",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.one",
+            "test.one",
+            0,
+            HookSubscriptionDependencies::new([subscription_id("sub.missing")], []),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("missing dependency should be rejected");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::MissingDependency { subscription_id, dependency_id, phase }
+                if subscription_id == self::subscription_id("sub.one")
+                    && dependency_id == self::subscription_id("sub.missing")
+                    && phase == HookPhase::TurnPrePromptCompile
+        ));
+        assert!(calls.lock().expect("calls lock").is_empty());
+    }
+
+    #[test]
+    fn disabled_dependency_is_reported_missing() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        for id in ["test.enabled", "test.disabled"] {
+            register_handler(
+                &handlers,
+                id,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![Ok(HookHandlerResponse::default())],
+            );
+        }
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.enabled",
+            "test.enabled",
+            0,
+            HookSubscriptionDependencies::new([subscription_id("sub.disabled")], []),
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.disabled",
+            "test.disabled",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
+        subscriptions
+            .disable_subscription(&subscription_id("sub.disabled"))
+            .expect("disable succeeds");
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("disabled dependency should be missing");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::MissingDependency { subscription_id, dependency_id, phase }
+                if subscription_id == self::subscription_id("sub.enabled")
+                    && dependency_id == self::subscription_id("sub.disabled")
+                    && phase == HookPhase::TurnPrePromptCompile
+        ));
+    }
+
+    #[test]
+    fn missing_handler_is_resolved_before_any_handler_executes() {
+        let registration_handlers = Arc::new(HookRegistry::new());
+        let runtime_handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &registration_handlers,
+            "test.ok",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_handler(
+            &registration_handlers,
+            "test.missing",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        runtime_handlers
+            .register_handler(handler(
+                "test.ok",
+                calls.clone(),
+                vec![Ok(HookHandlerResponse::default())],
+            ))
+            .expect("handler registers");
+        register_subscription(
+            &registration_handlers,
+            &subscriptions,
+            "sub.ok",
+            "test.ok",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        register_subscription(
+            &registration_handlers,
+            &subscriptions,
+            "sub.missing",
+            "test.missing",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(runtime_handlers, subscriptions);
+
+        let error =
+            block_on_ready(runtime.run_phase(phase_request())).expect_err("handler missing");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::MissingHandler { subscription_id, hook_id, phase }
+                if subscription_id == self::subscription_id("sub.missing")
+                    && hook_id == self::hook_id("test.missing")
+                    && phase == HookPhase::TurnPrePromptCompile
+        ));
+        assert!(calls.lock().expect("calls lock").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_hooks_run_concurrently() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let barrier = Arc::new(Barrier::new(2));
+        let started_count = Arc::new(AtomicUsize::new(0));
+        for id in ["test.one", "test.two"] {
+            handlers
+                .register_handler(Arc::new(BarrierHookHandler {
+                    id: hook_id(id),
+                    barrier: barrier.clone(),
+                    started_count: started_count.clone(),
+                }))
+                .expect("handler registers");
+        }
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.one",
+            "test.one",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.two",
+            "test.two",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), runtime.run_phase(phase_request()))
+                .await
+                .expect("parallel execution should not hang")
+                .expect("phase execution succeeds");
+
+        assert_eq!(started_count.load(Ordering::SeqCst), 2);
+        assert_eq!(response.runs.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_contribution_order_is_deterministic_when_completion_order_differs() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        handlers
+            .register_handler(Arc::new(DelayedHookHandler {
+                id: hook_id("test.slow"),
+                delay: Duration::from_millis(50),
+                contribution: contribution("section.slow", "slow"),
+            }))
+            .expect("handler registers");
+        handlers
+            .register_handler(Arc::new(DelayedHookHandler {
+                id: hook_id("test.fast"),
+                delay: Duration::from_millis(1),
+                contribution: contribution("section.fast", "fast"),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.slow",
+            "test.slow",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.fast",
+            "test.fast",
+            10,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), runtime.run_phase(phase_request()))
+                .await
+                .expect("phase should complete")
+                .expect("phase execution succeeds");
+
+        assert_eq!(
+            contribution_section_ids(&response),
+            vec![
+                HookSectionId::new("section.slow").expect("valid section id"),
+                HookSectionId::new("section.fast").expect("valid section id")
+            ]
+        );
+    }
+
+    #[test]
+    fn best_effort_failure_in_parallel_batch_records_diagnostic_and_continues() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.fail",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error("hook.failed", "failed"))],
+        );
+        register_handler(
+            &handlers,
+            "test.ok",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.ok", "ok")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.fail",
+            "test.fail",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.ok",
+            "test.ok",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(response.runs[0].status, HookRunStatus::Failed);
+        assert_eq!(response.runs[1].status, HookRunStatus::Succeeded);
+        assert_eq!(response.contributions.len(), 1);
+    }
+
+    #[test]
+    fn non_best_effort_failure_stops_later_batches() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.fail",
+            calls.clone(),
+            vec![Err(hook_error("hook.failed", "failed"))],
+        );
+        register_handler(
+            &handlers,
+            "test.later",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.fail",
+            "test.fail",
+            0,
+            HookFailurePolicy::Required,
+        );
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.later",
+            "test.later",
+            1,
+            HookSubscriptionDependencies::new([subscription_id("sub.fail")], []),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request())).expect_err("runtime fails");
+
+        assert!(matches!(error, HookRuntimeError::HookFailed { .. }));
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![hook_id("test.fail")]
         );
     }
 }
