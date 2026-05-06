@@ -1385,8 +1385,18 @@ impl HookHandler for ActiveMemoryRecallHook {
             }
         }
 
-        let active_items = dedup_active_recall_items(active_items, &deterministic.memory_ids);
-        if active_items.is_empty() {
+        let active_dedup = dedup_active_recall_items_with_lines(
+            active_items,
+            &deterministic.memory_ids,
+            &deterministic.rendered_line_fingerprints,
+        );
+        response
+            .diagnostics
+            .push(active_memory_dedup_observability_diagnostic(
+                &deterministic,
+                &active_dedup,
+            ));
+        if active_dedup.items.is_empty() {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.active_recall.no_hits",
                 "memory active recall returned no non-duplicate memory context",
@@ -1395,7 +1405,7 @@ impl HookHandler for ActiveMemoryRecallHook {
         }
 
         if let Some(contribution) = memory_active_recall_prompt_context_contribution(
-            active_items,
+            active_dedup.items,
             active_truncated,
             &config,
         ) {
@@ -1489,7 +1499,7 @@ impl HookHandler for MemoryPromptContractHook {
         if let Some(contribution) = memory_recall_prompt_section_contribution_from_context(
             available_tool_names,
             prompt_policy,
-            recall_context.content,
+            recall_context.clone(),
             recall_context.truncated,
         ) {
             response.diagnostics.push(memory_safe_info_diagnostic(
@@ -1501,6 +1511,9 @@ impl HookHandler for MemoryPromptContractHook {
                     recall_context.count
                 ),
             ));
+            response
+                .diagnostics
+                .push(memory_prompt_recall_dedup_diagnostic(&recall_context));
             response.contributions.push(contribution);
         }
         Ok(response)
@@ -1720,6 +1733,13 @@ fn hook_metadata_key(key: &'static str) -> HookMetadataKey {
     HookMetadataKey::new(key).expect("static metadata key is valid")
 }
 
+fn insert_usize_metadata(object: &mut HookMetadata, key: &'static str, value: usize) {
+    object.insert(
+        hook_metadata_key(key),
+        HookValue::I64(i64::try_from(value).unwrap_or(i64::MAX)),
+    );
+}
+
 fn insert_policy_text(
     object: &mut BTreeMap<HookMetadataKey, HookValue>,
     key: &'static str,
@@ -1912,6 +1932,7 @@ fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
 #[derive(Debug, Clone, Default)]
 struct DeterministicRecallContextSummary {
     memory_ids: BTreeSet<String>,
+    rendered_line_fingerprints: BTreeSet<String>,
     context_count: usize,
     context_chars: usize,
     sufficient: bool,
@@ -1930,6 +1951,9 @@ fn deterministic_recall_context_summary(
         }
         summary.context_count += 1;
         summary.context_chars += entry.content.as_str().chars().count();
+        summary
+            .rendered_line_fingerprints
+            .extend(rendered_line_fingerprints(entry.content.as_str()));
         for source_ref in &entry.source_refs {
             if source_ref.kind.as_str() == "memory" {
                 summary.memory_ids.insert(source_ref.id.as_str().to_owned());
@@ -2092,6 +2116,102 @@ fn active_memory_decision_observability_diagnostic(
     )
 }
 
+fn active_memory_dedup_observability_diagnostic(
+    deterministic: &DeterministicRecallContextSummary,
+    dedup: &ActiveRecallDedupResult,
+) -> HookDiagnostic {
+    let mut diagnostic = memory_safe_info_diagnostic(
+        "memory.active_recall.dedup",
+        format!(
+            "memory active recall dedup: deterministic_recall_count={} active_raw_count={} active_duplicate_count={} active_rendered_count={} duplicate_only={}",
+            deterministic.memory_ids.len(),
+            dedup.raw_count,
+            dedup.duplicate_count(),
+            dedup.rendered_count(),
+            dedup.duplicate_only()
+        ),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "deterministic_recall_count",
+        deterministic.memory_ids.len(),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_raw_count",
+        dedup.raw_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_duplicate_id_count",
+        dedup.duplicate_id_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_duplicate_line_count",
+        dedup.duplicate_line_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_rendered_count",
+        dedup.rendered_count(),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("active_duplicate_only"),
+        HookValue::Bool(dedup.duplicate_only()),
+    );
+    diagnostic
+}
+
+fn memory_prompt_recall_dedup_diagnostic(context: &MemoryRecallPromptContext) -> HookDiagnostic {
+    let mut diagnostic = memory_safe_info_diagnostic(
+        "memory.prompt_recall.dedup",
+        format!(
+            "memory prompt recall dedup: deterministic_recall_count={} active_raw_count={} active_duplicate_count={} active_rendered_count={} active_synthesis_rendered={} active_duplicate_only={}",
+            context.deterministic_memory_count,
+            context.active_raw_count,
+            context.active_duplicate_count(),
+            context.active_rendered_count,
+            context.active_synthesis_rendered,
+            context.active_duplicate_only()
+        ),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "deterministic_recall_count",
+        context.deterministic_memory_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_raw_count",
+        context.active_raw_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_duplicate_id_count",
+        context.active_duplicate_id_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_duplicate_line_count",
+        context.active_duplicate_line_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "active_rendered_count",
+        context.active_rendered_count,
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("active_synthesis_rendered"),
+        HookValue::Bool(context.active_synthesis_rendered),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("active_duplicate_only"),
+        HookValue::Bool(context.active_duplicate_only()),
+    );
+    diagnostic
+}
+
 fn active_memory_decision_status_name(status: ActiveMemoryDecisionStatus) -> &'static str {
     match status {
         ActiveMemoryDecisionStatus::Skip => "skip",
@@ -2187,20 +2307,100 @@ fn active_memory_query_plan(
     queries
 }
 
-fn dedup_active_recall_items(
+#[derive(Debug, Clone, Default)]
+struct ActiveRecallDedupResult {
+    items: Vec<MemoryRecallItem>,
+    raw_count: usize,
+    duplicate_id_count: usize,
+    duplicate_line_count: usize,
+}
+
+impl ActiveRecallDedupResult {
+    fn rendered_count(&self) -> usize {
+        self.items.len()
+    }
+
+    fn duplicate_count(&self) -> usize {
+        self.duplicate_id_count + self.duplicate_line_count
+    }
+
+    fn duplicate_only(&self) -> bool {
+        self.raw_count > 0 && self.rendered_count() == 0 && self.duplicate_count() > 0
+    }
+}
+
+fn dedup_active_recall_items_with_lines(
     items: Vec<MemoryRecallItem>,
     deterministic_ids: &BTreeSet<String>,
-) -> Vec<MemoryRecallItem> {
+    deterministic_line_fingerprints: &BTreeSet<String>,
+) -> ActiveRecallDedupResult {
     let mut seen = deterministic_ids.clone();
+    let mut seen_lines = deterministic_line_fingerprints.clone();
+    let mut result = ActiveRecallDedupResult {
+        raw_count: items.len(),
+        ..ActiveRecallDedupResult::default()
+    };
     let mut deduped = Vec::new();
     for item in items {
         let memory_id = item.memory_id.trim();
         if memory_id.is_empty() || !seen.insert(memory_id.to_owned()) {
+            result.duplicate_id_count += 1;
+            continue;
+        }
+        if let Some(fingerprint) = memory_recall_item_rendered_line_fingerprint(&item)
+            && !seen_lines.insert(fingerprint)
+        {
+            result.duplicate_line_count += 1;
             continue;
         }
         deduped.push(item);
     }
-    deduped
+    result.items = deduped;
+    result
+}
+
+fn memory_recall_item_rendered_line_fingerprint(item: &MemoryRecallItem) -> Option<String> {
+    let prompt_item = memory_recall_prompt_item(item.clone());
+    let (line, _) = render_memory_recall_context_block(&[prompt_item], false);
+    rendered_line_fingerprint(line.as_str())
+}
+
+fn rendered_line_fingerprints(content: &str) -> BTreeSet<String> {
+    content
+        .lines()
+        .filter_map(rendered_line_fingerprint)
+        .collect()
+}
+
+fn active_memory_context_lines(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "Active memory context:")
+        .collect()
+}
+
+fn rendered_memory_line_id(line: &str) -> Option<String> {
+    let line = line.trim();
+    let metadata = line.strip_prefix("- [")?;
+    let end = metadata
+        .char_indices()
+        .find_map(|(index, ch)| (ch == ',' || ch == ']').then_some(index))?;
+    let memory_id = metadata[..end].trim();
+    if memory_id.is_empty() {
+        None
+    } else {
+        Some(memory_id.to_owned())
+    }
+}
+
+fn rendered_line_fingerprint(line: &str) -> Option<String> {
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn memory_active_recall_prompt_context_contribution(
@@ -2221,7 +2421,7 @@ fn memory_active_recall_prompt_context_contribution(
     if content.trim().is_empty() {
         return None;
     }
-    let mut content = format!("Active memory context:\n{content}");
+    let mut content = content;
     let mut truncated = rendered_truncated;
     let content_chars = content.chars().count();
     if content_chars > config.max_prompt_chars {
@@ -2324,9 +2524,29 @@ fn memory_tool_names_from_prompt_compile_input(
 
 #[derive(Debug, Clone, Default)]
 struct MemoryRecallPromptContext {
-    content: Option<String>,
+    deterministic_content: Option<String>,
+    active_content: Option<String>,
     count: usize,
+    deterministic_count: usize,
+    deterministic_memory_count: usize,
+    active_raw_count: usize,
+    active_duplicate_id_count: usize,
+    active_duplicate_line_count: usize,
+    active_rendered_count: usize,
+    active_synthesis_rendered: bool,
     truncated: bool,
+}
+
+impl MemoryRecallPromptContext {
+    fn active_duplicate_count(&self) -> usize {
+        self.active_duplicate_id_count + self.active_duplicate_line_count
+    }
+
+    fn active_duplicate_only(&self) -> bool {
+        self.active_raw_count > 0
+            && self.active_rendered_count == 0
+            && self.active_duplicate_count() > 0
+    }
 }
 
 fn memory_recall_context_from_prompt_context_set(
@@ -2338,38 +2558,84 @@ fn memory_recall_context_from_prompt_context_set(
     }
 
     let mut context = MemoryRecallPromptContext::default();
-    let mut content = String::new();
+    let mut deterministic_content = String::new();
+    let mut active_content = String::new();
+    let mut deterministic_ids = BTreeSet::new();
+    let mut seen_line_fingerprints = BTreeSet::new();
+    let mut active_ids = BTreeSet::new();
     for entry in prompt_context_set.entries() {
         if entry.domain.as_str() != MEMORY_POLICY_DOMAIN {
             continue;
         }
-        if !memory_recall_prompt_context_contribution_allowed(entry.contribution_id.as_str()) {
-            continue;
+        match entry.contribution_id.as_str() {
+            MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID => {
+                let entry_content = entry.content.as_str().trim();
+                if entry_content.is_empty() {
+                    continue;
+                }
+                if !deterministic_content.is_empty() {
+                    deterministic_content.push('\n');
+                }
+                deterministic_content.push_str(entry_content);
+                context.count += 1;
+                context.deterministic_count += 1;
+                context.truncated |= entry.truncated;
+                seen_line_fingerprints.extend(rendered_line_fingerprints(entry_content));
+                for source_ref in &entry.source_refs {
+                    if source_ref.kind.as_str() == "memory"
+                        && deterministic_ids.insert(source_ref.id.as_str().to_owned())
+                    {
+                        context.deterministic_memory_count += 1;
+                    }
+                }
+            }
+            MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID => {
+                let entry_content = entry.content.as_str().trim();
+                if entry_content.is_empty() {
+                    continue;
+                }
+                context.count += 1;
+                context.truncated |= entry.truncated;
+                for line in active_memory_context_lines(entry_content) {
+                    context.active_raw_count += 1;
+                    let parsed_id = rendered_memory_line_id(line);
+                    if let Some(memory_id) = parsed_id.as_deref() {
+                        if deterministic_ids.contains(memory_id)
+                            || !active_ids.insert(memory_id.to_owned())
+                        {
+                            context.active_duplicate_id_count += 1;
+                            continue;
+                        }
+                    }
+                    let Some(fingerprint) = rendered_line_fingerprint(line) else {
+                        continue;
+                    };
+                    if !seen_line_fingerprints.insert(fingerprint) {
+                        context.active_duplicate_line_count += 1;
+                        continue;
+                    }
+                    if !active_content.is_empty() {
+                        active_content.push('\n');
+                    }
+                    active_content.push_str(line);
+                    context.active_rendered_count += 1;
+                    context.active_synthesis_rendered |= parsed_id.is_none();
+                }
+            }
+            _ => {}
         }
-        let entry_content = entry.content.as_str().trim();
-        if entry_content.is_empty() {
-            continue;
-        }
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(entry_content);
-        context.count += 1;
-        context.truncated |= entry.truncated;
     }
-    context.content = if content.trim().is_empty() {
+    context.deterministic_content = if deterministic_content.trim().is_empty() {
         None
     } else {
-        Some(content)
+        Some(deterministic_content)
+    };
+    context.active_content = if active_content.trim().is_empty() {
+        None
+    } else {
+        Some(active_content)
     };
     context
-}
-
-fn memory_recall_prompt_context_contribution_allowed(contribution_id: &str) -> bool {
-    matches!(
-        contribution_id,
-        MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID | MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID
-    )
 }
 
 fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
@@ -2706,22 +2972,24 @@ pub(crate) fn memory_recall_prompt_input(
             .map(memory_recall_prompt_item)
             .collect(),
         recalled_context: None,
+        active_context: None,
         truncated: recall_snapshot.truncated,
     }
 }
 
-pub(crate) fn memory_recall_prompt_section_contribution_from_context(
+fn memory_recall_prompt_section_contribution_from_context(
     available_tool_names: Vec<String>,
     policy: MemoryRecallPromptPolicy,
-    recalled_context: Option<String>,
+    recall_context: MemoryRecallPromptContext,
     truncated: bool,
 ) -> Option<HookContribution> {
     memory_recall_prompt_section_contribution_from_input(MemoryRecallPromptInput {
         available_tool_names,
         policy,
         recalled_items: Vec::new(),
-        recalled_context,
-        truncated,
+        recalled_context: recall_context.deterministic_content,
+        active_context: recall_context.active_content,
+        truncated: truncated || recall_context.truncated,
     })
 }
 
@@ -3673,7 +3941,7 @@ mod tests {
             MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID
         );
         assert_eq!(context.domain.as_str(), MEMORY_POLICY_DOMAIN);
-        assert!(context.content.as_str().contains("Active memory context:"));
+        assert!(!context.content.as_str().contains("Active memory context:"));
         assert!(
             context
                 .content
@@ -4014,6 +4282,213 @@ mod tests {
         assert!(content.contains("Active memory context:"));
         assert!(content.contains("Use hooks for memory domains."));
         assert!(!content.contains("Unrelated memory-domain context"));
+    }
+
+    #[tokio::test]
+    async fn phase_16_deterministic_only_recall_omits_active_heading() {
+        let hook = MemoryPromptContractHook;
+        let deterministic_context =
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic prompt context");
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [deterministic_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+        assert!(content.contains("Relevant memories:"));
+        assert!(content.contains("User likes Porto."));
+        assert!(!content.contains("Active memory context:"));
+    }
+
+    #[tokio::test]
+    async fn phase_16_duplicate_active_memory_id_is_suppressed() {
+        let hook = MemoryPromptContractHook;
+        let deterministic_context =
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic prompt context");
+        let active_context = memory_active_recall_prompt_context_contribution(
+            recalled_city_snapshot().items,
+            false,
+            &MemoryActiveRecallConfig::default(),
+        )
+        .expect("active prompt context");
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [deterministic_context, active_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.prompt_recall.dedup"
+                && diagnostic.message.as_str().contains("active_raw_count=1")
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("active_duplicate_count=1")
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("active_rendered_count=0")
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("active_duplicate_only=true")
+        }));
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+        assert_eq!(content.matches("User likes Porto.").count(), 1);
+        assert!(!content.contains("Active memory context:"));
+    }
+
+    #[tokio::test]
+    async fn phase_16_mixed_active_duplicates_keep_only_unique_context() {
+        let hook = MemoryPromptContractHook;
+        let deterministic_context =
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic prompt context");
+        let mut active_items = recalled_city_snapshot().items;
+        active_items.extend(active_project_snapshot().items);
+        let active_context = memory_active_recall_prompt_context_contribution(
+            active_items,
+            false,
+            &MemoryActiveRecallConfig::default(),
+        )
+        .expect("active prompt context");
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [deterministic_context, active_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+
+        assert_eq!(content.matches("User likes Porto.").count(), 1);
+        assert!(content.contains("Active memory context:"));
+        assert!(content.contains("Use hooks for memory domains."));
+        let active_section = content
+            .split("Active memory context:")
+            .nth(1)
+            .expect("active section should render");
+        assert!(!active_section.contains("mem_city"));
+    }
+
+    #[tokio::test]
+    async fn phase_16_exact_active_line_duplicate_is_suppressed() {
+        let hook = MemoryPromptContractHook;
+        let deterministic_context = PromptContextContribution {
+            contribution_id: HookContributionId::new(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
+                .expect("valid contribution id"),
+            domain: memory_policy_domain(),
+            priority: 500,
+            content: HookPromptContent::new("Shared synthesized line.")
+                .expect("valid prompt content"),
+            max_chars: Some(500),
+            source_refs: Vec::new(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        };
+        let active_context = PromptContextContribution {
+            contribution_id: HookContributionId::new(MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID)
+                .expect("valid contribution id"),
+            domain: memory_policy_domain(),
+            priority: 490,
+            content: HookPromptContent::new("Shared synthesized line.")
+                .expect("valid prompt content"),
+            max_chars: Some(500),
+            source_refs: Vec::new(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        };
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [deterministic_context, active_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+
+        assert_eq!(content.matches("Shared synthesized line.").count(), 1);
+        assert!(!content.contains("Active memory context:"));
+    }
+
+    #[tokio::test]
+    async fn phase_16_active_synthesis_context_is_kept_when_unique() {
+        let hook = MemoryPromptContractHook;
+        let deterministic_context =
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic prompt context");
+        let active_context = PromptContextContribution {
+            contribution_id: HookContributionId::new(MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID)
+                .expect("valid contribution id"),
+            domain: memory_policy_domain(),
+            priority: 490,
+            content: HookPromptContent::new("User is continuing Pioneer memory architecture work.")
+                .expect("valid prompt content"),
+            max_chars: Some(500),
+            source_refs: vec![memory_source_ref("mem_city")],
+            diagnostics: Vec::new(),
+            truncated: false,
+        };
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [deterministic_context, active_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.prompt_recall.dedup"
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("active_synthesis_rendered=true")
+        }));
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+
+        assert!(content.contains("Relevant memories:"));
+        assert!(content.contains("Active memory context:"));
+        assert!(content.contains("User is continuing Pioneer memory architecture work."));
     }
 
     #[tokio::test]
@@ -4565,6 +5040,14 @@ mod tests {
             [contribution],
             HookPromptContextLimits::default(),
         )
+    }
+
+    fn memory_source_ref(memory_id: &str) -> HookSourceRef {
+        HookSourceRef {
+            kind: HookSourceKind::Custom("memory".to_owned()),
+            id: HookSourceId::new(memory_id.to_owned()).expect("valid memory source id"),
+            label: None,
+        }
     }
 
     fn prompt_section_content(response: HookHandlerResponse) -> Option<String> {

@@ -4521,6 +4521,96 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
 }
 
 #[tokio::test]
+async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let mut config = test_tool_loop_config();
+    config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
+    config.memory.active_recall.max_queries = 1;
+    config
+        .memory
+        .active_recall
+        .deterministic_sufficient_min_items = 99;
+    let manager = AgentManager::new(registry, config);
+    let duplicate_memory = memory_recall_item(
+        "mem_phase16_duplicate",
+        MemoryCategory::Identity,
+        Some("name"),
+        "User's name is Alexander.",
+    );
+    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
+        vec![
+            Ok(MemoryRecallSnapshot {
+                items: vec![duplicate_memory.clone()],
+                diagnostics: Vec::new(),
+                truncated: false,
+            }),
+            Ok(MemoryRecallSnapshot {
+                items: vec![duplicate_memory],
+                diagnostics: Vec::new(),
+                truncated: false,
+            }),
+        ],
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase16_active_memory_dup",
+        "ws_phase16_active_memory_dup",
+        "turn_phase16_active_memory_dup",
+        ThreadMode::Agent,
+        "capture",
+        "continue the previous architecture implementation with the same memory constraints",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("Relevant memories:"));
+    assert_eq!(
+        prompt
+            .full_system_text
+            .matches("User's name is Alexander.")
+            .count(),
+        1
+    );
+    assert!(!prompt.full_system_text.contains("Active memory context:"));
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    assert!(manifest.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == PromptManifestDiagnosticCode::HookDiagnostic
+            && diagnostic.message.contains("memory prompt recall dedup")
+            && diagnostic.message.contains("active_duplicate_count=1")
+            && diagnostic.message.contains("active_rendered_count=0")
+            && diagnostic.message.contains("active_duplicate_only=true")
+            && diagnostic
+                .hook_source
+                .as_ref()
+                .is_some_and(|source| source.hook_id == "memory.prompt_contract")
+    }));
+}
+
+#[tokio::test]
 async fn memory_provider_without_tools_recalls_but_omits_prompt_contract() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));

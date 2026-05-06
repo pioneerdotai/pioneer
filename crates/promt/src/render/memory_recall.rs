@@ -10,6 +10,7 @@ pub struct MemoryRecallPromptInput {
     pub policy: MemoryRecallPromptPolicy,
     pub recalled_items: Vec<MemoryRecallPromptItem>,
     pub recalled_context: Option<String>,
+    pub active_context: Option<String>,
     pub truncated: bool,
 }
 
@@ -122,6 +123,24 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
         prompt.push_str(recall_block.as_str());
         if truncated {
             prompt.push_str("\nAdditional recalled memories were omitted for prompt budget.");
+        }
+    }
+    if input.policy != MemoryRecallPromptPolicy::ForgetOnly
+        && let Some(active_context) = input
+            .active_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|context| !context.is_empty())
+    {
+        let (active_context, active_truncated) =
+            truncate_recall_context(active_context, input.truncated);
+        if !active_context.is_empty() {
+            prompt.push_str("\n\nActive memory context:\n");
+            prompt.push_str(active_context.as_str());
+            if active_truncated {
+                prompt
+                    .push_str("\nAdditional active memory context was omitted for prompt budget.");
+            }
         }
     }
 
@@ -265,6 +284,7 @@ mod tests {
             policy: MemoryRecallPromptPolicy::Full,
             recalled_items: vec![memory_prompt_item("mem_123", "User's name is Alexander.")],
             recalled_context: None,
+            active_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -294,6 +314,7 @@ mod tests {
                 policy: MemoryRecallPromptPolicy::Full,
                 recalled_items: Vec::new(),
                 recalled_context: None,
+                active_context: None,
                 truncated: false,
             })
             .is_none()
@@ -319,6 +340,7 @@ mod tests {
             policy: MemoryRecallPromptPolicy::Full,
             recalled_items: items,
             recalled_context: None,
+            active_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -339,6 +361,7 @@ mod tests {
             policy: MemoryRecallPromptPolicy::ReadOnly,
             recalled_items: vec![memory_prompt_item("mem_123", "User prefers short answers.")],
             recalled_context: None,
+            active_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -359,6 +382,7 @@ mod tests {
             policy: MemoryRecallPromptPolicy::ForgetOnly,
             recalled_items: vec![memory_prompt_item("mem_123", "User's birthday is May 5.")],
             recalled_context: None,
+            active_context: Some("- [mem_active] Active should also be omitted.".to_owned()),
             truncated: false,
         })
         .expect("memory prompt");
@@ -366,6 +390,29 @@ mod tests {
         assert!(prompt.contains("only to identify and forget"));
         assert!(!prompt.contains("Before non-trivial tasks"));
         assert!(!prompt.contains("Relevant memories:"));
+        assert!(!prompt.contains("Active memory context:"));
         assert!(!prompt.contains("User's birthday is May 5."));
+    }
+
+    #[test]
+    fn memory_prompt_renders_active_context_as_separate_section() {
+        let prompt = render_memory_recall_prompt(&MemoryRecallPromptInput {
+            available_tool_names: vec!["memory_search".to_owned()],
+            policy: MemoryRecallPromptPolicy::Full,
+            recalled_items: vec![memory_prompt_item("mem_123", "User's name is Alexander.")],
+            recalled_context: None,
+            active_context: Some("User is working on Pioneer memory architecture.".to_owned()),
+            truncated: false,
+        })
+        .expect("memory prompt");
+
+        let relevant_index = prompt
+            .find("Relevant memories:")
+            .expect("relevant section should render");
+        let active_index = prompt
+            .find("Active memory context:")
+            .expect("active section should render");
+        assert!(relevant_index < active_index);
+        assert!(prompt.contains("User is working on Pioneer memory architecture."));
     }
 }
