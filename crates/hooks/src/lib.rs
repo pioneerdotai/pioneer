@@ -1,3 +1,4 @@
+mod config;
 mod context;
 mod contribution;
 mod diagnostic;
@@ -15,12 +16,18 @@ mod runtime;
 mod store;
 mod subscription;
 mod text;
+mod tool_bundle_set;
 mod value;
 
+pub use config::{
+    HookConfigLayer, HookConfigLayerKind, HookPhaseConfig, HookRuntimeConfig,
+    HookSubscriptionConfig,
+};
 pub use context::{HookActor, HookActorKind, HookContext, HookContextMode};
 pub use contribution::{
-    AuditContribution, HookContribution, HookSourceKind, HookSourceRef, PolicyContribution,
-    PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
+    AuditContribution, BackgroundJobContribution, HookContribution, HookSourceKind, HookSourceRef,
+    PolicyContribution, PromptContextContribution, PromptManifestDiagnosticContribution,
+    PromptSectionContribution, ToolBundleContribution,
 };
 pub use diagnostic::{
     HookDiagnostic, HookDiagnosticPreview, HookDiagnosticRedactionPolicy, HookDiagnosticSeverity,
@@ -28,11 +35,12 @@ pub use diagnostic::{
 pub use error::{HookError, HookRegistryError, HookResult};
 pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
-    HookActorId, HookAgentId, HookAuditEventKind, HookCapability, HookCompactionId,
-    HookContributionHash, HookContributionId, HookDiagnosticCode, HookDomain, HookFeatureFlag,
-    HookFilterKey, HookId, HookIdError, HookKind, HookMetadataKey, HookPolicyKey, HookRunAttemptId,
-    HookRunId, HookRunIdempotencyKey, HookRunScopeId, HookSectionId, HookSourceId,
-    HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId, HookWorkspaceId,
+    HookActorId, HookAgentId, HookAuditEventKind, HookBackgroundJobId, HookCapability,
+    HookCompactionId, HookContributionHash, HookContributionId, HookDiagnosticCode, HookDomain,
+    HookFeatureFlag, HookFilterKey, HookId, HookIdError, HookKind, HookMetadataKey, HookPolicyKey,
+    HookRunAttemptId, HookRunId, HookRunIdempotencyKey, HookRunScopeId, HookSectionId,
+    HookSourceId, HookSubscriptionId, HookTaskId, HookThreadId, HookToolBundleId, HookToolName,
+    HookTurnId, HookWorkspaceId,
 };
 pub use phase::{HookPhase, ParseHookPhaseError};
 pub use policy::{
@@ -62,16 +70,18 @@ pub use request::{
     TurnPreCompactionRawTurnRetention, TurnPreCompactionRetentionPolicy,
     TurnPreCompactionSourceKind, TurnPreCompactionSourceRange, TurnPreCompactionSummaryPolicy,
     TurnPreCompactionSummaryStorage, TurnPreCompactionSummaryStrategy,
-    TurnPreCompactionTokenBudget, TurnPreCompactionTrigger,
+    TurnPreCompactionTokenBudget, TurnPreCompactionTrigger, TurnPrePolicyHookInput,
+    TurnPreToolMaterializationHookInput,
 };
 pub use runtime::{
     HookAttemptSummary, HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus,
     HookRunSummary, HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
 };
 pub use store::{
-    HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunScope, HookRunScopeKind,
-    HookRunStore, HookRunStoreCompletion, HookRunStoreError, HookRunStoreRecord,
-    HookRunStoreResult, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookAuditEventStoreRecord, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
+    HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
+    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,
@@ -80,4 +90,5 @@ pub use text::{
     HookDiagnosticMessage, HookPromptContent, HookPromptSectionTitle, HookSourceLabel,
     HookTextError,
 };
+pub use tool_bundle_set::{HookToolBundleEntry, HookToolBundleSet};
 pub use value::{HookMetadata, HookValue};

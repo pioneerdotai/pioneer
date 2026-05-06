@@ -1,7 +1,7 @@
 use crate::{
     HookCompactionId, HookContext, HookContribution, HookDiagnostic, HookId, HookMetadata,
-    HookPhase, HookPolicySet, HookPromptContextSet, HookThreadId, HookTurnId, HookValue,
-    HookWorkspaceId,
+    HookPhase, HookPolicySet, HookPromptContextSet, HookThreadId, HookToolName, HookTurnId,
+    HookValue, HookWorkspaceId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -11,6 +11,7 @@ use std::fmt;
 pub enum HookInputKind {
     TurnPrePolicy,
     TurnPrePromptContext,
+    TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
     TurnPostTurn,
@@ -23,6 +24,7 @@ impl HookInputKind {
         match self {
             Self::TurnPrePolicy => "turn.pre_policy",
             Self::TurnPrePromptContext => "turn.pre_prompt_context",
+            Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
             Self::TurnPostTurn => "turn.post_turn",
@@ -37,6 +39,7 @@ impl From<HookPhase> for HookInputKind {
         match phase {
             HookPhase::TurnPrePolicy => Self::TurnPrePolicy,
             HookPhase::TurnPrePromptContext => Self::TurnPrePromptContext,
+            HookPhase::TurnPreToolMaterialization => Self::TurnPreToolMaterialization,
             HookPhase::TurnPrePromptCompile => Self::TurnPrePromptCompile,
             HookPhase::TurnPostPromptCompile => Self::TurnPostPromptCompile,
             HookPhase::TurnPostTurn => Self::TurnPostTurn,
@@ -50,6 +53,7 @@ impl From<&str> for HookInputKind {
         match value {
             "turn.pre_policy" => Self::TurnPrePolicy,
             "turn.pre_prompt_context" => Self::TurnPrePromptContext,
+            "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
             "turn.post_turn" => Self::TurnPostTurn,
@@ -64,6 +68,7 @@ impl From<String> for HookInputKind {
         match value.as_str() {
             "turn.pre_policy" => Self::TurnPrePolicy,
             "turn.pre_prompt_context" => Self::TurnPrePromptContext,
+            "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
             "turn.post_turn" => Self::TurnPostTurn,
@@ -119,10 +124,24 @@ impl HookInput {
         }
     }
 
+    pub fn turn_pre_policy(payload: TurnPrePolicyHookInput) -> Self {
+        Self {
+            kind: HookInputKind::TurnPrePolicy,
+            payload: HookInputPayload::TurnPrePolicy(payload),
+        }
+    }
+
     pub fn turn_post_turn(payload: TurnPostTurnHookInput) -> Self {
         Self {
             kind: HookInputKind::TurnPostTurn,
             payload: HookInputPayload::TurnPostTurn(payload),
+        }
+    }
+
+    pub fn turn_pre_tool_materialization(payload: TurnPreToolMaterializationHookInput) -> Self {
+        Self {
+            kind: HookInputKind::TurnPreToolMaterialization,
+            payload: HookInputPayload::TurnPreToolMaterialization(payload),
         }
     }
 
@@ -138,6 +157,8 @@ impl HookInput {
 #[serde(rename_all = "snake_case", tag = "type", content = "value")]
 pub enum HookInputPayload {
     Empty,
+    TurnPrePolicy(TurnPrePolicyHookInput),
+    TurnPreToolMaterialization(TurnPreToolMaterializationHookInput),
     TurnPostTurn(TurnPostTurnHookInput),
     TurnPreCompaction(TurnPreCompactionHookInput),
     Custom(HookValue),
@@ -156,6 +177,51 @@ pub const DEFAULT_POST_TURN_TOOL_EVENT_MAX_COUNT: usize = 40;
 pub const DEFAULT_POST_TURN_DOMAIN_EVENT_MAX_COUNT: usize = 40;
 pub const DEFAULT_POST_TURN_DOMAIN_EVENT_MESSAGE_MAX_CHARS: usize = 1_000;
 pub const DEFAULT_PRE_COMPACTION_EXISTING_SUMMARY_PREVIEW_MAX_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPrePolicyHookInput {
+    pub input_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+}
+
+impl TurnPrePolicyHookInput {
+    pub fn from_parts(
+        input_text: impl Into<String>,
+        model: Option<impl Into<String>>,
+        model_provider: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            input_text: input_text.into(),
+            model: model.map(Into::into),
+            model_provider: model_provider.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreToolMaterializationHookInput {
+    pub provider_tool_calling: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_tool_names: Vec<HookToolName>,
+}
+
+impl TurnPreToolMaterializationHookInput {
+    pub fn from_parts(
+        provider_tool_calling: bool,
+        mut existing_tool_names: Vec<HookToolName>,
+    ) -> Self {
+        existing_tool_names.sort();
+        existing_tool_names.dedup();
+
+        Self {
+            provider_tool_calling,
+            existing_tool_names,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnPostTurnHookInputLimits {
@@ -578,6 +644,105 @@ mod tests {
         let decoded: HookHandlerResponse =
             serde_json::from_value(value).expect("response should deserialize");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn turn_pre_policy_input_roundtrips() {
+        let input = TurnPrePolicyHookInput::from_parts(
+            "remember my birthday",
+            Some("gpt-test"),
+            Some("test-provider"),
+        );
+
+        let value = serde_json::to_value(&input).expect("pre-policy input serializes");
+        let decoded: TurnPrePolicyHookInput =
+            serde_json::from_value(value).expect("pre-policy input deserializes");
+
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn hook_input_payload_distinguishes_pre_policy() {
+        let input = TurnPrePolicyHookInput::from_parts(
+            "turn text",
+            Option::<String>::None,
+            Option::<String>::None,
+        );
+        let hook_input = HookInput::turn_pre_policy(input.clone());
+
+        assert_eq!(hook_input.kind, HookInputKind::TurnPrePolicy);
+        assert_eq!(hook_input.payload, HookInputPayload::TurnPrePolicy(input));
+    }
+
+    #[test]
+    fn turn_pre_tool_materialization_input_sorts_and_dedups_tool_names() {
+        let input = TurnPreToolMaterializationHookInput::from_parts(
+            true,
+            vec![
+                HookToolName::new("memory_search").expect("valid tool name"),
+                HookToolName::new("shell").expect("valid tool name"),
+                HookToolName::new("memory_search").expect("valid tool name"),
+            ],
+        );
+
+        assert!(input.provider_tool_calling);
+        assert_eq!(
+            input.existing_tool_names,
+            vec![
+                HookToolName::new("memory_search").expect("valid tool name"),
+                HookToolName::new("shell").expect("valid tool name"),
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_pre_tool_materialization_input_roundtrips() {
+        let input = TurnPreToolMaterializationHookInput::from_parts(
+            false,
+            vec![HookToolName::new("shell").expect("valid tool name")],
+        );
+
+        let value = serde_json::to_value(&input).expect("pre-tool input serializes");
+        let decoded: TurnPreToolMaterializationHookInput =
+            serde_json::from_value(value).expect("pre-tool input deserializes");
+
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn hook_input_payload_distinguishes_pre_tool_materialization() {
+        let empty = HookInput::empty(HookInputKind::TurnPrePolicy);
+        assert_eq!(empty.payload, HookInputPayload::Empty);
+
+        let pre_tool = HookInput::turn_pre_tool_materialization(
+            TurnPreToolMaterializationHookInput::from_parts(
+                true,
+                vec![HookToolName::new("shell").expect("valid tool name")],
+            ),
+        );
+
+        assert_eq!(pre_tool.kind, HookInputKind::TurnPreToolMaterialization);
+        assert!(matches!(
+            pre_tool.payload,
+            HookInputPayload::TurnPreToolMaterialization(_)
+        ));
+    }
+
+    #[test]
+    fn hook_input_kind_maps_pre_tool_materialization_phase() {
+        assert_eq!(
+            HookInputKind::from(HookPhase::TurnPreToolMaterialization),
+            HookInputKind::TurnPreToolMaterialization
+        );
+        assert_eq!(
+            HookInputKind::from("turn.pre_tool_materialization"),
+            HookInputKind::TurnPreToolMaterialization
+        );
+        assert_eq!(
+            serde_json::to_value(HookInputKind::TurnPreToolMaterialization)
+                .expect("input kind serializes"),
+            serde_json::json!("turn.pre_tool_materialization")
+        );
     }
 
     #[test]

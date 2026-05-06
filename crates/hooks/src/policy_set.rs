@@ -129,8 +129,10 @@ impl HookPolicySet {
                 HookContribution::Policy(policy) => Some(policy),
                 HookContribution::PromptContext(_)
                 | HookContribution::PromptSection(_)
+                | HookContribution::ToolBundle(_)
                 | HookContribution::PromptManifestDiagnostic(_)
                 | HookContribution::Audit(_)
+                | HookContribution::BackgroundJob(_)
                 | HookContribution::Noop => None,
             }
         }))
@@ -368,6 +370,8 @@ mod tests {
         let set = HookPolicySet::merge_hook_contributions([
             HookContribution::Policy(policy("test", "mode", HookValue::Bool(true), 0)),
             HookContribution::PromptSection(PromptSectionContribution {
+                contribution_id: crate::HookContributionId::new("test.section")
+                    .expect("valid contribution id"),
                 section_id: HookSectionId::new("test.section").expect("valid section id"),
                 title: Some(HookPromptSectionTitle::new("Test").expect("valid title")),
                 domain: domain("test"),

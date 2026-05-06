@@ -755,6 +755,10 @@ pub struct PromptManifestHookSourceEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_id: Option<String>,
     pub contribution_kind: PromptManifestHookContributionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_count: Option<usize>,
     pub truncation: PromptManifestHookTruncation,
 }
 

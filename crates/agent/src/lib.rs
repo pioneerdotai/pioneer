@@ -6,7 +6,7 @@ mod manager_recovery;
 mod manager_tests;
 mod memory;
 
-use pioneer_hooks::HookRuntime;
+use pioneer_hooks::{HookRegistry, HookRuntime, HookSubscriptionRegistry};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream,
     ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnItemType, UserInput,
@@ -33,7 +33,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 pub use hooks::AgentPostTurnHookDispatchPolicy;
+use hooks::AgentToolBundleArtifactStore;
 use manager_recovery::apply_recovery_adjustments;
+use memory::install_memory_hooks;
 pub use memory::{
     AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryActiveContextPolicy,
     MemoryClassifierFallbackPolicy, MemoryExtractionPolicy, MemoryMutationToolPolicy,
@@ -1343,6 +1345,41 @@ struct AgentManagerState {
     threads: HashMap<String, AgentThreadHandle>,
 }
 
+fn build_agent_hook_runtime(
+    runtime: Option<Arc<HookRuntime>>,
+    memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
+    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+) -> Result<
+    (
+        Option<Arc<HookRuntime>>,
+        Option<Arc<AgentToolBundleArtifactStore>>,
+    ),
+    AgentStartError,
+> {
+    let Some(memory_provider) = memory_provider else {
+        return Ok((runtime, None));
+    };
+
+    let runtime = runtime.unwrap_or_else(|| {
+        Arc::new(HookRuntime::new(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        ))
+    });
+    let tool_bundle_artifacts = Arc::new(AgentToolBundleArtifactStore::new());
+    install_memory_hooks(
+        &runtime,
+        memory_provider,
+        memory_turn_policy_provider,
+        tool_bundle_artifacts.clone(),
+    )
+    .map_err(|error| {
+        AgentStartError::Internal(format!("failed to install memory hooks: {error}"))
+    })?;
+
+    Ok((Some(runtime), Some(tool_bundle_artifacts)))
+}
+
 pub struct AgentManager {
     state: RwLock<AgentManagerState>,
     provider_registry: Arc<ProviderRegistry>,
@@ -1451,6 +1488,14 @@ impl AgentManager {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let event_hub = Arc::new(AgentEventHub::new());
 
+        let memory_provider = self.memory_provider.read().await.clone();
+        let memory_turn_policy_provider = self.memory_turn_policy_provider.read().await.clone();
+        let (hook_runtime, tool_bundle_artifacts) = build_agent_hook_runtime(
+            self.hook_runtime.read().await.clone(),
+            memory_provider,
+            memory_turn_policy_provider,
+        )?;
+
         let loop_handle = tokio::spawn(agent_loop::run_agent_loop(
             thread_id_owned,
             workspace_id_owned.clone(),
@@ -1458,9 +1503,8 @@ impl AgentManager {
             self.tool_loop_config.clone(),
             self.mcp_tool_provider.clone(),
             self.task_tool_provider.read().await.clone(),
-            self.memory_provider.read().await.clone(),
-            self.memory_turn_policy_provider.read().await.clone(),
-            self.hook_runtime.read().await.clone(),
+            hook_runtime,
+            tool_bundle_artifacts,
             *self.post_turn_hook_dispatch_policy.read().await,
             command_tx.clone(),
             command_rx,

@@ -6,8 +6,8 @@ use crate::{
     HookMetadata, HookPhase, HookPolicySet, HookPromptContextSet, HookRegistry, HookRegistryError,
     HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunIdempotencyKey, HookRunScope,
     HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreRecord, HookSubscription,
-    HookSubscriptionId, HookSubscriptionRegistry, NewHookRunAttemptStoreRecord,
-    NewHookRunStoreRecord,
+    HookSubscriptionId, HookSubscriptionRegistry, NewHookAuditEventStoreRecord,
+    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
@@ -51,6 +51,12 @@ pub enum HookRuntimeError {
         subscription_id: HookSubscriptionId,
         hook_id: HookId,
         phase: HookPhase,
+    },
+    InvalidExecutionPolicy {
+        subscription_id: HookSubscriptionId,
+        hook_id: HookId,
+        phase: HookPhase,
+        reason: String,
     },
     MissingDependency {
         subscription_id: HookSubscriptionId,
@@ -115,6 +121,16 @@ impl fmt::Display for HookRuntimeError {
                 "hook subscription `{}` handler `{}` requires fallback contributions for phase `{}`",
                 subscription_id, hook_id, phase
             ),
+            Self::InvalidExecutionPolicy {
+                subscription_id,
+                hook_id,
+                phase,
+                reason,
+            } => write!(
+                formatter,
+                "hook subscription `{}` handler `{}` has invalid execution policy for phase `{}`: {}",
+                subscription_id, hook_id, phase, reason
+            ),
             Self::MissingDependency {
                 subscription_id,
                 dependency_id,
@@ -149,6 +165,7 @@ impl std::error::Error for HookRuntimeError {
             Self::MissingHandler { .. }
             | Self::HookTimedOut { .. }
             | Self::MissingFallbackContribution { .. }
+            | Self::InvalidExecutionPolicy { .. }
             | Self::MissingDependency { .. }
             | Self::DependencyCycle { .. } => None,
         }
@@ -410,130 +427,22 @@ impl HookRuntime {
         let mut response = HookPhaseResponse::default();
 
         for batch in plan.batches {
-            let mut results = join_all(batch.into_iter().map(|node| {
-                execute_node(
-                    node,
-                    request.clone(),
-                    self.queued_background.clone(),
-                    self.options.clone(),
-                    self.run_store.clone(),
-                )
-            }))
-            .await;
-            results.sort_by_key(|result| result.order_index);
+            let chunk_size = batch_parallelism(&batch);
+            for chunk in batch.chunks(chunk_size) {
+                let mut results = join_all(chunk.iter().cloned().map(|node| {
+                    execute_node(
+                        node,
+                        request.clone(),
+                        self.queued_background.clone(),
+                        self.options.clone(),
+                        self.run_store.clone(),
+                    )
+                }))
+                .await;
+                results.sort_by_key(|result| result.order_index);
 
-            for result in results {
-                let NodeExecutionResult {
-                    subscription,
-                    outcome,
-                    ..
-                } = result;
-                match outcome? {
-                    HookNodeOutcome::Succeeded(handler_response) => {
-                        append_success(
-                            &mut response,
-                            subscription.subscription_id,
-                            subscription.hook_id,
-                            request.phase,
-                            handler_response,
-                            &self.options,
-                        );
-                    }
-                    HookNodeOutcome::Failed(error) => match subscription.failure_policy {
-                        HookFailurePolicy::Required => {
-                            return Err(HookRuntimeError::HookFailed {
-                                subscription_id: subscription.subscription_id,
-                                hook_id: subscription.hook_id,
-                                phase: request.phase,
-                                error,
-                            });
-                        }
-                        HookFailurePolicy::Fallback => {
-                            append_fallback_failure(
-                                &mut response,
-                                &subscription,
-                                request.phase,
-                                HookRunStatus::Failed,
-                                error,
-                                &self.options,
-                            );
-                        }
-                        HookFailurePolicy::BestEffort => {
-                            append_best_effort_failure(
-                                &mut response,
-                                subscription.subscription_id,
-                                subscription.hook_id,
-                                request.phase,
-                                HookRunStatus::Failed,
-                                error,
-                                &self.options,
-                            );
-                        }
-                        HookFailurePolicy::Skip => {
-                            append_skipped(&mut response, subscription, request.phase);
-                        }
-                        HookFailurePolicy::FailClosed => {
-                            return Err(HookRuntimeError::HookFailedClosed {
-                                subscription_id: subscription.subscription_id,
-                                hook_id: subscription.hook_id,
-                                phase: request.phase,
-                                error,
-                            });
-                        }
-                    },
-                    HookNodeOutcome::TimedOut { timeout_ms } => match subscription.failure_policy {
-                        HookFailurePolicy::Required => {
-                            return Err(HookRuntimeError::HookTimedOut {
-                                subscription_id: subscription.subscription_id,
-                                hook_id: subscription.hook_id,
-                                phase: request.phase,
-                                timeout_ms,
-                            });
-                        }
-                        HookFailurePolicy::Fallback => {
-                            append_fallback_failure(
-                                &mut response,
-                                &subscription,
-                                request.phase,
-                                HookRunStatus::TimedOut,
-                                timeout_error(timeout_ms),
-                                &self.options,
-                            );
-                        }
-                        HookFailurePolicy::BestEffort => {
-                            append_best_effort_failure(
-                                &mut response,
-                                subscription.subscription_id,
-                                subscription.hook_id,
-                                request.phase,
-                                HookRunStatus::TimedOut,
-                                timeout_error(timeout_ms),
-                                &self.options,
-                            );
-                        }
-                        HookFailurePolicy::Skip => {
-                            append_skipped(&mut response, subscription, request.phase);
-                        }
-                        HookFailurePolicy::FailClosed => {
-                            return Err(HookRuntimeError::HookFailedClosed {
-                                subscription_id: subscription.subscription_id,
-                                hook_id: subscription.hook_id,
-                                phase: request.phase,
-                                error: timeout_error(timeout_ms),
-                            });
-                        }
-                    },
-                    HookNodeOutcome::Skipped => {
-                        append_skipped(&mut response, subscription, request.phase);
-                    }
-                    HookNodeOutcome::Queued => {
-                        append_queued(
-                            &mut response,
-                            subscription.subscription_id,
-                            subscription.hook_id,
-                            request.phase,
-                        );
-                    }
+                for result in results {
+                    append_node_result(&mut response, result, request.phase, &self.options)?;
                 }
             }
         }
@@ -668,6 +577,14 @@ fn validate_policy_configuration(
                 phase,
             });
         }
+        if subscription.execution_policy.max_parallelism == Some(0) {
+            return Err(HookRuntimeError::InvalidExecutionPolicy {
+                subscription_id: subscription.subscription_id.clone(),
+                hook_id: subscription.hook_id.clone(),
+                phase,
+                reason: "max_parallelism must be greater than zero".to_owned(),
+            });
+        }
     }
     Ok(())
 }
@@ -752,6 +669,138 @@ fn add_edge(from: usize, to: usize, successors: &mut [BTreeSet<usize>], indegree
     if successors[from].insert(to) {
         indegrees[to] += 1;
     }
+}
+
+fn batch_parallelism(batch: &[HookExecutionNode]) -> usize {
+    let batch_len = batch.len().max(1);
+    batch
+        .iter()
+        .filter_map(|node| node.subscription.execution_policy.max_parallelism)
+        .map(usize::from)
+        .min()
+        .map(|limit| limit.clamp(1, batch_len))
+        .unwrap_or(batch_len)
+}
+
+fn append_node_result(
+    response: &mut HookPhaseResponse,
+    result: NodeExecutionResult,
+    phase: HookPhase,
+    options: &HookRuntimeOptions,
+) -> HookRuntimeResult<()> {
+    let NodeExecutionResult {
+        subscription,
+        outcome,
+        ..
+    } = result;
+    match outcome? {
+        HookNodeOutcome::Succeeded(handler_response) => {
+            append_success(
+                response,
+                subscription.subscription_id,
+                subscription.hook_id,
+                phase,
+                handler_response,
+                options,
+            );
+        }
+        HookNodeOutcome::Failed(error) => match subscription.failure_policy {
+            HookFailurePolicy::Required => {
+                return Err(HookRuntimeError::HookFailed {
+                    subscription_id: subscription.subscription_id,
+                    hook_id: subscription.hook_id,
+                    phase,
+                    error,
+                });
+            }
+            HookFailurePolicy::Fallback => {
+                append_fallback_failure(
+                    response,
+                    &subscription,
+                    phase,
+                    HookRunStatus::Failed,
+                    error,
+                    options,
+                );
+            }
+            HookFailurePolicy::BestEffort => {
+                append_best_effort_failure(
+                    response,
+                    subscription.subscription_id,
+                    subscription.hook_id,
+                    phase,
+                    HookRunStatus::Failed,
+                    error,
+                    options,
+                );
+            }
+            HookFailurePolicy::Skip => {
+                append_skipped(response, subscription, phase);
+            }
+            HookFailurePolicy::FailClosed => {
+                return Err(HookRuntimeError::HookFailedClosed {
+                    subscription_id: subscription.subscription_id,
+                    hook_id: subscription.hook_id,
+                    phase,
+                    error,
+                });
+            }
+        },
+        HookNodeOutcome::TimedOut { timeout_ms } => match subscription.failure_policy {
+            HookFailurePolicy::Required => {
+                return Err(HookRuntimeError::HookTimedOut {
+                    subscription_id: subscription.subscription_id,
+                    hook_id: subscription.hook_id,
+                    phase,
+                    timeout_ms,
+                });
+            }
+            HookFailurePolicy::Fallback => {
+                append_fallback_failure(
+                    response,
+                    &subscription,
+                    phase,
+                    HookRunStatus::TimedOut,
+                    timeout_error(timeout_ms),
+                    options,
+                );
+            }
+            HookFailurePolicy::BestEffort => {
+                append_best_effort_failure(
+                    response,
+                    subscription.subscription_id,
+                    subscription.hook_id,
+                    phase,
+                    HookRunStatus::TimedOut,
+                    timeout_error(timeout_ms),
+                    options,
+                );
+            }
+            HookFailurePolicy::Skip => {
+                append_skipped(response, subscription, phase);
+            }
+            HookFailurePolicy::FailClosed => {
+                return Err(HookRuntimeError::HookFailedClosed {
+                    subscription_id: subscription.subscription_id,
+                    hook_id: subscription.hook_id,
+                    phase,
+                    error: timeout_error(timeout_ms),
+                });
+            }
+        },
+        HookNodeOutcome::Skipped => {
+            append_skipped(response, subscription, phase);
+        }
+        HookNodeOutcome::Queued => {
+            append_queued(
+                response,
+                subscription.subscription_id,
+                subscription.hook_id,
+                phase,
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn execute_node(
@@ -946,6 +995,13 @@ impl HookRunPersistence {
                     current_unix_ms(),
                 )
                 .await;
+                self.persist_audit_contributions(
+                    subscription,
+                    phase,
+                    response.contributions.as_slice(),
+                    current_unix_ms(),
+                )
+                .await;
             }
             HookNodeOutcome::Failed(error) => {
                 self.complete_error_outcome(
@@ -984,7 +1040,7 @@ impl HookRunPersistence {
     async fn complete_error_outcome(
         &mut self,
         subscription: &HookSubscription,
-        _phase: HookPhase,
+        phase: HookPhase,
         status: HookRunStatus,
         error: HookError,
         options: &HookRuntimeOptions,
@@ -1015,6 +1071,15 @@ impl HookRunPersistence {
             current_unix_ms(),
         )
         .await;
+        if subscription.failure_policy == HookFailurePolicy::Fallback {
+            self.persist_audit_contributions(
+                subscription,
+                phase,
+                subscription.fallback_contributions.as_slice(),
+                current_unix_ms(),
+            )
+            .await;
+        }
     }
 
     async fn complete_attempt_and_run(
@@ -1100,6 +1165,43 @@ impl HookRunPersistence {
             .await
         {
             self.run = Some(updated);
+        }
+    }
+
+    async fn persist_audit_contributions(
+        &self,
+        subscription: &HookSubscription,
+        phase: HookPhase,
+        contributions: &[HookContribution],
+        created_at_unix_ms: i64,
+    ) {
+        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
+            return;
+        };
+        let attempt_id = self.attempt.as_ref().map(|attempt| attempt.id.clone());
+        let events = contributions
+            .iter()
+            .filter_map(|contribution| {
+                let HookContribution::Audit(audit) = contribution else {
+                    return None;
+                };
+                Some(NewHookAuditEventStoreRecord {
+                    hook_run_id: run.id.clone(),
+                    hook_run_attempt_id: attempt_id.clone(),
+                    subscription_id: subscription.subscription_id.clone(),
+                    hook_id: subscription.hook_id.clone(),
+                    phase,
+                    context: run.context.clone(),
+                    event_kind: audit.event_kind.clone(),
+                    contribution_hash: HookContributionHash::from_contribution(contribution),
+                    details: audit.details.clone(),
+                    safe_for_user: audit.safe_for_user,
+                    created_at_unix_ms: Some(created_at_unix_ms),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !events.is_empty() {
+            let _ = store.append_audit_events(events).await;
         }
     }
 }
@@ -1216,7 +1318,7 @@ async fn execute_node_with_policy(
         HookAwaitPolicy::Blocking => {
             let handler_request = handler_request(node, request);
             Ok(match node.handler.execute(handler_request).await {
-                Ok(response) => HookNodeOutcome::Succeeded(response),
+                Ok(response) => validated_success(node.handler.as_ref(), response),
                 Err(error) => HookNodeOutcome::Failed(error),
             })
         }
@@ -1231,7 +1333,7 @@ async fn execute_node_with_policy(
             let timeout_future = Delay::new(Duration::from_millis(timeout_ms));
             match select(handler_future, timeout_future).await {
                 Either::Left((Ok(response), _timeout_future)) => {
-                    Ok(HookNodeOutcome::Succeeded(response))
+                    Ok(validated_success(node.handler.as_ref(), response))
                 }
                 Either::Left((Err(error), _timeout_future)) => Ok(HookNodeOutcome::Failed(error)),
                 Either::Right((_elapsed, _handler_future)) => {
@@ -1251,6 +1353,38 @@ async fn execute_node_with_policy(
             Ok(HookNodeOutcome::Queued)
         }
     }
+}
+
+fn validated_success(handler: &dyn HookHandler, response: HookHandlerResponse) -> HookNodeOutcome {
+    match missing_contribution_capability(handler, response.contributions.as_slice()) {
+        Some(error) => HookNodeOutcome::Failed(error),
+        None => HookNodeOutcome::Succeeded(response),
+    }
+}
+
+fn missing_contribution_capability(
+    handler: &dyn HookHandler,
+    contributions: &[HookContribution],
+) -> Option<HookError> {
+    let capabilities = handler.capabilities();
+    contributions.iter().find_map(|contribution| {
+        let required = contribution.required_capability()?;
+        if capabilities.contains(&required) {
+            None
+        } else {
+            Some(HookError::new(
+                HookDiagnosticCode::new("hook.capability_missing")
+                    .expect("static diagnostic code is valid"),
+                HookDiagnosticMessage::new(format!(
+                    "hook `{}` returned `{}` contribution without `{}` capability",
+                    handler.id(),
+                    contribution.kind_name(),
+                    required
+                ))
+                .expect("static diagnostic message is valid"),
+            ))
+        }
+    })
 }
 
 impl HookContributionHash {
@@ -1496,10 +1630,11 @@ fn hash_contribution(contribution: &HookContribution) -> Option<HookContribution
 mod tests {
     use super::*;
     use crate::{
-        HookDiagnosticMessage, HookDomain, HookError, HookFilterKey, HookHandler, HookKind,
-        HookPromptContent, HookPromptSectionTitle, HookResult, HookRunAttemptId, HookRunId,
-        HookRunStoreResult, HookSectionId, HookSubscription, HookSubscriptionDependencies,
-        HookValue,
+        HookAuditEventStoreRecord, HookCapabilities, HookCapability, HookDiagnosticMessage,
+        HookDomain, HookError, HookFilterKey, HookHandler, HookKind, HookPromptContent,
+        HookPromptSectionTitle, HookResult, HookRunAttemptId, HookRunId, HookRunStoreResult,
+        HookSectionId, HookSubscription, HookSubscriptionDependencies, HookValue,
+        NewHookAuditEventStoreRecord,
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -1517,6 +1652,7 @@ mod tests {
         phases: Vec<HookPhase>,
         calls: Arc<Mutex<Vec<HookId>>>,
         responses: Mutex<VecDeque<HookResult<HookHandlerResponse>>>,
+        capabilities: HookCapabilities,
     }
 
     #[async_trait]
@@ -1531,6 +1667,10 @@ mod tests {
 
         fn supported_phases(&self) -> Vec<HookPhase> {
             self.phases.clone()
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            self.capabilities.clone()
         }
 
         async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -1577,6 +1717,40 @@ mod tests {
         }
     }
 
+    struct ConcurrencyTrackingHookHandler {
+        id: HookId,
+        active_count: Arc<AtomicUsize>,
+        max_active_count: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl HookHandler for ConcurrencyTrackingHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            let active = self.active_count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    (active > current).then_some(active)
+                })
+                .ok();
+            tokio::time::sleep(self.delay).await;
+            self.active_count.fetch_sub(1, Ordering::SeqCst);
+            Ok(HookHandlerResponse::default())
+        }
+    }
+
     struct DelayedHookHandler {
         id: HookId,
         delay: Duration,
@@ -1595,6 +1769,10 @@ mod tests {
 
         fn supported_phases(&self) -> Vec<HookPhase> {
             vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            test_output_capabilities()
         }
 
         async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -1674,6 +1852,18 @@ mod tests {
         HookSubscriptionId::new(value).expect("valid subscription id")
     }
 
+    fn test_output_capabilities() -> HookCapabilities {
+        HookCapabilities::new([
+            HookCapability::new("contribute_policy").expect("valid capability"),
+            HookCapability::new("contribute_prompt_context").expect("valid capability"),
+            HookCapability::new("contribute_prompt_section").expect("valid capability"),
+            HookCapability::new("contribute_tool_bundle").expect("valid capability"),
+            HookCapability::new("contribute_prompt_manifest_diagnostic").expect("valid capability"),
+            HookCapability::new("emit_audit").expect("valid capability"),
+            HookCapability::new("schedule_background_job").expect("valid capability"),
+        ])
+    }
+
     fn phase_request() -> HookPhaseRequest {
         HookPhaseRequest::new(
             HookPhase::TurnPrePromptCompile,
@@ -1684,6 +1874,8 @@ mod tests {
 
     fn contribution(section_id: &str, content: &str) -> HookContribution {
         HookContribution::PromptSection(crate::PromptSectionContribution {
+            contribution_id: crate::HookContributionId::new(section_id)
+                .expect("valid contribution id"),
             section_id: HookSectionId::new(section_id).expect("valid section id"),
             title: Some(HookPromptSectionTitle::new("Test").expect("valid title")),
             domain: HookDomain::new("test").expect("valid domain"),
@@ -1733,6 +1925,7 @@ mod tests {
             phases: vec![HookPhase::TurnPrePromptCompile],
             calls,
             responses: Mutex::new(VecDeque::from(responses)),
+            capabilities: test_output_capabilities(),
         })
     }
 
@@ -1895,6 +2088,47 @@ mod tests {
         assert_eq!(
             *calls.lock().expect("calls lock"),
             vec![hook_id("test.one")]
+        );
+    }
+
+    #[test]
+    fn contribution_without_required_capability_is_rejected() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hook_id = hook_id("test.no_capability");
+        handlers
+            .register_handler(Arc::new(RecordingHookHandler {
+                id: hook_id.clone(),
+                phases: vec![HookPhase::TurnPrePromptCompile],
+                calls: calls.clone(),
+                responses: Mutex::new(VecDeque::from([Ok(HookHandlerResponse {
+                    contributions: vec![contribution("section.no_capability", "context")],
+                    diagnostics: Vec::new(),
+                    metadata: HookMetadata::default(),
+                })])),
+                capabilities: HookCapabilities::default(),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.no_capability",
+            "test.no_capability",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(*calls.lock().expect("calls lock"), vec![hook_id]);
+        assert!(response.contributions.is_empty());
+        assert_eq!(response.runs[0].status, HookRunStatus::Failed);
+        assert_eq!(
+            response.diagnostics[0].code,
+            HookDiagnosticCode::new("hook.capability_missing").expect("valid code")
         );
     }
 
@@ -2743,6 +2977,86 @@ mod tests {
 
         assert_eq!(started_count.load(Ordering::SeqCst), 2);
         assert_eq!(response.runs.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_parallelism_limits_ready_batch_width() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active_count = Arc::new(AtomicUsize::new(0));
+
+        for id in ["test.limit.one", "test.limit.two", "test.limit.three"] {
+            handlers
+                .register_handler(Arc::new(ConcurrencyTrackingHookHandler {
+                    id: hook_id(id),
+                    active_count: active_count.clone(),
+                    max_active_count: max_active_count.clone(),
+                    delay: Duration::from_millis(10),
+                }))
+                .expect("handler registers");
+            subscriptions
+                .register_subscription(
+                    handlers.as_ref(),
+                    HookSubscription::new(
+                        subscription_id(format!("sub.{id}").as_str()),
+                        hook_id(id),
+                        HookPhase::TurnPrePromptCompile,
+                    )
+                    .with_execution_policy(crate::HookExecutionPolicy {
+                        await_policy: HookAwaitPolicy::Blocking,
+                        timeout_ms: None,
+                        max_parallelism: Some(1),
+                    }),
+                )
+                .expect("subscription registers");
+        }
+        let runtime = runtime(handlers, subscriptions);
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), runtime.run_phase(phase_request()))
+                .await
+                .expect("limited execution should not hang")
+                .expect("phase execution succeeds");
+
+        assert_eq!(response.runs.len(), 3);
+        assert_eq!(max_active_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn zero_max_parallelism_is_invalid() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.invalid.parallelism",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    subscription_id("sub.invalid.parallelism"),
+                    hook_id("test.invalid.parallelism"),
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_execution_policy(crate::HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::Blocking,
+                    timeout_ms: None,
+                    max_parallelism: Some(0),
+                }),
+            )
+            .expect("subscription registers");
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("zero max_parallelism should be rejected");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::InvalidExecutionPolicy { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3733,6 +4047,55 @@ mod tests {
         assert_eq!(response.runs[0].contribution_hashes, vec![expected_hash]);
     }
 
+    #[test]
+    fn audit_contribution_is_appended_to_run_store() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let audit_contribution = HookContribution::Audit(crate::AuditContribution {
+            event_kind: crate::HookAuditEventKind::new("test.audit.persisted")
+                .expect("valid audit event kind"),
+            details: HookValue::Text("audit details".to_owned()),
+            safe_for_user: false,
+        });
+        let expected_hash = HookContributionHash::from_contribution(&audit_contribution)
+            .expect("audit contribution hash should be produced");
+        register_handler(
+            &handlers,
+            "test.audit.persisted",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![audit_contribution],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.audit.persisted",
+            "test.audit.persisted",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = HookRuntime::with_run_store(handlers, subscriptions, store.clone());
+
+        let response =
+            block_on_ready(runtime.run_phase(phase_request())).expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::AppendAudit {
+                    event_kinds,
+                    contribution_hashes
+                } if event_kinds == &vec!["test.audit.persisted".to_owned()]
+                    && contribution_hashes == &vec![Some(expected_hash.clone())]
+            )
+        }));
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum StoreEvent {
         CreateRun {
@@ -3752,6 +4115,10 @@ mod tests {
         CompleteRun {
             status: HookRunStatus,
             contribution_hashes: Vec<HookContributionHash>,
+        },
+        AppendAudit {
+            event_kinds: Vec<String>,
+            contribution_hashes: Vec<Option<HookContributionHash>>,
         },
     }
 
@@ -3957,6 +4324,46 @@ mod tests {
                 completed_at_unix_ms: Some(completion.completed_at_unix_ms),
                 duration_ms: completion.duration_ms,
             })
+        }
+
+        async fn append_audit_events(
+            &self,
+            events: Vec<NewHookAuditEventStoreRecord>,
+        ) -> HookRunStoreResult<Vec<HookAuditEventStoreRecord>> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::AppendAudit {
+                    event_kinds: events
+                        .iter()
+                        .map(|event| event.event_kind.as_str().to_owned())
+                        .collect(),
+                    contribution_hashes: events
+                        .iter()
+                        .map(|event| event.contribution_hash.clone())
+                        .collect(),
+                });
+            Ok(events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| HookAuditEventStoreRecord {
+                    id: format!("audit.{index}"),
+                    hook_run_id: event.hook_run_id,
+                    hook_run_attempt_id: event.hook_run_attempt_id,
+                    subscription_id: event.subscription_id,
+                    hook_id: event.hook_id,
+                    phase: event.phase,
+                    context: event.context,
+                    event_kind: event.event_kind,
+                    contribution_hash: event.contribution_hash,
+                    details: event.details,
+                    safe_for_user: event.safe_for_user,
+                    created_at_unix_ms: event.created_at_unix_ms.unwrap_or(0),
+                })
+                .collect())
         }
     }
 

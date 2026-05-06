@@ -19,11 +19,11 @@ use pioneer_crud::{
 };
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
 use pioneer_hooks::{
-    HookAwaitPolicy, HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDomain,
-    HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
-    HookHandlerResponse, HookId, HookInputPayload, HookKind, HookPhase, HookPromptContent,
-    HookRegistry, HookRuntime, HookRuntimeOptions, HookSectionId, HookSubscription,
-    HookSubscriptionId, HookSubscriptionRegistry, PromptSectionContribution,
+    HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
+    HookDiagnosticMessage, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
+    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInputPayload, HookKind,
+    HookPhase, HookPromptContent, HookRegistry, HookRuntime, HookRuntimeOptions, HookSectionId,
+    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, PromptSectionContribution,
     TurnPreCompactionRawTurnRetention, TurnPreCompactionSummaryStorage,
     TurnPreCompactionSummaryStrategy, TurnPreCompactionTrigger,
 };
@@ -610,6 +610,12 @@ impl HookHandler for Phase13RecordingHookHandler {
 
     fn supported_phases(&self) -> Vec<HookPhase> {
         vec![HookPhase::TurnPreCompaction]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        HookCapabilities::new([
+            HookCapability::new("contribute_prompt_section").expect("valid capability")
+        ])
     }
 
     async fn execute(
@@ -4862,6 +4868,8 @@ async fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             },
             section_id: Some("identity_base".to_owned()),
             contribution_kind: PromptManifestHookContributionKind::PromptSection,
+            priority: Some(10),
+            source_count: Some(1),
             truncation: PromptManifestHookTruncation::None,
         }],
     };
@@ -9144,6 +9152,8 @@ async fn seed_phase_13_compaction_thread(
 
 fn phase_13_prompt_section_contribution() -> HookContribution {
     HookContribution::PromptSection(PromptSectionContribution {
+        contribution_id: pioneer_hooks::HookContributionId::new("phase13.prompt_section")
+            .expect("valid contribution id"),
         section_id: HookSectionId::new("phase13.prompt_section").expect("valid section id"),
         title: None,
         domain: HookDomain::new("test.phase13").expect("valid hook domain"),

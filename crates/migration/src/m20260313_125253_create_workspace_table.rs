@@ -2544,10 +2544,95 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_audit_event")
+                    .if_not_exists()
+                    .col(string("id").string_len(21).primary_key())
+                    .col(string("hook_run_id").string_len(21))
+                    .col(string("hook_run_attempt_id").string_len(21).null())
+                    .col(string("subscription_id").string_len(255))
+                    .col(string("hook_id").string_len(255))
+                    .col(string("phase").string_len(96))
+                    .col(string("event_kind").string_len(255))
+                    .col(string("contribution_hash").string_len(255).null())
+                    .col(string("workspace_id").string_len(21).null())
+                    .col(string("thread_id").string_len(21).null())
+                    .col(string("turn_id").string_len(21).null())
+                    .col(string("task_id").string_len(21).null())
+                    .col(string("agent_id").string_len(255).null())
+                    .col(string("actor_kind").string_len(64).null())
+                    .col(string("actor_id").string_len(255).null())
+                    .col(string("context_mode").string_len(64).null())
+                    .col(boolean("safe_for_user").default(false))
+                    .col(text("details_json").default("null"))
+                    .col(timestamp_with_time_zone("created_at").default(Expr::current_timestamp()))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_run_id")
+                    .table("hook_audit_event")
+                    .col("hook_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_workspace_phase")
+                    .table("hook_audit_event")
+                    .col("workspace_id")
+                    .col("phase")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_thread_turn")
+                    .table("hook_audit_event")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_kind_created_at")
+                    .table("hook_audit_event")
+                    .col("event_kind")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_created_at")
+                    .table("hook_audit_event")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table("hook_audit_event").to_owned())
+            .await?;
+
         manager
             .drop_table(Table::drop().table("hook_run_attempt").to_owned())
             .await?;

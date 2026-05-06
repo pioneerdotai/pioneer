@@ -7,6 +7,7 @@ use std::str::FromStr;
 pub enum HookPhase {
     TurnPrePolicy,
     TurnPrePromptContext,
+    TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
     TurnPostTurn,
@@ -18,6 +19,7 @@ impl HookPhase {
         match self {
             Self::TurnPrePolicy => "turn.pre_policy",
             Self::TurnPrePromptContext => "turn.pre_prompt_context",
+            Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
             Self::TurnPostTurn => "turn.post_turn",
@@ -46,6 +48,7 @@ impl FromStr for HookPhase {
         match value {
             "turn.pre_policy" => Ok(Self::TurnPrePolicy),
             "turn.pre_prompt_context" => Ok(Self::TurnPrePromptContext),
+            "turn.pre_tool_materialization" => Ok(Self::TurnPreToolMaterialization),
             "turn.pre_prompt_compile" => Ok(Self::TurnPrePromptCompile),
             "turn.post_prompt_compile" => Ok(Self::TurnPostPromptCompile),
             "turn.post_turn" => Ok(Self::TurnPostTurn),
@@ -112,6 +115,10 @@ mod tests {
             serde_json::to_value(HookPhase::TurnPostTurn).expect("phase serializes"),
             serde_json::json!("turn.post_turn")
         );
+        assert_eq!(
+            serde_json::to_value(HookPhase::TurnPreToolMaterialization).expect("phase serializes"),
+            serde_json::json!("turn.pre_tool_materialization")
+        );
     }
 
     #[test]
@@ -119,6 +126,11 @@ mod tests {
         let phase: HookPhase = serde_json::from_value(serde_json::json!("turn.pre_prompt_context"))
             .expect("phase deserializes");
         assert_eq!(phase, HookPhase::TurnPrePromptContext);
+
+        let phase: HookPhase =
+            serde_json::from_value(serde_json::json!("turn.pre_tool_materialization"))
+                .expect("phase deserializes");
+        assert_eq!(phase, HookPhase::TurnPreToolMaterialization);
     }
 
     #[test]

@@ -77,9 +77,9 @@ pub use crate::memory::{
 pub use crate::repositories::hook_run::{
     HOOK_RUN_CONTRIBUTION_HASH_MAX_COUNT, HOOK_RUN_DIAGNOSTIC_MESSAGE_MAX_CHARS,
     HOOK_RUN_DIAGNOSTIC_PREVIEW_MAX_COUNT, HOOK_RUN_ERROR_MESSAGE_MAX_CHARS,
-    HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookRunAttemptCompletionRecord, HookRunAttemptRecord,
-    HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
-    NewHookRunAttemptRecord, NewHookRunRecord,
+    HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookAuditEventRecord, HookRunAttemptCompletionRecord,
+    HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
+    NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{
@@ -462,6 +462,26 @@ impl CrudStore {
         run_id: &pioneer_hooks::HookRunId,
     ) -> Result<Vec<HookRunAttemptRecord>> {
         hook_run::list_hook_run_attempts(&self.connection, run_id).await
+    }
+
+    pub async fn append_hook_audit_events(
+        &self,
+        records: Vec<NewHookAuditEventRecord>,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Vec<HookAuditEventRecord>> {
+        self.run_serialized_write(|| {
+            let records = records.clone();
+            let now = now.clone();
+            async move { hook_run::append_hook_audit_events(&self.connection, records, now).await }
+        })
+        .await
+    }
+
+    pub async fn list_hook_audit_events_for_run(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+    ) -> Result<Vec<HookAuditEventRecord>> {
+        hook_run::list_hook_audit_events_for_run(&self.connection, run_id).await
     }
 
     pub async fn resolve_memory_scope(&self, scope: MemoryScope) -> Result<MemoryScopeResolution> {
@@ -8216,6 +8236,8 @@ mod tests {
                 },
                 section_id: Some("identity_base".to_owned()),
                 contribution_kind: PromptManifestHookContributionKind::PromptSection,
+                priority: Some(10),
+                source_count: Some(1),
                 truncation: PromptManifestHookTruncation::None,
             }],
         };

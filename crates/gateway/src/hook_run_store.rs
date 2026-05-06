@@ -1,17 +1,20 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use pioneer_crud::{
-    CrudStore, HookRunAttemptCompletionRecord as CrudHookRunAttemptCompletionRecord,
+    CrudStore, HookAuditEventRecord as CrudHookAuditEventRecord,
+    HookRunAttemptCompletionRecord as CrudHookRunAttemptCompletionRecord,
     HookRunAttemptRecord as CrudHookRunAttemptRecord,
     HookRunCompletionRecord as CrudHookRunCompletionRecord, HookRunRecord as CrudHookRunRecord,
     HookRunScope as CrudHookRunScope, HookRunScopeKind as CrudHookRunScopeKind,
+    NewHookAuditEventRecord as CrudNewHookAuditEventRecord,
     NewHookRunAttemptRecord as CrudNewHookRunAttemptRecord,
     NewHookRunRecord as CrudNewHookRunRecord,
 };
 use pioneer_hooks::{
-    HookRunAttemptId, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunId,
-    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
-    HookRunStoreRecord, HookRunStoreResult, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookAuditEventStoreRecord, HookRunAttemptId, HookRunAttemptStoreCompletion,
+    HookRunAttemptStoreRecord, HookRunId, HookRunScope, HookRunScopeKind, HookRunStore,
+    HookRunStoreCompletion, HookRunStoreError, HookRunStoreRecord, HookRunStoreResult,
+    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::sync::Arc;
@@ -176,6 +179,44 @@ impl HookRunStore for CrudHookRunStore {
         };
         crud_attempt_to_store_record(record)
     }
+
+    async fn append_audit_events(
+        &self,
+        events: Vec<NewHookAuditEventStoreRecord>,
+    ) -> HookRunStoreResult<Vec<HookAuditEventStoreRecord>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = unix_ms_to_datetime(
+            events
+                .first()
+                .and_then(|event| event.created_at_unix_ms)
+                .unwrap_or_else(current_unix_ms),
+        );
+        let records = events
+            .into_iter()
+            .map(|event| CrudNewHookAuditEventRecord {
+                hook_run_id: event.hook_run_id,
+                hook_run_attempt_id: event.hook_run_attempt_id,
+                subscription_id: event.subscription_id,
+                hook_id: event.hook_id,
+                phase: event.phase,
+                context: event.context,
+                event_kind: event.event_kind,
+                contribution_hash: event.contribution_hash,
+                details: event.details,
+                safe_for_user: event.safe_for_user,
+                created_at: event.created_at_unix_ms.map(unix_ms_to_datetime),
+            })
+            .collect::<Vec<_>>();
+        self.crud_store
+            .append_hook_audit_events(records, now)
+            .await
+            .map_err(|_| HookRunStoreError::internal("failed to append hook audit events"))?
+            .into_iter()
+            .map(crud_audit_to_store_record)
+            .collect()
+    }
 }
 
 fn crud_run_to_store_record(record: CrudHookRunRecord) -> HookRunStoreResult<HookRunStoreRecord> {
@@ -217,6 +258,25 @@ fn crud_attempt_to_store_record(
         started_at_unix_ms: record.started_at.map(datetime_to_unix_ms),
         completed_at_unix_ms: record.completed_at.map(datetime_to_unix_ms),
         duration_ms: record.duration_ms,
+    })
+}
+
+fn crud_audit_to_store_record(
+    record: CrudHookAuditEventRecord,
+) -> HookRunStoreResult<HookAuditEventStoreRecord> {
+    Ok(HookAuditEventStoreRecord {
+        id: record.id,
+        hook_run_id: record.hook_run_id,
+        hook_run_attempt_id: record.hook_run_attempt_id,
+        subscription_id: record.subscription_id,
+        hook_id: record.hook_id,
+        phase: record.phase,
+        context: record.context,
+        event_kind: record.event_kind,
+        contribution_hash: record.contribution_hash,
+        details: record.details,
+        safe_for_user: record.safe_for_user,
+        created_at_unix_ms: record.created_at.timestamp_millis(),
     })
 }
 
@@ -280,14 +340,15 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_entity::{hook_run, hook_run_attempt};
+    use pioneer_entity::{hook_audit_event, hook_run, hook_run_attempt};
     use pioneer_hooks::{
-        HookAwaitPolicy, HookContext, HookContribution, HookDiagnosticCode, HookDiagnosticMessage,
-        HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler,
-        HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookInputKind, HookKind,
-        HookPhase, HookPhaseRequest, HookPromptContent, HookRegistry, HookRunIdempotencyKey,
-        HookRunScopeId, HookRunStatus, HookRuntime, HookRuntimeOptions, HookSectionId,
-        HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, PromptSectionContribution,
+        AuditContribution, HookAuditEventKind, HookAwaitPolicy, HookCapabilities, HookCapability,
+        HookContext, HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDomain,
+        HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
+        HookHandlerResponse, HookId, HookInput, HookInputKind, HookKind, HookPhase,
+        HookPhaseRequest, HookPromptContent, HookRegistry, HookRunIdempotencyKey, HookRunScopeId,
+        HookRunStatus, HookRuntime, HookRuntimeOptions, HookSectionId, HookSubscription,
+        HookSubscriptionId, HookSubscriptionRegistry, HookValue, PromptSectionContribution,
     };
     use sea_orm::{Database, DatabaseConnection, EntityTrait};
     use std::time::Duration;
@@ -311,12 +372,22 @@ mod tests {
             vec![HookPhase::TurnPrePromptCompile]
         }
 
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([
+                HookCapability::new("contribute_prompt_section").expect("valid capability")
+            ])
+        }
+
         async fn execute(
             &self,
             _request: HookHandlerRequest,
         ) -> pioneer_hooks::HookResult<HookHandlerResponse> {
             Ok(HookHandlerResponse {
                 contributions: vec![HookContribution::PromptSection(PromptSectionContribution {
+                    contribution_id: pioneer_hooks::HookContributionId::new(
+                        "gateway.phase15.secret",
+                    )
+                    .expect("valid contribution id"),
                     section_id: HookSectionId::new("gateway.phase15.secret")
                         .expect("valid section id"),
                     title: None,
@@ -329,6 +400,44 @@ mod tests {
                 })],
                 diagnostics: Vec::new(),
                 metadata: pioneer_hooks::HookMetadata::default(),
+            })
+        }
+    }
+
+    struct AuditContributionHandler {
+        id: HookId,
+    }
+
+    #[async_trait]
+    impl HookHandler for AuditContributionHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([HookCapability::new("emit_audit").expect("valid capability")])
+        }
+
+        async fn execute(
+            &self,
+            _request: HookHandlerRequest,
+        ) -> pioneer_hooks::HookResult<HookHandlerResponse> {
+            Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::Audit(AuditContribution {
+                    event_kind: HookAuditEventKind::new("test.gateway_hook_audit")
+                        .expect("valid audit event kind"),
+                    details: HookValue::Text("gateway audit detail".to_owned()),
+                    safe_for_user: false,
+                })],
+                ..HookHandlerResponse::default()
             })
         }
     }
@@ -447,6 +556,15 @@ mod tests {
             .expect("hook run attempt rows should query");
         assert_eq!(rows.len(), 1);
         rows.into_iter().next().expect("one hook run attempt row")
+    }
+
+    async fn one_audit_row(connection: &DatabaseConnection) -> hook_audit_event::Model {
+        let rows = hook_audit_event::Entity::find()
+            .all(connection)
+            .await
+            .expect("hook audit rows should query");
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().expect("one hook audit row")
     }
 
     #[tokio::test]
@@ -663,5 +781,57 @@ mod tests {
             "hook run persistence must not store raw prompt contribution"
         );
         assert!(persisted_text.contains("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn crud_hook_run_store_persists_audit_contribution_rows() {
+        let (connection, crud_store, hook_store) = migrated_store().await;
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let hook_id = HookId::new("gateway.phase15.audit").expect("valid hook id");
+        handlers
+            .register_handler(Arc::new(AuditContributionHandler {
+                id: hook_id.clone(),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    HookSubscriptionId::new("gateway.phase15.audit").expect("valid sub id"),
+                    hook_id,
+                    HookPhase::TurnPrePromptCompile,
+                ),
+            )
+            .expect("subscription registers");
+
+        let runtime = HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
+        let response = runtime
+            .run_phase(phase_15_request())
+            .await
+            .expect("hook runtime should succeed");
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+
+        let run = one_run_row(&connection).await;
+        let audit_row = one_audit_row(&connection).await;
+        assert_eq!(audit_row.hook_run_id, run.id);
+        assert_eq!(audit_row.event_kind, "test.gateway_hook_audit");
+        assert_eq!(audit_row.safe_for_user, false);
+        assert!(
+            audit_row
+                .contribution_hash
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("sha256:")
+        );
+        let records = crud_store
+            .list_hook_audit_events_for_run(&HookRunId::new(run.id).expect("valid run id"))
+            .await
+            .expect("hook audit event list should succeed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].details,
+            HookValue::Text("gateway audit detail".to_owned())
+        );
     }
 }

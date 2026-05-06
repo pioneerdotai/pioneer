@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
-use pioneer_entity::{hook_run, hook_run_attempt};
+use pioneer_entity::{hook_audit_event, hook_run, hook_run_attempt};
 use pioneer_hooks::{
-    HookActor, HookActorKind, HookAgentId, HookContext, HookContextMode, HookContributionHash,
-    HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview, HookId, HookIdError,
-    HookMetadata, HookPhase, HookRunAttemptId, HookRunErrorSummary, HookRunId,
+    HookActor, HookActorKind, HookAgentId, HookAuditEventKind, HookContext, HookContextMode,
+    HookContributionHash, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview, HookId,
+    HookIdError, HookMetadata, HookPhase, HookRunAttemptId, HookRunErrorSummary, HookRunId,
     HookRunIdempotencyKey, HookRunScopeId, HookRunStatus, HookSubscriptionId, HookTaskId,
-    HookThreadId, HookTurnId, HookWorkspaceId,
+    HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
 };
 use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -183,6 +183,37 @@ pub struct HookRunAttemptCompletionRecord {
     pub error: Option<HookRunErrorSummary>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewHookAuditEventRecord {
+    pub hook_run_id: HookRunId,
+    pub hook_run_attempt_id: Option<HookRunAttemptId>,
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub context: HookContext,
+    pub event_kind: HookAuditEventKind,
+    pub contribution_hash: Option<HookContributionHash>,
+    pub details: HookValue,
+    pub safe_for_user: bool,
+    pub created_at: Option<DateTimeWithTimeZone>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookAuditEventRecord {
+    pub id: String,
+    pub hook_run_id: HookRunId,
+    pub hook_run_attempt_id: Option<HookRunAttemptId>,
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub context: HookContext,
+    pub event_kind: HookAuditEventKind,
+    pub contribution_hash: Option<HookContributionHash>,
+    pub details: HookValue,
+    pub safe_for_user: bool,
+    pub created_at: DateTimeWithTimeZone,
 }
 
 pub async fn create_hook_run<C: ConnectionTrait>(
@@ -548,6 +579,80 @@ pub async fn list_hook_run_attempts<C: ConnectionTrait>(
         .collect()
 }
 
+pub async fn append_hook_audit_events<C: ConnectionTrait>(
+    db: &C,
+    records: Vec<NewHookAuditEventRecord>,
+    now: DateTimeWithTimeZone,
+) -> Result<Vec<HookAuditEventRecord>> {
+    let mut created = Vec::with_capacity(records.len());
+    for record in records {
+        let id = generate_id(DB_ID_LEN);
+        let created_at = record.created_at.unwrap_or(now);
+        let actor_kind = record
+            .context
+            .actor
+            .as_ref()
+            .map(|actor| actor.kind.as_str().to_owned());
+        let actor_id = record
+            .context
+            .actor
+            .as_ref()
+            .and_then(|actor| actor.id.as_ref())
+            .map(|id| id.as_str().to_owned());
+
+        hook_audit_event::Entity::insert(hook_audit_event::ActiveModel {
+            id: Set(id.clone()),
+            hook_run_id: Set(record.hook_run_id.into_inner()),
+            hook_run_attempt_id: Set(record.hook_run_attempt_id.map(HookRunAttemptId::into_inner)),
+            subscription_id: Set(record.subscription_id.into_inner()),
+            hook_id: Set(record.hook_id.into_inner()),
+            phase: Set(record.phase.as_str().to_owned()),
+            event_kind: Set(record.event_kind.into_inner()),
+            contribution_hash: Set(record
+                .contribution_hash
+                .map(HookContributionHash::into_inner)),
+            workspace_id: Set(record.context.workspace_id.map(HookWorkspaceId::into_inner)),
+            thread_id: Set(record.context.thread_id.map(HookThreadId::into_inner)),
+            turn_id: Set(record.context.turn_id.map(HookTurnId::into_inner)),
+            task_id: Set(record.context.task_id.map(HookTaskId::into_inner)),
+            agent_id: Set(record.context.agent_id.map(HookAgentId::into_inner)),
+            actor_kind: Set(actor_kind),
+            actor_id: Set(actor_id),
+            context_mode: Set(record.context.mode.map(|mode| mode.as_str().to_owned())),
+            safe_for_user: Set(record.safe_for_user),
+            details_json: Set(serialize_hook_value(&record.details)?),
+            created_at: Set(created_at),
+        })
+        .exec(db)
+        .await
+        .context("failed to insert hook_audit_event row")?;
+
+        let row = hook_audit_event::Entity::find_by_id(id)
+            .one(db)
+            .await
+            .context("failed to load inserted hook_audit_event row")?
+            .context("inserted hook_audit_event row missing")?;
+        created.push(hook_audit_event_record_from_model(row)?);
+    }
+    Ok(created)
+}
+
+pub async fn list_hook_audit_events_for_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &HookRunId,
+) -> Result<Vec<HookAuditEventRecord>> {
+    let rows = hook_audit_event::Entity::find()
+        .filter(hook_audit_event::Column::HookRunId.eq(run_id.as_str().to_owned()))
+        .order_by_asc(hook_audit_event::Column::CreatedAt)
+        .all(db)
+        .await
+        .with_context(|| format!("failed to list hook audit events for run `{run_id}`"))?;
+
+    rows.into_iter()
+        .map(hook_audit_event_record_from_model)
+        .collect()
+}
+
 async fn find_hook_run_attempt_by_id<C: ConnectionTrait>(
     db: &C,
     attempt_id: &HookRunAttemptId,
@@ -663,6 +768,55 @@ fn hook_run_attempt_record_from_model(
         started_at: model.started_at,
         completed_at: model.completed_at,
         duration_ms: model.duration_ms,
+    })
+}
+
+fn hook_audit_event_record_from_model(
+    model: hook_audit_event::Model,
+) -> Result<HookAuditEventRecord> {
+    let actor = match model.actor_kind {
+        Some(kind) => Some(HookActor {
+            kind: HookActorKind::from(kind),
+            id: parse_optional_hook_id(model.actor_id, "hook_audit_event.actor_id")?,
+        }),
+        None => None,
+    };
+    let context = HookContext {
+        workspace_id: parse_optional_hook_id(model.workspace_id, "hook_audit_event.workspace_id")?,
+        thread_id: parse_optional_hook_id(model.thread_id, "hook_audit_event.thread_id")?,
+        turn_id: parse_optional_hook_id(model.turn_id, "hook_audit_event.turn_id")?,
+        task_id: parse_optional_hook_id(model.task_id, "hook_audit_event.task_id")?,
+        agent_id: parse_optional_hook_id(model.agent_id, "hook_audit_event.agent_id")?,
+        mode: model.context_mode.map(HookContextMode::from),
+        actor,
+        now_unix: None,
+        runtime_home: None,
+        feature_flags: BTreeMap::new(),
+        metadata: HookMetadata::default(),
+    };
+    Ok(HookAuditEventRecord {
+        id: model.id,
+        hook_run_id: HookRunId::new(model.hook_run_id)
+            .context("invalid hook_audit_event.hook_run_id")?,
+        hook_run_attempt_id: parse_optional_hook_id(
+            model.hook_run_attempt_id,
+            "hook_audit_event.hook_run_attempt_id",
+        )?,
+        subscription_id: HookSubscriptionId::new(model.subscription_id)
+            .context("invalid hook_audit_event.subscription_id")?,
+        hook_id: HookId::new(model.hook_id).context("invalid hook_audit_event.hook_id")?,
+        phase: HookPhase::from_str(model.phase.as_str())
+            .context("invalid hook_audit_event.phase")?,
+        context,
+        event_kind: HookAuditEventKind::new(model.event_kind)
+            .context("invalid hook_audit_event.event_kind")?,
+        contribution_hash: parse_optional_hook_id(
+            model.contribution_hash,
+            "hook_audit_event.contribution_hash",
+        )?,
+        details: deserialize_hook_value(model.details_json.as_str())?,
+        safe_for_user: model.safe_for_user,
+        created_at: model.created_at,
     })
 }
 
@@ -807,6 +961,17 @@ fn deserialize_metadata(value: &str) -> Result<HookMetadata> {
         return Ok(HookMetadata::default());
     }
     serde_json::from_str(value).context("failed to deserialize hook run metadata")
+}
+
+fn serialize_hook_value(value: &HookValue) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize hook value")
+}
+
+fn deserialize_hook_value(value: &str) -> Result<HookValue> {
+    if value.trim().is_empty() {
+        return Ok(HookValue::Null);
+    }
+    serde_json::from_str(value).context("failed to deserialize hook value")
 }
 
 fn parse_optional_hook_id<T>(value: Option<String>, field: &'static str) -> Result<Option<T>>

@@ -212,8 +212,10 @@ impl HookPromptSectionSet {
                     HookContribution::PromptSection(section) => Some(section),
                     HookContribution::Policy(_)
                     | HookContribution::PromptContext(_)
+                    | HookContribution::ToolBundle(_)
                     | HookContribution::PromptManifestDiagnostic(_)
                     | HookContribution::Audit(_)
+                    | HookContribution::BackgroundJob(_)
                     | HookContribution::Noop => None,
                 }),
             limits,
@@ -448,6 +450,8 @@ mod tests {
         content_value: &str,
     ) -> PromptSectionContribution {
         PromptSectionContribution {
+            contribution_id: crate::HookContributionId::new(section)
+                .expect("valid contribution id"),
             section_id: section_id(section),
             title: Some(title("Section")),
             domain: domain(domain_value),

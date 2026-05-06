@@ -21,6 +21,10 @@ impl HookCapabilities {
             metadata: HookMetadata::default(),
         }
     }
+
+    pub fn contains(&self, capability: &HookCapability) -> bool {
+        self.names.contains(capability)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

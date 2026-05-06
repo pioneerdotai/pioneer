@@ -7,15 +7,15 @@ use super::{
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
-    AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookContextMode,
-    HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity,
-    HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
-    HookHandlerResponse, HookId, HookInputKind, HookInputPayload, HookKind, HookPhase,
-    HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptContextSet, HookPromptSectionTitle,
-    HookRegistry, HookRuntime, HookSectionId, HookSubscription, HookSubscriptionId,
-    HookSubscriptionRegistry, HookValue, PolicyContribution, PromptContextContribution,
-    PromptManifestDiagnosticContribution, PromptSectionContribution, TurnPostTurnStatus,
-    TurnPostTurnToolStatus,
+    AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
+    HookCapability, HookContextMode, HookContribution, HookDiagnosticCode, HookDiagnosticMessage,
+    HookDiagnosticSeverity, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
+    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInputKind, HookInputPayload,
+    HookKind, HookPhase, HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptContextSet,
+    HookPromptSectionTitle, HookRegistry, HookRuntime, HookSectionId, HookSubscription,
+    HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
+    PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
+    TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
 use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
@@ -188,9 +188,10 @@ impl CaptureAgentProvider {
     }
 }
 
-const PHASE_07_HOOK_PHASES: [HookPhase; 5] = [
+const PHASE_07_HOOK_PHASES: [HookPhase; 6] = [
     HookPhase::TurnPrePolicy,
     HookPhase::TurnPrePromptContext,
+    HookPhase::TurnPreToolMaterialization,
     HookPhase::TurnPrePromptCompile,
     HookPhase::TurnPostPromptCompile,
     HookPhase::TurnPostTurn,
@@ -229,6 +230,10 @@ impl HookHandler for RecordingHookHandler {
 
     fn supported_phases(&self) -> Vec<HookPhase> {
         PHASE_07_HOOK_PHASES.to_vec()
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        test_hook_capabilities()
     }
 
     async fn execute(
@@ -279,6 +284,18 @@ impl HookHandler for RecordingHookHandler {
             ..HookHandlerResponse::default()
         })
     }
+}
+
+fn test_hook_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("contribute_policy").expect("valid capability"),
+        HookCapability::new("contribute_prompt_context").expect("valid capability"),
+        HookCapability::new("contribute_prompt_section").expect("valid capability"),
+        HookCapability::new("contribute_tool_bundle").expect("valid capability"),
+        HookCapability::new("contribute_prompt_manifest_diagnostic").expect("valid capability"),
+        HookCapability::new("emit_audit").expect("valid capability"),
+        HookCapability::new("schedule_background_job").expect("valid capability"),
+    ])
 }
 
 fn empty_hook_runtime() -> Arc<HookRuntime> {
@@ -479,6 +496,8 @@ fn prompt_section_contribution(
     content: &str,
 ) -> HookContribution {
     HookContribution::PromptSection(PromptSectionContribution {
+        contribution_id: pioneer_hooks::HookContributionId::new(section_id)
+            .expect("valid contribution id"),
         section_id: HookSectionId::new(section_id).expect("valid section id"),
         title: Some(HookPromptSectionTitle::new(title).expect("valid section title")),
         domain: HookDomain::new(domain).expect("valid domain"),
@@ -535,6 +554,7 @@ fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
     let value = match phase {
         HookPhase::TurnPrePolicy => "test.phase07.pre_policy",
         HookPhase::TurnPrePromptContext => "test.phase07.pre_prompt_context",
+        HookPhase::TurnPreToolMaterialization => "test.phase07.pre_tool_materialization",
         HookPhase::TurnPrePromptCompile => "test.phase07.pre_prompt_compile",
         HookPhase::TurnPostPromptCompile => "test.phase07.post_prompt_compile",
         HookPhase::TurnPostTurn => "test.phase07.post_turn",
@@ -1758,6 +1778,18 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
                     .map(|preview| preview.text.as_str()),
                 Some("done")
             );
+        } else if call.phase == HookPhase::TurnPreToolMaterialization {
+            let HookInputPayload::TurnPreToolMaterialization(payload) = &call.payload else {
+                panic!("pre-tool-materialization call should receive typed payload");
+            };
+            assert!(payload.provider_tool_calling);
+        } else if call.phase == HookPhase::TurnPrePolicy {
+            let HookInputPayload::TurnPrePolicy(payload) = &call.payload else {
+                panic!("pre-policy call should receive typed payload");
+            };
+            assert_eq!(payload.input_text, "phase 07 agent hook phases");
+            assert_eq!(payload.model.as_deref(), Some("test-model"));
+            assert_eq!(payload.model_provider.as_deref(), Some("capture"));
         } else {
             assert_eq!(call.payload, HookInputPayload::Empty);
         }
@@ -3335,6 +3367,12 @@ async fn phase_11_hook_prompt_section_is_manifest_observable() {
             .as_deref()
             .is_some_and(|hash| hash.starts_with("sha256:"))
     );
+    assert_eq!(
+        source.source.contribution_id.as_deref(),
+        Some("test.phase11.manifest_source")
+    );
+    assert_eq!(source.priority, Some(10));
+    assert_eq!(source.source_count, Some(0));
 }
 
 #[tokio::test]
@@ -3968,6 +4006,73 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
             .full_system_text
             .contains("test memory tool diagnostic")
     );
+}
+
+#[tokio::test]
+async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_names() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPreToolMaterialization,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_pre_tool_bundle_names",
+        "ws_pre_tool_bundle_names",
+        "turn_pre_tool_bundle_names",
+        ThreadMode::Agent,
+        "capture",
+        "pre-tool should see memory tools",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = wait_for_hook_calls(&calls, 1).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].phase, HookPhase::TurnPreToolMaterialization);
+    let HookInputPayload::TurnPreToolMaterialization(payload) = &calls[0].payload else {
+        panic!("pre-tool hook should receive typed tool materialization input");
+    };
+    let tool_names = payload
+        .existing_tool_names
+        .iter()
+        .map(|name| name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"read_skill"),
+        "pre-tool materialization input should include local skill tools, got {tool_names:?}"
+    );
+    assert!(
+        !tool_names.iter().any(|name| name.starts_with("memory_")),
+        "memory tools should be contributed by memory hook, not pre-existing local input: {tool_names:?}"
+    );
+
+    let request = provider
+        .snapshot_requests()
+        .into_iter()
+        .next()
+        .expect("provider request");
+    let tools = request.tools.expect("agent request should include tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
 }
 
 #[tokio::test]

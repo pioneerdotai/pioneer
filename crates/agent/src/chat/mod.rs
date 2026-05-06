@@ -10,23 +10,18 @@ use self::tool_retry_lifecycle::{
     turn_item_type_code,
 };
 use crate::hooks::{
-    AgentTurnHookContext, AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary,
-    EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+    AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
+    AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
     EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
     EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
     EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
     run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
-    run_noop_agent_turn_hook_phase,
-};
-use crate::memory::{
-    filter_memory_tool_materialization, memory_recall_prompt_input, memory_tool_names,
-    resolve_memory_turn_policy,
+    run_agent_turn_tool_materialization_hook_phase, run_noop_agent_turn_hook_phase,
+    tool_bundle_contributions_from_bundles,
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicyContext,
-    MemoryTurnPolicyRequest, RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider,
+    AgentMcpToolProvider, RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider,
     TaskTurnContext, TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl,
 };
 use chrono::Local;
@@ -35,12 +30,12 @@ use pioneer_config::AppConfig;
 use pioneer_hooks::{
     HookPhase, HookRuntime, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
     TurnPostTurnToolErrorClass, TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus,
-    TurnPostTurnToolStatus,
+    TurnPostTurnToolStatus, TurnPrePolicyHookInput,
 };
 use pioneer_promt::{
     CompiledPromptBundle, DynamicPromptSectionInput, PromptCompileInput, PromptDiagnosticCode,
     PromptDynamicSectionId, PromptLimits, PromptProfile, ToolRetryInstructionKind, compile_prompt,
-    render_memory_recall_prompt, render_tool_retry_instruction, tool_loop_final_answer_instruction,
+    render_tool_retry_instruction, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
@@ -75,6 +70,9 @@ const DISCOVERY_TOOL_SUGGEST: &str = "tool_suggest";
 const PROVIDER_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDER_INTER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
+const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
+const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
+const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 
 #[derive(Debug, Default, Clone)]
 struct PendingToolUiState {
@@ -328,32 +326,45 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
     })
 }
 
-fn dynamic_prompt_sections_from_hook_sections(
+#[derive(Debug, Clone, Default)]
+struct PromptSectionsForCompile {
+    memory_recall: Option<String>,
+    dynamic_sections: Vec<DynamicPromptSectionInput>,
+}
+
+fn prompt_sections_for_compile_from_hook_sections(
     section_set: &EffectiveTurnPromptSectionSet,
-) -> Result<Vec<DynamicPromptSectionInput>, ChatTurnError> {
+) -> Result<PromptSectionsForCompile, ChatTurnError> {
     if section_set.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PromptSectionsForCompile::default());
     }
     let sections = section_set.clone_hook_prompt_section_set();
 
-    sections
-        .entries()
-        .map(|entry| {
-            let id = PromptDynamicSectionId::new(entry.section_id.as_str()).map_err(|error| {
-                ChatTurnError::Terminal(format!(
-                    "failed to convert hook prompt section `{}`: {error}",
-                    entry.section_id
-                ))
-            })?;
-            Ok(DynamicPromptSectionInput {
+    let mut compiled_sections = PromptSectionsForCompile::default();
+    for entry in sections.entries() {
+        if entry.section_id.as_str() == "memory_recall" {
+            compiled_sections.memory_recall = Some(entry.content.as_str().to_owned());
+            continue;
+        }
+
+        let id = PromptDynamicSectionId::new(entry.section_id.as_str()).map_err(|error| {
+            ChatTurnError::Terminal(format!(
+                "failed to convert hook prompt section `{}`: {error}",
+                entry.section_id
+            ))
+        })?;
+        compiled_sections
+            .dynamic_sections
+            .push(DynamicPromptSectionInput {
                 id,
                 title: entry.title.as_ref().map(|title| title.as_str().to_owned()),
                 content: entry.content.as_str().to_owned(),
                 max_chars: None,
                 truncated: entry.truncated,
-            })
-        })
-        .collect()
+            });
+    }
+
+    Ok(compiled_sections)
 }
 
 fn compile_agent_prompt_bundle(
@@ -588,7 +599,11 @@ fn prompt_manifest_hook_sources(
         .sources
         .iter()
         .filter_map(|entry| {
-            let source = prompt_manifest_hook_source(&entry.source)?;
+            let mut source = prompt_manifest_hook_source(&entry.source)?;
+            source.contribution_id = entry
+                .contribution_id
+                .as_ref()
+                .map(|contribution_id| contribution_id.as_str().to_owned());
             let section_id = entry
                 .section_id
                 .as_ref()
@@ -602,6 +617,8 @@ fn prompt_manifest_hook_sources(
                 source,
                 section_id,
                 contribution_kind: prompt_manifest_hook_contribution_kind(entry.contribution_kind),
+                priority: entry.priority,
+                source_count: entry.source_count,
                 truncation: prompt_manifest_hook_truncation(entry.hook_truncated, prompt_truncated),
             })
         })
@@ -654,6 +671,7 @@ fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhas
         HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
         HookPhase::TurnPrePolicy
         | HookPhase::TurnPrePromptContext
+        | HookPhase::TurnPreToolMaterialization
         | HookPhase::TurnPostPromptCompile
         | HookPhase::TurnPostTurn
         | HookPhase::TurnPreCompaction => None,
@@ -770,9 +788,8 @@ pub(super) async fn execute_chat_turn_flow(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
-    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
@@ -813,9 +830,8 @@ pub(super) async fn execute_chat_turn_flow(
             tool_loop_config,
             mcp_tool_provider,
             task_tool_provider,
-            memory_provider,
-            memory_turn_policy_provider,
             hook_runtime,
+            tool_bundle_artifacts,
             turn_control.clone(),
             recovery,
             &workspace_id,
@@ -1019,96 +1035,6 @@ async fn materialize_task_tooling(
     }
 }
 
-fn memory_turn_context(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    mode: ThreadMode,
-    input_text: String,
-) -> MemoryTurnContext {
-    MemoryTurnContext {
-        workspace_id: workspace_id.to_owned(),
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.to_owned(),
-        mode,
-        input_text,
-        task_id: None,
-        agent_id: None,
-    }
-}
-
-fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
-    MemoryRecallRequest {
-        query: input_text.to_owned(),
-        categories: Vec::new(),
-        top_k: Some(5),
-        max_chars: Some(1_500),
-    }
-}
-
-async fn load_memory_recall_snapshot(
-    provider: Option<&Arc<dyn AgentMemoryProvider>>,
-    context: MemoryTurnContext,
-    request: MemoryRecallRequest,
-) -> MemoryRecallSnapshot {
-    let Some(provider) = provider else {
-        return MemoryRecallSnapshot::empty();
-    };
-    match provider.recall_memory(context.clone(), request).await {
-        Ok(snapshot) => {
-            for diagnostic in &snapshot.diagnostics {
-                warn!(
-                    thread_id = context.thread_id.as_str(),
-                    turn_id = context.turn_id.as_str(),
-                    diagnostic = diagnostic.as_str(),
-                    "memory recall provider reported diagnostic"
-                );
-            }
-            snapshot
-        }
-        Err(error) => {
-            warn!(
-                thread_id = context.thread_id.as_str(),
-                turn_id = context.turn_id.as_str(),
-                error = error.as_str(),
-                "memory recall provider failed; continuing without memory recall"
-            );
-            MemoryRecallSnapshot::empty()
-        }
-    }
-}
-
-async fn materialize_memory_tooling(
-    provider: Option<&Arc<dyn AgentMemoryProvider>>,
-    context: MemoryTurnContext,
-) -> MemoryToolMaterialization {
-    let Some(provider) = provider else {
-        return MemoryToolMaterialization::default();
-    };
-    match provider.materialize_memory_tools(context.clone()).await {
-        Ok(materialization) => {
-            for diagnostic in &materialization.diagnostics {
-                warn!(
-                    thread_id = context.thread_id.as_str(),
-                    turn_id = context.turn_id.as_str(),
-                    diagnostic = diagnostic.as_str(),
-                    "memory tool materialization reported diagnostic"
-                );
-            }
-            materialization
-        }
-        Err(error) => {
-            warn!(
-                thread_id = context.thread_id.as_str(),
-                turn_id = context.turn_id.as_str(),
-                error = error.as_str(),
-                "memory tool materialization failed; continuing without memory tools"
-            );
-            MemoryToolMaterialization::default()
-        }
-    }
-}
-
 async fn pending_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -1301,9 +1227,8 @@ async fn execute_agent_provider_response(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
-    memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
     workspace_id: &str,
@@ -1320,48 +1245,25 @@ async fn execute_agent_provider_response(
     let provider_tool_calling = provider.capabilities().tool_calling;
     let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
 
-    let effective_policy_set =
-        run_agent_turn_policy_hook_phase(hook_runtime.as_ref(), &hook_context)
-            .await
-            .map_err(|error| {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error_kind = error.kind(),
-                    "turn policy hook failed before prompt construction"
-                );
-                ChatTurnError::Terminal(error.safe_message().to_owned())
-            })?;
-
-    let memory_context = memory_turn_context(
-        workspace_id,
-        thread_id,
-        turn_id,
-        ThreadMode::Agent,
-        user_message.text_content_lossy(),
-    );
-    let memory_turn_policy = resolve_memory_turn_policy(
-        memory_turn_policy_provider.as_ref(),
-        MemoryTurnPolicyContext {
-            workspace_id: workspace_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            mode: ThreadMode::Agent,
-            input_text: memory_context.input_text.clone(),
-            model: Some(model.clone()),
-            model_provider: Some(provider.name().to_owned()),
-        },
-        MemoryTurnPolicyRequest::default(),
+    let effective_policy_set = run_agent_turn_policy_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        TurnPrePolicyHookInput::from_parts(
+            user_message.text_content_lossy(),
+            Some(model.clone()),
+            Some(provider.name().to_owned()),
+        ),
     )
-    .await;
-    for diagnostic in &memory_turn_policy.diagnostics {
+    .await
+    .map_err(|error| {
         warn!(
             thread_id,
             turn_id,
-            diagnostic = diagnostic.as_str(),
-            "memory turn policy reported diagnostic"
+            error_kind = error.kind(),
+            "turn policy hook failed before prompt construction"
         );
-    }
+        ChatTurnError::Terminal(error.safe_message().to_owned())
+    })?;
 
     let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
         hook_runtime.as_ref(),
@@ -1458,11 +1360,32 @@ async fn execute_agent_provider_response(
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
     if !provider_tool_calling {
+        let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            &effective_policy_set,
+            &effective_prompt_context_set,
+            Vec::new(),
+            tool_bundle_artifacts.as_ref(),
+            provider_tool_calling,
+        )
+        .await
+        .map_err(|error| {
+            warn!(
+                thread_id,
+                turn_id,
+                error_kind = error.kind(),
+                "turn tool materialization hook failed before prompt construction"
+            );
+            ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
+        })?;
+
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
+            Vec::new(),
         )
         .await
         .map_err(|error| {
@@ -1474,14 +1397,14 @@ async fn execute_agent_provider_response(
             );
             ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
         })?;
-        let dynamic_prompt_sections =
-            dynamic_prompt_sections_from_hook_sections(&effective_prompt_section_set)?;
+        let prompt_sections =
+            prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
 
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
             None,
-            None,
-            dynamic_prompt_sections.as_slice(),
+            prompt_sections.memory_recall.clone(),
+            prompt_sections.dynamic_sections.as_slice(),
             include_task_orchestration_policy,
             continue_generation_hint,
             thread_id,
@@ -1560,22 +1483,6 @@ async fn execute_agent_provider_response(
         }
     }
 
-    let memory_tool_materialization = if memory_turn_policy.allows_any_memory_tool() {
-        let raw_materialization =
-            materialize_memory_tooling(memory_provider.as_ref(), memory_context.clone()).await;
-        filter_memory_tool_materialization(raw_materialization, &memory_turn_policy)
-    } else {
-        MemoryToolMaterialization::default()
-    };
-    for diagnostic in &memory_tool_materialization.diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            diagnostic = diagnostic.as_str(),
-            "memory tool materialization reported diagnostic"
-        );
-    }
-
     let mcp_materialization =
         materialize_mcp_tooling(mcp_tool_provider.as_ref(), workspace_id, turn_id, thread_id).await;
     for diagnostic in &mcp_materialization.diagnostics {
@@ -1610,10 +1517,46 @@ async fn execute_agent_provider_response(
         );
     }
 
-    let mut extension_bundles = skill_tool_materialization.bundles.clone();
-    extension_bundles.extend(mcp_materialization.bundles.clone());
-    extension_bundles.extend(task_materialization.bundles.clone());
-    extension_bundles.extend(memory_tool_materialization.bundles.clone());
+    let mut tool_bundle_contributions = Vec::new();
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "skill",
+        "skill.runtime",
+        SKILL_TOOL_BUNDLE_PRIORITY,
+        skill_tool_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "mcp",
+        "mcp.runtime",
+        MCP_TOOL_BUNDLE_PRIORITY,
+        mcp_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "task",
+        "task.runtime",
+        TASK_TOOL_BUNDLE_PRIORITY,
+        task_materialization.bundles.clone(),
+    ));
+    let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+        hook_runtime.as_ref(),
+        &hook_context,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+        tool_bundle_contributions,
+        tool_bundle_artifacts.as_ref(),
+        provider_tool_calling,
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            thread_id,
+            turn_id,
+            error_kind = error.kind(),
+            "turn tool materialization hook failed before tool runtime construction"
+        );
+        ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
+    })?;
+
+    let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
 
     let tools = match build_tools(
         workdir.clone(),
@@ -1687,43 +1630,13 @@ async fn execute_agent_provider_response(
         .into_iter()
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
-    let all_tool_name_set = all_tool_names.iter().cloned().collect::<BTreeSet<_>>();
-    let available_memory_tool_names = memory_tool_names(&memory_tool_materialization)
-        .into_iter()
-        .filter(|name| all_tool_name_set.contains(name))
-        .collect::<Vec<_>>();
-    let memory_recall_snapshot =
-        if memory_turn_policy.allow_pre_turn_recall() && !available_memory_tool_names.is_empty() {
-            load_memory_recall_snapshot(
-                memory_provider.as_ref(),
-                memory_context.clone(),
-                memory_recall_request(memory_context.input_text.as_str()),
-            )
-            .await
-        } else {
-            MemoryRecallSnapshot::empty()
-        };
-    let memory_recall_prompt =
-        if memory_turn_policy.allow_memory_prompt() && !available_memory_tool_names.is_empty() {
-            if let Some(prompt_policy) = memory_turn_policy.recall_prompt_policy() {
-                let prompt_input = memory_recall_prompt_input(
-                    available_memory_tool_names,
-                    prompt_policy,
-                    memory_recall_snapshot,
-                );
-                render_memory_recall_prompt(&prompt_input)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
     let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
         &effective_policy_set,
         &effective_prompt_context_set,
+        Vec::new(),
     )
     .await
     .map_err(|error| {
@@ -1735,14 +1648,14 @@ async fn execute_agent_provider_response(
         );
         ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
     })?;
-    let dynamic_prompt_sections =
-        dynamic_prompt_sections_from_hook_sections(&effective_prompt_section_set)?;
+    let prompt_sections =
+        prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
 
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
         None,
-        memory_recall_prompt.clone(),
-        dynamic_prompt_sections.as_slice(),
+        prompt_sections.memory_recall.clone(),
+        prompt_sections.dynamic_sections.as_slice(),
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -1898,8 +1811,8 @@ async fn execute_agent_provider_response(
                     let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
-                        memory_recall_prompt.clone(),
-                        dynamic_prompt_sections.as_slice(),
+                        prompt_sections.memory_recall.clone(),
+                        prompt_sections.dynamic_sections.as_slice(),
                         include_task_orchestration_policy,
                         continue_generation_hint,
                         thread_id,
@@ -1947,7 +1860,7 @@ async fn execute_agent_provider_response(
                 None
             };
 
-            let round_compiled_prompt = if round_plan.tools_enabled || memory_recall_prompt.is_none()
+            let round_compiled_prompt = if round_plan.tools_enabled || prompt_sections.memory_recall.is_none()
             {
                 active_compiled_prompt.clone()
             } else {
@@ -1955,7 +1868,7 @@ async fn execute_agent_provider_response(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
                     None,
-                    dynamic_prompt_sections.as_slice(),
+                    prompt_sections.dynamic_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -2039,8 +1952,8 @@ async fn execute_agent_provider_response(
                         let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
-                            memory_recall_prompt.clone(),
-                            dynamic_prompt_sections.as_slice(),
+                            prompt_sections.memory_recall.clone(),
+                            prompt_sections.dynamic_sections.as_slice(),
                             include_task_orchestration_policy,
                             continue_generation_hint,
                             thread_id,
@@ -2700,8 +2613,8 @@ async fn execute_agent_provider_response(
                 let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
-                    memory_recall_prompt.clone(),
-                    dynamic_prompt_sections.as_slice(),
+                    prompt_sections.memory_recall.clone(),
+                    prompt_sections.dynamic_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,

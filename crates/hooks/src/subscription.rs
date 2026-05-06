@@ -12,7 +12,8 @@ pub type HookFilterSet = BTreeMap<HookFilterKey, HookValue>;
 pub enum HookSubscriptionVisibility {
     #[default]
     Internal,
-    Developer,
+    Debug,
+    UserAudit,
     UserVisible,
 }
 
@@ -170,6 +171,15 @@ mod tests {
 
     #[test]
     fn subscription_visibility_serializes_stably() {
+        assert_eq!(
+            serde_json::to_value(HookSubscriptionVisibility::Debug).expect("visibility serializes"),
+            serde_json::json!("debug")
+        );
+        assert_eq!(
+            serde_json::to_value(HookSubscriptionVisibility::UserAudit)
+                .expect("visibility serializes"),
+            serde_json::json!("user_audit")
+        );
         assert_eq!(
             serde_json::to_value(HookSubscriptionVisibility::UserVisible)
                 .expect("visibility serializes"),

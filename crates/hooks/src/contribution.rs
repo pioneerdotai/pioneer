@@ -1,8 +1,8 @@
 use crate::{
-    HookAuditEventKind, HookContributionId, HookDiagnostic, HookDiagnosticCode,
-    HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain, HookId, HookPolicyKey,
-    HookPromptContent, HookPromptSectionTitle, HookSectionId, HookSourceId, HookSourceLabel,
-    HookSubscriptionId, HookValue,
+    HookAuditEventKind, HookBackgroundJobId, HookCapability, HookContributionId, HookDiagnostic,
+    HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain, HookId,
+    HookPolicyKey, HookPromptContent, HookPromptSectionTitle, HookRunIdempotencyKey, HookSectionId,
+    HookSourceId, HookSourceLabel, HookSubscriptionId, HookToolBundleId, HookToolName, HookValue,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -137,6 +137,7 @@ pub struct PromptContextContribution {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptSectionContribution {
+    pub contribution_id: HookContributionId,
     pub section_id: HookSectionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<HookPromptSectionTitle>,
@@ -149,6 +150,18 @@ pub struct PromptSectionContribution {
     pub diagnostics: Vec<HookDiagnostic>,
     #[serde(default)]
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolBundleContribution {
+    pub contribution_id: HookContributionId,
+    pub bundle_id: HookToolBundleId,
+    pub domain: HookDomain,
+    pub priority: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_names: Vec<HookToolName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<HookDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,14 +185,63 @@ pub struct AuditContribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundJobContribution {
+    pub contribution_id: HookContributionId,
+    pub job_id: HookBackgroundJobId,
+    pub domain: HookDomain,
+    pub priority: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<HookRunIdempotencyKey>,
+    pub payload: HookValue,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<HookDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum HookContribution {
     Policy(PolicyContribution),
     PromptContext(PromptContextContribution),
     PromptSection(PromptSectionContribution),
+    ToolBundle(ToolBundleContribution),
     PromptManifestDiagnostic(PromptManifestDiagnosticContribution),
     Audit(AuditContribution),
+    BackgroundJob(BackgroundJobContribution),
     Noop,
+}
+
+impl HookContribution {
+    pub fn required_capability(&self) -> Option<HookCapability> {
+        match self {
+            Self::Policy(_) => Some(static_capability("contribute_policy")),
+            Self::PromptContext(_) => Some(static_capability("contribute_prompt_context")),
+            Self::PromptSection(_) => Some(static_capability("contribute_prompt_section")),
+            Self::ToolBundle(_) => Some(static_capability("contribute_tool_bundle")),
+            Self::PromptManifestDiagnostic(_) => {
+                Some(static_capability("contribute_prompt_manifest_diagnostic"))
+            }
+            Self::Audit(_) => Some(static_capability("emit_audit")),
+            Self::BackgroundJob(_) => Some(static_capability("schedule_background_job")),
+            Self::Noop => None,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Policy(_) => "policy",
+            Self::PromptContext(_) => "prompt_context",
+            Self::PromptSection(_) => "prompt_section",
+            Self::ToolBundle(_) => "tool_bundle",
+            Self::PromptManifestDiagnostic(_) => "prompt_manifest_diagnostic",
+            Self::Audit(_) => "audit",
+            Self::BackgroundJob(_) => "background_job",
+            Self::Noop => "noop",
+        }
+    }
+}
+
+fn static_capability(value: &'static str) -> HookCapability {
+    HookCapability::new(value).expect("static hook capability is valid")
 }
 
 #[cfg(test)]
@@ -189,6 +251,8 @@ mod tests {
     #[test]
     fn prompt_section_contribution_roundtrips() {
         let contribution = HookContribution::PromptSection(PromptSectionContribution {
+            contribution_id: HookContributionId::new("dynamic.context")
+                .expect("valid contribution id"),
             section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
             title: Some(HookPromptSectionTitle::new("Dynamic Context").expect("valid title")),
             domain: HookDomain::new("test").expect("valid domain"),
@@ -207,6 +271,66 @@ mod tests {
     }
 
     #[test]
+    fn prompt_section_declares_required_capability() {
+        let contribution = HookContribution::PromptSection(PromptSectionContribution {
+            contribution_id: HookContributionId::new("dynamic.context")
+                .expect("valid contribution id"),
+            section_id: HookSectionId::new("dynamic.context").expect("valid section id"),
+            title: None,
+            domain: HookDomain::new("test").expect("valid domain"),
+            priority: 10,
+            content: HookPromptContent::new("context").expect("valid content"),
+            max_chars: None,
+            diagnostics: Vec::new(),
+            truncated: false,
+        });
+
+        assert_eq!(contribution.kind_name(), "prompt_section");
+        assert_eq!(
+            contribution
+                .required_capability()
+                .expect("prompt section requires a capability"),
+            HookCapability::new("contribute_prompt_section").expect("valid capability"),
+        );
+    }
+
+    #[test]
+    fn noop_requires_no_capability() {
+        assert_eq!(HookContribution::Noop.required_capability(), None);
+        assert_eq!(HookContribution::Noop.kind_name(), "noop");
+    }
+
+    #[test]
+    fn background_job_contribution_roundtrips_and_declares_capability() {
+        let contribution = HookContribution::BackgroundJob(BackgroundJobContribution {
+            contribution_id: HookContributionId::new("background.extract")
+                .expect("valid contribution id"),
+            job_id: HookBackgroundJobId::new("memory.extract").expect("valid job id"),
+            domain: HookDomain::new("memory").expect("valid domain"),
+            priority: 20,
+            idempotency_key: Some(
+                HookRunIdempotencyKey::new("turn-1:memory.extract").expect("valid key"),
+            ),
+            payload: HookValue::Text("extract durable facts".to_owned()),
+            diagnostics: Vec::new(),
+        });
+
+        let value = serde_json::to_value(&contribution).expect("contribution should serialize");
+        assert_eq!(value["kind"], "background_job");
+        let decoded: HookContribution =
+            serde_json::from_value(value).expect("contribution should deserialize");
+
+        assert_eq!(decoded, contribution);
+        assert_eq!(decoded.kind_name(), "background_job");
+        assert_eq!(
+            decoded
+                .required_capability()
+                .expect("background job requires a capability"),
+            HookCapability::new("schedule_background_job").expect("valid capability"),
+        );
+    }
+
+    #[test]
     fn source_ref_roundtrips() {
         let source = HookSourceRef {
             kind: HookSourceKind::Thread,
@@ -217,6 +341,28 @@ mod tests {
         let decoded: HookSourceRef =
             serde_json::from_value(value).expect("source should deserialize");
         assert_eq!(decoded, source);
+    }
+
+    #[test]
+    fn tool_bundle_contribution_roundtrips() {
+        let contribution = HookContribution::ToolBundle(ToolBundleContribution {
+            contribution_id: HookContributionId::new("test.tool_bundle")
+                .expect("valid contribution id"),
+            bundle_id: HookToolBundleId::new("test.memory_tools").expect("valid bundle id"),
+            domain: HookDomain::new("memory").expect("valid domain"),
+            priority: 20,
+            tool_names: vec![
+                HookToolName::new("memory_search").expect("valid tool name"),
+                HookToolName::new("memory_remember").expect("valid tool name"),
+            ],
+            diagnostics: Vec::new(),
+        });
+
+        let value = serde_json::to_value(&contribution).expect("tool bundle should serialize");
+        assert_eq!(value["kind"], "tool_bundle");
+        let decoded: HookContribution =
+            serde_json::from_value(value).expect("tool bundle should deserialize");
+        assert_eq!(decoded, contribution);
     }
 
     #[test]

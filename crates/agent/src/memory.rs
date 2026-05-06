@@ -1,8 +1,23 @@
+use crate::hooks::AgentToolBundleArtifactStore;
 use chrono::{DateTime, Utc};
-use pioneer_promt::{MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy};
+use pioneer_hooks::HookHandler;
+use pioneer_hooks::{
+    HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookContributionId,
+    HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain,
+    HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
+    HookId, HookInputPayload, HookKind, HookMetadata, HookPhase, HookPolicyKey, HookPromptContent,
+    HookRegistryError, HookResult, HookRuntime, HookSectionId, HookSubscription,
+    HookSubscriptionId, HookToolBundleId, HookToolName, HookValue, PolicyContribution,
+    PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
+};
+use pioneer_promt::{
+    MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
+    render_memory_recall_prompt,
+};
 use pioneer_protocol::{MemoryCategory, MemoryScope, MemoryScopeKind, ThreadMode};
-use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use pioneer_tools::ToolExtensionBundle;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Mutex};
 
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 pub const MEMORY_GET_TOOL: &str = "memory_get";
@@ -391,6 +406,480 @@ pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
     ) -> Result<MemoryTurnPolicy, String>;
 }
 
+#[derive(Clone)]
+struct MemoryHookTurnState {
+    context: MemoryTurnContext,
+    policy: MemoryTurnPolicy,
+    available_tool_names: Vec<String>,
+}
+
+#[derive(Default)]
+struct MemoryHookTurnStateStore {
+    states: Mutex<BTreeMap<String, MemoryHookTurnState>>,
+}
+
+impl MemoryHookTurnStateStore {
+    fn set_policy(&self, context: MemoryTurnContext, policy: MemoryTurnPolicy) {
+        if let Ok(mut states) = self.states.lock() {
+            states.insert(
+                memory_hook_state_key(
+                    context.workspace_id.as_str(),
+                    context.thread_id.as_str(),
+                    context.turn_id.as_str(),
+                ),
+                MemoryHookTurnState {
+                    context,
+                    policy,
+                    available_tool_names: Vec::new(),
+                },
+            );
+        }
+    }
+
+    fn state(&self, request: &HookHandlerRequest) -> Option<MemoryHookTurnState> {
+        let workspace_id = request.context.workspace_id.as_ref()?.as_str();
+        let thread_id = request.context.thread_id.as_ref()?.as_str();
+        let turn_id = request.context.turn_id.as_ref()?.as_str();
+        self.states.lock().ok().and_then(|states| {
+            states
+                .get(&memory_hook_state_key(workspace_id, thread_id, turn_id))
+                .cloned()
+        })
+    }
+
+    fn set_available_tool_names(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        available_tool_names: Vec<String>,
+    ) {
+        if let Ok(mut states) = self.states.lock()
+            && let Some(state) =
+                states.get_mut(&memory_hook_state_key(workspace_id, thread_id, turn_id))
+        {
+            state.available_tool_names = available_tool_names;
+        }
+    }
+}
+
+fn memory_hook_state_key(workspace_id: &str, thread_id: &str, turn_id: &str) -> String {
+    format!("{workspace_id}\n{thread_id}\n{turn_id}")
+}
+
+pub(crate) fn install_memory_hooks(
+    runtime: &Arc<HookRuntime>,
+    memory_provider: Arc<dyn AgentMemoryProvider>,
+    policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
+) -> Result<(), HookRegistryError> {
+    let state = Arc::new(MemoryHookTurnStateStore::default());
+    register_memory_hook_handler(
+        runtime,
+        Arc::new(MemoryTurnPolicyHook {
+            policy_provider,
+            state: state.clone(),
+        }),
+        "memory.turn_policy.default",
+        HookPhase::TurnPrePolicy,
+        0,
+    )?;
+    register_memory_hook_handler(
+        runtime,
+        Arc::new(MemoryToolMaterializationHook {
+            memory_provider: memory_provider.clone(),
+            state: state.clone(),
+            tool_bundle_artifacts,
+        }),
+        "memory.tool_materialization.default",
+        HookPhase::TurnPreToolMaterialization,
+        0,
+    )?;
+    register_memory_hook_handler(
+        runtime,
+        Arc::new(MemoryPromptSectionHook {
+            memory_provider,
+            state,
+        }),
+        "memory.prompt_section.default",
+        HookPhase::TurnPrePromptCompile,
+        0,
+    )?;
+    Ok(())
+}
+
+fn register_memory_hook_handler(
+    runtime: &Arc<HookRuntime>,
+    handler: Arc<dyn HookHandler>,
+    subscription_id: &'static str,
+    phase: HookPhase,
+    priority: i32,
+) -> Result<(), HookRegistryError> {
+    let hook_id = handler.id();
+    if !runtime.handlers().contains_handler(&hook_id)? {
+        runtime.handlers().register_handler(handler)?;
+    }
+
+    let subscription_id =
+        HookSubscriptionId::new(subscription_id).expect("static subscription id is valid");
+    if runtime
+        .subscriptions()
+        .get_subscription(&subscription_id)?
+        .is_none()
+    {
+        runtime.subscriptions().register_subscription(
+            runtime.handlers().as_ref(),
+            HookSubscription::new(subscription_id, hook_id, phase)
+                .with_priority(priority)
+                .with_execution_policy(HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::Blocking,
+                    timeout_ms: None,
+                    max_parallelism: None,
+                })
+                .with_failure_policy(HookFailurePolicy::BestEffort),
+        )?;
+    }
+    Ok(())
+}
+
+struct MemoryTurnPolicyHook {
+    policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    state: Arc<MemoryHookTurnStateStore>,
+}
+
+struct MemoryToolMaterializationHook {
+    memory_provider: Arc<dyn AgentMemoryProvider>,
+    state: Arc<MemoryHookTurnStateStore>,
+    tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
+}
+
+struct MemoryPromptSectionHook {
+    memory_provider: Arc<dyn AgentMemoryProvider>,
+    state: Arc<MemoryHookTurnStateStore>,
+}
+
+#[async_trait::async_trait]
+impl HookHandler for MemoryTurnPolicyHook {
+    fn id(&self) -> HookId {
+        HookId::new("memory.turn_policy").expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPrePolicy]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_hook_capabilities()
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let input = turn_pre_policy_input(&request)?;
+        let workspace_id = required_context_id(
+            request.context.workspace_id.as_ref().map(|id| id.as_str()),
+            "workspace_id",
+        )?;
+        let thread_id = required_context_id(
+            request.context.thread_id.as_ref().map(|id| id.as_str()),
+            "thread_id",
+        )?;
+        let turn_id = required_context_id(
+            request.context.turn_id.as_ref().map(|id| id.as_str()),
+            "turn_id",
+        )?;
+
+        let context = MemoryTurnPolicyContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            mode: ThreadMode::Agent,
+            input_text: input.input_text.clone(),
+            model: input.model.clone(),
+            model_provider: input.model_provider.clone(),
+        };
+        let policy = resolve_memory_turn_policy(
+            self.policy_provider.as_ref(),
+            context,
+            MemoryTurnPolicyRequest::default(),
+        )
+        .await;
+        let turn_context = MemoryTurnContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            mode: ThreadMode::Agent,
+            input_text: input.input_text.clone(),
+            task_id: None,
+            agent_id: None,
+        };
+        self.state.set_policy(turn_context, policy.clone());
+
+        let mut response = HookHandlerResponse::default();
+        response.diagnostics = hook_diagnostics_from_strings(policy.diagnostics.as_slice());
+        response
+            .contributions
+            .push(HookContribution::Policy(memory_policy_contribution(
+                &policy,
+            )));
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl HookHandler for MemoryToolMaterializationHook {
+    fn id(&self) -> HookId {
+        HookId::new("memory.tool_materialization").expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPreToolMaterialization]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_hook_capabilities()
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let Some(state) = self.state.state(&request) else {
+            return Ok(memory_missing_state_response("memory.tool_materialization"));
+        };
+        if !turn_pre_tool_materialization_allows_tools(&request)
+            || !state.policy.allows_any_memory_tool()
+        {
+            return Ok(HookHandlerResponse::default());
+        }
+
+        let mut materialization = match self
+            .memory_provider
+            .materialize_memory_tools(state.context.clone())
+            .await
+        {
+            Ok(materialization) => {
+                filter_memory_tool_materialization(materialization, &state.policy)
+            }
+            Err(error) => {
+                let mut response = HookHandlerResponse::default();
+                response
+                    .diagnostics
+                    .push(memory_hook_diagnostic("memory.tools_failed", error));
+                return Ok(response);
+            }
+        };
+
+        let available_tool_names = memory_tool_names(&materialization);
+        self.state.set_available_tool_names(
+            state.context.workspace_id.as_str(),
+            state.context.thread_id.as_str(),
+            state.context.turn_id.as_str(),
+            available_tool_names,
+        );
+
+        let mut response = HookHandlerResponse::default();
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            materialization.diagnostics.as_slice(),
+        ));
+        for (index, bundle) in materialization.bundles.drain(..).enumerate() {
+            let bundle_id = HookToolBundleId::new(format!("memory.runtime.bundle.{index}"))
+                .expect("static bundle id is valid");
+            self.tool_bundle_artifacts.insert(
+                state.context.turn_id.clone(),
+                bundle_id.clone(),
+                bundle.clone(),
+            );
+            response.contributions.push(HookContribution::ToolBundle(
+                memory_tool_bundle_contribution(index, bundle_id, &bundle),
+            ));
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl HookHandler for MemoryPromptSectionHook {
+    fn id(&self) -> HookId {
+        HookId::new("memory.prompt_section").expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPrePromptCompile]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_hook_capabilities()
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let Some(state) = self.state.state(&request) else {
+            return Ok(memory_missing_state_response("memory.prompt_section"));
+        };
+        if state.available_tool_names.is_empty() {
+            return Ok(HookHandlerResponse::default());
+        }
+
+        let mut response = HookHandlerResponse::default();
+        let recall_snapshot = if state.policy.allow_pre_turn_recall() {
+            match self
+                .memory_provider
+                .recall_memory(
+                    state.context.clone(),
+                    memory_recall_request(state.context.input_text.as_str()),
+                )
+                .await
+            {
+                Ok(snapshot) => {
+                    response.diagnostics.extend(hook_diagnostics_from_strings(
+                        snapshot.diagnostics.as_slice(),
+                    ));
+                    snapshot
+                }
+                Err(error) => {
+                    response
+                        .diagnostics
+                        .push(memory_hook_diagnostic("memory.recall_failed", error));
+                    MemoryRecallSnapshot::empty()
+                }
+            }
+        } else {
+            MemoryRecallSnapshot::empty()
+        };
+
+        if state.policy.allow_memory_prompt()
+            && let Some(prompt_policy) = state.policy.recall_prompt_policy()
+            && let Some(contribution) = memory_recall_prompt_section_contribution(
+                state.available_tool_names,
+                prompt_policy,
+                recall_snapshot,
+            )
+        {
+            response.contributions.push(contribution);
+        }
+        Ok(response)
+    }
+}
+
+fn memory_hook_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("write_domain_context").expect("static capability is valid"),
+        HookCapability::new("call_provider").expect("static capability is valid"),
+        HookCapability::new("call_tools").expect("static capability is valid"),
+        HookCapability::new("contribute_policy").expect("static capability is valid"),
+        HookCapability::new("contribute_prompt_section").expect("static capability is valid"),
+        HookCapability::new("contribute_tool_bundle").expect("static capability is valid"),
+    ])
+}
+
+fn turn_pre_policy_input(request: &HookHandlerRequest) -> HookResult<&TurnPrePolicyHookInput> {
+    match &request.input.payload {
+        HookInputPayload::TurnPrePolicy(input) => Ok(input),
+        _ => Err(memory_hook_error(
+            "memory.invalid_input",
+            "memory policy hook expected turn pre-policy input",
+        )),
+    }
+}
+
+fn turn_pre_tool_materialization_allows_tools(request: &HookHandlerRequest) -> bool {
+    match &request.input.payload {
+        HookInputPayload::TurnPreToolMaterialization(input) => input.provider_tool_calling,
+        _ => false,
+    }
+}
+
+fn required_context_id<'a>(value: Option<&'a str>, field: &'static str) -> HookResult<&'a str> {
+    value.ok_or_else(|| {
+        memory_hook_error(
+            "memory.missing_context",
+            format!("memory hook request missing {field}"),
+        )
+    })
+}
+
+fn memory_policy_contribution(policy: &MemoryTurnPolicy) -> PolicyContribution {
+    PolicyContribution {
+        domain: HookDomain::new("memory").expect("static domain is valid"),
+        key: HookPolicyKey::new("turn_policy").expect("static policy key is valid"),
+        value: HookValue::Text(policy.reason_code.as_str().to_owned()),
+        priority: 500,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn memory_tool_bundle_contribution(
+    index: usize,
+    bundle_id: HookToolBundleId,
+    bundle: &ToolExtensionBundle,
+) -> ToolBundleContribution {
+    ToolBundleContribution {
+        contribution_id: HookContributionId::new(format!("memory.runtime.contribution.{index}"))
+            .expect("static contribution id is valid"),
+        bundle_id,
+        domain: HookDomain::new("memory").expect("static domain is valid"),
+        priority: 100,
+        tool_names: bundle
+            .specs
+            .iter()
+            .filter_map(|configured| HookToolName::new(configured.spec.name.clone()).ok())
+            .collect(),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
+    MemoryRecallRequest {
+        query: input_text.to_owned(),
+        categories: Vec::new(),
+        top_k: Some(5),
+        max_chars: Some(1_500),
+    }
+}
+
+fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
+    messages
+        .iter()
+        .map(|message| memory_hook_diagnostic("memory.diagnostic", message.clone()))
+        .collect()
+}
+
+fn memory_missing_state_response(hook: &'static str) -> HookHandlerResponse {
+    let mut response = HookHandlerResponse::default();
+    response.diagnostics.push(memory_hook_diagnostic(
+        "memory.missing_state",
+        format!("{hook} skipped because memory turn policy state was unavailable"),
+    ));
+    response
+}
+
+fn memory_hook_diagnostic(code: &'static str, message: impl Into<String>) -> HookDiagnostic {
+    HookDiagnostic {
+        code: HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
+        message: HookDiagnosticMessage::new(message.into())
+            .expect("diagnostic message should be non-empty"),
+        severity: HookDiagnosticSeverity::Warning,
+        safe_for_user: false,
+        metadata: HookMetadata::default(),
+    }
+}
+
+fn memory_hook_error(code: &'static str, message: impl Into<String>) -> HookError {
+    HookError::new(
+        HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
+        HookDiagnosticMessage::new(message.into()).expect("hook error message should be non-empty"),
+    )
+}
+
 pub(crate) async fn resolve_memory_turn_policy(
     provider: Option<&Arc<dyn AgentMemoryTurnPolicyProvider>>,
     context: MemoryTurnPolicyContext,
@@ -566,6 +1055,27 @@ pub(crate) fn memory_recall_prompt_input(
             .collect(),
         truncated: recall_snapshot.truncated,
     }
+}
+
+pub(crate) fn memory_recall_prompt_section_contribution(
+    available_tool_names: Vec<String>,
+    policy: MemoryRecallPromptPolicy,
+    recall_snapshot: MemoryRecallSnapshot,
+) -> Option<HookContribution> {
+    let prompt_input = memory_recall_prompt_input(available_tool_names, policy, recall_snapshot);
+    let prompt = render_memory_recall_prompt(&prompt_input)?;
+    Some(HookContribution::PromptSection(PromptSectionContribution {
+        contribution_id: HookContributionId::new("memory.recall_prompt")
+            .expect("static contribution id is valid"),
+        section_id: HookSectionId::new("memory_recall").expect("static section id is valid"),
+        title: None,
+        domain: HookDomain::new("memory").expect("static domain is valid"),
+        priority: 500,
+        content: HookPromptContent::new(prompt).ok()?,
+        max_chars: None,
+        diagnostics: Vec::new(),
+        truncated: false,
+    }))
 }
 
 fn memory_recall_prompt_item(item: MemoryRecallItem) -> MemoryRecallPromptItem {

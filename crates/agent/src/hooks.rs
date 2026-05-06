@@ -1,20 +1,24 @@
 use pioneer_hooks::{
     HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookContributionHash,
-    HookDiagnostic, HookId, HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest,
-    HookPolicySet, HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits,
-    HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError,
-    HookSectionId, HookSubscriptionId, HookThreadId, HookTurnId, HookWorkspaceId,
-    PromptManifestDiagnosticContribution, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
-    TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolEventSummary,
+    HookContributionId, HookDiagnostic, HookId, HookIdError, HookInput, HookInputKind, HookPhase,
+    HookPhaseRequest, HookPolicySet, HookPromptContextLimits, HookPromptContextSet,
+    HookPromptSectionLimits, HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime,
+    HookRuntimeError, HookSectionId, HookSubscriptionId, HookThreadId, HookToolBundleId,
+    HookToolBundleSet, HookToolName, HookTurnId, HookWorkspaceId,
+    PromptManifestDiagnosticContribution, ToolBundleContribution, TurnPostTurnDomainEventSummary,
+    TurnPostTurnHookInput, TurnPostTurnHookInputLimits, TurnPostTurnStatus,
+    TurnPostTurnToolEventSummary, TurnPrePolicyHookInput, TurnPreToolMaterializationHookInput,
 };
+use pioneer_tools::ToolExtensionBundle;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
 const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
+const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AgentTurnHookContext {
@@ -225,10 +229,6 @@ pub(super) struct EffectiveTurnPromptSectionSet {
 }
 
 impl EffectiveTurnPromptSectionSet {
-    pub(super) fn empty() -> Self {
-        Self::default()
-    }
-
     pub(super) fn from_hook_prompt_section_set_and_manifest(
         sections: HookPromptSectionSet,
         manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -266,6 +266,9 @@ pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
     pub(super) source: EffectiveTurnPromptManifestHookSource,
     pub(super) section_id: Option<HookSectionId>,
     pub(super) contribution_kind: EffectiveTurnPromptManifestHookContributionKind,
+    pub(super) contribution_id: Option<HookContributionId>,
+    pub(super) priority: Option<i32>,
+    pub(super) source_count: Option<usize>,
     pub(super) hook_truncated: bool,
     pub(super) hook_content_chars: Option<usize>,
 }
@@ -296,6 +299,121 @@ pub(super) enum EffectiveTurnPromptManifestHookDiagnosticCode {
     HookBestEffortFailed,
 }
 
+#[derive(Clone)]
+pub(super) struct AgentTurnToolBundleContribution {
+    contribution: ToolBundleContribution,
+    bundle: ToolExtensionBundle,
+}
+
+impl AgentTurnToolBundleContribution {
+    fn new(contribution: ToolBundleContribution, bundle: ToolExtensionBundle) -> Self {
+        Self {
+            contribution,
+            bundle,
+        }
+    }
+
+    fn contribution(&self) -> &ToolBundleContribution {
+        &self.contribution
+    }
+
+    fn bundle(&self) -> &ToolExtensionBundle {
+        &self.bundle
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AgentToolBundleArtifactStore {
+    bundles: Mutex<BTreeMap<(String, HookToolBundleId), ToolExtensionBundle>>,
+}
+
+impl AgentToolBundleArtifactStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(
+        &self,
+        turn_id: impl Into<String>,
+        bundle_id: HookToolBundleId,
+        bundle: ToolExtensionBundle,
+    ) {
+        if let Ok(mut bundles) = self.bundles.lock() {
+            bundles.insert((turn_id.into(), bundle_id), bundle);
+        }
+    }
+
+    fn get(&self, turn_id: &str, bundle_id: &HookToolBundleId) -> Option<ToolExtensionBundle> {
+        self.bundles.lock().ok().and_then(|bundles| {
+            bundles
+                .get(&(turn_id.to_owned(), bundle_id.clone()))
+                .cloned()
+        })
+    }
+
+    pub(crate) fn clear_turn(&self, turn_id: &str) {
+        if let Ok(mut bundles) = self.bundles.lock() {
+            bundles.retain(|(bundle_turn_id, _), _| bundle_turn_id != turn_id);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct EffectiveTurnToolBundleSet {
+    bundles: Vec<ToolExtensionBundle>,
+    metadata: HookToolBundleSet,
+}
+
+impl EffectiveTurnToolBundleSet {
+    pub(super) fn bundles(&self) -> &[ToolExtensionBundle] {
+        &self.bundles
+    }
+
+    pub(super) fn diagnostics(&self) -> &[HookDiagnostic] {
+        &self.metadata.diagnostics
+    }
+
+    fn from_local(local_contributions: Vec<AgentTurnToolBundleContribution>) -> Self {
+        Self::from_local_and_hook_contributions(local_contributions, Vec::new(), None, "")
+    }
+
+    fn from_local_and_hook_contributions(
+        local_contributions: Vec<AgentTurnToolBundleContribution>,
+        hook_contributions: Vec<HookContribution>,
+        artifact_store: Option<&AgentToolBundleArtifactStore>,
+        turn_id: &str,
+    ) -> Self {
+        let local_artifacts = local_tool_bundle_artifacts_by_id(&local_contributions);
+        let mut contributions = local_contributions
+            .into_iter()
+            .map(|local| HookContribution::ToolBundle(local.contribution))
+            .collect::<Vec<_>>();
+        contributions.extend(hook_contributions);
+
+        let mut metadata = HookToolBundleSet::aggregate_hook_contributions(contributions);
+        let mut bundles = Vec::new();
+        let mut missing_artifact_ids = Vec::new();
+        for entry in metadata.entries() {
+            if let Some(bundle) = local_artifacts.get(&entry.bundle_id) {
+                bundles.push(bundle.clone());
+            } else if let Some(bundle) =
+                artifact_store.and_then(|store| store.get(turn_id, &entry.bundle_id))
+            {
+                bundles.push(bundle);
+            } else {
+                missing_artifact_ids.push(entry.bundle_id.as_str().to_owned());
+            }
+        }
+        metadata.diagnostics.extend(
+            missing_artifact_ids
+                .into_iter()
+                .map(|bundle_id| missing_tool_bundle_artifact_diagnostic(bundle_id.as_str())),
+        );
+
+        Self { bundles, metadata }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum AgentTurnHookError {
     InvalidContext(HookIdError),
@@ -324,6 +442,7 @@ impl AgentTurnHookError {
 pub(super) async fn run_agent_turn_policy_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
+    input: TurnPrePolicyHookInput,
 ) -> Result<EffectiveTurnPolicySet, AgentTurnHookError> {
     let Some(runtime) = runtime else {
         return Ok(EffectiveTurnPolicySet::empty());
@@ -331,11 +450,12 @@ pub(super) async fn run_agent_turn_policy_hook_phase(
 
     let empty_policy_set = EffectiveTurnPolicySet::empty();
     let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
-    let request = build_phase_request(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPrePolicy,
         &empty_policy_set,
         &empty_prompt_context_set,
+        HookInput::turn_pre_policy(input),
     )
     .map_err(AgentTurnHookError::InvalidContext)?;
 
@@ -410,9 +530,16 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
     context: &AgentTurnHookContext,
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
+    base_contributions: Vec<HookContribution>,
 ) -> Result<EffectiveTurnPromptSectionSet, AgentTurnHookError> {
     let Some(runtime) = runtime else {
-        return Ok(EffectiveTurnPromptSectionSet::empty());
+        let prompt_section_set = prompt_section_set_from_contributions(base_contributions);
+        return Ok(
+            EffectiveTurnPromptSectionSet::from_hook_prompt_section_set_and_manifest(
+                prompt_section_set,
+                EffectiveTurnPromptManifestHookMetadata::empty(),
+            ),
+        );
     };
 
     let request = build_phase_request(
@@ -428,16 +555,17 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
             for diagnostic in &response.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
             }
-            let contributions = response.contributions;
+            let hook_contributions = response.contributions;
             let phase_diagnostics = std::mem::take(&mut response.diagnostics);
-            let mut prompt_section_set =
-                prompt_section_set_from_contributions(contributions.clone());
+            let mut contributions = base_contributions;
+            contributions.extend(hook_contributions.clone());
+            let mut prompt_section_set = prompt_section_set_from_contributions(contributions);
             prompt_section_set.diagnostics.extend(phase_diagnostics);
             for diagnostic in &prompt_section_set.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptCompile, diagnostic);
             }
             let manifest = prompt_manifest_hook_metadata_from_phase_response(
-                &contributions,
+                &hook_contributions,
                 &response.runs,
                 &prompt_section_set,
             );
@@ -450,6 +578,61 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
         }
         Err(error) => {
             warn_hook_prompt_section_runtime_error(HookPhase::TurnPrePromptCompile, &error);
+            Err(AgentTurnHookError::Runtime(error))
+        }
+    }
+}
+
+pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
+    runtime: Option<&Arc<HookRuntime>>,
+    context: &AgentTurnHookContext,
+    policy_set: &EffectiveTurnPolicySet,
+    prompt_context_set: &EffectiveTurnPromptContextSet,
+    local_contributions: Vec<AgentTurnToolBundleContribution>,
+    artifact_store: Option<&Arc<AgentToolBundleArtifactStore>>,
+    provider_tool_calling: bool,
+) -> Result<EffectiveTurnToolBundleSet, AgentTurnHookError> {
+    let Some(runtime) = runtime else {
+        return Ok(EffectiveTurnToolBundleSet::from_local(local_contributions));
+    };
+
+    let input = TurnPreToolMaterializationHookInput::from_parts(
+        provider_tool_calling,
+        existing_tool_names_from_local_contributions(&local_contributions),
+    );
+    let request = build_phase_request_with_input(
+        context,
+        HookPhase::TurnPreToolMaterialization,
+        policy_set,
+        prompt_context_set,
+        HookInput::turn_pre_tool_materialization(input),
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
+
+    match runtime.run_phase(request).await {
+        Ok(mut response) => {
+            for diagnostic in &response.diagnostics {
+                warn_hook_diagnostic(HookPhase::TurnPreToolMaterialization, diagnostic);
+            }
+            let hook_contributions = response.contributions;
+            let phase_diagnostics = std::mem::take(&mut response.diagnostics);
+            let mut set = EffectiveTurnToolBundleSet::from_local_and_hook_contributions(
+                local_contributions,
+                hook_contributions,
+                artifact_store.map(Arc::as_ref),
+                context.turn_id.as_str(),
+            );
+            if let Some(store) = artifact_store {
+                store.clear_turn(context.turn_id.as_str());
+            }
+            set.metadata.diagnostics.extend(phase_diagnostics);
+            for diagnostic in set.diagnostics() {
+                warn_hook_diagnostic(HookPhase::TurnPreToolMaterialization, diagnostic);
+            }
+            Ok(set)
+        }
+        Err(error) => {
+            warn_hook_runtime_error(HookPhase::TurnPreToolMaterialization, &error);
             Err(AgentTurnHookError::Runtime(error))
         }
     }
@@ -486,6 +669,9 @@ fn prompt_manifest_hook_metadata_from_phase_response(
                             section_id: Some(section.section_id.clone()),
                             contribution_kind:
                                 EffectiveTurnPromptManifestHookContributionKind::PromptSection,
+                            contribution_id: Some(section.contribution_id.clone()),
+                            priority: Some(section.priority),
+                            source_count: Some(0),
                             hook_truncated,
                             hook_content_chars,
                         });
@@ -525,7 +711,9 @@ fn prompt_manifest_hook_metadata_from_phase_response(
             }
             HookContribution::Policy(_)
             | HookContribution::PromptContext(_)
+            | HookContribution::ToolBundle(_)
             | HookContribution::Audit(_)
+            | HookContribution::BackgroundJob(_)
             | HookContribution::Noop => {}
         }
     }
@@ -572,6 +760,9 @@ fn prompt_manifest_hook_metadata_from_phase_response(
                     &prompt_manifest_hook_contribution_kind_order(right.contribution_kind),
                 )
             })
+            .then_with(|| left.contribution_id.cmp(&right.contribution_id))
+            .then_with(|| left.priority.cmp(&right.priority))
+            .then_with(|| left.source_count.cmp(&right.source_count))
     });
     metadata.diagnostics.sort_by(|left, right| {
         prompt_manifest_hook_diagnostic_code_order(left.code)
@@ -863,6 +1054,93 @@ fn prompt_section_set_from_contributions(
     )
 }
 
+pub(super) fn tool_bundle_contributions_from_bundles(
+    domain: &'static str,
+    id_prefix: &'static str,
+    priority: i32,
+    bundles: Vec<ToolExtensionBundle>,
+) -> Vec<AgentTurnToolBundleContribution> {
+    bundles
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, bundle)| {
+            if bundle.specs.is_empty() && bundle.handlers.is_empty() {
+                return None;
+            }
+
+            let contribution_id =
+                pioneer_hooks::HookContributionId::new(format!("{id_prefix}.contribution.{index}"))
+                    .expect("static tool bundle contribution id prefix is valid");
+            let bundle_id = HookToolBundleId::new(format!("{id_prefix}.bundle.{index}"))
+                .expect("static tool bundle id prefix is valid");
+            let domain =
+                pioneer_hooks::HookDomain::new(domain).expect("static tool bundle domain is valid");
+            let tool_names = bundle
+                .specs
+                .iter()
+                .filter_map(|configured| HookToolName::new(configured.spec.name.clone()).ok())
+                .collect::<Vec<_>>();
+
+            Some(AgentTurnToolBundleContribution::new(
+                ToolBundleContribution {
+                    contribution_id,
+                    bundle_id,
+                    domain,
+                    priority,
+                    tool_names,
+                    diagnostics: Vec::new(),
+                },
+                bundle,
+            ))
+        })
+        .collect()
+}
+
+fn existing_tool_names_from_local_contributions(
+    contributions: &[AgentTurnToolBundleContribution],
+) -> Vec<HookToolName> {
+    let mut names = contributions
+        .iter()
+        .flat_map(|contribution| contribution.contribution().tool_names.iter().cloned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn local_tool_bundle_artifacts_by_id(
+    contributions: &[AgentTurnToolBundleContribution],
+) -> BTreeMap<HookToolBundleId, ToolExtensionBundle> {
+    contributions
+        .iter()
+        .map(|contribution| {
+            (
+                contribution.contribution().bundle_id.clone(),
+                contribution.bundle().clone(),
+            )
+        })
+        .collect()
+}
+
+fn missing_tool_bundle_artifact_diagnostic(bundle_id: &str) -> HookDiagnostic {
+    let mut metadata = pioneer_hooks::HookMetadata::default();
+    metadata.insert(
+        pioneer_hooks::HookMetadataKey::new("bundle_id").expect("static metadata key is valid"),
+        pioneer_hooks::HookValue::Text(bundle_id.to_owned()),
+    );
+    HookDiagnostic {
+        code: pioneer_hooks::HookDiagnosticCode::new(TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE)
+            .expect("static diagnostic code is valid"),
+        message: pioneer_hooks::HookDiagnosticMessage::new(
+            "tool bundle contribution was ignored because no local bundle artifact was registered",
+        )
+        .expect("static diagnostic message is valid"),
+        severity: pioneer_hooks::HookDiagnosticSeverity::Warning,
+        safe_for_user: false,
+        metadata,
+    }
+}
+
 fn runtime_failed_prompt_context_set() -> EffectiveTurnPromptContextSet {
     EffectiveTurnPromptContextSet::from_hook_prompt_context_set(
         HookPromptContextSet::runtime_failed(),
@@ -972,6 +1250,22 @@ fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_fallback_contribution",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            reason,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                reason = %reason,
+                error_kind = "invalid_execution_policy",
                 "agent turn policy hook phase failed; failing turn"
             );
         }
@@ -1093,6 +1387,22 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 "agent turn prompt context hook phase failed; continuing with empty context"
             );
         }
+        HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            reason,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                reason = %reason,
+                error_kind = "invalid_execution_policy",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
         HookRuntimeError::MissingDependency {
             subscription_id,
             dependency_id,
@@ -1211,6 +1521,22 @@ fn warn_hook_prompt_section_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 "agent turn prompt section hook phase failed; failing turn"
             );
         }
+        HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            reason,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                reason = %reason,
+                error_kind = "invalid_execution_policy",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
         HookRuntimeError::MissingDependency {
             subscription_id,
             dependency_id,
@@ -1326,6 +1652,22 @@ fn warn_hook_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_fallback_contribution",
+                "agent turn hook phase failed; continuing"
+            );
+        }
+        HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id,
+            hook_id,
+            phase: error_phase,
+            reason,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                subscription_id = %subscription_id,
+                hook_id = %hook_id,
+                reason = %reason,
+                error_kind = "invalid_execution_policy",
                 "agent turn hook phase failed; continuing"
             );
         }

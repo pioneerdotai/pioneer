@@ -1,7 +1,7 @@
 use crate::{
-    HookContext, HookContributionHash, HookDiagnosticPreview, HookId, HookPhase, HookRunAttemptId,
-    HookRunErrorSummary, HookRunId, HookRunIdempotencyKey, HookRunScopeId, HookRunStatus,
-    HookSubscriptionId,
+    HookAuditEventKind, HookContext, HookContributionHash, HookDiagnosticPreview, HookId,
+    HookPhase, HookRunAttemptId, HookRunErrorSummary, HookRunId, HookRunIdempotencyKey,
+    HookRunScopeId, HookRunStatus, HookSubscriptionId, HookValue,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -223,6 +223,37 @@ pub struct HookRunAttemptStoreCompletion {
     pub duration_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewHookAuditEventStoreRecord {
+    pub hook_run_id: HookRunId,
+    pub hook_run_attempt_id: Option<HookRunAttemptId>,
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub context: HookContext,
+    pub event_kind: HookAuditEventKind,
+    pub contribution_hash: Option<HookContributionHash>,
+    pub details: HookValue,
+    pub safe_for_user: bool,
+    pub created_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookAuditEventStoreRecord {
+    pub id: String,
+    pub hook_run_id: HookRunId,
+    pub hook_run_attempt_id: Option<HookRunAttemptId>,
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub context: HookContext,
+    pub event_kind: HookAuditEventKind,
+    pub contribution_hash: Option<HookContributionHash>,
+    pub details: HookValue,
+    pub safe_for_user: bool,
+    pub created_at_unix_ms: i64,
+}
+
 #[async_trait]
 pub trait HookRunStore: Send + Sync {
     async fn create_or_load_run(
@@ -252,4 +283,11 @@ pub trait HookRunStore: Send + Sync {
         attempt_id: &HookRunAttemptId,
         completion: HookRunAttemptStoreCompletion,
     ) -> HookRunStoreResult<HookRunAttemptStoreRecord>;
+
+    async fn append_audit_events(
+        &self,
+        _events: Vec<NewHookAuditEventStoreRecord>,
+    ) -> HookRunStoreResult<Vec<HookAuditEventStoreRecord>> {
+        Ok(Vec::new())
+    }
 }
