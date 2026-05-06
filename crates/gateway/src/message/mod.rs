@@ -705,6 +705,12 @@ impl MessageProcessor {
                         allow_function_proxy_tools: true,
                     },
                 },
+                memory: pioneer_agent::MemoryLoopConfig {
+                    active_recall: pioneer_agent::MemoryActiveRecallConfig {
+                        mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
+                        ..pioneer_agent::MemoryActiveRecallConfig::default()
+                    },
+                },
                 budget: pioneer_tools::ToolLoopBudgetConfig::default(),
                 retry: pioneer_tools::ToolRetryBudgetConfig::default(),
             }

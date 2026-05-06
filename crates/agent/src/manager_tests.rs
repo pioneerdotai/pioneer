@@ -37,7 +37,7 @@ use pioneer_tools::{
     ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolLoopBudgetConfig,
     ToolPayload, ToolRetryBudgetConfig, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +111,12 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 allow_shell_tools: true,
                 allow_http_tools: true,
                 allow_function_proxy_tools: true,
+            },
+        },
+        memory: super::MemoryLoopConfig {
+            active_recall: super::MemoryActiveRecallConfig {
+                mode: super::MemoryActiveRecallMode::DeterministicOnly,
+                ..super::MemoryActiveRecallConfig::default()
             },
         },
         budget: ToolLoopBudgetConfig::default(),
@@ -805,7 +811,7 @@ struct RecordingMemoryProvider {
     recall_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
     recall_requests: std::sync::Mutex<Vec<MemoryRecallRequest>>,
     tool_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
-    recall_result: Result<MemoryRecallSnapshot, String>,
+    recall_results: std::sync::Mutex<VecDeque<Result<MemoryRecallSnapshot, String>>>,
     tool_result: Result<MemoryToolMaterialization, String>,
 }
 
@@ -814,11 +820,18 @@ impl RecordingMemoryProvider {
         recall_result: Result<MemoryRecallSnapshot, String>,
         tool_result: Result<MemoryToolMaterialization, String>,
     ) -> Self {
+        Self::with_recall_sequence(vec![recall_result], tool_result)
+    }
+
+    fn with_recall_sequence(
+        recall_results: Vec<Result<MemoryRecallSnapshot, String>>,
+        tool_result: Result<MemoryToolMaterialization, String>,
+    ) -> Self {
         Self {
             recall_contexts: std::sync::Mutex::new(Vec::new()),
             recall_requests: std::sync::Mutex::new(Vec::new()),
             tool_contexts: std::sync::Mutex::new(Vec::new()),
-            recall_result,
+            recall_results: std::sync::Mutex::new(VecDeque::from(recall_results)),
             tool_result,
         }
     }
@@ -867,7 +880,18 @@ impl AgentMemoryProvider for RecordingMemoryProvider {
             .lock()
             .expect("memory recall requests lock poisoned")
             .push(request);
-        self.recall_result.clone()
+        let mut results = self
+            .recall_results
+            .lock()
+            .expect("memory recall results lock poisoned");
+        if results.len() > 1 {
+            results.pop_front().expect("result exists")
+        } else {
+            results
+                .front()
+                .cloned()
+                .unwrap_or_else(|| Ok(MemoryRecallSnapshot::empty()))
+        }
     }
 
     async fn materialize_memory_tools(
@@ -4393,6 +4417,107 @@ async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
         Some("memory.deterministic_recall.context")
     );
     assert_eq!(deterministic_recall_source.source_count, Some(1));
+}
+
+#[tokio::test]
+async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let mut config = test_tool_loop_config();
+    config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
+    config.memory.active_recall.max_queries = 1;
+    config
+        .memory
+        .active_recall
+        .deterministic_sufficient_min_items = 99;
+    let manager = AgentManager::new(registry, config);
+    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
+        vec![
+            Ok(MemoryRecallSnapshot::empty()),
+            Ok(MemoryRecallSnapshot {
+                items: vec![memory_recall_item(
+                    "mem_phase15_active",
+                    MemoryCategory::ProjectDecision,
+                    Some("hook_runtime"),
+                    "Use the hook runtime for proactive memory recall.",
+                )],
+                diagnostics: Vec::new(),
+                truncated: false,
+            }),
+        ],
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase15_active_memory",
+        "ws_phase15_active_memory",
+        "turn_phase15_active_memory",
+        ThreadMode::Agent,
+        "capture",
+        "continue the previous architecture implementation with the same memory constraints",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.recall_contexts().len(), 2);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    let recall_requests = memory_provider.recall_requests();
+    assert_eq!(recall_requests.len(), 2);
+    assert_eq!(recall_requests[1].top_k, Some(5));
+    assert_eq!(recall_requests[1].max_chars, Some(1_500));
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("## Memory Recall"));
+    assert!(prompt.full_system_text.contains("Active memory context:"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Use the hook runtime for proactive memory recall.")
+    );
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let active_recall_source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| {
+            source.section_id.is_none()
+                && source.contribution_kind == PromptManifestHookContributionKind::PromptContext
+                && source.source.hook_id == "memory.active_recall"
+        })
+        .expect("active recall prompt-context hook source should be recorded");
+    assert_eq!(
+        active_recall_source.source.phase,
+        PromptManifestHookPhase::TurnPrePromptContext
+    );
+    assert_eq!(
+        active_recall_source.source.subscription_id,
+        "memory.active_recall.default"
+    );
+    assert_eq!(
+        active_recall_source.source.contribution_id.as_deref(),
+        Some("memory.active_recall.context")
+    );
+    assert_eq!(active_recall_source.source_count, Some(1));
 }
 
 #[tokio::test]

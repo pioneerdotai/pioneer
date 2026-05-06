@@ -7,10 +7,11 @@ use pioneer_hooks::{
     HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
     HookId, HookInputPayload, HookKind, HookMetadata, HookMetadataKey, HookPhase, HookPolicyKey,
     HookPolicySet, HookPromptContent, HookRegistryError, HookResult, HookRuntime, HookSectionId,
-    HookSourceId, HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionId,
-    HookToolBundleId, HookToolName, HookValue, PolicyContribution, PromptContextContribution,
-    PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
-    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    HookSourceId, HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionDependencies,
+    HookSubscriptionId, HookSubscriptionVisibility, HookToolBundleId, HookToolName, HookValue,
+    PolicyContribution, PromptContextContribution, PromptSectionContribution,
+    ToolBundleContribution, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
     MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
@@ -18,6 +19,7 @@ use pioneer_promt::{
 };
 use pioneer_protocol::{MemoryCategory, MemoryScope, MemoryScopeKind, ThreadMode};
 use pioneer_tools::ToolExtensionBundle;
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -43,10 +45,14 @@ const MEMORY_TOOL_BUNDLE_ID_PREFIX: &str = "memory.tool_bundle.bundle";
 const MEMORY_DETERMINISTIC_RECALL_HOOK_ID: &str = "memory.deterministic_recall";
 const MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID: &str = "memory.deterministic_recall.default";
 const MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID: &str = "memory.deterministic_recall.context";
+const MEMORY_ACTIVE_RECALL_HOOK_ID: &str = "memory.active_recall";
+const MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID: &str = "memory.active_recall.default";
+const MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID: &str = "memory.active_recall.context";
 const MEMORY_PROMPT_CONTRACT_HOOK_ID: &str = "memory.prompt_contract";
 const MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID: &str = "memory.prompt_contract.default";
 const MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID: &str = "memory.prompt_contract.section";
 const MEMORY_PROMPT_CONTRACT_SECTION_ID: &str = "memory_recall";
+const MEMORY_ACTIVE_RECALL_GENERIC_QUERY: &str = "durable user identity preferences biography communication style recurring instructions project facts project decisions procedures constraints todos ongoing tasks";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTurnContext {
@@ -92,6 +98,83 @@ impl MemoryRecallSnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryActiveRecallMode {
+    Disabled,
+    DeterministicOnly,
+    Hybrid,
+    StrictDebug,
+}
+
+impl Default for MemoryActiveRecallMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+impl MemoryActiveRecallMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DeterministicOnly => "deterministic_only",
+            Self::Hybrid => "hybrid",
+            Self::StrictDebug => "strict_debug",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryActiveRecallConfig {
+    pub mode: MemoryActiveRecallMode,
+    pub timeout_ms: u64,
+    pub max_queries: usize,
+    pub top_k_per_query: u32,
+    pub max_prompt_chars: usize,
+    pub deterministic_sufficient_min_items: usize,
+    pub deterministic_sufficient_min_chars: usize,
+}
+
+impl Default for MemoryActiveRecallConfig {
+    fn default() -> Self {
+        Self {
+            mode: MemoryActiveRecallMode::Hybrid,
+            timeout_ms: 800,
+            max_queries: 3,
+            top_k_per_query: 5,
+            max_prompt_chars: 1_500,
+            deterministic_sufficient_min_items: 1,
+            deterministic_sufficient_min_chars: 600,
+        }
+    }
+}
+
+impl MemoryActiveRecallConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            mode: self.mode,
+            timeout_ms: self.timeout_ms.max(1),
+            max_queries: self.max_queries.max(1),
+            top_k_per_query: self.top_k_per_query.max(1),
+            max_prompt_chars: self.max_prompt_chars.max(1),
+            deterministic_sufficient_min_items: self.deterministic_sufficient_min_items.max(1),
+            deterministic_sufficient_min_chars: self.deterministic_sufficient_min_chars.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryLoopConfig {
+    pub active_recall: MemoryActiveRecallConfig,
+}
+
+impl MemoryLoopConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            active_recall: self.active_recall.normalized(),
+        }
     }
 }
 
@@ -409,7 +492,7 @@ impl MemoryTurnPolicy {
             remember_tool: MemoryMutationToolPolicy::Allow,
             forget_tool: MemoryMutationToolPolicy::Allow,
             post_turn_extraction: MemoryExtractionPolicy::Disabled,
-            active_memory: MemoryActiveContextPolicy::Disabled,
+            active_memory: MemoryActiveContextPolicy::Allow,
             explicit_remember: false,
             explicit_forget: false,
             forget_target_hint: None,
@@ -481,7 +564,7 @@ impl MemoryTurnPolicy {
             remember_tool: MemoryMutationToolPolicy::Disabled,
             forget_tool: MemoryMutationToolPolicy::Allow,
             post_turn_extraction: MemoryExtractionPolicy::Disabled,
-            active_memory: MemoryActiveContextPolicy::Disabled,
+            active_memory: MemoryActiveContextPolicy::Allow,
             explicit_remember: false,
             explicit_forget: false,
             forget_target_hint: None,
@@ -641,6 +724,79 @@ pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
     ) -> Result<MemoryTurnPolicy, String>;
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryActiveRecallDecisionContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub mode: ThreadMode,
+    pub input_text_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryActiveRecallDecisionRequest {
+    pub deterministic_context_count: usize,
+    pub deterministic_context_chars: usize,
+    pub deterministic_memory_ids: Vec<String>,
+    pub config_mode: MemoryActiveRecallMode,
+}
+
+#[async_trait::async_trait]
+pub trait AgentActiveMemoryDecisionProvider: Send + Sync {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        context: MemoryActiveRecallDecisionContext,
+        request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveMemoryDecisionStatus {
+    Skip,
+    Run,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveMemoryDecisionReasonCode {
+    PolicyDisabled,
+    ConfigDisabled,
+    DeterministicOnly,
+    DeterministicSufficient,
+    TrivialSelfContained,
+    MemoryLikely,
+    StrictDebug,
+    ProviderRun,
+    ProviderSkip,
+    ProviderUncertain,
+}
+
+impl ActiveMemoryDecisionReasonCode {
+    fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::PolicyDisabled => "memory.active_recall.policy_disabled",
+            Self::ConfigDisabled => "memory.active_recall.config_disabled",
+            Self::DeterministicOnly => "memory.active_recall.deterministic_only",
+            Self::DeterministicSufficient => "memory.active_recall.deterministic_sufficient",
+            Self::TrivialSelfContained => "memory.active_recall.skipped",
+            Self::MemoryLikely | Self::StrictDebug | Self::ProviderRun => {
+                "memory.active_recall.started"
+            }
+            Self::ProviderSkip => "memory.active_recall.skipped",
+            Self::ProviderUncertain => "memory.active_recall.uncertain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveMemoryDecision {
+    status: ActiveMemoryDecisionStatus,
+    reason_code: ActiveMemoryDecisionReasonCode,
+    confidence: f32,
+    query_hints: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
 #[derive(Clone)]
 struct MemoryHookTurnState {
     context: MemoryTurnContext,
@@ -686,7 +842,10 @@ pub(crate) fn install_memory_hooks(
     memory_provider: Arc<dyn AgentMemoryProvider>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
+    memory_config: MemoryLoopConfig,
 ) -> Result<(), HookRegistryError> {
+    let memory_config = memory_config.normalized();
+    let active_recall_config = memory_config.active_recall.clone();
     let state = Arc::new(MemoryHookTurnStateStore::default());
     register_memory_hook_handler(
         runtime,
@@ -706,6 +865,30 @@ pub(crate) fn install_memory_hooks(
         MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID,
         HookPhase::TurnPrePromptContext,
         0,
+    )?;
+    register_memory_hook_handler_with_options(
+        runtime,
+        Arc::new(ActiveMemoryRecallHook {
+            memory_provider: memory_provider.clone(),
+            decision_provider: None,
+            config: active_recall_config.clone(),
+        }),
+        MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID,
+        HookPhase::TurnPrePromptContext,
+        -10,
+        HookExecutionPolicy {
+            await_policy: HookAwaitPolicy::Deadline,
+            timeout_ms: Some(active_recall_config.timeout_ms),
+            max_parallelism: None,
+        },
+        HookSubscriptionDependencies::new(
+            [
+                HookSubscriptionId::new(MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID)
+                    .expect("static subscription id is valid"),
+            ],
+            [],
+        ),
+        HookSubscriptionVisibility::Internal,
     )?;
     register_memory_hook_handler(
         runtime,
@@ -735,6 +918,32 @@ fn register_memory_hook_handler(
     phase: HookPhase,
     priority: i32,
 ) -> Result<(), HookRegistryError> {
+    register_memory_hook_handler_with_options(
+        runtime,
+        handler,
+        subscription_id,
+        phase,
+        priority,
+        HookExecutionPolicy {
+            await_policy: HookAwaitPolicy::Blocking,
+            timeout_ms: None,
+            max_parallelism: None,
+        },
+        HookSubscriptionDependencies::default(),
+        HookSubscriptionVisibility::Internal,
+    )
+}
+
+fn register_memory_hook_handler_with_options(
+    runtime: &Arc<HookRuntime>,
+    handler: Arc<dyn HookHandler>,
+    subscription_id: &'static str,
+    phase: HookPhase,
+    priority: i32,
+    execution_policy: HookExecutionPolicy,
+    dependencies: HookSubscriptionDependencies,
+    visibility: HookSubscriptionVisibility,
+) -> Result<(), HookRegistryError> {
     let hook_id = handler.id();
     if !runtime.handlers().contains_handler(&hook_id)? {
         runtime.handlers().register_handler(handler)?;
@@ -751,12 +960,10 @@ fn register_memory_hook_handler(
             runtime.handlers().as_ref(),
             HookSubscription::new(subscription_id, hook_id, phase)
                 .with_priority(priority)
-                .with_execution_policy(HookExecutionPolicy {
-                    await_policy: HookAwaitPolicy::Blocking,
-                    timeout_ms: None,
-                    max_parallelism: None,
-                })
-                .with_failure_policy(HookFailurePolicy::BestEffort),
+                .with_dependencies(dependencies)
+                .with_execution_policy(execution_policy)
+                .with_failure_policy(HookFailurePolicy::BestEffort)
+                .with_visibility(visibility),
         )?;
     }
     Ok(())
@@ -775,6 +982,12 @@ struct MemoryToolBundleHook {
 
 struct MemoryDeterministicRecallHook {
     memory_provider: Arc<dyn AgentMemoryProvider>,
+}
+
+struct ActiveMemoryRecallHook {
+    memory_provider: Arc<dyn AgentMemoryProvider>,
+    decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    config: MemoryActiveRecallConfig,
 }
 
 struct MemoryPromptContractHook;
@@ -1048,6 +1261,136 @@ impl HookHandler for MemoryDeterministicRecallHook {
 }
 
 #[async_trait::async_trait]
+impl HookHandler for ActiveMemoryRecallHook {
+    fn id(&self) -> HookId {
+        HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPrePromptContext]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_active_recall_capabilities(self.decision_provider.is_some())
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let input = turn_pre_prompt_context_input(&request)?;
+        let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => {
+                let mut response = HookHandlerResponse::default();
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.policy_decode_failed",
+                    format!("memory active recall skipped: policy_decode_failed {error}"),
+                ));
+                return Ok(response);
+            }
+            None => return Ok(memory_missing_policy_response(MEMORY_ACTIVE_RECALL_HOOK_ID)),
+        };
+        let config = self.config.normalized();
+        let deterministic =
+            deterministic_recall_context_summary(&request.prompt_context_set, &config);
+        let context = memory_turn_context_from_prompt_context_request(&request, input)?;
+        let mut response = HookHandlerResponse::default();
+        let decision = resolve_active_memory_decision(
+            self.decision_provider.as_ref(),
+            &context,
+            input,
+            &policy,
+            &config,
+            &deterministic,
+        )
+        .await;
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            decision.diagnostics.as_slice(),
+        ));
+
+        if decision.status != ActiveMemoryDecisionStatus::Run {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                decision.reason_code.diagnostic_code(),
+                format!(
+                    "memory active recall skipped: reason={:?} confidence={:.2}",
+                    decision.reason_code, decision.confidence
+                ),
+            ));
+            return Ok(response);
+        }
+
+        let queries = active_memory_query_plan(input.input_text.as_str(), &decision, &config);
+        if queries.is_empty() {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.active_recall.no_query",
+                "memory active recall skipped: no bounded query available",
+            ));
+            return Ok(response);
+        }
+
+        let mut active_items = Vec::new();
+        let mut active_truncated = false;
+        for query in queries {
+            match self
+                .memory_provider
+                .recall_memory(
+                    context.clone(),
+                    MemoryRecallRequest {
+                        query,
+                        categories: Vec::new(),
+                        top_k: Some(config.top_k_per_query),
+                        max_chars: Some(config.max_prompt_chars),
+                    },
+                )
+                .await
+            {
+                Ok(snapshot) => {
+                    response.diagnostics.extend(hook_diagnostics_from_strings(
+                        snapshot.diagnostics.as_slice(),
+                    ));
+                    active_truncated |= snapshot.truncated;
+                    active_items.extend(snapshot.items);
+                }
+                Err(error) => {
+                    let _ = error;
+                    response.diagnostics.push(memory_safe_warning_diagnostic(
+                        "memory.active_recall.failed",
+                        "memory active recall failed",
+                    ));
+                    return Ok(response);
+                }
+            }
+        }
+
+        let active_items = dedup_active_recall_items(active_items, &deterministic.memory_ids);
+        if active_items.is_empty() {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.active_recall.no_hits",
+                "memory active recall returned no non-duplicate memory context",
+            ));
+            return Ok(response);
+        }
+
+        if let Some(contribution) = memory_active_recall_prompt_context_contribution(
+            active_items,
+            active_truncated,
+            &config,
+        ) {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.active_recall.context_contributed",
+                "memory active recall contributed prompt context",
+            ));
+            response
+                .contributions
+                .push(HookContribution::PromptContext(contribution));
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
 impl HookHandler for MemoryPromptContractHook {
     fn id(&self) -> HookId {
         HookId::new(MEMORY_PROMPT_CONTRACT_HOOK_ID).expect("static hook id is valid")
@@ -1166,6 +1509,19 @@ fn memory_deterministic_recall_capabilities() -> HookCapabilities {
         HookCapability::new("read_domain_context").expect("static capability is valid"),
         HookCapability::new("contribute_prompt_context").expect("static capability is valid"),
     ])
+}
+
+fn memory_active_recall_capabilities(provider_enabled: bool) -> HookCapabilities {
+    let mut capabilities = vec![
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("contribute_prompt_context").expect("static capability is valid"),
+    ];
+    if provider_enabled {
+        capabilities
+            .push(HookCapability::new("call_provider").expect("static capability is valid"));
+    }
+    HookCapabilities::new(capabilities)
 }
 
 fn memory_prompt_contract_capabilities() -> HookCapabilities {
@@ -1532,6 +1888,325 @@ fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DeterministicRecallContextSummary {
+    memory_ids: BTreeSet<String>,
+    context_count: usize,
+    context_chars: usize,
+    sufficient: bool,
+}
+
+fn deterministic_recall_context_summary(
+    prompt_context_set: &pioneer_hooks::HookPromptContextSet,
+    config: &MemoryActiveRecallConfig,
+) -> DeterministicRecallContextSummary {
+    let mut summary = DeterministicRecallContextSummary::default();
+    for entry in prompt_context_set.entries() {
+        if entry.domain.as_str() != MEMORY_POLICY_DOMAIN
+            || entry.contribution_id.as_str() != MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID
+        {
+            continue;
+        }
+        summary.context_count += 1;
+        summary.context_chars += entry.content.as_str().chars().count();
+        for source_ref in &entry.source_refs {
+            if source_ref.kind.as_str() == "memory" {
+                summary.memory_ids.insert(source_ref.id.as_str().to_owned());
+            }
+        }
+    }
+    summary.sufficient = !summary.memory_ids.is_empty()
+        && (summary.memory_ids.len() >= config.deterministic_sufficient_min_items
+            || summary.context_chars >= config.deterministic_sufficient_min_chars);
+    summary
+}
+
+async fn resolve_active_memory_decision(
+    provider: Option<&Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    context: &MemoryTurnContext,
+    input: &TurnPrePromptContextHookInput,
+    policy: &MemoryTurnPolicy,
+    config: &MemoryActiveRecallConfig,
+    deterministic: &DeterministicRecallContextSummary,
+) -> ActiveMemoryDecision {
+    if !policy.allow_pre_turn_recall()
+        || policy.active_memory == MemoryActiveContextPolicy::Disabled
+    {
+        return ActiveMemoryDecision {
+            status: ActiveMemoryDecisionStatus::Skip,
+            reason_code: ActiveMemoryDecisionReasonCode::PolicyDisabled,
+            confidence: policy.confidence,
+            query_hints: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+    }
+    match config.mode {
+        MemoryActiveRecallMode::Disabled => {
+            return ActiveMemoryDecision {
+                status: ActiveMemoryDecisionStatus::Skip,
+                reason_code: ActiveMemoryDecisionReasonCode::ConfigDisabled,
+                confidence: 1.0,
+                query_hints: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        }
+        MemoryActiveRecallMode::DeterministicOnly => {
+            return ActiveMemoryDecision {
+                status: ActiveMemoryDecisionStatus::Skip,
+                reason_code: ActiveMemoryDecisionReasonCode::DeterministicOnly,
+                confidence: 1.0,
+                query_hints: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        }
+        MemoryActiveRecallMode::StrictDebug => {
+            return ActiveMemoryDecision {
+                status: ActiveMemoryDecisionStatus::Run,
+                reason_code: ActiveMemoryDecisionReasonCode::StrictDebug,
+                confidence: 1.0,
+                query_hints: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        }
+        MemoryActiveRecallMode::Hybrid => {}
+    }
+
+    if deterministic.sufficient {
+        return ActiveMemoryDecision {
+            status: ActiveMemoryDecisionStatus::Skip,
+            reason_code: ActiveMemoryDecisionReasonCode::DeterministicSufficient,
+            confidence: 0.9,
+            query_hints: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+    }
+
+    if let Some(provider) = provider {
+        let request = MemoryActiveRecallDecisionRequest {
+            deterministic_context_count: deterministic.context_count,
+            deterministic_context_chars: deterministic.context_chars,
+            deterministic_memory_ids: deterministic.memory_ids.iter().cloned().collect(),
+            config_mode: config.mode,
+        };
+        match provider
+            .resolve_active_memory_decision_json(
+                MemoryActiveRecallDecisionContext {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                    mode: context.mode,
+                    input_text_preview: truncate_chars(input.input_text.as_str(), 1_000),
+                },
+                request,
+            )
+            .await
+        {
+            Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
+                Ok(decision) => {
+                    return decision;
+                }
+                Err(_) => {
+                    return ActiveMemoryDecision {
+                        status: ActiveMemoryDecisionStatus::Skip,
+                        reason_code: ActiveMemoryDecisionReasonCode::ProviderUncertain,
+                        confidence: 0.0,
+                        query_hints: Vec::new(),
+                        diagnostics: vec!["memory.active_recall.invalid_json".to_owned()],
+                    };
+                }
+            },
+            Err(_) => {
+                return ActiveMemoryDecision {
+                    status: ActiveMemoryDecisionStatus::Skip,
+                    reason_code: ActiveMemoryDecisionReasonCode::ProviderUncertain,
+                    confidence: 0.0,
+                    query_hints: Vec::new(),
+                    diagnostics: vec!["memory.active_recall.provider_failed".to_owned()],
+                };
+            }
+        }
+    }
+
+    local_active_memory_decision(input.input_text.as_str(), "")
+}
+
+fn local_active_memory_decision(input_text: &str, diagnostic: &str) -> ActiveMemoryDecision {
+    let mut diagnostics = Vec::new();
+    if !diagnostic.trim().is_empty() {
+        diagnostics.push(diagnostic.to_owned());
+    }
+    if is_trivial_self_contained_turn(input_text) {
+        return ActiveMemoryDecision {
+            status: ActiveMemoryDecisionStatus::Skip,
+            reason_code: ActiveMemoryDecisionReasonCode::TrivialSelfContained,
+            confidence: 0.75,
+            query_hints: Vec::new(),
+            diagnostics,
+        };
+    }
+    ActiveMemoryDecision {
+        status: ActiveMemoryDecisionStatus::Run,
+        reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
+        confidence: 0.65,
+        query_hints: vec![MEMORY_ACTIVE_RECALL_GENERIC_QUERY.to_owned()],
+        diagnostics,
+    }
+}
+
+fn parse_active_memory_decision_json(raw: &str) -> Result<ActiveMemoryDecision, serde_json::Error> {
+    let parsed = serde_json::from_str::<ActiveMemoryDecisionJson>(raw.trim())?;
+    let status = match parsed.status {
+        ActiveMemoryDecisionJsonStatus::Skip => ActiveMemoryDecisionStatus::Skip,
+        ActiveMemoryDecisionJsonStatus::Run => ActiveMemoryDecisionStatus::Run,
+        ActiveMemoryDecisionJsonStatus::Uncertain => ActiveMemoryDecisionStatus::Uncertain,
+    };
+    let reason_code = match status {
+        ActiveMemoryDecisionStatus::Skip => ActiveMemoryDecisionReasonCode::ProviderSkip,
+        ActiveMemoryDecisionStatus::Run => ActiveMemoryDecisionReasonCode::ProviderRun,
+        ActiveMemoryDecisionStatus::Uncertain => ActiveMemoryDecisionReasonCode::ProviderUncertain,
+    };
+    Ok(ActiveMemoryDecision {
+        status,
+        reason_code,
+        confidence: parsed.confidence.clamp(0.0, 1.0),
+        query_hints: parsed
+            .query_hints
+            .into_iter()
+            .filter_map(|hint| bounded_nonempty_text(hint.as_str(), 240))
+            .take(3)
+            .collect(),
+        diagnostics: parsed
+            .diagnostics
+            .into_iter()
+            .filter_map(|diagnostic| bounded_nonempty_text(diagnostic.as_str(), 160))
+            .collect(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveMemoryDecisionJson {
+    status: ActiveMemoryDecisionJsonStatus,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    query_hints: Vec<String>,
+    #[serde(default)]
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActiveMemoryDecisionJsonStatus {
+    Skip,
+    Run,
+    Uncertain,
+}
+
+fn is_trivial_self_contained_turn(input_text: &str) -> bool {
+    let trimmed = input_text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let word_count = trimmed.split_whitespace().count();
+    let char_count = trimmed.chars().count();
+    word_count <= 5 && char_count <= 48
+}
+
+fn active_memory_query_plan(
+    input_text: &str,
+    decision: &ActiveMemoryDecision,
+    config: &MemoryActiveRecallConfig,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut queries = Vec::new();
+    for query in decision
+        .query_hints
+        .iter()
+        .map(String::as_str)
+        .chain([MEMORY_ACTIVE_RECALL_GENERIC_QUERY, input_text])
+    {
+        let Some(query) = bounded_nonempty_text(query, 500) else {
+            continue;
+        };
+        let key = query.to_lowercase();
+        if seen.insert(key) {
+            queries.push(query);
+        }
+        if queries.len() >= config.max_queries {
+            break;
+        }
+    }
+    queries
+}
+
+fn dedup_active_recall_items(
+    items: Vec<MemoryRecallItem>,
+    deterministic_ids: &BTreeSet<String>,
+) -> Vec<MemoryRecallItem> {
+    let mut seen = deterministic_ids.clone();
+    let mut deduped = Vec::new();
+    for item in items {
+        let memory_id = item.memory_id.trim();
+        if memory_id.is_empty() || !seen.insert(memory_id.to_owned()) {
+            continue;
+        }
+        deduped.push(item);
+    }
+    deduped
+}
+
+fn memory_active_recall_prompt_context_contribution(
+    items: Vec<MemoryRecallItem>,
+    snapshot_truncated: bool,
+    config: &MemoryActiveRecallConfig,
+) -> Option<PromptContextContribution> {
+    if items.is_empty() {
+        return None;
+    }
+    let source_refs = memory_recall_source_refs(items.as_slice());
+    let prompt_items = items
+        .into_iter()
+        .map(memory_recall_prompt_item)
+        .collect::<Vec<_>>();
+    let (content, rendered_truncated) =
+        render_memory_recall_context_block(prompt_items.as_slice(), snapshot_truncated);
+    if content.trim().is_empty() {
+        return None;
+    }
+    let mut content = format!("Active memory context:\n{content}");
+    let mut truncated = rendered_truncated;
+    let content_chars = content.chars().count();
+    if content_chars > config.max_prompt_chars {
+        content = truncate_chars(content.as_str(), config.max_prompt_chars);
+        truncated = true;
+    }
+    Some(PromptContextContribution {
+        contribution_id: HookContributionId::new(MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID)
+            .expect("static contribution id is valid"),
+        domain: memory_policy_domain(),
+        priority: 490,
+        content: HookPromptContent::new(content).ok()?,
+        max_chars: Some(config.max_prompt_chars),
+        source_refs,
+        diagnostics: Vec::new(),
+        truncated,
+    })
+}
+
+fn bounded_nonempty_text(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(trimmed.as_str(), max_chars))
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn memory_recall_prompt_context_contribution(
     recall_snapshot: MemoryRecallSnapshot,
 ) -> Option<PromptContextContribution> {
@@ -1621,11 +2296,7 @@ fn memory_recall_context_from_prompt_context_set(
         if entry.domain.as_str() != MEMORY_POLICY_DOMAIN {
             continue;
         }
-        if !entry
-            .contribution_id
-            .as_str()
-            .starts_with(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
-        {
+        if !memory_recall_prompt_context_contribution_allowed(entry.contribution_id.as_str()) {
             continue;
         }
         let entry_content = entry.content.as_str().trim();
@@ -1645,6 +2316,13 @@ fn memory_recall_context_from_prompt_context_set(
         Some(content)
     };
     context
+}
+
+fn memory_recall_prompt_context_contribution_allowed(contribution_id: &str) -> bool {
+    matches!(
+        contribution_id,
+        MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID | MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID
+    )
 }
 
 fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
@@ -2067,9 +2745,10 @@ fn category_label(category: MemoryCategory) -> &'static str {
 mod tests {
     use super::*;
     use pioneer_hooks::{
-        HookContext, HookInput, HookPromptContextLimits, HookPromptContextSet, HookThreadId,
-        HookToolName, HookTurnId, HookWorkspaceId, TurnPrePromptCompileHookInput,
-        TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
+        HookContext, HookInput, HookPhaseRequest, HookPromptContextLimits, HookPromptContextSet,
+        HookRegistry, HookRuntime, HookSubscriptionRegistry, HookThreadId, HookToolName,
+        HookTurnId, HookWorkspaceId, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+        TurnPreToolMaterializationHookInput,
     };
     use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use serde_json::json;
@@ -2079,6 +2758,32 @@ mod tests {
             kind: MemoryScopeKind::User,
             key: "global".to_owned(),
         }
+    }
+
+    #[test]
+    fn memory_active_recall_config_defaults_to_bounded_hybrid() {
+        let config = MemoryLoopConfig::default().normalized();
+
+        assert_eq!(config.active_recall.mode, MemoryActiveRecallMode::Hybrid);
+        assert!(config.active_recall.timeout_ms > 0);
+        assert!(config.active_recall.max_queries > 0);
+        assert!(config.active_recall.top_k_per_query > 0);
+        assert!(config.active_recall.max_prompt_chars > 0);
+
+        let zero = MemoryActiveRecallConfig {
+            timeout_ms: 0,
+            max_queries: 0,
+            top_k_per_query: 0,
+            max_prompt_chars: 0,
+            deterministic_sufficient_min_items: 0,
+            deterministic_sufficient_min_chars: 0,
+            ..MemoryActiveRecallConfig::default()
+        }
+        .normalized();
+        assert_eq!(zero.timeout_ms, 1);
+        assert_eq!(zero.max_queries, 1);
+        assert_eq!(zero.top_k_per_query, 1);
+        assert_eq!(zero.max_prompt_chars, 1);
     }
 
     #[test]
@@ -2092,12 +2797,17 @@ mod tests {
             default_policy.post_turn_extraction,
             MemoryExtractionPolicy::Disabled
         );
+        assert_eq!(
+            default_policy.active_memory,
+            MemoryActiveContextPolicy::Allow
+        );
 
         let no_save = MemoryTurnPolicy::no_save();
         assert!(no_save.allow_pre_turn_recall());
         assert!(no_save.allows_memory_tool(MEMORY_SEARCH_TOOL));
         assert!(!no_save.allows_memory_tool(MEMORY_REMEMBER_TOOL));
         assert!(no_save.allows_memory_tool(MEMORY_FORGET_TOOL));
+        assert_eq!(no_save.active_memory, MemoryActiveContextPolicy::Allow);
 
         let forget = MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned()));
         assert!(!forget.allow_pre_turn_recall());
@@ -2291,6 +3001,188 @@ mod tests {
         assert!(
             !capabilities
                 .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+    }
+
+    #[test]
+    fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
+                MemoryRecallSnapshot::empty(),
+            )),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig::default(),
+        };
+
+        assert_eq!(hook.id().as_str(), MEMORY_ACTIVE_RECALL_HOOK_ID);
+        assert_eq!(
+            hook.supported_phases(),
+            vec![HookPhase::TurnPrePromptContext]
+        );
+        let capabilities = hook.capabilities();
+        assert!(
+            capabilities
+                .contains(&HookCapability::new("memory").expect("static capability is valid"))
+        );
+        assert!(capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
+        ));
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+        assert!(
+            !capabilities.contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+
+        let hook_with_provider = ActiveMemoryRecallHook {
+            memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
+                MemoryRecallSnapshot::empty(),
+            )),
+            decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
+                r#"{"status":"skip","confidence":1.0}"#,
+            ))),
+            config: MemoryActiveRecallConfig::default(),
+        };
+        assert!(
+            hook_with_provider.capabilities().contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+    }
+
+    #[test]
+    fn phase_15_install_memory_hooks_registers_active_recall_with_deadline_dependency() {
+        let runtime = Arc::new(HookRuntime::new(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        ));
+        let artifacts = Arc::new(AgentToolBundleArtifactStore::new());
+        install_memory_hooks(
+            &runtime,
+            Arc::new(TestRecallMemoryProvider::with_recall(
+                MemoryRecallSnapshot::empty(),
+            )),
+            None,
+            artifacts,
+            MemoryLoopConfig {
+                active_recall: MemoryActiveRecallConfig {
+                    timeout_ms: 321,
+                    ..MemoryActiveRecallConfig::default()
+                },
+            },
+        )
+        .expect("memory hooks install");
+
+        let subscription_id = HookSubscriptionId::new(MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID)
+            .expect("static subscription id is valid");
+        let subscription = runtime
+            .subscriptions()
+            .get_subscription(&subscription_id)
+            .expect("subscription lookup succeeds")
+            .expect("active recall subscription registered");
+
+        assert_eq!(subscription.hook_id.as_str(), MEMORY_ACTIVE_RECALL_HOOK_ID);
+        assert_eq!(subscription.phase, HookPhase::TurnPrePromptContext);
+        assert_eq!(
+            subscription.execution_policy.await_policy,
+            HookAwaitPolicy::Deadline
+        );
+        assert_eq!(subscription.execution_policy.timeout_ms, Some(321));
+        assert_eq!(subscription.failure_policy, HookFailurePolicy::BestEffort);
+        assert_eq!(
+            subscription.dependencies.after,
+            vec![
+                HookSubscriptionId::new(MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID)
+                    .expect("static subscription id is valid")
+            ]
+        );
+        assert_eq!(
+            subscription.visibility,
+            HookSubscriptionVisibility::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_timeout_falls_back_without_prompt_context() {
+        let runtime = Arc::new(HookRuntime::new(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        ));
+        let handler = Arc::new(ActiveMemoryRecallHook {
+            memory_provider: Arc::new(SlowRecallMemoryProvider),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig {
+                mode: MemoryActiveRecallMode::StrictDebug,
+                max_queries: 1,
+                ..MemoryActiveRecallConfig::default()
+            },
+        });
+        runtime
+            .handlers()
+            .register_handler(handler)
+            .expect("active handler registers");
+        let subscription_id = HookSubscriptionId::new(MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID)
+            .expect("static subscription id is valid");
+        runtime
+            .subscriptions()
+            .register_subscription(
+                runtime.handlers().as_ref(),
+                HookSubscription::new(
+                    subscription_id,
+                    HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid"),
+                    HookPhase::TurnPrePromptContext,
+                )
+                .with_execution_policy(HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::Deadline,
+                    timeout_ms: Some(1),
+                    max_parallelism: None,
+                })
+                .with_failure_policy(HookFailurePolicy::BestEffort),
+            )
+            .expect("active subscription registers");
+
+        let response = runtime
+            .run_phase(
+                HookPhaseRequest::new(
+                    HookPhase::TurnPrePromptContext,
+                    HookContext {
+                        workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                        thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                        turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                        ..HookContext::default()
+                    },
+                    HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
+                        "continue the previous memory-aware architecture work",
+                        Some("test-model"),
+                        Some("test-provider"),
+                    )),
+                )
+                .with_policy_set(memory_policy_set(&MemoryTurnPolicy::normal_default_allow())),
+            )
+            .await
+            .expect("best-effort timeout should not fail phase");
+
+        assert!(response.contributions.is_empty());
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "hook.timeout")
         );
     }
 
@@ -2683,6 +3575,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase_15_active_memory_hook_contributes_read_only_prompt_context() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            active_project_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig {
+                max_queries: 1,
+                ..MemoryActiveRecallConfig::default()
+            },
+        };
+
+        let response = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                HookPromptContextSet::default(),
+                "continue the architecture work using prior project decisions and constraints",
+            ))
+            .await
+            .expect("active recall hook executes");
+
+        assert_eq!(provider.recall_call_count(), 1);
+        assert_eq!(provider.materialize_call_count(), 0);
+        let request = provider
+            .recall_requests()
+            .into_iter()
+            .next()
+            .expect("active recall request recorded");
+        assert_eq!(request.top_k, Some(5));
+        assert_eq!(request.max_chars, Some(1_500));
+        let contributions = response.contributions;
+        assert_eq!(contributions.len(), 1);
+        let HookContribution::PromptContext(context) = &contributions[0] else {
+            panic!("active recall should contribute prompt context only");
+        };
+        assert_eq!(
+            context.contribution_id.as_str(),
+            MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID
+        );
+        assert_eq!(context.domain.as_str(), MEMORY_POLICY_DOMAIN);
+        assert!(context.content.as_str().contains("Active memory context:"));
+        assert!(
+            context
+                .content
+                .as_str()
+                .contains("Use hooks for memory domains.")
+        );
+        assert_eq!(context.source_refs.len(), 1);
+        assert_eq!(context.source_refs[0].id.as_str(), "mem_active_project");
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_respects_policy_config_and_trivial_skips() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            active_project_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig::default(),
+        };
+
+        let no_use = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::no_use()),
+                HookPromptContextSet::default(),
+                "continue prior decisions",
+            ))
+            .await
+            .expect("no-use policy is best-effort");
+        assert!(no_use.contributions.is_empty());
+
+        let mut active_disabled_policy = MemoryTurnPolicy::normal_default_allow();
+        active_disabled_policy.active_memory = MemoryActiveContextPolicy::Disabled;
+        let disabled_policy = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&active_disabled_policy),
+                HookPromptContextSet::default(),
+                "continue prior decisions",
+            ))
+            .await
+            .expect("disabled active policy is best-effort");
+        assert!(disabled_policy.contributions.is_empty());
+
+        let deterministic_only = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig {
+                mode: MemoryActiveRecallMode::DeterministicOnly,
+                ..MemoryActiveRecallConfig::default()
+            },
+        }
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue prior decisions",
+        ))
+        .await
+        .expect("deterministic-only config is best-effort");
+        assert!(deterministic_only.contributions.is_empty());
+
+        let trivial = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                HookPromptContextSet::default(),
+                "what time?",
+            ))
+            .await
+            .expect("trivial turn is best-effort");
+        assert!(trivial.contributions.is_empty());
+        assert_eq!(provider.recall_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_skips_when_deterministic_is_sufficient() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            active_project_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig::default(),
+        };
+        let deterministic_context = prompt_context_set_from_prompt_context_contribution(
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic context contribution"),
+        );
+
+        let response = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                deterministic_context,
+                "continue the previous work with the same constraints",
+            ))
+            .await
+            .expect("active recall hook executes");
+
+        assert!(response.contributions.is_empty());
+        assert_eq!(provider.recall_call_count(), 0);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_deduplicates_deterministic_ids() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            recalled_city_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: None,
+            config: MemoryActiveRecallConfig {
+                mode: MemoryActiveRecallMode::StrictDebug,
+                max_queries: 1,
+                deterministic_sufficient_min_items: 99,
+                ..MemoryActiveRecallConfig::default()
+            },
+        };
+        let deterministic_context = prompt_context_set_from_prompt_context_contribution(
+            memory_recall_prompt_context_contribution(recalled_city_snapshot())
+                .expect("deterministic context contribution"),
+        );
+
+        let response = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                deterministic_context,
+                "continue the previous memory-dependent task",
+            ))
+            .await
+            .expect("active recall hook executes");
+
+        assert_eq!(provider.recall_call_count(), 1);
+        assert!(response.contributions.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.no_hits"
+                && diagnostic.message.as_str().contains("non-duplicate")
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_ignores_malformed_internal_json() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            active_project_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
+                "{not json",
+            ))),
+            config: MemoryActiveRecallConfig::default(),
+        };
+
+        let response = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                HookPromptContextSet::default(),
+                "continue the architecture work using prior project decisions and constraints",
+            ))
+            .await
+            .expect("malformed provider json is best-effort");
+
+        assert!(response.contributions.is_empty());
+        assert_eq!(provider.recall_call_count(), 0);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .as_str()
+                .contains("memory.active_recall.invalid_json")
+        }));
+    }
+
+    #[tokio::test]
     async fn memory_prompt_contract_hook_renders_from_prompt_context_and_compile_input() {
         let recall_provider = Arc::new(TestRecallMemoryProvider::with_recall(
             recalled_city_snapshot(),
@@ -2720,6 +3827,48 @@ mod tests {
         ));
         assert!(content.contains("User likes Porto."));
         assert!(content.contains("Call memory_remember proactively"));
+    }
+
+    #[tokio::test]
+    async fn phase_15_memory_prompt_contract_consumes_active_context_allowlist() {
+        let hook = MemoryPromptContractHook;
+        let active_context = memory_active_recall_prompt_context_contribution(
+            active_project_snapshot().items,
+            false,
+            &MemoryActiveRecallConfig::default(),
+        )
+        .expect("active prompt context contribution");
+        let unrelated_memory_context = PromptContextContribution {
+            contribution_id: HookContributionId::new("memory.unrelated.context")
+                .expect("valid contribution id"),
+            domain: memory_policy_domain(),
+            priority: 480,
+            content: HookPromptContent::new("Unrelated memory-domain context must stay out.")
+                .expect("valid prompt content"),
+            max_chars: Some(500),
+            source_refs: Vec::new(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        };
+        let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+            [active_context, unrelated_memory_context],
+            HookPromptContextLimits::default(),
+        );
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+        assert!(content.contains("Active memory context:"));
+        assert!(content.contains("Use hooks for memory domains."));
+        assert!(!content.contains("Unrelated memory-domain context"));
     }
 
     #[tokio::test]
@@ -3160,6 +4309,30 @@ mod tests {
         }
     }
 
+    fn test_active_prompt_context_hook_request(
+        policy_set: HookPolicySet,
+        prompt_context_set: HookPromptContextSet,
+        input_text: &str,
+    ) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid"),
+            phase: HookPhase::TurnPrePromptContext,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            input: HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
+                input_text,
+                Some("test-model"),
+                Some("test-provider"),
+            )),
+            policy_set,
+            prompt_context_set,
+        }
+    }
+
     fn test_prompt_compile_hook_request(
         policy_set: HookPolicySet,
         provider_tool_calling: bool,
@@ -3217,9 +4390,34 @@ mod tests {
         }
     }
 
+    fn active_project_snapshot() -> MemoryRecallSnapshot {
+        MemoryRecallSnapshot {
+            items: vec![MemoryRecallItem {
+                memory_id: "mem_active_project".to_owned(),
+                scope: user_scope(),
+                category: MemoryCategory::ProjectDecision,
+                key: Some("hooks".to_owned()),
+                content: "Use hooks for memory domains.".to_owned(),
+                score: Some(0.88),
+                updated_at: 1_714_867_200,
+            }],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }
+    }
+
     fn prompt_context_set_from_response(response: HookHandlerResponse) -> HookPromptContextSet {
         HookPromptContextSet::aggregate_hook_contributions(
             response.contributions,
+            HookPromptContextLimits::default(),
+        )
+    }
+
+    fn prompt_context_set_from_prompt_context_contribution(
+        contribution: PromptContextContribution,
+    ) -> HookPromptContextSet {
+        HookPromptContextSet::aggregate_contributions(
+            [contribution],
             HookPromptContextLimits::default(),
         )
     }
@@ -3384,6 +4582,7 @@ mod tests {
     struct TestRecallMemoryProvider {
         recall_result: Result<MemoryRecallSnapshot, String>,
         recall_calls: Arc<Mutex<usize>>,
+        recall_requests: Arc<Mutex<Vec<MemoryRecallRequest>>>,
         materialize_calls: Arc<Mutex<usize>>,
     }
 
@@ -3392,6 +4591,7 @@ mod tests {
             Self {
                 recall_result: Ok(recall_result),
                 recall_calls: Arc::new(Mutex::new(0)),
+                recall_requests: Arc::new(Mutex::new(Vec::new())),
                 materialize_calls: Arc::new(Mutex::new(0)),
             }
         }
@@ -3400,6 +4600,7 @@ mod tests {
             Self {
                 recall_result: Err(error.into()),
                 recall_calls: Arc::new(Mutex::new(0)),
+                recall_requests: Arc::new(Mutex::new(Vec::new())),
                 materialize_calls: Arc::new(Mutex::new(0)),
             }
         }
@@ -3414,6 +4615,13 @@ mod tests {
                 .lock()
                 .expect("materialize lock poisoned")
         }
+
+        fn recall_requests(&self) -> Vec<MemoryRecallRequest> {
+            self.recall_requests
+                .lock()
+                .expect("recall request lock poisoned")
+                .clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -3421,9 +4629,13 @@ mod tests {
         async fn recall_memory(
             &self,
             _context: MemoryTurnContext,
-            _request: MemoryRecallRequest,
+            request: MemoryRecallRequest,
         ) -> Result<MemoryRecallSnapshot, String> {
             *self.recall_calls.lock().expect("recall lock poisoned") += 1;
+            self.recall_requests
+                .lock()
+                .expect("recall request lock poisoned")
+                .push(request);
             self.recall_result.clone()
         }
 
@@ -3458,6 +4670,48 @@ mod tests {
                 .lock()
                 .expect("materialize call count lock poisoned") += 1;
             self.materialization.clone()
+        }
+    }
+
+    struct SlowRecallMemoryProvider;
+
+    #[async_trait::async_trait]
+    impl AgentMemoryProvider for SlowRecallMemoryProvider {
+        async fn recall_memory(
+            &self,
+            _context: MemoryTurnContext,
+            _request: MemoryRecallRequest,
+        ) -> Result<MemoryRecallSnapshot, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(active_project_snapshot())
+        }
+
+        async fn materialize_memory_tools(
+            &self,
+            _context: MemoryTurnContext,
+        ) -> Result<MemoryToolMaterialization, String> {
+            panic!("active memory recall timeout test must not materialize tools")
+        }
+    }
+
+    struct TestActiveMemoryDecisionProvider {
+        json: String,
+    }
+
+    impl TestActiveMemoryDecisionProvider {
+        fn json(json: impl Into<String>) -> Self {
+            Self { json: json.into() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentActiveMemoryDecisionProvider for TestActiveMemoryDecisionProvider {
+        async fn resolve_active_memory_decision_json(
+            &self,
+            _context: MemoryActiveRecallDecisionContext,
+            _request: MemoryActiveRecallDecisionRequest,
+        ) -> Result<String, String> {
+            Ok(self.json.clone())
         }
     }
 

@@ -24,7 +24,7 @@ mod workspace;
 
 use anyhow::{Context, Result};
 use attachment::CrudAttachmentUploadRegistryBackend;
-use pioneer_agent::ToolLoopConfig;
+use pioneer_agent::{MemoryLoopConfig, ToolLoopConfig};
 use pioneer_config::AppConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::{
@@ -326,6 +326,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
                 allow_function_proxy_tools: skills_cfg.runtime.allow_function_proxy_tools,
             },
         },
+        memory: MemoryLoopConfig::default(),
         budget: ToolLoopBudgetConfig {
             max_agent_rounds_per_turn: tool_budget_cfg.max_agent_rounds_per_turn,
             max_tool_calls_per_turn: tool_budget_cfg.max_tool_calls_per_turn,

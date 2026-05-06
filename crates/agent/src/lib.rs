@@ -37,12 +37,14 @@ use hooks::AgentToolBundleArtifactStore;
 use manager_recovery::apply_recovery_adjustments;
 use memory::install_memory_hooks;
 pub use memory::{
-    AgentMemoryProvider, AgentMemoryTurnPolicyProvider, MemoryActiveContextPolicy,
-    MemoryClassifierFallbackPolicy, MemoryExtractionPolicy, MemoryMutationToolPolicy,
-    MemoryPolicyReasonCode, MemoryPolicySource, MemoryPromptPolicy, MemoryReadToolPolicy,
-    MemoryRecallItem, MemoryRecallPolicy, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext,
-    MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
+    AgentActiveMemoryDecisionProvider, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
+    MemoryActiveContextPolicy, MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext,
+    MemoryActiveRecallDecisionRequest, MemoryActiveRecallMode, MemoryClassifierFallbackPolicy,
+    MemoryExtractionPolicy, MemoryLoopConfig, MemoryMutationToolPolicy, MemoryPolicyReasonCode,
+    MemoryPolicySource, MemoryPromptPolicy, MemoryReadToolPolicy, MemoryRecallItem,
+    MemoryRecallPolicy, MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization,
+    MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyOverride,
+    MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
@@ -57,6 +59,7 @@ pub struct ToolLoopConfig {
     pub web: WebToolsConfig,
     pub computer_use: ComputerUseToolsConfig,
     pub skills: SkillsLoopConfig,
+    pub memory: MemoryLoopConfig,
     pub budget: ToolLoopBudgetConfig,
     pub retry: ToolRetryBudgetConfig,
 }
@@ -286,6 +289,7 @@ impl ToolLoopConfig {
             web: self.web.normalized(),
             computer_use: self.computer_use.normalized(),
             skills: self.skills.normalized(),
+            memory: self.memory.normalized(),
             budget: self.budget.normalized(),
             retry: self.retry.normalized(),
         }
@@ -1349,6 +1353,7 @@ fn build_agent_hook_runtime(
     runtime: Option<Arc<HookRuntime>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    memory_config: MemoryLoopConfig,
 ) -> Result<
     (
         Option<Arc<HookRuntime>>,
@@ -1372,6 +1377,7 @@ fn build_agent_hook_runtime(
         memory_provider,
         memory_turn_policy_provider,
         tool_bundle_artifacts.clone(),
+        memory_config,
     )
     .map_err(|error| {
         AgentStartError::Internal(format!("failed to install memory hooks: {error}"))
@@ -1494,6 +1500,7 @@ impl AgentManager {
             self.hook_runtime.read().await.clone(),
             memory_provider,
             memory_turn_policy_provider,
+            self.tool_loop_config.memory.clone(),
         )?;
 
         let loop_handle = tokio::spawn(agent_loop::run_agent_loop(
