@@ -1,6 +1,6 @@
 use crate::diagnostics::PromptDiagnostic;
 use crate::profile::PromptProfile;
-use crate::section::{DynamicPromptSectionInput, PromptSection};
+use crate::section::{DynamicPromptSectionInput, PromptRuntimeSectionInput, PromptSection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ pub struct PromptCompileInput {
     pub include_tool_recovery_policy: bool,
     pub include_task_orchestration_policy: bool,
     pub continue_generation_hint: bool,
-    pub memory_recall: Option<String>,
+    pub runtime_sections: Vec<PromptRuntimeSectionInput>,
     pub dynamic_sections: Vec<DynamicPromptSectionInput>,
     pub dynamic_context: Option<String>,
     pub extra_system: Option<String>,

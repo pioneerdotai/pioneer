@@ -1791,6 +1791,18 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
             assert_eq!(payload.input_text, "phase 07 agent hook phases");
             assert_eq!(payload.model.as_deref(), Some("test-model"));
             assert_eq!(payload.model_provider.as_deref(), Some("capture"));
+        } else if call.phase == HookPhase::TurnPrePromptContext {
+            let HookInputPayload::TurnPrePromptContext(payload) = &call.payload else {
+                panic!("pre-prompt-context call should receive typed payload");
+            };
+            assert_eq!(payload.input_text, "phase 07 agent hook phases");
+            assert_eq!(payload.model.as_deref(), Some("test-model"));
+            assert_eq!(payload.model_provider.as_deref(), Some("capture"));
+        } else if call.phase == HookPhase::TurnPrePromptCompile {
+            let HookInputPayload::TurnPrePromptCompile(payload) = &call.payload else {
+                panic!("pre-prompt-compile call should receive typed payload");
+            };
+            assert!(payload.provider_tool_calling);
         } else {
             assert_eq!(call.payload, HookInputPayload::Empty);
         }
@@ -4282,7 +4294,109 @@ async fn identity_recall_prompt_contains_relevant_memory() {
 }
 
 #[tokio::test]
-async fn memory_provider_without_tools_has_no_policy_or_recall() {
+async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_phase14_identity",
+                MemoryCategory::Identity,
+                Some("name"),
+                "User's name is Alexander.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase14_memory_manifest",
+        "ws_phase14_memory_manifest",
+        "turn_phase14_memory_manifest",
+        ThreadMode::Agent,
+        "capture",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+
+    let prompt_contract_source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| source.section_id.as_deref() == Some("memory_recall"))
+        .expect("memory prompt contract hook source should be recorded");
+    assert_eq!(
+        prompt_contract_source.contribution_kind,
+        PromptManifestHookContributionKind::PromptSection
+    );
+    assert_eq!(
+        prompt_contract_source.source.phase,
+        PromptManifestHookPhase::TurnPrePromptCompile
+    );
+    assert_eq!(
+        prompt_contract_source.source.hook_id,
+        "memory.prompt_contract"
+    );
+    assert_eq!(
+        prompt_contract_source.source.subscription_id,
+        "memory.prompt_contract.default"
+    );
+    assert_eq!(
+        prompt_contract_source.source.contribution_id.as_deref(),
+        Some("memory.prompt_contract.section")
+    );
+
+    let deterministic_recall_source = manifest
+        .hook_sources
+        .iter()
+        .find(|source| {
+            source.section_id.is_none()
+                && source.contribution_kind == PromptManifestHookContributionKind::PromptContext
+                && source.source.hook_id == "memory.deterministic_recall"
+        })
+        .expect("deterministic recall prompt-context hook source should be recorded");
+    assert_eq!(
+        deterministic_recall_source.source.phase,
+        PromptManifestHookPhase::TurnPrePromptContext
+    );
+    assert_eq!(
+        deterministic_recall_source.source.subscription_id,
+        "memory.deterministic_recall.default"
+    );
+    assert_eq!(
+        deterministic_recall_source
+            .source
+            .contribution_id
+            .as_deref(),
+        Some("memory.deterministic_recall.context")
+    );
+    assert_eq!(deterministic_recall_source.source_count, Some(1));
+}
+
+#[tokio::test]
+async fn memory_provider_without_tools_recalls_but_omits_prompt_contract() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
@@ -4317,7 +4431,7 @@ async fn memory_provider_without_tools_has_no_policy_or_recall() {
     assert_turn_completed(&observed);
 
     assert_eq!(memory_provider.tool_contexts().len(), 1);
-    assert!(memory_provider.recall_contexts().is_empty());
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     let request = &requests[0];

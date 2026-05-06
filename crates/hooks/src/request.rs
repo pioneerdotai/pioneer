@@ -131,6 +131,20 @@ impl HookInput {
         }
     }
 
+    pub fn turn_pre_prompt_context(payload: TurnPrePromptContextHookInput) -> Self {
+        Self {
+            kind: HookInputKind::TurnPrePromptContext,
+            payload: HookInputPayload::TurnPrePromptContext(payload),
+        }
+    }
+
+    pub fn turn_pre_prompt_compile(payload: TurnPrePromptCompileHookInput) -> Self {
+        Self {
+            kind: HookInputKind::TurnPrePromptCompile,
+            payload: HookInputPayload::TurnPrePromptCompile(payload),
+        }
+    }
+
     pub fn turn_post_turn(payload: TurnPostTurnHookInput) -> Self {
         Self {
             kind: HookInputKind::TurnPostTurn,
@@ -158,7 +172,9 @@ impl HookInput {
 pub enum HookInputPayload {
     Empty,
     TurnPrePolicy(TurnPrePolicyHookInput),
+    TurnPrePromptContext(TurnPrePromptContextHookInput),
     TurnPreToolMaterialization(TurnPreToolMaterializationHookInput),
+    TurnPrePromptCompile(TurnPrePromptCompileHookInput),
     TurnPostTurn(TurnPostTurnHookInput),
     TurnPreCompaction(TurnPreCompactionHookInput),
     Custom(HookValue),
@@ -202,6 +218,29 @@ impl TurnPrePolicyHookInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPrePromptContextHookInput {
+    pub input_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+}
+
+impl TurnPrePromptContextHookInput {
+    pub fn from_parts(
+        input_text: impl Into<String>,
+        model: Option<impl Into<String>>,
+        model_provider: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            input_text: input_text.into(),
+            model: model.map(Into::into),
+            model_provider: model_provider.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnPreToolMaterializationHookInput {
     pub provider_tool_calling: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -219,6 +258,28 @@ impl TurnPreToolMaterializationHookInput {
         Self {
             provider_tool_calling,
             existing_tool_names,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPrePromptCompileHookInput {
+    pub provider_tool_calling: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tool_names: Vec<HookToolName>,
+}
+
+impl TurnPrePromptCompileHookInput {
+    pub fn from_parts(
+        provider_tool_calling: bool,
+        mut available_tool_names: Vec<HookToolName>,
+    ) -> Self {
+        available_tool_names.sort();
+        available_tool_names.dedup();
+
+        Self {
+            provider_tool_calling,
+            available_tool_names,
         }
     }
 }
@@ -672,6 +733,87 @@ mod tests {
 
         assert_eq!(hook_input.kind, HookInputKind::TurnPrePolicy);
         assert_eq!(hook_input.payload, HookInputPayload::TurnPrePolicy(input));
+    }
+
+    #[test]
+    fn turn_pre_prompt_context_input_roundtrips() {
+        let input = TurnPrePromptContextHookInput::from_parts(
+            "what do you remember?",
+            Some("gpt-test"),
+            Some("test-provider"),
+        );
+
+        let value = serde_json::to_value(&input).expect("pre-prompt-context input serializes");
+        let decoded: TurnPrePromptContextHookInput =
+            serde_json::from_value(value).expect("pre-prompt-context input deserializes");
+
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn hook_input_payload_distinguishes_pre_prompt_context() {
+        let input = TurnPrePromptContextHookInput::from_parts(
+            "turn text",
+            Option::<String>::None,
+            Option::<String>::None,
+        );
+        let hook_input = HookInput::turn_pre_prompt_context(input.clone());
+
+        assert_eq!(hook_input.kind, HookInputKind::TurnPrePromptContext);
+        assert_eq!(
+            hook_input.payload,
+            HookInputPayload::TurnPrePromptContext(input)
+        );
+    }
+
+    #[test]
+    fn turn_pre_prompt_compile_input_sorts_and_dedups_tool_names() {
+        let input = TurnPrePromptCompileHookInput::from_parts(
+            true,
+            vec![
+                HookToolName::new("memory_search").expect("valid tool name"),
+                HookToolName::new("shell").expect("valid tool name"),
+                HookToolName::new("memory_search").expect("valid tool name"),
+            ],
+        );
+
+        assert!(input.provider_tool_calling);
+        assert_eq!(
+            input.available_tool_names,
+            vec![
+                HookToolName::new("memory_search").expect("valid tool name"),
+                HookToolName::new("shell").expect("valid tool name"),
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_pre_prompt_compile_input_roundtrips() {
+        let input = TurnPrePromptCompileHookInput::from_parts(
+            false,
+            vec![HookToolName::new("shell").expect("valid tool name")],
+        );
+
+        let value = serde_json::to_value(&input).expect("pre-prompt-compile input serializes");
+        let decoded: TurnPrePromptCompileHookInput =
+            serde_json::from_value(value).expect("pre-prompt-compile input deserializes");
+
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn hook_input_payload_distinguishes_pre_prompt_compile() {
+        let input = TurnPrePromptCompileHookInput::from_parts(
+            true,
+            vec![HookToolName::new("shell").expect("valid tool name")],
+        );
+        let hook_input = HookInput::turn_pre_prompt_compile(input.clone());
+
+        assert_eq!(hook_input.kind, HookInputKind::TurnPrePromptCompile);
+        assert_eq!(
+            hook_input.payload,
+            HookInputPayload::TurnPrePromptCompile(input)
+        );
     }
 
     #[test]

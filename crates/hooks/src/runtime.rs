@@ -1215,6 +1215,9 @@ fn hook_run_idempotency_key(
     let mut hasher = Sha256::new();
     hash_segment(&mut hasher, "phase", phase.as_str());
     hash_segment(&mut hasher, "input_kind", input.kind.as_str());
+    if let Ok(input_payload) = serde_json::to_string(&input.payload) {
+        hash_segment(&mut hasher, "input_payload", input_payload.as_str());
+    }
     hash_segment(
         &mut hasher,
         "subscription_id",

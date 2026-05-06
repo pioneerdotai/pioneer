@@ -776,6 +776,7 @@ pub struct PromptManifestHookSource {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookContributionKind {
+    PromptContext,
     PromptSection,
     PromptManifestDiagnostic,
     RuntimeFailure,
@@ -794,6 +795,7 @@ pub enum PromptManifestHookTruncation {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookPhase {
+    TurnPrePromptContext,
     TurnPrePromptCompile,
 }
 

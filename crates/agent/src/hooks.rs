@@ -7,7 +7,8 @@ use pioneer_hooks::{
     HookToolBundleSet, HookToolName, HookTurnId, HookWorkspaceId,
     PromptManifestDiagnosticContribution, ToolBundleContribution, TurnPostTurnDomainEventSummary,
     TurnPostTurnHookInput, TurnPostTurnHookInputLimits, TurnPostTurnStatus,
-    TurnPostTurnToolEventSummary, TurnPrePolicyHookInput, TurnPreToolMaterializationHookInput,
+    TurnPostTurnToolEventSummary, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
 };
 use pioneer_tools::ToolExtensionBundle;
 use std::collections::BTreeMap;
@@ -206,6 +207,7 @@ impl EffectiveTurnPolicySet {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct EffectiveTurnPromptContextSet {
     contexts: HookPromptContextSet,
+    manifest: EffectiveTurnPromptManifestHookMetadata,
 }
 
 impl EffectiveTurnPromptContextSet {
@@ -214,11 +216,25 @@ impl EffectiveTurnPromptContextSet {
     }
 
     pub(super) fn from_hook_prompt_context_set(contexts: HookPromptContextSet) -> Self {
-        Self { contexts }
+        Self {
+            contexts,
+            manifest: EffectiveTurnPromptManifestHookMetadata::empty(),
+        }
+    }
+
+    pub(super) fn from_hook_prompt_context_set_and_manifest(
+        contexts: HookPromptContextSet,
+        manifest: EffectiveTurnPromptManifestHookMetadata,
+    ) -> Self {
+        Self { contexts, manifest }
     }
 
     pub(super) fn clone_hook_prompt_context_set(&self) -> HookPromptContextSet {
         self.contexts.clone()
+    }
+
+    pub(super) fn manifest_metadata(&self) -> &EffectiveTurnPromptManifestHookMetadata {
+        &self.manifest
     }
 }
 
@@ -259,6 +275,18 @@ impl EffectiveTurnPromptManifestHookMetadata {
     pub(super) fn empty() -> Self {
         Self::default()
     }
+
+    pub(super) fn combined(
+        first: &EffectiveTurnPromptManifestHookMetadata,
+        second: &EffectiveTurnPromptManifestHookMetadata,
+    ) -> Self {
+        let mut combined = first.clone();
+        combined.sources.extend(second.sources.iter().cloned());
+        combined
+            .diagnostics
+            .extend(second.diagnostics.iter().cloned());
+        combined
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +311,7 @@ pub(super) struct EffectiveTurnPromptManifestHookSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
+    PromptContext,
     PromptSection,
 }
 
@@ -481,17 +510,19 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
     policy_set: &EffectiveTurnPolicySet,
+    input: TurnPrePromptContextHookInput,
 ) -> EffectiveTurnPromptContextSet {
     let Some(runtime) = runtime else {
         return EffectiveTurnPromptContextSet::empty();
     };
 
     let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
-    let request = match build_phase_request(
+    let request = match build_phase_request_with_input(
         context,
         HookPhase::TurnPrePromptContext,
         policy_set,
         &empty_prompt_context_set,
+        HookInput::turn_pre_prompt_context(input),
     ) {
         Ok(request) => request,
         Err(error) => {
@@ -509,14 +540,23 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
             for diagnostic in &response.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptContext, diagnostic);
             }
+            let hook_contributions = response.contributions;
             let phase_diagnostics = std::mem::take(&mut response.diagnostics);
             let mut prompt_context_set =
-                prompt_context_set_from_contributions(response.contributions);
+                prompt_context_set_from_contributions(hook_contributions.clone());
             prompt_context_set.diagnostics.extend(phase_diagnostics);
             for diagnostic in &prompt_context_set.diagnostics {
                 warn_hook_diagnostic(HookPhase::TurnPrePromptContext, diagnostic);
             }
-            EffectiveTurnPromptContextSet::from_hook_prompt_context_set(prompt_context_set)
+            let manifest = prompt_context_manifest_hook_metadata_from_phase_response(
+                &hook_contributions,
+                &response.runs,
+                &prompt_context_set,
+            );
+            EffectiveTurnPromptContextSet::from_hook_prompt_context_set_and_manifest(
+                prompt_context_set,
+                manifest,
+            )
         }
         Err(error) => {
             warn_hook_prompt_context_runtime_error(HookPhase::TurnPrePromptContext, &error);
@@ -531,6 +571,7 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
     base_contributions: Vec<HookContribution>,
+    input: TurnPrePromptCompileHookInput,
 ) -> Result<EffectiveTurnPromptSectionSet, AgentTurnHookError> {
     let Some(runtime) = runtime else {
         let prompt_section_set = prompt_section_set_from_contributions(base_contributions);
@@ -542,11 +583,12 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
         );
     };
 
-    let request = build_phase_request(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPrePromptCompile,
         policy_set,
         prompt_context_set,
+        HookInput::turn_pre_prompt_compile(input),
     )
     .map_err(AgentTurnHookError::InvalidContext)?;
 
@@ -638,6 +680,49 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
     }
 }
 
+fn prompt_context_manifest_hook_metadata_from_phase_response(
+    contributions: &[HookContribution],
+    runs: &[HookRunSummary],
+    prompt_context_set: &HookPromptContextSet,
+) -> EffectiveTurnPromptManifestHookMetadata {
+    let run_sources_by_hash = run_sources_by_hash(runs);
+    let mut metadata = EffectiveTurnPromptManifestHookMetadata::empty();
+    let context_entries = prompt_context_entries_by_id(prompt_context_set);
+
+    for contribution in contributions {
+        if let HookContribution::PromptContext(context) = contribution {
+            let hash = HookContributionHash::from_contribution(contribution);
+            let Some(hash) = hash else {
+                continue;
+            };
+            let Some(run_sources) = run_sources_by_hash.get(&hash) else {
+                continue;
+            };
+            let entry = context_entries.get(&context.contribution_id);
+            let hook_truncated =
+                context.truncated || entry.is_none() || entry.is_some_and(|entry| entry.0);
+            let hook_content_chars = entry.map(|entry| entry.1);
+            for run_source in run_sources {
+                metadata
+                    .sources
+                    .push(EffectiveTurnPromptManifestHookSourceEntry {
+                        source: run_source.clone(),
+                        section_id: None,
+                        contribution_kind:
+                            EffectiveTurnPromptManifestHookContributionKind::PromptContext,
+                        contribution_id: Some(context.contribution_id.clone()),
+                        priority: Some(context.priority),
+                        source_count: Some(context.source_refs.len()),
+                        hook_truncated,
+                        hook_content_chars,
+                    });
+            }
+        }
+    }
+
+    metadata
+}
+
 fn prompt_manifest_hook_metadata_from_phase_response(
     contributions: &[HookContribution],
     runs: &[HookRunSummary],
@@ -710,8 +795,8 @@ fn prompt_manifest_hook_metadata_from_phase_response(
                 }
             }
             HookContribution::Policy(_)
-            | HookContribution::PromptContext(_)
             | HookContribution::ToolBundle(_)
+            | HookContribution::PromptContext(_)
             | HookContribution::Audit(_)
             | HookContribution::BackgroundJob(_)
             | HookContribution::Noop => {}
@@ -828,6 +913,20 @@ fn prompt_section_entries_by_id(
         .collect()
 }
 
+fn prompt_context_entries_by_id(
+    prompt_context_set: &HookPromptContextSet,
+) -> BTreeMap<HookContributionId, (bool, usize)> {
+    prompt_context_set
+        .entries()
+        .map(|entry| {
+            (
+                entry.contribution_id.clone(),
+                (entry.truncated, entry.content.as_str().chars().count()),
+            )
+        })
+        .collect()
+}
+
 fn prompt_manifest_diagnostic_contribution_source(
     diagnostic: &PromptManifestDiagnosticContribution,
     contribution_hash: Option<HookContributionHash>,
@@ -906,7 +1005,8 @@ fn prompt_manifest_hook_contribution_kind_order(
     kind: EffectiveTurnPromptManifestHookContributionKind,
 ) -> u8 {
     match kind {
-        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 0,
+        EffectiveTurnPromptManifestHookContributionKind::PromptContext => 0,
+        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 1,
     }
 }
 

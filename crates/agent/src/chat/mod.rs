@@ -28,13 +28,15 @@ use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{
-    HookPhase, HookRuntime, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
+    HookPhase, HookRuntime, HookToolName, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
     TurnPostTurnToolErrorClass, TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus,
-    TurnPostTurnToolStatus, TurnPrePolicyHookInput,
+    TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
-    CompiledPromptBundle, DynamicPromptSectionInput, PromptCompileInput, PromptDiagnosticCode,
-    PromptDynamicSectionId, PromptLimits, PromptProfile, ToolRetryInstructionKind, compile_prompt,
+    CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId,
+    PromptLimits, PromptProfile, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
+    PromptRuntimeSectionInput, ToolRetryInstructionKind, compile_prompt,
     render_tool_retry_instruction, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
@@ -328,8 +330,7 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
 
 #[derive(Debug, Clone, Default)]
 struct PromptSectionsForCompile {
-    memory_recall: Option<String>,
-    dynamic_sections: Vec<DynamicPromptSectionInput>,
+    runtime_sections: Vec<PromptRuntimeSectionInput>,
 }
 
 fn prompt_sections_for_compile_from_hook_sections(
@@ -342,21 +343,10 @@ fn prompt_sections_for_compile_from_hook_sections(
 
     let mut compiled_sections = PromptSectionsForCompile::default();
     for entry in sections.entries() {
-        if entry.section_id.as_str() == "memory_recall" {
-            compiled_sections.memory_recall = Some(entry.content.as_str().to_owned());
-            continue;
-        }
-
-        let id = PromptDynamicSectionId::new(entry.section_id.as_str()).map_err(|error| {
-            ChatTurnError::Terminal(format!(
-                "failed to convert hook prompt section `{}`: {error}",
-                entry.section_id
-            ))
-        })?;
         compiled_sections
-            .dynamic_sections
-            .push(DynamicPromptSectionInput {
-                id,
+            .runtime_sections
+            .push(PromptRuntimeSectionInput {
+                id: prompt_runtime_section_id_from_hook_section(entry.section_id.as_str())?,
                 title: entry.title.as_ref().map(|title| title.as_str().to_owned()),
                 content: entry.content.as_str().to_owned(),
                 max_chars: None,
@@ -367,11 +357,34 @@ fn prompt_sections_for_compile_from_hook_sections(
     Ok(compiled_sections)
 }
 
+fn prompt_runtime_section_id_from_hook_section(
+    section_id: &str,
+) -> Result<PromptRuntimeSectionId, ChatTurnError> {
+    if let Some(id) = PromptRuntimeBuiltInSectionId::from_manifest_id(section_id) {
+        return Ok(PromptRuntimeSectionId::BuiltIn(id));
+    }
+    let id = PromptDynamicSectionId::new(section_id).map_err(|error| {
+        ChatTurnError::Terminal(format!(
+            "failed to convert hook prompt section `{section_id}`: {error}"
+        ))
+    })?;
+    Ok(PromptRuntimeSectionId::Dynamic(id))
+}
+
+fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
+    let mut names = names
+        .iter()
+        .filter_map(|name| HookToolName::new(name.clone()).ok())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
-    memory_recall: Option<String>,
-    dynamic_sections: &[DynamicPromptSectionInput],
+    runtime_sections: &[PromptRuntimeSectionInput],
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -388,8 +401,7 @@ fn compile_agent_prompt_bundle(
         prompt_root.as_path(),
         skills_prompt,
         retry_instruction,
-        memory_recall,
-        dynamic_sections,
+        runtime_sections,
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -401,8 +413,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
-    memory_recall: Option<String>,
-    dynamic_sections: &[DynamicPromptSectionInput],
+    runtime_sections: &[PromptRuntimeSectionInput],
     include_task_orchestration_policy: bool,
     continue_generation_hint: bool,
     thread_id: &str,
@@ -424,8 +435,8 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         include_tool_recovery_policy: true,
         include_task_orchestration_policy,
         continue_generation_hint,
-        memory_recall,
-        dynamic_sections: dynamic_sections.to_vec(),
+        runtime_sections: runtime_sections.to_vec(),
+        dynamic_sections: Vec::new(),
         dynamic_context: None,
         extra_system: Some(extra_system),
         limits: PromptLimits::default(),
@@ -668,9 +679,9 @@ fn prompt_manifest_hook_source(
 
 fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhase> {
     match phase {
+        HookPhase::TurnPrePromptContext => Some(PromptManifestHookPhase::TurnPrePromptContext),
         HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
         HookPhase::TurnPrePolicy
-        | HookPhase::TurnPrePromptContext
         | HookPhase::TurnPreToolMaterialization
         | HookPhase::TurnPostPromptCompile
         | HookPhase::TurnPostTurn
@@ -682,6 +693,9 @@ fn prompt_manifest_hook_contribution_kind(
     kind: EffectiveTurnPromptManifestHookContributionKind,
 ) -> PromptManifestHookContributionKind {
     match kind {
+        EffectiveTurnPromptManifestHookContributionKind::PromptContext => {
+            PromptManifestHookContributionKind::PromptContext
+        }
         EffectiveTurnPromptManifestHookContributionKind::PromptSection => {
             PromptManifestHookContributionKind::PromptSection
         }
@@ -1269,6 +1283,11 @@ async fn execute_agent_provider_response(
         hook_runtime.as_ref(),
         &hook_context,
         &effective_policy_set,
+        TurnPrePromptContextHookInput::from_parts(
+            user_message.text_content_lossy(),
+            Some(model.clone()),
+            Some(provider.name().to_owned()),
+        ),
     )
     .await;
 
@@ -1386,6 +1405,7 @@ async fn execute_agent_provider_response(
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
+            TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
         )
         .await
         .map_err(|error| {
@@ -1403,8 +1423,7 @@ async fn execute_agent_provider_response(
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
             None,
-            prompt_sections.memory_recall.clone(),
-            prompt_sections.dynamic_sections.as_slice(),
+            prompt_sections.runtime_sections.as_slice(),
             include_task_orchestration_policy,
             continue_generation_hint,
             thread_id,
@@ -1427,7 +1446,10 @@ async fn execute_agent_provider_response(
                 turn_id: turn_id.to_owned(),
                 manifest: prompt_manifest_from_bundle(
                     &initial_prompt_bundle,
-                    effective_prompt_section_set.manifest_metadata(),
+                    &EffectiveTurnPromptManifestHookMetadata::combined(
+                        effective_prompt_context_set.manifest_metadata(),
+                        effective_prompt_section_set.manifest_metadata(),
+                    ),
                 ),
             },
         )
@@ -1637,6 +1659,10 @@ async fn execute_agent_provider_response(
         &effective_policy_set,
         &effective_prompt_context_set,
         Vec::new(),
+        TurnPrePromptCompileHookInput::from_parts(
+            provider_tool_calling,
+            hook_tool_names_from_strings(&all_tool_names),
+        ),
     )
     .await
     .map_err(|error| {
@@ -1654,8 +1680,7 @@ async fn execute_agent_provider_response(
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
         None,
-        prompt_sections.memory_recall.clone(),
-        prompt_sections.dynamic_sections.as_slice(),
+        prompt_sections.runtime_sections.as_slice(),
         include_task_orchestration_policy,
         continue_generation_hint,
         thread_id,
@@ -1678,7 +1703,10 @@ async fn execute_agent_provider_response(
             turn_id: turn_id.to_owned(),
             manifest: prompt_manifest_from_bundle(
                 &initial_prompt_bundle,
-                effective_prompt_section_set.manifest_metadata(),
+                &EffectiveTurnPromptManifestHookMetadata::combined(
+                    effective_prompt_context_set.manifest_metadata(),
+                    effective_prompt_section_set.manifest_metadata(),
+                ),
             ),
         },
     )
@@ -1811,8 +1839,7 @@ async fn execute_agent_provider_response(
                     let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
-                        prompt_sections.memory_recall.clone(),
-                        prompt_sections.dynamic_sections.as_slice(),
+                        prompt_sections.runtime_sections.as_slice(),
                         include_task_orchestration_policy,
                         continue_generation_hint,
                         thread_id,
@@ -1830,7 +1857,10 @@ async fn execute_agent_provider_response(
                             turn_id: turn_id.to_owned(),
                             manifest: prompt_manifest_from_bundle(
                                 &refreshed_prompt_bundle,
-                                effective_prompt_section_set.manifest_metadata(),
+                                &EffectiveTurnPromptManifestHookMetadata::combined(
+                                    effective_prompt_context_set.manifest_metadata(),
+                                    effective_prompt_section_set.manifest_metadata(),
+                                ),
                             ),
                         },
                     )
@@ -1860,15 +1890,34 @@ async fn execute_agent_provider_response(
                 None
             };
 
-            let round_compiled_prompt = if round_plan.tools_enabled || prompt_sections.memory_recall.is_none()
-            {
+            let round_compiled_prompt = if round_plan.tools_enabled {
                 active_compiled_prompt.clone()
             } else {
-                let prompt_without_memory = compile_agent_prompt_bundle(
+                let no_tool_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+                    hook_runtime.as_ref(),
+                    &hook_context,
+                    &effective_policy_set,
+                    &effective_prompt_context_set,
+                    Vec::new(),
+                    TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        ChatTurnError::Terminal(format!(
+                            "turn prompt section hook failed before no-tool provider round: {}",
+                            error.kind()
+                        )),
+                        current_thinking_id.clone(),
+                    )
+                })?;
+                let no_tool_prompt_sections =
+                    prompt_sections_for_compile_from_hook_sections(&no_tool_prompt_section_set)
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                let prompt_without_tools = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
-                    None,
-                    prompt_sections.dynamic_sections.as_slice(),
+                    no_tool_prompt_sections.runtime_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -1881,14 +1930,17 @@ async fn execute_agent_provider_response(
                         thread_id: thread_id.to_owned(),
                         turn_id: turn_id.to_owned(),
                         manifest: prompt_manifest_from_bundle(
-                            &prompt_without_memory,
-                            effective_prompt_section_set.manifest_metadata(),
+                            &prompt_without_tools,
+                            &EffectiveTurnPromptManifestHookMetadata::combined(
+                                effective_prompt_context_set.manifest_metadata(),
+                                no_tool_prompt_section_set.manifest_metadata(),
+                            ),
                         ),
                     },
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                Some(compiled_prompt_payload_from_bundle(&prompt_without_memory))
+                Some(compiled_prompt_payload_from_bundle(&prompt_without_tools))
             };
 
             let round = provider::request_agent_round(
@@ -1952,8 +2004,7 @@ async fn execute_agent_provider_response(
                         let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
-                            prompt_sections.memory_recall.clone(),
-                            prompt_sections.dynamic_sections.as_slice(),
+                            prompt_sections.runtime_sections.as_slice(),
                             include_task_orchestration_policy,
                             continue_generation_hint,
                             thread_id,
@@ -1971,7 +2022,10 @@ async fn execute_agent_provider_response(
                                 turn_id: turn_id.to_owned(),
                                 manifest: prompt_manifest_from_bundle(
                                     &refreshed_prompt_bundle,
-                                    effective_prompt_section_set.manifest_metadata(),
+                                    &EffectiveTurnPromptManifestHookMetadata::combined(
+                                        effective_prompt_context_set.manifest_metadata(),
+                                        effective_prompt_section_set.manifest_metadata(),
+                                    ),
                                 ),
                             },
                         )
@@ -2613,8 +2667,7 @@ async fn execute_agent_provider_response(
                 let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
-                    prompt_sections.memory_recall.clone(),
-                    prompt_sections.dynamic_sections.as_slice(),
+                    prompt_sections.runtime_sections.as_slice(),
                     include_task_orchestration_policy,
                     continue_generation_hint,
                     thread_id,
@@ -2632,7 +2685,10 @@ async fn execute_agent_provider_response(
                         turn_id: turn_id.to_owned(),
                         manifest: prompt_manifest_from_bundle(
                             &refreshed_prompt_bundle,
-                            effective_prompt_section_set.manifest_metadata(),
+                            &EffectiveTurnPromptManifestHookMetadata::combined(
+                                effective_prompt_context_set.manifest_metadata(),
+                                effective_prompt_section_set.manifest_metadata(),
+                            ),
                         ),
                     },
                 )
@@ -3049,7 +3105,6 @@ mod tests {
 
         let bundle = compile_agent_prompt_bundle_with_prompt_root(
             runtime_home.as_path(),
-            None,
             None,
             None,
             &[],

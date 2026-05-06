@@ -9980,7 +9980,7 @@ async fn persisted_prompt_manifest(
         .expect("turn should persist prompt manifest")
 }
 
-fn assert_memory_recall_manifest(manifest: &PromptManifest) {
+fn assert_memory_recall_manifest(manifest: &PromptManifest, expect_recall_context_source: bool) {
     assert!(
         manifest
             .section_ids
@@ -9989,6 +9989,30 @@ fn assert_memory_recall_manifest(manifest: &PromptManifest) {
         "prompt manifest should include memory_recall, got {:?}",
         manifest.section_ids
     );
+    assert!(
+        manifest.hook_sources.iter().any(|source| {
+            source.section_id.as_deref() == Some("memory_recall")
+                && source.contribution_kind == PromptManifestHookContributionKind::PromptSection
+                && source.source.hook_id == "memory.prompt_contract"
+                && source.source.subscription_id == "memory.prompt_contract.default"
+                && source.source.phase == PromptManifestHookPhase::TurnPrePromptCompile
+        }),
+        "prompt manifest should attribute memory_recall to memory.prompt_contract, got {:?}",
+        manifest.hook_sources
+    );
+    if expect_recall_context_source {
+        assert!(
+            manifest.hook_sources.iter().any(|source| {
+                source.section_id.is_none()
+                    && source.contribution_kind == PromptManifestHookContributionKind::PromptContext
+                    && source.source.hook_id == "memory.deterministic_recall"
+                    && source.source.subscription_id == "memory.deterministic_recall.default"
+                    && source.source.phase == PromptManifestHookPhase::TurnPrePromptContext
+            }),
+            "prompt manifest should include deterministic recall prompt-context source, got {:?}",
+            manifest.hook_sources
+        );
+    }
 }
 
 async fn service_search_memory(
@@ -10940,7 +10964,7 @@ async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
         remember_turn_id.as_str(),
     )
     .await;
-    assert_memory_recall_manifest(&remember_manifest);
+    assert_memory_recall_manifest(&remember_manifest, false);
 
     let name_search = service_search_memory(
         &harness,
@@ -10980,7 +11004,7 @@ async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
     let recall_manifest =
         persisted_prompt_manifest(&harness, recall_thread_id.as_str(), recall_turn_id.as_str())
             .await;
-    assert_memory_recall_manifest(&recall_manifest);
+    assert_memory_recall_manifest(&recall_manifest, true);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
@@ -11024,7 +11048,7 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     .await;
     let seed_manifest =
         persisted_prompt_manifest(&harness, seed_thread_id.as_str(), seed_turn_id.as_str()).await;
-    assert_memory_recall_manifest(&seed_manifest);
+    assert_memory_recall_manifest(&seed_manifest, false);
 
     let birthday_search = service_search_memory(
         &harness,
@@ -11093,7 +11117,7 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     let forget_manifest =
         persisted_prompt_manifest(&harness, forget_thread_id.as_str(), forget_turn_id.as_str())
             .await;
-    assert_memory_recall_manifest(&forget_manifest);
+    assert_memory_recall_manifest(&forget_manifest, false);
 
     let active_get = service_get_memory(&harness, birthday_memory_id.as_str(), false).await;
     assert!(active_get.record.is_none());
@@ -11140,7 +11164,7 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     let recall_manifest =
         persisted_prompt_manifest(&harness, recall_thread_id.as_str(), recall_turn_id.as_str())
             .await;
-    assert_memory_recall_manifest(&recall_manifest);
+    assert_memory_recall_manifest(&recall_manifest, false);
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }

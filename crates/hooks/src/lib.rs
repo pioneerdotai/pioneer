@@ -71,6 +71,7 @@ pub use request::{
     TurnPreCompactionSourceKind, TurnPreCompactionSourceRange, TurnPreCompactionSummaryPolicy,
     TurnPreCompactionSummaryStorage, TurnPreCompactionSummaryStrategy,
     TurnPreCompactionTokenBudget, TurnPreCompactionTrigger, TurnPrePolicyHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
     TurnPreToolMaterializationHookInput,
 };
 pub use runtime::{

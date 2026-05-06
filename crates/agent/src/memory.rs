@@ -7,12 +7,14 @@ use pioneer_hooks::{
     HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
     HookId, HookInputPayload, HookKind, HookMetadata, HookMetadataKey, HookPhase, HookPolicyKey,
     HookPolicySet, HookPromptContent, HookRegistryError, HookResult, HookRuntime, HookSectionId,
-    HookSubscription, HookSubscriptionId, HookToolBundleId, HookToolName, HookValue,
-    PolicyContribution, PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
+    HookSourceId, HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionId,
+    HookToolBundleId, HookToolName, HookValue, PolicyContribution, PromptContextContribution,
+    PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
     MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
-    render_memory_recall_prompt,
+    render_memory_recall_context_block, render_memory_recall_prompt,
 };
 use pioneer_protocol::{MemoryCategory, MemoryScope, MemoryScopeKind, ThreadMode};
 use pioneer_tools::ToolExtensionBundle;
@@ -38,6 +40,13 @@ const MEMORY_TOOL_BUNDLE_HOOK_ID: &str = "memory.tool_bundle";
 const MEMORY_TOOL_BUNDLE_SUBSCRIPTION_ID: &str = "memory.tool_bundle.default";
 const MEMORY_TOOL_BUNDLE_CONTRIBUTION_ID_PREFIX: &str = "memory.tool_bundle.contribution";
 const MEMORY_TOOL_BUNDLE_ID_PREFIX: &str = "memory.tool_bundle.bundle";
+const MEMORY_DETERMINISTIC_RECALL_HOOK_ID: &str = "memory.deterministic_recall";
+const MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID: &str = "memory.deterministic_recall.default";
+const MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID: &str = "memory.deterministic_recall.context";
+const MEMORY_PROMPT_CONTRACT_HOOK_ID: &str = "memory.prompt_contract";
+const MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID: &str = "memory.prompt_contract.default";
+const MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID: &str = "memory.prompt_contract.section";
+const MEMORY_PROMPT_CONTRACT_SECTION_ID: &str = "memory_recall";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTurnContext {
@@ -635,7 +644,6 @@ pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
 #[derive(Clone)]
 struct MemoryHookTurnState {
     context: MemoryTurnContext,
-    available_tool_names: Vec<String>,
 }
 
 #[derive(Default)]
@@ -652,10 +660,7 @@ impl MemoryHookTurnStateStore {
                     context.thread_id.as_str(),
                     context.turn_id.as_str(),
                 ),
-                MemoryHookTurnState {
-                    context,
-                    available_tool_names: Vec::new(),
-                },
+                MemoryHookTurnState { context },
             );
         }
     }
@@ -669,21 +674,6 @@ impl MemoryHookTurnStateStore {
                 .get(&memory_hook_state_key(workspace_id, thread_id, turn_id))
                 .cloned()
         })
-    }
-
-    fn set_available_tool_names(
-        &self,
-        workspace_id: &str,
-        thread_id: &str,
-        turn_id: &str,
-        available_tool_names: Vec<String>,
-    ) {
-        if let Ok(mut states) = self.states.lock()
-            && let Some(state) =
-                states.get_mut(&memory_hook_state_key(workspace_id, thread_id, turn_id))
-        {
-            state.available_tool_names = available_tool_names;
-        }
     }
 }
 
@@ -710,6 +700,15 @@ pub(crate) fn install_memory_hooks(
     )?;
     register_memory_hook_handler(
         runtime,
+        Arc::new(MemoryDeterministicRecallHook {
+            memory_provider: memory_provider.clone(),
+        }),
+        MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID,
+        HookPhase::TurnPrePromptContext,
+        0,
+    )?;
+    register_memory_hook_handler(
+        runtime,
         Arc::new(MemoryToolBundleHook {
             memory_provider: memory_provider.clone(),
             state: state.clone(),
@@ -721,11 +720,8 @@ pub(crate) fn install_memory_hooks(
     )?;
     register_memory_hook_handler(
         runtime,
-        Arc::new(MemoryPromptSectionHook {
-            memory_provider,
-            state,
-        }),
-        "memory.prompt_section.default",
+        Arc::new(MemoryPromptContractHook),
+        MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID,
         HookPhase::TurnPrePromptCompile,
         0,
     )?;
@@ -777,10 +773,11 @@ struct MemoryToolBundleHook {
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
 }
 
-struct MemoryPromptSectionHook {
+struct MemoryDeterministicRecallHook {
     memory_provider: Arc<dyn AgentMemoryProvider>,
-    state: Arc<MemoryHookTurnStateStore>,
 }
+
+struct MemoryPromptContractHook;
 
 #[async_trait::async_trait]
 impl HookHandler for MemoryPolicyClassifierHook {
@@ -930,14 +927,6 @@ impl HookHandler for MemoryToolBundleHook {
             }
         };
 
-        let available_tool_names = memory_tool_names(&materialization);
-        self.state.set_available_tool_names(
-            state.context.workspace_id.as_str(),
-            state.context.thread_id.as_str(),
-            state.context.turn_id.as_str(),
-            available_tool_names,
-        );
-
         let mut response = HookHandlerResponse::default();
         response.diagnostics.extend(hook_diagnostics_from_strings(
             materialization.diagnostics.as_slice(),
@@ -971,9 +960,97 @@ impl HookHandler for MemoryToolBundleHook {
 }
 
 #[async_trait::async_trait]
-impl HookHandler for MemoryPromptSectionHook {
+impl HookHandler for MemoryDeterministicRecallHook {
     fn id(&self) -> HookId {
-        HookId::new("memory.prompt_section").expect("static hook id is valid")
+        HookId::new(MEMORY_DETERMINISTIC_RECALL_HOOK_ID).expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPrePromptContext]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_deterministic_recall_capabilities()
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let input = turn_pre_prompt_context_input(&request)?;
+        let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => {
+                let mut response = HookHandlerResponse::default();
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.policy_decode_failed",
+                    format!("memory deterministic recall skipped: policy_decode_failed {error}"),
+                ));
+                return Ok(response);
+            }
+            None => {
+                return Ok(memory_missing_policy_response(
+                    MEMORY_DETERMINISTIC_RECALL_HOOK_ID,
+                ));
+            }
+        };
+        if !policy.allow_pre_turn_recall() {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.recall_omitted",
+                format!(
+                    "memory deterministic recall skipped: source={} reason={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str()
+                ),
+            ));
+            return Ok(response);
+        }
+
+        let context = memory_turn_context_from_prompt_context_request(&request, input)?;
+        let mut response = HookHandlerResponse::default();
+        let recall_snapshot = match self
+            .memory_provider
+            .recall_memory(
+                context.clone(),
+                memory_recall_request(context.input_text.as_str()),
+            )
+            .await
+        {
+            Ok(snapshot) => {
+                response.diagnostics.extend(hook_diagnostics_from_strings(
+                    snapshot.diagnostics.as_slice(),
+                ));
+                snapshot
+            }
+            Err(error) => {
+                let _ = error;
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.recall_failed",
+                    "memory deterministic recall failed",
+                ));
+                return Ok(response);
+            }
+        };
+
+        if let Some(contribution) = memory_recall_prompt_context_contribution(recall_snapshot) {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.recall_context_contributed",
+                "memory deterministic recall contributed prompt context",
+            ));
+            response
+                .contributions
+                .push(HookContribution::PromptContext(contribution));
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl HookHandler for MemoryPromptContractHook {
+    fn id(&self) -> HookId {
+        HookId::new(MEMORY_PROMPT_CONTRACT_HOOK_ID).expect("static hook id is valid")
     }
 
     fn kind(&self) -> HookKind {
@@ -985,81 +1062,85 @@ impl HookHandler for MemoryPromptSectionHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_hook_capabilities()
+        memory_prompt_contract_capabilities()
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
-        let Some(state) = self.state.state(&request) else {
-            return Ok(memory_missing_state_response("memory.prompt_section"));
-        };
+        let input = turn_pre_prompt_compile_input(&request)?;
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
             Some(Ok(policy)) => policy,
             Some(Err(error)) => {
                 let mut response = HookHandlerResponse::default();
-                response.diagnostics.push(memory_hook_diagnostic(
+                response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.policy_decode_failed",
-                    format!("memory prompt section skipped: {error}"),
+                    format!("memory prompt contract skipped: policy_decode_failed {error}"),
                 ));
                 return Ok(response);
             }
-            None => return Ok(memory_missing_policy_response("memory.prompt_section")),
+            None => {
+                return Ok(memory_missing_policy_response(
+                    MEMORY_PROMPT_CONTRACT_HOOK_ID,
+                ));
+            }
         };
-        if state.available_tool_names.is_empty() {
-            return Ok(HookHandlerResponse::default());
+        if !input.provider_tool_calling {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.prompt_omitted",
+                "memory prompt contract skipped: provider_tool_calling=false",
+            ));
+            return Ok(response);
+        }
+        if !policy.allow_memory_prompt() {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.prompt_omitted",
+                format!(
+                    "memory prompt contract skipped: source={} reason={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str()
+                ),
+            ));
+            return Ok(response);
         }
 
-        let mut response = HookHandlerResponse::default();
-        let recall_snapshot = if policy.allow_pre_turn_recall() {
-            match self
-                .memory_provider
-                .recall_memory(
-                    state.context.clone(),
-                    memory_recall_request(state.context.input_text.as_str()),
-                )
-                .await
-            {
-                Ok(snapshot) => {
-                    response.diagnostics.extend(hook_diagnostics_from_strings(
-                        snapshot.diagnostics.as_slice(),
-                    ));
-                    snapshot
-                }
-                Err(error) => {
-                    response
-                        .diagnostics
-                        .push(memory_hook_diagnostic("memory.recall_failed", error));
-                    MemoryRecallSnapshot::empty()
-                }
-            }
-        } else {
-            MemoryRecallSnapshot::empty()
-        };
+        let available_tool_names = memory_tool_names_from_prompt_compile_input(input);
+        if available_tool_names.is_empty() {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.prompt_omitted",
+                "memory prompt contract skipped: no visible memory tools",
+            ));
+            return Ok(response);
+        }
 
-        if policy.allow_memory_prompt()
-            && let Some(prompt_policy) = policy.recall_prompt_policy()
-            && let Some(contribution) = memory_recall_prompt_section_contribution(
-                state.available_tool_names,
-                prompt_policy,
-                recall_snapshot,
-            )
-        {
+        let Some(prompt_policy) = policy.recall_prompt_policy() else {
+            return Ok(HookHandlerResponse::default());
+        };
+        let recall_context = memory_recall_context_from_prompt_context_set(
+            &request.prompt_context_set,
+            prompt_policy,
+        );
+        let mut response = HookHandlerResponse::default();
+        if let Some(contribution) = memory_recall_prompt_section_contribution_from_context(
+            available_tool_names,
+            prompt_policy,
+            recall_context.content,
+            recall_context.truncated,
+        ) {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.prompt_rendered",
+                format!(
+                    "memory prompt contract rendered: source={} reason={} recalled_contexts={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str(),
+                    recall_context.count
+                ),
+            ));
             response.contributions.push(contribution);
         }
         Ok(response)
     }
-}
-
-fn memory_hook_capabilities() -> HookCapabilities {
-    HookCapabilities::new([
-        HookCapability::new("memory").expect("static capability is valid"),
-        HookCapability::new("read_domain_context").expect("static capability is valid"),
-        HookCapability::new("write_domain_context").expect("static capability is valid"),
-        HookCapability::new("call_provider").expect("static capability is valid"),
-        HookCapability::new("call_tools").expect("static capability is valid"),
-        HookCapability::new("contribute_policy").expect("static capability is valid"),
-        HookCapability::new("contribute_prompt_section").expect("static capability is valid"),
-        HookCapability::new("contribute_tool_bundle").expect("static capability is valid"),
-    ])
 }
 
 fn memory_policy_classifier_capabilities() -> HookCapabilities {
@@ -1079,6 +1160,22 @@ fn memory_tool_bundle_capabilities() -> HookCapabilities {
     ])
 }
 
+fn memory_deterministic_recall_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("contribute_prompt_context").expect("static capability is valid"),
+    ])
+}
+
+fn memory_prompt_contract_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("contribute_prompt_section").expect("static capability is valid"),
+    ])
+}
+
 fn turn_pre_policy_input(request: &HookHandlerRequest) -> HookResult<&TurnPrePolicyHookInput> {
     match &request.input.payload {
         HookInputPayload::TurnPrePolicy(input) => Ok(input),
@@ -1089,10 +1186,34 @@ fn turn_pre_policy_input(request: &HookHandlerRequest) -> HookResult<&TurnPrePol
     }
 }
 
+fn turn_pre_prompt_context_input(
+    request: &HookHandlerRequest,
+) -> HookResult<&TurnPrePromptContextHookInput> {
+    match &request.input.payload {
+        HookInputPayload::TurnPrePromptContext(input) => Ok(input),
+        _ => Err(memory_hook_error(
+            "memory.invalid_input",
+            "memory deterministic recall hook expected turn pre-prompt-context input",
+        )),
+    }
+}
+
 fn turn_pre_tool_materialization_allows_tools(request: &HookHandlerRequest) -> bool {
     match &request.input.payload {
         HookInputPayload::TurnPreToolMaterialization(input) => input.provider_tool_calling,
         _ => false,
+    }
+}
+
+fn turn_pre_prompt_compile_input(
+    request: &HookHandlerRequest,
+) -> HookResult<&TurnPrePromptCompileHookInput> {
+    match &request.input.payload {
+        HookInputPayload::TurnPrePromptCompile(input) => Ok(input),
+        _ => Err(memory_hook_error(
+            "memory.invalid_input",
+            "memory prompt contract hook expected turn pre-prompt-compile input",
+        )),
     }
 }
 
@@ -1367,6 +1488,41 @@ fn memory_tool_bundle_contribution(
     }
 }
 
+fn memory_turn_context_from_prompt_context_request(
+    request: &HookHandlerRequest,
+    input: &TurnPrePromptContextHookInput,
+) -> HookResult<MemoryTurnContext> {
+    let workspace_id = required_context_id(
+        request.context.workspace_id.as_ref().map(|id| id.as_str()),
+        "workspace_id",
+    )?;
+    let thread_id = required_context_id(
+        request.context.thread_id.as_ref().map(|id| id.as_str()),
+        "thread_id",
+    )?;
+    let turn_id = required_context_id(
+        request.context.turn_id.as_ref().map(|id| id.as_str()),
+        "turn_id",
+    )?;
+    Ok(MemoryTurnContext {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        mode: ThreadMode::Agent,
+        input_text: input.input_text.clone(),
+        task_id: request
+            .context
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        agent_id: request
+            .context
+            .agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+    })
+}
+
 fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
     MemoryRecallRequest {
         query: input_text.to_owned(),
@@ -1374,6 +1530,121 @@ fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
         top_k: Some(5),
         max_chars: Some(1_500),
     }
+}
+
+fn memory_recall_prompt_context_contribution(
+    recall_snapshot: MemoryRecallSnapshot,
+) -> Option<PromptContextContribution> {
+    if recall_snapshot.items.is_empty() {
+        return None;
+    }
+    let truncated = recall_snapshot.truncated;
+    let source_refs = memory_recall_source_refs(recall_snapshot.items.as_slice());
+    let prompt_items = recall_snapshot
+        .items
+        .into_iter()
+        .map(memory_recall_prompt_item)
+        .collect::<Vec<_>>();
+    let (content, truncated) =
+        render_memory_recall_context_block(prompt_items.as_slice(), truncated);
+    let content = HookPromptContent::new(content).ok()?;
+    Some(PromptContextContribution {
+        contribution_id: HookContributionId::new(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
+            .expect("static contribution id is valid"),
+        domain: memory_policy_domain(),
+        priority: 500,
+        content,
+        max_chars: Some(1_500),
+        source_refs,
+        diagnostics: Vec::new(),
+        truncated,
+    })
+}
+
+fn memory_recall_source_refs(items: &[MemoryRecallItem]) -> Vec<HookSourceRef> {
+    let mut seen = BTreeSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            let memory_id = item.memory_id.trim();
+            if memory_id.is_empty() || !seen.insert(memory_id.to_owned()) {
+                return None;
+            }
+            Some(HookSourceRef {
+                kind: HookSourceKind::Custom("memory".to_owned()),
+                id: HookSourceId::new(memory_id.to_owned()).ok()?,
+                label: None,
+            })
+        })
+        .collect()
+}
+
+fn memory_tool_names_from_prompt_compile_input(
+    input: &TurnPrePromptCompileHookInput,
+) -> Vec<String> {
+    let available = input
+        .available_tool_names
+        .iter()
+        .map(|name| name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    [
+        MEMORY_SEARCH_TOOL,
+        MEMORY_GET_TOOL,
+        MEMORY_REMEMBER_TOOL,
+        MEMORY_FORGET_TOOL,
+    ]
+    .into_iter()
+    .filter(|name| available.contains(name))
+    .map(str::to_owned)
+    .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryRecallPromptContext {
+    content: Option<String>,
+    count: usize,
+    truncated: bool,
+}
+
+fn memory_recall_context_from_prompt_context_set(
+    prompt_context_set: &pioneer_hooks::HookPromptContextSet,
+    prompt_policy: MemoryRecallPromptPolicy,
+) -> MemoryRecallPromptContext {
+    if prompt_policy == MemoryRecallPromptPolicy::ForgetOnly {
+        return MemoryRecallPromptContext::default();
+    }
+
+    let mut context = MemoryRecallPromptContext::default();
+    let mut content = String::new();
+    for entry in prompt_context_set.entries() {
+        if entry.domain.as_str() != MEMORY_POLICY_DOMAIN {
+            continue;
+        }
+        if !entry
+            .contribution_id
+            .as_str()
+            .starts_with(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
+        {
+            continue;
+        }
+        let entry_content = entry.content.as_str().trim();
+        if entry_content.is_empty() {
+            continue;
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(entry_content);
+        context.count += 1;
+        context.truncated |= entry.truncated;
+    }
+    context.content = if content.trim().is_empty() {
+        None
+    } else {
+        Some(content)
+    };
+    context
 }
 
 fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
@@ -1610,6 +1881,7 @@ fn fallback_policy(
     policy
 }
 
+#[cfg(test)]
 pub(crate) fn memory_tool_names(materialization: &MemoryToolMaterialization) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
@@ -1694,6 +1966,7 @@ fn hook_tool_names_csv(tool_names: &[HookToolName]) -> String {
         .join(",")
 }
 
+#[cfg(test)]
 pub(crate) fn memory_recall_prompt_input(
     available_tool_names: Vec<String>,
     policy: MemoryRecallPromptPolicy,
@@ -1707,21 +1980,35 @@ pub(crate) fn memory_recall_prompt_input(
             .into_iter()
             .map(memory_recall_prompt_item)
             .collect(),
+        recalled_context: None,
         truncated: recall_snapshot.truncated,
     }
 }
 
-pub(crate) fn memory_recall_prompt_section_contribution(
+pub(crate) fn memory_recall_prompt_section_contribution_from_context(
     available_tool_names: Vec<String>,
     policy: MemoryRecallPromptPolicy,
-    recall_snapshot: MemoryRecallSnapshot,
+    recalled_context: Option<String>,
+    truncated: bool,
 ) -> Option<HookContribution> {
-    let prompt_input = memory_recall_prompt_input(available_tool_names, policy, recall_snapshot);
+    memory_recall_prompt_section_contribution_from_input(MemoryRecallPromptInput {
+        available_tool_names,
+        policy,
+        recalled_items: Vec::new(),
+        recalled_context,
+        truncated,
+    })
+}
+
+fn memory_recall_prompt_section_contribution_from_input(
+    prompt_input: MemoryRecallPromptInput,
+) -> Option<HookContribution> {
     let prompt = render_memory_recall_prompt(&prompt_input)?;
     Some(HookContribution::PromptSection(PromptSectionContribution {
-        contribution_id: HookContributionId::new("memory.recall_prompt")
+        contribution_id: HookContributionId::new(MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID)
             .expect("static contribution id is valid"),
-        section_id: HookSectionId::new("memory_recall").expect("static section id is valid"),
+        section_id: HookSectionId::new(MEMORY_PROMPT_CONTRACT_SECTION_ID)
+            .expect("static section id is valid"),
         title: None,
         domain: HookDomain::new("memory").expect("static domain is valid"),
         priority: 500,
@@ -1780,8 +2067,9 @@ fn category_label(category: MemoryCategory) -> &'static str {
 mod tests {
     use super::*;
     use pioneer_hooks::{
-        HookContext, HookInput, HookPromptContextSet, HookThreadId, HookTurnId, HookWorkspaceId,
-        TurnPreToolMaterializationHookInput,
+        HookContext, HookInput, HookPromptContextLimits, HookPromptContextSet, HookThreadId,
+        HookToolName, HookTurnId, HookWorkspaceId, TurnPrePromptCompileHookInput,
+        TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
     };
     use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use serde_json::json;
@@ -1964,6 +2252,88 @@ mod tests {
         ));
         assert!(!capabilities.contains(
             &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+    }
+
+    #[test]
+    fn memory_deterministic_recall_hook_descriptor_is_stable_and_narrow() {
+        let hook = MemoryDeterministicRecallHook {
+            memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
+                MemoryRecallSnapshot::empty(),
+            )),
+        };
+
+        assert_eq!(hook.id().as_str(), MEMORY_DETERMINISTIC_RECALL_HOOK_ID);
+        assert_eq!(
+            hook.supported_phases(),
+            vec![HookPhase::TurnPrePromptContext]
+        );
+        let capabilities = hook.capabilities();
+        assert!(
+            capabilities
+                .contains(&HookCapability::new("memory").expect("static capability is valid"))
+        );
+        assert!(capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
+        ));
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+    }
+
+    #[test]
+    fn memory_prompt_contract_hook_descriptor_is_stable_and_narrow() {
+        let hook = MemoryPromptContractHook;
+
+        assert_eq!(hook.id().as_str(), MEMORY_PROMPT_CONTRACT_HOOK_ID);
+        assert_eq!(
+            hook.supported_phases(),
+            vec![HookPhase::TurnPrePromptCompile]
+        );
+        let capabilities = hook.capabilities();
+        assert!(
+            capabilities
+                .contains(&HookCapability::new("memory").expect("static capability is valid"))
+        );
+        assert!(capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+        assert!(
+            !capabilities.contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_policy").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
         ));
     }
 
@@ -2206,6 +2576,238 @@ mod tests {
                 && diagnostic.safe_for_user
                 && !diagnostic.message.as_str().contains("raw provider error")
         }));
+    }
+
+    #[tokio::test]
+    async fn memory_deterministic_recall_hook_contributes_prompt_context_from_policy_set() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            recalled_city_snapshot(),
+        ));
+        let hook = MemoryDeterministicRecallHook {
+            memory_provider: provider.clone(),
+        };
+
+        let response = hook
+            .execute(test_prompt_context_hook_request(memory_policy_set(
+                &MemoryTurnPolicy::normal_default_allow(),
+            )))
+            .await
+            .expect("recall hook executes");
+
+        assert_eq!(provider.recall_call_count(), 1);
+        assert_eq!(provider.materialize_call_count(), 0);
+        let contributions = response.contributions;
+        assert_eq!(contributions.len(), 1);
+        let HookContribution::PromptContext(context) = &contributions[0] else {
+            panic!("recall hook should contribute prompt context only");
+        };
+        assert_eq!(
+            context.contribution_id.as_str(),
+            MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID
+        );
+        assert_eq!(context.domain.as_str(), MEMORY_POLICY_DOMAIN);
+        assert!(context.content.as_str().contains("User likes Porto."));
+        assert_eq!(context.source_refs.len(), 1);
+        assert_eq!(context.source_refs[0].id.as_str(), "mem_city");
+    }
+
+    #[tokio::test]
+    async fn memory_deterministic_recall_hook_skips_without_allowed_policy() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            recalled_city_snapshot(),
+        ));
+        let hook = MemoryDeterministicRecallHook {
+            memory_provider: provider.clone(),
+        };
+
+        let response = hook
+            .execute(test_prompt_context_hook_request(memory_policy_set(
+                &MemoryTurnPolicy::no_use(),
+            )))
+            .await
+            .expect("recall hook executes");
+
+        assert_eq!(provider.recall_call_count(), 0);
+        assert!(response.contributions.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.recall_omitted" && diagnostic.safe_for_user
+        }));
+    }
+
+    #[tokio::test]
+    async fn memory_deterministic_recall_hook_skips_malformed_policy_safely() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            recalled_city_snapshot(),
+        ));
+        let hook = MemoryDeterministicRecallHook {
+            memory_provider: provider.clone(),
+        };
+
+        let response = hook
+            .execute(test_prompt_context_hook_request(
+                malformed_memory_policy_set(),
+            ))
+            .await
+            .expect("malformed policy is best-effort");
+
+        assert_eq!(provider.recall_call_count(), 0);
+        assert!(response.contributions.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.policy_decode_failed" && diagnostic.safe_for_user
+        }));
+    }
+
+    #[tokio::test]
+    async fn memory_deterministic_recall_hook_failure_is_safe_best_effort() {
+        let provider = Arc::new(TestRecallMemoryProvider::failing_recall(
+            "raw provider error must not leak",
+        ));
+        let hook = MemoryDeterministicRecallHook {
+            memory_provider: provider.clone(),
+        };
+
+        let response = hook
+            .execute(test_prompt_context_hook_request(memory_policy_set(
+                &MemoryTurnPolicy::normal_default_allow(),
+            )))
+            .await
+            .expect("recall failure is best-effort");
+
+        assert_eq!(provider.recall_call_count(), 1);
+        assert!(response.contributions.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.recall_failed"
+                && diagnostic.safe_for_user
+                && !diagnostic.message.as_str().contains("raw provider error")
+        }));
+    }
+
+    #[tokio::test]
+    async fn memory_prompt_contract_hook_renders_from_prompt_context_and_compile_input() {
+        let recall_provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            recalled_city_snapshot(),
+        ));
+        let recall_hook = MemoryDeterministicRecallHook {
+            memory_provider: recall_provider,
+        };
+        let recall_response = recall_hook
+            .execute(test_prompt_context_hook_request(memory_policy_set(
+                &MemoryTurnPolicy::normal_default_allow(),
+            )))
+            .await
+            .expect("recall hook executes");
+        let prompt_context_set = prompt_context_set_from_response(recall_response);
+        let hook = MemoryPromptContractHook;
+
+        let response = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &[
+                    MEMORY_FORGET_TOOL,
+                    MEMORY_REMEMBER_TOOL,
+                    MEMORY_GET_TOOL,
+                    MEMORY_SEARCH_TOOL,
+                ],
+                prompt_context_set,
+            ))
+            .await
+            .expect("prompt contract hook executes");
+
+        let content = prompt_section_content(response).expect("prompt section is rendered");
+        assert!(content.contains(
+            "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+        ));
+        assert!(content.contains("User likes Porto."));
+        assert!(content.contains("Call memory_remember proactively"));
+    }
+
+    #[tokio::test]
+    async fn memory_prompt_contract_hook_policy_and_tool_visibility_matrix() {
+        let hook = MemoryPromptContractHook;
+        let prompt_context_set = HookPromptContextSet::default();
+
+        let no_use = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::no_use()),
+                true,
+                &[MEMORY_SEARCH_TOOL],
+                prompt_context_set.clone(),
+            ))
+            .await
+            .expect("no-use policy is best-effort");
+        assert!(prompt_section_content(no_use).is_none());
+
+        let no_tools = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                true,
+                &["exec_command"],
+                prompt_context_set.clone(),
+            ))
+            .await
+            .expect("no visible memory tools is best-effort");
+        assert!(prompt_section_content(no_tools).is_none());
+
+        let no_provider_tool_calling = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                false,
+                &[MEMORY_SEARCH_TOOL],
+                prompt_context_set.clone(),
+            ))
+            .await
+            .expect("provider tool-calling disabled is best-effort");
+        assert!(prompt_section_content(no_provider_tool_calling).is_none());
+
+        let malformed = hook
+            .execute(test_prompt_compile_hook_request(
+                malformed_memory_policy_set(),
+                true,
+                &[MEMORY_SEARCH_TOOL],
+                prompt_context_set,
+            ))
+            .await
+            .expect("malformed policy is best-effort");
+        assert!(prompt_section_content(malformed).is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_prompt_contract_hook_renders_no_save_and_forget_contracts() {
+        let hook = MemoryPromptContractHook;
+
+        let no_save = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::no_save()),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+                HookPromptContextSet::default(),
+            ))
+            .await
+            .expect("no-save prompt contract executes");
+        let no_save_content = prompt_section_content(no_save).expect("no-save section renders");
+        assert!(no_save_content.contains("Memory writes are disabled for this turn"));
+        assert!(no_save_content.contains("Do not store, update, infer, or extract new memories"));
+        assert!(!no_save_content.contains("memory_remember"));
+
+        let forget = hook
+            .execute(test_prompt_compile_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::explicit_forget(Some(
+                    "birthday".to_owned(),
+                ))),
+                true,
+                &[MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+                HookPromptContextSet::default(),
+            ))
+            .await
+            .expect("forget prompt contract executes");
+        let forget_content = prompt_section_content(forget).expect("forget section renders");
+        assert!(
+            forget_content
+                .contains("If the user asks you to forget something, call memory_forget.")
+        );
+        assert!(forget_content.contains("only to identify and forget"));
+        assert!(!forget_content.contains("memory_remember"));
     }
 
     #[tokio::test]
@@ -2537,6 +3139,100 @@ mod tests {
         }
     }
 
+    fn test_prompt_context_hook_request(policy_set: HookPolicySet) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_DETERMINISTIC_RECALL_HOOK_ID)
+                .expect("static hook id is valid"),
+            phase: HookPhase::TurnPrePromptContext,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            input: HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
+                "what do you remember about my city?",
+                Some("test-model"),
+                Some("test-provider"),
+            )),
+            policy_set,
+            prompt_context_set: HookPromptContextSet::default(),
+        }
+    }
+
+    fn test_prompt_compile_hook_request(
+        policy_set: HookPolicySet,
+        provider_tool_calling: bool,
+        available_tool_names: &[&str],
+        prompt_context_set: HookPromptContextSet,
+    ) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_PROMPT_CONTRACT_HOOK_ID).expect("static hook id is valid"),
+            phase: HookPhase::TurnPrePromptCompile,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            input: HookInput::turn_pre_prompt_compile(TurnPrePromptCompileHookInput::from_parts(
+                provider_tool_calling,
+                available_tool_names
+                    .iter()
+                    .map(|name| HookToolName::new(*name).expect("valid tool name"))
+                    .collect(),
+            )),
+            policy_set,
+            prompt_context_set,
+        }
+    }
+
+    fn memory_policy_set(policy: &MemoryTurnPolicy) -> HookPolicySet {
+        HookPolicySet::merge_contributions([memory_policy_contribution(policy)])
+    }
+
+    fn malformed_memory_policy_set() -> HookPolicySet {
+        HookPolicySet::merge_contributions([PolicyContribution {
+            domain: memory_policy_domain(),
+            key: memory_turn_policy_key(),
+            value: HookValue::Text("memory_no_use".to_owned()),
+            priority: 500,
+            diagnostics: Vec::new(),
+        }])
+    }
+
+    fn recalled_city_snapshot() -> MemoryRecallSnapshot {
+        MemoryRecallSnapshot {
+            items: vec![MemoryRecallItem {
+                memory_id: "mem_city".to_owned(),
+                scope: user_scope(),
+                category: MemoryCategory::Preference,
+                key: Some("city".to_owned()),
+                content: "User likes Porto.".to_owned(),
+                score: Some(0.91),
+                updated_at: 1_714_867_200,
+            }],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn prompt_context_set_from_response(response: HookHandlerResponse) -> HookPromptContextSet {
+        HookPromptContextSet::aggregate_hook_contributions(
+            response.contributions,
+            HookPromptContextLimits::default(),
+        )
+    }
+
+    fn prompt_section_content(response: HookHandlerResponse) -> Option<String> {
+        response.contributions.into_iter().find_map(|contribution| {
+            let HookContribution::PromptSection(section) = contribution else {
+                return None;
+            };
+            Some(section.content.as_str().to_owned())
+        })
+    }
+
     fn test_memory_turn_context() -> MemoryTurnContext {
         MemoryTurnContext {
             workspace_id: "ws".to_owned(),
@@ -2682,6 +3378,64 @@ mod tests {
                 .materialize_calls
                 .lock()
                 .expect("materialize call count lock poisoned")
+        }
+    }
+
+    struct TestRecallMemoryProvider {
+        recall_result: Result<MemoryRecallSnapshot, String>,
+        recall_calls: Arc<Mutex<usize>>,
+        materialize_calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestRecallMemoryProvider {
+        fn with_recall(recall_result: MemoryRecallSnapshot) -> Self {
+            Self {
+                recall_result: Ok(recall_result),
+                recall_calls: Arc::new(Mutex::new(0)),
+                materialize_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn failing_recall(error: impl Into<String>) -> Self {
+            Self {
+                recall_result: Err(error.into()),
+                recall_calls: Arc::new(Mutex::new(0)),
+                materialize_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn recall_call_count(&self) -> usize {
+            *self.recall_calls.lock().expect("recall lock poisoned")
+        }
+
+        fn materialize_call_count(&self) -> usize {
+            *self
+                .materialize_calls
+                .lock()
+                .expect("materialize lock poisoned")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentMemoryProvider for TestRecallMemoryProvider {
+        async fn recall_memory(
+            &self,
+            _context: MemoryTurnContext,
+            _request: MemoryRecallRequest,
+        ) -> Result<MemoryRecallSnapshot, String> {
+            *self.recall_calls.lock().expect("recall lock poisoned") += 1;
+            self.recall_result.clone()
+        }
+
+        async fn materialize_memory_tools(
+            &self,
+            _context: MemoryTurnContext,
+        ) -> Result<MemoryToolMaterialization, String> {
+            *self
+                .materialize_calls
+                .lock()
+                .expect("materialize lock poisoned") += 1;
+            Ok(empty_tool_materialization())
         }
     }
 

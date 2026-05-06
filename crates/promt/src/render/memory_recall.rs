@@ -9,6 +9,7 @@ pub struct MemoryRecallPromptInput {
     pub available_tool_names: Vec<String>,
     pub policy: MemoryRecallPromptPolicy,
     pub recalled_items: Vec<MemoryRecallPromptItem>,
+    pub recalled_context: Option<String>,
     pub truncated: bool,
 }
 
@@ -106,6 +107,13 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
 
     let (recall_block, truncated) = if input.policy == MemoryRecallPromptPolicy::ForgetOnly {
         (String::new(), input.truncated)
+    } else if let Some(context) = input
+        .recalled_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+    {
+        truncate_recall_context(context, input.truncated)
     } else {
         render_recalled_memories(&input.recalled_items, input.truncated)
     };
@@ -118,6 +126,13 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
     }
 
     Some(prompt)
+}
+
+pub fn render_memory_recall_context_block(
+    items: &[MemoryRecallPromptItem],
+    snapshot_truncated: bool,
+) -> (String, bool) {
+    render_recalled_memories(items, snapshot_truncated)
 }
 
 fn render_recalled_memories(
@@ -155,6 +170,20 @@ fn render_recalled_memories(
     }
 
     (block, truncated)
+}
+
+fn truncate_recall_context(context: &str, already_truncated: bool) -> (String, bool) {
+    let content_chars = context.chars().count();
+    if content_chars <= MEMORY_PROMPT_MAX_RECALL_CHARS {
+        return (context.to_owned(), already_truncated);
+    }
+    (
+        context
+            .chars()
+            .take(MEMORY_PROMPT_MAX_RECALL_CHARS)
+            .collect(),
+        true,
+    )
 }
 
 fn render_recalled_memory_line(item: &MemoryRecallPromptItem) -> String {
@@ -235,6 +264,7 @@ mod tests {
             ],
             policy: MemoryRecallPromptPolicy::Full,
             recalled_items: vec![memory_prompt_item("mem_123", "User's name is Alexander.")],
+            recalled_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -263,6 +293,7 @@ mod tests {
                 available_tool_names: Vec::new(),
                 policy: MemoryRecallPromptPolicy::Full,
                 recalled_items: Vec::new(),
+                recalled_context: None,
                 truncated: false,
             })
             .is_none()
@@ -287,6 +318,7 @@ mod tests {
             available_tool_names: vec!["memory_search".to_owned()],
             policy: MemoryRecallPromptPolicy::Full,
             recalled_items: items,
+            recalled_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -306,6 +338,7 @@ mod tests {
             ],
             policy: MemoryRecallPromptPolicy::ReadOnly,
             recalled_items: vec![memory_prompt_item("mem_123", "User prefers short answers.")],
+            recalled_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -325,6 +358,7 @@ mod tests {
             ],
             policy: MemoryRecallPromptPolicy::ForgetOnly,
             recalled_items: vec![memory_prompt_item("mem_123", "User's birthday is May 5.")],
+            recalled_context: None,
             truncated: false,
         })
         .expect("memory prompt");

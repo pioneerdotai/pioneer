@@ -21,7 +21,7 @@ pub use profile::PromptProfile;
 pub use render::{
     memory_recall::{
         MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
-        render_memory_recall_prompt,
+        render_memory_recall_context_block, render_memory_recall_prompt,
     },
     memory_turn_policy::{
         MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,
@@ -31,6 +31,7 @@ pub use render::{
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
 pub use section::{
-    DynamicPromptSectionInput, PromptDynamicSectionId, PromptSection, PromptSectionId,
+    DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
+    PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSection, PromptSectionId,
     PromptSectionIdError, PromptStability,
 };

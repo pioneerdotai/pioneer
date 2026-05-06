@@ -52,6 +52,69 @@ impl fmt::Display for PromptDynamicSectionId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRuntimeBuiltInSectionId {
+    MemoryRecall,
+}
+
+impl PromptRuntimeBuiltInSectionId {
+    pub fn from_manifest_id(value: &str) -> Option<Self> {
+        match value {
+            "memory_recall" => Some(Self::MemoryRecall),
+            _ => None,
+        }
+    }
+
+    pub fn manifest_id(self) -> &'static str {
+        match self {
+            Self::MemoryRecall => "memory_recall",
+        }
+    }
+
+    pub fn prompt_section_id(self) -> PromptSectionId {
+        match self {
+            Self::MemoryRecall => PromptSectionId::MemoryRecall,
+        }
+    }
+
+    pub fn default_title(self) -> &'static str {
+        match self {
+            Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum PromptRuntimeSectionId {
+    BuiltIn(PromptRuntimeBuiltInSectionId),
+    Dynamic(PromptDynamicSectionId),
+}
+
+impl PromptRuntimeSectionId {
+    pub fn manifest_id(&self) -> String {
+        match self {
+            Self::BuiltIn(id) => id.manifest_id().to_owned(),
+            Self::Dynamic(id) => id.as_str().to_owned(),
+        }
+    }
+
+    pub fn prompt_section_id(&self) -> PromptSectionId {
+        match self {
+            Self::BuiltIn(id) => id.prompt_section_id(),
+            Self::Dynamic(id) => PromptSectionId::Dynamic(id.clone()),
+        }
+    }
+
+    pub fn default_title(&self) -> String {
+        match self {
+            Self::BuiltIn(id) => id.default_title().to_owned(),
+            Self::Dynamic(id) => format!("Dynamic: {}", id.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptSectionId {
@@ -122,6 +185,30 @@ pub struct DynamicPromptSectionInput {
     pub max_chars: Option<usize>,
     #[serde(default)]
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptRuntimeSectionInput {
+    pub id: PromptRuntimeSectionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl PromptRuntimeSectionInput {
+    pub fn dynamic(input: DynamicPromptSectionInput) -> Self {
+        Self {
+            id: PromptRuntimeSectionId::Dynamic(input.id),
+            title: input.title,
+            content: input.content,
+            max_chars: input.max_chars,
+            truncated: input.truncated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

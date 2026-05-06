@@ -9,7 +9,10 @@ use crate::diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
 use crate::fingerprint::sha256_hex;
 use crate::profile::PromptProfile;
 use crate::render::text::render_sections;
-use crate::section::{DynamicPromptSectionInput, PromptSection, PromptSectionId, PromptStability};
+use crate::section::{
+    DynamicPromptSectionInput, PromptRuntimeSectionInput, PromptSection, PromptSectionId,
+    PromptStability,
+};
 use crate::sources::budget::{BudgetedBootstrapFile, apply_budgets};
 use crate::sources::files::load_bootstrap_files;
 
@@ -53,16 +56,6 @@ fn build_task_orchestration_policy_section() -> PromptSection {
         stability: PromptStability::Dynamic,
         title: content::SECTION_TITLE_TASK_ORCHESTRATION_POLICY.to_owned(),
         content: content::TASK_ORCHESTRATION_POLICY_PROMPT.to_owned(),
-        sources: Vec::new(),
-    }
-}
-
-fn build_memory_recall_section(memory_recall: &str) -> PromptSection {
-    PromptSection {
-        id: PromptSectionId::MemoryRecall,
-        stability: PromptStability::Dynamic,
-        title: content::SECTION_TITLE_MEMORY_RECALL.to_owned(),
-        content: memory_recall.to_owned(),
         sources: Vec::new(),
     }
 }
@@ -216,11 +209,23 @@ fn build_dynamic_prompt_section(
     diagnostics: &mut Vec<PromptDiagnostic>,
     remaining_total_chars: &mut usize,
 ) -> Option<PromptSection> {
-    let section_id = input.id.as_str();
+    build_runtime_prompt_section(
+        &PromptRuntimeSectionInput::dynamic(input.clone()),
+        diagnostics,
+        remaining_total_chars,
+    )
+}
+
+fn build_runtime_prompt_section(
+    input: &PromptRuntimeSectionInput,
+    diagnostics: &mut Vec<PromptDiagnostic>,
+    remaining_total_chars: &mut usize,
+) -> Option<PromptSection> {
+    let section_id = input.id.manifest_id();
     let content = input.content.trim();
     if content.is_empty() {
         diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
-            section_id,
+            section_id.as_str(),
             "content was empty",
         ));
         return None;
@@ -228,7 +233,7 @@ fn build_dynamic_prompt_section(
 
     if *remaining_total_chars == 0 {
         diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
-            section_id,
+            section_id.as_str(),
             "dynamic section budget was exhausted",
         ));
         return None;
@@ -242,7 +247,7 @@ fn build_dynamic_prompt_section(
 
     if section_limit == 0 {
         diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
-            section_id,
+            section_id.as_str(),
             "section character limit was zero",
         ));
         return None;
@@ -259,7 +264,7 @@ fn build_dynamic_prompt_section(
 
     if truncated {
         diagnostics.push(PromptDiagnostic::dynamic_section_truncated(
-            section_id,
+            section_id.as_str(),
             content_chars,
             content.chars().count(),
         ));
@@ -273,10 +278,10 @@ fn build_dynamic_prompt_section(
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("Dynamic: {section_id}"));
+        .unwrap_or_else(|| input.id.default_title());
 
     Some(PromptSection {
-        id: PromptSectionId::Dynamic(input.id.clone()),
+        id: input.id.prompt_section_id(),
         stability: PromptStability::Dynamic,
         title,
         content,
@@ -310,17 +315,43 @@ fn build_dynamic_prompt_sections(
     sections
 }
 
+fn build_runtime_prompt_sections(
+    runtime_sections: &[PromptRuntimeSectionInput],
+    diagnostics: &mut Vec<PromptDiagnostic>,
+) -> Vec<PromptSection> {
+    let mut sections = Vec::new();
+    let mut remaining_total_chars = DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_TOTAL_CHARS;
+
+    for input in runtime_sections {
+        if sections.len() >= DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT {
+            let section_id = input.id.manifest_id();
+            diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
+                section_id.as_str(),
+                "dynamic section count limit was reached",
+            ));
+            continue;
+        }
+
+        if let Some(section) =
+            build_runtime_prompt_section(input, diagnostics, &mut remaining_total_chars)
+        {
+            sections.push(section);
+        }
+    }
+
+    sections
+}
+
 fn build_runtime_dynamic_sections(
     input: &PromptCompileInput,
     diagnostics: &mut Vec<PromptDiagnostic>,
 ) -> Vec<PromptSection> {
     let mut sections = Vec::new();
 
-    if let Some(memory_recall) = input.memory_recall.as_deref().map(str::trim)
-        && !memory_recall.is_empty()
-    {
-        sections.push(build_memory_recall_section(memory_recall));
-    }
+    sections.extend(build_runtime_prompt_sections(
+        input.runtime_sections.as_slice(),
+        diagnostics,
+    ));
 
     sections.extend(build_dynamic_prompt_sections(
         input.dynamic_sections.as_slice(),
@@ -529,7 +560,10 @@ mod tests {
     use crate::bundle::{PromptCompileInput, PromptLimits};
     use crate::diagnostics::PromptDiagnosticCode;
     use crate::profile::PromptProfile;
-    use crate::section::{DynamicPromptSectionInput, PromptDynamicSectionId, PromptSectionId};
+    use crate::section::{
+        DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
+        PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSectionId,
+    };
 
     fn temp_workspace(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -551,6 +585,16 @@ mod tests {
         }
     }
 
+    fn memory_recall_runtime_section(content: &str) -> PromptRuntimeSectionInput {
+        PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall),
+            title: None,
+            content: content.to_owned(),
+            max_chars: None,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn deterministic_output_for_same_input() {
         let root = temp_workspace("deterministic");
@@ -566,7 +610,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: None,
@@ -592,7 +636,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: Some("dynamic".to_owned()),
             extra_system: Some("extra".to_owned()),
@@ -619,7 +663,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: Some("ctx".to_owned()),
             extra_system: Some("extra".to_owned()),
@@ -665,7 +709,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: true,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -705,7 +749,9 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: Some("Available memory tools: memory_search".to_owned()),
+            runtime_sections: vec![memory_recall_runtime_section(
+                "Available memory tools: memory_search",
+            )],
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -744,7 +790,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
                 "test.phase10.alpha",
                 Some("Alpha Hook Section"),
@@ -788,7 +834,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
-            memory_recall: Some("memory recall content".to_owned()),
+            runtime_sections: vec![memory_recall_runtime_section("memory recall content")],
             dynamic_sections: vec![
                 dynamic_section("test.phase10.first", Some("First Hook"), "first content"),
                 dynamic_section("test.phase10.second", Some("Second Hook"), "second content"),
@@ -841,7 +887,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -857,7 +903,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
                 "test.phase10.dynamic",
                 Some("Dynamic Hook"),
@@ -892,7 +938,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: vec![section],
             dynamic_context: None,
             extra_system: None,
@@ -921,7 +967,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section("test.phase10.empty", Some("Empty"), "   ")],
             dynamic_context: None,
             extra_system: None,
@@ -947,7 +993,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
                 "test.phase10.filtered",
                 Some("Filtered Hook"),
@@ -991,7 +1037,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1035,7 +1081,7 @@ mod tests {
                 include_tool_recovery_policy: true,
                 include_task_orchestration_policy: false,
                 continue_generation_hint: false,
-                memory_recall: None,
+                runtime_sections: Vec::new(),
                 dynamic_sections: Vec::new(),
                 dynamic_context: None,
                 extra_system: None,
@@ -1082,7 +1128,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1098,7 +1144,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: true,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: Some("session dynamic context".to_owned()),
             extra_system: Some("runtime override".to_owned()),
@@ -1129,7 +1175,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1187,7 +1233,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1222,7 +1268,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1259,7 +1305,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1286,7 +1332,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1327,7 +1373,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
@@ -1366,7 +1412,7 @@ mod tests {
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
             continue_generation_hint: false,
-            memory_recall: None,
+            runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
             dynamic_context: None,
             extra_system: None,
