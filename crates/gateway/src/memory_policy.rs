@@ -12,6 +12,10 @@ use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry};
 use serde::Deserialize;
 use std::sync::Arc;
 
+// TODO(memory): re-enable LLM-backed memory policy resolution after the policy
+// classifier path is ready for production use again.
+const MEMORY_POLICY_LLM_CLASSIFIER_ENABLED: bool = false;
+
 pub(crate) struct GatewayMemoryTurnPolicyProvider {
     provider_registry: Arc<ProviderRegistry>,
 }
@@ -20,11 +24,8 @@ impl GatewayMemoryTurnPolicyProvider {
     pub(crate) fn new(provider_registry: Arc<ProviderRegistry>) -> Self {
         Self { provider_registry }
     }
-}
 
-#[async_trait::async_trait]
-impl AgentMemoryTurnPolicyProvider for GatewayMemoryTurnPolicyProvider {
-    async fn resolve_memory_turn_policy(
+    async fn resolve_memory_turn_policy_via_llm(
         &self,
         context: MemoryTurnPolicyContext,
         request: MemoryTurnPolicyRequest,
@@ -65,6 +66,33 @@ impl AgentMemoryTurnPolicyProvider for GatewayMemoryTurnPolicyProvider {
             .map_err(|error| format!("memory policy classifier request failed: {error:#}"))?;
 
         parse_memory_turn_policy_response(response.text.as_str())
+    }
+
+    fn default_allow_policy_without_classifier() -> MemoryTurnPolicy {
+        MemoryTurnPolicy::normal_default_allow()
+            .with_source(
+                MemoryPolicySource::DefaultFallback,
+                MemoryPolicyReasonCode::DefaultAllowRead,
+                1.0,
+            )
+            .with_diagnostic("memory.policy.classifier_disabled: using local default allow policy")
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryTurnPolicyProvider for GatewayMemoryTurnPolicyProvider {
+    async fn resolve_memory_turn_policy(
+        &self,
+        context: MemoryTurnPolicyContext,
+        request: MemoryTurnPolicyRequest,
+    ) -> Result<MemoryTurnPolicy, String> {
+        if MEMORY_POLICY_LLM_CLASSIFIER_ENABLED {
+            return self
+                .resolve_memory_turn_policy_via_llm(context, request)
+                .await;
+        }
+
+        Ok(Self::default_allow_policy_without_classifier())
     }
 }
 
@@ -302,11 +330,88 @@ impl From<ClassifierActiveContextPolicy> for MemoryActiveContextPolicy {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use pioneer_provider::{ChatResponse, Provider, StreamChunk};
+    use pioneer_provider::{ChatRequest, ChatResponse, Provider, StreamChunk};
     use std::sync::Mutex;
 
     #[tokio::test]
-    async fn classifier_request_sends_no_tools_or_compiled_prompt() {
+    async fn policy_provider_returns_default_allow_without_classifier_request() {
+        struct CapturingProvider {
+            request: Arc<Mutex<Option<ChatRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for CapturingProvider {
+            fn name(&self) -> &str {
+                "capture"
+            }
+
+            async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+                *self.request.lock().expect("request lock poisoned") = Some(request);
+                Ok(ChatResponse {
+                    text: "{}".to_owned(),
+                    usage: None,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                })
+            }
+
+            async fn stream_chat(
+                &self,
+                _request: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                Ok(futures_util::stream::empty().boxed())
+            }
+        }
+
+        let captured_request = Arc::new(Mutex::new(None));
+        let provider = Arc::new(CapturingProvider {
+            request: captured_request.clone(),
+        });
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+        let gateway_provider = GatewayMemoryTurnPolicyProvider::new(registry);
+
+        let policy = gateway_provider
+            .resolve_memory_turn_policy(
+                MemoryTurnPolicyContext {
+                    workspace_id: "ws".to_owned(),
+                    thread_id: "thread".to_owned(),
+                    turn_id: "turn".to_owned(),
+                    input_text: "No guardes esto.".to_owned(),
+                    mode: pioneer_protocol::ThreadMode::Agent,
+                    model: Some("test-model".to_owned()),
+                    model_provider: Some("capture".to_owned()),
+                },
+                MemoryTurnPolicyRequest::default(),
+            )
+            .await
+            .expect("default policy resolves");
+
+        assert_eq!(policy.recall, MemoryRecallPolicy::Allow);
+        assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
+        assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
+        assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.active_memory, MemoryActiveContextPolicy::Allow);
+        assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
+        assert_eq!(policy.source, MemoryPolicySource::DefaultFallback);
+        assert!(
+            policy
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("memory.policy.classifier_disabled"))
+        );
+        assert!(
+            captured_request
+                .lock()
+                .expect("request lock poisoned")
+                .is_none(),
+            "temporary classifier bypass must not call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_classifier_path_is_preserved_behind_disabled_switch() {
         struct CapturingProvider {
             request: Arc<Mutex<Option<ChatRequest>>>,
         }
@@ -360,13 +465,13 @@ mod tests {
         let gateway_provider = GatewayMemoryTurnPolicyProvider::new(registry);
 
         let policy = gateway_provider
-            .resolve_memory_turn_policy(
+            .resolve_memory_turn_policy_via_llm(
                 MemoryTurnPolicyContext {
                     workspace_id: "ws".to_owned(),
                     thread_id: "thread".to_owned(),
                     turn_id: "turn".to_owned(),
                     input_text: "No guardes esto.".to_owned(),
-                    mode: ThreadMode::Agent,
+                    mode: pioneer_protocol::ThreadMode::Agent,
                     model: Some("test-model".to_owned()),
                     model_provider: Some("capture".to_owned()),
                 },

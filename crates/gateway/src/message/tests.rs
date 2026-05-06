@@ -10115,6 +10115,7 @@ fn assert_request_has_tool(request: &ChatRequest, tool_name: &str) {
     );
 }
 
+#[allow(dead_code)]
 fn assert_request_lacks_tool(request: &ChatRequest, tool_name: &str) {
     let tool_names = request_tool_names(request);
     assert!(
@@ -10940,7 +10941,10 @@ async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
     )
     .await;
 
-    assert_eq!(remember_provider.snapshot_policy_requests().len(), 1);
+    assert!(
+        remember_provider.snapshot_policy_requests().is_empty(),
+        "temporary memory policy classifier bypass should not call the provider"
+    );
     let remember_requests = remember_provider.snapshot_main_requests();
     assert!(
         remember_requests.len() >= 2,
@@ -10999,7 +11003,10 @@ async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
     )
     .await;
 
-    assert_eq!(recall_provider.snapshot_policy_requests().len(), 1);
+    assert!(
+        recall_provider.snapshot_policy_requests().is_empty(),
+        "temporary memory policy classifier bypass should not call the provider"
+    );
     let recall_requests = recall_provider.snapshot_main_requests();
     assert_eq!(recall_requests.len(), 1);
     let recall_request = &recall_requests[0];
@@ -11086,7 +11093,10 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     )
     .await;
 
-    assert_eq!(forget_provider.snapshot_policy_requests().len(), 1);
+    assert!(
+        forget_provider.snapshot_policy_requests().is_empty(),
+        "temporary memory policy classifier bypass should not call the provider"
+    );
     let forget_requests = forget_provider.snapshot_main_requests();
     assert!(
         forget_requests.len() >= 3,
@@ -11096,9 +11106,12 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     assert_request_has_tool(first_forget_request, "memory_search");
     assert_request_has_tool(first_forget_request, "memory_get");
     assert_request_has_tool(first_forget_request, "memory_forget");
-    assert_request_lacks_tool(first_forget_request, "memory_remember");
+    assert_request_has_tool(first_forget_request, "memory_remember");
     assert!(compiled_prompt_text(first_forget_request).contains("## Memory Recall"));
-    assert!(compiled_prompt_text(first_forget_request).contains("only to identify and forget"));
+    assert!(
+        compiled_prompt_text(first_forget_request)
+            .contains("If the user asks you to forget something, call memory_forget.")
+    );
     assert!(
         has_tool_message_containing(&forget_requests[1], birthday_memory_id.as_str()),
         "memory_search result should reach the provider round that resolves forget target"
