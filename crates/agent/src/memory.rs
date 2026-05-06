@@ -772,6 +772,21 @@ enum ActiveMemoryDecisionReasonCode {
 }
 
 impl ActiveMemoryDecisionReasonCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyDisabled => "policy_disabled",
+            Self::ConfigDisabled => "config_disabled",
+            Self::DeterministicOnly => "deterministic_only",
+            Self::DeterministicSufficient => "deterministic_sufficient",
+            Self::TrivialSelfContained => "trivial_self_contained",
+            Self::MemoryLikely => "memory_likely",
+            Self::StrictDebug => "strict_debug",
+            Self::ProviderRun => "provider_run",
+            Self::ProviderSkip => "provider_skip",
+            Self::ProviderUncertain => "provider_uncertain",
+        }
+    }
+
     fn diagnostic_code(self) -> &'static str {
         match self {
             Self::PolicyDisabled => "memory.active_recall.policy_disabled",
@@ -1309,6 +1324,12 @@ impl HookHandler for ActiveMemoryRecallHook {
         response.diagnostics.extend(hook_diagnostics_from_strings(
             decision.diagnostics.as_slice(),
         ));
+        response
+            .diagnostics
+            .push(active_memory_decision_observability_diagnostic(
+                &decision,
+                &deterministic,
+            ));
 
         if decision.status != ActiveMemoryDecisionStatus::Run {
             response.diagnostics.push(memory_safe_info_diagnostic(
@@ -2050,6 +2071,32 @@ fn local_active_memory_decision(input_text: &str, diagnostic: &str) -> ActiveMem
         confidence: 0.65,
         query_hints: vec![MEMORY_ACTIVE_RECALL_GENERIC_QUERY.to_owned()],
         diagnostics,
+    }
+}
+
+fn active_memory_decision_observability_diagnostic(
+    decision: &ActiveMemoryDecision,
+    deterministic: &DeterministicRecallContextSummary,
+) -> HookDiagnostic {
+    memory_safe_info_diagnostic(
+        "memory.active_recall.decision",
+        format!(
+            "memory active recall decision: status={} reason={} confidence={:.2} deterministic_sufficient={} deterministic_contexts={} deterministic_chars={}",
+            active_memory_decision_status_name(decision.status),
+            decision.reason_code.as_str(),
+            decision.confidence,
+            deterministic.sufficient,
+            deterministic.context_count,
+            deterministic.context_chars
+        ),
+    )
+}
+
+fn active_memory_decision_status_name(status: ActiveMemoryDecisionStatus) -> &'static str {
+    match status {
+        ActiveMemoryDecisionStatus::Skip => "skip",
+        ActiveMemoryDecisionStatus::Run => "run",
+        ActiveMemoryDecisionStatus::Uncertain => "uncertain",
     }
 }
 
@@ -3606,6 +3653,16 @@ mod tests {
             .expect("active recall request recorded");
         assert_eq!(request.top_k, Some(5));
         assert_eq!(request.max_chars, Some(1_500));
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.decision"
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("deterministic_sufficient=false")
+        }));
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.context_contributed"
+        }));
         let contributions = response.contributions;
         assert_eq!(contributions.len(), 1);
         let HookContribution::PromptContext(context) = &contributions[0] else {
@@ -3625,6 +3682,94 @@ mod tests {
         );
         assert_eq!(context.source_refs.len(), 1);
         assert_eq!(context.source_refs[0].id.as_str(), "mem_active_project");
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_runs_for_memory_sensitive_turns() {
+        for input_text in [
+            "continue the previous architecture implementation with the same constraints",
+            "use my durable preferences and identity details when answering this",
+            "apply the project decisions and history from our earlier work",
+            "before answering, consider what we discussed in prior threads",
+        ] {
+            let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+                active_project_snapshot(),
+            ));
+            let hook = ActiveMemoryRecallHook {
+                memory_provider: provider.clone(),
+                decision_provider: None,
+                config: MemoryActiveRecallConfig {
+                    max_queries: 1,
+                    ..MemoryActiveRecallConfig::default()
+                },
+            };
+
+            let response = hook
+                .execute(test_active_prompt_context_hook_request(
+                    memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                    HookPromptContextSet::default(),
+                    input_text,
+                ))
+                .await
+                .expect("active recall hook executes");
+
+            assert_eq!(provider.recall_call_count(), 1, "{input_text}");
+            assert!(
+                response
+                    .contributions
+                    .iter()
+                    .any(|contribution| matches!(contribution, HookContribution::PromptContext(_))),
+                "{input_text}"
+            );
+            assert!(response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_str() == "memory.active_recall.decision"
+                    && diagnostic.message.as_str().contains("status=run")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_15_active_memory_hook_uses_valid_strict_json_query_hints() {
+        let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+            active_project_snapshot(),
+        ));
+        let hook = ActiveMemoryRecallHook {
+            memory_provider: provider.clone(),
+            decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
+                r#"{"status":"run","confidence":0.92,"queryHints":["project hook runtime constraints"],"diagnostics":["provider ok"]}"#,
+            ))),
+            config: MemoryActiveRecallConfig {
+                max_queries: 1,
+                ..MemoryActiveRecallConfig::default()
+            },
+        };
+
+        let response = hook
+            .execute(test_active_prompt_context_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                HookPromptContextSet::default(),
+                "finish the architecture task",
+            ))
+            .await
+            .expect("active recall hook executes");
+
+        assert_eq!(provider.recall_call_count(), 1);
+        let request = provider
+            .recall_requests()
+            .into_iter()
+            .next()
+            .expect("strict JSON query hint should drive recall");
+        assert_eq!(request.query, "project hook runtime constraints");
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.decision"
+                && diagnostic.message.as_str().contains("reason=provider_run")
+        }));
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.as_str().contains("provider ok") })
+        );
     }
 
     #[tokio::test]
