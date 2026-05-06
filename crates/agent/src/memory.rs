@@ -5,10 +5,10 @@ use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookContributionId,
     HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain,
     HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
-    HookId, HookInputPayload, HookKind, HookMetadata, HookPhase, HookPolicyKey, HookPromptContent,
-    HookRegistryError, HookResult, HookRuntime, HookSectionId, HookSubscription,
-    HookSubscriptionId, HookToolBundleId, HookToolName, HookValue, PolicyContribution,
-    PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
+    HookId, HookInputPayload, HookKind, HookMetadata, HookMetadataKey, HookPhase, HookPolicyKey,
+    HookPolicySet, HookPromptContent, HookRegistryError, HookResult, HookRuntime, HookSectionId,
+    HookSubscription, HookSubscriptionId, HookToolBundleId, HookToolName, HookValue,
+    PolicyContribution, PromptSectionContribution, ToolBundleContribution, TurnPrePolicyHookInput,
 };
 use pioneer_promt::{
     MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
@@ -17,12 +17,23 @@ use pioneer_promt::{
 use pioneer_protocol::{MemoryCategory, MemoryScope, MemoryScopeKind, ThreadMode};
 use pioneer_tools::ToolExtensionBundle;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
 pub const MEMORY_GET_TOOL: &str = "memory_get";
 pub const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
 pub const MEMORY_FORGET_TOOL: &str = "memory_forget";
+
+const MEMORY_POLICY_DOMAIN: &str = "memory";
+const MEMORY_TURN_POLICY_KEY: &str = "turn_policy";
+const MEMORY_POLICY_CLASSIFIER_HOOK_ID: &str = "memory.policy_classifier";
+const MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID: &str = "memory.policy_classifier.default";
+const MEMORY_TURN_POLICY_OVERRIDE_METADATA_KEY: &str = "memory.policy_classifier.override";
+const MEMORY_TURN_POLICY_DEFAULT_METADATA_KEY: &str = "memory.policy_classifier.default_policy";
+const MEMORY_TURN_POLICY_CLASSIFIER_ENABLED_METADATA_KEY: &str =
+    "memory.policy_classifier.classifier_enabled";
+const MEMORY_TURN_POLICY_FALLBACK_METADATA_KEY: &str = "memory.policy_classifier.fallback";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTurnContext {
@@ -83,12 +94,50 @@ pub enum MemoryRecallPolicy {
     Disabled,
 }
 
+impl MemoryRecallPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("recall")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryPromptPolicy {
     Full,
     ReadOnly,
     ForgetOnly,
     Disabled,
+}
+
+impl MemoryPromptPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReadOnly => "read_only",
+            Self::ForgetOnly => "forget_only",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "full" => Ok(Self::Full),
+            "read_only" => Ok(Self::ReadOnly),
+            "forget_only" => Ok(Self::ForgetOnly),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("prompt")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,10 +147,46 @@ pub enum MemoryReadToolPolicy {
     Disabled,
 }
 
+impl MemoryReadToolPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::ForgetOnly => "forget_only",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "forget_only" => Ok(Self::ForgetOnly),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("read_tools")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryMutationToolPolicy {
     Allow,
     Disabled,
+}
+
+impl MemoryMutationToolPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("mutation_tool")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,10 +195,46 @@ pub enum MemoryExtractionPolicy {
     Disabled,
 }
 
+impl MemoryExtractionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value(
+                "post_turn_extraction",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryActiveContextPolicy {
     Allow,
     Disabled,
+}
+
+impl MemoryActiveContextPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("active_memory")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +242,25 @@ pub enum MemoryPolicySource {
     StructuredOverride,
     PreMemoryClassifier,
     DefaultFallback,
+}
+
+impl MemoryPolicySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuredOverride => "structured_override",
+            Self::PreMemoryClassifier => "pre_memory_classifier",
+            Self::DefaultFallback => "default_fallback",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "structured_override" => Ok(Self::StructuredOverride),
+            "pre_memory_classifier" => Ok(Self::PreMemoryClassifier),
+            "default_fallback" => Ok(Self::DefaultFallback),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("source")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +294,23 @@ impl MemoryPolicyReasonCode {
             Self::MemoryRuntimeDisabled => "memory_runtime_disabled",
         }
     }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "default_allow_read" => Ok(Self::DefaultAllowRead),
+            "memory_no_use" => Ok(Self::MemoryNoUse),
+            "memory_no_save" => Ok(Self::MemoryNoSave),
+            "explicit_remember" => Ok(Self::ExplicitRemember),
+            "explicit_forget" => Ok(Self::ExplicitForget),
+            "structured_override" => Ok(Self::StructuredOverride),
+            "classifier_unavailable" => Ok(Self::ClassifierUnavailable),
+            "classifier_invalid_json" => Ok(Self::ClassifierInvalidJson),
+            "classifier_low_confidence" => Ok(Self::ClassifierLowConfidence),
+            "chat_mode_disabled" => Ok(Self::ChatModeDisabled),
+            "memory_runtime_disabled" => Ok(Self::MemoryRuntimeDisabled),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("reason_code")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +319,54 @@ pub enum MemoryClassifierFallbackPolicy {
     StrictDeny,
     AllowReadOnly,
 }
+
+impl MemoryClassifierFallbackPolicy {
+    fn from_str(value: &str) -> Result<Self, MemoryPolicyDecodeError> {
+        match value {
+            "default_allow" => Ok(Self::DefaultAllow),
+            "strict_deny" => Ok(Self::StrictDeny),
+            "allow_read_only" => Ok(Self::AllowReadOnly),
+            _ => Err(MemoryPolicyDecodeError::invalid_value("fallback")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPolicyDecodeError {
+    field: &'static str,
+    reason: &'static str,
+}
+
+impl MemoryPolicyDecodeError {
+    fn missing(field: &'static str) -> Self {
+        Self {
+            field,
+            reason: "missing",
+        }
+    }
+
+    fn invalid_type(field: &'static str) -> Self {
+        Self {
+            field,
+            reason: "invalid_type",
+        }
+    }
+
+    fn invalid_value(field: &'static str) -> Self {
+        Self {
+            field,
+            reason: "invalid_value",
+        }
+    }
+}
+
+impl fmt::Display for MemoryPolicyDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.field, self.reason)
+    }
+}
+
+impl std::error::Error for MemoryPolicyDecodeError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryTurnPolicy {
@@ -178,6 +383,7 @@ pub struct MemoryTurnPolicy {
     pub reason_code: MemoryPolicyReasonCode,
     pub confidence: f32,
     pub source: MemoryPolicySource,
+    pub detected_language: Option<String>,
     pub diagnostics: Vec<String>,
 }
 
@@ -197,6 +403,7 @@ impl MemoryTurnPolicy {
             reason_code: MemoryPolicyReasonCode::DefaultAllowRead,
             confidence: 1.0,
             source: MemoryPolicySource::PreMemoryClassifier,
+            detected_language: None,
             diagnostics: Vec::new(),
         }
     }
@@ -228,6 +435,7 @@ impl MemoryTurnPolicy {
             reason_code: MemoryPolicyReasonCode::ExplicitForget,
             confidence: 1.0,
             source: MemoryPolicySource::PreMemoryClassifier,
+            detected_language: None,
             diagnostics: Vec::new(),
         }
     }
@@ -247,6 +455,7 @@ impl MemoryTurnPolicy {
             reason_code: MemoryPolicyReasonCode::MemoryNoUse,
             confidence: 1.0,
             source: MemoryPolicySource::PreMemoryClassifier,
+            detected_language: None,
             diagnostics: Vec::new(),
         }
     }
@@ -266,6 +475,7 @@ impl MemoryTurnPolicy {
             reason_code: MemoryPolicyReasonCode::MemoryNoSave,
             confidence: 1.0,
             source: MemoryPolicySource::PreMemoryClassifier,
+            detected_language: None,
             diagnostics: Vec::new(),
         }
     }
@@ -300,6 +510,18 @@ impl MemoryTurnPolicy {
 
     pub fn with_diagnostic(mut self, diagnostic: impl Into<String>) -> Self {
         self.diagnostics.push(diagnostic.into());
+        self
+    }
+
+    pub fn with_detected_language(mut self, language: Option<String>) -> Self {
+        self.detected_language = language.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
         self
     }
 
@@ -409,7 +631,6 @@ pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
 #[derive(Clone)]
 struct MemoryHookTurnState {
     context: MemoryTurnContext,
-    policy: MemoryTurnPolicy,
     available_tool_names: Vec<String>,
 }
 
@@ -419,7 +640,7 @@ struct MemoryHookTurnStateStore {
 }
 
 impl MemoryHookTurnStateStore {
-    fn set_policy(&self, context: MemoryTurnContext, policy: MemoryTurnPolicy) {
+    fn set_turn_context(&self, context: MemoryTurnContext) {
         if let Ok(mut states) = self.states.lock() {
             states.insert(
                 memory_hook_state_key(
@@ -429,7 +650,6 @@ impl MemoryHookTurnStateStore {
                 ),
                 MemoryHookTurnState {
                     context,
-                    policy,
                     available_tool_names: Vec::new(),
                 },
             );
@@ -476,11 +696,11 @@ pub(crate) fn install_memory_hooks(
     let state = Arc::new(MemoryHookTurnStateStore::default());
     register_memory_hook_handler(
         runtime,
-        Arc::new(MemoryTurnPolicyHook {
+        Arc::new(MemoryPolicyClassifierHook {
             policy_provider,
             state: state.clone(),
         }),
-        "memory.turn_policy.default",
+        MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID,
         HookPhase::TurnPrePolicy,
         0,
     )?;
@@ -542,7 +762,7 @@ fn register_memory_hook_handler(
     Ok(())
 }
 
-struct MemoryTurnPolicyHook {
+struct MemoryPolicyClassifierHook {
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     state: Arc<MemoryHookTurnStateStore>,
 }
@@ -559,9 +779,9 @@ struct MemoryPromptSectionHook {
 }
 
 #[async_trait::async_trait]
-impl HookHandler for MemoryTurnPolicyHook {
+impl HookHandler for MemoryPolicyClassifierHook {
     fn id(&self) -> HookId {
-        HookId::new("memory.turn_policy").expect("static hook id is valid")
+        HookId::new(MEMORY_POLICY_CLASSIFIER_HOOK_ID).expect("static hook id is valid")
     }
 
     fn kind(&self) -> HookKind {
@@ -573,7 +793,7 @@ impl HookHandler for MemoryTurnPolicyHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_hook_capabilities()
+        memory_policy_classifier_capabilities()
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -600,12 +820,11 @@ impl HookHandler for MemoryTurnPolicyHook {
             model: input.model.clone(),
             model_provider: input.model_provider.clone(),
         };
-        let policy = resolve_memory_turn_policy(
-            self.policy_provider.as_ref(),
-            context,
-            MemoryTurnPolicyRequest::default(),
-        )
-        .await;
+        let (policy_request, request_diagnostics) =
+            memory_turn_policy_request_from_metadata(&request.context.metadata);
+        let policy =
+            resolve_memory_turn_policy(self.policy_provider.as_ref(), context, policy_request)
+                .await;
         let turn_context = MemoryTurnContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -615,10 +834,15 @@ impl HookHandler for MemoryTurnPolicyHook {
             task_id: None,
             agent_id: None,
         };
-        self.state.set_policy(turn_context, policy.clone());
+        self.state.set_turn_context(turn_context);
 
         let mut response = HookHandlerResponse::default();
-        response.diagnostics = hook_diagnostics_from_strings(policy.diagnostics.as_slice());
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            request_diagnostics.as_slice(),
+        ));
+        response
+            .diagnostics
+            .extend(hook_diagnostics_from_strings(policy.diagnostics.as_slice()));
         response
             .contributions
             .push(HookContribution::Policy(memory_policy_contribution(
@@ -650,8 +874,23 @@ impl HookHandler for MemoryToolMaterializationHook {
         let Some(state) = self.state.state(&request) else {
             return Ok(memory_missing_state_response("memory.tool_materialization"));
         };
-        if !turn_pre_tool_materialization_allows_tools(&request)
-            || !state.policy.allows_any_memory_tool()
+        let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => {
+                let mut response = HookHandlerResponse::default();
+                response.diagnostics.push(memory_hook_diagnostic(
+                    "memory.policy_decode_failed",
+                    format!("memory tool materialization skipped: {error}"),
+                ));
+                return Ok(response);
+            }
+            None => {
+                return Ok(memory_missing_policy_response(
+                    "memory.tool_materialization",
+                ));
+            }
+        };
+        if !turn_pre_tool_materialization_allows_tools(&request) || !policy.allows_any_memory_tool()
         {
             return Ok(HookHandlerResponse::default());
         }
@@ -661,9 +900,7 @@ impl HookHandler for MemoryToolMaterializationHook {
             .materialize_memory_tools(state.context.clone())
             .await
         {
-            Ok(materialization) => {
-                filter_memory_tool_materialization(materialization, &state.policy)
-            }
+            Ok(materialization) => filter_memory_tool_materialization(materialization, &policy),
             Err(error) => {
                 let mut response = HookHandlerResponse::default();
                 response
@@ -723,12 +960,24 @@ impl HookHandler for MemoryPromptSectionHook {
         let Some(state) = self.state.state(&request) else {
             return Ok(memory_missing_state_response("memory.prompt_section"));
         };
+        let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => {
+                let mut response = HookHandlerResponse::default();
+                response.diagnostics.push(memory_hook_diagnostic(
+                    "memory.policy_decode_failed",
+                    format!("memory prompt section skipped: {error}"),
+                ));
+                return Ok(response);
+            }
+            None => return Ok(memory_missing_policy_response("memory.prompt_section")),
+        };
         if state.available_tool_names.is_empty() {
             return Ok(HookHandlerResponse::default());
         }
 
         let mut response = HookHandlerResponse::default();
-        let recall_snapshot = if state.policy.allow_pre_turn_recall() {
+        let recall_snapshot = if policy.allow_pre_turn_recall() {
             match self
                 .memory_provider
                 .recall_memory(
@@ -754,8 +1003,8 @@ impl HookHandler for MemoryPromptSectionHook {
             MemoryRecallSnapshot::empty()
         };
 
-        if state.policy.allow_memory_prompt()
-            && let Some(prompt_policy) = state.policy.recall_prompt_policy()
+        if policy.allow_memory_prompt()
+            && let Some(prompt_policy) = policy.recall_prompt_policy()
             && let Some(contribution) = memory_recall_prompt_section_contribution(
                 state.available_tool_names,
                 prompt_policy,
@@ -778,6 +1027,14 @@ fn memory_hook_capabilities() -> HookCapabilities {
         HookCapability::new("contribute_policy").expect("static capability is valid"),
         HookCapability::new("contribute_prompt_section").expect("static capability is valid"),
         HookCapability::new("contribute_tool_bundle").expect("static capability is valid"),
+    ])
+}
+
+fn memory_policy_classifier_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("call_provider").expect("static capability is valid"),
+        HookCapability::new("contribute_policy").expect("static capability is valid"),
     ])
 }
 
@@ -809,11 +1066,231 @@ fn required_context_id<'a>(value: Option<&'a str>, field: &'static str) -> HookR
 
 fn memory_policy_contribution(policy: &MemoryTurnPolicy) -> PolicyContribution {
     PolicyContribution {
-        domain: HookDomain::new("memory").expect("static domain is valid"),
-        key: HookPolicyKey::new("turn_policy").expect("static policy key is valid"),
-        value: HookValue::Text(policy.reason_code.as_str().to_owned()),
+        domain: memory_policy_domain(),
+        key: memory_turn_policy_key(),
+        value: memory_turn_policy_to_hook_value(policy),
         priority: 500,
-        diagnostics: Vec::new(),
+        diagnostics: hook_diagnostics_from_strings(policy.diagnostics.as_slice()),
+    }
+}
+
+pub(crate) fn memory_turn_policy_to_hook_value(policy: &MemoryTurnPolicy) -> HookValue {
+    let mut object = BTreeMap::new();
+    insert_policy_text(&mut object, "recall", policy.recall.as_str());
+    insert_policy_text(&mut object, "prompt", policy.prompt.as_str());
+    insert_policy_text(&mut object, "read_tools", policy.read_tools.as_str());
+    insert_policy_text(&mut object, "remember_tool", policy.remember_tool.as_str());
+    insert_policy_text(&mut object, "forget_tool", policy.forget_tool.as_str());
+    insert_policy_text(
+        &mut object,
+        "post_turn_extraction",
+        policy.post_turn_extraction.as_str(),
+    );
+    insert_policy_text(&mut object, "active_memory", policy.active_memory.as_str());
+    insert_policy_bool(&mut object, "explicit_remember", policy.explicit_remember);
+    insert_policy_bool(&mut object, "explicit_forget", policy.explicit_forget);
+    insert_policy_text_optional(
+        &mut object,
+        "forget_target_hint",
+        policy.forget_target_hint.as_deref(),
+    );
+    insert_policy_text(&mut object, "reason_code", policy.reason_code.as_str());
+    object.insert(
+        hook_metadata_key("confidence"),
+        HookValue::F64(policy.confidence.clamp(0.0, 1.0) as f64),
+    );
+    insert_policy_text(&mut object, "source", policy.source.as_str());
+    insert_policy_text_optional(
+        &mut object,
+        "detected_language",
+        policy.detected_language.as_deref(),
+    );
+    if !policy.diagnostics.is_empty() {
+        object.insert(
+            hook_metadata_key("diagnostics_summary"),
+            HookValue::List(
+                policy
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| HookValue::Text(safe_memory_policy_diagnostic(diagnostic)))
+                    .collect(),
+            ),
+        );
+    }
+    HookValue::Object(object)
+}
+
+pub(crate) fn memory_turn_policy_from_hook_value(
+    value: &HookValue,
+) -> Result<MemoryTurnPolicy, MemoryPolicyDecodeError> {
+    let HookValue::Object(object) = value else {
+        return Err(MemoryPolicyDecodeError::invalid_type("turn_policy"));
+    };
+
+    let mut policy = MemoryTurnPolicy {
+        recall: MemoryRecallPolicy::from_str(required_text(object, "recall")?)?,
+        prompt: MemoryPromptPolicy::from_str(required_text(object, "prompt")?)?,
+        read_tools: MemoryReadToolPolicy::from_str(required_text(object, "read_tools")?)?,
+        remember_tool: MemoryMutationToolPolicy::from_str(required_text(object, "remember_tool")?)?,
+        forget_tool: MemoryMutationToolPolicy::from_str(required_text(object, "forget_tool")?)?,
+        post_turn_extraction: MemoryExtractionPolicy::from_str(required_text(
+            object,
+            "post_turn_extraction",
+        )?)?,
+        active_memory: MemoryActiveContextPolicy::from_str(required_text(
+            object,
+            "active_memory",
+        )?)?,
+        explicit_remember: required_bool(object, "explicit_remember")?,
+        explicit_forget: required_bool(object, "explicit_forget")?,
+        forget_target_hint: optional_text(object, "forget_target_hint")?,
+        reason_code: MemoryPolicyReasonCode::from_str(required_text(object, "reason_code")?)?,
+        confidence: required_f32(object, "confidence")?.clamp(0.0, 1.0),
+        source: MemoryPolicySource::from_str(required_text(object, "source")?)?,
+        detected_language: optional_text(object, "detected_language")?,
+        diagnostics: optional_text_list(object, "diagnostics_summary")?,
+    };
+    policy.detected_language = policy.detected_language.and_then(|language| {
+        let trimmed = language.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    });
+    Ok(policy)
+}
+
+pub(crate) fn memory_turn_policy_from_hook_policy_set(
+    policy_set: &HookPolicySet,
+) -> Option<Result<MemoryTurnPolicy, MemoryPolicyDecodeError>> {
+    policy_set
+        .get(&memory_policy_domain(), &memory_turn_policy_key())
+        .map(|entry| memory_turn_policy_from_hook_value(&entry.value))
+}
+
+fn memory_policy_domain() -> HookDomain {
+    HookDomain::new(MEMORY_POLICY_DOMAIN).expect("static domain is valid")
+}
+
+fn memory_turn_policy_key() -> HookPolicyKey {
+    HookPolicyKey::new(MEMORY_TURN_POLICY_KEY).expect("static policy key is valid")
+}
+
+fn hook_metadata_key(key: &'static str) -> HookMetadataKey {
+    HookMetadataKey::new(key).expect("static metadata key is valid")
+}
+
+fn insert_policy_text(
+    object: &mut BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+    value: &'static str,
+) {
+    object.insert(hook_metadata_key(key), HookValue::Text(value.to_owned()));
+}
+
+fn insert_policy_text_optional(
+    object: &mut BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+    value: Option<&str>,
+) {
+    match value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        Some(value) => {
+            object.insert(hook_metadata_key(key), HookValue::Text(value.to_owned()));
+        }
+        None => {
+            object.insert(hook_metadata_key(key), HookValue::Null);
+        }
+    }
+}
+
+fn insert_policy_bool(
+    object: &mut BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+    value: bool,
+) {
+    object.insert(hook_metadata_key(key), HookValue::Bool(value));
+}
+
+fn required_value<'a>(
+    object: &'a BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<&'a HookValue, MemoryPolicyDecodeError> {
+    object
+        .get(&hook_metadata_key(key))
+        .ok_or_else(|| MemoryPolicyDecodeError::missing(key))
+}
+
+fn required_text<'a>(
+    object: &'a BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<&'a str, MemoryPolicyDecodeError> {
+    match required_value(object, key)? {
+        HookValue::Text(value) if !value.trim().is_empty() => Ok(value.trim()),
+        _ => Err(MemoryPolicyDecodeError::invalid_type(key)),
+    }
+}
+
+fn optional_text(
+    object: &BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<Option<String>, MemoryPolicyDecodeError> {
+    match object.get(&hook_metadata_key(key)) {
+        None | Some(HookValue::Null) => Ok(None),
+        Some(HookValue::Text(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_owned()))
+            }
+        }
+        Some(_) => Err(MemoryPolicyDecodeError::invalid_type(key)),
+    }
+}
+
+fn required_bool(
+    object: &BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<bool, MemoryPolicyDecodeError> {
+    match required_value(object, key)? {
+        HookValue::Bool(value) => Ok(*value),
+        _ => Err(MemoryPolicyDecodeError::invalid_type(key)),
+    }
+}
+
+fn required_f32(
+    object: &BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<f32, MemoryPolicyDecodeError> {
+    match required_value(object, key)? {
+        HookValue::F64(value) => Ok(*value as f32),
+        HookValue::I64(value) => Ok(*value as f32),
+        _ => Err(MemoryPolicyDecodeError::invalid_type(key)),
+    }
+}
+
+fn optional_text_list(
+    object: &BTreeMap<HookMetadataKey, HookValue>,
+    key: &'static str,
+) -> Result<Vec<String>, MemoryPolicyDecodeError> {
+    match object.get(&hook_metadata_key(key)) {
+        None | Some(HookValue::Null) => Ok(Vec::new()),
+        Some(HookValue::List(values)) => values
+            .iter()
+            .map(|value| match value {
+                HookValue::Text(text) => Ok(safe_memory_policy_diagnostic(text)),
+                _ => Err(MemoryPolicyDecodeError::invalid_type(key)),
+            })
+            .collect(),
+        Some(_) => Err(MemoryPolicyDecodeError::invalid_type(key)),
     }
 }
 
@@ -862,6 +1339,15 @@ fn memory_missing_state_response(hook: &'static str) -> HookHandlerResponse {
     response
 }
 
+fn memory_missing_policy_response(hook: &'static str) -> HookHandlerResponse {
+    let mut response = HookHandlerResponse::default();
+    response.diagnostics.push(memory_hook_diagnostic(
+        "memory.missing_policy",
+        format!("{hook} skipped because memory hook policy was unavailable"),
+    ));
+    response
+}
+
 fn memory_hook_diagnostic(code: &'static str, message: impl Into<String>) -> HookDiagnostic {
     HookDiagnostic {
         code: HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
@@ -878,6 +1364,68 @@ fn memory_hook_error(code: &'static str, message: impl Into<String>) -> HookErro
         HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
         HookDiagnosticMessage::new(message.into()).expect("hook error message should be non-empty"),
     )
+}
+
+fn memory_turn_policy_request_from_metadata(
+    metadata: &HookMetadata,
+) -> (MemoryTurnPolicyRequest, Vec<String>) {
+    let mut request = MemoryTurnPolicyRequest::default();
+    let mut diagnostics = Vec::new();
+
+    if let Some(value) = metadata.get(&hook_metadata_key(MEMORY_TURN_POLICY_DEFAULT_METADATA_KEY)) {
+        match memory_turn_policy_from_hook_value(value) {
+            Ok(default_policy) => request.default_policy = default_policy,
+            Err(error) => diagnostics.push(format!(
+                "memory.policy.metadata_invalid: default_policy {error}"
+            )),
+        }
+    }
+
+    if let Some(value) = metadata.get(&hook_metadata_key(MEMORY_TURN_POLICY_OVERRIDE_METADATA_KEY))
+    {
+        match memory_turn_policy_from_hook_value(value) {
+            Ok(policy) => {
+                request.structured_override = Some(MemoryTurnPolicyOverride::new(policy));
+            }
+            Err(error) => {
+                diagnostics.push(format!("memory.policy.metadata_invalid: override {error}"))
+            }
+        }
+    }
+
+    if let Some(value) = metadata.get(&hook_metadata_key(
+        MEMORY_TURN_POLICY_CLASSIFIER_ENABLED_METADATA_KEY,
+    )) {
+        match value {
+            HookValue::Bool(enabled) => request.classifier_enabled = *enabled,
+            _ => diagnostics
+                .push("memory.policy.metadata_invalid: classifier_enabled invalid_type".to_owned()),
+        }
+    }
+
+    if let Some(value) = metadata.get(&hook_metadata_key(MEMORY_TURN_POLICY_FALLBACK_METADATA_KEY))
+    {
+        match value {
+            HookValue::Text(fallback) => match MemoryClassifierFallbackPolicy::from_str(fallback) {
+                Ok(fallback) => request.fallback = fallback,
+                Err(error) => {
+                    diagnostics.push(format!("memory.policy.metadata_invalid: fallback {error}"))
+                }
+            },
+            _ => {
+                diagnostics.push("memory.policy.metadata_invalid: fallback invalid_type".to_owned())
+            }
+        }
+    }
+
+    (request, diagnostics)
+}
+
+fn safe_memory_policy_diagnostic(message: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 300;
+    let mut safe = message.replace(['\r', '\n'], " ");
+    safe.truncate(MAX_DIAGNOSTIC_CHARS);
+    safe
 }
 
 pub(crate) async fn resolve_memory_turn_policy(
@@ -924,12 +1472,18 @@ pub(crate) async fn resolve_memory_turn_policy(
         .await
     {
         Ok(policy) => policy,
-        Err(error) => fallback_policy(
-            request.default_policy,
-            request.fallback,
-            fallback_reason_for_classifier_error(error.as_str()),
-            Some(format!("memory.policy.classifier_failed: {error}")),
-        ),
+        Err(error) => {
+            let reason_code = fallback_reason_for_classifier_error(error.as_str());
+            fallback_policy(
+                request.default_policy,
+                request.fallback,
+                reason_code,
+                Some(format!(
+                    "memory.policy.classifier_failed: reason={}",
+                    reason_code.as_str()
+                )),
+            )
+        }
     }
 }
 
@@ -963,7 +1517,10 @@ fn fallback_policy(
         }
     };
     if let Some(diagnostic) = diagnostic {
-        policy.diagnostics.push(diagnostic.into());
+        let diagnostic: String = diagnostic.into();
+        policy
+            .diagnostics
+            .push(safe_memory_policy_diagnostic(diagnostic.as_str()));
     }
     policy
 }
@@ -1125,6 +1682,9 @@ fn category_label(category: MemoryCategory) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_hooks::{
+        HookContext, HookInput, HookPromptContextSet, HookThreadId, HookTurnId, HookWorkspaceId,
+    };
     use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use serde_json::json;
 
@@ -1141,6 +1701,7 @@ mod tests {
         assert!(default_policy.allow_pre_turn_recall());
         assert!(default_policy.allows_memory_tool(MEMORY_SEARCH_TOOL));
         assert!(default_policy.allows_memory_tool(MEMORY_REMEMBER_TOOL));
+        assert_eq!(default_policy.detected_language, None);
         assert_eq!(
             default_policy.post_turn_extraction,
             MemoryExtractionPolicy::Disabled
@@ -1158,6 +1719,207 @@ mod tests {
         assert!(forget.allows_memory_tool(MEMORY_GET_TOOL));
         assert!(!forget.allows_memory_tool(MEMORY_REMEMBER_TOOL));
         assert!(forget.allows_memory_tool(MEMORY_FORGET_TOOL));
+    }
+
+    #[test]
+    fn memory_turn_policy_hook_value_roundtrips_full_policy() {
+        let policy = MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned()))
+            .with_detected_language(Some("ru".to_owned()))
+            .with_diagnostic("memory.policy.resolved: safe");
+
+        let value = memory_turn_policy_to_hook_value(&policy);
+        let decoded =
+            memory_turn_policy_from_hook_value(&value).expect("policy hook value decodes");
+
+        assert_eq!(decoded, policy);
+        let HookValue::Object(object) = value else {
+            panic!("policy should be encoded as object");
+        };
+        assert!(object.contains_key(&hook_metadata_key("recall")));
+        assert!(object.contains_key(&hook_metadata_key("remember_tool")));
+        assert!(object.contains_key(&hook_metadata_key("detected_language")));
+        assert!(object.contains_key(&hook_metadata_key("diagnostics_summary")));
+    }
+
+    #[test]
+    fn memory_policy_contribution_emits_full_policy_object() {
+        let policy = MemoryTurnPolicy::no_save().with_detected_language(Some("de".to_owned()));
+        let contribution = memory_policy_contribution(&policy);
+
+        assert_eq!(contribution.domain.as_str(), MEMORY_POLICY_DOMAIN);
+        assert_eq!(contribution.key.as_str(), MEMORY_TURN_POLICY_KEY);
+        let decoded = memory_turn_policy_from_hook_value(&contribution.value)
+            .expect("contribution should contain full policy");
+        assert_eq!(decoded, policy);
+        assert_ne!(
+            contribution.value,
+            HookValue::Text(MemoryPolicyReasonCode::MemoryNoSave.as_str().to_owned())
+        );
+    }
+
+    #[test]
+    fn memory_turn_policy_decodes_from_hook_policy_set() {
+        let policy =
+            MemoryTurnPolicy::explicit_remember().with_detected_language(Some("es".into()));
+        let set = HookPolicySet::merge_contributions([memory_policy_contribution(&policy)]);
+
+        let decoded = memory_turn_policy_from_hook_policy_set(&set)
+            .expect("memory policy entry exists")
+            .expect("memory policy entry decodes");
+
+        assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn memory_turn_policy_from_hook_policy_set_reports_malformed_policy() {
+        let malformed = PolicyContribution {
+            domain: memory_policy_domain(),
+            key: memory_turn_policy_key(),
+            value: HookValue::Text("memory_no_use".to_owned()),
+            priority: 500,
+            diagnostics: Vec::new(),
+        };
+        let set = HookPolicySet::merge_contributions([malformed]);
+
+        let decoded =
+            memory_turn_policy_from_hook_policy_set(&set).expect("memory policy entry exists");
+
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn memory_policy_classifier_hook_descriptor_is_stable_and_narrow() {
+        let hook = MemoryPolicyClassifierHook {
+            policy_provider: None,
+            state: Arc::new(MemoryHookTurnStateStore::default()),
+        };
+
+        assert_eq!(hook.id().as_str(), MEMORY_POLICY_CLASSIFIER_HOOK_ID);
+        assert_eq!(hook.supported_phases(), vec![HookPhase::TurnPrePolicy]);
+        let capabilities = hook.capabilities();
+        assert!(capabilities.contains(
+            &HookCapability::new("contribute_policy").expect("static capability is valid")
+        ));
+        assert!(
+            capabilities.contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+        assert!(!capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
+        ));
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_policy_classifier_hook_uses_metadata_structured_override() {
+        struct PanickingProvider;
+
+        #[async_trait::async_trait]
+        impl AgentMemoryTurnPolicyProvider for PanickingProvider {
+            async fn resolve_memory_turn_policy(
+                &self,
+                _context: MemoryTurnPolicyContext,
+                _request: MemoryTurnPolicyRequest,
+            ) -> Result<MemoryTurnPolicy, String> {
+                panic!("structured override should bypass classifier provider")
+            }
+        }
+
+        let hook = MemoryPolicyClassifierHook {
+            policy_provider: Some(Arc::new(PanickingProvider)),
+            state: Arc::new(MemoryHookTurnStateStore::default()),
+        };
+        let mut metadata = HookMetadata::default();
+        metadata.insert(
+            hook_metadata_key(MEMORY_TURN_POLICY_OVERRIDE_METADATA_KEY),
+            memory_turn_policy_to_hook_value(&MemoryTurnPolicy::no_use()),
+        );
+
+        let response = hook
+            .execute(test_policy_hook_request(metadata))
+            .await
+            .expect("hook executes");
+
+        let contribution = response
+            .contributions
+            .into_iter()
+            .find_map(|contribution| match contribution {
+                HookContribution::Policy(policy) => Some(policy),
+                _ => None,
+            })
+            .expect("policy contribution exists");
+        let policy = memory_turn_policy_from_hook_value(&contribution.value)
+            .expect("policy contribution decodes");
+
+        assert_eq!(policy.source, MemoryPolicySource::StructuredOverride);
+        assert!(!policy.allow_pre_turn_recall());
+        assert!(!policy.allows_any_memory_tool());
+    }
+
+    #[tokio::test]
+    async fn memory_policy_classifier_hook_accepts_structured_override_variants() {
+        let variants = vec![
+            MemoryTurnPolicy::no_use(),
+            MemoryTurnPolicy::no_save(),
+            MemoryTurnPolicy::explicit_remember(),
+            MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned())),
+        ];
+
+        for expected in variants {
+            let hook = MemoryPolicyClassifierHook {
+                policy_provider: None,
+                state: Arc::new(MemoryHookTurnStateStore::default()),
+            };
+            let mut metadata = HookMetadata::default();
+            metadata.insert(
+                hook_metadata_key(MEMORY_TURN_POLICY_OVERRIDE_METADATA_KEY),
+                memory_turn_policy_to_hook_value(&expected),
+            );
+
+            let response = hook
+                .execute(test_policy_hook_request(metadata))
+                .await
+                .expect("hook executes");
+            let contribution = response
+                .contributions
+                .into_iter()
+                .find_map(|contribution| match contribution {
+                    HookContribution::Policy(policy) => Some(policy),
+                    _ => None,
+                })
+                .expect("policy contribution exists");
+            let policy = memory_turn_policy_from_hook_value(&contribution.value)
+                .expect("policy contribution decodes");
+
+            assert_eq!(policy.recall, expected.recall);
+            assert_eq!(policy.prompt, expected.prompt);
+            assert_eq!(policy.read_tools, expected.read_tools);
+            assert_eq!(policy.remember_tool, expected.remember_tool);
+            assert_eq!(policy.forget_tool, expected.forget_tool);
+            assert_eq!(policy.post_turn_extraction, expected.post_turn_extraction);
+            assert_eq!(policy.active_memory, expected.active_memory);
+            assert_eq!(policy.explicit_remember, expected.explicit_remember);
+            assert_eq!(policy.explicit_forget, expected.explicit_forget);
+            assert_eq!(policy.forget_target_hint, expected.forget_target_hint);
+            assert_eq!(policy.source, MemoryPolicySource::StructuredOverride);
+            assert_eq!(
+                policy.reason_code,
+                MemoryPolicyReasonCode::StructuredOverride
+            );
+        }
     }
 
     #[tokio::test]
@@ -1345,6 +2107,28 @@ mod tests {
             }),
             "agent:agent_123"
         );
+    }
+
+    fn test_policy_hook_request(metadata: HookMetadata) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_POLICY_CLASSIFIER_HOOK_ID)
+                .expect("static hook id is valid"),
+            phase: HookPhase::TurnPrePolicy,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                metadata,
+                ..HookContext::default()
+            },
+            input: HookInput::turn_pre_policy(TurnPrePolicyHookInput::from_parts(
+                "No guardes esto.",
+                Some("test-model"),
+                Some("test-provider"),
+            )),
+            policy_set: HookPolicySet::empty(),
+            prompt_context_set: HookPromptContextSet::default(),
+        }
     }
 
     fn test_tool_spec(name: &str) -> ConfiguredToolSpec {

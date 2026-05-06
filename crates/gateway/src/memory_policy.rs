@@ -112,6 +112,7 @@ pub(crate) fn parse_memory_turn_policy_response(
         reason_code,
         confidence: parsed.confidence,
         source: MemoryPolicySource::PreMemoryClassifier,
+        detected_language: normalized_language(parsed.language.as_str()),
         diagnostics: Vec::new(),
     };
     policy.diagnostics.push(format!(
@@ -122,6 +123,15 @@ pub(crate) fn parse_memory_turn_policy_response(
         parsed.language.trim()
     ));
     Ok(policy)
+}
+
+fn normalized_language(language: &str) -> Option<String> {
+    let language = language.trim();
+    if language.is_empty() {
+        None
+    } else {
+        Some(language.to_owned())
+    }
 }
 
 fn parse_reason_code(value: &str) -> Result<MemoryPolicyReasonCode, String> {
@@ -291,6 +301,131 @@ impl From<ClassifierActiveContextPolicy> for MemoryActiveContextPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+    use pioneer_provider::{ChatResponse, Provider, StreamChunk};
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn classifier_request_sends_no_tools_or_compiled_prompt() {
+        struct CapturingProvider {
+            request: Arc<Mutex<Option<ChatRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for CapturingProvider {
+            fn name(&self) -> &str {
+                "capture"
+            }
+
+            async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+                *self.request.lock().expect("request lock poisoned") = Some(request);
+                Ok(ChatResponse {
+                    text: r#"{
+                        "intent": "normal",
+                        "recall": "allow",
+                        "prompt": "full",
+                        "readTools": "allow",
+                        "rememberTool": "allow",
+                        "forgetTool": "allow",
+                        "postTurnExtraction": "disabled",
+                        "activeMemory": "disabled",
+                        "explicitRemember": false,
+                        "explicitForget": false,
+                        "forgetTargetHint": null,
+                        "language": "und",
+                        "confidence": 0.72,
+                        "reasonCode": "default_allow_read"
+                    }"#
+                    .to_owned(),
+                    usage: None,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                })
+            }
+
+            async fn stream_chat(
+                &self,
+                _request: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                Ok(futures_util::stream::empty().boxed())
+            }
+        }
+
+        let captured_request = Arc::new(Mutex::new(None));
+        let provider = Arc::new(CapturingProvider {
+            request: captured_request.clone(),
+        });
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+        let gateway_provider = GatewayMemoryTurnPolicyProvider::new(registry);
+
+        let policy = gateway_provider
+            .resolve_memory_turn_policy(
+                MemoryTurnPolicyContext {
+                    workspace_id: "ws".to_owned(),
+                    thread_id: "thread".to_owned(),
+                    turn_id: "turn".to_owned(),
+                    input_text: "No guardes esto.".to_owned(),
+                    mode: ThreadMode::Agent,
+                    model: Some("test-model".to_owned()),
+                    model_provider: Some("capture".to_owned()),
+                },
+                MemoryTurnPolicyRequest::default(),
+            )
+            .await
+            .expect("classifier request succeeds");
+
+        assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
+        let request = captured_request
+            .lock()
+            .expect("request lock poisoned")
+            .clone()
+            .expect("request captured");
+        assert_eq!(request.model, "test-model");
+        assert_eq!(request.temperature, Some(0.0));
+        assert!(request.tools.is_none());
+        assert!(request.compiled_prompt.is_none());
+        let classifier_prompt = request
+            .messages
+            .first()
+            .expect("classifier prompt message exists")
+            .content
+            .as_str();
+        assert!(classifier_prompt.contains("No guardes esto."));
+        assert!(classifier_prompt.contains("Do not search memory"));
+        assert!(!classifier_prompt.contains("## Memory Recall"));
+    }
+
+    #[test]
+    fn parses_normal_default_allow_policy() {
+        let policy = parse_memory_turn_policy_response(
+            r#"{
+                "intent": "normal",
+                "recall": "allow",
+                "prompt": "full",
+                "readTools": "allow",
+                "rememberTool": "allow",
+                "forgetTool": "allow",
+                "postTurnExtraction": "disabled",
+                "activeMemory": "disabled",
+                "explicitRemember": false,
+                "explicitForget": false,
+                "forgetTargetHint": null,
+                "language": "und",
+                "confidence": 0.83,
+                "reasonCode": "default_allow_read"
+            }"#,
+        )
+        .expect("valid normal classifier policy");
+
+        assert_eq!(policy.recall, MemoryRecallPolicy::Allow);
+        assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
+        assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
+        assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
+        assert_eq!(policy.detected_language.as_deref(), Some("und"));
+    }
 
     #[test]
     fn parses_no_use_policy() {
@@ -321,6 +456,7 @@ mod tests {
         assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Disabled);
         assert_eq!(policy.reason_code, MemoryPolicyReasonCode::MemoryNoUse);
         assert_eq!(policy.source, MemoryPolicySource::PreMemoryClassifier);
+        assert_eq!(policy.detected_language.as_deref(), Some("es"));
     }
 
     #[test]
@@ -350,10 +486,46 @@ mod tests {
         assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
         assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Disabled);
         assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.detected_language.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn parses_explicit_forget_policy() {
+        let policy = parse_memory_turn_policy_response(
+            r#"{
+                "intent": "explicit_forget",
+                "recall": "disabled",
+                "prompt": "forget_only",
+                "readTools": "forget_only",
+                "rememberTool": "disabled",
+                "forgetTool": "allow",
+                "postTurnExtraction": "disabled",
+                "activeMemory": "disabled",
+                "explicitRemember": false,
+                "explicitForget": true,
+                "forgetTargetHint": "birthday",
+                "language": "en",
+                "confidence": 0.94,
+                "reasonCode": "explicit_forget"
+            }"#,
+        )
+        .expect("valid forget classifier policy");
+
+        assert_eq!(policy.recall, MemoryRecallPolicy::Disabled);
+        assert_eq!(policy.prompt, MemoryPromptPolicy::ForgetOnly);
+        assert_eq!(policy.read_tools, MemoryReadToolPolicy::ForgetOnly);
+        assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Disabled);
+        assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert!(policy.explicit_forget);
+        assert_eq!(policy.forget_target_hint.as_deref(), Some("birthday"));
+        assert_eq!(policy.reason_code, MemoryPolicyReasonCode::ExplicitForget);
     }
 
     #[test]
     fn rejects_unknown_enum_values_and_invalid_confidence() {
+        let invalid_json = parse_memory_turn_policy_response("{not json");
+        assert!(invalid_json.is_err());
+
         let unknown = parse_memory_turn_policy_response(
             r#"{
                 "intent": "normal",

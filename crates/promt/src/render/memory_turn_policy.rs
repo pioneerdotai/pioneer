@@ -72,6 +72,9 @@ mod tests {
         assert!(prompt.contains("explicit_forget"));
         assert!(prompt.contains("Do not search memory"));
         assert!(prompt.contains("No guardes esto."));
+        assert!(!prompt.contains("## Memory Recall"));
+        assert!(!prompt.contains("Relevant memories"));
+        assert!(!prompt.contains("\"tools\""));
     }
 
     #[test]

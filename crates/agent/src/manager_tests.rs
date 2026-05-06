@@ -5,6 +5,7 @@ use super::{
     MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
     ToolLoopConfig, TurnExecutionControl,
 };
+use crate::memory::memory_turn_policy_from_hook_policy_set;
 use futures_util::StreamExt;
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
@@ -4354,6 +4355,72 @@ async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
             .full_system_text
             .contains("Do not store, update, infer, or extract new memories")
     );
+}
+
+#[tokio::test]
+async fn phase_12_memory_policy_classifier_contributes_full_hook_policy() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::no_save().with_detected_language(Some("de".to_owned())),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase12_memory_policy_payload",
+        "ws_phase12_memory_policy_payload",
+        "turn_phase12_memory_policy_payload",
+        ThreadMode::Agent,
+        "capture",
+        "Speichere das nicht.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_context = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptContext)
+        .expect("pre-prompt-context hook called");
+    let policy = memory_turn_policy_from_hook_policy_set(&pre_prompt_context.policy_set)
+        .expect("memory policy exists")
+        .expect("memory policy decodes from hook policy set");
+
+    assert_eq!(
+        policy.reason_code,
+        super::MemoryPolicyReasonCode::MemoryNoSave
+    );
+    assert_eq!(policy.detected_language.as_deref(), Some("de"));
+    assert_eq!(
+        policy.remember_tool,
+        super::MemoryMutationToolPolicy::Disabled
+    );
+    assert_eq!(policy.read_tools, super::MemoryReadToolPolicy::Allow);
 }
 
 #[tokio::test]
