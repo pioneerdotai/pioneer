@@ -34,6 +34,10 @@ const MEMORY_TURN_POLICY_DEFAULT_METADATA_KEY: &str = "memory.policy_classifier.
 const MEMORY_TURN_POLICY_CLASSIFIER_ENABLED_METADATA_KEY: &str =
     "memory.policy_classifier.classifier_enabled";
 const MEMORY_TURN_POLICY_FALLBACK_METADATA_KEY: &str = "memory.policy_classifier.fallback";
+const MEMORY_TOOL_BUNDLE_HOOK_ID: &str = "memory.tool_bundle";
+const MEMORY_TOOL_BUNDLE_SUBSCRIPTION_ID: &str = "memory.tool_bundle.default";
+const MEMORY_TOOL_BUNDLE_CONTRIBUTION_ID_PREFIX: &str = "memory.tool_bundle.contribution";
+const MEMORY_TOOL_BUNDLE_ID_PREFIX: &str = "memory.tool_bundle.bundle";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTurnContext {
@@ -706,12 +710,12 @@ pub(crate) fn install_memory_hooks(
     )?;
     register_memory_hook_handler(
         runtime,
-        Arc::new(MemoryToolMaterializationHook {
+        Arc::new(MemoryToolBundleHook {
             memory_provider: memory_provider.clone(),
             state: state.clone(),
             tool_bundle_artifacts,
         }),
-        "memory.tool_materialization.default",
+        MEMORY_TOOL_BUNDLE_SUBSCRIPTION_ID,
         HookPhase::TurnPreToolMaterialization,
         0,
     )?;
@@ -767,7 +771,7 @@ struct MemoryPolicyClassifierHook {
     state: Arc<MemoryHookTurnStateStore>,
 }
 
-struct MemoryToolMaterializationHook {
+struct MemoryToolBundleHook {
     memory_provider: Arc<dyn AgentMemoryProvider>,
     state: Arc<MemoryHookTurnStateStore>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
@@ -853,9 +857,9 @@ impl HookHandler for MemoryPolicyClassifierHook {
 }
 
 #[async_trait::async_trait]
-impl HookHandler for MemoryToolMaterializationHook {
+impl HookHandler for MemoryToolBundleHook {
     fn id(&self) -> HookId {
-        HookId::new("memory.tool_materialization").expect("static hook id is valid")
+        HookId::new(MEMORY_TOOL_BUNDLE_HOOK_ID).expect("static hook id is valid")
     }
 
     fn kind(&self) -> HookKind {
@@ -867,32 +871,46 @@ impl HookHandler for MemoryToolMaterializationHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_hook_capabilities()
+        memory_tool_bundle_capabilities()
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
         let Some(state) = self.state.state(&request) else {
-            return Ok(memory_missing_state_response("memory.tool_materialization"));
+            return Ok(memory_missing_state_response(MEMORY_TOOL_BUNDLE_HOOK_ID));
         };
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
             Some(Ok(policy)) => policy,
             Some(Err(error)) => {
                 let mut response = HookHandlerResponse::default();
-                response.diagnostics.push(memory_hook_diagnostic(
+                response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.policy_decode_failed",
-                    format!("memory tool materialization skipped: {error}"),
+                    format!("memory tool bundle skipped: policy_decode_failed {error}"),
                 ));
                 return Ok(response);
             }
             None => {
-                return Ok(memory_missing_policy_response(
-                    "memory.tool_materialization",
-                ));
+                return Ok(memory_missing_policy_response(MEMORY_TOOL_BUNDLE_HOOK_ID));
             }
         };
-        if !turn_pre_tool_materialization_allows_tools(&request) || !policy.allows_any_memory_tool()
-        {
-            return Ok(HookHandlerResponse::default());
+        if !turn_pre_tool_materialization_allows_tools(&request) {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.tools_omitted",
+                "memory tool bundle skipped: provider_tool_calling=false",
+            ));
+            return Ok(response);
+        }
+        if !policy.allows_any_memory_tool() {
+            let mut response = HookHandlerResponse::default();
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.tools_omitted",
+                format!(
+                    "memory tool bundle skipped: no tools allowed by policy source={} reason={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str()
+                ),
+            ));
+            return Ok(response);
         }
 
         let mut materialization = match self
@@ -903,9 +921,11 @@ impl HookHandler for MemoryToolMaterializationHook {
             Ok(materialization) => filter_memory_tool_materialization(materialization, &policy),
             Err(error) => {
                 let mut response = HookHandlerResponse::default();
-                response
-                    .diagnostics
-                    .push(memory_hook_diagnostic("memory.tools_failed", error));
+                let _ = error;
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.tools_failed",
+                    "memory tool bundle materialization failed",
+                ));
                 return Ok(response);
             }
         };
@@ -922,16 +942,28 @@ impl HookHandler for MemoryToolMaterializationHook {
         response.diagnostics.extend(hook_diagnostics_from_strings(
             materialization.diagnostics.as_slice(),
         ));
+        if materialization.bundles.is_empty() {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.tools_omitted",
+                format!(
+                    "memory tool bundle skipped: materializer returned no exposed tools source={} reason={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str()
+                ),
+            ));
+            return Ok(response);
+        }
         for (index, bundle) in materialization.bundles.drain(..).enumerate() {
-            let bundle_id = HookToolBundleId::new(format!("memory.runtime.bundle.{index}"))
-                .expect("static bundle id is valid");
+            let bundle_id =
+                HookToolBundleId::new(format!("{MEMORY_TOOL_BUNDLE_ID_PREFIX}.{index}"))
+                    .expect("static bundle id is valid");
             self.tool_bundle_artifacts.insert(
                 state.context.turn_id.clone(),
                 bundle_id.clone(),
                 bundle.clone(),
             );
             response.contributions.push(HookContribution::ToolBundle(
-                memory_tool_bundle_contribution(index, bundle_id, &bundle),
+                memory_tool_bundle_contribution(index, bundle_id, &bundle, &policy),
             ));
         }
         Ok(response)
@@ -1035,6 +1067,15 @@ fn memory_policy_classifier_capabilities() -> HookCapabilities {
         HookCapability::new("memory").expect("static capability is valid"),
         HookCapability::new("call_provider").expect("static capability is valid"),
         HookCapability::new("contribute_policy").expect("static capability is valid"),
+    ])
+}
+
+fn memory_tool_bundle_capabilities() -> HookCapabilities {
+    HookCapabilities::new([
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("write_domain_context").expect("static capability is valid"),
+        HookCapability::new("contribute_tool_bundle").expect("static capability is valid"),
     ])
 }
 
@@ -1298,19 +1339,31 @@ fn memory_tool_bundle_contribution(
     index: usize,
     bundle_id: HookToolBundleId,
     bundle: &ToolExtensionBundle,
+    policy: &MemoryTurnPolicy,
 ) -> ToolBundleContribution {
+    let tool_names = bundle
+        .specs
+        .iter()
+        .filter_map(|configured| HookToolName::new(configured.spec.name.clone()).ok())
+        .collect::<Vec<_>>();
     ToolBundleContribution {
-        contribution_id: HookContributionId::new(format!("memory.runtime.contribution.{index}"))
-            .expect("static contribution id is valid"),
+        contribution_id: HookContributionId::new(format!(
+            "{MEMORY_TOOL_BUNDLE_CONTRIBUTION_ID_PREFIX}.{index}"
+        ))
+        .expect("static contribution id is valid"),
         bundle_id,
         domain: HookDomain::new("memory").expect("static domain is valid"),
         priority: 100,
-        tool_names: bundle
-            .specs
-            .iter()
-            .filter_map(|configured| HookToolName::new(configured.spec.name.clone()).ok())
-            .collect(),
-        diagnostics: Vec::new(),
+        diagnostics: vec![memory_safe_info_diagnostic(
+            "memory.tools_exposed",
+            format!(
+                "memory tool bundle exposed: source={} reason={} tools={}",
+                policy.source.as_str(),
+                policy.reason_code.as_str(),
+                hook_tool_names_csv(&tool_names)
+            ),
+        )],
+        tool_names,
     }
 }
 
@@ -1326,13 +1379,15 @@ fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
 fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
     messages
         .iter()
-        .map(|message| memory_hook_diagnostic("memory.diagnostic", message.clone()))
+        .map(|message| {
+            memory_hook_diagnostic("memory.diagnostic", safe_memory_policy_diagnostic(message))
+        })
         .collect()
 }
 
 fn memory_missing_state_response(hook: &'static str) -> HookHandlerResponse {
     let mut response = HookHandlerResponse::default();
-    response.diagnostics.push(memory_hook_diagnostic(
+    response.diagnostics.push(memory_safe_warning_diagnostic(
         "memory.missing_state",
         format!("{hook} skipped because memory turn policy state was unavailable"),
     ));
@@ -1341,7 +1396,7 @@ fn memory_missing_state_response(hook: &'static str) -> HookHandlerResponse {
 
 fn memory_missing_policy_response(hook: &'static str) -> HookHandlerResponse {
     let mut response = HookHandlerResponse::default();
-    response.diagnostics.push(memory_hook_diagnostic(
+    response.diagnostics.push(memory_safe_warning_diagnostic(
         "memory.missing_policy",
         format!("{hook} skipped because memory hook policy was unavailable"),
     ));
@@ -1355,6 +1410,32 @@ fn memory_hook_diagnostic(code: &'static str, message: impl Into<String>) -> Hoo
             .expect("diagnostic message should be non-empty"),
         severity: HookDiagnosticSeverity::Warning,
         safe_for_user: false,
+        metadata: HookMetadata::default(),
+    }
+}
+
+fn memory_safe_info_diagnostic(code: &'static str, message: impl Into<String>) -> HookDiagnostic {
+    memory_safe_diagnostic(code, message, HookDiagnosticSeverity::Info)
+}
+
+fn memory_safe_warning_diagnostic(
+    code: &'static str,
+    message: impl Into<String>,
+) -> HookDiagnostic {
+    memory_safe_diagnostic(code, message, HookDiagnosticSeverity::Warning)
+}
+
+fn memory_safe_diagnostic(
+    code: &'static str,
+    message: impl Into<String>,
+    severity: HookDiagnosticSeverity,
+) -> HookDiagnostic {
+    HookDiagnostic {
+        code: HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
+        message: HookDiagnosticMessage::new(safe_memory_policy_diagnostic(message.into().as_str()))
+            .expect("safe diagnostic message should be non-empty"),
+        severity,
+        safe_for_user: true,
         metadata: HookMetadata::default(),
     }
 }
@@ -1425,7 +1506,11 @@ fn safe_memory_policy_diagnostic(message: &str) -> String {
     const MAX_DIAGNOSTIC_CHARS: usize = 300;
     let mut safe = message.replace(['\r', '\n'], " ");
     safe.truncate(MAX_DIAGNOSTIC_CHARS);
-    safe
+    if safe.trim().is_empty() {
+        "memory diagnostic unavailable".to_owned()
+    } else {
+        safe
+    }
 }
 
 pub(crate) async fn resolve_memory_turn_policy(
@@ -1585,7 +1670,8 @@ pub(crate) fn filter_memory_tool_materialization(
     removed_tools.dedup();
     if !removed_tools.is_empty() {
         diagnostics.push(format!(
-            "memory.policy.tools_filtered: reason={} removed={}",
+            "memory.policy.tools_filtered: source={} reason={} removed={}",
+            policy.source.as_str(),
             policy.reason_code.as_str(),
             removed_tools.join(",")
         ));
@@ -1595,6 +1681,17 @@ pub(crate) fn filter_memory_tool_materialization(
         bundles,
         diagnostics,
     }
+}
+
+fn hook_tool_names_csv(tool_names: &[HookToolName]) -> String {
+    if tool_names.is_empty() {
+        return "none".to_owned();
+    }
+    tool_names
+        .iter()
+        .map(|name| name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn memory_recall_prompt_input(
@@ -1684,6 +1781,7 @@ mod tests {
     use super::*;
     use pioneer_hooks::{
         HookContext, HookInput, HookPromptContextSet, HookThreadId, HookTurnId, HookWorkspaceId,
+        TurnPreToolMaterializationHookInput,
     };
     use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use serde_json::json;
@@ -1821,6 +1919,293 @@ mod tests {
         assert!(!capabilities.contains(
             &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
         ));
+    }
+
+    #[test]
+    fn memory_tool_bundle_hook_descriptor_is_stable_and_narrow() {
+        let hook = MemoryToolBundleHook {
+            memory_provider: Arc::new(TestMemoryProvider::with_materialization(
+                empty_tool_materialization(),
+            )),
+            state: Arc::new(MemoryHookTurnStateStore::default()),
+            tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
+        };
+
+        assert_eq!(hook.id().as_str(), MEMORY_TOOL_BUNDLE_HOOK_ID);
+        assert_eq!(
+            hook.supported_phases(),
+            vec![HookPhase::TurnPreToolMaterialization]
+        );
+        let capabilities = hook.capabilities();
+        assert!(
+            capabilities
+                .contains(&HookCapability::new("memory").expect("static capability is valid"))
+        );
+        assert!(capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+        assert!(
+            !capabilities.contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_policy").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+    }
+
+    #[test]
+    fn memory_tool_bundle_contribution_uses_stable_ids_and_policy_diagnostic() {
+        let policy = MemoryTurnPolicy::normal_default_allow();
+        let bundle = test_memory_tool_bundle(&[
+            MEMORY_SEARCH_TOOL,
+            MEMORY_GET_TOOL,
+            MEMORY_REMEMBER_TOOL,
+            MEMORY_FORGET_TOOL,
+        ]);
+        let bundle_id = HookToolBundleId::new(format!("{MEMORY_TOOL_BUNDLE_ID_PREFIX}.7"))
+            .expect("valid bundle id");
+
+        let contribution = memory_tool_bundle_contribution(7, bundle_id.clone(), &bundle, &policy);
+
+        assert_eq!(
+            contribution.contribution_id.as_str(),
+            "memory.tool_bundle.contribution.7"
+        );
+        assert_eq!(contribution.bundle_id, bundle_id);
+        assert_eq!(contribution.domain.as_str(), MEMORY_POLICY_DOMAIN);
+        assert_eq!(
+            hook_tool_names_to_strings(&contribution.tool_names),
+            vec![
+                MEMORY_SEARCH_TOOL,
+                MEMORY_GET_TOOL,
+                MEMORY_REMEMBER_TOOL,
+                MEMORY_FORGET_TOOL,
+            ]
+        );
+        assert!(contribution.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.tools_exposed"
+                && diagnostic.safe_for_user
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("reason=default_allow_read")
+        }));
+    }
+
+    #[tokio::test]
+    async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
+        let cases = vec![
+            (
+                MemoryTurnPolicy::normal_default_allow(),
+                vec![
+                    MEMORY_SEARCH_TOOL,
+                    MEMORY_GET_TOOL,
+                    MEMORY_REMEMBER_TOOL,
+                    MEMORY_FORGET_TOOL,
+                ],
+                1,
+            ),
+            (MemoryTurnPolicy::no_use(), Vec::new(), 0),
+            (
+                MemoryTurnPolicy::no_save(),
+                vec![MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+                1,
+            ),
+            (
+                MemoryTurnPolicy::explicit_remember(),
+                vec![
+                    MEMORY_SEARCH_TOOL,
+                    MEMORY_GET_TOOL,
+                    MEMORY_REMEMBER_TOOL,
+                    MEMORY_FORGET_TOOL,
+                ],
+                1,
+            ),
+            (
+                MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned())),
+                vec![MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+                1,
+            ),
+        ];
+
+        for (policy, expected_tools, expected_materialize_calls) in cases {
+            let provider = Arc::new(TestMemoryProvider::with_materialization(
+                standard_tool_materialization(),
+            ));
+            let state = Arc::new(MemoryHookTurnStateStore::default());
+            state.set_turn_context(test_memory_turn_context());
+            let hook = MemoryToolBundleHook {
+                memory_provider: provider.clone(),
+                state,
+                tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
+            };
+
+            let response = hook
+                .execute(test_tool_bundle_hook_request(
+                    HookPolicySet::merge_contributions([memory_policy_contribution(&policy)]),
+                    true,
+                ))
+                .await
+                .expect("tool bundle hook executes");
+
+            assert_eq!(
+                provider.materialize_call_count(),
+                expected_materialize_calls,
+                "policy {:?}",
+                policy.reason_code
+            );
+            assert_eq!(
+                response_tool_names(&response),
+                expected_tools,
+                "policy {:?}",
+                policy.reason_code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tool_bundle_hook_omits_tools_without_valid_policy_or_tool_calling() {
+        let provider = Arc::new(TestMemoryProvider::with_materialization(
+            standard_tool_materialization(),
+        ));
+        let state = Arc::new(MemoryHookTurnStateStore::default());
+        state.set_turn_context(test_memory_turn_context());
+        let hook = MemoryToolBundleHook {
+            memory_provider: provider.clone(),
+            state,
+            tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
+        };
+
+        let missing = hook
+            .execute(test_tool_bundle_hook_request(HookPolicySet::empty(), true))
+            .await
+            .expect("missing policy is best-effort");
+        assert!(response_tool_names(&missing).is_empty());
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code.as_str() == "memory.missing_policy" })
+        );
+
+        let malformed = PolicyContribution {
+            domain: memory_policy_domain(),
+            key: memory_turn_policy_key(),
+            value: HookValue::Text("memory_no_use".to_owned()),
+            priority: 500,
+            diagnostics: Vec::new(),
+        };
+        let malformed = hook
+            .execute(test_tool_bundle_hook_request(
+                HookPolicySet::merge_contributions([malformed]),
+                true,
+            ))
+            .await
+            .expect("malformed policy is best-effort");
+        assert!(response_tool_names(&malformed).is_empty());
+        assert!(malformed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.policy_decode_failed" && diagnostic.safe_for_user
+        }));
+
+        let disabled = hook
+            .execute(test_tool_bundle_hook_request(
+                HookPolicySet::merge_contributions([memory_policy_contribution(
+                    &MemoryTurnPolicy::normal_default_allow(),
+                )]),
+                false,
+            ))
+            .await
+            .expect("provider tool-calling disabled is best-effort");
+        assert!(response_tool_names(&disabled).is_empty());
+        assert!(disabled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.tools_omitted"
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("provider_tool_calling=false")
+        }));
+        assert_eq!(provider.materialize_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_tool_bundle_hook_does_not_execute_tool_handlers_during_materialization() {
+        let provider = Arc::new(TestMemoryProvider::with_materialization(
+            panicking_handler_tool_materialization(),
+        ));
+        let state = Arc::new(MemoryHookTurnStateStore::default());
+        state.set_turn_context(test_memory_turn_context());
+        let hook = MemoryToolBundleHook {
+            memory_provider: provider.clone(),
+            state,
+            tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
+        };
+
+        let response = hook
+            .execute(test_tool_bundle_hook_request(
+                HookPolicySet::merge_contributions([memory_policy_contribution(
+                    &MemoryTurnPolicy::normal_default_allow(),
+                )]),
+                true,
+            ))
+            .await
+            .expect("tool bundle hook executes without invoking handlers");
+
+        assert_eq!(provider.materialize_call_count(), 1);
+        assert_eq!(
+            response_tool_names(&response),
+            vec![
+                MEMORY_SEARCH_TOOL,
+                MEMORY_GET_TOOL,
+                MEMORY_REMEMBER_TOOL,
+                MEMORY_FORGET_TOOL
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_tool_bundle_hook_materialization_error_is_safe_best_effort() {
+        let provider = Arc::new(TestMemoryProvider::failing(
+            "raw provider error must not leak",
+        ));
+        let state = Arc::new(MemoryHookTurnStateStore::default());
+        state.set_turn_context(test_memory_turn_context());
+        let hook = MemoryToolBundleHook {
+            memory_provider: provider.clone(),
+            state,
+            tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
+        };
+
+        let response = hook
+            .execute(test_tool_bundle_hook_request(
+                HookPolicySet::merge_contributions([memory_policy_contribution(
+                    &MemoryTurnPolicy::normal_default_allow(),
+                )]),
+                true,
+            ))
+            .await
+            .expect("materialization error is best-effort");
+
+        assert_eq!(provider.materialize_call_count(), 1);
+        assert!(response_tool_names(&response).is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.tools_failed"
+                && diagnostic.safe_for_user
+                && !diagnostic.message.as_str().contains("raw provider error")
+        }));
     }
 
     #[tokio::test]
@@ -2131,6 +2516,39 @@ mod tests {
         }
     }
 
+    fn test_tool_bundle_hook_request(
+        policy_set: HookPolicySet,
+        provider_tool_calling: bool,
+    ) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_TOOL_BUNDLE_HOOK_ID).expect("static hook id is valid"),
+            phase: HookPhase::TurnPreToolMaterialization,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            input: HookInput::turn_pre_tool_materialization(
+                TurnPreToolMaterializationHookInput::from_parts(provider_tool_calling, Vec::new()),
+            ),
+            policy_set,
+            prompt_context_set: HookPromptContextSet::default(),
+        }
+    }
+
+    fn test_memory_turn_context() -> MemoryTurnContext {
+        MemoryTurnContext {
+            workspace_id: "ws".to_owned(),
+            thread_id: "thr".to_owned(),
+            turn_id: "turn".to_owned(),
+            mode: ThreadMode::Agent,
+            input_text: "remember my preference".to_owned(),
+            task_id: None,
+            agent_id: None,
+        }
+    }
+
     fn test_tool_spec(name: &str) -> ConfiguredToolSpec {
         ConfiguredToolSpec::new(
             ToolSpec::new(
@@ -2146,6 +2564,160 @@ mod tests {
             ExecutionClass::Shared,
             pioneer_tools::dynamic_unknown_output_policy(),
         )
+    }
+
+    fn test_memory_tool_bundle(names: &[&str]) -> ToolExtensionBundle {
+        ToolExtensionBundle {
+            specs: names.iter().map(|name| test_tool_spec(name)).collect(),
+            handlers: names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        Arc::new(TestToolHandler) as Arc<dyn pioneer_tools::ToolHandler>,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn empty_tool_materialization() -> MemoryToolMaterialization {
+        MemoryToolMaterialization {
+            bundles: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn standard_tool_materialization() -> MemoryToolMaterialization {
+        MemoryToolMaterialization {
+            bundles: vec![test_memory_tool_bundle(&[
+                MEMORY_SEARCH_TOOL,
+                MEMORY_GET_TOOL,
+                MEMORY_REMEMBER_TOOL,
+                MEMORY_FORGET_TOOL,
+            ])],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn panicking_handler_tool_materialization() -> MemoryToolMaterialization {
+        let handler: Arc<dyn pioneer_tools::ToolHandler> = Arc::new(PanickingToolHandler);
+        MemoryToolMaterialization {
+            bundles: vec![ToolExtensionBundle {
+                specs: [
+                    MEMORY_SEARCH_TOOL,
+                    MEMORY_GET_TOOL,
+                    MEMORY_REMEMBER_TOOL,
+                    MEMORY_FORGET_TOOL,
+                ]
+                .into_iter()
+                .map(test_tool_spec)
+                .collect(),
+                handlers: [
+                    MEMORY_SEARCH_TOOL,
+                    MEMORY_GET_TOOL,
+                    MEMORY_REMEMBER_TOOL,
+                    MEMORY_FORGET_TOOL,
+                ]
+                .into_iter()
+                .map(|name| (name.to_owned(), handler.clone()))
+                .collect(),
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn response_tool_names(response: &HookHandlerResponse) -> Vec<&'static str> {
+        response
+            .contributions
+            .iter()
+            .flat_map(|contribution| match contribution {
+                HookContribution::ToolBundle(bundle) => {
+                    hook_tool_names_to_static(&bundle.tool_names)
+                }
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn hook_tool_names_to_static(tool_names: &[HookToolName]) -> Vec<&'static str> {
+        tool_names
+            .iter()
+            .filter_map(|name| match name.as_str() {
+                MEMORY_SEARCH_TOOL => Some(MEMORY_SEARCH_TOOL),
+                MEMORY_GET_TOOL => Some(MEMORY_GET_TOOL),
+                MEMORY_REMEMBER_TOOL => Some(MEMORY_REMEMBER_TOOL),
+                MEMORY_FORGET_TOOL => Some(MEMORY_FORGET_TOOL),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
+        tool_names.iter().map(|name| name.as_str()).collect()
+    }
+
+    struct TestMemoryProvider {
+        materialization: Result<MemoryToolMaterialization, String>,
+        materialize_calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestMemoryProvider {
+        fn with_materialization(materialization: MemoryToolMaterialization) -> Self {
+            Self {
+                materialization: Ok(materialization),
+                materialize_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn failing(error: impl Into<String>) -> Self {
+            Self {
+                materialization: Err(error.into()),
+                materialize_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn materialize_call_count(&self) -> usize {
+            *self
+                .materialize_calls
+                .lock()
+                .expect("materialize call count lock poisoned")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentMemoryProvider for TestMemoryProvider {
+        async fn recall_memory(
+            &self,
+            _context: MemoryTurnContext,
+            _request: MemoryRecallRequest,
+        ) -> Result<MemoryRecallSnapshot, String> {
+            Ok(MemoryRecallSnapshot::empty())
+        }
+
+        async fn materialize_memory_tools(
+            &self,
+            _context: MemoryTurnContext,
+        ) -> Result<MemoryToolMaterialization, String> {
+            *self
+                .materialize_calls
+                .lock()
+                .expect("materialize call count lock poisoned") += 1;
+            self.materialization.clone()
+        }
+    }
+
+    struct PanickingToolHandler;
+
+    #[async_trait::async_trait]
+    impl pioneer_tools::ToolHandler for PanickingToolHandler {
+        async fn handle(
+            &self,
+            _invocation: pioneer_tools::ToolInvocation,
+            _trace: pioneer_tools::ToolEventTrace,
+        ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+            panic!("tool materialization must not execute memory tool handlers")
+        }
     }
 
     struct TestToolHandler;

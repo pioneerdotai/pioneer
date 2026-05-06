@@ -4077,6 +4077,132 @@ async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_nam
 }
 
 #[tokio::test]
+async fn phase_13_memory_tool_bundle_visibility_is_driven_by_hook_policy_set() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    let policy_provider = Arc::new(FakeMemoryTurnPolicyProvider::new(
+        MemoryTurnPolicy::no_save(),
+    ));
+    let policy_trait_provider: Arc<dyn AgentMemoryTurnPolicyProvider> = policy_provider.clone();
+    manager
+        .set_memory_turn_policy_provider(Some(policy_trait_provider))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase13_tool_policy",
+        "ws_phase13_tool_policy",
+        "turn_phase13_tool_policy",
+        ThreadMode::Agent,
+        "capture",
+        "Speichere das nicht, aber nutze vorhandene Erinnerung.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_policy_index = calls
+        .iter()
+        .position(|call| call.phase == HookPhase::TurnPrePolicy)
+        .expect("pre-policy hook call exists");
+    let pre_tool_index = calls
+        .iter()
+        .position(|call| call.phase == HookPhase::TurnPreToolMaterialization)
+        .expect("pre-tool hook call exists");
+    assert!(
+        pre_policy_index < pre_tool_index,
+        "policy must run before tool materialization"
+    );
+    let policy = memory_turn_policy_from_hook_policy_set(&calls[pre_tool_index].policy_set)
+        .expect("memory policy exists at tool materialization")
+        .expect("memory policy decodes at tool materialization");
+    assert_eq!(
+        policy.reason_code,
+        super::MemoryPolicyReasonCode::MemoryNoSave
+    );
+    assert_eq!(
+        policy.remember_tool,
+        super::MemoryMutationToolPolicy::Disabled
+    );
+
+    assert_eq!(memory_provider.tool_contexts().len(), 1);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0]
+        .tools
+        .as_ref()
+        .expect("agent request should include tools");
+    assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
+    assert!(!tools.iter().any(|tool| tool.name == "memory_remember"));
+}
+
+#[tokio::test]
+async fn phase_13_without_memory_hook_subscription_exposes_no_memory_tools() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPreToolMaterialization,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase13_no_memory_hook",
+        "ws_phase13_no_memory_hook",
+        "turn_phase13_no_memory_hook",
+        ThreadMode::Agent,
+        "capture",
+        "no memory provider is installed",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = wait_for_hook_calls(&calls, 1).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].phase, HookPhase::TurnPreToolMaterialization);
+    assert!(
+        memory_turn_policy_from_hook_policy_set(&calls[0].policy_set).is_none(),
+        "memory policy should not exist without memory hooks"
+    );
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0]
+        .tools
+        .as_ref()
+        .expect("agent request should include non-memory built-in tools");
+    assert!(!tools.iter().any(|tool| tool.name.starts_with("memory_")));
+}
+
+#[tokio::test]
 async fn identity_recall_prompt_contains_relevant_memory() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
