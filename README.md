@@ -31,7 +31,7 @@
 
 ---
 
-**Pioneer** is a local-first AI workspace for running an assistant on your own machine or on infrastructure you control. It combines a persistent gateway, a native desktop app, a JSON-RPC protocol, provider adapters, durable threads, task automation, MCP servers, and real local tools.
+**Pioneer** is a local-first AI workspace for running an assistant on your own machine or on infrastructure you control. It combines a persistent gateway, a native desktop app, a JSON-RPC protocol, provider adapters, durable threads, agent memory, task automation, MCP servers, skills, and real local tools.
 
 The gateway is the core of Pioneer. It owns state, configuration, storage, model access, task execution, tool execution, MCP runtime, skills, and thread history. The desktop app is the primary client for connecting to one or more gateways, whether the gateway is running on the same computer or on a remote server.
 
@@ -48,6 +48,8 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **One desktop, many gateways** - connect the desktop app to any number of gateways and switch between them from one native client.
 - **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
 - **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
+- **Durable agent memory** - agent mode can recall and write stable facts, preferences, recurring instructions, project decisions, and communication style through prompt policy, memory tools, proactive post-turn extraction, service-owned dedupe, and memvid-backed search capsules.
+- **Typed hook runtime** - lifecycle hooks attach policy, context, prompt sections, tool bundles, diagnostics, and post-turn work without turning the agent loop into a domain-specific container.
 - **Bring your own model** - built-in providers for OpenAI, Anthropic, OpenRouter, Gemini, Azure OpenAI, Bedrock, Ollama, Copilot, Claude Code, Gemini CLI, Kilo CLI, and many OpenAI-compatible endpoints.
 - **Keystore-backed secrets** - provider API keys, MCP env/header secrets, superuser JWT signing material, and desktop gateway bearer tokens are stored in `keystore.db` instead of ordinary TOML or domain tables.
 - **Real tools** - shell sessions, file reads and edits, patch application, grep, web search/fetch, URL downloads, computer use, MCP tool proxying, and dynamic skill tools.
