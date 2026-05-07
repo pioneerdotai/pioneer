@@ -1,14 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerStatusItem",
   "type": "object",
-  "required": [
-    "id",
-    "name",
-    "runtime",
-    "scope_kind",
-    "status"
-  ],
   "properties": {
     "id": {
       "type": "string"
@@ -17,13 +10,13 @@
       "type": "string"
     },
     "runtime": {
-      "$ref": "#/definitions/McpRuntimeStatus"
+      "$ref": "#/$defs/McpRuntimeStatus"
     },
     "scope_kind": {
-      "$ref": "#/definitions/McpScopeKind"
+      "$ref": "#/$defs/McpScopeKind"
     },
     "status": {
-      "$ref": "#/definitions/McpServerStatus"
+      "$ref": "#/$defs/McpServerStatus"
     },
     "status_reason": {
       "type": [
@@ -32,7 +25,14 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "id",
+    "name",
+    "scope_kind",
+    "runtime",
+    "status"
+  ],
+  "$defs": {
     "McpRuntimeState": {
       "type": "string",
       "enum": [
@@ -50,10 +50,6 @@
     },
     "McpRuntimeStatus": {
       "type": "object",
-      "required": [
-        "live",
-        "state"
-      ],
       "properties": {
         "last_error": {
           "type": [
@@ -72,9 +68,13 @@
           "type": "boolean"
         },
         "state": {
-          "$ref": "#/definitions/McpRuntimeState"
+          "$ref": "#/$defs/McpRuntimeState"
         }
-      }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
     },
     "McpScopeKind": {
       "type": "string",

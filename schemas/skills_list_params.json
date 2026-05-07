@@ -1,21 +1,21 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillListParams",
   "type": "object",
-  "required": [
-    "workspace_id"
-  ],
   "properties": {
     "include_health": {
-      "default": true,
-      "type": "boolean"
+      "type": "boolean",
+      "default": true
     },
     "include_policy": {
-      "default": true,
-      "type": "boolean"
+      "type": "boolean",
+      "default": true
     },
     "workspace_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspace_id"
+  ]
 }

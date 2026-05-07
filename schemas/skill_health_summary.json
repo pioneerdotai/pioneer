@@ -1,45 +1,39 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillHealthSummary",
   "type": "object",
-  "required": [
-    "status"
-  ],
   "properties": {
     "dependency_failures": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillDependencyDiagnostic"
+        "$ref": "#/$defs/SkillDependencyDiagnostic"
       }
     },
     "security_blocks": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillSecurityFinding"
+        "$ref": "#/$defs/SkillSecurityFinding"
       }
     },
     "status": {
       "type": "string"
     },
     "validation_issues": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillValidationDiagnostic"
+        "$ref": "#/$defs/SkillValidationDiagnostic"
       }
     }
   },
-  "definitions": {
+  "required": [
+    "status"
+  ],
+  "$defs": {
     "SkillDependencyDiagnostic": {
       "type": "object",
-      "required": [
-        "hint",
-        "kind",
-        "name",
-        "status"
-      ],
       "properties": {
         "hint": {
           "type": "string"
@@ -53,15 +47,16 @@
         "status": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
     },
     "SkillSecurityFinding": {
       "type": "object",
-      "required": [
-        "message",
-        "rule_id",
-        "severity"
-      ],
       "properties": {
         "message": {
           "type": "string"
@@ -78,15 +73,15 @@
         "severity": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
     },
     "SkillValidationDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "level",
-        "message"
-      ],
       "properties": {
         "code": {
           "type": "string"
@@ -103,7 +98,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
     }
   }
 }

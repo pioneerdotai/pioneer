@@ -1,15 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUploadStartResponse",
   "type": "object",
-  "required": [
-    "expires_at_unix",
-    "max_chunk_size_bytes",
-    "max_compressed_size_bytes",
-    "max_uncompressed_size_bytes",
-    "recommended_chunk_size_bytes",
-    "upload_id"
-  ],
   "properties": {
     "expires_at_unix": {
       "type": "integer",
@@ -18,25 +10,33 @@
     "max_chunk_size_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "max_compressed_size_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "max_uncompressed_size_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "recommended_chunk_size_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "upload_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "upload_id",
+    "recommended_chunk_size_bytes",
+    "max_chunk_size_bytes",
+    "max_compressed_size_bytes",
+    "max_uncompressed_size_bytes",
+    "expires_at_unix"
+  ]
 }

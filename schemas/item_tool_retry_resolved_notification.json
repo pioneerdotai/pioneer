@@ -1,43 +1,31 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ItemToolRetryResolvedNotification",
   "type": "object",
-  "required": [
-    "attempt_number",
-    "item_id",
-    "item_type",
-    "reason",
-    "resolution",
-    "thread_id",
-    "tool_name",
-    "tool_retry_episode_id",
-    "turn_id",
-    "workspace_id"
-  ],
   "properties": {
     "attempt_number": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "budgets": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/ToolRetryBudgetUsage"
+        "$ref": "#/$defs/ToolRetryBudgetUsage"
       }
     },
     "item_id": {
       "type": "string"
     },
     "item_type": {
-      "$ref": "#/definitions/TurnItemType"
+      "$ref": "#/$defs/TurnItemType"
     },
     "reason": {
       "type": "string"
     },
     "resolution": {
-      "$ref": "#/definitions/ToolRetryResolution"
+      "$ref": "#/$defs/ToolRetryResolution"
     },
     "thread_id": {
       "type": "string"
@@ -55,7 +43,19 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "item_type",
+    "tool_retry_episode_id",
+    "tool_name",
+    "attempt_number",
+    "resolution",
+    "reason"
+  ],
+  "$defs": {
     "ToolRetryBudgetKind": {
       "type": "string",
       "enum": [
@@ -67,26 +67,26 @@
     },
     "ToolRetryBudgetUsage": {
       "type": "object",
-      "required": [
-        "kind",
-        "limit",
-        "used"
-      ],
       "properties": {
         "kind": {
-          "$ref": "#/definitions/ToolRetryBudgetKind"
+          "$ref": "#/$defs/ToolRetryBudgetKind"
         },
         "limit": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "used": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "kind",
+        "used",
+        "limit"
+      ]
     },
     "ToolRetryResolution": {
       "type": "string",

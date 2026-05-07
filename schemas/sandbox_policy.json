@@ -1,16 +1,16 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SandboxPolicy",
   "type": "object",
+  "properties": {
+    "mode": {
+      "$ref": "#/$defs/SandboxMode"
+    }
+  },
   "required": [
     "mode"
   ],
-  "properties": {
-    "mode": {
-      "$ref": "#/definitions/SandboxMode"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "SandboxMode": {
       "type": "string",
       "enum": [

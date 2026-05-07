@@ -1,14 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerPolicy",
   "type": "object",
-  "required": [
-    "allow_implicit_invocation",
-    "enabled",
-    "name",
-    "scope_kind",
-    "workspace_id"
-  ],
   "properties": {
     "allow_implicit_invocation": {
       "type": "boolean"
@@ -20,13 +13,20 @@
       "type": "string"
     },
     "scope_kind": {
-      "$ref": "#/definitions/McpScopeKind"
+      "$ref": "#/$defs/McpScopeKind"
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "name",
+    "scope_kind",
+    "enabled",
+    "allow_implicit_invocation"
+  ],
+  "$defs": {
     "McpScopeKind": {
       "type": "string",
       "enum": [

@@ -1,16 +1,16 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadUnsubscribeResponse",
   "type": "object",
+  "properties": {
+    "status": {
+      "$ref": "#/$defs/ThreadUnsubscribeStatus"
+    }
+  },
   "required": [
     "status"
   ],
-  "properties": {
-    "status": {
-      "$ref": "#/definitions/ThreadUnsubscribeStatus"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "ThreadUnsubscribeStatus": {
       "type": "string",
       "enum": [

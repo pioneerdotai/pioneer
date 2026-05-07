@@ -1,44 +1,30 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ItemRecoveryAttachedNotification",
   "type": "object",
-  "required": [
-    "action",
-    "existing_status",
-    "item_id",
-    "item_type",
-    "next_attempt_number",
-    "recovery_item_id",
-    "recovery_item_type",
-    "recovery_job_id",
-    "thread_id",
-    "trigger",
-    "turn_id",
-    "workspace_id"
-  ],
   "properties": {
     "action": {
-      "$ref": "#/definitions/RecoveryAction"
+      "$ref": "#/$defs/RecoveryAction"
     },
     "existing_status": {
-      "$ref": "#/definitions/RecoveryJobStatus"
+      "$ref": "#/$defs/RecoveryJobStatus"
     },
     "item_id": {
       "type": "string"
     },
     "item_type": {
-      "$ref": "#/definitions/TurnItemType"
+      "$ref": "#/$defs/TurnItemType"
     },
     "next_attempt_number": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "recovery_item_id": {
       "type": "string"
     },
     "recovery_item_type": {
-      "$ref": "#/definitions/TurnItemType"
+      "$ref": "#/$defs/TurnItemType"
     },
     "recovery_job_id": {
       "type": "string"
@@ -47,7 +33,7 @@
       "type": "string"
     },
     "trigger": {
-      "$ref": "#/definitions/RecoveryTrigger"
+      "$ref": "#/$defs/RecoveryTrigger"
     },
     "turn_id": {
       "type": "string"
@@ -56,7 +42,21 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "item_type",
+    "recovery_job_id",
+    "recovery_item_id",
+    "recovery_item_type",
+    "trigger",
+    "action",
+    "existing_status",
+    "next_attempt_number"
+  ],
+  "$defs": {
     "RecoveryAction": {
       "type": "string",
       "enum": [
@@ -83,23 +83,17 @@
         {
           "description": "Turn-item execution exceeded timeout policy (start/idle/hard/lease).",
           "type": "string",
-          "enum": [
-            "timeout"
-          ]
+          "const": "timeout"
         },
         {
           "description": "Any provider/model/transport failure in LLM interaction path.",
           "type": "string",
-          "enum": [
-            "provider_error"
-          ]
+          "const": "provider_error"
         },
         {
           "description": "Forward-compatibility fallback for unknown persisted values.",
           "type": "string",
-          "enum": [
-            "unknown"
-          ]
+          "const": "unknown"
         }
       ]
     },

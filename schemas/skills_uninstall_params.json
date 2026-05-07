@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUninstallParams",
   "type": "object",
-  "required": [
-    "slug",
-    "source_kind",
-    "workspace_id"
-  ],
   "properties": {
     "slug": {
       "type": "string"
@@ -17,5 +12,10 @@
     "workspace_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspace_id",
+    "slug",
+    "source_kind"
+  ]
 }

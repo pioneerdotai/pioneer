@@ -1,26 +1,26 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerStatusChangedNotification",
   "type": "object",
-  "required": [
-    "server",
-    "snapshot_version",
-    "workspace_id"
-  ],
   "properties": {
     "server": {
-      "$ref": "#/definitions/McpServerStatusItem"
+      "$ref": "#/$defs/McpServerStatusItem"
     },
     "snapshot_version": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "snapshot_version",
+    "server"
+  ],
+  "$defs": {
     "McpRuntimeState": {
       "type": "string",
       "enum": [
@@ -38,10 +38,6 @@
     },
     "McpRuntimeStatus": {
       "type": "object",
-      "required": [
-        "live",
-        "state"
-      ],
       "properties": {
         "last_error": {
           "type": [
@@ -60,9 +56,13 @@
           "type": "boolean"
         },
         "state": {
-          "$ref": "#/definitions/McpRuntimeState"
+          "$ref": "#/$defs/McpRuntimeState"
         }
-      }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
     },
     "McpScopeKind": {
       "type": "string",
@@ -88,13 +88,6 @@
     },
     "McpServerStatusItem": {
       "type": "object",
-      "required": [
-        "id",
-        "name",
-        "runtime",
-        "scope_kind",
-        "status"
-      ],
       "properties": {
         "id": {
           "type": "string"
@@ -103,13 +96,13 @@
           "type": "string"
         },
         "runtime": {
-          "$ref": "#/definitions/McpRuntimeStatus"
+          "$ref": "#/$defs/McpRuntimeStatus"
         },
         "scope_kind": {
-          "$ref": "#/definitions/McpScopeKind"
+          "$ref": "#/$defs/McpScopeKind"
         },
         "status": {
-          "$ref": "#/definitions/McpServerStatus"
+          "$ref": "#/$defs/McpServerStatus"
         },
         "status_reason": {
           "type": [
@@ -117,7 +110,14 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope_kind",
+        "runtime",
+        "status"
+      ]
     }
   }
 }

@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProviderSetApiKeyResponse",
   "type": "object",
-  "required": [
-    "provider",
-    "updated"
-  ],
   "properties": {
     "provider": {
       "type": "string"
@@ -13,5 +9,9 @@
     "updated": {
       "type": "boolean"
     }
-  }
+  },
+  "required": [
+    "provider",
+    "updated"
+  ]
 }

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidateScore",
+  "type": "object",
+  "properties": {
+    "bucket": {
+      "$ref": "#/$defs/MemoryCandidateScoreBucket"
+    },
+    "certainty_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "durability_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "evidence_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "explicitness_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "relation_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "scope_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "sensitivity_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "total_score": {
+      "type": "number",
+      "format": "float"
+    }
+  },
+  "required": [
+    "total_score",
+    "bucket",
+    "explicitness_score",
+    "durability_score",
+    "scope_score",
+    "evidence_score",
+    "certainty_score",
+    "sensitivity_score",
+    "relation_score"
+  ],
+  "$defs": {
+    "MemoryCandidateScoreBucket": {
+      "type": "string",
+      "enum": [
+        "high",
+        "middle",
+        "extremely_low"
+      ]
+    }
+  }
+}

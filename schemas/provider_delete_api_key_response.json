@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProviderDeleteApiKeyResponse",
   "type": "object",
-  "required": [
-    "deleted",
-    "provider"
-  ],
   "properties": {
     "deleted": {
       "type": "boolean"
@@ -13,5 +9,9 @@
     "provider": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "provider",
+    "deleted"
+  ]
 }

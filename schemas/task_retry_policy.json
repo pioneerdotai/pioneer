@@ -1,14 +1,10 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskRetryPolicy",
   "type": "object",
-  "required": [
-    "backoff",
-    "maxAttempts"
-  ],
   "properties": {
     "backoff": {
-      "$ref": "#/definitions/TaskRetryBackoffKind"
+      "$ref": "#/$defs/TaskRetryBackoffKind"
     },
     "initialDelaySeconds": {
       "type": [
@@ -20,7 +16,7 @@
     "maxAttempts": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "maxDelaySeconds": {
       "type": [
@@ -30,14 +26,18 @@
       "format": "int64"
     },
     "retryOn": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/TaskErrorClass"
+        "$ref": "#/$defs/TaskErrorClass"
       }
     }
   },
-  "definitions": {
+  "required": [
+    "maxAttempts",
+    "backoff"
+  ],
+  "$defs": {
     "TaskErrorClass": {
       "type": "string",
       "enum": [

@@ -1,14 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillLifecycleResultSkill",
   "type": "object",
-  "required": [
-    "fingerprint",
-    "install_path",
-    "slug",
-    "source_kind",
-    "trust_level"
-  ],
   "properties": {
     "fingerprint": {
       "type": "string"
@@ -31,5 +24,12 @@
         "null"
       ]
     }
-  }
+  },
+  "required": [
+    "slug",
+    "source_kind",
+    "fingerprint",
+    "trust_level",
+    "install_path"
+  ]
 }

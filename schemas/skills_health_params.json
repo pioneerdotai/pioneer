@@ -1,35 +1,31 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsHealthParams",
   "type": "object",
-  "required": [
-    "workspace_id"
-  ],
   "properties": {
     "audit_limit": {
-      "default": 16,
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "default": 16,
+      "minimum": 0
     },
     "skills": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillHealthTarget"
+        "$ref": "#/$defs/SkillHealthTarget"
       }
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id"
+  ],
+  "$defs": {
     "SkillHealthTarget": {
       "type": "object",
-      "required": [
-        "slug",
-        "source_kind"
-      ],
       "properties": {
         "slug": {
           "type": "string"
@@ -37,7 +33,11 @@
         "source_kind": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "slug",
+        "source_kind"
+      ]
     }
   }
 }

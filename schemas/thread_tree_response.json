@@ -1,55 +1,48 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadTreeResponse",
   "type": "object",
-  "required": [
-    "workspace_id"
-  ],
   "properties": {
     "folders": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/ThreadFolder"
+        "$ref": "#/$defs/ThreadFolder"
       }
     },
     "placements": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/ThreadPlacement"
+        "$ref": "#/$defs/ThreadPlacement"
       }
     },
     "threads": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/Thread"
+        "$ref": "#/$defs/Thread"
       }
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id"
+  ],
+  "$defs": {
     "PromptManifest": {
       "type": "object",
-      "required": [
-        "compiler_version",
-        "fingerprint_dynamic",
-        "fingerprint_full",
-        "fingerprint_stable",
-        "profile"
-      ],
       "properties": {
         "compiler_version": {
           "type": "string"
         },
         "diagnostics": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestDiagnostic"
+            "$ref": "#/$defs/PromptManifestDiagnostic"
           }
         },
         "fingerprint_dynamic": {
@@ -62,33 +55,36 @@
           "type": "string"
         },
         "hook_sources": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestHookSourceEntry"
+            "$ref": "#/$defs/PromptManifestHookSourceEntry"
           }
         },
         "profile": {
-          "$ref": "#/definitions/PromptManifestProfile"
+          "$ref": "#/$defs/PromptManifestProfile"
         },
         "section_ids": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "compiler_version",
+        "profile",
+        "fingerprint_stable",
+        "fingerprint_dynamic",
+        "fingerprint_full"
+      ]
     },
     "PromptManifestDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "message"
-      ],
       "properties": {
         "code": {
-          "$ref": "#/definitions/PromptManifestDiagnosticCode"
+          "$ref": "#/$defs/PromptManifestDiagnosticCode"
         },
         "file": {
           "type": [
@@ -99,7 +95,7 @@
         "hook_source": {
           "anyOf": [
             {
-              "$ref": "#/definitions/PromptManifestHookSource"
+              "$ref": "#/$defs/PromptManifestHookSource"
             },
             {
               "type": "null"
@@ -115,7 +111,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
     },
     "PromptManifestDiagnosticCode": {
       "type": "string",
@@ -134,6 +134,7 @@
     "PromptManifestHookContributionKind": {
       "type": "string",
       "enum": [
+        "prompt_context",
         "prompt_section",
         "prompt_manifest_diagnostic",
         "runtime_failure"
@@ -142,16 +143,12 @@
     "PromptManifestHookPhase": {
       "type": "string",
       "enum": [
+        "turn_pre_prompt_context",
         "turn_pre_prompt_compile"
       ]
     },
     "PromptManifestHookSource": {
       "type": "object",
-      "required": [
-        "hook_id",
-        "phase",
-        "subscription_id"
-      ],
       "properties": {
         "contribution_hash": {
           "type": [
@@ -169,23 +166,30 @@
           "type": "string"
         },
         "phase": {
-          "$ref": "#/definitions/PromptManifestHookPhase"
+          "$ref": "#/$defs/PromptManifestHookPhase"
         },
         "subscription_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
     },
     "PromptManifestHookSourceEntry": {
       "type": "object",
-      "required": [
-        "contribution_kind",
-        "source",
-        "truncation"
-      ],
       "properties": {
         "contribution_kind": {
-          "$ref": "#/definitions/PromptManifestHookContributionKind"
+          "$ref": "#/$defs/PromptManifestHookContributionKind"
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
         },
         "section_id": {
           "type": [
@@ -194,12 +198,25 @@
           ]
         },
         "source": {
-          "$ref": "#/definitions/PromptManifestHookSource"
+          "$ref": "#/$defs/PromptManifestHookSource"
+        },
+        "source_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         },
         "truncation": {
-          "$ref": "#/definitions/PromptManifestHookTruncation"
+          "$ref": "#/$defs/PromptManifestHookTruncation"
         }
-      }
+      },
+      "required": [
+        "source",
+        "contribution_kind",
+        "truncation"
+      ]
     },
     "PromptManifestHookTruncation": {
       "type": "string",
@@ -221,18 +238,6 @@
     },
     "Thread": {
       "type": "object",
-      "required": [
-        "created_at",
-        "id",
-        "mode",
-        "model",
-        "model_provider",
-        "preview",
-        "status",
-        "turns",
-        "updated_at",
-        "workspace_id"
-      ],
       "properties": {
         "agent_nickname": {
           "type": [
@@ -254,7 +259,7 @@
           "type": "string"
         },
         "mode": {
-          "$ref": "#/definitions/ThreadMode"
+          "$ref": "#/$defs/ThreadMode"
         },
         "model": {
           "type": "string"
@@ -269,31 +274,23 @@
           ]
         },
         "origin_kind": {
-          "default": "user",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ThreadOriginKind"
-            }
-          ]
+          "$ref": "#/$defs/ThreadOriginKind",
+          "default": "user"
         },
         "preview": {
           "type": "string"
         },
         "sidebar_visibility": {
-          "default": "visible",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ThreadSidebarVisibility"
-            }
-          ]
+          "$ref": "#/$defs/ThreadSidebarVisibility",
+          "default": "visible"
         },
         "status": {
-          "$ref": "#/definitions/ThreadStatus"
+          "$ref": "#/$defs/ThreadStatus"
         },
         "turns": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/Turn"
+            "$ref": "#/$defs/Turn"
           }
         },
         "updated_at": {
@@ -303,17 +300,22 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "id",
+        "preview",
+        "mode",
+        "model",
+        "model_provider",
+        "created_at",
+        "updated_at",
+        "status",
+        "turns"
+      ]
     },
     "ThreadFolder": {
       "type": "object",
-      "required": [
-        "created_at",
-        "id",
-        "name",
-        "updated_at",
-        "workspace_id"
-      ],
       "properties": {
         "created_at": {
           "type": "integer",
@@ -338,7 +340,14 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "name",
+        "created_at",
+        "updated_at"
+      ]
     },
     "ThreadMode": {
       "type": "string",
@@ -357,10 +366,6 @@
     },
     "ThreadPlacement": {
       "type": "object",
-      "required": [
-        "thread_id",
-        "workspace_id"
-      ],
       "properties": {
         "folder_id": {
           "type": [
@@ -374,7 +379,11 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "thread_id",
+        "workspace_id"
+      ]
     },
     "ThreadSidebarVisibility": {
       "type": "string",
@@ -393,10 +402,6 @@
     },
     "Turn": {
       "type": "object",
-      "required": [
-        "id",
-        "status"
-      ],
       "properties": {
         "error": {
           "type": [
@@ -410,7 +415,7 @@
         "prompt_manifest": {
           "anyOf": [
             {
-              "$ref": "#/definitions/PromptManifest"
+              "$ref": "#/$defs/PromptManifest"
             },
             {
               "type": "null"
@@ -418,9 +423,13 @@
           ]
         },
         "status": {
-          "$ref": "#/definitions/TurnStatus"
+          "$ref": "#/$defs/TurnStatus"
         }
-      }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
     },
     "TurnStatus": {
       "type": "string",

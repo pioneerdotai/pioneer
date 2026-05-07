@@ -1,16 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryCandidatesDecideParams",
   "type": "object",
-  "required": [
-    "candidate_id",
-    "decision"
-  ],
   "properties": {
     "actor": {
       "anyOf": [
         {
-          "$ref": "#/definitions/MemoryActor"
+          "$ref": "#/$defs/MemoryActor"
         },
         {
           "type": "null"
@@ -21,7 +17,7 @@
       "type": "string"
     },
     "decision": {
-      "$ref": "#/definitions/MemoryCandidateDecision"
+      "$ref": "#/$defs/MemoryCandidateDecision"
     },
     "reason": {
       "type": [
@@ -30,12 +26,13 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "candidate_id",
+    "decision"
+  ],
+  "$defs": {
     "MemoryActor": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": [
@@ -44,9 +41,12 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/MemoryActorKind"
+          "$ref": "#/$defs/MemoryActorKind"
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "MemoryActorKind": {
       "type": "string",

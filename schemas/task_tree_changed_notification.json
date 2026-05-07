@@ -1,24 +1,18 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskTreeChangedNotification",
   "type": "object",
+  "properties": {
+    "context": {
+      "$ref": "#/$defs/TaskNotificationContext"
+    }
+  },
   "required": [
     "context"
   ],
-  "properties": {
-    "context": {
-      "$ref": "#/definitions/TaskNotificationContext"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "TaskNotificationContext": {
       "type": "object",
-      "required": [
-        "eventId",
-        "sequence",
-        "taskId",
-        "workspaceId"
-      ],
       "properties": {
         "eventId": {
           "type": "string"
@@ -63,7 +57,13 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "eventId",
+        "sequence"
+      ]
     }
   }
 }

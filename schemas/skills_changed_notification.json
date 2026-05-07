@@ -1,19 +1,13 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsChangedNotification",
   "type": "object",
-  "required": [
-    "created_at",
-    "reason",
-    "snapshot_version",
-    "workspace_id"
-  ],
   "properties": {
     "changes": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillChangedItem"
+        "$ref": "#/$defs/SkillChangedItem"
       }
     },
     "created_at": {
@@ -26,20 +20,21 @@
     "snapshot_version": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "snapshot_version",
+    "reason",
+    "created_at"
+  ],
+  "$defs": {
     "SkillChangedItem": {
       "type": "object",
-      "required": [
-        "change_type",
-        "slug",
-        "source_kind"
-      ],
       "properties": {
         "change_type": {
           "type": "string"
@@ -62,7 +57,12 @@
         "source_kind": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "slug",
+        "source_kind",
+        "change_type"
+      ]
     }
   }
 }

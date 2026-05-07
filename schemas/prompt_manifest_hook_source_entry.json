@@ -1,15 +1,17 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PromptManifestHookSourceEntry",
   "type": "object",
-  "required": [
-    "contribution_kind",
-    "source",
-    "truncation"
-  ],
   "properties": {
     "contribution_kind": {
-      "$ref": "#/definitions/PromptManifestHookContributionKind"
+      "$ref": "#/$defs/PromptManifestHookContributionKind"
+    },
+    "priority": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
     },
     "section_id": {
       "type": [
@@ -18,16 +20,30 @@
       ]
     },
     "source": {
-      "$ref": "#/definitions/PromptManifestHookSource"
+      "$ref": "#/$defs/PromptManifestHookSource"
+    },
+    "source_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "minimum": 0
     },
     "truncation": {
-      "$ref": "#/definitions/PromptManifestHookTruncation"
+      "$ref": "#/$defs/PromptManifestHookTruncation"
     }
   },
-  "definitions": {
+  "required": [
+    "source",
+    "contribution_kind",
+    "truncation"
+  ],
+  "$defs": {
     "PromptManifestHookContributionKind": {
       "type": "string",
       "enum": [
+        "prompt_context",
         "prompt_section",
         "prompt_manifest_diagnostic",
         "runtime_failure"
@@ -36,16 +52,12 @@
     "PromptManifestHookPhase": {
       "type": "string",
       "enum": [
+        "turn_pre_prompt_context",
         "turn_pre_prompt_compile"
       ]
     },
     "PromptManifestHookSource": {
       "type": "object",
-      "required": [
-        "hook_id",
-        "phase",
-        "subscription_id"
-      ],
       "properties": {
         "contribution_hash": {
           "type": [
@@ -63,12 +75,17 @@
           "type": "string"
         },
         "phase": {
-          "$ref": "#/definitions/PromptManifestHookPhase"
+          "$ref": "#/$defs/PromptManifestHookPhase"
         },
         "subscription_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
     },
     "PromptManifestHookTruncation": {
       "type": "string",

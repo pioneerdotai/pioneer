@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillChangedItem",
   "type": "object",
-  "required": [
-    "change_type",
-    "slug",
-    "source_kind"
-  ],
   "properties": {
     "change_type": {
       "type": "string"
@@ -29,5 +24,10 @@
     "source_kind": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "slug",
+    "source_kind",
+    "change_type"
+  ]
 }

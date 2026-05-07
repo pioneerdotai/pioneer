@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryDurability",
+  "type": "string",
+  "enum": [
+    "long_lived",
+    "project_lifetime",
+    "session_only",
+    "transient",
+    "unknown"
+  ]
+}

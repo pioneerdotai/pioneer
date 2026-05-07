@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpValidationDiagnostic",
   "type": "object",
-  "required": [
-    "code",
-    "level",
-    "message"
-  ],
   "properties": {
     "code": {
       "type": "string"
@@ -18,13 +13,18 @@
       ]
     },
     "level": {
-      "$ref": "#/definitions/McpDiagnosticLevel"
+      "$ref": "#/$defs/McpDiagnosticLevel"
     },
     "message": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "code",
+    "level",
+    "message"
+  ],
+  "$defs": {
     "McpDiagnosticLevel": {
       "type": "string",
       "enum": [

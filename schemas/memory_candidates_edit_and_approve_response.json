@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatesEditAndApproveResponse",
+  "type": "object",
+  "properties": {
+    "candidate": {
+      "$ref": "#/$defs/MemoryCandidate"
+    },
+    "record": {
+      "$ref": "#/$defs/MemoryRecord"
+    }
+  },
+  "required": [
+    "candidate",
+    "record"
+  ],
+  "$defs": {
+    "MemoryActor": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryActorKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    },
+    "MemoryCandidate": {
+      "type": "object",
+      "properties": {
+        "candidate_text": {
+          "type": "string"
+        },
+        "category": {
+          "$ref": "#/$defs/MemoryCategory"
+        },
+        "confidence": {
+          "type": "number",
+          "format": "float"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decided_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "decision_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "provenance": {
+          "$ref": "#/$defs/MemoryProvenance"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "status": {
+          "$ref": "#/$defs/MemoryCandidateStatus"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "category",
+        "candidate_text",
+        "confidence",
+        "reason",
+        "provenance",
+        "status",
+        "created_at"
+      ]
+    },
+    "MemoryCandidateStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "pending_silent",
+        "ask_on_use",
+        "needs_review",
+        "approved",
+        "rejected",
+        "auto_rejected",
+        "review_disabled_rejected",
+        "superseded",
+        "merged_duplicate",
+        "expired"
+      ]
+    },
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "recurring_instruction",
+        "project_policy",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
+      ]
+    },
+    "MemoryProvenance": {
+      "type": "object",
+      "properties": {
+        "created_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_kind": {
+          "$ref": "#/$defs/MemorySourceKind"
+        },
+        "source_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source_kind"
+      ]
+    },
+    "MemoryRecord": {
+      "type": "object",
+      "properties": {
+        "access_count": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "category": {
+          "$ref": "#/$defs/MemoryCategory"
+        },
+        "confidence": {
+          "type": "number",
+          "format": "float"
+        },
+        "content": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "delete_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deleted_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "expires_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "importance": {
+          "type": "number",
+          "format": "float"
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_accessed_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/MemoryProvenance"
+        },
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/MemorySensitivity"
+        },
+        "status": {
+          "$ref": "#/$defs/MemoryStatus"
+        },
+        "superseded_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "category",
+        "content",
+        "status",
+        "confidence",
+        "importance",
+        "sensitivity",
+        "provenance",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "MemoryScope": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryScopeKind"
+        }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    },
+    "MemorySensitivity": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "personal",
+        "secret_like",
+        "regulated"
+      ]
+    },
+    "MemorySourceKind": {
+      "type": "string",
+      "enum": [
+        "explicit_user_request",
+        "user_correction",
+        "assistant_inference",
+        "background_extractor",
+        "tool_observation",
+        "import",
+        "system"
+      ]
+    },
+    "MemoryStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "superseded",
+        "deleted",
+        "expired"
+      ]
+    }
+  }
+}

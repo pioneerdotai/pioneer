@@ -1,46 +1,39 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsInstallResponse",
   "type": "object",
-  "required": [
-    "audit",
-    "skill",
-    "status"
-  ],
   "properties": {
     "audit": {
-      "$ref": "#/definitions/SkillLifecycleAuditSummary"
+      "$ref": "#/$defs/SkillLifecycleAuditSummary"
     },
     "skill": {
-      "$ref": "#/definitions/SkillLifecycleResultSkill"
+      "$ref": "#/$defs/SkillLifecycleResultSkill"
     },
     "status": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "status",
+    "skill",
+    "audit"
+  ],
+  "$defs": {
     "SkillLifecycleAuditSummary": {
       "type": "object",
-      "required": [
-        "events_written"
-      ],
       "properties": {
         "events_written": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "events_written"
+      ]
     },
     "SkillLifecycleResultSkill": {
       "type": "object",
-      "required": [
-        "fingerprint",
-        "install_path",
-        "slug",
-        "source_kind",
-        "trust_level"
-      ],
       "properties": {
         "fingerprint": {
           "type": "string"
@@ -63,7 +56,14 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "slug",
+        "source_kind",
+        "fingerprint",
+        "trust_level",
+        "install_path"
+      ]
     }
   }
 }

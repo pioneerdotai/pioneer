@@ -1,29 +1,29 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpChangedNotification",
   "type": "object",
-  "required": [
-    "snapshot_version",
-    "workspace_id"
-  ],
   "properties": {
     "changed": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpChangedItem"
+        "$ref": "#/$defs/McpChangedItem"
       }
     },
     "snapshot_version": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "snapshot_version"
+  ],
+  "$defs": {
     "McpChangedAction": {
       "type": "string",
       "enum": [
@@ -35,22 +35,22 @@
     },
     "McpChangedItem": {
       "type": "object",
-      "required": [
-        "action",
-        "name",
-        "source_kind"
-      ],
       "properties": {
         "action": {
-          "$ref": "#/definitions/McpChangedAction"
+          "$ref": "#/$defs/McpChangedAction"
         },
         "name": {
           "type": "string"
         },
         "source_kind": {
-          "$ref": "#/definitions/McpSourceKind"
+          "$ref": "#/$defs/McpSourceKind"
         }
-      }
+      },
+      "required": [
+        "name",
+        "source_kind",
+        "action"
+      ]
     },
     "McpSourceKind": {
       "type": "string",

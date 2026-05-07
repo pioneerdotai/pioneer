@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpPolicyState",
   "type": "object",
-  "required": [
-    "allow_implicit_invocation",
-    "enabled"
-  ],
   "properties": {
     "allow_implicit_invocation": {
       "type": "boolean"
@@ -13,5 +9,9 @@
     "enabled": {
       "type": "boolean"
     }
-  }
+  },
+  "required": [
+    "enabled",
+    "allow_implicit_invocation"
+  ]
 }

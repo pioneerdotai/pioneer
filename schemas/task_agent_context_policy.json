@@ -1,17 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskAgentContextPolicy",
   "type": "object",
-  "required": [
-    "includeArtifacts",
-    "includeParentSummary",
-    "mode"
-  ],
   "properties": {
     "customContext": {
       "anyOf": [
         {
-          "$ref": "#/definitions/TaskAgentContext"
+          "$ref": "#/$defs/TaskAgentContext"
         },
         {
           "type": "null"
@@ -30,28 +25,33 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "mode": {
-      "$ref": "#/definitions/TaskAgentContextMode"
+      "$ref": "#/$defs/TaskAgentContextMode"
     }
   },
-  "definitions": {
+  "required": [
+    "mode",
+    "includeParentSummary",
+    "includeArtifacts"
+  ],
+  "$defs": {
     "TaskAgentContext": {
       "type": "object",
       "properties": {
         "attachments": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputAttachment"
+            "$ref": "#/$defs/TaskAgentInputAttachment"
           }
         },
         "references": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputReference"
+            "$ref": "#/$defs/TaskAgentInputReference"
           }
         },
         "text": {
@@ -61,10 +61,10 @@
           ]
         },
         "variables": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputVariable"
+            "$ref": "#/$defs/TaskAgentInputVariable"
           }
         }
       }
@@ -81,9 +81,6 @@
     },
     "TaskAgentInputAttachment": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "artifactId": {
           "type": [
@@ -92,7 +89,7 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/TaskAgentInputAttachmentKind"
+          "$ref": "#/$defs/TaskAgentInputAttachmentKind"
         },
         "mimeType": {
           "type": [
@@ -118,7 +115,10 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "TaskAgentInputAttachmentKind": {
       "type": "string",
@@ -130,16 +130,12 @@
     },
     "TaskAgentInputReference": {
       "type": "object",
-      "required": [
-        "id",
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": "string"
         },
         "kind": {
-          "$ref": "#/definitions/TaskAgentInputReferenceKind"
+          "$ref": "#/$defs/TaskAgentInputReferenceKind"
         },
         "label": {
           "type": [
@@ -147,7 +143,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
     },
     "TaskAgentInputReferenceKind": {
       "type": "string",
@@ -161,150 +161,136 @@
     },
     "TaskAgentInputVariable": {
       "type": "object",
-      "required": [
-        "name",
-        "value"
-      ],
       "properties": {
         "name": {
           "type": "string"
         },
         "value": {
-          "$ref": "#/definitions/TaskValue"
+          "$ref": "#/$defs/TaskValue"
         }
-      }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
     },
     "TaskValue": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "integer"
-              ]
+              "const": "integer"
             },
             "value": {
               "type": "integer",
               "format": "int64"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "number",
               "format": "double"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             },
             "value": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             },
             "value": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         }
       ]
     }

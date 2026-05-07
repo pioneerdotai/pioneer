@@ -1,13 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpAuditEventSummary",
   "type": "object",
-  "required": [
-    "action",
-    "created_at",
-    "decision",
-    "server_name"
-  ],
   "properties": {
     "action": {
       "type": "string"
@@ -61,5 +55,11 @@
         "null"
       ]
     }
-  }
+  },
+  "required": [
+    "server_name",
+    "action",
+    "decision",
+    "created_at"
+  ]
 }

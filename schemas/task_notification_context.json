@@ -1,13 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskNotificationContext",
   "type": "object",
-  "required": [
-    "eventId",
-    "sequence",
-    "taskId",
-    "workspaceId"
-  ],
   "properties": {
     "eventId": {
       "type": "string"
@@ -52,5 +46,11 @@
     "workspaceId": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspaceId",
+    "taskId",
+    "eventId",
+    "sequence"
+  ]
 }

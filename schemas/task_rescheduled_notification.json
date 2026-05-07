@@ -1,20 +1,20 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskRescheduledNotification",
   "type": "object",
+  "properties": {
+    "context": {
+      "$ref": "#/$defs/TaskNotificationContext"
+    },
+    "trigger": {
+      "$ref": "#/$defs/TaskTrigger"
+    }
+  },
   "required": [
     "context",
     "trigger"
   ],
-  "properties": {
-    "context": {
-      "$ref": "#/definitions/TaskNotificationContext"
-    },
-    "trigger": {
-      "$ref": "#/definitions/TaskTrigger"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "TaskDependencyTriggerMode": {
       "type": "string",
       "enum": [
@@ -25,21 +25,21 @@
     },
     "TaskDependencyTriggerPolicy": {
       "type": "object",
-      "required": [
-        "mode"
-      ],
       "properties": {
         "dependsOnTaskIds": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "mode": {
-          "$ref": "#/definitions/TaskDependencyTriggerMode"
+          "$ref": "#/$defs/TaskDependencyTriggerMode"
         }
-      }
+      },
+      "required": [
+        "mode"
+      ]
     },
     "TaskExternalTriggerFilter": {
       "type": "object",
@@ -51,11 +51,11 @@
           ]
         },
         "fields": {
-          "default": {},
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/TaskValue"
-          }
+            "$ref": "#/$defs/TaskValue"
+          },
+          "default": {}
         }
       }
     },
@@ -70,12 +70,6 @@
     },
     "TaskNotificationContext": {
       "type": "object",
-      "required": [
-        "eventId",
-        "sequence",
-        "taskId",
-        "workspaceId"
-      ],
       "properties": {
         "eventId": {
           "type": "string"
@@ -120,18 +114,16 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "eventId",
+        "sequence"
+      ]
     },
     "TaskTrigger": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "id",
-        "spec",
-        "status",
-        "taskId",
-        "updatedAt"
-      ],
       "properties": {
         "createdAt": {
           "type": "integer",
@@ -155,10 +147,10 @@
           "format": "int64"
         },
         "spec": {
-          "$ref": "#/definitions/TaskTriggerSpec"
+          "$ref": "#/$defs/TaskTriggerSpec"
         },
         "status": {
-          "$ref": "#/definitions/TaskTriggerStatus"
+          "$ref": "#/$defs/TaskTriggerStatus"
         },
         "taskId": {
           "type": "string"
@@ -167,36 +159,36 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "status",
+        "spec",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskTriggerSpec": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "immediate"
-              ]
+              "const": "immediate"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "scheduled_at"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "scheduled_at"
-              ]
+              "const": "scheduled_at"
             },
             "scheduled_at": {
               "type": "integer",
@@ -208,14 +200,14 @@
                 "null"
               ]
             }
-          }
+          },
+          "required": [
+            "kind",
+            "scheduled_at"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "interval_seconds",
-            "kind"
-          ],
           "properties": {
             "interval_anchor_at": {
               "type": [
@@ -230,44 +222,41 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "interval"
-              ]
+              "const": "interval"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "interval_seconds"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "cron_expr",
-            "kind",
-            "timezone"
-          ],
           "properties": {
             "cron_expr": {
               "type": "string"
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "cron"
-              ]
+              "const": "cron"
             },
             "timezone": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "cron_expr",
+            "timezone"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "allowed_actor": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/TaskManualActor"
+                  "$ref": "#/$defs/TaskManualActor"
                 },
                 {
                   "type": "null"
@@ -276,18 +265,15 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "manual"
-              ]
+              "const": "manual"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "source"
-          ],
           "properties": {
             "event_type": {
               "type": [
@@ -298,7 +284,7 @@
             "filter": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/TaskExternalTriggerFilter"
+                  "$ref": "#/$defs/TaskExternalTriggerFilter"
                 },
                 {
                   "type": "null"
@@ -307,32 +293,32 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "external"
-              ]
+              "const": "external"
             },
             "source": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "source"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "policy"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "dependency"
-              ]
+              "const": "dependency"
             },
             "policy": {
-              "$ref": "#/definitions/TaskDependencyTriggerPolicy"
+              "$ref": "#/$defs/TaskDependencyTriggerPolicy"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "policy"
+          ]
         }
       ]
     },
@@ -349,133 +335,119 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "integer"
-              ]
+              "const": "integer"
             },
             "value": {
               "type": "integer",
               "format": "int64"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "number",
               "format": "double"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             },
             "value": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             },
             "value": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         }
       ]
     }

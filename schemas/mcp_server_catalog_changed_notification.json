@@ -1,18 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerCatalogChangedNotification",
   "type": "object",
-  "required": [
-    "catalog_version",
-    "name",
-    "prompts_count",
-    "resource_templates_count",
-    "resources_count",
-    "server_id",
-    "snapshot_version",
-    "tools_count",
-    "workspace_id"
-  ],
   "properties": {
     "catalog_version": {
       "type": "string"
@@ -23,17 +12,17 @@
     "prompts_count": {
       "type": "integer",
       "format": "uint",
-      "minimum": 0.0
+      "minimum": 0
     },
     "resource_templates_count": {
       "type": "integer",
       "format": "uint",
-      "minimum": 0.0
+      "minimum": 0
     },
     "resources_count": {
       "type": "integer",
       "format": "uint",
-      "minimum": 0.0
+      "minimum": 0
     },
     "server_id": {
       "type": "string"
@@ -41,15 +30,26 @@
     "snapshot_version": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "tools_count": {
       "type": "integer",
       "format": "uint",
-      "minimum": 0.0
+      "minimum": 0
     },
     "workspace_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspace_id",
+    "snapshot_version",
+    "server_id",
+    "name",
+    "catalog_version",
+    "tools_count",
+    "resources_count",
+    "resource_templates_count",
+    "prompts_count"
+  ]
 }

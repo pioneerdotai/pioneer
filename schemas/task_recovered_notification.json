@@ -1,29 +1,23 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskRecoveredNotification",
   "type": "object",
-  "required": [
-    "context",
-    "recoveredAt"
-  ],
   "properties": {
     "context": {
-      "$ref": "#/definitions/TaskNotificationContext"
+      "$ref": "#/$defs/TaskNotificationContext"
     },
     "recoveredAt": {
       "type": "integer",
       "format": "int64"
     }
   },
-  "definitions": {
+  "required": [
+    "context",
+    "recoveredAt"
+  ],
+  "$defs": {
     "TaskNotificationContext": {
       "type": "object",
-      "required": [
-        "eventId",
-        "sequence",
-        "taskId",
-        "workspaceId"
-      ],
       "properties": {
         "eventId": {
           "type": "string"
@@ -68,7 +62,13 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "eventId",
+        "sequence"
+      ]
     }
   }
 }

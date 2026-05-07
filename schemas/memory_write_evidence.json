@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryWriteEvidence",
+  "type": "object",
+  "properties": {
+    "extractor_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quote_or_span": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_item_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,15 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Workspace",
   "type": "object",
-  "required": [
-    "created_at",
-    "id",
-    "is_active",
-    "is_current",
-    "name",
-    "updated_at"
-  ],
   "properties": {
     "created_at": {
       "type": "integer",
@@ -31,5 +23,13 @@
       "type": "integer",
       "format": "int64"
     }
-  }
+  },
+  "required": [
+    "id",
+    "name",
+    "is_active",
+    "is_current",
+    "created_at",
+    "updated_at"
+  ]
 }

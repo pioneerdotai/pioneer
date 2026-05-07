@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatesSuppressSimilarParams",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryActor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "candidate_id"
+  ],
+  "$defs": {
+    "MemoryActor": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryActorKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    }
+  }
+}

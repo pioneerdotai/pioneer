@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemorySemanticWriteDisposition",
+  "type": "string",
+  "enum": [
+    "accept_active",
+    "create_pending_candidate",
+    "reject_suppressed",
+    "route_to_candidate_policy"
+  ]
+}

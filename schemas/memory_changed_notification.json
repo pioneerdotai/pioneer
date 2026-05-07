@@ -1,15 +1,10 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryChangedNotification",
   "type": "object",
-  "required": [
-    "change_kind",
-    "memory_id",
-    "scope"
-  ],
   "properties": {
     "change_kind": {
-      "$ref": "#/definitions/MemoryChangeKind"
+      "$ref": "#/$defs/MemoryChangeKind"
     },
     "memory_id": {
       "type": "string"
@@ -17,7 +12,7 @@
     "record": {
       "anyOf": [
         {
-          "$ref": "#/definitions/MemoryRecord"
+          "$ref": "#/$defs/MemoryRecord"
         },
         {
           "type": "null"
@@ -25,15 +20,17 @@
       ]
     },
     "scope": {
-      "$ref": "#/definitions/MemoryScope"
+      "$ref": "#/$defs/MemoryScope"
     }
   },
-  "definitions": {
+  "required": [
+    "memory_id",
+    "scope",
+    "change_kind"
+  ],
+  "$defs": {
     "MemoryActor": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": [
@@ -42,9 +39,12 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/MemoryActorKind"
+          "$ref": "#/$defs/MemoryActorKind"
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "MemoryActorKind": {
       "type": "string",
@@ -63,6 +63,8 @@
         "preference",
         "biography",
         "relationship",
+        "recurring_instruction",
+        "project_policy",
         "project_fact",
         "project_decision",
         "procedure",
@@ -84,14 +86,11 @@
     },
     "MemoryProvenance": {
       "type": "object",
-      "required": [
-        "source_kind"
-      ],
       "properties": {
         "created_by": {
           "anyOf": [
             {
-              "$ref": "#/definitions/MemoryActor"
+              "$ref": "#/$defs/MemoryActor"
             },
             {
               "type": "null"
@@ -105,7 +104,7 @@
           ]
         },
         "source_kind": {
-          "$ref": "#/definitions/MemorySourceKind"
+          "$ref": "#/$defs/MemorySourceKind"
         },
         "source_thread_id": {
           "type": [
@@ -119,32 +118,22 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "source_kind"
+      ]
     },
     "MemoryRecord": {
       "type": "object",
-      "required": [
-        "category",
-        "confidence",
-        "content",
-        "created_at",
-        "id",
-        "importance",
-        "provenance",
-        "scope",
-        "sensitivity",
-        "status",
-        "updated_at"
-      ],
       "properties": {
         "access_count": {
-          "default": 0,
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "default": 0,
+          "minimum": 0
         },
         "category": {
-          "$ref": "#/definitions/MemoryCategory"
+          "$ref": "#/$defs/MemoryCategory"
         },
         "confidence": {
           "type": "number",
@@ -208,16 +197,16 @@
           ]
         },
         "provenance": {
-          "$ref": "#/definitions/MemoryProvenance"
+          "$ref": "#/$defs/MemoryProvenance"
         },
         "scope": {
-          "$ref": "#/definitions/MemoryScope"
+          "$ref": "#/$defs/MemoryScope"
         },
         "sensitivity": {
-          "$ref": "#/definitions/MemorySensitivity"
+          "$ref": "#/$defs/MemorySensitivity"
         },
         "status": {
-          "$ref": "#/definitions/MemoryStatus"
+          "$ref": "#/$defs/MemoryStatus"
         },
         "superseded_by": {
           "type": [
@@ -229,22 +218,35 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "scope",
+        "category",
+        "content",
+        "status",
+        "confidence",
+        "importance",
+        "sensitivity",
+        "provenance",
+        "created_at",
+        "updated_at"
+      ]
     },
     "MemoryScope": {
       "type": "object",
-      "required": [
-        "key",
-        "kind"
-      ],
       "properties": {
         "key": {
           "type": "string"
         },
         "kind": {
-          "$ref": "#/definitions/MemoryScopeKind"
+          "$ref": "#/$defs/MemoryScopeKind"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
     },
     "MemoryScopeKind": {
       "type": "string",

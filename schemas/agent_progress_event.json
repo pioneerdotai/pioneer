@@ -1,47 +1,35 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AgentProgressEvent",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "item_delta"
-          ]
+          "const": "item_delta"
         },
         "notification": {
-          "$ref": "#/definitions/ItemDeltaNotification"
+          "$ref": "#/$defs/ItemDeltaNotification"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "item_id",
-        "item_type",
-        "kind",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "item_id": {
           "type": "string"
         },
         "item_type": {
-          "$ref": "#/definitions/TurnItemType"
+          "$ref": "#/$defs/TurnItemType"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "item_heartbeat"
-          ]
+          "const": "item_heartbeat"
         },
         "thread_id": {
           "type": "string"
@@ -52,19 +40,18 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "item_type"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "delta",
-        "item_id",
-        "kind",
-        "stream",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "delta": {
           "type": "string"
@@ -74,13 +61,11 @@
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "tool_output_delta"
-          ]
+          "const": "tool_output_delta"
         },
         "payload": true,
         "stream": {
-          "$ref": "#/definitions/ItemDeltaStream"
+          "$ref": "#/$defs/ItemDeltaStream"
         },
         "thread_id": {
           "type": "string"
@@ -91,28 +76,26 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "stream",
+        "delta"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "item_id",
-        "kind",
-        "summary",
-        "task_id",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "item_id": {
           "type": "string"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "task_progress"
-          ]
+          "const": "task_progress"
         },
         "run_id": {
           "type": [
@@ -135,19 +118,21 @@
         "workspace_id": {
           "type": "string"
         }
-      }
-    }
-  ],
-  "definitions": {
-    "ItemDeltaNotification": {
-      "type": "object",
+      },
       "required": [
-        "delta",
-        "item_id",
+        "kind",
+        "workspace_id",
         "thread_id",
         "turn_id",
-        "workspace_id"
-      ],
+        "item_id",
+        "task_id",
+        "summary"
+      ]
+    }
+  ],
+  "$defs": {
+    "ItemDeltaNotification": {
+      "type": "object",
       "properties": {
         "delta": {
           "type": "string"
@@ -158,7 +143,7 @@
         "markdown": {
           "anyOf": [
             {
-              "$ref": "#/definitions/MarkdownDocument"
+              "$ref": "#/$defs/MarkdownDocument"
             },
             {
               "type": "null"
@@ -171,13 +156,14 @@
             "null"
           ],
           "format": "uint16",
-          "minimum": 0.0
+          "maximum": 65535,
+          "minimum": 0
         },
         "payload": true,
         "stream": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ItemDeltaStream"
+              "$ref": "#/$defs/ItemDeltaStream"
             },
             {
               "type": "null"
@@ -193,7 +179,14 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "delta"
+      ]
     },
     "ItemDeltaStream": {
       "type": "string",
@@ -210,111 +203,74 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
-            "marks": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownMark"
-              }
-            },
-            "text": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "paragraph"
-              ]
+              "const": "paragraph"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownInline",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "content",
-            "level",
-            "type"
-          ],
           "properties": {
             "content": {
-              "$ref": "#/definitions/MarkdownInline"
+              "$ref": "#/$defs/MarkdownInline"
             },
             "level": {
               "type": "integer",
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "heading"
-              ]
+              "const": "heading"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level",
+            "content"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "ordered",
-            "start",
-            "type"
-          ],
           "properties": {
-            "items": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownListItem"
-              }
-            },
-            "ordered": {
-              "type": "boolean"
-            },
-            "start": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0.0
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownList",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "blocks",
-            "type"
-          ],
           "properties": {
             "blocks": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/MarkdownBlock"
+                "$ref": "#/$defs/MarkdownBlock"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "quote"
-              ]
+              "const": "quote"
             }
-          }
+          },
+          "required": [
+            "type",
+            "blocks"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
             "language": {
               "type": [
@@ -327,25 +283,25 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "rule"
-              ]
+              "const": "rule"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
@@ -353,40 +309,64 @@
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         }
       }
     },
     "MarkdownInline": {
       "type": "object",
-      "required": [
-        "text"
-      ],
       "properties": {
         "marks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownMark"
+            "$ref": "#/$defs/MarkdownMark"
           }
         },
         "text": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "MarkdownList": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownListItem"
+          }
+        },
+        "ordered": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ordered",
+        "start"
+      ]
     },
     "MarkdownListItem": {
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         },
         "checked": {
@@ -399,102 +379,92 @@
     },
     "MarkdownMark": {
       "type": "object",
-      "required": [
-        "end",
-        "kind",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "kind": {
-          "$ref": "#/definitions/MarkdownMarkKind"
+          "$ref": "#/$defs/MarkdownMarkKind"
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
     },
     "MarkdownMarkKind": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "bold"
-              ]
+              "const": "bold"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "italic"
-              ]
+              "const": "italic"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "strike"
-              ]
+              "const": "strike"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "link"
-              ]
+              "const": "link"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         }
       ]
     },

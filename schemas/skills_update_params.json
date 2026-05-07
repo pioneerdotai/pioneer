@@ -1,13 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUpdateParams",
   "type": "object",
-  "required": [
-    "slug",
-    "source",
-    "source_kind",
-    "workspace_id"
-  ],
   "properties": {
     "expected_previous_fingerprint": {
       "type": [
@@ -19,7 +13,7 @@
       "type": "string"
     },
     "source": {
-      "$ref": "#/definitions/SkillLifecycleSource"
+      "$ref": "#/$defs/SkillLifecycleSource"
     },
     "source_kind": {
       "type": "string"
@@ -28,26 +22,30 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "slug",
+    "source_kind",
+    "source"
+  ],
+  "$defs": {
     "SkillLifecycleSource": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type",
-            "upload_id"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "uploaded_archive"
-              ]
+              "const": "uploaded_archive"
             },
             "upload_id": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "upload_id"
+          ]
         }
       ]
     }

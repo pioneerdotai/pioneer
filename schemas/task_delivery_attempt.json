@@ -1,19 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskDeliveryAttempt",
   "type": "object",
-  "required": [
-    "attemptNumber",
-    "deliveryId",
-    "id",
-    "startedAt",
-    "status"
-  ],
   "properties": {
     "attemptNumber": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "completedAt": {
       "type": [
@@ -37,7 +30,8 @@
         "null"
       ],
       "format": "uint16",
-      "minimum": 0.0
+      "maximum": 65535,
+      "minimum": 0
     },
     "id": {
       "type": "string"
@@ -53,10 +47,17 @@
       "format": "int64"
     },
     "status": {
-      "$ref": "#/definitions/TaskDeliveryAttemptStatus"
+      "$ref": "#/$defs/TaskDeliveryAttemptStatus"
     }
   },
-  "definitions": {
+  "required": [
+    "id",
+    "deliveryId",
+    "attemptNumber",
+    "status",
+    "startedAt"
+  ],
+  "$defs": {
     "TaskDeliveryAttemptStatus": {
       "type": "string",
       "enum": [

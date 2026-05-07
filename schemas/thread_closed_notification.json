@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadClosedNotification",
   "type": "object",
-  "required": [
-    "threadId",
-    "workspaceId"
-  ],
   "properties": {
     "threadId": {
       "type": "string"
@@ -13,5 +9,9 @@
     "workspaceId": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspaceId",
+    "threadId"
+  ]
 }

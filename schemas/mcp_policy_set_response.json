@@ -1,38 +1,22 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpPolicySetResponse",
   "type": "object",
+  "properties": {
+    "policy": {
+      "$ref": "#/$defs/McpServerPolicy"
+    },
+    "server": {
+      "$ref": "#/$defs/McpListItem"
+    }
+  },
   "required": [
     "policy",
     "server"
   ],
-  "properties": {
-    "policy": {
-      "$ref": "#/definitions/McpServerPolicy"
-    },
-    "server": {
-      "$ref": "#/definitions/McpListItem"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "McpListItem": {
       "type": "object",
-      "required": [
-        "fingerprint",
-        "id",
-        "name",
-        "policy",
-        "prompts_count",
-        "required",
-        "resource_templates_count",
-        "resources_count",
-        "runtime",
-        "scope",
-        "source_kind",
-        "status",
-        "tools_count",
-        "transport"
-      ],
       "properties": {
         "display_name": {
           "type": [
@@ -50,12 +34,12 @@
           "type": "string"
         },
         "policy": {
-          "$ref": "#/definitions/McpPolicyState"
+          "$ref": "#/$defs/McpPolicyState"
         },
         "prompts_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "required": {
           "type": "boolean"
@@ -63,24 +47,24 @@
         "resource_templates_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "resources_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "runtime": {
-          "$ref": "#/definitions/McpRuntimeStatus"
+          "$ref": "#/$defs/McpRuntimeStatus"
         },
         "scope": {
-          "$ref": "#/definitions/McpScopeKind"
+          "$ref": "#/$defs/McpScopeKind"
         },
         "source_kind": {
-          "$ref": "#/definitions/McpSourceKind"
+          "$ref": "#/$defs/McpSourceKind"
         },
         "status": {
-          "$ref": "#/definitions/McpServerStatus"
+          "$ref": "#/$defs/McpServerStatus"
         },
         "status_reason": {
           "type": [
@@ -91,19 +75,31 @@
         "tools_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "transport": {
-          "$ref": "#/definitions/McpTransportSummary"
+          "$ref": "#/$defs/McpTransportSummary"
         }
-      }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "source_kind",
+        "transport",
+        "policy",
+        "required",
+        "fingerprint",
+        "runtime",
+        "tools_count",
+        "resources_count",
+        "resource_templates_count",
+        "prompts_count",
+        "status"
+      ]
     },
     "McpPolicyState": {
       "type": "object",
-      "required": [
-        "allow_implicit_invocation",
-        "enabled"
-      ],
       "properties": {
         "allow_implicit_invocation": {
           "type": "boolean"
@@ -111,7 +107,11 @@
         "enabled": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
     },
     "McpRuntimeState": {
       "type": "string",
@@ -130,10 +130,6 @@
     },
     "McpRuntimeStatus": {
       "type": "object",
-      "required": [
-        "live",
-        "state"
-      ],
       "properties": {
         "last_error": {
           "type": [
@@ -152,9 +148,13 @@
           "type": "boolean"
         },
         "state": {
-          "$ref": "#/definitions/McpRuntimeState"
+          "$ref": "#/$defs/McpRuntimeState"
         }
-      }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
     },
     "McpScopeKind": {
       "type": "string",
@@ -165,13 +165,6 @@
     },
     "McpServerPolicy": {
       "type": "object",
-      "required": [
-        "allow_implicit_invocation",
-        "enabled",
-        "name",
-        "scope_kind",
-        "workspace_id"
-      ],
       "properties": {
         "allow_implicit_invocation": {
           "type": "boolean"
@@ -183,12 +176,19 @@
           "type": "string"
         },
         "scope_kind": {
-          "$ref": "#/definitions/McpScopeKind"
+          "$ref": "#/$defs/McpScopeKind"
         },
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "name",
+        "scope_kind",
+        "enabled",
+        "allow_implicit_invocation"
+      ]
     },
     "McpServerStatus": {
       "type": "string",
@@ -215,39 +215,35 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "command",
-            "kind"
-          ],
           "properties": {
             "command": {
               "type": "string"
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "stdio"
-              ]
+              "const": "stdio"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "url"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "streamable_http"
-              ]
+              "const": "streamable_http"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "url"
+          ]
         }
       ]
     }

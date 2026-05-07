@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatesGetParams",
+  "type": "object",
+  "properties": {
+    "candidate_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "candidate_id"
+  ]
+}

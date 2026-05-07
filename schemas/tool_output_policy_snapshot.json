@@ -1,91 +1,85 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ToolOutputPolicySnapshot",
   "type": "object",
-  "required": [
-    "deltas",
-    "llm",
-    "llmRetention",
-    "recovery",
-    "storage",
-    "timeline"
-  ],
   "properties": {
     "deltas": {
-      "$ref": "#/definitions/DeltaOutputPolicy"
+      "$ref": "#/$defs/DeltaOutputPolicy"
     },
     "llm": {
-      "$ref": "#/definitions/LlmOutputPolicy"
+      "$ref": "#/$defs/LlmOutputPolicy"
     },
     "llmRetention": {
-      "$ref": "#/definitions/LlmRetentionPolicy"
+      "$ref": "#/$defs/LlmRetentionPolicy"
     },
     "recovery": {
-      "$ref": "#/definitions/RecoveryOutputPolicy"
+      "$ref": "#/$defs/RecoveryOutputPolicy"
     },
     "storage": {
-      "$ref": "#/definitions/StorageOutputPolicy"
+      "$ref": "#/$defs/StorageOutputPolicy"
     },
     "timeline": {
-      "$ref": "#/definitions/TimelineOutputPolicy"
+      "$ref": "#/$defs/TimelineOutputPolicy"
     }
   },
-  "definitions": {
+  "required": [
+    "llm",
+    "llmRetention",
+    "timeline",
+    "storage",
+    "recovery",
+    "deltas"
+  ],
+  "$defs": {
     "DeltaOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_chunk_bytes",
-            "max_total_bytes",
-            "mode"
-          ],
           "properties": {
             "max_chunk_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "max_total_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "persist_and_display"
-              ]
+              "const": "persist_and_display"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chunk_bytes",
+            "max_total_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "progress_only"
-              ]
+              "const": "progress_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -93,57 +87,51 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "errors_only"
-              ]
+              "const": "errors_only"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "output"
-              ]
+              "const": "output"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         }
       ]
     },
@@ -151,57 +139,51 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "structured"
-              ]
+              "const": "structured"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "summary_only"
-              ]
+              "const": "summary_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -209,37 +191,33 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "until_turn_terminal"
-              ]
+              "const": "until_turn_terminal"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "do_not_retain"
-              ]
+              "const": "do_not_retain"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -247,17 +225,9 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "diagnostic_excerpt",
-            "include_error_class",
-            "include_exit_status",
-            "include_fingerprints",
-            "include_retry_hint",
-            "mode"
-          ],
           "properties": {
             "diagnostic_excerpt": {
-              "$ref": "#/definitions/DiagnosticExcerptPolicy"
+              "$ref": "#/$defs/DiagnosticExcerptPolicy"
             },
             "include_error_class": {
               "type": "boolean"
@@ -273,39 +243,41 @@
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "evidence"
-              ]
+              "const": "evidence"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "include_exit_status",
+            "include_error_class",
+            "include_retry_hint",
+            "diagnostic_excerpt",
+            "include_fingerprints"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -313,71 +285,63 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -385,71 +349,63 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "hidden"
-              ]
+              "const": "hidden"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     }

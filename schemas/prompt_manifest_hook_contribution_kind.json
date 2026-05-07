@@ -1,8 +1,9 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PromptManifestHookContributionKind",
   "type": "string",
   "enum": [
+    "prompt_context",
     "prompt_section",
     "prompt_manifest_diagnostic",
     "runtime_failure"

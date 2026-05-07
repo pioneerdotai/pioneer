@@ -1,10 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskAgendaParams",
   "type": "object",
-  "required": [
-    "workspaceId"
-  ],
   "properties": {
     "from": {
       "type": [
@@ -14,12 +11,12 @@
       "format": "int64"
     },
     "includeCompleted": {
-      "default": false,
-      "type": "boolean"
+      "type": "boolean",
+      "default": false
     },
     "includePaused": {
-      "default": false,
-      "type": "boolean"
+      "type": "boolean",
+      "default": false
     },
     "limit": {
       "type": [
@@ -27,7 +24,7 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "ownerId": {
       "type": [
@@ -38,7 +35,7 @@
     "ownerKind": {
       "anyOf": [
         {
-          "$ref": "#/definitions/TaskOwnerKind"
+          "$ref": "#/$defs/TaskOwnerKind"
         },
         {
           "type": "null"
@@ -46,10 +43,10 @@
       ]
     },
     "statuses": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/TaskStatus"
+        "$ref": "#/$defs/TaskStatus"
       }
     },
     "to": {
@@ -60,17 +57,20 @@
       "format": "int64"
     },
     "triggerKinds": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/TaskTriggerKind"
+        "$ref": "#/$defs/TaskTriggerKind"
       }
     },
     "workspaceId": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspaceId"
+  ],
+  "$defs": {
     "TaskOwnerKind": {
       "type": "string",
       "enum": [

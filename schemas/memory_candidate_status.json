@@ -1,11 +1,18 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryCandidateStatus",
   "type": "string",
   "enum": [
     "pending",
+    "pending_silent",
+    "ask_on_use",
+    "needs_review",
     "approved",
     "rejected",
+    "auto_rejected",
+    "review_disabled_rejected",
+    "superseded",
+    "merged_duplicate",
     "expired"
   ]
 }

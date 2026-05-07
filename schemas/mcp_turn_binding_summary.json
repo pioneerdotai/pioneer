@@ -1,15 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpTurnBindingSummary",
   "type": "object",
-  "required": [
-    "callable_name",
-    "catalog_version",
-    "fingerprint",
-    "raw_tool_name",
-    "server_installation_id",
-    "server_name"
-  ],
   "properties": {
     "callable_name": {
       "type": "string"
@@ -29,5 +21,13 @@
     "server_name": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "server_installation_id",
+    "server_name",
+    "raw_tool_name",
+    "callable_name",
+    "catalog_version",
+    "fingerprint"
+  ]
 }

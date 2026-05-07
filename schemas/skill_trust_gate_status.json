@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillTrustGateStatus",
   "type": "object",
-  "required": [
-    "allowed",
-    "minimum_trust",
-    "tool_kind"
-  ],
   "properties": {
     "allowed": {
       "type": "boolean"
@@ -17,5 +12,10 @@
     "tool_kind": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "tool_kind",
+    "minimum_trust",
+    "allowed"
+  ]
 }

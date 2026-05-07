@@ -1,0 +1,400 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemorySemanticWriteParams",
+  "type": "object",
+  "properties": {
+    "client_provided_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "confidence": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "content": {
+      "type": "string"
+    },
+    "disposition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemorySemanticWriteDisposition"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryWriteEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "importance": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryProvenance"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scope": {
+      "$ref": "#/$defs/MemoryScope"
+    },
+    "semantic": {
+      "$ref": "#/$defs/MemorySemanticFields"
+    },
+    "value": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "scope",
+    "semantic",
+    "content"
+  ],
+  "$defs": {
+    "MemoryActor": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryActorKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    },
+    "MemoryAttribute": {
+      "type": "string",
+      "enum": [
+        "name",
+        "birthday",
+        "preferred_language",
+        "communication_style",
+        "migration_policy",
+        "review_style",
+        "phase_naming",
+        "custom"
+      ]
+    },
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "recurring_instruction",
+        "project_policy",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
+      ]
+    },
+    "MemoryDurability": {
+      "type": "string",
+      "enum": [
+        "long_lived",
+        "project_lifetime",
+        "session_only",
+        "transient",
+        "unknown"
+      ]
+    },
+    "MemoryExplicitness": {
+      "type": "string",
+      "enum": [
+        "explicit",
+        "implicit",
+        "none",
+        "unclear"
+      ]
+    },
+    "MemoryExtractorCertainty": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "MemoryIntent": {
+      "type": "string",
+      "enum": [
+        "explicit_store",
+        "explicit_forget",
+        "explicit_no_memory",
+        "implicit_candidate",
+        "none"
+      ]
+    },
+    "MemoryProvenance": {
+      "type": "object",
+      "properties": {
+        "created_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_kind": {
+          "$ref": "#/$defs/MemorySourceKind"
+        },
+        "source_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source_kind"
+      ]
+    },
+    "MemoryScope": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryScopeKind"
+        }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
+    },
+    "MemoryScopeHint": {
+      "type": "string",
+      "enum": [
+        "user_global",
+        "user_workspace",
+        "agent_global",
+        "agent_workspace",
+        "project_workspace",
+        "unknown"
+      ]
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    },
+    "MemorySemanticFields": {
+      "type": "object",
+      "properties": {
+        "attribute": {
+          "$ref": "#/$defs/MemoryAttribute"
+        },
+        "category": {
+          "$ref": "#/$defs/MemoryCategory"
+        },
+        "certainty": {
+          "$ref": "#/$defs/MemoryExtractorCertainty"
+        },
+        "custom_attribute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "custom_subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durability": {
+          "$ref": "#/$defs/MemoryDurability"
+        },
+        "explicitness": {
+          "$ref": "#/$defs/MemoryExplicitness"
+        },
+        "intent": {
+          "$ref": "#/$defs/MemoryIntent"
+        },
+        "scope_hint": {
+          "$ref": "#/$defs/MemoryScopeHint"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/MemorySensitivityHint"
+        },
+        "subject": {
+          "$ref": "#/$defs/MemorySubject"
+        },
+        "subject_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "intent",
+        "explicitness",
+        "category",
+        "subject",
+        "attribute",
+        "scope_hint",
+        "durability",
+        "sensitivity",
+        "certainty"
+      ]
+    },
+    "MemorySemanticWriteDisposition": {
+      "type": "string",
+      "enum": [
+        "accept_active",
+        "create_pending_candidate",
+        "reject_suppressed",
+        "route_to_candidate_policy"
+      ]
+    },
+    "MemorySensitivityHint": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "personal",
+        "regulated",
+        "secret",
+        "unknown"
+      ]
+    },
+    "MemorySourceKind": {
+      "type": "string",
+      "enum": [
+        "explicit_user_request",
+        "user_correction",
+        "assistant_inference",
+        "background_extractor",
+        "tool_observation",
+        "import",
+        "system"
+      ]
+    },
+    "MemorySubject": {
+      "type": "string",
+      "enum": [
+        "current_user",
+        "current_agent",
+        "workspace",
+        "project",
+        "person",
+        "organization",
+        "artifact",
+        "custom"
+      ]
+    },
+    "MemoryWriteEvidence": {
+      "type": "object",
+      "properties": {
+        "extractor_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quote_or_span": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

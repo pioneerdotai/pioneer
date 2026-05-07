@@ -1,42 +1,38 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpTransportSummary",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "command",
-        "kind"
-      ],
       "properties": {
         "command": {
           "type": "string"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "stdio"
-          ]
+          "const": "stdio"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "command"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "kind",
-        "url"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "streamable_http"
-          ]
+          "const": "streamable_http"
         },
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "url"
+      ]
     }
   ]
 }

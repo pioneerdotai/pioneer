@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemorySubject",
+  "type": "string",
+  "enum": [
+    "current_user",
+    "current_agent",
+    "workspace",
+    "project",
+    "person",
+    "organization",
+    "artifact",
+    "custom"
+  ]
+}

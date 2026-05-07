@@ -1,21 +1,16 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskDeliveryPolicy",
   "type": "object",
-  "required": [
-    "format",
-    "includeResult",
-    "mode"
-  ],
   "properties": {
     "format": {
-      "$ref": "#/definitions/TaskDeliveryFormat"
+      "$ref": "#/$defs/TaskDeliveryFormat"
     },
     "includeResult": {
       "type": "boolean"
     },
     "mode": {
-      "$ref": "#/definitions/TaskDeliveryMode"
+      "$ref": "#/$defs/TaskDeliveryMode"
     },
     "threadId": {
       "type": [
@@ -30,7 +25,12 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "mode",
+    "includeResult",
+    "format"
+  ],
+  "$defs": {
     "TaskDeliveryFormat": {
       "type": "string",
       "enum": [

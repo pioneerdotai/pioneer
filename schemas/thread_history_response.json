@@ -1,17 +1,13 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadHistoryResponse",
   "type": "object",
-  "required": [
-    "thread_id",
-    "workspace_id"
-  ],
   "properties": {
     "events": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/ThreadHistoryEvent"
+        "$ref": "#/$defs/ThreadHistoryEvent"
       }
     },
     "thread_id": {
@@ -21,81 +17,79 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id"
+  ],
+  "$defs": {
     "ByteRange": {
       "type": "object",
-      "required": [
-        "end",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
     },
     "DeltaOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_chunk_bytes",
-            "max_total_bytes",
-            "mode"
-          ],
           "properties": {
             "max_chunk_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "max_total_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "persist_and_display"
-              ]
+              "const": "persist_and_display"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chunk_bytes",
+            "max_total_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "progress_only"
-              ]
+              "const": "progress_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -103,57 +97,51 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "errors_only"
-              ]
+              "const": "errors_only"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "output"
-              ]
+              "const": "output"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         }
       ]
     },
@@ -172,57 +160,51 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "structured"
-              ]
+              "const": "structured"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "summary_only"
-              ]
+              "const": "summary_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -230,37 +212,33 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "until_turn_terminal"
-              ]
+              "const": "until_turn_terminal"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "do_not_retain"
-              ]
+              "const": "do_not_retain"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -268,111 +246,74 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
-            "marks": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownMark"
-              }
-            },
-            "text": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "paragraph"
-              ]
+              "const": "paragraph"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownInline",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "content",
-            "level",
-            "type"
-          ],
           "properties": {
             "content": {
-              "$ref": "#/definitions/MarkdownInline"
+              "$ref": "#/$defs/MarkdownInline"
             },
             "level": {
               "type": "integer",
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "heading"
-              ]
+              "const": "heading"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level",
+            "content"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "ordered",
-            "start",
-            "type"
-          ],
           "properties": {
-            "items": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownListItem"
-              }
-            },
-            "ordered": {
-              "type": "boolean"
-            },
-            "start": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0.0
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownList",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "blocks",
-            "type"
-          ],
           "properties": {
             "blocks": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/MarkdownBlock"
+                "$ref": "#/$defs/MarkdownBlock"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "quote"
-              ]
+              "const": "quote"
             }
-          }
+          },
+          "required": [
+            "type",
+            "blocks"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
             "language": {
               "type": [
@@ -385,25 +326,25 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "rule"
-              ]
+              "const": "rule"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
@@ -411,40 +352,64 @@
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         }
       }
     },
     "MarkdownInline": {
       "type": "object",
-      "required": [
-        "text"
-      ],
       "properties": {
         "marks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownMark"
+            "$ref": "#/$defs/MarkdownMark"
           }
         },
         "text": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "MarkdownList": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownListItem"
+          }
+        },
+        "ordered": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ordered",
+        "start"
+      ]
     },
     "MarkdownListItem": {
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         },
         "checked": {
@@ -457,123 +422,106 @@
     },
     "MarkdownMark": {
       "type": "object",
-      "required": [
-        "end",
-        "kind",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "kind": {
-          "$ref": "#/definitions/MarkdownMarkKind"
+          "$ref": "#/$defs/MarkdownMarkKind"
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
     },
     "MarkdownMarkKind": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "bold"
-              ]
+              "const": "bold"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "italic"
-              ]
+              "const": "italic"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "strike"
-              ]
+              "const": "strike"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "link"
-              ]
+              "const": "link"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         }
       ]
     },
     "PromptManifest": {
       "type": "object",
-      "required": [
-        "compiler_version",
-        "fingerprint_dynamic",
-        "fingerprint_full",
-        "fingerprint_stable",
-        "profile"
-      ],
       "properties": {
         "compiler_version": {
           "type": "string"
         },
         "diagnostics": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestDiagnostic"
+            "$ref": "#/$defs/PromptManifestDiagnostic"
           }
         },
         "fingerprint_dynamic": {
@@ -586,33 +534,36 @@
           "type": "string"
         },
         "hook_sources": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestHookSourceEntry"
+            "$ref": "#/$defs/PromptManifestHookSourceEntry"
           }
         },
         "profile": {
-          "$ref": "#/definitions/PromptManifestProfile"
+          "$ref": "#/$defs/PromptManifestProfile"
         },
         "section_ids": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "compiler_version",
+        "profile",
+        "fingerprint_stable",
+        "fingerprint_dynamic",
+        "fingerprint_full"
+      ]
     },
     "PromptManifestDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "message"
-      ],
       "properties": {
         "code": {
-          "$ref": "#/definitions/PromptManifestDiagnosticCode"
+          "$ref": "#/$defs/PromptManifestDiagnosticCode"
         },
         "file": {
           "type": [
@@ -623,7 +574,7 @@
         "hook_source": {
           "anyOf": [
             {
-              "$ref": "#/definitions/PromptManifestHookSource"
+              "$ref": "#/$defs/PromptManifestHookSource"
             },
             {
               "type": "null"
@@ -639,7 +590,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
     },
     "PromptManifestDiagnosticCode": {
       "type": "string",
@@ -658,6 +613,7 @@
     "PromptManifestHookContributionKind": {
       "type": "string",
       "enum": [
+        "prompt_context",
         "prompt_section",
         "prompt_manifest_diagnostic",
         "runtime_failure"
@@ -666,16 +622,12 @@
     "PromptManifestHookPhase": {
       "type": "string",
       "enum": [
+        "turn_pre_prompt_context",
         "turn_pre_prompt_compile"
       ]
     },
     "PromptManifestHookSource": {
       "type": "object",
-      "required": [
-        "hook_id",
-        "phase",
-        "subscription_id"
-      ],
       "properties": {
         "contribution_hash": {
           "type": [
@@ -693,23 +645,30 @@
           "type": "string"
         },
         "phase": {
-          "$ref": "#/definitions/PromptManifestHookPhase"
+          "$ref": "#/$defs/PromptManifestHookPhase"
         },
         "subscription_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
     },
     "PromptManifestHookSourceEntry": {
       "type": "object",
-      "required": [
-        "contribution_kind",
-        "source",
-        "truncation"
-      ],
       "properties": {
         "contribution_kind": {
-          "$ref": "#/definitions/PromptManifestHookContributionKind"
+          "$ref": "#/$defs/PromptManifestHookContributionKind"
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
         },
         "section_id": {
           "type": [
@@ -718,12 +677,25 @@
           ]
         },
         "source": {
-          "$ref": "#/definitions/PromptManifestHookSource"
+          "$ref": "#/$defs/PromptManifestHookSource"
+        },
+        "source_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         },
         "truncation": {
-          "$ref": "#/definitions/PromptManifestHookTruncation"
+          "$ref": "#/$defs/PromptManifestHookTruncation"
         }
-      }
+      },
+      "required": [
+        "source",
+        "contribution_kind",
+        "truncation"
+      ]
     },
     "PromptManifestHookTruncation": {
       "type": "string",
@@ -768,17 +740,9 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "diagnostic_excerpt",
-            "include_error_class",
-            "include_exit_status",
-            "include_fingerprints",
-            "include_retry_hint",
-            "mode"
-          ],
           "properties": {
             "diagnostic_excerpt": {
-              "$ref": "#/definitions/DiagnosticExcerptPolicy"
+              "$ref": "#/$defs/DiagnosticExcerptPolicy"
             },
             "include_error_class": {
               "type": "boolean"
@@ -794,39 +758,41 @@
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "evidence"
-              ]
+              "const": "evidence"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "include_exit_status",
+            "include_error_class",
+            "include_retry_hint",
+            "diagnostic_excerpt",
+            "include_fingerprints"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -835,23 +801,17 @@
         {
           "description": "Turn-item execution exceeded timeout policy (start/idle/hard/lease).",
           "type": "string",
-          "enum": [
-            "timeout"
-          ]
+          "const": "timeout"
         },
         {
           "description": "Any provider/model/transport failure in LLM interaction path.",
           "type": "string",
-          "enum": [
-            "provider_error"
-          ]
+          "const": "provider_error"
         },
         {
           "description": "Forward-compatibility fallback for unknown persisted values.",
           "type": "string",
-          "enum": [
-            "unknown"
-          ]
+          "const": "unknown"
         }
       ]
     },
@@ -859,71 +819,63 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -972,12 +924,9 @@
     },
     "TextElement": {
       "type": "object",
-      "required": [
-        "byte_range"
-      ],
       "properties": {
         "byte_range": {
-          "$ref": "#/definitions/ByteRange"
+          "$ref": "#/$defs/ByteRange"
         },
         "placeholder": {
           "type": [
@@ -985,23 +934,20 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "byte_range"
+      ]
     },
     "ThreadHistoryEvent": {
       "type": "object",
-      "required": [
-        "created_at",
-        "payload",
-        "sequence",
-        "turn_id"
-      ],
       "properties": {
         "created_at": {
           "type": "integer",
           "format": "int64"
         },
         "payload": {
-          "$ref": "#/definitions/ThreadHistoryEventPayload"
+          "$ref": "#/$defs/ThreadHistoryEventPayload"
         },
         "sequence": {
           "type": "integer",
@@ -1010,55 +956,52 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "turn_id",
+        "sequence",
+        "created_at",
+        "payload"
+      ]
     },
     "ThreadHistoryEventPayload": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "threadId",
-            "turn",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "input": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/UserInput"
+                "$ref": "#/$defs/UserInput"
               }
             },
             "threadId": {
               "type": "string"
             },
             "turn": {
-              "$ref": "#/definitions/Turn"
+              "$ref": "#/$defs/Turn"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "turnStarted"
-              ]
+              "const": "turnStarted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turn"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "item",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "item": {
-              "$ref": "#/definitions/TurnItem"
+              "$ref": "#/$defs/TurnItem"
             },
             "threadId": {
               "type": "string"
@@ -1068,25 +1011,22 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemStarted"
-              ]
+              "const": "itemStarted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "item"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "delta",
-            "itemId",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "delta": {
               "type": "string"
@@ -1097,7 +1037,7 @@
             "markdown": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/MarkdownDocument"
+                  "$ref": "#/$defs/MarkdownDocument"
                 },
                 {
                   "type": "null"
@@ -1110,13 +1050,14 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "payload": true,
             "stream": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ItemDeltaStream"
+                  "$ref": "#/$defs/ItemDeltaStream"
                 },
                 {
                   "type": "null"
@@ -1131,101 +1072,93 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemDelta"
-              ]
+              "const": "itemDelta"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
-            "item",
+            "type",
+            "workspaceId",
             "threadId",
             "turnId",
-            "type",
-            "workspaceId"
-          ],
-          "properties": {
-            "item": {
-              "$ref": "#/definitions/TurnItem"
-            },
-            "threadId": {
-              "type": "string"
-            },
-            "turnId": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "itemCompleted"
-              ]
-            },
-            "workspaceId": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "item",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
-          "properties": {
-            "item": {
-              "$ref": "#/definitions/TurnItem"
-            },
-            "threadId": {
-              "type": "string"
-            },
-            "turnId": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "itemUpdated"
-              ]
-            },
-            "workspaceId": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "attemptNumber",
             "itemId",
-            "itemType",
-            "reason",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/TurnItem"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "itemCompleted"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workspaceId",
             "threadId",
             "turnId",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/TurnItem"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "itemUpdated"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
             "type",
-            "workspaceId"
-          ],
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "item"
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "reason": {
-              "$ref": "#/definitions/TurnItemTimeoutReason"
+              "$ref": "#/$defs/TurnItemTimeoutReason"
             },
             "recoveryJobId": {
               "type": [
@@ -1241,43 +1174,39 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemTimeoutDetected"
-              ]
+              "const": "itemTimeoutDetected"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "attemptNumber",
+            "reason"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "action",
-            "attemptNumber",
-            "itemId",
-            "itemType",
-            "recoveryJobId",
-            "threadId",
-            "trigger",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "action": {
-              "$ref": "#/definitions/RecoveryAction"
+              "$ref": "#/$defs/RecoveryAction"
             },
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "recoveryJobId": {
               "type": "string"
@@ -1286,62 +1215,57 @@
               "type": "string"
             },
             "trigger": {
-              "$ref": "#/definitions/RecoveryTrigger"
+              "$ref": "#/$defs/RecoveryTrigger"
             },
             "turnId": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRecoveryOpened"
-              ]
+              "const": "itemRecoveryOpened"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "recoveryJobId",
+            "trigger",
+            "action",
+            "attemptNumber"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "action",
-            "existingStatus",
-            "itemId",
-            "itemType",
-            "nextAttemptNumber",
-            "recoveryItemId",
-            "recoveryItemType",
-            "recoveryJobId",
-            "threadId",
-            "trigger",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "action": {
-              "$ref": "#/definitions/RecoveryAction"
+              "$ref": "#/$defs/RecoveryAction"
             },
             "existingStatus": {
-              "$ref": "#/definitions/RecoveryJobStatus"
+              "$ref": "#/$defs/RecoveryJobStatus"
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "nextAttemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "recoveryItemId": {
               "type": "string"
             },
             "recoveryItemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "recoveryJobId": {
               "type": "string"
@@ -1350,46 +1274,48 @@
               "type": "string"
             },
             "trigger": {
-              "$ref": "#/definitions/RecoveryTrigger"
+              "$ref": "#/$defs/RecoveryTrigger"
             },
             "turnId": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRecoveryAttached"
-              ]
+              "const": "itemRecoveryAttached"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "recoveryJobId",
+            "recoveryItemId",
+            "recoveryItemType",
+            "trigger",
+            "action",
+            "existingStatus",
+            "nextAttemptNumber"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "attemptNumber",
-            "itemId",
-            "itemType",
-            "nextRunAtUnix",
-            "recoveryJobId",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "nextRunAtUnix": {
               "type": "integer",
@@ -1412,38 +1338,37 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRetryScheduled"
-              ]
+              "const": "itemRetryScheduled"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
-            "attemptNumber",
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
             "itemId",
             "itemType",
             "recoveryJobId",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
+            "attemptNumber",
+            "nextRunAtUnix"
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "recoveryJobId": {
               "type": "string"
@@ -1456,38 +1381,36 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRetryAttemptStarted"
-              ]
+              "const": "itemRetryAttemptStarted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
-            "attemptNumber",
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
             "itemId",
             "itemType",
             "recoveryJobId",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
+            "attemptNumber"
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "recoveryJobId": {
               "type": "string"
@@ -1500,34 +1423,30 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRecoverySucceeded"
-              ]
+              "const": "itemRecoverySucceeded"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
-            "attemptNumber",
-            "errorMessage",
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
             "itemId",
             "itemType",
             "recoveryJobId",
-            "status",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
+            "attemptNumber"
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "errorMessage": {
               "type": "string"
@@ -1536,13 +1455,13 @@
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "recoveryJobId": {
               "type": "string"
             },
             "status": {
-              "$ref": "#/definitions/RecoveryJobStatus"
+              "$ref": "#/$defs/RecoveryJobStatus"
             },
             "threadId": {
               "type": "string"
@@ -1552,47 +1471,41 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemRecoveryExhausted"
-              ]
+              "const": "itemRecoveryExhausted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "recoveryJobId",
+            "attemptNumber",
+            "status",
+            "errorMessage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "attemptNumber",
-            "budgets",
-            "errorClass",
-            "failureSignatureFingerprint",
-            "itemId",
-            "itemType",
-            "reason",
-            "retryHint",
-            "threadId",
-            "toolName",
-            "toolRetryEpisodeId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "budgets": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolRetryBudgetUsage"
+                "$ref": "#/$defs/ToolRetryBudgetUsage"
               }
             },
             "errorClass": {
-              "$ref": "#/definitions/ToolRetryErrorClass"
+              "$ref": "#/$defs/ToolRetryErrorClass"
             },
             "failureSignatureFingerprint": {
               "type": "string"
@@ -1601,7 +1514,7 @@
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "reason": {
               "type": "string"
@@ -1623,54 +1536,54 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemToolRetryScheduled"
-              ]
+              "const": "itemToolRetryScheduled"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "toolRetryEpisodeId",
+            "toolName",
+            "attemptNumber",
+            "errorClass",
+            "retryHint",
+            "budgets",
+            "failureSignatureFingerprint",
+            "reason"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "attemptNumber",
-            "budgets",
-            "itemId",
-            "itemType",
-            "reason",
-            "resolution",
-            "threadId",
-            "toolName",
-            "toolRetryEpisodeId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "budgets": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolRetryBudgetUsage"
+                "$ref": "#/$defs/ToolRetryBudgetUsage"
               }
             },
             "itemId": {
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "reason": {
               "type": "string"
             },
             "resolution": {
-              "$ref": "#/definitions/ToolRetryResolution"
+              "$ref": "#/$defs/ToolRetryResolution"
             },
             "threadId": {
               "type": "string"
@@ -1686,50 +1599,46 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemToolRetryResolved"
-              ]
+              "const": "itemToolRetryResolved"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "toolRetryEpisodeId",
+            "toolName",
+            "attemptNumber",
+            "resolution",
+            "budgets",
+            "reason"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "attemptNumber",
-            "budgets",
-            "errorClass",
-            "exhaustionKind",
-            "failureSignatureFingerprint",
-            "itemId",
-            "itemType",
-            "reason",
-            "threadId",
-            "toolName",
-            "toolRetryEpisodeId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "attemptNumber": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "budgets": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolRetryBudgetUsage"
+                "$ref": "#/$defs/ToolRetryBudgetUsage"
               }
             },
             "errorClass": {
-              "$ref": "#/definitions/ToolRetryErrorClass"
+              "$ref": "#/$defs/ToolRetryErrorClass"
             },
             "exhaustionKind": {
-              "$ref": "#/definitions/ToolRetryExhaustionKind"
+              "$ref": "#/$defs/ToolRetryExhaustionKind"
             },
             "failureSignatureFingerprint": {
               "type": "string"
@@ -1738,7 +1647,7 @@
               "type": "string"
             },
             "itemType": {
-              "$ref": "#/definitions/TurnItemType"
+              "$ref": "#/$defs/TurnItemType"
             },
             "reason": {
               "type": "string"
@@ -1757,44 +1666,47 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "itemToolRetryExhausted"
-              ]
+              "const": "itemToolRetryExhausted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "itemId",
+            "itemType",
+            "toolRetryEpisodeId",
+            "toolName",
+            "attemptNumber",
+            "errorClass",
+            "exhaustionKind",
+            "budgets",
+            "failureSignatureFingerprint",
+            "reason"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "action",
-            "limit",
-            "limitKind",
-            "observed",
-            "reason",
-            "threadId",
-            "turnId",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "action": {
-              "$ref": "#/definitions/ToolLoopBudgetAction"
+              "$ref": "#/$defs/ToolLoopBudgetAction"
             },
             "limit": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "limitKind": {
-              "$ref": "#/definitions/ToolLoopBudgetLimitKind"
+              "$ref": "#/$defs/ToolLoopBudgetLimitKind"
             },
             "observed": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "reason": {
               "type": "string"
@@ -1807,66 +1719,71 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "turnToolLoopBudgetExceeded"
-              ]
+              "const": "turnToolLoopBudgetExceeded"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "limitKind",
+            "limit",
+            "observed",
+            "action",
+            "reason"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "threadId",
-            "turn",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "threadId": {
               "type": "string"
             },
             "turn": {
-              "$ref": "#/definitions/Turn"
+              "$ref": "#/$defs/Turn"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "turnCompleted"
-              ]
+              "const": "turnCompleted"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turn"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "threadId",
-            "turn",
-            "type",
-            "workspaceId"
-          ],
           "properties": {
             "threadId": {
               "type": "string"
             },
             "turn": {
-              "$ref": "#/definitions/Turn"
+              "$ref": "#/$defs/Turn"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "turnFailed"
-              ]
+              "const": "turnFailed"
             },
             "workspaceId": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turn"
+          ]
         }
       ]
     },
@@ -1874,71 +1791,63 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "hidden"
-              ]
+              "const": "hidden"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -1954,10 +1863,6 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "truncated"
-          ],
           "properties": {
             "aggregated_output": {
               "type": [
@@ -1971,7 +1876,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "exit_code": {
               "type": [
@@ -1982,9 +1887,7 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "shell"
-              ]
+              "const": "shell"
             },
             "stderr": {
               "type": [
@@ -2007,81 +1910,59 @@
             "truncated": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
-            "metadata",
-            "title",
             "truncated"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "summary"
-              ]
-            },
-            "lines": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "metadata": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
-              }
-            },
-            "title": {
-              "type": "string"
-            },
-            "truncated": {
-              "type": "boolean"
-            }
-          }
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "metadata",
-            "stage"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "progress"
-              ]
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "progress"
             },
             "metadata": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             },
             "stage": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "stage",
+            "metadata"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "hidden"
-              ]
+              "const": "hidden"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -2139,137 +2020,116 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "values"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "array"
-              ]
+              "const": "array"
             },
             "values": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "values"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "fields",
-            "kind"
-          ],
           "properties": {
             "fields": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "fields"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "bytes",
-            "kind",
-            "raw_kind",
-            "sha256",
-            "value_kind"
-          ],
           "properties": {
             "bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "redacted_raw"
-              ]
+              "const": "redacted_raw"
             },
             "raw_kind": {
-              "$ref": "#/definitions/ToolMetadataRawKind"
+              "$ref": "#/$defs/ToolMetadataRawKind"
             },
             "sha256": {
               "type": "string"
@@ -2277,37 +2137,34 @@
             "value_kind": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "raw_kind",
+            "sha256",
+            "bytes",
+            "value_kind"
+          ]
         }
       ]
     },
     "ToolObservation": {
       "type": "object",
-      "required": [
-        "attemptId",
-        "eventSeq",
-        "monoNs",
-        "pipelineStage",
-        "toolCallId",
-        "traceId",
-        "tsUnixMs",
-        "turnId"
-      ],
       "properties": {
         "attemptId": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "eventSeq": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "monoNs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "pipelineStage": {
           "type": "string"
@@ -2325,20 +2182,25 @@
         "turnId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "traceId",
+        "turnId",
+        "toolCallId",
+        "attemptId",
+        "pipelineStage",
+        "tsUnixMs",
+        "monoNs",
+        "eventSeq"
+      ]
     },
     "ToolOutcome": {
       "type": "object",
-      "required": [
-        "incomplete",
-        "shouldRetry",
-        "status"
-      ],
       "properties": {
         "errorClass": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolErrorClass"
+              "$ref": "#/$defs/ToolErrorClass"
             },
             {
               "type": "null"
@@ -2364,9 +2226,14 @@
           "type": "boolean"
         },
         "status": {
-          "$ref": "#/definitions/ToolOutcomeStatus"
+          "$ref": "#/$defs/ToolOutcomeStatus"
         }
-      }
+      },
+      "required": [
+        "status",
+        "shouldRetry",
+        "incomplete"
+      ]
     },
     "ToolOutcomeStatus": {
       "type": "string",
@@ -2379,34 +2246,62 @@
     },
     "ToolOutputPolicySnapshot": {
       "type": "object",
-      "required": [
-        "deltas",
-        "llm",
-        "llmRetention",
-        "recovery",
-        "storage",
-        "timeline"
-      ],
       "properties": {
         "deltas": {
-          "$ref": "#/definitions/DeltaOutputPolicy"
+          "$ref": "#/$defs/DeltaOutputPolicy"
         },
         "llm": {
-          "$ref": "#/definitions/LlmOutputPolicy"
+          "$ref": "#/$defs/LlmOutputPolicy"
         },
         "llmRetention": {
-          "$ref": "#/definitions/LlmRetentionPolicy"
+          "$ref": "#/$defs/LlmRetentionPolicy"
         },
         "recovery": {
-          "$ref": "#/definitions/RecoveryOutputPolicy"
+          "$ref": "#/$defs/RecoveryOutputPolicy"
         },
         "storage": {
-          "$ref": "#/definitions/StorageOutputPolicy"
+          "$ref": "#/$defs/StorageOutputPolicy"
         },
         "timeline": {
-          "$ref": "#/definitions/TimelineOutputPolicy"
+          "$ref": "#/$defs/TimelineOutputPolicy"
         }
-      }
+      },
+      "required": [
+        "llm",
+        "llmRetention",
+        "timeline",
+        "storage",
+        "recovery",
+        "deltas"
+      ]
+    },
+    "ToolOutputSummary": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolMetadataValue"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "title",
+        "metadata",
+        "truncated"
+      ]
     },
     "ToolRecoveryIdempotencyMode": {
       "type": "string",
@@ -2419,49 +2314,50 @@
     },
     "ToolRecoveryPolicySnapshot": {
       "type": "object",
-      "required": [
-        "baseBackoffSecs",
-        "canResume",
-        "idempotencyMode",
-        "maxAttempts",
-        "maxWallClockSecs",
-        "noProgressLimit",
-        "resolvedAction",
-        "retryClass"
-      ],
       "properties": {
         "baseBackoffSecs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "canResume": {
           "type": "boolean"
         },
         "idempotencyMode": {
-          "$ref": "#/definitions/ToolRecoveryIdempotencyMode"
+          "$ref": "#/$defs/ToolRecoveryIdempotencyMode"
         },
         "maxAttempts": {
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "maxWallClockSecs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "noProgressLimit": {
           "type": "integer",
           "format": "int64"
         },
         "resolvedAction": {
-          "$ref": "#/definitions/RecoveryAction"
+          "$ref": "#/$defs/RecoveryAction"
         },
         "retryClass": {
-          "$ref": "#/definitions/ToolRecoveryRetryClass"
+          "$ref": "#/$defs/ToolRecoveryRetryClass"
         }
-      }
+      },
+      "required": [
+        "retryClass",
+        "idempotencyMode",
+        "maxAttempts",
+        "canResume",
+        "resolvedAction",
+        "baseBackoffSecs",
+        "maxWallClockSecs",
+        "noProgressLimit"
+      ]
     },
     "ToolRecoveryRetryClass": {
       "type": "string",
@@ -2475,9 +2371,6 @@
     },
     "ToolRecoveryView": {
       "type": "object",
-      "required": [
-        "wasTruncated"
-      ],
       "properties": {
         "contentFingerprint": {
           "type": [
@@ -2525,7 +2418,10 @@
         "wasTruncated": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "wasTruncated"
+      ]
     },
     "ToolRetryBudgetKind": {
       "type": "string",
@@ -2538,26 +2434,26 @@
     },
     "ToolRetryBudgetUsage": {
       "type": "object",
-      "required": [
-        "kind",
-        "limit",
-        "used"
-      ],
       "properties": {
         "kind": {
-          "$ref": "#/definitions/ToolRetryBudgetKind"
+          "$ref": "#/$defs/ToolRetryBudgetKind"
         },
         "limit": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "used": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "kind",
+        "used",
+        "limit"
+      ]
     },
     "ToolRetryErrorClass": {
       "type": "string",
@@ -2595,10 +2491,6 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "truncated"
-          ],
           "properties": {
             "aggregated_output": {
               "type": [
@@ -2612,7 +2504,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "exit_code": {
               "type": [
@@ -2623,9 +2515,7 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "shell"
-              ]
+              "const": "shell"
             },
             "stderr": {
               "type": [
@@ -2648,86 +2538,60 @@
             "truncated": {
               "type": "boolean"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "truncated"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "metadata",
-            "title",
-            "truncated"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
-            },
-            "lines": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "metadata"
             },
             "metadata": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
-            },
-            "title": {
-              "type": "string"
-            },
-            "truncated": {
-              "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "metadata"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "metadata"
-              ]
-            },
-            "metadata": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
-              }
-            }
-          }
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
     "Turn": {
       "type": "object",
-      "required": [
-        "id",
-        "status"
-      ],
       "properties": {
         "error": {
           "type": [
@@ -2741,7 +2605,7 @@
         "prompt_manifest": {
           "anyOf": [
             {
-              "$ref": "#/definitions/PromptManifest"
+              "$ref": "#/$defs/PromptManifest"
             },
             {
               "type": "null"
@@ -2749,24 +2613,23 @@
           ]
         },
         "status": {
-          "$ref": "#/definitions/TurnStatus"
+          "$ref": "#/$defs/TurnStatus"
         }
-      }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
     },
     "TurnItem": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "id",
-            "text",
-            "type"
-          ],
           "properties": {
             "attachments": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/UserMessageAttachment"
+                "$ref": "#/$defs/UserMessageAttachment"
               }
             },
             "id": {
@@ -2777,19 +2640,17 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "userMessage"
-              ]
+              "const": "userMessage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "text",
-            "type"
-          ],
           "properties": {
             "id": {
               "type": "string"
@@ -2797,7 +2658,7 @@
             "markdown": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/MarkdownDocument"
+                  "$ref": "#/$defs/MarkdownDocument"
                 },
                 {
                   "type": "null"
@@ -2810,29 +2671,29 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "text": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "agentMessage"
-              ]
+              "const": "agentMessage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "type"
-          ],
           "properties": {
             "content": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
@@ -2841,28 +2702,24 @@
               "type": "string"
             },
             "summary": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "reasoning"
-              ]
+              "const": "reasoning"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "level",
-            "message",
-            "type"
-          ],
           "properties": {
             "code": {
               "type": [
@@ -2875,34 +2732,25 @@
               "type": "string"
             },
             "level": {
-              "$ref": "#/definitions/SystemEventLevel"
+              "$ref": "#/$defs/SystemEventLevel"
             },
             "message": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "systemEvent"
-              ]
+              "const": "systemEvent"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "level",
+            "message"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "createdAt",
-            "depth",
-            "executorKind",
-            "id",
-            "maxDepth",
-            "status",
-            "taskId",
-            "title",
-            "triggerKind",
-            "type",
-            "updatedAt"
-          ],
           "properties": {
             "agentRole": {
               "type": [
@@ -2937,7 +2785,7 @@
               ]
             },
             "executorKind": {
-              "$ref": "#/definitions/TaskExecutorKind"
+              "$ref": "#/$defs/TaskExecutorKind"
             },
             "id": {
               "type": "string"
@@ -2978,7 +2826,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/TaskStatus"
+              "$ref": "#/$defs/TaskStatus"
             },
             "taskId": {
               "type": "string"
@@ -2987,37 +2835,38 @@
               "type": "string"
             },
             "triggerKind": {
-              "$ref": "#/definitions/TaskTriggerKind"
+              "$ref": "#/$defs/TaskTriggerKind"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "task"
-              ]
+              "const": "task"
             },
             "updatedAt": {
               "type": "integer",
               "format": "int64"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "taskId",
+            "title",
+            "status",
+            "triggerKind",
+            "executorKind",
+            "depth",
+            "maxDepth",
+            "createdAt",
+            "updatedAt"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "command": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
@@ -3029,7 +2878,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -3037,7 +2886,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3047,7 +2896,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3055,12 +2904,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3070,7 +2919,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3078,10 +2927,10 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3094,35 +2943,33 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "commandExecution"
-              ]
+              "const": "commandExecution"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "changedFiles": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "exitCode": {
               "type": [
@@ -3137,7 +2984,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3147,7 +2994,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3155,12 +3002,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3170,7 +3017,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3178,7 +3025,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "stderr": {
               "type": [
@@ -3193,7 +3040,7 @@
               ]
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3206,28 +3053,26 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "fileChange"
-              ]
+              "const": "fileChange"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -3235,7 +3080,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3245,7 +3090,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3253,7 +3098,7 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "provider": {
               "type": [
@@ -3270,7 +3115,7 @@
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3280,7 +3125,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3293,20 +3138,20 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "results": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/WebSearchResultItem"
+                "$ref": "#/$defs/WebSearchResultItem"
               }
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3320,31 +3165,29 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "toolName": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "webSearch"
-              ]
+              "const": "webSearch"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "bytesReceived": {
@@ -3353,7 +3196,7 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "contentType": {
               "type": [
@@ -3362,7 +3205,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "elapsedMs": {
               "type": [
@@ -3370,7 +3213,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "extractMode": {
               "type": [
@@ -3388,16 +3231,16 @@
               "type": "string"
             },
             "links": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/WebFetchLink"
+                "$ref": "#/$defs/WebFetchLink"
               }
             },
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3407,7 +3250,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3415,12 +3258,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3430,7 +3273,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3444,7 +3287,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "statusCode": {
               "type": [
@@ -3452,10 +3295,11 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3475,9 +3319,7 @@
             "truncated": true,
             "type": {
               "type": "string",
-              "enum": [
-                "webFetch"
-              ]
+              "const": "webFetch"
             },
             "url": {
               "type": [
@@ -3491,22 +3333,22 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "bytesWritten": {
@@ -3515,7 +3357,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "contentType": {
               "type": [
@@ -3524,7 +3366,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "elapsedMs": {
               "type": [
@@ -3532,7 +3374,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "finalUrl": {
               "type": [
@@ -3546,7 +3388,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3556,7 +3398,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3564,7 +3406,7 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "path": {
               "type": [
@@ -3575,7 +3417,7 @@
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3585,7 +3427,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3599,7 +3441,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "statusCode": {
               "type": [
@@ -3607,10 +3449,11 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3629,9 +3472,7 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "download"
-              ]
+              "const": "download"
             },
             "url": {
               "type": [
@@ -3639,24 +3480,24 @@
                 "null"
               ]
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -3664,7 +3505,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -3674,7 +3515,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -3682,12 +3523,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -3697,7 +3538,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -3705,10 +3546,10 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -3721,11 +3562,19 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "dynamicToolCall"
-              ]
+              "const": "dynamicToolCall"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         }
       ]
     },
@@ -3767,180 +3616,157 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
             "text": {
               "type": "string"
             },
             "textElements": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/TextElement"
+                "$ref": "#/$defs/TextElement"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "text"
-              ]
+              "const": "text"
             }
-          }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "image"
-              ]
+              "const": "image"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localImage"
-              ]
+              "const": "localImage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "file"
-              ]
+              "const": "file"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localFile"
-              ]
+              "const": "localFile"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "audio"
-              ]
+              "const": "audio"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localAudio"
-              ]
+              "const": "localAudio"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "video"
-              ]
+              "const": "video"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localVideo"
-              ]
+              "const": "localVideo"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "name",
-            "path",
-            "type"
-          ],
           "properties": {
             "name": {
               "type": "string"
@@ -3950,19 +3776,17 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "skill"
-              ]
+              "const": "skill"
             }
-          }
+          },
+          "required": [
+            "type",
+            "name",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "name",
-            "path",
-            "type"
-          ],
           "properties": {
             "name": {
               "type": "string"
@@ -3972,11 +3796,14 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "mention"
-              ]
+              "const": "mention"
             }
-          }
+          },
+          "required": [
+            "type",
+            "name",
+            "path"
+          ]
         }
       ]
     },
@@ -3984,156 +3811,136 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "image"
-              ]
+              "const": "image"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localImage"
-              ]
+              "const": "localImage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "file"
-              ]
+              "const": "file"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localFile"
-              ]
+              "const": "localFile"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "audio"
-              ]
+              "const": "audio"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localAudio"
-              ]
+              "const": "localAudio"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "video"
-              ]
+              "const": "video"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localVideo"
-              ]
+              "const": "localVideo"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         }
       ]
     },
     "WebFetchLink": {
       "type": "object",
-      "required": [
-        "text",
-        "url"
-      ],
       "properties": {
         "text": {
           "type": "string"
@@ -4141,17 +3948,14 @@
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "text",
+        "url"
+      ]
     },
     "WebSearchResultItem": {
       "type": "object",
-      "required": [
-        "rank",
-        "snippet",
-        "source",
-        "title",
-        "url"
-      ],
       "properties": {
         "publishedAt": {
           "type": [
@@ -4162,7 +3966,7 @@
         "rank": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "snippet": {
           "type": "string"
@@ -4176,7 +3980,14 @@
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "rank",
+        "title",
+        "url",
+        "snippet",
+        "source"
+      ]
     }
   }
 }

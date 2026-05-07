@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatePolicyDecision",
+  "type": "string",
+  "enum": [
+    "auto_approve",
+    "pending_silent",
+    "ask_on_use",
+    "needs_review",
+    "auto_reject",
+    "reject_review_disabled"
+  ]
+}

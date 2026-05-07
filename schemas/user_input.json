@@ -1,183 +1,160 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "UserInput",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "text",
-        "type"
-      ],
       "properties": {
         "text": {
           "type": "string"
         },
         "textElements": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TextElement"
+            "$ref": "#/$defs/TextElement"
           }
         },
         "type": {
           "type": "string",
-          "enum": [
-            "text"
-          ]
+          "const": "text"
         }
-      }
+      },
+      "required": [
+        "type",
+        "text"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "type",
-        "url"
-      ],
       "properties": {
         "type": {
           "type": "string",
-          "enum": [
-            "image"
-          ]
+          "const": "image"
         },
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "type",
+        "url"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "path",
-        "type"
-      ],
       "properties": {
         "path": {
           "type": "string"
         },
         "type": {
           "type": "string",
-          "enum": [
-            "localImage"
-          ]
+          "const": "localImage"
         }
-      }
+      },
+      "required": [
+        "type",
+        "path"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "type",
-        "url"
-      ],
       "properties": {
         "type": {
           "type": "string",
-          "enum": [
-            "file"
-          ]
+          "const": "file"
         },
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "type",
+        "url"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "path",
-        "type"
-      ],
       "properties": {
         "path": {
           "type": "string"
         },
         "type": {
           "type": "string",
-          "enum": [
-            "localFile"
-          ]
+          "const": "localFile"
         }
-      }
+      },
+      "required": [
+        "type",
+        "path"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "type",
-        "url"
-      ],
       "properties": {
         "type": {
           "type": "string",
-          "enum": [
-            "audio"
-          ]
+          "const": "audio"
         },
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "type",
+        "url"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "path",
-        "type"
-      ],
       "properties": {
         "path": {
           "type": "string"
         },
         "type": {
           "type": "string",
-          "enum": [
-            "localAudio"
-          ]
+          "const": "localAudio"
         }
-      }
+      },
+      "required": [
+        "type",
+        "path"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "type",
-        "url"
-      ],
       "properties": {
         "type": {
           "type": "string",
-          "enum": [
-            "video"
-          ]
+          "const": "video"
         },
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "type",
+        "url"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "path",
-        "type"
-      ],
       "properties": {
         "path": {
           "type": "string"
         },
         "type": {
           "type": "string",
-          "enum": [
-            "localVideo"
-          ]
+          "const": "localVideo"
         }
-      }
+      },
+      "required": [
+        "type",
+        "path"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "name",
-        "path",
-        "type"
-      ],
       "properties": {
         "name": {
           "type": "string"
@@ -187,19 +164,17 @@
         },
         "type": {
           "type": "string",
-          "enum": [
-            "skill"
-          ]
+          "const": "skill"
         }
-      }
+      },
+      "required": [
+        "type",
+        "name",
+        "path"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "name",
-        "path",
-        "type"
-      ],
       "properties": {
         "name": {
           "type": "string"
@@ -209,41 +184,41 @@
         },
         "type": {
           "type": "string",
-          "enum": [
-            "mention"
-          ]
+          "const": "mention"
         }
-      }
+      },
+      "required": [
+        "type",
+        "name",
+        "path"
+      ]
     }
   ],
-  "definitions": {
+  "$defs": {
     "ByteRange": {
       "type": "object",
-      "required": [
-        "end",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
     },
     "TextElement": {
       "type": "object",
-      "required": [
-        "byte_range"
-      ],
       "properties": {
         "byte_range": {
-          "$ref": "#/definitions/ByteRange"
+          "$ref": "#/$defs/ByteRange"
         },
         "placeholder": {
           "type": [
@@ -251,7 +226,10 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "byte_range"
+      ]
     }
   }
 }

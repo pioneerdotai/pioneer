@@ -1,36 +1,32 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpInstallParams",
   "type": "object",
-  "required": [
-    "config_json",
-    "workspace_id"
-  ],
   "properties": {
     "allow_implicit_invocation": {
-      "default": true,
-      "type": "boolean"
+      "type": "boolean",
+      "default": true
     },
     "config_json": {
       "type": "string"
     },
     "enabled": {
-      "default": true,
-      "type": "boolean"
+      "type": "boolean",
+      "default": true
     },
     "scope_kind": {
-      "default": "workspace",
-      "allOf": [
-        {
-          "$ref": "#/definitions/McpScopeKind"
-        }
-      ]
+      "$ref": "#/$defs/McpScopeKind",
+      "default": "workspace"
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "config_json"
+  ],
+  "$defs": {
     "McpScopeKind": {
       "type": "string",
       "enum": [

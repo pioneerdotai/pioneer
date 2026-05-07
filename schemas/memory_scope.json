@@ -1,20 +1,20 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryScope",
   "type": "object",
-  "required": [
-    "key",
-    "kind"
-  ],
   "properties": {
     "key": {
       "type": "string"
     },
     "kind": {
-      "$ref": "#/definitions/MemoryScopeKind"
+      "$ref": "#/$defs/MemoryScopeKind"
     }
   },
-  "definitions": {
+  "required": [
+    "kind",
+    "key"
+  ],
+  "$defs": {
     "MemoryScopeKind": {
       "type": "string",
       "enum": [

@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillSecurityFinding",
   "type": "object",
-  "required": [
-    "message",
-    "rule_id",
-    "severity"
-  ],
   "properties": {
     "message": {
       "type": "string"
@@ -23,5 +18,10 @@
     "severity": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "rule_id",
+    "severity",
+    "message"
+  ]
 }

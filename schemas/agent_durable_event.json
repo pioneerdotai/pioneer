@@ -1,24 +1,16 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AgentDurableEvent",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "kind",
-        "manifest",
-        "thread_id",
-        "turn_id"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "prompt_manifest_compiled"
-          ]
+          "const": "prompt_manifest_compiled"
         },
         "manifest": {
-          "$ref": "#/definitions/PromptManifest"
+          "$ref": "#/$defs/PromptManifest"
         },
         "thread_id": {
           "type": "string"
@@ -26,28 +18,26 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "manifest"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "bindings",
-        "kind",
-        "thread_id",
-        "turn_id"
-      ],
       "properties": {
         "bindings": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/TurnSkillBinding"
+            "$ref": "#/$defs/TurnSkillBinding"
           }
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "turn_skills_resolved"
-          ]
+          "const": "turn_skills_resolved"
         },
         "thread_id": {
           "type": "string"
@@ -55,28 +45,26 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "bindings"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "events",
-        "kind",
-        "thread_id",
-        "turn_id"
-      ],
       "properties": {
         "events": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/SkillAuditEvent"
+            "$ref": "#/$defs/SkillAuditEvent"
           }
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "skill_audit_events"
-          ]
+          "const": "skill_audit_events"
         },
         "thread_id": {
           "type": "string"
@@ -84,21 +72,16 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "events"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "item_id",
-        "kind",
-        "output_policy_snapshot",
-        "payload",
-        "sequence",
-        "source",
-        "thread_id",
-        "tool_name",
-        "turn_id"
-      ],
       "properties": {
         "attempt_id": {
           "type": [
@@ -111,15 +94,13 @@
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "turn_llm_context_appended"
-          ]
+          "const": "turn_llm_context_appended"
         },
         "output_policy_snapshot": {
-          "$ref": "#/definitions/ToolOutputPolicySnapshot"
+          "$ref": "#/$defs/ToolOutputPolicySnapshot"
         },
         "payload": {
-          "$ref": "#/definitions/ToolResultView"
+          "$ref": "#/$defs/ToolResultView"
         },
         "sequence": {
           "type": "integer",
@@ -137,146 +118,135 @@
         "turn_id": {
           "type": "string"
         }
-      }
-    },
-    {
-      "type": "object",
+      },
       "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "item_started"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/ItemStartedNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "item_completed"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/ItemCompletedNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "item_tool_retry_scheduled"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/ItemToolRetryScheduledNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "item_tool_retry_resolved"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/ItemToolRetryResolvedNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "item_tool_retry_exhausted"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/ItemToolRetryExhaustedNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "kind",
-        "notification"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "turn_tool_loop_budget_exceeded"
-          ]
-        },
-        "notification": {
-          "$ref": "#/definitions/TurnToolLoopBudgetExceededNotification"
-        }
-      }
-    },
-    {
-      "type": "object",
-      "required": [
-        "failure",
-        "item_id",
-        "item_type",
         "kind",
         "thread_id",
-        "turn_id"
-      ],
+        "turn_id",
+        "item_id",
+        "sequence",
+        "source",
+        "tool_name",
+        "payload",
+        "output_policy_snapshot"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "item_started"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemStartedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "item_completed"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemCompletedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "item_tool_retry_scheduled"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemToolRetryScheduledNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "item_tool_retry_resolved"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemToolRetryResolvedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "item_tool_retry_exhausted"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemToolRetryExhaustedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "turn_tool_loop_budget_exceeded"
+        },
+        "notification": {
+          "$ref": "#/$defs/TurnToolLoopBudgetExceededNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification"
+      ]
+    },
+    {
+      "type": "object",
       "properties": {
         "failure": {
-          "$ref": "#/definitions/ProviderFailureDetails"
+          "$ref": "#/$defs/ProviderFailureDetails"
         },
         "item_id": {
           "type": "string"
         },
         "item_type": {
-          "$ref": "#/definitions/TurnItemType"
+          "$ref": "#/$defs/TurnItemType"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "provider_failure_detected"
-          ]
+          "const": "provider_failure_detected"
         },
         "recovery": {
           "anyOf": [
             {
-              "$ref": "#/definitions/RecoveryAttemptContext"
+              "$ref": "#/$defs/RecoveryAttemptContext"
             },
             {
               "type": "null"
@@ -289,25 +259,25 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "item_type",
+        "failure"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "kind",
-        "recovery",
-        "thread_id",
-        "turn_id"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "recovery_attempt_succeeded"
-          ]
+          "const": "recovery_attempt_succeeded"
         },
         "recovery": {
-          "$ref": "#/definitions/RecoveryAttemptContext"
+          "$ref": "#/$defs/RecoveryAttemptContext"
         },
         "thread_id": {
           "type": "string"
@@ -315,26 +285,25 @@
         "turn_id": {
           "type": "string"
         }
-      }
-    },
-    {
-      "type": "object",
+      },
       "required": [
         "kind",
         "thread_id",
-        "turn_id"
-      ],
+        "turn_id",
+        "recovery"
+      ]
+    },
+    {
+      "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "turn_completed"
-          ]
+          "const": "turn_completed"
         },
         "recovery": {
           "anyOf": [
             {
-              "$ref": "#/definitions/RecoveryAttemptContext"
+              "$ref": "#/$defs/RecoveryAttemptContext"
             },
             {
               "type": "null"
@@ -347,30 +316,27 @@
         "turn_id": {
           "type": "string"
         }
-      }
-    },
-    {
-      "type": "object",
+      },
       "required": [
-        "error",
         "kind",
         "thread_id",
         "turn_id"
-      ],
+      ]
+    },
+    {
+      "type": "object",
       "properties": {
         "error": {
           "type": "string"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "turn_failed"
-          ]
+          "const": "turn_failed"
         },
         "recovery": {
           "anyOf": [
             {
-              "$ref": "#/definitions/RecoveryAttemptContext"
+              "$ref": "#/$defs/RecoveryAttemptContext"
             },
             {
               "type": "null"
@@ -383,22 +349,20 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "error"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "kind",
-        "reason",
-        "thread_id",
-        "turn_id"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "turn_interrupted"
-          ]
+          "const": "turn_interrupted"
         },
         "reason": {
           "type": "string"
@@ -406,7 +370,7 @@
         "recovery": {
           "anyOf": [
             {
-              "$ref": "#/definitions/RecoveryAttemptContext"
+              "$ref": "#/$defs/RecoveryAttemptContext"
             },
             {
               "type": "null"
@@ -419,101 +383,97 @@
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "reason"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "event",
-        "kind"
-      ],
       "properties": {
         "event": {
-          "$ref": "#/definitions/TaskEvent"
+          "$ref": "#/$defs/TaskEvent"
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "task_event"
-          ]
+          "const": "task_event"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "event"
+      ]
     },
     {
       "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "thread_lineage_created"
+        },
+        "lineage": {
+          "$ref": "#/$defs/ThreadLineage"
+        }
+      },
       "required": [
         "kind",
         "lineage"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "thread_lineage_created"
-          ]
-        },
-        "lineage": {
-          "$ref": "#/definitions/ThreadLineage"
-        }
-      }
+      ]
     }
   ],
-  "definitions": {
+  "$defs": {
     "DeltaOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_chunk_bytes",
-            "max_total_bytes",
-            "mode"
-          ],
           "properties": {
             "max_chunk_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "max_total_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "persist_and_display"
-              ]
+              "const": "persist_and_display"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chunk_bytes",
+            "max_total_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "progress_only"
-              ]
+              "const": "progress_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -521,71 +481,59 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "disabled"
-              ]
+              "const": "disabled"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "errors_only"
-              ]
+              "const": "errors_only"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "output"
-              ]
+              "const": "output"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         }
       ]
     },
     "ItemCompletedNotification": {
       "type": "object",
-      "required": [
-        "item",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "item": {
-          "$ref": "#/definitions/TurnItem"
+          "$ref": "#/$defs/TurnItem"
         },
         "thread_id": {
           "type": "string"
@@ -596,19 +544,19 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item"
+      ]
     },
     "ItemStartedNotification": {
       "type": "object",
-      "required": [
-        "item",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "item": {
-          "$ref": "#/definitions/TurnItem"
+          "$ref": "#/$defs/TurnItem"
         },
         "thread_id": {
           "type": "string"
@@ -619,42 +567,34 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item"
+      ]
     },
     "ItemToolRetryExhaustedNotification": {
       "type": "object",
-      "required": [
-        "attempt_number",
-        "error_class",
-        "exhaustion_kind",
-        "failure_signature_fingerprint",
-        "item_id",
-        "item_type",
-        "reason",
-        "thread_id",
-        "tool_name",
-        "tool_retry_episode_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "attempt_number": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "budgets": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/ToolRetryBudgetUsage"
+            "$ref": "#/$defs/ToolRetryBudgetUsage"
           }
         },
         "error_class": {
-          "$ref": "#/definitions/ToolRetryErrorClass"
+          "$ref": "#/$defs/ToolRetryErrorClass"
         },
         "exhaustion_kind": {
-          "$ref": "#/definitions/ToolRetryExhaustionKind"
+          "$ref": "#/$defs/ToolRetryExhaustionKind"
         },
         "failure_signature_fingerprint": {
           "type": "string"
@@ -663,7 +603,7 @@
           "type": "string"
         },
         "item_type": {
-          "$ref": "#/definitions/TurnItemType"
+          "$ref": "#/$defs/TurnItemType"
         },
         "reason": {
           "type": "string"
@@ -683,46 +623,48 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "item_type",
+        "tool_retry_episode_id",
+        "tool_name",
+        "attempt_number",
+        "error_class",
+        "exhaustion_kind",
+        "failure_signature_fingerprint",
+        "reason"
+      ]
     },
     "ItemToolRetryResolvedNotification": {
       "type": "object",
-      "required": [
-        "attempt_number",
-        "item_id",
-        "item_type",
-        "reason",
-        "resolution",
-        "thread_id",
-        "tool_name",
-        "tool_retry_episode_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "attempt_number": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "budgets": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/ToolRetryBudgetUsage"
+            "$ref": "#/$defs/ToolRetryBudgetUsage"
           }
         },
         "item_id": {
           "type": "string"
         },
         "item_type": {
-          "$ref": "#/definitions/TurnItemType"
+          "$ref": "#/$defs/TurnItemType"
         },
         "reason": {
           "type": "string"
         },
         "resolution": {
-          "$ref": "#/definitions/ToolRetryResolution"
+          "$ref": "#/$defs/ToolRetryResolution"
         },
         "thread_id": {
           "type": "string"
@@ -739,39 +681,37 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "item_type",
+        "tool_retry_episode_id",
+        "tool_name",
+        "attempt_number",
+        "resolution",
+        "reason"
+      ]
     },
     "ItemToolRetryScheduledNotification": {
       "type": "object",
-      "required": [
-        "attempt_number",
-        "error_class",
-        "failure_signature_fingerprint",
-        "item_id",
-        "item_type",
-        "reason",
-        "retry_hint",
-        "thread_id",
-        "tool_name",
-        "tool_retry_episode_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "attempt_number": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "budgets": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/ToolRetryBudgetUsage"
+            "$ref": "#/$defs/ToolRetryBudgetUsage"
           }
         },
         "error_class": {
-          "$ref": "#/definitions/ToolRetryErrorClass"
+          "$ref": "#/$defs/ToolRetryErrorClass"
         },
         "failure_signature_fingerprint": {
           "type": "string"
@@ -780,7 +720,7 @@
           "type": "string"
         },
         "item_type": {
-          "$ref": "#/definitions/TurnItemType"
+          "$ref": "#/$defs/TurnItemType"
         },
         "reason": {
           "type": "string"
@@ -803,63 +743,71 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "item_type",
+        "tool_retry_episode_id",
+        "tool_name",
+        "attempt_number",
+        "error_class",
+        "retry_hint",
+        "failure_signature_fingerprint",
+        "reason"
+      ]
     },
     "LlmOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "structured"
-              ]
+              "const": "structured"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "summary_only"
-              ]
+              "const": "summary_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -867,37 +815,33 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "until_turn_terminal"
-              ]
+              "const": "until_turn_terminal"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "do_not_retain"
-              ]
+              "const": "do_not_retain"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -905,111 +849,74 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
-            "marks": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownMark"
-              }
-            },
-            "text": {
-              "type": "string"
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "paragraph"
-              ]
+              "const": "paragraph"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownInline",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "content",
-            "level",
-            "type"
-          ],
           "properties": {
             "content": {
-              "$ref": "#/definitions/MarkdownInline"
+              "$ref": "#/$defs/MarkdownInline"
             },
             "level": {
               "type": "integer",
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "heading"
-              ]
+              "const": "heading"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level",
+            "content"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "ordered",
-            "start",
-            "type"
-          ],
           "properties": {
-            "items": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/MarkdownListItem"
-              }
-            },
-            "ordered": {
-              "type": "boolean"
-            },
-            "start": {
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0.0
-            },
             "type": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             }
-          }
+          },
+          "$ref": "#/$defs/MarkdownList",
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "blocks",
-            "type"
-          ],
           "properties": {
             "blocks": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/MarkdownBlock"
+                "$ref": "#/$defs/MarkdownBlock"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "quote"
-              ]
+              "const": "quote"
             }
-          }
+          },
+          "required": [
+            "type",
+            "blocks"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "text",
-            "type"
-          ],
           "properties": {
             "language": {
               "type": [
@@ -1022,25 +929,25 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "rule"
-              ]
+              "const": "rule"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
@@ -1048,40 +955,64 @@
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         }
       }
     },
     "MarkdownInline": {
       "type": "object",
-      "required": [
-        "text"
-      ],
       "properties": {
         "marks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownMark"
+            "$ref": "#/$defs/MarkdownMark"
           }
         },
         "text": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "MarkdownList": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownListItem"
+          }
+        },
+        "ordered": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ordered",
+        "start"
+      ]
     },
     "MarkdownListItem": {
       "type": "object",
       "properties": {
         "blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/MarkdownBlock"
+            "$ref": "#/$defs/MarkdownBlock"
           }
         },
         "checked": {
@@ -1094,123 +1025,106 @@
     },
     "MarkdownMark": {
       "type": "object",
-      "required": [
-        "end",
-        "kind",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "kind": {
-          "$ref": "#/definitions/MarkdownMarkKind"
+          "$ref": "#/$defs/MarkdownMarkKind"
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
     },
     "MarkdownMarkKind": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "bold"
-              ]
+              "const": "bold"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "italic"
-              ]
+              "const": "italic"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "strike"
-              ]
+              "const": "strike"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "link"
-              ]
+              "const": "link"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         }
       ]
     },
     "PromptManifest": {
       "type": "object",
-      "required": [
-        "compiler_version",
-        "fingerprint_dynamic",
-        "fingerprint_full",
-        "fingerprint_stable",
-        "profile"
-      ],
       "properties": {
         "compiler_version": {
           "type": "string"
         },
         "diagnostics": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestDiagnostic"
+            "$ref": "#/$defs/PromptManifestDiagnostic"
           }
         },
         "fingerprint_dynamic": {
@@ -1223,33 +1137,36 @@
           "type": "string"
         },
         "hook_sources": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/PromptManifestHookSourceEntry"
+            "$ref": "#/$defs/PromptManifestHookSourceEntry"
           }
         },
         "profile": {
-          "$ref": "#/definitions/PromptManifestProfile"
+          "$ref": "#/$defs/PromptManifestProfile"
         },
         "section_ids": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "compiler_version",
+        "profile",
+        "fingerprint_stable",
+        "fingerprint_dynamic",
+        "fingerprint_full"
+      ]
     },
     "PromptManifestDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "message"
-      ],
       "properties": {
         "code": {
-          "$ref": "#/definitions/PromptManifestDiagnosticCode"
+          "$ref": "#/$defs/PromptManifestDiagnosticCode"
         },
         "file": {
           "type": [
@@ -1260,7 +1177,7 @@
         "hook_source": {
           "anyOf": [
             {
-              "$ref": "#/definitions/PromptManifestHookSource"
+              "$ref": "#/$defs/PromptManifestHookSource"
             },
             {
               "type": "null"
@@ -1276,7 +1193,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
     },
     "PromptManifestDiagnosticCode": {
       "type": "string",
@@ -1295,6 +1216,7 @@
     "PromptManifestHookContributionKind": {
       "type": "string",
       "enum": [
+        "prompt_context",
         "prompt_section",
         "prompt_manifest_diagnostic",
         "runtime_failure"
@@ -1303,16 +1225,12 @@
     "PromptManifestHookPhase": {
       "type": "string",
       "enum": [
+        "turn_pre_prompt_context",
         "turn_pre_prompt_compile"
       ]
     },
     "PromptManifestHookSource": {
       "type": "object",
-      "required": [
-        "hook_id",
-        "phase",
-        "subscription_id"
-      ],
       "properties": {
         "contribution_hash": {
           "type": [
@@ -1330,23 +1248,30 @@
           "type": "string"
         },
         "phase": {
-          "$ref": "#/definitions/PromptManifestHookPhase"
+          "$ref": "#/$defs/PromptManifestHookPhase"
         },
         "subscription_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
     },
     "PromptManifestHookSourceEntry": {
       "type": "object",
-      "required": [
-        "contribution_kind",
-        "source",
-        "truncation"
-      ],
       "properties": {
         "contribution_kind": {
-          "$ref": "#/definitions/PromptManifestHookContributionKind"
+          "$ref": "#/$defs/PromptManifestHookContributionKind"
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
         },
         "section_id": {
           "type": [
@@ -1355,12 +1280,25 @@
           ]
         },
         "source": {
-          "$ref": "#/definitions/PromptManifestHookSource"
+          "$ref": "#/$defs/PromptManifestHookSource"
+        },
+        "source_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         },
         "truncation": {
-          "$ref": "#/definitions/PromptManifestHookTruncation"
+          "$ref": "#/$defs/PromptManifestHookTruncation"
         }
-      }
+      },
+      "required": [
+        "source",
+        "contribution_kind",
+        "truncation"
+      ]
     },
     "PromptManifestHookTruncation": {
       "type": "string",
@@ -1399,17 +1337,9 @@
     },
     "ProviderFailureDetails": {
       "type": "object",
-      "required": [
-        "class",
-        "is_recoverable_hint",
-        "model",
-        "provider",
-        "stage",
-        "transport"
-      ],
       "properties": {
         "class": {
-          "$ref": "#/definitions/ProviderFailureClass"
+          "$ref": "#/$defs/ProviderFailureClass"
         },
         "http_status": {
           "type": [
@@ -1417,7 +1347,8 @@
             "null"
           ],
           "format": "uint16",
-          "minimum": 0.0
+          "maximum": 65535,
+          "minimum": 0
         },
         "is_recoverable_hint": {
           "type": "boolean"
@@ -1446,15 +1377,23 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "stage": {
-          "$ref": "#/definitions/ProviderFailureStage"
+          "$ref": "#/$defs/ProviderFailureStage"
         },
         "transport": {
-          "$ref": "#/definitions/ProviderTransportKind"
+          "$ref": "#/$defs/ProviderTransportKind"
         }
-      }
+      },
+      "required": [
+        "provider",
+        "model",
+        "transport",
+        "class",
+        "stage",
+        "is_recoverable_hint"
+      ]
     },
     "ProviderFailureStage": {
       "type": "string",
@@ -1486,10 +1425,6 @@
     },
     "RecoveryAttemptContext": {
       "type": "object",
-      "required": [
-        "attempt_id",
-        "job_id"
-      ],
       "properties": {
         "attempt_id": {
           "type": "string"
@@ -1497,23 +1432,19 @@
         "job_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "job_id",
+        "attempt_id"
+      ]
     },
     "RecoveryOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "diagnostic_excerpt",
-            "include_error_class",
-            "include_exit_status",
-            "include_fingerprints",
-            "include_retry_hint",
-            "mode"
-          ],
           "properties": {
             "diagnostic_excerpt": {
-              "$ref": "#/definitions/DiagnosticExcerptPolicy"
+              "$ref": "#/$defs/DiagnosticExcerptPolicy"
             },
             "include_error_class": {
               "type": "boolean"
@@ -1529,51 +1460,46 @@
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "evidence"
-              ]
+              "const": "evidence"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "include_exit_status",
+            "include_error_class",
+            "include_retry_hint",
+            "diagnostic_excerpt",
+            "include_fingerprints"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
     "SkillAuditEvent": {
       "type": "object",
-      "required": [
-        "action",
-        "created_at_unix",
-        "decision",
-        "skill_slug",
-        "source_kind"
-      ],
       "properties": {
         "action": {
           "type": "string"
@@ -1600,77 +1526,76 @@
         "source_kind": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "skill_slug",
+        "source_kind",
+        "action",
+        "decision",
+        "created_at_unix"
+      ]
     },
     "StorageOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -1684,19 +1609,6 @@
     },
     "Task": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "executorKind",
-        "goal",
-        "id",
-        "ownerKind",
-        "priority",
-        "revision",
-        "status",
-        "title",
-        "updatedAt",
-        "workspaceId"
-      ],
       "properties": {
         "completedAt": {
           "type": [
@@ -1708,7 +1620,7 @@
         "concurrencyPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskConcurrencyPolicy"
+              "$ref": "#/$defs/TaskConcurrencyPolicy"
             },
             {
               "type": "null"
@@ -1734,7 +1646,7 @@
         "deliveryPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskDeliveryPolicy"
+              "$ref": "#/$defs/TaskDeliveryPolicy"
             },
             {
               "type": "null"
@@ -1744,7 +1656,7 @@
         "error": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskError"
+              "$ref": "#/$defs/TaskError"
             },
             {
               "type": "null"
@@ -1752,7 +1664,7 @@
           ]
         },
         "executorKind": {
-          "$ref": "#/definitions/TaskExecutorKind"
+          "$ref": "#/$defs/TaskExecutorKind"
         },
         "goal": {
           "type": "string"
@@ -1763,7 +1675,7 @@
         "lifecyclePolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskLifecyclePolicy"
+              "$ref": "#/$defs/TaskLifecyclePolicy"
             },
             {
               "type": "null"
@@ -1773,7 +1685,7 @@
         "metadata": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskMetadata"
+              "$ref": "#/$defs/TaskMetadata"
             },
             {
               "type": "null"
@@ -1787,7 +1699,7 @@
           ]
         },
         "ownerKind": {
-          "$ref": "#/definitions/TaskOwnerKind"
+          "$ref": "#/$defs/TaskOwnerKind"
         },
         "parentTaskId": {
           "type": [
@@ -1802,7 +1714,7 @@
         "result": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskResult"
+              "$ref": "#/$defs/TaskResult"
             },
             {
               "type": "null"
@@ -1812,7 +1724,7 @@
         "retryPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskRetryPolicy"
+              "$ref": "#/$defs/TaskRetryPolicy"
             },
             {
               "type": "null"
@@ -1830,12 +1742,12 @@
           ]
         },
         "status": {
-          "$ref": "#/definitions/TaskStatus"
+          "$ref": "#/$defs/TaskStatus"
         },
         "timeoutPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskTimeoutPolicy"
+              "$ref": "#/$defs/TaskTimeoutPolicy"
             },
             {
               "type": "null"
@@ -1852,23 +1764,36 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "workspaceId",
+        "ownerKind",
+        "executorKind",
+        "status",
+        "title",
+        "goal",
+        "priority",
+        "revision",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskAgentContext": {
       "type": "object",
       "properties": {
         "attachments": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputAttachment"
+            "$ref": "#/$defs/TaskAgentInputAttachment"
           }
         },
         "references": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputReference"
+            "$ref": "#/$defs/TaskAgentInputReference"
           }
         },
         "text": {
@@ -1878,10 +1803,10 @@
           ]
         },
         "variables": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputVariable"
+            "$ref": "#/$defs/TaskAgentInputVariable"
           }
         }
       }
@@ -1898,16 +1823,11 @@
     },
     "TaskAgentContextPolicy": {
       "type": "object",
-      "required": [
-        "includeArtifacts",
-        "includeParentSummary",
-        "mode"
-      ],
       "properties": {
         "customContext": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskAgentContext"
+              "$ref": "#/$defs/TaskAgentContext"
             },
             {
               "type": "null"
@@ -1926,28 +1846,33 @@
             "null"
           ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "mode": {
-          "$ref": "#/definitions/TaskAgentContextMode"
+          "$ref": "#/$defs/TaskAgentContextMode"
         }
-      }
+      },
+      "required": [
+        "mode",
+        "includeParentSummary",
+        "includeArtifacts"
+      ]
     },
     "TaskAgentInput": {
       "type": "object",
       "properties": {
         "attachments": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputAttachment"
+            "$ref": "#/$defs/TaskAgentInputAttachment"
           }
         },
         "references": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputReference"
+            "$ref": "#/$defs/TaskAgentInputReference"
           }
         },
         "text": {
@@ -1957,19 +1882,16 @@
           ]
         },
         "variables": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskAgentInputVariable"
+            "$ref": "#/$defs/TaskAgentInputVariable"
           }
         }
       }
     },
     "TaskAgentInputAttachment": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "artifactId": {
           "type": [
@@ -1978,7 +1900,7 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/TaskAgentInputAttachmentKind"
+          "$ref": "#/$defs/TaskAgentInputAttachmentKind"
         },
         "mimeType": {
           "type": [
@@ -2004,7 +1926,10 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "TaskAgentInputAttachmentKind": {
       "type": "string",
@@ -2016,16 +1941,12 @@
     },
     "TaskAgentInputReference": {
       "type": "object",
-      "required": [
-        "id",
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": "string"
         },
         "kind": {
-          "$ref": "#/definitions/TaskAgentInputReferenceKind"
+          "$ref": "#/$defs/TaskAgentInputReferenceKind"
         },
         "label": {
           "type": [
@@ -2033,7 +1954,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
     },
     "TaskAgentInputReferenceKind": {
       "type": "string",
@@ -2047,24 +1972,21 @@
     },
     "TaskAgentInputVariable": {
       "type": "object",
-      "required": [
-        "name",
-        "value"
-      ],
       "properties": {
         "name": {
           "type": "string"
         },
         "value": {
-          "$ref": "#/definitions/TaskValue"
+          "$ref": "#/$defs/TaskValue"
         }
-      }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
     },
     "TaskAgentPrompt": {
       "type": "object",
-      "required": [
-        "goal"
-      ],
       "properties": {
         "goal": {
           "type": "string"
@@ -2072,7 +1994,7 @@
         "input": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskAgentInput"
+              "$ref": "#/$defs/TaskAgentInput"
             },
             {
               "type": "null"
@@ -2080,8 +2002,8 @@
           ]
         },
         "instructions": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
@@ -2092,17 +2014,16 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "goal"
+      ]
     },
     "TaskAgentResultContract": {
       "type": "object",
-      "required": [
-        "format",
-        "required"
-      ],
       "properties": {
         "format": {
-          "$ref": "#/definitions/TaskAgentResultFormat"
+          "$ref": "#/$defs/TaskAgentResultFormat"
         },
         "required": {
           "type": "boolean"
@@ -2110,14 +2031,18 @@
         "schema": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskSchema"
+              "$ref": "#/$defs/TaskSchema"
             },
             {
               "type": "null"
             }
           ]
         }
-      }
+      },
+      "required": [
+        "format",
+        "required"
+      ]
     },
     "TaskAgentResultFormat": {
       "type": "string",
@@ -2130,15 +2055,6 @@
     },
     "TaskAgentSpec": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "depth",
-        "id",
-        "maxDepth",
-        "prompt",
-        "taskId",
-        "updatedAt"
-      ],
       "properties": {
         "agentNickname": {
           "type": [
@@ -2155,7 +2071,7 @@
         "contextPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskAgentContextPolicy"
+              "$ref": "#/$defs/TaskAgentContextPolicy"
             },
             {
               "type": "null"
@@ -2190,12 +2106,12 @@
           ]
         },
         "prompt": {
-          "$ref": "#/definitions/TaskAgentPrompt"
+          "$ref": "#/$defs/TaskAgentPrompt"
         },
         "resultContract": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskAgentResultContract"
+              "$ref": "#/$defs/TaskAgentResultContract"
             },
             {
               "type": "null"
@@ -2214,7 +2130,7 @@
         "toolPolicy": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskAgentToolPolicy"
+              "$ref": "#/$defs/TaskAgentToolPolicy"
             },
             {
               "type": "null"
@@ -2225,32 +2141,37 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "prompt",
+        "depth",
+        "maxDepth",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskAgentToolPolicy": {
       "type": "object",
-      "required": [
-        "networkAccess",
-        "writeMode"
-      ],
       "properties": {
         "allowedPaths": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "allowedTools": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "deniedTools": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
@@ -2259,9 +2180,13 @@
           "type": "boolean"
         },
         "writeMode": {
-          "$ref": "#/definitions/TaskAgentWriteMode"
+          "$ref": "#/$defs/TaskAgentWriteMode"
         }
-      }
+      },
+      "required": [
+        "writeMode",
+        "networkAccess"
+      ]
     },
     "TaskAgentWriteMode": {
       "type": "string",
@@ -2284,7 +2209,7 @@
         "metadata": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -2337,10 +2262,6 @@
     },
     "TaskConcurrencyPolicy": {
       "type": "object",
-      "required": [
-        "maxParallelRuns",
-        "onConflict"
-      ],
       "properties": {
         "key": {
           "type": [
@@ -2351,33 +2272,24 @@
         "maxParallelRuns": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "onConflict": {
-          "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+          "$ref": "#/$defs/TaskConcurrencyConflictPolicy"
         }
-      }
+      },
+      "required": [
+        "maxParallelRuns",
+        "onConflict"
+      ]
     },
     "TaskDelivery": {
       "type": "object",
-      "required": [
-        "attemptCount",
-        "createdAt",
-        "deliveryKey",
-        "id",
-        "maxAttempts",
-        "mode",
-        "runId",
-        "status",
-        "taskId",
-        "updatedAt",
-        "workspaceId"
-      ],
       "properties": {
         "attemptCount": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "createdAt": {
           "type": "integer",
@@ -2408,7 +2320,7 @@
         "errorSnapshot": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskError"
+              "$ref": "#/$defs/TaskError"
             },
             {
               "type": "null"
@@ -2427,10 +2339,10 @@
         "maxAttempts": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "mode": {
-          "$ref": "#/definitions/TaskDeliveryMode"
+          "$ref": "#/$defs/TaskDeliveryMode"
         },
         "nextAttemptAt": {
           "type": [
@@ -2442,7 +2354,7 @@
         "resultSnapshot": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskResult"
+              "$ref": "#/$defs/TaskResult"
             },
             {
               "type": "null"
@@ -2453,7 +2365,7 @@
           "type": "string"
         },
         "status": {
-          "$ref": "#/definitions/TaskDeliveryStatus"
+          "$ref": "#/$defs/TaskDeliveryStatus"
         },
         "targetThreadId": {
           "type": [
@@ -2489,22 +2401,28 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "workspaceId",
+        "taskId",
+        "runId",
+        "deliveryKey",
+        "mode",
+        "status",
+        "attemptCount",
+        "maxAttempts",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskDeliveryAttempt": {
       "type": "object",
-      "required": [
-        "attemptNumber",
-        "deliveryId",
-        "id",
-        "startedAt",
-        "status"
-      ],
       "properties": {
         "attemptNumber": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "completedAt": {
           "type": [
@@ -2528,7 +2446,8 @@
             "null"
           ],
           "format": "uint16",
-          "minimum": 0.0
+          "maximum": 65535,
+          "minimum": 0
         },
         "id": {
           "type": "string"
@@ -2544,9 +2463,16 @@
           "format": "int64"
         },
         "status": {
-          "$ref": "#/definitions/TaskDeliveryAttemptStatus"
+          "$ref": "#/$defs/TaskDeliveryAttemptStatus"
         }
-      }
+      },
+      "required": [
+        "id",
+        "deliveryId",
+        "attemptNumber",
+        "status",
+        "startedAt"
+      ]
     },
     "TaskDeliveryAttemptStatus": {
       "type": "string",
@@ -2575,20 +2501,15 @@
     },
     "TaskDeliveryPolicy": {
       "type": "object",
-      "required": [
-        "format",
-        "includeResult",
-        "mode"
-      ],
       "properties": {
         "format": {
-          "$ref": "#/definitions/TaskDeliveryFormat"
+          "$ref": "#/$defs/TaskDeliveryFormat"
         },
         "includeResult": {
           "type": "boolean"
         },
         "mode": {
-          "$ref": "#/definitions/TaskDeliveryMode"
+          "$ref": "#/$defs/TaskDeliveryMode"
         },
         "threadId": {
           "type": [
@@ -2602,7 +2523,12 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "mode",
+        "includeResult",
+        "format"
+      ]
     },
     "TaskDeliveryStatus": {
       "type": "string",
@@ -2616,18 +2542,11 @@
     },
     "TaskDependency": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "dependsOnTaskId",
-        "id",
-        "kind",
-        "taskId"
-      ],
       "properties": {
         "condition": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskDependencyCondition"
+              "$ref": "#/$defs/TaskDependencyCondition"
             },
             {
               "type": "null"
@@ -2650,7 +2569,14 @@
         "taskId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "dependsOnTaskId",
+        "kind",
+        "createdAt"
+      ]
     },
     "TaskDependencyCondition": {
       "type": "object",
@@ -2658,7 +2584,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -2683,32 +2609,27 @@
     },
     "TaskDependencyTriggerPolicy": {
       "type": "object",
-      "required": [
-        "mode"
-      ],
       "properties": {
         "dependsOnTaskIds": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "mode": {
-          "$ref": "#/definitions/TaskDependencyTriggerMode"
+          "$ref": "#/$defs/TaskDependencyTriggerMode"
         }
-      }
+      },
+      "required": [
+        "mode"
+      ]
     },
     "TaskError": {
       "type": "object",
-      "required": [
-        "class",
-        "code",
-        "message"
-      ],
       "properties": {
         "class": {
-          "$ref": "#/definitions/TaskErrorClass"
+          "$ref": "#/$defs/TaskErrorClass"
         },
         "code": {
           "type": "string"
@@ -2716,7 +2637,7 @@
         "details": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -2732,7 +2653,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "message",
+        "class"
+      ]
     },
     "TaskErrorClass": {
       "type": "string",
@@ -2750,14 +2676,6 @@
     },
     "TaskEvent": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "eventType",
-        "id",
-        "payload",
-        "sequence",
-        "taskId"
-      ],
       "properties": {
         "createdAt": {
           "type": "integer",
@@ -2770,7 +2688,7 @@
           "type": "string"
         },
         "payload": {
-          "$ref": "#/definitions/TaskEventPayload"
+          "$ref": "#/$defs/TaskEventPayload"
         },
         "runId": {
           "type": [
@@ -2797,133 +2715,123 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "sequence",
+        "eventType",
+        "payload",
+        "createdAt"
+      ]
     },
     "TaskEventPayload": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "payload"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_created"
-              ]
+              "const": "task_created"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "task"
-              ],
               "properties": {
                 "task": {
-                  "$ref": "#/definitions/Task"
+                  "$ref": "#/$defs/Task"
                 }
-              }
+              },
+              "required": [
+                "task"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "trigger_created"
-              ]
+              "const": "trigger_created"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "trigger"
-              ],
               "properties": {
                 "trigger": {
-                  "$ref": "#/definitions/TaskTrigger"
+                  "$ref": "#/$defs/TaskTrigger"
                 }
-              }
+              },
+              "required": [
+                "trigger"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "dependency_created"
-              ]
+              "const": "dependency_created"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "dependency"
-              ],
               "properties": {
                 "dependency": {
-                  "$ref": "#/definitions/TaskDependency"
+                  "$ref": "#/$defs/TaskDependency"
                 }
-              }
+              },
+              "required": [
+                "dependency"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "agent_spec_created"
-              ]
+              "const": "agent_spec_created"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "agent_spec"
-              ],
               "properties": {
                 "agent_spec": {
-                  "$ref": "#/definitions/TaskAgentSpec"
+                  "$ref": "#/$defs/TaskAgentSpec"
                 }
-              }
+              },
+              "required": [
+                "agent_spec"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_scheduled"
-              ]
+              "const": "task_scheduled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "task_id",
-                "trigger_id"
-              ],
               "properties": {
                 "next_fire_at": {
                   "type": [
@@ -2938,28 +2846,27 @@
                 "trigger_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "trigger_id"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_queued"
-              ]
+              "const": "task_queued"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "task_id"
-              ],
               "properties": {
                 "run_id": {
                   "type": [
@@ -2970,33 +2877,31 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_created"
-              ]
+              "const": "run_created"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "run"
-              ],
               "properties": {
                 "agent_spec": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskAgentSpec"
+                      "$ref": "#/$defs/TaskAgentSpec"
                     },
                     {
                       "type": "null"
@@ -3004,32 +2909,28 @@
                   ]
                 },
                 "run": {
-                  "$ref": "#/definitions/TaskRun"
+                  "$ref": "#/$defs/TaskRun"
                 }
-              }
+              },
+              "required": [
+                "run"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_started"
-              ]
+              "const": "run_started"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "run_id",
-                "started_at",
-                "task_id"
-              ],
               "properties": {
                 "run_id": {
                   "type": "string"
@@ -3041,34 +2942,33 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "started_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "progress"
-              ]
+              "const": "progress"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "message",
-                "task_id"
-              ],
               "properties": {
                 "details": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskProgressDetails"
+                      "$ref": "#/$defs/TaskProgressDetails"
                     },
                     {
                       "type": "null"
@@ -3087,30 +2987,27 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "message"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_completed"
-              ]
+              "const": "run_completed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "completed_at",
-                "run_id",
-                "task_id"
-              ],
               "properties": {
                 "completed_at": {
                   "type": "integer",
@@ -3119,7 +3016,7 @@
                 "result": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskResult"
+                      "$ref": "#/$defs/TaskResult"
                     },
                     {
                       "type": "null"
@@ -3132,30 +3029,28 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "completed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_failed"
-              ]
+              "const": "run_failed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "completed_at",
-                "run_id",
-                "task_id"
-              ],
               "properties": {
                 "completed_at": {
                   "type": "integer",
@@ -3164,7 +3059,7 @@
                 "error": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskError"
+                      "$ref": "#/$defs/TaskError"
                     },
                     {
                       "type": "null"
@@ -3177,31 +3072,28 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "completed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_retry_scheduled"
-              ]
+              "const": "run_retry_scheduled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "failed_run_id",
-                "next_attempt_at",
-                "retry_run",
-                "task_id"
-              ],
               "properties": {
                 "failed_run_id": {
                   "type": "string"
@@ -3213,7 +3105,7 @@
                 "reason": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskError"
+                      "$ref": "#/$defs/TaskError"
                     },
                     {
                       "type": "null"
@@ -3221,41 +3113,39 @@
                   ]
                 },
                 "retry_run": {
-                  "$ref": "#/definitions/TaskRun"
+                  "$ref": "#/$defs/TaskRun"
                 },
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "failed_run_id",
+                "retry_run",
+                "next_attempt_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_retry_exhausted"
-              ]
+              "const": "run_retry_exhausted"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "exhausted_at",
-                "final_run_id",
-                "run_group_id",
-                "task_id"
-              ],
               "properties": {
                 "error": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskError"
+                      "$ref": "#/$defs/TaskError"
                     },
                     {
                       "type": "null"
@@ -3275,30 +3165,29 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_group_id",
+                "final_run_id",
+                "exhausted_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "run_cancelled"
-              ]
+              "const": "run_cancelled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "cancelled_at",
-                "run_id",
-                "task_id"
-              ],
               "properties": {
                 "cancelled_at": {
                   "type": "integer",
@@ -3316,29 +3205,28 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "cancelled_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_completed"
-              ]
+              "const": "task_completed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "completed_at",
-                "task_id"
-              ],
               "properties": {
                 "completed_at": {
                   "type": "integer",
@@ -3347,7 +3235,7 @@
                 "result": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskResult"
+                      "$ref": "#/$defs/TaskResult"
                     },
                     {
                       "type": "null"
@@ -3357,29 +3245,27 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "completed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_failed"
-              ]
+              "const": "task_failed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "completed_at",
-                "task_id"
-              ],
               "properties": {
                 "completed_at": {
                   "type": "integer",
@@ -3388,7 +3274,7 @@
                 "error": {
                   "anyOf": [
                     {
-                      "$ref": "#/definitions/TaskError"
+                      "$ref": "#/$defs/TaskError"
                     },
                     {
                       "type": "null"
@@ -3398,29 +3284,27 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "completed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_cancelled"
-              ]
+              "const": "task_cancelled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "completed_at",
-                "task_id"
-              ],
               "properties": {
                 "completed_at": {
                   "type": "integer",
@@ -3435,61 +3319,56 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "completed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_detached"
-              ]
+              "const": "task_detached"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "detached_at",
-                "task"
-              ],
               "properties": {
                 "detached_at": {
                   "type": "integer",
                   "format": "int64"
                 },
                 "task": {
-                  "$ref": "#/definitions/Task"
+                  "$ref": "#/$defs/Task"
                 }
-              }
+              },
+              "required": [
+                "task",
+                "detached_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_rescheduled"
-              ]
+              "const": "task_rescheduled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "rescheduled_at",
-                "task_id",
-                "trigger"
-              ],
               "properties": {
                 "rescheduled_at": {
                   "type": "integer",
@@ -3499,31 +3378,30 @@
                   "type": "string"
                 },
                 "trigger": {
-                  "$ref": "#/definitions/TaskTrigger"
+                  "$ref": "#/$defs/TaskTrigger"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "trigger",
+                "rescheduled_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_paused"
-              ]
+              "const": "task_paused"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "paused_at",
-                "task"
-              ],
               "properties": {
                 "paused_at": {
                   "type": "integer",
@@ -3536,38 +3414,36 @@
                   ]
                 },
                 "task": {
-                  "$ref": "#/definitions/Task"
+                  "$ref": "#/$defs/Task"
                 },
                 "triggers": {
-                  "default": [],
                   "type": "array",
+                  "default": [],
                   "items": {
-                    "$ref": "#/definitions/TaskTrigger"
+                    "$ref": "#/$defs/TaskTrigger"
                   }
                 }
-              }
+              },
+              "required": [
+                "task",
+                "paused_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_resumed"
-              ]
+              "const": "task_resumed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "resumed_at",
-                "task"
-              ],
               "properties": {
                 "reason": {
                   "type": [
@@ -3580,39 +3456,36 @@
                   "format": "int64"
                 },
                 "task": {
-                  "$ref": "#/definitions/Task"
+                  "$ref": "#/$defs/Task"
                 },
                 "triggers": {
-                  "default": [],
                   "type": "array",
+                  "default": [],
                   "items": {
-                    "$ref": "#/definitions/TaskTrigger"
+                    "$ref": "#/$defs/TaskTrigger"
                   }
                 }
-              }
+              },
+              "required": [
+                "task",
+                "resumed_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "task_recovered"
-              ]
+              "const": "task_recovered"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "message",
-                "recovered_at",
-                "task_id"
-              ],
               "properties": {
                 "message": {
                   "type": "string"
@@ -3630,56 +3503,52 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "message",
+                "recovered_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "child_thread_linked"
-              ]
+              "const": "child_thread_linked"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "lineage"
-              ],
               "properties": {
                 "lineage": {
-                  "$ref": "#/definitions/ThreadLineage"
+                  "$ref": "#/$defs/ThreadLineage"
                 }
-              }
+              },
+              "required": [
+                "lineage"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "depth_limit_exceeded"
-              ]
+              "const": "depth_limit_exceeded"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "depth",
-                "max_depth",
-                "task_id"
-              ],
               "properties": {
                 "depth": {
                   "type": "integer",
@@ -3698,147 +3567,139 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "depth",
+                "max_depth"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "delivery_queued"
-              ]
+              "const": "delivery_queued"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "delivery"
-              ],
               "properties": {
                 "delivery": {
-                  "$ref": "#/definitions/TaskDelivery"
+                  "$ref": "#/$defs/TaskDelivery"
                 }
-              }
+              },
+              "required": [
+                "delivery"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "delivery_started"
-              ]
+              "const": "delivery_started"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "attempt",
-                "delivery"
-              ],
               "properties": {
                 "attempt": {
-                  "$ref": "#/definitions/TaskDeliveryAttempt"
+                  "$ref": "#/$defs/TaskDeliveryAttempt"
                 },
                 "delivery": {
-                  "$ref": "#/definitions/TaskDelivery"
+                  "$ref": "#/$defs/TaskDelivery"
                 }
-              }
+              },
+              "required": [
+                "delivery",
+                "attempt"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "delivery_delivered"
-              ]
+              "const": "delivery_delivered"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "attempt",
-                "delivery"
-              ],
               "properties": {
                 "attempt": {
-                  "$ref": "#/definitions/TaskDeliveryAttempt"
+                  "$ref": "#/$defs/TaskDeliveryAttempt"
                 },
                 "delivery": {
-                  "$ref": "#/definitions/TaskDelivery"
+                  "$ref": "#/$defs/TaskDelivery"
                 }
-              }
+              },
+              "required": [
+                "delivery",
+                "attempt"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "delivery_failed"
-              ]
+              "const": "delivery_failed"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "attempt",
-                "delivery"
-              ],
               "properties": {
                 "attempt": {
-                  "$ref": "#/definitions/TaskDeliveryAttempt"
+                  "$ref": "#/$defs/TaskDeliveryAttempt"
                 },
                 "delivery": {
-                  "$ref": "#/definitions/TaskDelivery"
+                  "$ref": "#/$defs/TaskDelivery"
                 }
-              }
+              },
+              "required": [
+                "delivery",
+                "attempt"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "delivery_cancelled"
-              ]
+              "const": "delivery_cancelled"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "delivery"
-              ],
               "properties": {
                 "delivery": {
-                  "$ref": "#/definitions/TaskDelivery"
+                  "$ref": "#/$defs/TaskDelivery"
                 },
                 "reason": {
                   "type": [
@@ -3846,97 +3707,89 @@
                     "null"
                   ]
                 }
-              }
+              },
+              "required": [
+                "delivery"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "write_lock_acquired"
-              ]
+              "const": "write_lock_acquired"
             },
             "payload": {
               "type": "object",
+              "properties": {
+                "lock": {
+                  "$ref": "#/$defs/TaskWriteLock"
+                }
+              },
               "required": [
                 "lock"
-              ],
-              "properties": {
-                "lock": {
-                  "$ref": "#/definitions/TaskWriteLock"
-                }
-              }
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "write_lock_released"
-              ]
+              "const": "write_lock_released"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "lock",
-                "released_at"
-              ],
               "properties": {
                 "lock": {
-                  "$ref": "#/definitions/TaskWriteLock"
+                  "$ref": "#/$defs/TaskWriteLock"
                 },
                 "released_at": {
                   "type": "integer",
                   "format": "int64"
                 }
-              }
+              },
+              "required": [
+                "lock",
+                "released_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "write_lock_blocked"
-              ]
+              "const": "write_lock_blocked"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "blocked_at",
-                "run_id",
-                "task_id"
-              ],
               "properties": {
                 "blocked_at": {
                   "type": "integer",
                   "format": "int64"
                 },
                 "conflicts": {
-                  "default": [],
                   "type": "array",
+                  "default": [],
                   "items": {
-                    "$ref": "#/definitions/TaskWriteLockConflict"
+                    "$ref": "#/$defs/TaskWriteLockConflict"
                   }
                 },
                 "run_id": {
@@ -3945,40 +3798,47 @@
                 "task_id": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "blocked_at"
+              ]
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "payload"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "write_lock_expired"
-              ]
+              "const": "write_lock_expired"
             },
             "payload": {
               "type": "object",
-              "required": [
-                "expired_at",
-                "lock"
-              ],
               "properties": {
                 "expired_at": {
                   "type": "integer",
                   "format": "int64"
                 },
                 "lock": {
-                  "$ref": "#/definitions/TaskWriteLock"
+                  "$ref": "#/$defs/TaskWriteLock"
                 }
-              }
+              },
+              "required": [
+                "lock",
+                "expired_at"
+              ]
             }
-          }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
         }
       ]
     },
@@ -4002,36 +3862,36 @@
           ]
         },
         "fields": {
-          "default": {},
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/TaskValue"
-          }
+            "$ref": "#/$defs/TaskValue"
+          },
+          "default": {}
         }
       }
     },
     "TaskLifecyclePolicy": {
       "type": "object",
-      "required": [
-        "attachment",
-        "completion",
-        "onParentCancel",
-        "onParentFailure"
-      ],
       "properties": {
         "attachment": {
-          "$ref": "#/definitions/TaskAttachmentMode"
+          "$ref": "#/$defs/TaskAttachmentMode"
         },
         "completion": {
-          "$ref": "#/definitions/TaskCompletionBehavior"
+          "$ref": "#/$defs/TaskCompletionBehavior"
         },
         "onParentCancel": {
-          "$ref": "#/definitions/TaskParentTerminalAction"
+          "$ref": "#/$defs/TaskParentTerminalAction"
         },
         "onParentFailure": {
-          "$ref": "#/definitions/TaskParentTerminalAction"
+          "$ref": "#/$defs/TaskParentTerminalAction"
         }
-      }
+      },
+      "required": [
+        "attachment",
+        "onParentCancel",
+        "onParentFailure",
+        "completion"
+      ]
     },
     "TaskManualActor": {
       "type": "string",
@@ -4048,7 +3908,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -4056,8 +3916,8 @@
           ]
         },
         "labels": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
@@ -4087,7 +3947,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -4113,10 +3973,10 @@
       "type": "object",
       "properties": {
         "artifacts": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskArtifact"
+            "$ref": "#/$defs/TaskArtifact"
           }
         },
         "completedByRunId": {
@@ -4128,7 +3988,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -4153,13 +4013,9 @@
     },
     "TaskRetryPolicy": {
       "type": "object",
-      "required": [
-        "backoff",
-        "maxAttempts"
-      ],
       "properties": {
         "backoff": {
-          "$ref": "#/definitions/TaskRetryBackoffKind"
+          "$ref": "#/$defs/TaskRetryBackoffKind"
         },
         "initialDelaySeconds": {
           "type": [
@@ -4171,7 +4027,7 @@
         "maxAttempts": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "maxDelaySeconds": {
           "type": [
@@ -4181,32 +4037,25 @@
           "format": "int64"
         },
         "retryOn": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskErrorClass"
+            "$ref": "#/$defs/TaskErrorClass"
           }
         }
-      }
+      },
+      "required": [
+        "maxAttempts",
+        "backoff"
+      ]
     },
     "TaskRun": {
       "type": "object",
-      "required": [
-        "attemptNumber",
-        "createdAt",
-        "executorKind",
-        "id",
-        "runGroupId",
-        "runNumber",
-        "status",
-        "taskId",
-        "updatedAt"
-      ],
       "properties": {
         "attemptNumber": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "completedAt": {
           "type": [
@@ -4222,7 +4071,7 @@
         "error": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskError"
+              "$ref": "#/$defs/TaskError"
             },
             {
               "type": "null"
@@ -4230,7 +4079,7 @@
           ]
         },
         "executorKind": {
-          "$ref": "#/definitions/TaskExecutorKind"
+          "$ref": "#/$defs/TaskExecutorKind"
         },
         "heartbeatAt": {
           "type": [
@@ -4271,7 +4120,7 @@
         "result": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskResult"
+              "$ref": "#/$defs/TaskResult"
             },
             {
               "type": "null"
@@ -4299,7 +4148,7 @@
           "format": "int64"
         },
         "status": {
-          "$ref": "#/definitions/TaskRunStatus"
+          "$ref": "#/$defs/TaskRunStatus"
         },
         "taskId": {
           "type": "string"
@@ -4314,7 +4163,18 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runGroupId",
+        "attemptNumber",
+        "runNumber",
+        "status",
+        "executorKind",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskRunStatus": {
       "type": "string",
@@ -4331,9 +4191,6 @@
     },
     "TaskSchema": {
       "type": "object",
-      "required": [
-        "schema"
-      ],
       "properties": {
         "description": {
           "type": [
@@ -4348,9 +4205,12 @@
           ]
         },
         "schema": {
-          "$ref": "#/definitions/TaskValue"
+          "$ref": "#/$defs/TaskValue"
         }
-      }
+      },
+      "required": [
+        "schema"
+      ]
     },
     "TaskStatus": {
       "type": "string",
@@ -4393,14 +4253,6 @@
     },
     "TaskTrigger": {
       "type": "object",
-      "required": [
-        "createdAt",
-        "id",
-        "spec",
-        "status",
-        "taskId",
-        "updatedAt"
-      ],
       "properties": {
         "createdAt": {
           "type": "integer",
@@ -4424,10 +4276,10 @@
           "format": "int64"
         },
         "spec": {
-          "$ref": "#/definitions/TaskTriggerSpec"
+          "$ref": "#/$defs/TaskTriggerSpec"
         },
         "status": {
-          "$ref": "#/definitions/TaskTriggerStatus"
+          "$ref": "#/$defs/TaskTriggerStatus"
         },
         "taskId": {
           "type": "string"
@@ -4436,7 +4288,15 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "status",
+        "spec",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskTriggerKind": {
       "type": "string",
@@ -4454,30 +4314,22 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "immediate"
-              ]
+              "const": "immediate"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "scheduled_at"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "scheduled_at"
-              ]
+              "const": "scheduled_at"
             },
             "scheduled_at": {
               "type": "integer",
@@ -4489,14 +4341,14 @@
                 "null"
               ]
             }
-          }
+          },
+          "required": [
+            "kind",
+            "scheduled_at"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "interval_seconds",
-            "kind"
-          ],
           "properties": {
             "interval_anchor_at": {
               "type": [
@@ -4511,44 +4363,41 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "interval"
-              ]
+              "const": "interval"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "interval_seconds"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "cron_expr",
-            "kind",
-            "timezone"
-          ],
           "properties": {
             "cron_expr": {
               "type": "string"
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "cron"
-              ]
+              "const": "cron"
             },
             "timezone": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "cron_expr",
+            "timezone"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "allowed_actor": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/TaskManualActor"
+                  "$ref": "#/$defs/TaskManualActor"
                 },
                 {
                   "type": "null"
@@ -4557,18 +4406,15 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "manual"
-              ]
+              "const": "manual"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "source"
-          ],
           "properties": {
             "event_type": {
               "type": [
@@ -4579,7 +4425,7 @@
             "filter": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/TaskExternalTriggerFilter"
+                  "$ref": "#/$defs/TaskExternalTriggerFilter"
                 },
                 {
                   "type": "null"
@@ -4588,32 +4434,32 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "external"
-              ]
+              "const": "external"
             },
             "source": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "source"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "policy"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "dependency"
-              ]
+              "const": "dependency"
             },
             "policy": {
-              "$ref": "#/definitions/TaskDependencyTriggerPolicy"
+              "$ref": "#/$defs/TaskDependencyTriggerPolicy"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "policy"
+          ]
         }
       ]
     },
@@ -4630,158 +4476,131 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "integer"
-              ]
+              "const": "integer"
             },
             "value": {
               "type": "integer",
               "format": "int64"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "number",
               "format": "double"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             },
             "value": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             },
             "value": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         }
       ]
     },
     "TaskWriteLock": {
       "type": "object",
-      "required": [
-        "acquiredAt",
-        "conflictPolicy",
-        "createdAt",
-        "id",
-        "runId",
-        "scopeKind",
-        "scopePath",
-        "status",
-        "taskId",
-        "updatedAt",
-        "workspaceId"
-      ],
       "properties": {
         "acquiredAt": {
           "type": "integer",
           "format": "int64"
         },
         "conflictPolicy": {
-          "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+          "$ref": "#/$defs/TaskConcurrencyConflictPolicy"
         },
         "createdAt": {
           "type": "integer",
@@ -4814,13 +4633,13 @@
           "type": "string"
         },
         "scopeKind": {
-          "$ref": "#/definitions/TaskWriteLockScopeKind"
+          "$ref": "#/$defs/TaskWriteLockScopeKind"
         },
         "scopePath": {
           "type": "string"
         },
         "status": {
-          "$ref": "#/definitions/TaskWriteLockStatus"
+          "$ref": "#/$defs/TaskWriteLockStatus"
         },
         "taskId": {
           "type": "string"
@@ -4832,17 +4651,23 @@
         "workspaceId": {
           "type": "string"
         }
-      }
-    },
-    "TaskWriteLockConflict": {
-      "type": "object",
+      },
       "required": [
-        "lockId",
+        "id",
+        "workspaceId",
+        "taskId",
         "runId",
         "scopeKind",
         "scopePath",
-        "taskId"
-      ],
+        "status",
+        "acquiredAt",
+        "conflictPolicy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TaskWriteLockConflict": {
+      "type": "object",
       "properties": {
         "lockId": {
           "type": "string"
@@ -4851,7 +4676,7 @@
           "type": "string"
         },
         "scopeKind": {
-          "$ref": "#/definitions/TaskWriteLockScopeKind"
+          "$ref": "#/$defs/TaskWriteLockScopeKind"
         },
         "scopePath": {
           "type": "string"
@@ -4859,7 +4684,14 @@
         "taskId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "lockId",
+        "taskId",
+        "runId",
+        "scopeKind",
+        "scopePath"
+      ]
     },
     "TaskWriteLockScopeKind": {
       "type": "string",
@@ -4881,16 +4713,6 @@
     },
     "ThreadLineage": {
       "type": "object",
-      "required": [
-        "childThreadId",
-        "childTurnId",
-        "createdAt",
-        "depth",
-        "parentThreadId",
-        "rootThreadId",
-        "taskId",
-        "taskRunId"
-      ],
       "properties": {
         "childThreadId": {
           "type": "string"
@@ -4924,77 +4746,79 @@
         "taskRunId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "childThreadId",
+        "childTurnId",
+        "parentThreadId",
+        "taskId",
+        "taskRunId",
+        "rootThreadId",
+        "depth",
+        "createdAt"
+      ]
     },
     "TimelineOutputPolicy": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "max_bytes",
-            "mode"
-          ],
           "properties": {
             "max_bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "full"
-              ]
+              "const": "full"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "max_chars",
-            "mode"
-          ],
           "properties": {
             "max_chars": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
+              "const": "summary"
             }
-          }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "metadata_only"
-              ]
+              "const": "metadata_only"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "hidden"
-              ]
+              "const": "hidden"
             }
-          }
+          },
+          "required": [
+            "mode"
+          ]
         }
       ]
     },
@@ -5010,10 +4834,6 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "truncated"
-          ],
           "properties": {
             "aggregated_output": {
               "type": [
@@ -5027,7 +4847,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "exit_code": {
               "type": [
@@ -5038,9 +4858,7 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "shell"
-              ]
+              "const": "shell"
             },
             "stderr": {
               "type": [
@@ -5063,81 +4881,59 @@
             "truncated": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
-            "metadata",
-            "title",
             "truncated"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "summary"
-              ]
-            },
-            "lines": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "metadata": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
-              }
-            },
-            "title": {
-              "type": "string"
-            },
-            "truncated": {
-              "type": "boolean"
-            }
-          }
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "metadata",
-            "stage"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "progress"
-              ]
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "progress"
             },
             "metadata": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             },
             "stage": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "stage",
+            "metadata"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "hidden"
-              ]
+              "const": "hidden"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -5195,137 +4991,116 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "values"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "array"
-              ]
+              "const": "array"
             },
             "values": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "values"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "fields",
-            "kind"
-          ],
           "properties": {
             "fields": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "fields"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "bytes",
-            "kind",
-            "raw_kind",
-            "sha256",
-            "value_kind"
-          ],
           "properties": {
             "bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "redacted_raw"
-              ]
+              "const": "redacted_raw"
             },
             "raw_kind": {
-              "$ref": "#/definitions/ToolMetadataRawKind"
+              "$ref": "#/$defs/ToolMetadataRawKind"
             },
             "sha256": {
               "type": "string"
@@ -5333,37 +5108,34 @@
             "value_kind": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "raw_kind",
+            "sha256",
+            "bytes",
+            "value_kind"
+          ]
         }
       ]
     },
     "ToolObservation": {
       "type": "object",
-      "required": [
-        "attemptId",
-        "eventSeq",
-        "monoNs",
-        "pipelineStage",
-        "toolCallId",
-        "traceId",
-        "tsUnixMs",
-        "turnId"
-      ],
       "properties": {
         "attemptId": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "eventSeq": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "monoNs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "pipelineStage": {
           "type": "string"
@@ -5381,20 +5153,25 @@
         "turnId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "traceId",
+        "turnId",
+        "toolCallId",
+        "attemptId",
+        "pipelineStage",
+        "tsUnixMs",
+        "monoNs",
+        "eventSeq"
+      ]
     },
     "ToolOutcome": {
       "type": "object",
-      "required": [
-        "incomplete",
-        "shouldRetry",
-        "status"
-      ],
       "properties": {
         "errorClass": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolErrorClass"
+              "$ref": "#/$defs/ToolErrorClass"
             },
             {
               "type": "null"
@@ -5420,9 +5197,14 @@
           "type": "boolean"
         },
         "status": {
-          "$ref": "#/definitions/ToolOutcomeStatus"
+          "$ref": "#/$defs/ToolOutcomeStatus"
         }
-      }
+      },
+      "required": [
+        "status",
+        "shouldRetry",
+        "incomplete"
+      ]
     },
     "ToolOutcomeStatus": {
       "type": "string",
@@ -5435,34 +5217,62 @@
     },
     "ToolOutputPolicySnapshot": {
       "type": "object",
-      "required": [
-        "deltas",
-        "llm",
-        "llmRetention",
-        "recovery",
-        "storage",
-        "timeline"
-      ],
       "properties": {
         "deltas": {
-          "$ref": "#/definitions/DeltaOutputPolicy"
+          "$ref": "#/$defs/DeltaOutputPolicy"
         },
         "llm": {
-          "$ref": "#/definitions/LlmOutputPolicy"
+          "$ref": "#/$defs/LlmOutputPolicy"
         },
         "llmRetention": {
-          "$ref": "#/definitions/LlmRetentionPolicy"
+          "$ref": "#/$defs/LlmRetentionPolicy"
         },
         "recovery": {
-          "$ref": "#/definitions/RecoveryOutputPolicy"
+          "$ref": "#/$defs/RecoveryOutputPolicy"
         },
         "storage": {
-          "$ref": "#/definitions/StorageOutputPolicy"
+          "$ref": "#/$defs/StorageOutputPolicy"
         },
         "timeline": {
-          "$ref": "#/definitions/TimelineOutputPolicy"
+          "$ref": "#/$defs/TimelineOutputPolicy"
         }
-      }
+      },
+      "required": [
+        "llm",
+        "llmRetention",
+        "timeline",
+        "storage",
+        "recovery",
+        "deltas"
+      ]
+    },
+    "ToolOutputSummary": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolMetadataValue"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "title",
+        "metadata",
+        "truncated"
+      ]
     },
     "ToolRecoveryIdempotencyMode": {
       "type": "string",
@@ -5475,49 +5285,50 @@
     },
     "ToolRecoveryPolicySnapshot": {
       "type": "object",
-      "required": [
-        "baseBackoffSecs",
-        "canResume",
-        "idempotencyMode",
-        "maxAttempts",
-        "maxWallClockSecs",
-        "noProgressLimit",
-        "resolvedAction",
-        "retryClass"
-      ],
       "properties": {
         "baseBackoffSecs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "canResume": {
           "type": "boolean"
         },
         "idempotencyMode": {
-          "$ref": "#/definitions/ToolRecoveryIdempotencyMode"
+          "$ref": "#/$defs/ToolRecoveryIdempotencyMode"
         },
         "maxAttempts": {
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "maxWallClockSecs": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "noProgressLimit": {
           "type": "integer",
           "format": "int64"
         },
         "resolvedAction": {
-          "$ref": "#/definitions/RecoveryAction"
+          "$ref": "#/$defs/RecoveryAction"
         },
         "retryClass": {
-          "$ref": "#/definitions/ToolRecoveryRetryClass"
+          "$ref": "#/$defs/ToolRecoveryRetryClass"
         }
-      }
+      },
+      "required": [
+        "retryClass",
+        "idempotencyMode",
+        "maxAttempts",
+        "canResume",
+        "resolvedAction",
+        "baseBackoffSecs",
+        "maxWallClockSecs",
+        "noProgressLimit"
+      ]
     },
     "ToolRecoveryRetryClass": {
       "type": "string",
@@ -5531,9 +5342,6 @@
     },
     "ToolRecoveryView": {
       "type": "object",
-      "required": [
-        "wasTruncated"
-      ],
       "properties": {
         "contentFingerprint": {
           "type": [
@@ -5581,23 +5389,19 @@
         "wasTruncated": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "wasTruncated"
+      ]
     },
     "ToolResultView": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "text",
-            "truncated"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "text"
-              ]
+              "const": "text"
             },
             "text": {
               "type": "string"
@@ -5605,41 +5409,42 @@
             "truncated": {
               "type": "boolean"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "text",
+            "truncated"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "truncated",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "json"
-              ]
+              "const": "json"
             },
             "truncated": {
               "type": "boolean"
             },
             "value": true
-          }
+          },
+          "required": [
+            "kind",
+            "value",
+            "truncated"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "empty"
-              ]
+              "const": "empty"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -5654,26 +5459,26 @@
     },
     "ToolRetryBudgetUsage": {
       "type": "object",
-      "required": [
-        "kind",
-        "limit",
-        "used"
-      ],
       "properties": {
         "kind": {
-          "$ref": "#/definitions/ToolRetryBudgetKind"
+          "$ref": "#/$defs/ToolRetryBudgetKind"
         },
         "limit": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "used": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "kind",
+        "used",
+        "limit"
+      ]
     },
     "ToolRetryErrorClass": {
       "type": "string",
@@ -5711,10 +5516,6 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind",
-            "truncated"
-          ],
           "properties": {
             "aggregated_output": {
               "type": [
@@ -5728,7 +5529,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "exit_code": {
               "type": [
@@ -5739,9 +5540,7 @@
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "shell"
-              ]
+              "const": "shell"
             },
             "stderr": {
               "type": [
@@ -5764,77 +5563,55 @@
             "truncated": {
               "type": "boolean"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "truncated"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "metadata",
-            "title",
-            "truncated"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "summary"
-              ]
-            },
-            "lines": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "metadata"
             },
             "metadata": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
-            },
-            "title": {
-              "type": "string"
-            },
-            "truncated": {
-              "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "metadata"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "metadata"
-              ]
-            },
-            "metadata": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
-              }
-            }
-          }
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "none"
-              ]
+              "const": "none"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -5842,16 +5619,11 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "id",
-            "text",
-            "type"
-          ],
           "properties": {
             "attachments": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/UserMessageAttachment"
+                "$ref": "#/$defs/UserMessageAttachment"
               }
             },
             "id": {
@@ -5862,19 +5634,17 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "userMessage"
-              ]
+              "const": "userMessage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "text",
-            "type"
-          ],
           "properties": {
             "id": {
               "type": "string"
@@ -5882,7 +5652,7 @@
             "markdown": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/MarkdownDocument"
+                  "$ref": "#/$defs/MarkdownDocument"
                 },
                 {
                   "type": "null"
@@ -5895,29 +5665,29 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "text": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "agentMessage"
-              ]
+              "const": "agentMessage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "type"
-          ],
           "properties": {
             "content": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
@@ -5926,28 +5696,24 @@
               "type": "string"
             },
             "summary": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "reasoning"
-              ]
+              "const": "reasoning"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "level",
-            "message",
-            "type"
-          ],
           "properties": {
             "code": {
               "type": [
@@ -5960,34 +5726,25 @@
               "type": "string"
             },
             "level": {
-              "$ref": "#/definitions/SystemEventLevel"
+              "$ref": "#/$defs/SystemEventLevel"
             },
             "message": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "systemEvent"
-              ]
+              "const": "systemEvent"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "level",
+            "message"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "createdAt",
-            "depth",
-            "executorKind",
-            "id",
-            "maxDepth",
-            "status",
-            "taskId",
-            "title",
-            "triggerKind",
-            "type",
-            "updatedAt"
-          ],
           "properties": {
             "agentRole": {
               "type": [
@@ -6022,7 +5779,7 @@
               ]
             },
             "executorKind": {
-              "$ref": "#/definitions/TaskExecutorKind"
+              "$ref": "#/$defs/TaskExecutorKind"
             },
             "id": {
               "type": "string"
@@ -6063,7 +5820,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/TaskStatus"
+              "$ref": "#/$defs/TaskStatus"
             },
             "taskId": {
               "type": "string"
@@ -6072,37 +5829,38 @@
               "type": "string"
             },
             "triggerKind": {
-              "$ref": "#/definitions/TaskTriggerKind"
+              "$ref": "#/$defs/TaskTriggerKind"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "task"
-              ]
+              "const": "task"
             },
             "updatedAt": {
               "type": "integer",
               "format": "int64"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "taskId",
+            "title",
+            "status",
+            "triggerKind",
+            "executorKind",
+            "depth",
+            "maxDepth",
+            "createdAt",
+            "updatedAt"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "command": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
@@ -6114,7 +5872,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -6122,7 +5880,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6132,7 +5890,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6140,12 +5898,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6155,7 +5913,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6163,10 +5921,10 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6179,35 +5937,33 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "commandExecution"
-              ]
+              "const": "commandExecution"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "changedFiles": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
                 "type": "string"
               }
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "exitCode": {
               "type": [
@@ -6222,7 +5978,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6232,7 +5988,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6240,12 +5996,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6255,7 +6011,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6263,7 +6019,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "stderr": {
               "type": [
@@ -6278,7 +6034,7 @@
               ]
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6291,28 +6047,26 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "fileChange"
-              ]
+              "const": "fileChange"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -6320,7 +6074,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6330,7 +6084,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6338,7 +6092,7 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "provider": {
               "type": [
@@ -6355,7 +6109,7 @@
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6365,7 +6119,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6378,20 +6132,20 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "results": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/WebSearchResultItem"
+                "$ref": "#/$defs/WebSearchResultItem"
               }
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6405,31 +6159,29 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "toolName": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "webSearch"
-              ]
+              "const": "webSearch"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "bytesReceived": {
@@ -6438,7 +6190,7 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "contentType": {
               "type": [
@@ -6447,7 +6199,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "elapsedMs": {
               "type": [
@@ -6455,7 +6207,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "extractMode": {
               "type": [
@@ -6473,16 +6225,16 @@
               "type": "string"
             },
             "links": {
-              "default": [],
               "type": "array",
+              "default": [],
               "items": {
-                "$ref": "#/definitions/WebFetchLink"
+                "$ref": "#/$defs/WebFetchLink"
               }
             },
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6492,7 +6244,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6500,12 +6252,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6515,7 +6267,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6529,7 +6281,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "statusCode": {
               "type": [
@@ -6537,10 +6289,11 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6560,9 +6313,7 @@
             "truncated": true,
             "type": {
               "type": "string",
-              "enum": [
-                "webFetch"
-              ]
+              "const": "webFetch"
             },
             "url": {
               "type": [
@@ -6576,22 +6327,22 @@
                 "null"
               ],
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "bytesWritten": {
@@ -6600,7 +6351,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "contentType": {
               "type": [
@@ -6609,7 +6360,7 @@
               ]
             },
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "elapsedMs": {
               "type": [
@@ -6617,7 +6368,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "finalUrl": {
               "type": [
@@ -6631,7 +6382,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6641,7 +6392,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6649,7 +6400,7 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "path": {
               "type": [
@@ -6660,7 +6411,7 @@
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6670,7 +6421,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6684,7 +6435,7 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "statusCode": {
               "type": [
@@ -6692,10 +6443,11 @@
                 "null"
               ],
               "format": "uint16",
-              "minimum": 0.0
+              "maximum": 65535,
+              "minimum": 0
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6714,9 +6466,7 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "download"
-              ]
+              "const": "download"
             },
             "url": {
               "type": [
@@ -6724,24 +6474,24 @@
                 "null"
               ]
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "arguments",
-            "display",
-            "id",
-            "outputPolicy",
-            "status",
-            "storage",
-            "toolName",
-            "type"
-          ],
           "properties": {
             "arguments": true,
             "display": {
-              "$ref": "#/definitions/ToolDisplayPayload"
+              "$ref": "#/$defs/ToolDisplayPayload"
             },
             "id": {
               "type": "string"
@@ -6749,7 +6499,7 @@
             "observation": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolObservation"
+                  "$ref": "#/$defs/ToolObservation"
                 },
                 {
                   "type": "null"
@@ -6759,7 +6509,7 @@
             "outcome": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolOutcome"
+                  "$ref": "#/$defs/ToolOutcome"
                 },
                 {
                   "type": "null"
@@ -6767,12 +6517,12 @@
               ]
             },
             "outputPolicy": {
-              "$ref": "#/definitions/ToolOutputPolicySnapshot"
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
             },
             "recovery": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryView"
+                  "$ref": "#/$defs/ToolRecoveryView"
                 },
                 {
                   "type": "null"
@@ -6782,7 +6532,7 @@
             "recoveryPolicy": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ToolRecoveryPolicySnapshot"
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
                 },
                 {
                   "type": "null"
@@ -6790,10 +6540,10 @@
               ]
             },
             "status": {
-              "$ref": "#/definitions/ToolCallStatus"
+              "$ref": "#/$defs/ToolCallStatus"
             },
             "storage": {
-              "$ref": "#/definitions/ToolStoragePayload"
+              "$ref": "#/$defs/ToolStoragePayload"
             },
             "success": {
               "type": [
@@ -6806,11 +6556,19 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "dynamicToolCall"
-              ]
+              "const": "dynamicToolCall"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
         }
       ]
     },
@@ -6832,12 +6590,6 @@
     },
     "TurnSkillBinding": {
       "type": "object",
-      "required": [
-        "fingerprint",
-        "resolved_reason",
-        "skill_slug",
-        "source_kind"
-      ],
       "properties": {
         "fingerprint": {
           "type": "string"
@@ -6857,36 +6609,32 @@
         "source_kind": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "skill_slug",
+        "fingerprint",
+        "source_kind",
+        "resolved_reason"
+      ]
     },
     "TurnToolLoopBudgetExceededNotification": {
       "type": "object",
-      "required": [
-        "action",
-        "limit",
-        "limit_kind",
-        "observed",
-        "reason",
-        "thread_id",
-        "turn_id",
-        "workspace_id"
-      ],
       "properties": {
         "action": {
-          "$ref": "#/definitions/ToolLoopBudgetAction"
+          "$ref": "#/$defs/ToolLoopBudgetAction"
         },
         "limit": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "limit_kind": {
-          "$ref": "#/definitions/ToolLoopBudgetLimitKind"
+          "$ref": "#/$defs/ToolLoopBudgetLimitKind"
         },
         "observed": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "reason": {
           "type": "string"
@@ -6900,162 +6648,152 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "limit_kind",
+        "limit",
+        "observed",
+        "action",
+        "reason"
+      ]
     },
     "UserMessageAttachment": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "image"
-              ]
+              "const": "image"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localImage"
-              ]
+              "const": "localImage"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "file"
-              ]
+              "const": "file"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localFile"
-              ]
+              "const": "localFile"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "audio"
-              ]
+              "const": "audio"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localAudio"
-              ]
+              "const": "localAudio"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "video"
-              ]
+              "const": "video"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "localVideo"
-              ]
+              "const": "localVideo"
             }
-          }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
         }
       ]
     },
     "WebFetchLink": {
       "type": "object",
-      "required": [
-        "text",
-        "url"
-      ],
       "properties": {
         "text": {
           "type": "string"
@@ -7063,17 +6801,14 @@
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "text",
+        "url"
+      ]
     },
     "WebSearchResultItem": {
       "type": "object",
-      "required": [
-        "rank",
-        "snippet",
-        "source",
-        "title",
-        "url"
-      ],
       "properties": {
         "publishedAt": {
           "type": [
@@ -7084,7 +6819,7 @@
         "rank": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "snippet": {
           "type": "string"
@@ -7098,7 +6833,14 @@
         "url": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "rank",
+        "title",
+        "url",
+        "snippet",
+        "source"
+      ]
     }
   }
 }

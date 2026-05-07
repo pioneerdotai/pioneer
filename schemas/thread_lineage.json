@@ -1,17 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadLineage",
   "type": "object",
-  "required": [
-    "childThreadId",
-    "childTurnId",
-    "createdAt",
-    "depth",
-    "parentThreadId",
-    "rootThreadId",
-    "taskId",
-    "taskRunId"
-  ],
   "properties": {
     "childThreadId": {
       "type": "string"
@@ -45,5 +35,15 @@
     "taskRunId": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "childThreadId",
+    "childTurnId",
+    "parentThreadId",
+    "taskId",
+    "taskRunId",
+    "rootThreadId",
+    "depth",
+    "createdAt"
+  ]
 }

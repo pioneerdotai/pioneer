@@ -1,16 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpPromptCatalogItem",
   "type": "object",
-  "required": [
-    "arguments_count",
-    "name"
-  ],
   "properties": {
     "arguments_count": {
       "type": "integer",
       "format": "uint",
-      "minimum": 0.0
+      "minimum": 0
     },
     "description": {
       "type": [
@@ -27,5 +23,9 @@
         "null"
       ]
     }
-  }
+  },
+  "required": [
+    "name",
+    "arguments_count"
+  ]
 }

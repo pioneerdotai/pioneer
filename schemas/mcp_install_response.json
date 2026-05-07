@@ -1,27 +1,27 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpInstallResponse",
   "type": "object",
-  "required": [
-    "audit",
-    "status"
-  ],
   "properties": {
     "audit": {
-      "$ref": "#/definitions/McpLifecycleAuditSummary"
+      "$ref": "#/$defs/McpLifecycleAuditSummary"
     },
     "servers": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpInstallResult"
+        "$ref": "#/$defs/McpInstallResult"
       }
     },
     "status": {
-      "$ref": "#/definitions/McpInstallStatus"
+      "$ref": "#/$defs/McpInstallStatus"
     }
   },
-  "definitions": {
+  "required": [
+    "status",
+    "audit"
+  ],
+  "$defs": {
     "McpDiagnosticLevel": {
       "type": "string",
       "enum": [
@@ -31,16 +31,12 @@
     },
     "McpInstallResult": {
       "type": "object",
-      "required": [
-        "name",
-        "status"
-      ],
       "properties": {
         "diagnostics": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/McpValidationDiagnostic"
+            "$ref": "#/$defs/McpValidationDiagnostic"
           }
         },
         "name": {
@@ -49,7 +45,7 @@
         "server": {
           "anyOf": [
             {
-              "$ref": "#/definitions/McpListItem"
+              "$ref": "#/$defs/McpListItem"
             },
             {
               "type": "null"
@@ -57,9 +53,13 @@
           ]
         },
         "status": {
-          "$ref": "#/definitions/McpInstallResultStatus"
+          "$ref": "#/$defs/McpInstallResultStatus"
         }
-      }
+      },
+      "required": [
+        "name",
+        "status"
+      ]
     },
     "McpInstallResultStatus": {
       "type": "string",
@@ -79,35 +79,19 @@
     },
     "McpLifecycleAuditSummary": {
       "type": "object",
-      "required": [
-        "events_written"
-      ],
       "properties": {
         "events_written": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "events_written"
+      ]
     },
     "McpListItem": {
       "type": "object",
-      "required": [
-        "fingerprint",
-        "id",
-        "name",
-        "policy",
-        "prompts_count",
-        "required",
-        "resource_templates_count",
-        "resources_count",
-        "runtime",
-        "scope",
-        "source_kind",
-        "status",
-        "tools_count",
-        "transport"
-      ],
       "properties": {
         "display_name": {
           "type": [
@@ -125,12 +109,12 @@
           "type": "string"
         },
         "policy": {
-          "$ref": "#/definitions/McpPolicyState"
+          "$ref": "#/$defs/McpPolicyState"
         },
         "prompts_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "required": {
           "type": "boolean"
@@ -138,24 +122,24 @@
         "resource_templates_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "resources_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "runtime": {
-          "$ref": "#/definitions/McpRuntimeStatus"
+          "$ref": "#/$defs/McpRuntimeStatus"
         },
         "scope": {
-          "$ref": "#/definitions/McpScopeKind"
+          "$ref": "#/$defs/McpScopeKind"
         },
         "source_kind": {
-          "$ref": "#/definitions/McpSourceKind"
+          "$ref": "#/$defs/McpSourceKind"
         },
         "status": {
-          "$ref": "#/definitions/McpServerStatus"
+          "$ref": "#/$defs/McpServerStatus"
         },
         "status_reason": {
           "type": [
@@ -166,19 +150,31 @@
         "tools_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "transport": {
-          "$ref": "#/definitions/McpTransportSummary"
+          "$ref": "#/$defs/McpTransportSummary"
         }
-      }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "source_kind",
+        "transport",
+        "policy",
+        "required",
+        "fingerprint",
+        "runtime",
+        "tools_count",
+        "resources_count",
+        "resource_templates_count",
+        "prompts_count",
+        "status"
+      ]
     },
     "McpPolicyState": {
       "type": "object",
-      "required": [
-        "allow_implicit_invocation",
-        "enabled"
-      ],
       "properties": {
         "allow_implicit_invocation": {
           "type": "boolean"
@@ -186,7 +182,11 @@
         "enabled": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
     },
     "McpRuntimeState": {
       "type": "string",
@@ -205,10 +205,6 @@
     },
     "McpRuntimeStatus": {
       "type": "object",
-      "required": [
-        "live",
-        "state"
-      ],
       "properties": {
         "last_error": {
           "type": [
@@ -227,9 +223,13 @@
           "type": "boolean"
         },
         "state": {
-          "$ref": "#/definitions/McpRuntimeState"
+          "$ref": "#/$defs/McpRuntimeState"
         }
-      }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
     },
     "McpScopeKind": {
       "type": "string",
@@ -263,49 +263,40 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "command",
-            "kind"
-          ],
           "properties": {
             "command": {
               "type": "string"
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "stdio"
-              ]
+              "const": "stdio"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "url"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "streamable_http"
-              ]
+              "const": "streamable_http"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "url"
+          ]
         }
       ]
     },
     "McpValidationDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "level",
-        "message"
-      ],
       "properties": {
         "code": {
           "type": "string"
@@ -317,12 +308,17 @@
           ]
         },
         "level": {
-          "$ref": "#/definitions/McpDiagnosticLevel"
+          "$ref": "#/$defs/McpDiagnosticLevel"
         },
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
     }
   }
 }

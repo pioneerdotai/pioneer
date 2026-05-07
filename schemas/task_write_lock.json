@@ -1,27 +1,14 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskWriteLock",
   "type": "object",
-  "required": [
-    "acquiredAt",
-    "conflictPolicy",
-    "createdAt",
-    "id",
-    "runId",
-    "scopeKind",
-    "scopePath",
-    "status",
-    "taskId",
-    "updatedAt",
-    "workspaceId"
-  ],
   "properties": {
     "acquiredAt": {
       "type": "integer",
       "format": "int64"
     },
     "conflictPolicy": {
-      "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+      "$ref": "#/$defs/TaskConcurrencyConflictPolicy"
     },
     "createdAt": {
       "type": "integer",
@@ -54,13 +41,13 @@
       "type": "string"
     },
     "scopeKind": {
-      "$ref": "#/definitions/TaskWriteLockScopeKind"
+      "$ref": "#/$defs/TaskWriteLockScopeKind"
     },
     "scopePath": {
       "type": "string"
     },
     "status": {
-      "$ref": "#/definitions/TaskWriteLockStatus"
+      "$ref": "#/$defs/TaskWriteLockStatus"
     },
     "taskId": {
       "type": "string"
@@ -73,7 +60,20 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "id",
+    "workspaceId",
+    "taskId",
+    "runId",
+    "scopeKind",
+    "scopePath",
+    "status",
+    "acquiredAt",
+    "conflictPolicy",
+    "createdAt",
+    "updatedAt"
+  ],
+  "$defs": {
     "TaskConcurrencyConflictPolicy": {
       "type": "string",
       "enum": [

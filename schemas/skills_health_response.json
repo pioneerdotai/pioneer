@@ -1,38 +1,32 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsHealthResponse",
   "type": "object",
-  "required": [
-    "generated_at",
-    "snapshot_version"
-  ],
   "properties": {
     "generated_at": {
       "type": "integer",
       "format": "int64"
     },
     "skills": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/SkillHealthItem"
+        "$ref": "#/$defs/SkillHealthItem"
       }
     },
     "snapshot_version": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     }
   },
-  "definitions": {
+  "required": [
+    "snapshot_version",
+    "generated_at"
+  ],
+  "$defs": {
     "SkillAuditTimelineItem": {
       "type": "object",
-      "required": [
-        "action",
-        "created_at",
-        "decision",
-        "details_json"
-      ],
       "properties": {
         "action": {
           "type": "string"
@@ -53,16 +47,16 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "action",
+        "decision",
+        "created_at",
+        "details_json"
+      ]
     },
     "SkillDependencyDiagnostic": {
       "type": "object",
-      "required": [
-        "hint",
-        "kind",
-        "name",
-        "status"
-      ],
       "properties": {
         "hint": {
           "type": "string"
@@ -76,35 +70,36 @@
         "status": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
     },
     "SkillHealthItem": {
       "type": "object",
-      "required": [
-        "slug",
-        "source_kind",
-        "trust_level"
-      ],
       "properties": {
         "dependency_diagnostics": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillDependencyDiagnostic"
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
           }
         },
         "recent_audit": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillAuditTimelineItem"
+            "$ref": "#/$defs/SkillAuditTimelineItem"
           }
         },
         "security_findings": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillSecurityFinding"
+            "$ref": "#/$defs/SkillSecurityFinding"
           }
         },
         "slug": {
@@ -114,31 +109,31 @@
           "type": "string"
         },
         "trust_gate": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillTrustGateStatus"
+            "$ref": "#/$defs/SkillTrustGateStatus"
           }
         },
         "trust_level": {
           "type": "string"
         },
         "validation_issues": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillValidationDiagnostic"
+            "$ref": "#/$defs/SkillValidationDiagnostic"
           }
         }
-      }
+      },
+      "required": [
+        "slug",
+        "source_kind",
+        "trust_level"
+      ]
     },
     "SkillSecurityFinding": {
       "type": "object",
-      "required": [
-        "message",
-        "rule_id",
-        "severity"
-      ],
       "properties": {
         "message": {
           "type": "string"
@@ -155,15 +150,15 @@
         "severity": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
     },
     "SkillTrustGateStatus": {
       "type": "object",
-      "required": [
-        "allowed",
-        "minimum_trust",
-        "tool_kind"
-      ],
       "properties": {
         "allowed": {
           "type": "boolean"
@@ -174,15 +169,15 @@
         "tool_kind": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "tool_kind",
+        "minimum_trust",
+        "allowed"
+      ]
     },
     "SkillValidationDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "level",
-        "message"
-      ],
       "properties": {
         "code": {
           "type": "string"
@@ -199,7 +194,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
     }
   }
 }

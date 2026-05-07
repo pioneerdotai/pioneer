@@ -1,12 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ContextCompressingNotification",
   "type": "object",
-  "required": [
-    "message",
-    "thread_id",
-    "turn_id"
-  ],
   "properties": {
     "message": {
       "type": "string"
@@ -17,5 +12,10 @@
     "turn_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "thread_id",
+    "turn_id",
+    "message"
+  ]
 }

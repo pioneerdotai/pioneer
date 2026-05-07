@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadStartParams",
   "type": "object",
-  "required": [
-    "thread_id",
-    "workspace_id"
-  ],
   "properties": {
     "agent_nickname": {
       "type": [
@@ -22,7 +18,7 @@
     "mode": {
       "anyOf": [
         {
-          "$ref": "#/definitions/ThreadMode"
+          "$ref": "#/$defs/ThreadMode"
         },
         {
           "type": "null"
@@ -50,7 +46,7 @@
     "origin_kind": {
       "anyOf": [
         {
-          "$ref": "#/definitions/ThreadOriginKind"
+          "$ref": "#/$defs/ThreadOriginKind"
         },
         {
           "type": "null"
@@ -60,7 +56,7 @@
     "sandbox": {
       "anyOf": [
         {
-          "$ref": "#/definitions/SandboxMode"
+          "$ref": "#/$defs/SandboxMode"
         },
         {
           "type": "null"
@@ -70,7 +66,7 @@
     "sidebar_visibility": {
       "anyOf": [
         {
-          "$ref": "#/definitions/ThreadSidebarVisibility"
+          "$ref": "#/$defs/ThreadSidebarVisibility"
         },
         {
           "type": "null"
@@ -84,7 +80,11 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "thread_id",
+    "workspace_id"
+  ],
+  "$defs": {
     "SandboxMode": {
       "type": "string",
       "enum": [

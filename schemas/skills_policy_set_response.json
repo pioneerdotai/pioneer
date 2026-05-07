@@ -1,23 +1,18 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsPolicySetResponse",
   "type": "object",
+  "properties": {
+    "policy": {
+      "$ref": "#/$defs/SkillWorkspacePolicy"
+    }
+  },
   "required": [
     "policy"
   ],
-  "properties": {
-    "policy": {
-      "$ref": "#/definitions/SkillWorkspacePolicy"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "SkillWorkspacePolicy": {
       "type": "object",
-      "required": [
-        "skill_slug",
-        "source_kind",
-        "workspace_id"
-      ],
       "properties": {
         "allow_implicit_invocation": {
           "type": [
@@ -40,7 +35,12 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspace_id",
+        "skill_slug",
+        "source_kind"
+      ]
     }
   }
 }

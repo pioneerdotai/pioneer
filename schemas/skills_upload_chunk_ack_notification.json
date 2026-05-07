@@ -1,37 +1,37 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUploadChunkAckNotification",
   "type": "object",
-  "required": [
-    "len",
-    "next_offset",
-    "offset",
-    "received_bytes",
-    "upload_id"
-  ],
   "properties": {
     "len": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "next_offset": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "offset": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "received_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "upload_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "upload_id",
+    "offset",
+    "len",
+    "received_bytes",
+    "next_offset"
+  ]
 }

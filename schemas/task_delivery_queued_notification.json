@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskDeliveryQueuedNotification",
   "type": "object",
-  "required": [
-    "context",
-    "delivery"
-  ],
   "properties": {
     "childThreadId": {
       "type": [
@@ -20,10 +16,10 @@
       ]
     },
     "context": {
-      "$ref": "#/definitions/TaskNotificationContext"
+      "$ref": "#/$defs/TaskNotificationContext"
     },
     "delivery": {
-      "$ref": "#/definitions/TaskDelivery"
+      "$ref": "#/$defs/TaskDelivery"
     },
     "errorPreview": {
       "type": [
@@ -38,7 +34,11 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "context",
+    "delivery"
+  ],
+  "$defs": {
     "TaskArtifact": {
       "type": "object",
       "properties": {
@@ -51,7 +51,7 @@
         "metadata": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -80,24 +80,11 @@
     },
     "TaskDelivery": {
       "type": "object",
-      "required": [
-        "attemptCount",
-        "createdAt",
-        "deliveryKey",
-        "id",
-        "maxAttempts",
-        "mode",
-        "runId",
-        "status",
-        "taskId",
-        "updatedAt",
-        "workspaceId"
-      ],
       "properties": {
         "attemptCount": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "createdAt": {
           "type": "integer",
@@ -128,7 +115,7 @@
         "errorSnapshot": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskError"
+              "$ref": "#/$defs/TaskError"
             },
             {
               "type": "null"
@@ -147,10 +134,10 @@
         "maxAttempts": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "mode": {
-          "$ref": "#/definitions/TaskDeliveryMode"
+          "$ref": "#/$defs/TaskDeliveryMode"
         },
         "nextAttemptAt": {
           "type": [
@@ -162,7 +149,7 @@
         "resultSnapshot": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskResult"
+              "$ref": "#/$defs/TaskResult"
             },
             {
               "type": "null"
@@ -173,7 +160,7 @@
           "type": "string"
         },
         "status": {
-          "$ref": "#/definitions/TaskDeliveryStatus"
+          "$ref": "#/$defs/TaskDeliveryStatus"
         },
         "targetThreadId": {
           "type": [
@@ -209,7 +196,20 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "workspaceId",
+        "taskId",
+        "runId",
+        "deliveryKey",
+        "mode",
+        "status",
+        "attemptCount",
+        "maxAttempts",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskDeliveryMode": {
       "type": "string",
@@ -233,14 +233,9 @@
     },
     "TaskError": {
       "type": "object",
-      "required": [
-        "class",
-        "code",
-        "message"
-      ],
       "properties": {
         "class": {
-          "$ref": "#/definitions/TaskErrorClass"
+          "$ref": "#/$defs/TaskErrorClass"
         },
         "code": {
           "type": "string"
@@ -248,7 +243,7 @@
         "details": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -264,7 +259,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "message",
+        "class"
+      ]
     },
     "TaskErrorClass": {
       "type": "string",
@@ -282,12 +282,6 @@
     },
     "TaskNotificationContext": {
       "type": "object",
-      "required": [
-        "eventId",
-        "sequence",
-        "taskId",
-        "workspaceId"
-      ],
       "properties": {
         "eventId": {
           "type": "string"
@@ -332,16 +326,22 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "eventId",
+        "sequence"
+      ]
     },
     "TaskResult": {
       "type": "object",
       "properties": {
         "artifacts": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskArtifact"
+            "$ref": "#/$defs/TaskArtifact"
           }
         },
         "completedByRunId": {
@@ -353,7 +353,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -372,133 +372,119 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "integer"
-              ]
+              "const": "integer"
             },
             "value": {
               "type": "integer",
               "format": "int64"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "number",
               "format": "double"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             },
             "value": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             },
             "value": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         }
       ]
     }

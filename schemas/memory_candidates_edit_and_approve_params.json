@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatesEditAndApproveParams",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryActor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "edited_text": {
+      "type": "string"
+    },
+    "edited_value": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "candidate_id",
+    "edited_text"
+  ],
+  "$defs": {
+    "MemoryActor": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryActorKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "MemoryActorKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "extractor",
+        "system",
+        "tool"
+      ]
+    }
+  }
+}

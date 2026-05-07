@@ -1,8 +1,14 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryCandidatesListParams",
   "type": "object",
   "properties": {
+    "categories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryCategory"
+      }
+    },
     "cursor": {
       "type": [
         "string",
@@ -15,45 +21,70 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "scopes": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/MemoryScope"
+        "$ref": "#/$defs/MemoryScope"
       }
     },
     "statuses": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/MemoryCandidateStatus"
+        "$ref": "#/$defs/MemoryCandidateStatus"
       }
     }
   },
-  "definitions": {
+  "$defs": {
     "MemoryCandidateStatus": {
       "type": "string",
       "enum": [
         "pending",
+        "pending_silent",
+        "ask_on_use",
+        "needs_review",
         "approved",
         "rejected",
+        "auto_rejected",
+        "review_disabled_rejected",
+        "superseded",
+        "merged_duplicate",
         "expired"
+      ]
+    },
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "recurring_instruction",
+        "project_policy",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
       ]
     },
     "MemoryScope": {
       "type": "object",
-      "required": [
-        "key",
-        "kind"
-      ],
       "properties": {
         "key": {
           "type": "string"
         },
         "kind": {
-          "$ref": "#/definitions/MemoryScopeKind"
+          "$ref": "#/$defs/MemoryScopeKind"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
     },
     "MemoryScopeKind": {
       "type": "string",

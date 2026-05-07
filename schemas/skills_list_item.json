@@ -1,19 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillListItem",
   "type": "object",
-  "required": [
-    "description",
-    "display_name",
-    "fingerprint",
-    "health",
-    "install",
-    "policy",
-    "slug",
-    "source_kind",
-    "status",
-    "trust_level"
-  ],
   "properties": {
     "description": {
       "type": "string"
@@ -25,13 +13,13 @@
       "type": "string"
     },
     "health": {
-      "$ref": "#/definitions/SkillHealthSummary"
+      "$ref": "#/$defs/SkillHealthSummary"
     },
     "install": {
-      "$ref": "#/definitions/SkillInstallState"
+      "$ref": "#/$defs/SkillInstallState"
     },
     "policy": {
-      "$ref": "#/definitions/SkillPolicyState"
+      "$ref": "#/$defs/SkillPolicyState"
     },
     "slug": {
       "type": "string"
@@ -58,15 +46,21 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "slug",
+    "source_kind",
+    "display_name",
+    "description",
+    "fingerprint",
+    "trust_level",
+    "install",
+    "policy",
+    "health",
+    "status"
+  ],
+  "$defs": {
     "SkillDependencyDiagnostic": {
       "type": "object",
-      "required": [
-        "hint",
-        "kind",
-        "name",
-        "status"
-      ],
       "properties": {
         "hint": {
           "type": "string"
@@ -80,46 +74,48 @@
         "status": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
     },
     "SkillHealthSummary": {
       "type": "object",
-      "required": [
-        "status"
-      ],
       "properties": {
         "dependency_failures": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillDependencyDiagnostic"
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
           }
         },
         "security_blocks": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillSecurityFinding"
+            "$ref": "#/$defs/SkillSecurityFinding"
           }
         },
         "status": {
           "type": "string"
         },
         "validation_issues": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/SkillValidationDiagnostic"
+            "$ref": "#/$defs/SkillValidationDiagnostic"
           }
         }
-      }
+      },
+      "required": [
+        "status"
+      ]
     },
     "SkillInstallState": {
       "type": "object",
-      "required": [
-        "installed",
-        "managed"
-      ],
       "properties": {
         "install_path": {
           "type": [
@@ -140,14 +136,14 @@
           ],
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "managed",
+        "installed"
+      ]
     },
     "SkillPolicyState": {
       "type": "object",
-      "required": [
-        "allow_implicit_invocation",
-        "enabled"
-      ],
       "properties": {
         "allow_implicit_invocation": {
           "type": "boolean"
@@ -155,15 +151,14 @@
         "enabled": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
     },
     "SkillSecurityFinding": {
       "type": "object",
-      "required": [
-        "message",
-        "rule_id",
-        "severity"
-      ],
       "properties": {
         "message": {
           "type": "string"
@@ -180,15 +175,15 @@
         "severity": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
     },
     "SkillValidationDiagnostic": {
       "type": "object",
-      "required": [
-        "code",
-        "level",
-        "message"
-      ],
       "properties": {
         "code": {
           "type": "string"
@@ -205,7 +200,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
     }
   }
 }

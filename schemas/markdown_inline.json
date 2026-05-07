@@ -1,121 +1,111 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MarkdownInline",
   "type": "object",
-  "required": [
-    "text"
-  ],
   "properties": {
     "marks": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/MarkdownMark"
+        "$ref": "#/$defs/MarkdownMark"
       }
     },
     "text": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "text"
+  ],
+  "$defs": {
     "MarkdownMark": {
       "type": "object",
-      "required": [
-        "end",
-        "kind",
-        "start"
-      ],
       "properties": {
         "end": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "kind": {
-          "$ref": "#/definitions/MarkdownMarkKind"
+          "$ref": "#/$defs/MarkdownMarkKind"
         },
         "start": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
     },
     "MarkdownMarkKind": {
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "bold"
-              ]
+              "const": "bold"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "italic"
-              ]
+              "const": "italic"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "strike"
-              ]
+              "const": "strike"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "code"
-              ]
+              "const": "code"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "type",
-            "url"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "link"
-              ]
+              "const": "link"
             },
             "url": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
         }
       ]
     }

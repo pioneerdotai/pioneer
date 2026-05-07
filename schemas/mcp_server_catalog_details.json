@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerCatalogDetails",
   "type": "object",
   "properties": {
@@ -17,24 +17,24 @@
       "format": "int64"
     },
     "prompts": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpPromptCatalogItem"
+        "$ref": "#/$defs/McpPromptCatalogItem"
       }
     },
     "resource_templates": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpResourceTemplateCatalogItem"
+        "$ref": "#/$defs/McpResourceTemplateCatalogItem"
       }
     },
     "resources": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpResourceCatalogItem"
+        "$ref": "#/$defs/McpResourceCatalogItem"
       }
     },
     "server_info": {
@@ -47,25 +47,21 @@
       ]
     },
     "tools": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/McpToolCatalogItem"
+        "$ref": "#/$defs/McpToolCatalogItem"
       }
     }
   },
-  "definitions": {
+  "$defs": {
     "McpPromptCatalogItem": {
       "type": "object",
-      "required": [
-        "arguments_count",
-        "name"
-      ],
       "properties": {
         "arguments_count": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "description": {
           "type": [
@@ -82,7 +78,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "name",
+        "arguments_count"
+      ]
     },
     "McpResourceCatalogItem": {
       "type": "object",
@@ -191,14 +191,11 @@
     },
     "McpToolCatalogItem": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
         "annotations": {
           "anyOf": [
             {
-              "$ref": "#/definitions/McpToolAnnotationSummary"
+              "$ref": "#/$defs/McpToolAnnotationSummary"
             },
             {
               "type": "null"
@@ -221,7 +218,10 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "name"
+      ]
     }
   }
 }

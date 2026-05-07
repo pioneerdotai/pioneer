@@ -1,15 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryProvenance",
   "type": "object",
-  "required": [
-    "source_kind"
-  ],
   "properties": {
     "created_by": {
       "anyOf": [
         {
-          "$ref": "#/definitions/MemoryActor"
+          "$ref": "#/$defs/MemoryActor"
         },
         {
           "type": "null"
@@ -23,7 +20,7 @@
       ]
     },
     "source_kind": {
-      "$ref": "#/definitions/MemorySourceKind"
+      "$ref": "#/$defs/MemorySourceKind"
     },
     "source_thread_id": {
       "type": [
@@ -38,12 +35,12 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "source_kind"
+  ],
+  "$defs": {
     "MemoryActor": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": [
@@ -52,9 +49,12 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/MemoryActorKind"
+          "$ref": "#/$defs/MemoryActorKind"
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "MemoryActorKind": {
       "type": "string",

@@ -1,78 +1,70 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "DurableEventCausalityKey",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "scope",
-        "turn_id"
-      ],
       "properties": {
         "scope": {
           "type": "string",
-          "enum": [
-            "turn"
-          ]
+          "const": "turn"
         },
         "turn_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "scope",
+        "turn_id"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "scope",
-        "task_id"
-      ],
       "properties": {
         "scope": {
           "type": "string",
-          "enum": [
-            "task"
-          ]
+          "const": "task"
         },
         "task_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "scope",
+        "task_id"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "scope",
-        "task_run_id"
-      ],
       "properties": {
         "scope": {
           "type": "string",
-          "enum": [
-            "task_run"
-          ]
+          "const": "task_run"
         },
         "task_run_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "scope",
+        "task_run_id"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "child_thread_id",
-        "scope"
-      ],
       "properties": {
         "child_thread_id": {
           "type": "string"
         },
         "scope": {
           "type": "string",
-          "enum": [
-            "thread_lineage"
-          ]
+          "const": "thread_lineage"
         }
-      }
+      },
+      "required": [
+        "scope",
+        "child_thread_id"
+      ]
     }
   ]
 }

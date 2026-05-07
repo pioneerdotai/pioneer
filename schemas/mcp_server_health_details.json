@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpServerHealthDetails",
   "type": "object",
-  "required": [
-    "runtime",
-    "status"
-  ],
   "properties": {
     "catalog_version": {
       "type": [
@@ -32,13 +28,13 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "runtime": {
-      "$ref": "#/definitions/McpRuntimeStatus"
+      "$ref": "#/$defs/McpRuntimeStatus"
     },
     "status": {
-      "$ref": "#/definitions/McpServerStatus"
+      "$ref": "#/$defs/McpServerStatus"
     },
     "status_reason": {
       "type": [
@@ -53,7 +49,11 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "runtime",
+    "status"
+  ],
+  "$defs": {
     "McpRuntimeState": {
       "type": "string",
       "enum": [
@@ -71,10 +71,6 @@
     },
     "McpRuntimeStatus": {
       "type": "object",
-      "required": [
-        "live",
-        "state"
-      ],
       "properties": {
         "last_error": {
           "type": [
@@ -93,9 +89,13 @@
           "type": "boolean"
         },
         "state": {
-          "$ref": "#/definitions/McpRuntimeState"
+          "$ref": "#/$defs/McpRuntimeState"
         }
-      }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
     },
     "McpServerStatus": {
       "type": "string",

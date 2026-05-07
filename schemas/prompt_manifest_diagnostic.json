@@ -1,14 +1,10 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PromptManifestDiagnostic",
   "type": "object",
-  "required": [
-    "code",
-    "message"
-  ],
   "properties": {
     "code": {
-      "$ref": "#/definitions/PromptManifestDiagnosticCode"
+      "$ref": "#/$defs/PromptManifestDiagnosticCode"
     },
     "file": {
       "type": [
@@ -19,7 +15,7 @@
     "hook_source": {
       "anyOf": [
         {
-          "$ref": "#/definitions/PromptManifestHookSource"
+          "$ref": "#/$defs/PromptManifestHookSource"
         },
         {
           "type": "null"
@@ -36,7 +32,11 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "code",
+    "message"
+  ],
+  "$defs": {
     "PromptManifestDiagnosticCode": {
       "type": "string",
       "enum": [
@@ -54,16 +54,12 @@
     "PromptManifestHookPhase": {
       "type": "string",
       "enum": [
+        "turn_pre_prompt_context",
         "turn_pre_prompt_compile"
       ]
     },
     "PromptManifestHookSource": {
       "type": "object",
-      "required": [
-        "hook_id",
-        "phase",
-        "subscription_id"
-      ],
       "properties": {
         "contribution_hash": {
           "type": [
@@ -81,12 +77,17 @@
           "type": "string"
         },
         "phase": {
-          "$ref": "#/definitions/PromptManifestHookPhase"
+          "$ref": "#/$defs/PromptManifestHookPhase"
         },
         "subscription_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
     }
   }
 }

@@ -1,10 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskListParams",
   "type": "object",
-  "required": [
-    "workspaceId"
-  ],
   "properties": {
     "limit": {
       "type": [
@@ -12,7 +9,7 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "ownerId": {
       "type": [
@@ -23,7 +20,7 @@
     "ownerKind": {
       "anyOf": [
         {
-          "$ref": "#/definitions/TaskOwnerKind"
+          "$ref": "#/$defs/TaskOwnerKind"
         },
         {
           "type": "null"
@@ -45,7 +42,7 @@
     "status": {
       "anyOf": [
         {
-          "$ref": "#/definitions/TaskStatus"
+          "$ref": "#/$defs/TaskStatus"
         },
         {
           "type": "null"
@@ -56,7 +53,10 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspaceId"
+  ],
+  "$defs": {
     "TaskOwnerKind": {
       "type": "string",
       "enum": [

@@ -1,25 +1,18 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadFolderCreateResponse",
   "type": "object",
+  "properties": {
+    "folder": {
+      "$ref": "#/$defs/ThreadFolder"
+    }
+  },
   "required": [
     "folder"
   ],
-  "properties": {
-    "folder": {
-      "$ref": "#/definitions/ThreadFolder"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "ThreadFolder": {
       "type": "object",
-      "required": [
-        "created_at",
-        "id",
-        "name",
-        "updated_at",
-        "workspace_id"
-      ],
       "properties": {
         "created_at": {
           "type": "integer",
@@ -44,7 +37,14 @@
         "workspace_id": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "name",
+        "created_at",
+        "updated_at"
+      ]
     }
   }
 }

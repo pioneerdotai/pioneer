@@ -1,30 +1,21 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ItemTimeoutDetectedNotification",
   "type": "object",
-  "required": [
-    "attempt_number",
-    "item_id",
-    "item_type",
-    "reason",
-    "thread_id",
-    "turn_id",
-    "workspace_id"
-  ],
   "properties": {
     "attempt_number": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "item_id": {
       "type": "string"
     },
     "item_type": {
-      "$ref": "#/definitions/TurnItemType"
+      "$ref": "#/$defs/TurnItemType"
     },
     "reason": {
-      "$ref": "#/definitions/TurnItemTimeoutReason"
+      "$ref": "#/$defs/TurnItemTimeoutReason"
     },
     "recovery_job_id": {
       "type": [
@@ -42,7 +33,16 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "item_type",
+    "attempt_number",
+    "reason"
+  ],
+  "$defs": {
     "TurnItemTimeoutReason": {
       "type": "string",
       "enum": [

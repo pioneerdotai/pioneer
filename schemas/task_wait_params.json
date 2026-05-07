@@ -1,34 +1,30 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskWaitParams",
   "type": "object",
   "properties": {
     "mode": {
-      "default": "all_terminal",
-      "allOf": [
-        {
-          "$ref": "#/definitions/TaskWaitMode"
-        }
-      ]
+      "$ref": "#/$defs/TaskWaitMode",
+      "default": "all_terminal"
     },
     "returnCompleted": {
-      "default": false,
-      "type": "boolean"
+      "type": "boolean",
+      "default": false
     },
     "returnPending": {
-      "default": false,
-      "type": "boolean"
+      "type": "boolean",
+      "default": false
     },
     "runIds": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
         "type": "string"
       }
     },
     "taskIds": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
         "type": "string"
       }
@@ -39,10 +35,10 @@
         "null"
       ],
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     }
   },
-  "definitions": {
+  "$defs": {
     "TaskWaitMode": {
       "type": "string",
       "enum": [

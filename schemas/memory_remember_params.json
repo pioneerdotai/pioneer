@@ -1,15 +1,10 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryRememberParams",
   "type": "object",
-  "required": [
-    "category",
-    "content",
-    "scope"
-  ],
   "properties": {
     "category": {
-      "$ref": "#/definitions/MemoryCategory"
+      "$ref": "#/$defs/MemoryCategory"
     },
     "confidence": {
       "type": [
@@ -53,7 +48,7 @@
     "provenance": {
       "anyOf": [
         {
-          "$ref": "#/definitions/MemoryProvenance"
+          "$ref": "#/$defs/MemoryProvenance"
         },
         {
           "type": "null"
@@ -61,12 +56,12 @@
       ]
     },
     "scope": {
-      "$ref": "#/definitions/MemoryScope"
+      "$ref": "#/$defs/MemoryScope"
     },
     "sensitivity": {
       "anyOf": [
         {
-          "$ref": "#/definitions/MemorySensitivity"
+          "$ref": "#/$defs/MemorySensitivity"
         },
         {
           "type": "null"
@@ -80,12 +75,14 @@
       ]
     }
   },
-  "definitions": {
+  "required": [
+    "scope",
+    "category",
+    "content"
+  ],
+  "$defs": {
     "MemoryActor": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "id": {
           "type": [
@@ -94,9 +91,12 @@
           ]
         },
         "kind": {
-          "$ref": "#/definitions/MemoryActorKind"
+          "$ref": "#/$defs/MemoryActorKind"
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     },
     "MemoryActorKind": {
       "type": "string",
@@ -115,6 +115,8 @@
         "preference",
         "biography",
         "relationship",
+        "recurring_instruction",
+        "project_policy",
         "project_fact",
         "project_decision",
         "procedure",
@@ -126,14 +128,11 @@
     },
     "MemoryProvenance": {
       "type": "object",
-      "required": [
-        "source_kind"
-      ],
       "properties": {
         "created_by": {
           "anyOf": [
             {
-              "$ref": "#/definitions/MemoryActor"
+              "$ref": "#/$defs/MemoryActor"
             },
             {
               "type": "null"
@@ -147,7 +146,7 @@
           ]
         },
         "source_kind": {
-          "$ref": "#/definitions/MemorySourceKind"
+          "$ref": "#/$defs/MemorySourceKind"
         },
         "source_thread_id": {
           "type": [
@@ -161,22 +160,25 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "source_kind"
+      ]
     },
     "MemoryScope": {
       "type": "object",
-      "required": [
-        "key",
-        "kind"
-      ],
       "properties": {
         "key": {
           "type": "string"
         },
         "kind": {
-          "$ref": "#/definitions/MemoryScopeKind"
+          "$ref": "#/$defs/MemoryScopeKind"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
     },
     "MemoryScopeKind": {
       "type": "string",

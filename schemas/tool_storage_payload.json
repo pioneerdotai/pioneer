@@ -1,13 +1,9 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ToolStoragePayload",
   "oneOf": [
     {
       "type": "object",
-      "required": [
-        "kind",
-        "truncated"
-      ],
       "properties": {
         "aggregated_output": {
           "type": [
@@ -21,7 +17,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "exit_code": {
           "type": [
@@ -32,9 +28,7 @@
         },
         "kind": {
           "type": "string",
-          "enum": [
-            "shell"
-          ]
+          "const": "shell"
         },
         "stderr": {
           "type": [
@@ -57,80 +51,58 @@
         "truncated": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "kind",
+        "truncated"
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "kind",
-        "metadata",
-        "title",
-        "truncated"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "summary"
-          ]
-        },
-        "lines": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+          "const": "summary"
+        }
+      },
+      "$ref": "#/$defs/ToolOutputSummary",
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "metadata"
         },
         "metadata": {
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/ToolMetadataValue"
+            "$ref": "#/$defs/ToolMetadataValue"
           }
-        },
-        "title": {
-          "type": "string"
-        },
-        "truncated": {
-          "type": "boolean"
         }
-      }
-    },
-    {
-      "type": "object",
+      },
       "required": [
         "kind",
         "metadata"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "metadata"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/ToolMetadataValue"
-          }
-        }
-      }
+      ]
     },
     {
       "type": "object",
-      "required": [
-        "kind"
-      ],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "none"
-          ]
+          "const": "none"
         }
-      }
+      },
+      "required": [
+        "kind"
+      ]
     }
   ],
-  "definitions": {
+  "$defs": {
     "ToolMetadataRawKind": {
       "type": "string",
       "enum": [
@@ -154,137 +126,116 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "values"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "array"
-              ]
+              "const": "array"
             },
             "values": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "values"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "fields",
-            "kind"
-          ],
           "properties": {
             "fields": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/ToolMetadataValue"
+                "$ref": "#/$defs/ToolMetadataValue"
               }
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "fields"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "bytes",
-            "kind",
-            "raw_kind",
-            "sha256",
-            "value_kind"
-          ],
           "properties": {
             "bytes": {
               "type": "integer",
               "format": "uint",
-              "minimum": 0.0
+              "minimum": 0
             },
             "kind": {
               "type": "string",
-              "enum": [
-                "redacted_raw"
-              ]
+              "const": "redacted_raw"
             },
             "raw_kind": {
-              "$ref": "#/definitions/ToolMetadataRawKind"
+              "$ref": "#/$defs/ToolMetadataRawKind"
             },
             "sha256": {
               "type": "string"
@@ -292,8 +243,43 @@
             "value_kind": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "kind",
+            "raw_kind",
+            "sha256",
+            "bytes",
+            "value_kind"
+          ]
         }
+      ]
+    },
+    "ToolOutputSummary": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolMetadataValue"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "title",
+        "metadata",
+        "truncated"
       ]
     }
   }

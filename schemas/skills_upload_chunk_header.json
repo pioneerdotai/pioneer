@@ -1,13 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUploadChunkHeader",
   "type": "object",
-  "required": [
-    "len",
-    "offset",
-    "upload_id",
-    "workspace_id"
-  ],
   "properties": {
     "chunk_sha256": {
       "type": [
@@ -18,12 +12,12 @@
     "len": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "offset": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "upload_id": {
       "type": "string"
@@ -31,5 +25,11 @@
     "workspace_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "workspace_id",
+    "upload_id",
+    "offset",
+    "len"
+  ]
 }

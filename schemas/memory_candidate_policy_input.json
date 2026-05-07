@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryCandidatePolicyInput",
+  "type": "object",
+  "properties": {
+    "active_no_memory_policy": {
+      "type": "boolean"
+    },
+    "evidence_count": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "has_contradiction": {
+      "type": "boolean"
+    },
+    "has_duplicate": {
+      "type": "boolean"
+    },
+    "has_rejected_duplicate": {
+      "type": "boolean"
+    },
+    "hook_run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "relation": {
+      "$ref": "#/$defs/MemoryWriteRelation"
+    },
+    "scope": {
+      "$ref": "#/$defs/MemoryScope"
+    },
+    "scope_clarity": {
+      "$ref": "#/$defs/MemoryScopeClarity"
+    },
+    "semantic": {
+      "$ref": "#/$defs/MemorySemanticFields"
+    },
+    "sensitivity": {
+      "$ref": "#/$defs/MemorySensitivity"
+    },
+    "source_kind": {
+      "$ref": "#/$defs/MemorySourceKind"
+    }
+  },
+  "required": [
+    "semantic",
+    "relation",
+    "scope",
+    "scope_clarity",
+    "evidence_count",
+    "has_contradiction",
+    "has_duplicate",
+    "has_rejected_duplicate",
+    "sensitivity",
+    "active_no_memory_policy",
+    "source_kind"
+  ],
+  "$defs": {
+    "MemoryAttribute": {
+      "type": "string",
+      "enum": [
+        "name",
+        "birthday",
+        "preferred_language",
+        "communication_style",
+        "migration_policy",
+        "review_style",
+        "phase_naming",
+        "custom"
+      ]
+    },
+    "MemoryCategory": {
+      "type": "string",
+      "enum": [
+        "identity",
+        "preference",
+        "biography",
+        "relationship",
+        "recurring_instruction",
+        "project_policy",
+        "project_fact",
+        "project_decision",
+        "procedure",
+        "todo",
+        "constraint",
+        "communication_style",
+        "custom"
+      ]
+    },
+    "MemoryDurability": {
+      "type": "string",
+      "enum": [
+        "long_lived",
+        "project_lifetime",
+        "session_only",
+        "transient",
+        "unknown"
+      ]
+    },
+    "MemoryExplicitness": {
+      "type": "string",
+      "enum": [
+        "explicit",
+        "implicit",
+        "none",
+        "unclear"
+      ]
+    },
+    "MemoryExtractorCertainty": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "MemoryIntent": {
+      "type": "string",
+      "enum": [
+        "explicit_store",
+        "explicit_forget",
+        "explicit_no_memory",
+        "implicit_candidate",
+        "none"
+      ]
+    },
+    "MemoryScope": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/MemoryScopeKind"
+        }
+      },
+      "required": [
+        "kind",
+        "key"
+      ]
+    },
+    "MemoryScopeClarity": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "inferred",
+        "unclear"
+      ]
+    },
+    "MemoryScopeHint": {
+      "type": "string",
+      "enum": [
+        "user_global",
+        "user_workspace",
+        "agent_global",
+        "agent_workspace",
+        "project_workspace",
+        "unknown"
+      ]
+    },
+    "MemoryScopeKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "workspace",
+        "thread",
+        "agent",
+        "task"
+      ]
+    },
+    "MemorySemanticFields": {
+      "type": "object",
+      "properties": {
+        "attribute": {
+          "$ref": "#/$defs/MemoryAttribute"
+        },
+        "category": {
+          "$ref": "#/$defs/MemoryCategory"
+        },
+        "certainty": {
+          "$ref": "#/$defs/MemoryExtractorCertainty"
+        },
+        "custom_attribute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "custom_subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durability": {
+          "$ref": "#/$defs/MemoryDurability"
+        },
+        "explicitness": {
+          "$ref": "#/$defs/MemoryExplicitness"
+        },
+        "intent": {
+          "$ref": "#/$defs/MemoryIntent"
+        },
+        "scope_hint": {
+          "$ref": "#/$defs/MemoryScopeHint"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/MemorySensitivityHint"
+        },
+        "subject": {
+          "$ref": "#/$defs/MemorySubject"
+        },
+        "subject_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "intent",
+        "explicitness",
+        "category",
+        "subject",
+        "attribute",
+        "scope_hint",
+        "durability",
+        "sensitivity",
+        "certainty"
+      ]
+    },
+    "MemorySensitivity": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "personal",
+        "secret_like",
+        "regulated"
+      ]
+    },
+    "MemorySensitivityHint": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "personal",
+        "regulated",
+        "secret",
+        "unknown"
+      ]
+    },
+    "MemorySourceKind": {
+      "type": "string",
+      "enum": [
+        "explicit_user_request",
+        "user_correction",
+        "assistant_inference",
+        "background_extractor",
+        "tool_observation",
+        "import",
+        "system"
+      ]
+    },
+    "MemorySubject": {
+      "type": "string",
+      "enum": [
+        "current_user",
+        "current_agent",
+        "workspace",
+        "project",
+        "person",
+        "organization",
+        "artifact",
+        "custom"
+      ]
+    },
+    "MemoryWriteRelation": {
+      "type": "string",
+      "enum": [
+        "duplicate",
+        "compatible_update",
+        "contradiction",
+        "novel",
+        "suppressed_by_rejection"
+      ]
+    }
+  }
+}

@@ -1,36 +1,22 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ItemToolRetryScheduledNotification",
   "type": "object",
-  "required": [
-    "attempt_number",
-    "error_class",
-    "failure_signature_fingerprint",
-    "item_id",
-    "item_type",
-    "reason",
-    "retry_hint",
-    "thread_id",
-    "tool_name",
-    "tool_retry_episode_id",
-    "turn_id",
-    "workspace_id"
-  ],
   "properties": {
     "attempt_number": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "budgets": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
-        "$ref": "#/definitions/ToolRetryBudgetUsage"
+        "$ref": "#/$defs/ToolRetryBudgetUsage"
       }
     },
     "error_class": {
-      "$ref": "#/definitions/ToolRetryErrorClass"
+      "$ref": "#/$defs/ToolRetryErrorClass"
     },
     "failure_signature_fingerprint": {
       "type": "string"
@@ -39,7 +25,7 @@
       "type": "string"
     },
     "item_type": {
-      "$ref": "#/definitions/TurnItemType"
+      "$ref": "#/$defs/TurnItemType"
     },
     "reason": {
       "type": "string"
@@ -63,7 +49,21 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "item_type",
+    "tool_retry_episode_id",
+    "tool_name",
+    "attempt_number",
+    "error_class",
+    "retry_hint",
+    "failure_signature_fingerprint",
+    "reason"
+  ],
+  "$defs": {
     "ToolRetryBudgetKind": {
       "type": "string",
       "enum": [
@@ -75,26 +75,26 @@
     },
     "ToolRetryBudgetUsage": {
       "type": "object",
-      "required": [
-        "kind",
-        "limit",
-        "used"
-      ],
       "properties": {
         "kind": {
-          "$ref": "#/definitions/ToolRetryBudgetKind"
+          "$ref": "#/$defs/ToolRetryBudgetKind"
         },
         "limit": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "used": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "kind",
+        "used",
+        "limit"
+      ]
     },
     "ToolRetryErrorClass": {
       "type": "string",

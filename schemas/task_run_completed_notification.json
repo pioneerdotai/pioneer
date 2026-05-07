@@ -1,20 +1,20 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskRunCompletedNotification",
   "type": "object",
+  "properties": {
+    "context": {
+      "$ref": "#/$defs/TaskNotificationContext"
+    },
+    "run": {
+      "$ref": "#/$defs/TaskRun"
+    }
+  },
   "required": [
     "context",
     "run"
   ],
-  "properties": {
-    "context": {
-      "$ref": "#/definitions/TaskNotificationContext"
-    },
-    "run": {
-      "$ref": "#/definitions/TaskRun"
-    }
-  },
-  "definitions": {
+  "$defs": {
     "TaskArtifact": {
       "type": "object",
       "properties": {
@@ -27,7 +27,7 @@
         "metadata": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -56,14 +56,9 @@
     },
     "TaskError": {
       "type": "object",
-      "required": [
-        "class",
-        "code",
-        "message"
-      ],
       "properties": {
         "class": {
-          "$ref": "#/definitions/TaskErrorClass"
+          "$ref": "#/$defs/TaskErrorClass"
         },
         "code": {
           "type": "string"
@@ -71,7 +66,7 @@
         "details": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -87,7 +82,12 @@
         "message": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "code",
+        "message",
+        "class"
+      ]
     },
     "TaskErrorClass": {
       "type": "string",
@@ -115,12 +115,6 @@
     },
     "TaskNotificationContext": {
       "type": "object",
-      "required": [
-        "eventId",
-        "sequence",
-        "taskId",
-        "workspaceId"
-      ],
       "properties": {
         "eventId": {
           "type": "string"
@@ -165,16 +159,22 @@
         "workspaceId": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "eventId",
+        "sequence"
+      ]
     },
     "TaskResult": {
       "type": "object",
       "properties": {
         "artifacts": {
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
-            "$ref": "#/definitions/TaskArtifact"
+            "$ref": "#/$defs/TaskArtifact"
           }
         },
         "completedByRunId": {
@@ -186,7 +186,7 @@
         "data": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskValue"
+              "$ref": "#/$defs/TaskValue"
             },
             {
               "type": "null"
@@ -203,22 +203,11 @@
     },
     "TaskRun": {
       "type": "object",
-      "required": [
-        "attemptNumber",
-        "createdAt",
-        "executorKind",
-        "id",
-        "runGroupId",
-        "runNumber",
-        "status",
-        "taskId",
-        "updatedAt"
-      ],
       "properties": {
         "attemptNumber": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0
         },
         "completedAt": {
           "type": [
@@ -234,7 +223,7 @@
         "error": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskError"
+              "$ref": "#/$defs/TaskError"
             },
             {
               "type": "null"
@@ -242,7 +231,7 @@
           ]
         },
         "executorKind": {
-          "$ref": "#/definitions/TaskExecutorKind"
+          "$ref": "#/$defs/TaskExecutorKind"
         },
         "heartbeatAt": {
           "type": [
@@ -283,7 +272,7 @@
         "result": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TaskResult"
+              "$ref": "#/$defs/TaskResult"
             },
             {
               "type": "null"
@@ -311,7 +300,7 @@
           "format": "int64"
         },
         "status": {
-          "$ref": "#/definitions/TaskRunStatus"
+          "$ref": "#/$defs/TaskRunStatus"
         },
         "taskId": {
           "type": "string"
@@ -326,7 +315,18 @@
           "type": "integer",
           "format": "int64"
         }
-      }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runGroupId",
+        "attemptNumber",
+        "runNumber",
+        "status",
+        "executorKind",
+        "createdAt",
+        "updatedAt"
+      ]
     },
     "TaskRunStatus": {
       "type": "string",
@@ -345,133 +345,119 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "kind"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "null"
-              ]
+              "const": "null"
             }
-          }
+          },
+          "required": [
+            "kind"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "kind",
-            "value"
-          ],
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "bool"
-              ]
+              "const": "bool"
             },
             "value": {
               "type": "boolean"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "integer"
-              ]
+              "const": "integer"
             },
             "value": {
               "type": "integer",
               "format": "int64"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "number"
-              ]
+              "const": "number"
             },
             "value": {
               "type": "number",
               "format": "double"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "string"
-              ]
+              "const": "string"
             },
             "value": {
               "type": "string"
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "list"
-              ]
+              "const": "list"
             },
             "value": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
-        },
-        {
-          "type": "object",
+          },
           "required": [
             "kind",
             "value"
-          ],
+          ]
+        },
+        {
+          "type": "object",
           "properties": {
             "kind": {
               "type": "string",
-              "enum": [
-                "object"
-              ]
+              "const": "object"
             },
             "value": {
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/TaskValue"
+                "$ref": "#/$defs/TaskValue"
               }
             }
-          }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
         }
       ]
     }

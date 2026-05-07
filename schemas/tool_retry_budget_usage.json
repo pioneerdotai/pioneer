@@ -1,28 +1,28 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ToolRetryBudgetUsage",
   "type": "object",
-  "required": [
-    "kind",
-    "limit",
-    "used"
-  ],
   "properties": {
     "kind": {
-      "$ref": "#/definitions/ToolRetryBudgetKind"
+      "$ref": "#/$defs/ToolRetryBudgetKind"
     },
     "limit": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "used": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     }
   },
-  "definitions": {
+  "required": [
+    "kind",
+    "used",
+    "limit"
+  ],
+  "$defs": {
     "ToolRetryBudgetKind": {
       "type": "string",
       "enum": [

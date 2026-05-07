@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskConcurrencyPolicy",
   "type": "object",
-  "required": [
-    "maxParallelRuns",
-    "onConflict"
-  ],
   "properties": {
     "key": {
       "type": [
@@ -16,13 +12,17 @@
     "maxParallelRuns": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "onConflict": {
-      "$ref": "#/definitions/TaskConcurrencyConflictPolicy"
+      "$ref": "#/$defs/TaskConcurrencyConflictPolicy"
     }
   },
-  "definitions": {
+  "required": [
+    "maxParallelRuns",
+    "onConflict"
+  ],
+  "$defs": {
     "TaskConcurrencyConflictPolicy": {
       "type": "string",
       "enum": [

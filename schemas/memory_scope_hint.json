@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryScopeHint",
+  "type": "string",
+  "enum": [
+    "user_global",
+    "user_workspace",
+    "agent_global",
+    "agent_workspace",
+    "project_workspace",
+    "unknown"
+  ]
+}

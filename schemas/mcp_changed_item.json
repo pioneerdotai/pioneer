@@ -1,24 +1,24 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpChangedItem",
   "type": "object",
-  "required": [
-    "action",
-    "name",
-    "source_kind"
-  ],
   "properties": {
     "action": {
-      "$ref": "#/definitions/McpChangedAction"
+      "$ref": "#/$defs/McpChangedAction"
     },
     "name": {
       "type": "string"
     },
     "source_kind": {
-      "$ref": "#/definitions/McpSourceKind"
+      "$ref": "#/$defs/McpSourceKind"
     }
   },
-  "definitions": {
+  "required": [
+    "name",
+    "source_kind",
+    "action"
+  ],
+  "$defs": {
     "McpChangedAction": {
       "type": "string",
       "enum": [

@@ -1,13 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TurnTimelineChangedNotification",
   "type": "object",
-  "required": [
-    "reason",
-    "threadId",
-    "turnId",
-    "workspaceId"
-  ],
   "properties": {
     "childThreadId": {
       "type": [
@@ -22,7 +16,7 @@
       ]
     },
     "reason": {
-      "$ref": "#/definitions/TurnTimelineChangedReason"
+      "$ref": "#/$defs/TurnTimelineChangedReason"
     },
     "runId": {
       "type": [
@@ -46,7 +40,13 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspaceId",
+    "threadId",
+    "turnId",
+    "reason"
+  ],
+  "$defs": {
     "TurnTimelineChangedReason": {
       "type": "string",
       "enum": [

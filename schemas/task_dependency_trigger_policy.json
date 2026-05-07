@@ -1,23 +1,23 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskDependencyTriggerPolicy",
   "type": "object",
-  "required": [
-    "mode"
-  ],
   "properties": {
     "dependsOnTaskIds": {
-      "default": [],
       "type": "array",
+      "default": [],
       "items": {
         "type": "string"
       }
     },
     "mode": {
-      "$ref": "#/definitions/TaskDependencyTriggerMode"
+      "$ref": "#/$defs/TaskDependencyTriggerMode"
     }
   },
-  "definitions": {
+  "required": [
+    "mode"
+  ],
+  "$defs": {
     "TaskDependencyTriggerMode": {
       "type": "string",
       "enum": [

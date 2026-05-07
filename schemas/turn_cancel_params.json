@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TurnCancelParams",
   "type": "object",
-  "required": [
-    "thread_id",
-    "turn_id"
-  ],
   "properties": {
     "reason": {
       "type": [
@@ -19,5 +15,9 @@
     "turn_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "thread_id",
+    "turn_id"
+  ]
 }

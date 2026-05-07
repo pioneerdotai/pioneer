@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryAttribute",
+  "type": "string",
+  "enum": [
+    "name",
+    "birthday",
+    "preferred_language",
+    "communication_style",
+    "migration_policy",
+    "review_style",
+    "phase_naming",
+    "custom"
+  ]
+}

@@ -1,18 +1,12 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SkillsUploadFinishResponse",
   "type": "object",
-  "required": [
-    "compressed_size_bytes",
-    "sha256",
-    "status",
-    "upload_id"
-  ],
   "properties": {
     "compressed_size_bytes": {
       "type": "integer",
       "format": "uint64",
-      "minimum": 0.0
+      "minimum": 0
     },
     "sha256": {
       "type": "string"
@@ -23,5 +17,11 @@
     "upload_id": {
       "type": "string"
     }
-  }
+  },
+  "required": [
+    "upload_id",
+    "status",
+    "sha256",
+    "compressed_size_bytes"
+  ]
 }

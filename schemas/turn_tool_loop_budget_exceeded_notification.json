@@ -1,33 +1,23 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TurnToolLoopBudgetExceededNotification",
   "type": "object",
-  "required": [
-    "action",
-    "limit",
-    "limit_kind",
-    "observed",
-    "reason",
-    "thread_id",
-    "turn_id",
-    "workspace_id"
-  ],
   "properties": {
     "action": {
-      "$ref": "#/definitions/ToolLoopBudgetAction"
+      "$ref": "#/$defs/ToolLoopBudgetAction"
     },
     "limit": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "limit_kind": {
-      "$ref": "#/definitions/ToolLoopBudgetLimitKind"
+      "$ref": "#/$defs/ToolLoopBudgetLimitKind"
     },
     "observed": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
     },
     "reason": {
       "type": "string"
@@ -42,7 +32,17 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "limit_kind",
+    "limit",
+    "observed",
+    "action",
+    "reason"
+  ],
+  "$defs": {
     "ToolLoopBudgetAction": {
       "type": "string",
       "enum": [

@@ -1,14 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TaskWriteLockConflict",
   "type": "object",
-  "required": [
-    "lockId",
-    "runId",
-    "scopeKind",
-    "scopePath",
-    "taskId"
-  ],
   "properties": {
     "lockId": {
       "type": "string"
@@ -17,7 +10,7 @@
       "type": "string"
     },
     "scopeKind": {
-      "$ref": "#/definitions/TaskWriteLockScopeKind"
+      "$ref": "#/$defs/TaskWriteLockScopeKind"
     },
     "scopePath": {
       "type": "string"
@@ -26,7 +19,14 @@
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "lockId",
+    "taskId",
+    "runId",
+    "scopeKind",
+    "scopePath"
+  ],
+  "$defs": {
     "TaskWriteLockScopeKind": {
       "type": "string",
       "enum": [

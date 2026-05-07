@@ -1,11 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "McpPolicySetParams",
   "type": "object",
-  "required": [
-    "name",
-    "workspace_id"
-  ],
   "properties": {
     "allow_implicit_invocation": {
       "type": [
@@ -23,18 +19,18 @@
       "type": "string"
     },
     "scope_kind": {
-      "default": "workspace",
-      "allOf": [
-        {
-          "$ref": "#/definitions/McpScopeKind"
-        }
-      ]
+      "$ref": "#/$defs/McpScopeKind",
+      "default": "workspace"
     },
     "workspace_id": {
       "type": "string"
     }
   },
-  "definitions": {
+  "required": [
+    "workspace_id",
+    "name"
+  ],
+  "$defs": {
     "McpScopeKind": {
       "type": "string",
       "enum": [

@@ -1,10 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MemoryActor",
   "type": "object",
-  "required": [
-    "kind"
-  ],
   "properties": {
     "id": {
       "type": [
@@ -13,10 +10,13 @@
       ]
     },
     "kind": {
-      "$ref": "#/definitions/MemoryActorKind"
+      "$ref": "#/$defs/MemoryActorKind"
     }
   },
-  "definitions": {
+  "required": [
+    "kind"
+  ],
+  "$defs": {
     "MemoryActorKind": {
       "type": "string",
       "enum": [
