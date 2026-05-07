@@ -17,19 +17,25 @@ use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
 use crate::recall::{
     MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse, compact_recall_content,
 };
+use crate::write::{
+    SemanticWritePrepared, merge_metadata, metadata_normalized_value, normalize_semantic_text,
+    prepare_semantic_write, semantic_metadata,
+};
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryControlRecord,
-    AgentMemoryListFilter, AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryControlRecord,
-    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
+    AgentMemoryListFilter, AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryCandidate,
+    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
-    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryListParams,
-    MemoryListResponse, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
-    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemoryStatus,
-    generate_id,
+    MemoryCandidate, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
+    MemoryCategory, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams,
+    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryRecord,
+    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit,
+    MemorySearchParams, MemorySearchResponse, MemorySemanticWriteDisposition,
+    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivity,
+    MemorySensitivityHint, MemorySourceKind, MemoryStatus, MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -42,6 +48,7 @@ const REPAIR_JOB_BACKEND_DELETE_FAILED: &str = "backend_delete_failed";
 const REPAIR_JOB_BACKEND_STALE_PAYLOAD: &str = "backend_stale_payload";
 const REPAIR_PRIORITY_DEFAULT: i64 = 10;
 const REPAIR_MAX_ATTEMPTS_DEFAULT: i32 = 3;
+const POLICY_ACTION_SEMANTIC_WRITE: &str = "semantic_write";
 
 pub struct MemoryService {
     store: Arc<CrudStore>,
@@ -201,7 +208,7 @@ impl MemoryService {
                 .with_context(|| format!("superseded memory `{superseded_id}` disappeared"))?;
         }
 
-        let row = if params.supersedes.is_some() || params.key.is_none() || existing.is_none() {
+        let row = if params.supersedes.is_some() || params.key.is_none() {
             self.store
                 .insert_agent_memory_record(new_record, None, now)
                 .await
@@ -235,6 +242,369 @@ impl MemoryService {
             created,
             superseded_memory_id: params.supersedes,
         })
+    }
+
+    pub async fn write_semantic_memory(
+        &self,
+        context: MemoryOperationContext,
+        params: MemorySemanticWriteParams,
+    ) -> Result<MemorySemanticWriteResponse> {
+        let now = context.now_or(current_unix());
+        let content = params.content.trim();
+        if content.is_empty() {
+            bail!("semantic memory content cannot be empty");
+        }
+        if params.evidence.is_none() {
+            bail!("semantic memory write requires evidence");
+        }
+        let value = params.value.as_deref().unwrap_or(content);
+        let prepared = prepare_semantic_write(&params.scope, &params.semantic, value)?;
+        let disposition = params
+            .disposition
+            .unwrap_or(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
+        let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
+        let provenance = semantic_write_provenance(&params, &context);
+        let mut base_metadata = params.metadata.clone();
+        for (key, value) in semantic_metadata(
+            &params.semantic,
+            &prepared,
+            params.client_provided_key.as_deref(),
+            Some("semantic_write"),
+        ) {
+            base_metadata.insert(key, value);
+        }
+        let metadata_json = merge_metadata(None, base_metadata, params.evidence.as_ref(), now)?;
+
+        if let Some(existing) = self
+            .store
+            .get_active_agent_memory_by_key(
+                params.scope.clone(),
+                Some(prepared.canonical.namespace.as_str()),
+                prepared.canonical.key.as_str(),
+                context.workspace_guard(),
+            )
+            .await?
+        {
+            let existing_value = metadata_normalized_value(existing.metadata_json.as_deref())
+                .or_else(|| {
+                    existing
+                        .content_preview
+                        .as_deref()
+                        .map(normalize_semantic_text)
+                });
+            if existing_value.as_deref() == Some(prepared.normalized_value.as_str()) {
+                let merged_metadata = merge_metadata(
+                    existing.metadata_json.as_deref(),
+                    semantic_metadata(
+                        &params.semantic,
+                        &prepared,
+                        params.client_provided_key.as_deref(),
+                        Some("semantic_duplicate"),
+                    ),
+                    params.evidence.as_ref(),
+                    now,
+                )?;
+                let merged = self
+                    .store
+                    .update_agent_memory_metadata(existing.id.as_str(), Some(merged_metadata), now)
+                    .await?
+                    .unwrap_or(existing);
+                let memory_id = merged.id.clone();
+                let workspace_id = merged.workspace_id.clone();
+                let record = self
+                    .hydrate_visible_row(merged, &context, &[], now, false)
+                    .await?;
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::Duplicate,
+                    "active_duplicate",
+                    &context,
+                    Some(memory_id),
+                    workspace_id,
+                    now,
+                )
+                .await?;
+                return Ok(MemorySemanticWriteResponse {
+                    relation: MemoryWriteRelation::Duplicate,
+                    canonical_key: prepared.canonical,
+                    semantic_fingerprint: prepared.semantic_fingerprint,
+                    record,
+                    candidate: None,
+                    created: false,
+                    superseded_memory_id: None,
+                    evidence_merged: true,
+                });
+            }
+
+            if disposition == MemorySemanticWriteDisposition::AcceptActive
+                && params.semantic.explicitness == pioneer_protocol::MemoryExplicitness::Explicit
+            {
+                let relation_context = context.clone();
+                let superseded_memory_id = existing.id.clone();
+                let response = self
+                    .remember(
+                        context,
+                        MemoryRememberParams {
+                            scope: params.scope,
+                            category: prepared.canonical.category,
+                            namespace: Some(prepared.canonical.namespace.clone()),
+                            key: Some(prepared.canonical.key.clone()),
+                            content: content.to_owned(),
+                            sensitivity: Some(sensitivity),
+                            confidence: params.confidence,
+                            importance: params.importance,
+                            provenance: Some(provenance),
+                            idempotency_key: None,
+                            supersedes: Some(superseded_memory_id),
+                            metadata: serde_json::from_str(metadata_json.as_str())
+                                .context("semantic metadata must decode")?,
+                        },
+                    )
+                    .await?;
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::CompatibleUpdate,
+                    "active_supersession",
+                    &relation_context,
+                    Some(response.record.id.clone()),
+                    relation_context.workspace_id.clone(),
+                    now,
+                )
+                .await?;
+                return Ok(MemorySemanticWriteResponse {
+                    relation: MemoryWriteRelation::CompatibleUpdate,
+                    canonical_key: prepared.canonical,
+                    semantic_fingerprint: prepared.semantic_fingerprint,
+                    record: Some(response.record),
+                    candidate: None,
+                    created: response.created,
+                    superseded_memory_id: response.superseded_memory_id,
+                    evidence_merged: false,
+                });
+            }
+
+            let candidate = self
+                .maybe_route_semantic_candidate(
+                    &context,
+                    &params,
+                    &prepared,
+                    content,
+                    metadata_json,
+                    disposition,
+                    now,
+                    "semantic_contradiction",
+                )
+                .await?;
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::Contradiction,
+                "same_key_value_conflict",
+                &context,
+                Some(existing.id.clone()),
+                existing.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(MemorySemanticWriteResponse {
+                relation: MemoryWriteRelation::Contradiction,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: None,
+                candidate,
+                created: false,
+                superseded_memory_id: None,
+                evidence_merged: false,
+            });
+        }
+
+        if let Some(rejected) = self
+            .store
+            .get_agent_memory_candidate_by_dedupe(
+                params.scope.clone(),
+                Some(prepared.canonical.namespace.as_str()),
+                prepared.dedupe_key.as_str(),
+                vec![
+                    MemoryCandidateStatus::Rejected,
+                    MemoryCandidateStatus::Expired,
+                ],
+                context.workspace_guard(),
+            )
+            .await?
+        {
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::SuppressedByRejection,
+                "suppressed_duplicate",
+                &context,
+                None,
+                rejected.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(MemorySemanticWriteResponse {
+                relation: MemoryWriteRelation::SuppressedByRejection,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: None,
+                candidate: None,
+                created: false,
+                superseded_memory_id: None,
+                evidence_merged: false,
+            });
+        }
+
+        if let Some(pending) = self
+            .store
+            .get_agent_memory_candidate_by_dedupe(
+                params.scope.clone(),
+                Some(prepared.canonical.namespace.as_str()),
+                prepared.dedupe_key.as_str(),
+                vec![MemoryCandidateStatus::Pending],
+                context.workspace_guard(),
+            )
+            .await?
+        {
+            let merged_metadata = merge_metadata(
+                pending.metadata_json.as_deref(),
+                semantic_metadata(
+                    &params.semantic,
+                    &prepared,
+                    params.client_provided_key.as_deref(),
+                    Some("semantic_pending_duplicate"),
+                ),
+                params.evidence.as_ref(),
+                now,
+            )?;
+            let updated = self
+                .store
+                .update_agent_memory_candidate_metadata(
+                    pending.id.as_str(),
+                    pending.reason.clone(),
+                    Some(merged_metadata),
+                    now,
+                )
+                .await?
+                .unwrap_or(pending);
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::Duplicate,
+                "pending_duplicate",
+                &context,
+                None,
+                updated.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(MemorySemanticWriteResponse {
+                relation: MemoryWriteRelation::Duplicate,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: None,
+                candidate: Some(crud_candidate_to_protocol(updated)?),
+                created: false,
+                superseded_memory_id: None,
+                evidence_merged: true,
+            });
+        }
+
+        match disposition {
+            MemorySemanticWriteDisposition::AcceptActive => {
+                let relation_context = context.clone();
+                let response = self
+                    .remember(
+                        context,
+                        MemoryRememberParams {
+                            scope: params.scope,
+                            category: prepared.canonical.category,
+                            namespace: Some(prepared.canonical.namespace.clone()),
+                            key: Some(prepared.canonical.key.clone()),
+                            content: content.to_owned(),
+                            sensitivity: Some(sensitivity),
+                            confidence: params.confidence,
+                            importance: params.importance,
+                            provenance: Some(provenance),
+                            idempotency_key: None,
+                            supersedes: None,
+                            metadata: serde_json::from_str(metadata_json.as_str())
+                                .context("semantic metadata must decode")?,
+                        },
+                    )
+                    .await?;
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::Novel,
+                    "active_created",
+                    &relation_context,
+                    Some(response.record.id.clone()),
+                    relation_context.workspace_id.clone(),
+                    now,
+                )
+                .await?;
+                Ok(MemorySemanticWriteResponse {
+                    relation: MemoryWriteRelation::Novel,
+                    canonical_key: prepared.canonical,
+                    semantic_fingerprint: prepared.semantic_fingerprint,
+                    record: Some(response.record),
+                    candidate: None,
+                    created: response.created,
+                    superseded_memory_id: response.superseded_memory_id,
+                    evidence_merged: false,
+                })
+            }
+            MemorySemanticWriteDisposition::CreatePendingCandidate
+            | MemorySemanticWriteDisposition::RejectSuppressed => {
+                let candidate = self
+                    .create_semantic_candidate(
+                        &context,
+                        &params,
+                        &prepared,
+                        content,
+                        metadata_json,
+                        disposition == MemorySemanticWriteDisposition::RejectSuppressed,
+                        now,
+                        "semantic_candidate",
+                    )
+                    .await?;
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::Novel,
+                    if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
+                        "suppressed_created"
+                    } else {
+                        "candidate_created"
+                    },
+                    &context,
+                    None,
+                    context.workspace_id.clone(),
+                    now,
+                )
+                .await?;
+                Ok(MemorySemanticWriteResponse {
+                    relation: MemoryWriteRelation::Novel,
+                    canonical_key: prepared.canonical,
+                    semantic_fingerprint: prepared.semantic_fingerprint,
+                    record: None,
+                    candidate: Some(candidate),
+                    created: true,
+                    superseded_memory_id: None,
+                    evidence_merged: false,
+                })
+            }
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy => {
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::Novel,
+                    "candidate_policy_boundary",
+                    &context,
+                    None,
+                    context.workspace_id.clone(),
+                    now,
+                )
+                .await?;
+                Ok(MemorySemanticWriteResponse {
+                    relation: MemoryWriteRelation::Novel,
+                    canonical_key: prepared.canonical,
+                    semantic_fingerprint: prepared.semantic_fingerprint,
+                    record: None,
+                    candidate: None,
+                    created: false,
+                    superseded_memory_id: None,
+                    evidence_merged: false,
+                })
+            }
+        }
     }
 
     pub async fn get(
@@ -742,6 +1112,102 @@ impl MemoryService {
             .await
     }
 
+    async fn maybe_route_semantic_candidate(
+        &self,
+        context: &MemoryOperationContext,
+        params: &MemorySemanticWriteParams,
+        prepared: &SemanticWritePrepared,
+        content: &str,
+        metadata_json: String,
+        disposition: MemorySemanticWriteDisposition,
+        now: i64,
+        reason: &str,
+    ) -> Result<Option<MemoryCandidate>> {
+        match disposition {
+            MemorySemanticWriteDisposition::CreatePendingCandidate => self
+                .create_semantic_candidate(
+                    context,
+                    params,
+                    prepared,
+                    content,
+                    metadata_json,
+                    false,
+                    now,
+                    reason,
+                )
+                .await
+                .map(Some),
+            MemorySemanticWriteDisposition::AcceptActive
+            | MemorySemanticWriteDisposition::RejectSuppressed => self
+                .create_semantic_candidate(
+                    context,
+                    params,
+                    prepared,
+                    content,
+                    metadata_json,
+                    true,
+                    now,
+                    reason,
+                )
+                .await
+                .map(Some),
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy => Ok(None),
+        }
+    }
+
+    async fn create_semantic_candidate(
+        &self,
+        context: &MemoryOperationContext,
+        params: &MemorySemanticWriteParams,
+        prepared: &SemanticWritePrepared,
+        content: &str,
+        metadata_json: String,
+        reject: bool,
+        now: i64,
+        reason: &str,
+    ) -> Result<MemoryCandidate> {
+        let provenance = semantic_write_provenance(params, context);
+        let candidate = self
+            .store
+            .insert_agent_memory_candidate(
+                NewAgentMemoryCandidate {
+                    id: None,
+                    scope: params.scope.clone(),
+                    namespace: Some(prepared.canonical.namespace.clone()),
+                    category: prepared.canonical.category,
+                    key: Some(prepared.canonical.key.clone()),
+                    candidate_text: content.to_owned(),
+                    confidence: f64::from(params.confidence.unwrap_or(0.5).clamp(0.0, 1.0)),
+                    reason: reason.to_owned(),
+                    source_kind: provenance.source_kind,
+                    source_thread_id: provenance.source_thread_id.clone(),
+                    source_turn_id: provenance.source_turn_id.clone(),
+                    source_item_id: provenance.source_item_id.clone(),
+                    created_by: protocol_actor_to_crud(provenance.created_by.clone()),
+                    dedupe_key: Some(prepared.dedupe_key.clone()),
+                    metadata_json: Some(metadata_json),
+                },
+                now,
+            )
+            .await?;
+        if !reject {
+            return crud_candidate_to_protocol(candidate);
+        }
+        let rejected = self
+            .store
+            .decide_agent_memory_candidate(AgentMemoryCandidateDecisionRecord {
+                candidate_id: candidate.id.clone(),
+                decision: MemoryCandidateDecision::Reject,
+                decided_by: protocol_actor_to_crud(context.actor.clone()),
+                decision_reason: Some("review_disabled_or_suppressed".to_owned()),
+                promoted_memory_id: None,
+                decided_at_unix: now,
+            })
+            .await?
+            .unwrap_or(candidate);
+        crud_candidate_to_protocol(rejected)
+    }
+
     async fn resolve_forget_targets(
         &self,
         context: &MemoryOperationContext,
@@ -989,6 +1455,28 @@ impl MemoryService {
         Ok(())
     }
 
+    async fn record_semantic_write_relation(
+        &self,
+        relation: MemoryWriteRelation,
+        reason_code: &'static str,
+        context: &MemoryOperationContext,
+        memory_id: Option<String>,
+        workspace_id: Option<String>,
+        now: i64,
+    ) -> Result<()> {
+        self.record_policy_decision(
+            POLICY_ACTION_SEMANTIC_WRITE,
+            memory_write_relation_to_policy_decision(relation),
+            Some(reason_code),
+            None,
+            context,
+            memory_id,
+            workspace_id,
+            now,
+        )
+        .await
+    }
+
     fn normalized_limit(&self, limit: Option<u32>) -> u32 {
         limit
             .unwrap_or(self.config.default_limit)
@@ -1114,6 +1602,53 @@ fn normalize_lexical_text(value: &str) -> String {
         }
     }
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sensitivity_from_hint(hint: MemorySensitivityHint) -> MemorySensitivity {
+    match hint {
+        MemorySensitivityHint::None
+        | MemorySensitivityHint::Low
+        | MemorySensitivityHint::Unknown => MemorySensitivity::Normal,
+        MemorySensitivityHint::Personal => MemorySensitivity::Personal,
+        MemorySensitivityHint::Regulated => MemorySensitivity::Regulated,
+        MemorySensitivityHint::Secret => MemorySensitivity::SecretLike,
+    }
+}
+
+fn semantic_write_provenance(
+    params: &MemorySemanticWriteParams,
+    context: &MemoryOperationContext,
+) -> MemoryProvenance {
+    if let Some(provenance) = &params.provenance {
+        return provenance.clone();
+    }
+
+    let evidence = params.evidence.as_ref();
+    MemoryProvenance {
+        source_kind: match params.semantic.intent {
+            pioneer_protocol::MemoryIntent::ExplicitStore => MemorySourceKind::ExplicitUserRequest,
+            pioneer_protocol::MemoryIntent::ExplicitForget
+            | pioneer_protocol::MemoryIntent::ExplicitNoMemory => MemorySourceKind::System,
+            pioneer_protocol::MemoryIntent::ImplicitCandidate
+            | pioneer_protocol::MemoryIntent::None => MemorySourceKind::BackgroundExtractor,
+        },
+        source_thread_id: evidence
+            .and_then(|evidence| evidence.source_thread_id.clone())
+            .or_else(|| context.thread_id.clone()),
+        source_turn_id: evidence.and_then(|evidence| evidence.source_turn_id.clone()),
+        source_item_id: evidence.and_then(|evidence| evidence.source_item_id.clone()),
+        created_by: context.actor.clone(),
+    }
+}
+
+fn memory_write_relation_to_policy_decision(relation: MemoryWriteRelation) -> &'static str {
+    match relation {
+        MemoryWriteRelation::Duplicate => "duplicate",
+        MemoryWriteRelation::CompatibleUpdate => "compatible_update",
+        MemoryWriteRelation::Contradiction => "contradiction",
+        MemoryWriteRelation::Novel => "novel",
+        MemoryWriteRelation::SuppressedByRejection => "suppressed_by_rejection",
+    }
 }
 
 fn current_unix() -> i64 {

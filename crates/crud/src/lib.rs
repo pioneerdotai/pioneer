@@ -10,10 +10,10 @@ mod util;
 
 use anyhow::{Context, Result};
 use pioneer_protocol::{
-    MemoryCandidateDecision, MemoryScope, MemoryScopeKind, PromptManifest, ProviderFailureClass,
-    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-    StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind, PromptManifest,
+    ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+    SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
+    TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
     TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams, TaskRun, TaskRunStatus,
     TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
     ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
@@ -598,11 +598,16 @@ impl CrudStore {
                 let row =
                     agent_memory::upsert_active_memory_record(&transaction, record, resolved, now)
                         .await?;
+                let default_event_kind = if row.created_at == now {
+                    MEMORY_EVENT_CREATED
+                } else {
+                    MEMORY_EVENT_UPDATED
+                };
                 let event = memory_event_for_record(
                     event,
                     row.id.clone(),
                     row.workspace_id.clone(),
-                    MEMORY_EVENT_UPDATED,
+                    default_event_kind,
                     event_timestamp_secs,
                 );
                 agent_memory_event::append_memory_event(&transaction, event).await?;
@@ -659,6 +664,64 @@ impl CrudStore {
             return Ok(None);
         }
         Ok(Some(record))
+    }
+
+    pub async fn update_agent_memory_metadata(
+        &self,
+        memory_id: &str,
+        metadata_json: Option<String>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        self.run_serialized_write(|| {
+            let metadata_json = metadata_json.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent memory metadata update transaction")?;
+                let now = unix_to_datetime(event_timestamp_secs);
+                let Some(row) = agent_memory::update_memory_metadata(
+                    &transaction,
+                    memory_id,
+                    metadata_json,
+                    now,
+                )
+                .await?
+                else {
+                    transaction.commit().await.context(
+                        "failed to commit empty agent memory metadata update transaction",
+                    )?;
+                    return Ok(None);
+                };
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: Some(row.id.clone()),
+                        candidate_id: None,
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: MEMORY_EVENT_UPDATED.to_owned(),
+                        actor: None,
+                        thread_id: row.source_thread_id.clone(),
+                        turn_id: row.source_turn_id.clone(),
+                        item_id: row.source_item_id.clone(),
+                        details_json: Some(
+                            serde_json::json!({ "reason": "semantic_evidence_merge" }).to_string(),
+                        ),
+                        created_at_unix: event_timestamp_secs,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit agent memory metadata update transaction")?;
+                Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                    row,
+                )?))
+            }
+        })
+        .await
     }
 
     pub async fn list_agent_memory_records(
@@ -1015,6 +1078,82 @@ impl CrudStore {
                     .await
                     .context("failed to commit memory candidate insert transaction")?;
                 crate::memory::agent_memory_candidate_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn get_agent_memory_candidate_by_dedupe(
+        &self,
+        scope: MemoryScope,
+        namespace: Option<&str>,
+        dedupe_key: &str,
+        statuses: Vec<MemoryCandidateStatus>,
+        workspace_guard: Option<MemoryWorkspaceGuard>,
+    ) -> Result<Option<AgentMemoryCandidateRecord>> {
+        let resolved = self.resolve_memory_scope(scope).await?;
+        let namespace = crate::memory::normalized_memory_namespace(namespace)?;
+        let Some(row) = agent_memory_candidate::find_candidate_by_dedupe(
+            &self.connection,
+            &resolved,
+            namespace.as_str(),
+            dedupe_key,
+            statuses.as_slice(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let record = crate::memory::agent_memory_candidate_record_from_model(row)?;
+        if let Some(guard) = workspace_guard
+            && !crate::memory::workspace_allowed_by_guard(
+                record.scope.kind,
+                &record.workspace_id,
+                &guard,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    pub async fn update_agent_memory_candidate_metadata(
+        &self,
+        candidate_id: &str,
+        reason: String,
+        metadata_json: Option<String>,
+        event_timestamp_secs: i64,
+    ) -> Result<Option<AgentMemoryCandidateRecord>> {
+        self.run_serialized_write(|| {
+            let reason = reason.clone();
+            let metadata_json = metadata_json.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory candidate metadata update transaction")?;
+                let Some(row) = agent_memory_candidate::update_candidate_metadata(
+                    &transaction,
+                    candidate_id,
+                    reason,
+                    metadata_json,
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await?
+                else {
+                    transaction.commit().await.context(
+                        "failed to commit empty memory candidate metadata update transaction",
+                    )?;
+                    return Ok(None);
+                };
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory candidate metadata update transaction")?;
+                Ok(Some(
+                    crate::memory::agent_memory_candidate_record_from_model(row)?,
+                ))
             }
         })
         .await

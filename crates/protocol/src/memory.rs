@@ -25,6 +25,8 @@ pub enum MemoryCategory {
     Preference,
     Biography,
     Relationship,
+    RecurringInstruction,
+    ProjectPolicy,
     ProjectFact,
     ProjectDecision,
     Procedure,
@@ -92,6 +94,202 @@ pub struct MemoryProvenance {
     pub source_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryIntent {
+    ExplicitStore,
+    ExplicitForget,
+    ExplicitNoMemory,
+    ImplicitCandidate,
+    None,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryExplicitness {
+    Explicit,
+    Implicit,
+    None,
+    Unclear,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySubject {
+    CurrentUser,
+    CurrentAgent,
+    Workspace,
+    Project,
+    Person,
+    Organization,
+    Artifact,
+    Custom,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAttribute {
+    Name,
+    Birthday,
+    PreferredLanguage,
+    CommunicationStyle,
+    MigrationPolicy,
+    ReviewStyle,
+    PhaseNaming,
+    Custom,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScopeHint {
+    UserGlobal,
+    UserWorkspace,
+    AgentGlobal,
+    AgentWorkspace,
+    ProjectWorkspace,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDurability {
+    LongLived,
+    ProjectLifetime,
+    SessionOnly,
+    Transient,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySensitivityHint {
+    None,
+    Low,
+    Personal,
+    Regulated,
+    Secret,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryExtractorCertainty {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAttributeCardinality {
+    SingleValue,
+    MultiValue,
+    SetMembership,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWriteRelation {
+    Duplicate,
+    CompatibleUpdate,
+    Contradiction,
+    Novel,
+    SuppressedByRejection,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySemanticWriteDisposition {
+    AcceptActive,
+    CreatePendingCandidate,
+    RejectSuppressed,
+    RouteToCandidatePolicy,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryWriteEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_or_span: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor_reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemorySemanticFields {
+    pub intent: MemoryIntent,
+    pub explicitness: MemoryExplicitness,
+    pub category: MemoryCategory,
+    pub subject: MemorySubject,
+    pub attribute: MemoryAttribute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_attribute: Option<String>,
+    pub scope_hint: MemoryScopeHint,
+    pub durability: MemoryDurability,
+    pub sensitivity: MemorySensitivityHint,
+    pub certainty: MemoryExtractorCertainty,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCanonicalKey {
+    pub key: String,
+    pub scope: MemoryScope,
+    pub namespace: String,
+    pub category: MemoryCategory,
+    pub cardinality: MemoryAttributeCardinality,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemorySemanticWriteParams {
+    pub scope: MemoryScope,
+    pub semantic: MemorySemanticFields,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<MemoryWriteEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MemoryProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<MemorySemanticWriteDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_provided_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemorySemanticWriteResponse {
+    pub relation: MemoryWriteRelation,
+    pub canonical_key: MemoryCanonicalKey,
+    pub semantic_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<MemoryRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<MemoryCandidate>,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_memory_id: Option<String>,
+    #[serde(default)]
+    pub evidence_merged: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -377,8 +575,11 @@ pub struct MemoryForgottenNotification {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryCandidateDecision, MemoryCategory, MemoryForgetTarget, MemoryRememberParams,
-        MemoryScope, MemoryScopeKind, MemorySearchParams,
+        MemoryAttribute, MemoryCandidateDecision, MemoryCategory, MemoryDurability,
+        MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetTarget, MemoryIntent,
+        MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams,
+        MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
+        MemorySensitivityHint, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
     };
     use crate::constants;
     use serde_json::json;
@@ -486,6 +687,63 @@ mod tests {
     }
 
     #[test]
+    fn semantic_write_contract_uses_typed_snake_case_fields() {
+        assert_eq!(
+            serde_json::to_value(MemoryIntent::ExplicitStore).expect("intent encode"),
+            json!("explicit_store")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryWriteRelation::SuppressedByRejection)
+                .expect("relation encode"),
+            json!("suppressed_by_rejection")
+        );
+
+        let params = MemorySemanticWriteParams {
+            scope: MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".to_owned(),
+            },
+            semantic: MemorySemanticFields {
+                intent: MemoryIntent::ExplicitStore,
+                explicitness: MemoryExplicitness::Explicit,
+                category: MemoryCategory::Identity,
+                subject: MemorySubject::CurrentUser,
+                attribute: MemoryAttribute::Name,
+                subject_key: None,
+                custom_subject: None,
+                custom_attribute: None,
+                scope_hint: MemoryScopeHint::UserGlobal,
+                durability: MemoryDurability::LongLived,
+                sensitivity: MemorySensitivityHint::None,
+                certainty: MemoryExtractorCertainty::High,
+            },
+            content: "Меня зовут Александр.".to_owned(),
+            value: Some("Александр".to_owned()),
+            evidence: Some(MemoryWriteEvidence {
+                source_thread_id: Some("thread_1".to_owned()),
+                source_turn_id: Some("turn_1".to_owned()),
+                source_item_id: None,
+                source_ref: Some("turn:turn_1".to_owned()),
+                quote_or_span: Some("Меня зовут Александр.".to_owned()),
+                extractor_reason: None,
+            }),
+            provenance: None,
+            disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
+            client_provided_key: Some("llm/freeform/key".to_owned()),
+            confidence: Some(0.95),
+            importance: Some(0.7),
+            metadata: BTreeMap::new(),
+        };
+
+        let encoded = serde_json::to_value(params).expect("semantic write encode");
+        assert_eq!(encoded["semantic"]["intent"], json!("explicit_store"));
+        assert_eq!(encoded["semantic"]["subject"], json!("current_user"));
+        assert_eq!(encoded["semantic"]["attribute"], json!("name"));
+        assert_eq!(encoded["disposition"], json!("accept_active"));
+        assert_eq!(encoded["client_provided_key"], json!("llm/freeform/key"));
+    }
+
+    #[test]
     fn constants_include_memory_methods_and_events() {
         assert_eq!(constants::methods::MEMORY_SEARCH, "memory/search");
         assert_eq!(
@@ -512,6 +770,9 @@ mod tests {
             "memory_search_response.json",
             "memory_remember_params.json",
             "memory_forget_params.json",
+            "memory_semantic_fields.json",
+            "memory_semantic_write_params.json",
+            "memory_semantic_write_response.json",
             "memory_candidate.json",
             "memory_candidates_decide_params.json",
             "memory_changed_notification.json",

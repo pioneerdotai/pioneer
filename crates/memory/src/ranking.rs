@@ -181,6 +181,8 @@ fn category_label(category: MemoryCategory) -> &'static str {
         MemoryCategory::Preference => "preference",
         MemoryCategory::Biography => "biography",
         MemoryCategory::Relationship => "relationship",
+        MemoryCategory::RecurringInstruction => "recurring_instruction",
+        MemoryCategory::ProjectPolicy => "project_policy",
         MemoryCategory::ProjectFact => "project_fact",
         MemoryCategory::ProjectDecision => "project_decision",
         MemoryCategory::Procedure => "procedure",

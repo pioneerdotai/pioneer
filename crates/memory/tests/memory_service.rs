@@ -10,9 +10,12 @@ use pioneer_memory::{
     MemoryRecallParams, MemoryService, MemoryServiceConfig,
 };
 use pioneer_protocol::{
-    MemoryActor, MemoryActorKind, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
-    MemoryGetParams, MemoryListParams, MemoryRememberParams, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySensitivity, MemoryStatus,
+    MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus, MemoryCategory,
+    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
+    MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryRememberParams,
+    MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySensitivity,
+    MemorySensitivityHint, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -114,6 +117,86 @@ fn remember_params(scope: MemoryScope, key: Option<&str>, content: &str) -> Memo
         supersedes: None,
         metadata: BTreeMap::new(),
     }
+}
+
+fn identity_name_semantic(explicitness: MemoryExplicitness) -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: match explicitness {
+            MemoryExplicitness::Explicit => MemoryIntent::ExplicitStore,
+            MemoryExplicitness::Implicit
+            | MemoryExplicitness::None
+            | MemoryExplicitness::Unclear => MemoryIntent::ImplicitCandidate,
+        },
+        explicitness,
+        category: MemoryCategory::Identity,
+        subject: MemorySubject::CurrentUser,
+        attribute: MemoryAttribute::Name,
+        subject_key: None,
+        custom_subject: None,
+        custom_attribute: None,
+        scope_hint: MemoryScopeHint::UserGlobal,
+        durability: MemoryDurability::LongLived,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn relationship_semantic(person_key: &str) -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::Relationship,
+        subject: MemorySubject::Person,
+        attribute: MemoryAttribute::Custom,
+        subject_key: Some(person_key.to_owned()),
+        custom_subject: None,
+        custom_attribute: Some("contact".to_owned()),
+        scope_hint: MemoryScopeHint::UserGlobal,
+        durability: MemoryDurability::LongLived,
+        sensitivity: MemorySensitivityHint::Personal,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn semantic_evidence(turn_id: &str) -> MemoryWriteEvidence {
+    MemoryWriteEvidence {
+        source_thread_id: Some("thread_semantic".to_owned()),
+        source_turn_id: Some(turn_id.to_owned()),
+        source_item_id: Some(format!("item_{turn_id}")),
+        source_ref: Some(format!("turn:{turn_id}")),
+        quote_or_span: Some("evidence quote".to_owned()),
+        extractor_reason: Some("test semantic extraction".to_owned()),
+    }
+}
+
+fn semantic_write_params(
+    semantic: MemorySemanticFields,
+    content: &str,
+    value: &str,
+    disposition: MemorySemanticWriteDisposition,
+    turn_id: &str,
+) -> MemorySemanticWriteParams {
+    MemorySemanticWriteParams {
+        scope: scope(MemoryScopeKind::User, "default"),
+        semantic,
+        content: content.to_owned(),
+        value: Some(value.to_owned()),
+        evidence: Some(semantic_evidence(turn_id)),
+        provenance: None,
+        disposition: Some(disposition),
+        client_provided_key: None,
+        confidence: Some(0.95),
+        importance: Some(0.7),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn metadata_evidence_count(metadata: &BTreeMap<String, serde_json::Value>) -> u64 {
+    metadata
+        .get("evidence")
+        .and_then(|value| value.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 #[tokio::test]
@@ -277,6 +360,441 @@ async fn remember_with_supersedes_marks_old_row_superseded() {
         decisions
             .iter()
             .any(|decision| { decision.action == "remember" && decision.decision == "allow" })
+    );
+}
+
+#[tokio::test]
+async fn semantic_identity_writes_share_canonical_key_and_merge_evidence() {
+    let (store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(310),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "Меня зовут Александр.",
+                "Александр",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_1",
+            ),
+        )
+        .await
+        .expect("first semantic write");
+    assert_eq!(first.relation, MemoryWriteRelation::Novel);
+    assert!(first.created);
+    assert_eq!(first.canonical_key.key, "user/global:identity:self:name");
+    let first_record = first.record.expect("first record");
+
+    let second = service
+        .write_semantic_memory(
+            user_context(311),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "My name is Alexander.",
+                "Александр",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_2",
+            ),
+        )
+        .await
+        .expect("duplicate semantic write");
+    assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
+    assert!(!second.created);
+    assert!(second.evidence_merged);
+    let second_record = second.record.expect("duplicate record");
+    assert_eq!(second_record.id, first_record.id);
+    assert_eq!(metadata_evidence_count(&second_record.metadata), 2);
+    let decisions = store
+        .list_agent_memory_policy_decisions_for_memory(second_record.id.as_str(), 20)
+        .await
+        .expect("semantic write policy decisions");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.action == "semantic_write" && decision.decision == "novel"
+        })
+    );
+    assert!(decisions.iter().any(|decision| {
+        decision.action == "semantic_write" && decision.decision == "duplicate"
+    }));
+
+    let listed = service
+        .list(
+            user_context(312),
+            MemoryListParams {
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                categories: vec![MemoryCategory::Identity],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list identity memories");
+    assert_eq!(listed.records.len(), 1);
+}
+
+#[tokio::test]
+async fn semantic_concurrent_duplicate_writes_leave_one_active_memory() {
+    let (_store, _backend, service) = setup_service().await;
+    let service = Arc::new(service);
+    let first_service = service.clone();
+    let second_service = service.clone();
+
+    let (first, second) = tokio::join!(
+        first_service.write_semantic_memory(
+            user_context(313),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "Меня зовут Александр.",
+                "Александр",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_race_1",
+            ),
+        ),
+        second_service.write_semantic_memory(
+            user_context(313),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "My name is Alexander.",
+                "Александр",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_race_2",
+            ),
+        )
+    );
+    first.expect("first concurrent semantic write");
+    second.expect("second concurrent semantic write");
+
+    let listed = service
+        .list(
+            user_context(314),
+            MemoryListParams {
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                categories: vec![MemoryCategory::Identity],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list identity memories");
+    assert_eq!(listed.records.len(), 1);
+    assert_eq!(
+        listed.records[0].key.as_deref(),
+        Some("user/global:identity:self:name")
+    );
+}
+
+#[tokio::test]
+async fn semantic_write_ignores_client_provided_free_form_key() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        identity_name_semantic(MemoryExplicitness::Explicit),
+        "User: Alexander.",
+        "Alexander",
+        MemorySemanticWriteDisposition::AcceptActive,
+        "turn_semantic_key",
+    );
+    params.client_provided_key = Some("llm/freeform/user-name".to_owned());
+
+    let response = service
+        .write_semantic_memory(user_context(320), params)
+        .await
+        .expect("semantic write");
+    let record = response.record.expect("record");
+    assert_eq!(
+        record.key.as_deref(),
+        Some("user/global:identity:self:name")
+    );
+    assert_ne!(record.key.as_deref(), Some("llm/freeform/user-name"));
+    assert_eq!(
+        record
+            .metadata
+            .get("client_provided_key")
+            .and_then(serde_json::Value::as_str),
+        Some("llm/freeform/user-name")
+    );
+}
+
+#[tokio::test]
+async fn semantic_write_requires_evidence() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        identity_name_semantic(MemoryExplicitness::Explicit),
+        "User: Alexander.",
+        "Alexander",
+        MemorySemanticWriteDisposition::AcceptActive,
+        "turn_semantic_no_evidence",
+    );
+    params.evidence = None;
+
+    let error = service
+        .write_semantic_memory(user_context(325), params)
+        .await
+        .expect_err("semantic writes without evidence must fail");
+    assert!(error.to_string().contains("requires evidence"));
+}
+
+#[tokio::test]
+async fn semantic_single_value_explicit_update_supersedes_same_key() {
+    let (store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(330),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_update_1",
+            ),
+        )
+        .await
+        .expect("first semantic write")
+        .record
+        .expect("first record");
+
+    let second = service
+        .write_semantic_memory(
+            user_context(331),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alex.",
+                "Alex",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_update_2",
+            ),
+        )
+        .await
+        .expect("semantic update");
+
+    assert_eq!(second.relation, MemoryWriteRelation::CompatibleUpdate);
+    assert_eq!(
+        second.superseded_memory_id.as_deref(),
+        Some(first.id.as_str())
+    );
+    let second_record = second.record.expect("updated record");
+    assert_eq!(
+        second_record.key.as_deref(),
+        Some("user/global:identity:self:name")
+    );
+
+    let old_row = store
+        .get_agent_memory_record(first.id.as_str(), true)
+        .await
+        .expect("load old row")
+        .expect("old row");
+    assert_eq!(old_row.status, MemoryStatus::Superseded);
+
+    let listed = service
+        .list(
+            user_context(332),
+            MemoryListParams {
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                categories: vec![MemoryCategory::Identity],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list active identity memories");
+    assert_eq!(listed.records.len(), 1);
+    assert_eq!(listed.records[0].id, second_record.id);
+}
+
+#[tokio::test]
+async fn semantic_implicit_contradiction_does_not_create_active_duplicate() {
+    let (_store, _backend, service) = setup_service().await;
+    service
+        .write_semantic_memory(
+            user_context(340),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_contradiction_1",
+            ),
+        )
+        .await
+        .expect("first semantic write");
+
+    let contradiction = service
+        .write_semantic_memory(
+            user_context(341),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "Maybe the user's name is Alexey.",
+                "Alexey",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_contradiction_2",
+            ),
+        )
+        .await
+        .expect("implicit contradiction");
+
+    assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
+    assert!(contradiction.record.is_none());
+    assert_eq!(
+        contradiction
+            .candidate
+            .as_ref()
+            .expect("suppressed candidate")
+            .status,
+        MemoryCandidateStatus::Rejected
+    );
+
+    let listed = service
+        .list(
+            user_context(342),
+            MemoryListParams {
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                categories: vec![MemoryCategory::Identity],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list active identity memories");
+    assert_eq!(listed.records.len(), 1);
+    assert!(listed.records[0].content.contains("Alexander"));
+}
+
+#[tokio::test]
+async fn semantic_pending_candidate_duplicates_merge_evidence() {
+    let (_store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(360),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name may be Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_semantic_pending_1",
+            ),
+        )
+        .await
+        .expect("first candidate");
+    assert_eq!(first.relation, MemoryWriteRelation::Novel);
+    let first_candidate = first.candidate.expect("first pending candidate");
+
+    let second = service
+        .write_semantic_memory(
+            user_context(361),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "User is called Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_semantic_pending_2",
+            ),
+        )
+        .await
+        .expect("duplicate candidate");
+    assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
+    assert!(second.evidence_merged);
+    let second_candidate = second.candidate.expect("merged pending candidate");
+    assert_eq!(second_candidate.id, first_candidate.id);
+    assert_eq!(metadata_evidence_count(&second_candidate.metadata), 2);
+}
+
+#[tokio::test]
+async fn semantic_route_to_candidate_policy_is_dormant_boundary() {
+    let (_store, _backend, service) = setup_service().await;
+    let response = service
+        .write_semantic_memory(
+            user_context(365),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name may be Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_boundary",
+            ),
+        )
+        .await
+        .expect("policy boundary write");
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+}
+
+#[tokio::test]
+async fn semantic_rejected_candidate_suppresses_repeat_suggestion() {
+    let (_store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(370),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name may be Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RejectSuppressed,
+                "turn_semantic_reject_1",
+            ),
+        )
+        .await
+        .expect("first suppressed candidate");
+    assert_eq!(first.relation, MemoryWriteRelation::Novel);
+    assert_eq!(
+        first.candidate.expect("rejected candidate").status,
+        MemoryCandidateStatus::Rejected
+    );
+
+    let second = service
+        .write_semantic_memory(
+            user_context(371),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "User is called Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_semantic_reject_2",
+            ),
+        )
+        .await
+        .expect("repeat suppressed candidate");
+    assert_eq!(second.relation, MemoryWriteRelation::SuppressedByRejection);
+    assert!(second.candidate.is_none());
+    assert!(second.record.is_none());
+}
+
+#[tokio::test]
+async fn semantic_multi_value_subjects_get_distinct_child_keys() {
+    let (_store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(380),
+            semantic_write_params(
+                relationship_semantic("alice"),
+                "Alice is a project contact.",
+                "Alice is a project contact.",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_multi_1",
+            ),
+        )
+        .await
+        .expect("first relationship")
+        .record
+        .expect("first relationship record");
+    let second = service
+        .write_semantic_memory(
+            user_context(381),
+            semantic_write_params(
+                relationship_semantic("bob"),
+                "Bob is a project contact.",
+                "Bob is a project contact.",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_multi_2",
+            ),
+        )
+        .await
+        .expect("second relationship")
+        .record
+        .expect("second relationship record");
+
+    assert_ne!(first.key, second.key);
+    assert_eq!(
+        first
+            .metadata
+            .get("semantic")
+            .and_then(|value| value.get("cardinality"))
+            .and_then(serde_json::Value::as_str),
+        Some("MultiValue")
     );
 }
 

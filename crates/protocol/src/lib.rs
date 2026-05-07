@@ -43,14 +43,18 @@ pub use mcp::{
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
 };
 pub use memory::{
-    MemoryActor, MemoryActorKind, MemoryCandidate, MemoryCandidateCreatedNotification,
-    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryRecord,
-    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemoryActor, MemoryActorKind, MemoryAttribute, MemoryAttributeCardinality, MemoryCandidate,
+    MemoryCandidateCreatedNotification, MemoryCandidateDecision, MemoryCandidateStatus,
+    MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse, MemoryCandidatesListParams,
+    MemoryCandidatesListResponse, MemoryCanonicalKey, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty,
+    MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification,
+    MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
+    MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
+    MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
+    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
+    MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceKind,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use provider::{

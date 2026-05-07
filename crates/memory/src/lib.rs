@@ -7,6 +7,7 @@ mod policy;
 mod ranking;
 mod recall;
 mod service;
+mod write;
 
 pub use backend::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
@@ -21,3 +22,4 @@ pub use memvid::{MemvidMemoryBackend, MemvidMemoryBackendConfig, memvid_search_r
 pub use policy::{MemoryPolicyDecision, MemoryPolicyEngine};
 pub use recall::{MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse};
 pub use service::MemoryService;
+pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

@@ -28,7 +28,8 @@ pub async fn insert_candidate<C: ConnectionTrait>(
 
     if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
         if let Some(existing) =
-            find_candidate_by_dedupe(db, &resolved_scope, namespace.as_str(), dedupe_key).await?
+            find_any_candidate_by_dedupe(db, &resolved_scope, namespace.as_str(), dedupe_key)
+                .await?
         {
             return Ok(existing);
         }
@@ -114,6 +115,67 @@ pub async fn list_candidates<C: ConnectionTrait>(
         .context("failed to list memory candidates")
 }
 
+pub async fn find_candidate_by_dedupe<C: ConnectionTrait>(
+    db: &C,
+    resolved_scope: &MemoryScopeResolution,
+    namespace: &str,
+    dedupe_key: &str,
+    statuses: &[MemoryCandidateStatus],
+) -> Result<Option<agent_memory_candidate::Model>> {
+    let mut query = agent_memory_candidate::Entity::find()
+        .filter(
+            agent_memory_candidate::Column::ScopeKind
+                .eq(memory_scope_kind_to_db(resolved_scope.scope.kind)),
+        )
+        .filter(
+            agent_memory_candidate::Column::ScopeKeyHash.eq(resolved_scope.scope_key_hash.clone()),
+        )
+        .filter(agent_memory_candidate::Column::Namespace.eq(namespace.to_owned()))
+        .filter(agent_memory_candidate::Column::DedupeKey.eq(dedupe_key.to_owned()));
+    if !statuses.is_empty() {
+        query = query.filter(
+            agent_memory_candidate::Column::Status.is_in(
+                statuses
+                    .iter()
+                    .map(|status| memory_candidate_status_to_db(*status).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    query
+        .one(db)
+        .await
+        .with_context(|| format!("failed to find memory candidate by dedupe key `{dedupe_key}`"))
+}
+
+pub async fn update_candidate_metadata<C: ConnectionTrait>(
+    db: &C,
+    candidate_id: &str,
+    reason: String,
+    metadata_json: Option<String>,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<agent_memory_candidate::Model>> {
+    let affected = agent_memory_candidate::Entity::update_many()
+        .col_expr(agent_memory_candidate::Column::Reason, Expr::value(reason))
+        .col_expr(
+            agent_memory_candidate::Column::MetadataJson,
+            Expr::value(metadata_json),
+        )
+        .filter(agent_memory_candidate::Column::Id.eq(candidate_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to update memory candidate `{candidate_id}` metadata"))?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(None);
+    }
+    let _ = now;
+    agent_memory_candidate::Entity::find_by_id(candidate_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to reload updated memory candidate")
+}
+
 pub async fn decide_candidate<C: ConnectionTrait>(
     db: &C,
     decision: AgentMemoryCandidateDecisionRecord,
@@ -176,25 +238,13 @@ pub async fn decide_candidate<C: ConnectionTrait>(
         .context("failed to reload decided memory candidate")
 }
 
-async fn find_candidate_by_dedupe<C: ConnectionTrait>(
+async fn find_any_candidate_by_dedupe<C: ConnectionTrait>(
     db: &C,
     resolved_scope: &MemoryScopeResolution,
     namespace: &str,
     dedupe_key: &str,
 ) -> Result<Option<agent_memory_candidate::Model>> {
-    agent_memory_candidate::Entity::find()
-        .filter(
-            agent_memory_candidate::Column::ScopeKind
-                .eq(memory_scope_kind_to_db(resolved_scope.scope.kind)),
-        )
-        .filter(
-            agent_memory_candidate::Column::ScopeKeyHash.eq(resolved_scope.scope_key_hash.clone()),
-        )
-        .filter(agent_memory_candidate::Column::Namespace.eq(namespace.to_owned()))
-        .filter(agent_memory_candidate::Column::DedupeKey.eq(dedupe_key.to_owned()))
-        .one(db)
-        .await
-        .with_context(|| format!("failed to find memory candidate by dedupe key `{dedupe_key}`"))
+    find_candidate_by_dedupe(db, resolved_scope, namespace, dedupe_key, &[]).await
 }
 
 fn scope_condition(scopes: &[MemoryScopeResolution]) -> Condition {

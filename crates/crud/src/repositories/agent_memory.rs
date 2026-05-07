@@ -240,6 +240,29 @@ pub async fn find_active_memory_by_scoped_key<C: ConnectionTrait>(
         .with_context(|| format!("failed to find active memory by key `{key}`"))
 }
 
+pub async fn update_memory_metadata<C: ConnectionTrait>(
+    db: &C,
+    memory_id: &str,
+    metadata_json: Option<String>,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<agent_memory::Model>> {
+    let affected = agent_memory::Entity::update_many()
+        .col_expr(
+            agent_memory::Column::MetadataJson,
+            Expr::value(metadata_json),
+        )
+        .col_expr(agent_memory::Column::UpdatedAt, Expr::value(now))
+        .filter(agent_memory::Column::Id.eq(memory_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to update agent memory `{memory_id}` metadata"))?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(None);
+    }
+    find_memory_by_id(db, memory_id, true).await
+}
+
 pub async fn list_memory_records<C: ConnectionTrait>(
     db: &C,
     filter: AgentMemoryListFilter,
