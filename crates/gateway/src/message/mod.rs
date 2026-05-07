@@ -256,10 +256,17 @@ impl MessageProcessor {
     }
 
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
+        let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
+            Arc::downgrade(self),
+        ));
         self.agent_manager
-            .set_memory_provider(Some(Arc::new(
-                crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(self)),
-            )))
+            .set_memory_provider(Some(memory_provider.clone()))
+            .await;
+        self.agent_manager
+            .set_memory_write_provider(Some(memory_provider.clone()))
+            .await;
+        self.agent_manager
+            .set_memory_post_turn_extractor_provider(Some(memory_provider))
             .await;
         self.agent_manager
             .set_memory_turn_policy_provider(Some(Arc::new(
@@ -279,6 +286,10 @@ impl MessageProcessor {
     #[allow(dead_code)]
     pub(crate) fn memory_runtime(&self) -> Arc<GatewayMemoryRuntime> {
         self.memory_runtime.clone()
+    }
+
+    pub(crate) fn provider_registry(&self) -> Arc<ProviderRegistry> {
+        self.provider_registry.clone()
     }
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
@@ -710,6 +721,7 @@ impl MessageProcessor {
                         mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
                         ..pioneer_agent::MemoryActiveRecallConfig::default()
                     },
+                    ..pioneer_agent::MemoryLoopConfig::default()
                 },
                 budget: pioneer_tools::ToolLoopBudgetConfig::default(),
                 retry: pioneer_tools::ToolRetryBudgetConfig::default(),

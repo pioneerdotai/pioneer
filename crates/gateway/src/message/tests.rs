@@ -1432,6 +1432,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
                 ..pioneer_agent::MemoryActiveRecallConfig::default()
             },
+            ..pioneer_agent::MemoryLoopConfig::default()
         },
         budget: ToolLoopBudgetConfig::default(),
         retry: ToolRetryBudgetConfig::default(),

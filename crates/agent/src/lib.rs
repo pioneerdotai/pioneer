@@ -37,14 +37,16 @@ use hooks::AgentToolBundleArtifactStore;
 use manager_recovery::apply_recovery_adjustments;
 use memory::install_memory_hooks;
 pub use memory::{
-    AgentActiveMemoryDecisionProvider, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
-    MemoryActiveContextPolicy, MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext,
-    MemoryActiveRecallDecisionRequest, MemoryActiveRecallMode, MemoryClassifierFallbackPolicy,
-    MemoryExtractionPolicy, MemoryLoopConfig, MemoryMutationToolPolicy, MemoryPolicyReasonCode,
-    MemoryPolicySource, MemoryPromptPolicy, MemoryReadToolPolicy, MemoryRecallItem,
-    MemoryRecallPolicy, MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization,
-    MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyOverride,
-    MemoryTurnPolicyRequest,
+    AgentActiveMemoryDecisionProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
+    AgentMemoryTurnPolicyProvider, AgentMemoryWriteProvider, MemoryActiveContextPolicy,
+    MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
+    MemoryActiveRecallMode, MemoryClassifierFallbackPolicy, MemoryExtractionPolicy,
+    MemoryLoopConfig, MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem,
+    MemoryManifestRequest, MemoryMutationToolPolicy, MemoryPolicyReasonCode, MemoryPolicySource,
+    MemoryPostTurnExtractorConfig, MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
+    MemoryPromptPolicy, MemoryReadToolPolicy, MemoryRecallItem, MemoryRecallPolicy,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
@@ -1352,6 +1354,8 @@ struct AgentManagerState {
 fn build_agent_hook_runtime(
     runtime: Option<Arc<HookRuntime>>,
     memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
+    memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
+    memory_post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     memory_config: MemoryLoopConfig,
 ) -> Result<
@@ -1375,6 +1379,8 @@ fn build_agent_hook_runtime(
     install_memory_hooks(
         &runtime,
         memory_provider,
+        memory_write_provider,
+        memory_post_turn_extractor_provider,
         memory_turn_policy_provider,
         tool_bundle_artifacts.clone(),
         memory_config,
@@ -1393,6 +1399,9 @@ pub struct AgentManager {
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
+    memory_write_provider: RwLock<Option<Arc<dyn AgentMemoryWriteProvider>>>,
+    memory_post_turn_extractor_provider:
+        RwLock<Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>>,
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
@@ -1424,6 +1433,8 @@ impl AgentManager {
             mcp_tool_provider,
             task_tool_provider: RwLock::new(None),
             memory_provider: RwLock::new(memory_provider),
+            memory_write_provider: RwLock::new(None),
+            memory_post_turn_extractor_provider: RwLock::new(None),
             memory_turn_policy_provider: RwLock::new(None),
             hook_runtime: RwLock::new(None),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
@@ -1436,6 +1447,20 @@ impl AgentManager {
 
     pub async fn set_memory_provider(&self, provider: Option<Arc<dyn AgentMemoryProvider>>) {
         *self.memory_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_write_provider(
+        &self,
+        provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
+    ) {
+        *self.memory_write_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_post_turn_extractor_provider(
+        &self,
+        provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
+    ) {
+        *self.memory_post_turn_extractor_provider.write().await = provider;
     }
 
     pub async fn set_memory_turn_policy_provider(
@@ -1495,10 +1520,18 @@ impl AgentManager {
         let event_hub = Arc::new(AgentEventHub::new());
 
         let memory_provider = self.memory_provider.read().await.clone();
+        let memory_write_provider = self.memory_write_provider.read().await.clone();
+        let memory_post_turn_extractor_provider = self
+            .memory_post_turn_extractor_provider
+            .read()
+            .await
+            .clone();
         let memory_turn_policy_provider = self.memory_turn_policy_provider.read().await.clone();
         let (hook_runtime, tool_bundle_artifacts) = build_agent_hook_runtime(
             self.hook_runtime.read().await.clone(),
             memory_provider,
+            memory_write_provider,
+            memory_post_turn_extractor_provider,
             memory_turn_policy_provider,
             self.tool_loop_config.memory.clone(),
         )?;

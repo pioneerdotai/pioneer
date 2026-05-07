@@ -33,7 +33,7 @@ pub fn render_memory_turn_policy_classifier_prompt(
             "  \"reasonCode\": \"default_allow_read\"\n",
             "}}\n\n",
             "Policy semantics:\n",
-            "- normal: allow recall, full prompt, read tools, memory_remember, memory_forget, and active memory. memory_remember may be used proactively for stable durable future-useful facts.\n",
+            "- normal: allow recall, full prompt, read tools, memory_remember, memory_forget, post-turn extraction, and active memory. memory_remember and post-turn extraction may be used proactively for stable durable future-useful facts.\n",
             "- memory_no_use: disable recall, prompt, read tools, memory_remember, memory_forget, post-turn extraction, and active memory.\n",
             "- memory_no_save: allow recall/read tools and active memory but disable memory_remember and post-turn extraction. memory_forget may remain allowed.\n",
             "- explicit_remember: allow memory_remember, active memory, and normal read tools.\n",
@@ -87,7 +87,9 @@ mod tests {
                 classifier_fallback_label: "default_allow".to_owned(),
             });
 
-        assert!(prompt.contains("memory_remember may be used proactively"));
+        assert!(
+            prompt.contains("memory_remember and post-turn extraction may be used proactively")
+        );
         assert!(prompt.contains("stable durable future-useful facts"));
     }
 }

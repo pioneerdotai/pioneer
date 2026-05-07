@@ -81,6 +81,8 @@ impl AgentPostTurnHookDispatchPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct AgentTurnPostTurnSummary {
     status: TurnPostTurnStatus,
+    model: Option<String>,
+    model_provider: Option<String>,
     user_text: String,
     assistant_text: String,
     error: Option<String>,
@@ -89,7 +91,9 @@ pub(super) struct AgentTurnPostTurnSummary {
 }
 
 impl AgentTurnPostTurnSummary {
-    pub(super) fn succeeded(
+    pub(super) fn succeeded_with_model(
+        model: Option<String>,
+        model_provider: Option<String>,
         user_text: String,
         assistant_text: String,
         tool_events: Vec<TurnPostTurnToolEventSummary>,
@@ -97,6 +101,8 @@ impl AgentTurnPostTurnSummary {
     ) -> Self {
         Self {
             status: TurnPostTurnStatus::Succeeded,
+            model,
+            model_provider,
             user_text,
             assistant_text,
             error: None,
@@ -132,6 +138,8 @@ impl AgentTurnPostTurnSummary {
         ));
         Self {
             status,
+            model: None,
+            model_provider: None,
             user_text,
             assistant_text,
             error: Some(error),
@@ -145,8 +153,10 @@ impl AgentTurnPostTurnSummary {
     }
 
     fn into_hook_input(self) -> TurnPostTurnHookInput {
-        TurnPostTurnHookInput::from_parts(
+        TurnPostTurnHookInput::from_parts_with_model(
             self.status,
+            self.model.as_deref(),
+            self.model_provider.as_deref(),
             Some(self.user_text.as_str()),
             Some(self.assistant_text.as_str()),
             self.error.as_deref(),

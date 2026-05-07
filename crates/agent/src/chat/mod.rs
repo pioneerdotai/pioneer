@@ -1257,6 +1257,8 @@ async fn execute_agent_provider_response(
 
     let tool_loop_config = tool_loop_config.normalized();
     let provider_tool_calling = provider.capabilities().tool_calling;
+    let post_turn_model = model.clone();
+    let post_turn_model_provider = provider.name().to_owned();
     let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
 
     let effective_policy_set = run_agent_turn_policy_hook_phase(
@@ -1477,7 +1479,9 @@ async fn execute_agent_provider_response(
                 turn_control
                     .succeed_recovery_attempt(turn_id, recovery.take())
                     .await;
-                let summary = AgentTurnPostTurnSummary::succeeded(
+                let summary = AgentTurnPostTurnSummary::succeeded_with_model(
+                    Some(post_turn_model.clone()),
+                    Some(post_turn_model_provider.clone()),
                     extract_user_text(input),
                     assistant_text,
                     Vec::new(),
@@ -2717,7 +2721,9 @@ async fn execute_agent_provider_response(
 
     match turn_result {
         Ok(()) => {
-            let summary = AgentTurnPostTurnSummary::succeeded(
+            let summary = AgentTurnPostTurnSummary::succeeded_with_model(
+                Some(post_turn_model.clone()),
+                Some(post_turn_model_provider.clone()),
                 extract_user_text(input),
                 post_turn_assistant_text,
                 post_turn_tool_events,

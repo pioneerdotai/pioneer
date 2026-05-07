@@ -9,7 +9,7 @@ use pioneer_protocol::{
     MemoryCandidatesRejectParams, MemoryCandidatesSuppressSimilarParams, MemoryChangeKind,
     MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse,
     MemoryForgottenNotification, MemoryGetParams, MemoryListParams, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScopeKind, MemorySearchParams,
+    MemoryRememberResponse, MemoryScopeKind, MemorySearchParams, MemorySemanticWriteResponse,
 };
 
 impl MessageProcessor {
@@ -867,6 +867,34 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+    }
+
+    pub(crate) async fn send_memory_changed_after_semantic_write(
+        &self,
+        context: &MemoryOperationContext,
+        response: &MemorySemanticWriteResponse,
+    ) {
+        let Some(workspace_id) = context.workspace_id.as_deref() else {
+            return;
+        };
+        if let Some(record) = response.record.as_ref() {
+            let notification = MemoryChangedNotification {
+                memory_id: record.id.clone(),
+                scope: record.scope.clone(),
+                change_kind: if response.created {
+                    MemoryChangeKind::Created
+                } else {
+                    MemoryChangeKind::Updated
+                },
+                record: Some(record.clone()),
+            };
+            self.send_notification_to_workspace_connections(
+                workspace_id,
+                events::MEMORY_CHANGED,
+                &notification,
+            )
+            .await;
+        }
     }
 
     #[allow(dead_code)]

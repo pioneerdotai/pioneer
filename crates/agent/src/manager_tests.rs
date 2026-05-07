@@ -118,6 +118,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 mode: super::MemoryActiveRecallMode::DeterministicOnly,
                 ..super::MemoryActiveRecallConfig::default()
             },
+            ..super::MemoryLoopConfig::default()
         },
         budget: ToolLoopBudgetConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
@@ -4779,7 +4780,7 @@ async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
     assert_eq!(policy_requests.len(), 1);
     assert_eq!(
         policy_requests[0].default_policy.post_turn_extraction,
-        MemoryExtractionPolicy::Disabled
+        MemoryExtractionPolicy::Allow
     );
     assert_eq!(memory_provider.tool_contexts().len(), 1);
     assert_eq!(memory_provider.recall_contexts().len(), 1);

@@ -582,6 +582,10 @@ impl TurnPostTurnDomainEventSummary {
 pub struct TurnPostTurnHookInput {
     pub status: TurnPostTurnStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_text: Option<HookTextPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_text: Option<HookTextPreview>,
@@ -602,11 +606,38 @@ impl TurnPostTurnHookInput {
         user_text: Option<impl AsRef<str>>,
         assistant_text: Option<impl AsRef<str>>,
         error: Option<impl AsRef<str>>,
+        tool_events: Vec<TurnPostTurnToolEventSummary>,
+        domain_events: Vec<TurnPostTurnDomainEventSummary>,
+        limits: TurnPostTurnHookInputLimits,
+    ) -> Self {
+        Self::from_parts_with_model(
+            status,
+            None::<String>,
+            None::<String>,
+            user_text,
+            assistant_text,
+            error,
+            tool_events,
+            domain_events,
+            limits,
+        )
+    }
+
+    pub fn from_parts_with_model(
+        status: TurnPostTurnStatus,
+        model: Option<impl AsRef<str>>,
+        model_provider: Option<impl AsRef<str>>,
+        user_text: Option<impl AsRef<str>>,
+        assistant_text: Option<impl AsRef<str>>,
+        error: Option<impl AsRef<str>>,
         mut tool_events: Vec<TurnPostTurnToolEventSummary>,
         mut domain_events: Vec<TurnPostTurnDomainEventSummary>,
         limits: TurnPostTurnHookInputLimits,
     ) -> Self {
         let limits = limits.normalized();
+        let model = model.and_then(|value| bounded_nonempty_string(value.as_ref(), 160));
+        let model_provider =
+            model_provider.and_then(|value| bounded_nonempty_string(value.as_ref(), 160));
         let user_text = user_text
             .filter(|text| !text.as_ref().is_empty())
             .map(|text| HookTextPreview::from_text(text, limits.user_text_preview_max_chars));
@@ -629,6 +660,8 @@ impl TurnPostTurnHookInput {
 
         Self {
             status,
+            model,
+            model_provider,
             user_text,
             assistant_text,
             error,
@@ -638,6 +671,15 @@ impl TurnPostTurnHookInput {
             domain_events_truncated,
             limits,
         }
+    }
+}
+
+fn bounded_nonempty_string(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(max_chars.max(1)).collect())
     }
 }
 

@@ -1,16 +1,22 @@
 use crate::message::MessageProcessor;
 use async_trait::async_trait;
 use pioneer_agent::{
-    AgentMemoryProvider, MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
+    MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
+    MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
+    MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
+    MemoryToolMaterialization, MemoryTurnContext,
 };
 use pioneer_crud::workspace_agent_memory_scope_key;
 use pioneer_memory::{MemoryOperationContext, MemoryRecallParams};
 use pioneer_protocol::{
-    MemoryActor, MemoryActorKind, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
-    MemoryGetParams, MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryScope,
-    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySensitivity, MemorySourceKind,
+    MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
+    MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
+    MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryScope, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySensitivity, MemorySourceKind, MemoryStatus,
 };
+use pioneer_provider::{ChatMessage, ChatRequest};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -29,6 +35,7 @@ const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
 const SNIPPET_MAX_CHARS: usize = 280;
+const POST_TURN_EXTRACTOR_MAX_TOKENS: u32 = 1_200;
 
 #[derive(Clone)]
 pub(crate) struct GatewayMemoryProvider {
@@ -123,6 +130,168 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[async_trait]
+impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
+    async fn extract_post_turn_memory_json(
+        &self,
+        context: MemoryPostTurnExtractorContext,
+        request: MemoryPostTurnExtractorRequest,
+    ) -> Result<String, String> {
+        let processor = self.processor()?;
+        let provider_name = context
+            .model_provider
+            .as_deref()
+            .ok_or_else(|| "missing model provider for memory post-turn extractor".to_owned())?;
+        let model = context
+            .model
+            .as_deref()
+            .ok_or_else(|| "missing model for memory post-turn extractor".to_owned())?;
+        let provider = processor
+            .provider_registry()
+            .get_or_create(provider_name)
+            .map_err(|error| {
+                format!("failed to create memory post-turn extractor provider: {error}")
+            })?;
+        let prompt = request.render_prompt();
+        let response = provider
+            .chat(ChatRequest {
+                model: model.to_owned(),
+                messages: vec![ChatMessage::user(prompt)],
+                temperature: Some(0.0),
+                max_tokens: Some(POST_TURN_EXTRACTOR_MAX_TOKENS),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                compiled_prompt: None,
+            })
+            .await
+            .map_err(|error| format!("memory post-turn extractor request failed: {error:#}"))?;
+        Ok(response.text)
+    }
+}
+
+#[async_trait]
+impl AgentMemoryWriteProvider for GatewayMemoryProvider {
+    async fn load_memory_manifest(
+        &self,
+        context: MemoryTurnContext,
+        request: MemoryManifestRequest,
+    ) -> Result<MemoryManifest, String> {
+        let processor = self.processor()?;
+        let runtime = processor.memory_runtime();
+        if let Err(error) = runtime.ensure_enabled() {
+            return Ok(MemoryManifest {
+                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
+                ..MemoryManifest::default()
+            });
+        }
+
+        let operation_context = runtime.operation_context_for_turn(&context, None);
+        let active = runtime
+            .service()
+            .list(
+                operation_context.clone(),
+                MemoryListParams {
+                    statuses: vec![MemoryStatus::Active],
+                    limit: Some(request.max_items as u32),
+                    ..MemoryListParams::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let candidates = runtime
+            .service()
+            .list_candidates(
+                operation_context,
+                MemoryCandidatesListParams {
+                    statuses: vec![
+                        MemoryCandidateStatus::Pending,
+                        MemoryCandidateStatus::PendingSilent,
+                        MemoryCandidateStatus::AskOnUse,
+                        MemoryCandidateStatus::NeedsReview,
+                        MemoryCandidateStatus::Rejected,
+                        MemoryCandidateStatus::AutoRejected,
+                        MemoryCandidateStatus::ReviewDisabledRejected,
+                        MemoryCandidateStatus::MergedDuplicate,
+                    ],
+                    limit: Some(request.max_items as u32),
+                    ..MemoryCandidatesListParams::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+
+        let active_count = active.records.len();
+        let candidate_count = candidates.candidates.len();
+        Ok(MemoryManifest {
+            active: active
+                .records
+                .into_iter()
+                .take(request.max_items)
+                .map(|record| MemoryManifestActiveItem {
+                    memory_id: record.id,
+                    scope: record.scope,
+                    category: record.category,
+                    key: record.key,
+                    content_preview: truncate_chars(
+                        record.content.as_str(),
+                        request.max_item_chars,
+                    ),
+                    updated_at: record.updated_at,
+                    status: record.status,
+                })
+                .collect(),
+            candidates: candidates
+                .candidates
+                .into_iter()
+                .take(request.max_items)
+                .map(|candidate| MemoryManifestCandidateItem {
+                    candidate_id: candidate.id,
+                    scope: candidate.scope,
+                    category: candidate.category,
+                    key: candidate.key,
+                    content_preview: truncate_chars(
+                        candidate.candidate_text.as_str(),
+                        request.max_item_chars,
+                    ),
+                    status: candidate.status,
+                    created_at: candidate.created_at,
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+            truncated: active_count > request.max_items || candidate_count > request.max_items,
+        })
+    }
+
+    async fn write_semantic_memory(
+        &self,
+        context: MemoryTurnContext,
+        params: MemorySemanticWriteParams,
+    ) -> Result<MemorySemanticWriteResponse, String> {
+        let processor = self.processor()?;
+        let runtime = processor.memory_runtime();
+        runtime
+            .ensure_enabled()
+            .map_err(|error| format!("{error:#}"))?;
+        let operation_context = runtime.operation_context_for_turn(
+            &context,
+            Some(MemoryActor {
+                kind: MemoryActorKind::Extractor,
+                id: Some("memory.post_turn_extractor".to_owned()),
+            }),
+        );
+        let response = runtime
+            .service()
+            .write_semantic_memory(operation_context.clone(), params)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        processor
+            .send_memory_changed_after_semantic_write(&operation_context, &response)
+            .await;
+        Ok(response)
     }
 }
 

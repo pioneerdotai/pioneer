@@ -10,14 +10,21 @@ use pioneer_hooks::{
     HookSourceId, HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionDependencies,
     HookSubscriptionId, HookSubscriptionVisibility, HookToolBundleId, HookToolName, HookValue,
     PolicyContribution, PromptContextContribution, PromptSectionContribution,
-    ToolBundleContribution, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
-    TurnPrePromptContextHookInput,
+    ToolBundleContribution, TurnPostTurnHookInput, TurnPostTurnStatus, TurnPrePolicyHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
-    MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
+    MemoryPostTurnExtractorPromptInput, MemoryRecallPromptInput, MemoryRecallPromptItem,
+    MemoryRecallPromptPolicy, render_memory_post_turn_extractor_prompt,
     render_memory_recall_context_block, render_memory_recall_prompt,
 };
-use pioneer_protocol::{MemoryCategory, MemoryScope, MemoryScopeKind, ThreadMode};
+use pioneer_protocol::{
+    MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryDurability,
+    MemoryExplicitness, MemoryIntent, MemoryProvenance, MemoryScope, MemoryScopeHint,
+    MemoryScopeKind, MemorySemanticFields, MemorySemanticWriteDisposition,
+    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivityHint,
+    MemorySourceKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, ThreadMode,
+};
 use pioneer_tools::ToolExtensionBundle;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -52,7 +59,11 @@ const MEMORY_PROMPT_CONTRACT_HOOK_ID: &str = "memory.prompt_contract";
 const MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID: &str = "memory.prompt_contract.default";
 const MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID: &str = "memory.prompt_contract.section";
 const MEMORY_PROMPT_CONTRACT_SECTION_ID: &str = "memory_recall";
+const MEMORY_POST_TURN_EXTRACTOR_HOOK_ID: &str = "memory.post_turn_extractor";
+const MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID: &str = "memory.post_turn_extractor.default";
+const MEMORY_POST_TURN_EXTRACTOR_VERSION: &str = "phase_19_v1";
 const MEMORY_ACTIVE_RECALL_GENERIC_QUERY: &str = "durable user identity preferences biography communication style recurring instructions project facts project decisions procedures constraints todos ongoing tasks";
+const MEMORY_DEFAULT_USER_SCOPE_KEY: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTurnContext {
@@ -165,15 +176,73 @@ impl MemoryActiveRecallConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPostTurnExtractorConfig {
+    pub enabled: bool,
+    pub provider_enabled: bool,
+    pub proactive_writes_enabled: bool,
+    pub await_policy: HookAwaitPolicy,
+    pub timeout_ms: u64,
+    pub max_facts_per_turn: usize,
+    pub max_input_chars: usize,
+    pub max_manifest_items: usize,
+    pub max_fact_content_chars: usize,
+    pub max_evidence_chars: usize,
+    pub strict_debug: bool,
+}
+
+impl Default for MemoryPostTurnExtractorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider_enabled: true,
+            proactive_writes_enabled: true,
+            await_policy: HookAwaitPolicy::FireAndRecord,
+            timeout_ms: 1_500,
+            max_facts_per_turn: 8,
+            max_input_chars: 8_000,
+            max_manifest_items: 24,
+            max_fact_content_chars: 800,
+            max_evidence_chars: 500,
+            strict_debug: false,
+        }
+    }
+}
+
+impl MemoryPostTurnExtractorConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            provider_enabled: self.provider_enabled,
+            proactive_writes_enabled: self.proactive_writes_enabled,
+            await_policy: match self.await_policy {
+                HookAwaitPolicy::Background | HookAwaitPolicy::FireAndRecord => self.await_policy,
+                HookAwaitPolicy::Blocking | HookAwaitPolicy::Deadline => {
+                    HookAwaitPolicy::FireAndRecord
+                }
+            },
+            timeout_ms: self.timeout_ms.max(1),
+            max_facts_per_turn: self.max_facts_per_turn.max(1),
+            max_input_chars: self.max_input_chars.max(1),
+            max_manifest_items: self.max_manifest_items.max(1),
+            max_fact_content_chars: self.max_fact_content_chars.max(1),
+            max_evidence_chars: self.max_evidence_chars.max(1),
+            strict_debug: self.strict_debug,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemoryLoopConfig {
     pub active_recall: MemoryActiveRecallConfig,
+    pub post_turn_extractor: MemoryPostTurnExtractorConfig,
 }
 
 impl MemoryLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
             active_recall: self.active_recall.normalized(),
+            post_turn_extractor: self.post_turn_extractor.normalized(),
         }
     }
 }
@@ -491,7 +560,7 @@ impl MemoryTurnPolicy {
             read_tools: MemoryReadToolPolicy::Allow,
             remember_tool: MemoryMutationToolPolicy::Allow,
             forget_tool: MemoryMutationToolPolicy::Allow,
-            post_turn_extraction: MemoryExtractionPolicy::Disabled,
+            post_turn_extraction: MemoryExtractionPolicy::Allow,
             active_memory: MemoryActiveContextPolicy::Allow,
             explicit_remember: false,
             explicit_forget: false,
@@ -715,6 +784,99 @@ pub trait AgentMemoryProvider: Send + Sync {
     ) -> Result<MemoryToolMaterialization, String>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryManifestRequest {
+    pub max_items: usize,
+    pub max_item_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoryManifest {
+    pub active: Vec<MemoryManifestActiveItem>,
+    pub candidates: Vec<MemoryManifestCandidateItem>,
+    pub diagnostics: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryManifestActiveItem {
+    pub memory_id: String,
+    pub scope: MemoryScope,
+    pub category: MemoryCategory,
+    pub key: Option<String>,
+    pub content_preview: String,
+    pub updated_at: i64,
+    pub status: MemoryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryManifestCandidateItem {
+    pub candidate_id: String,
+    pub scope: MemoryScope,
+    pub category: MemoryCategory,
+    pub key: Option<String>,
+    pub content_preview: String,
+    pub status: MemoryCandidateStatus,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryPostTurnExtractorContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub mode: ThreadMode,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryPostTurnExtractorRequest {
+    pub user_text: String,
+    pub assistant_text: String,
+    pub tool_events_summary: String,
+    pub domain_events_summary: String,
+    pub manifest: MemoryManifest,
+    pub max_facts: usize,
+}
+
+impl MemoryPostTurnExtractorRequest {
+    pub fn render_prompt(&self) -> String {
+        render_memory_post_turn_extractor_prompt(&MemoryPostTurnExtractorPromptInput {
+            user_text: self.user_text.clone(),
+            assistant_text: self.assistant_text.clone(),
+            tool_events_summary: self.tool_events_summary.clone(),
+            domain_events_summary: self.domain_events_summary.clone(),
+            memory_manifest: render_memory_manifest(&self.manifest),
+            max_facts: self.max_facts,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+pub trait AgentMemoryPostTurnExtractorProvider: Send + Sync {
+    async fn extract_post_turn_memory_json(
+        &self,
+        context: MemoryPostTurnExtractorContext,
+        request: MemoryPostTurnExtractorRequest,
+    ) -> Result<String, String>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentMemoryWriteProvider: Send + Sync {
+    async fn load_memory_manifest(
+        &self,
+        context: MemoryTurnContext,
+        request: MemoryManifestRequest,
+    ) -> Result<MemoryManifest, String>;
+
+    async fn write_semantic_memory(
+        &self,
+        context: MemoryTurnContext,
+        params: MemorySemanticWriteParams,
+    ) -> Result<MemorySemanticWriteResponse, String>;
+}
+
 #[async_trait::async_trait]
 pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
     async fn resolve_memory_turn_policy(
@@ -855,12 +1017,15 @@ fn memory_hook_state_key(workspace_id: &str, thread_id: &str, turn_id: &str) -> 
 pub(crate) fn install_memory_hooks(
     runtime: &Arc<HookRuntime>,
     memory_provider: Arc<dyn AgentMemoryProvider>,
+    memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
+    post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> Result<(), HookRegistryError> {
     let memory_config = memory_config.normalized();
     let active_recall_config = memory_config.active_recall.clone();
+    let post_turn_extractor_config = memory_config.post_turn_extractor.clone();
     let state = Arc::new(MemoryHookTurnStateStore::default());
     register_memory_hook_handler(
         runtime,
@@ -922,6 +1087,24 @@ pub(crate) fn install_memory_hooks(
         MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID,
         HookPhase::TurnPrePromptCompile,
         0,
+    )?;
+    register_memory_hook_handler_with_options(
+        runtime,
+        Arc::new(MemoryPostTurnExtractorHook {
+            write_provider: memory_write_provider,
+            extractor_provider: post_turn_extractor_provider,
+            config: post_turn_extractor_config.clone(),
+        }),
+        MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID,
+        HookPhase::TurnPostTurn,
+        0,
+        HookExecutionPolicy {
+            await_policy: post_turn_extractor_config.await_policy,
+            timeout_ms: Some(post_turn_extractor_config.timeout_ms),
+            max_parallelism: None,
+        },
+        HookSubscriptionDependencies::default(),
+        HookSubscriptionVisibility::Internal,
     )?;
     Ok(())
 }
@@ -1006,6 +1189,12 @@ struct ActiveMemoryRecallHook {
 }
 
 struct MemoryPromptContractHook;
+
+struct MemoryPostTurnExtractorHook {
+    write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
+    extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
+    config: MemoryPostTurnExtractorConfig,
+}
 
 #[async_trait::async_trait]
 impl HookHandler for MemoryPolicyClassifierHook {
@@ -1520,6 +1709,218 @@ impl HookHandler for MemoryPromptContractHook {
     }
 }
 
+#[async_trait::async_trait]
+impl HookHandler for MemoryPostTurnExtractorHook {
+    fn id(&self) -> HookId {
+        HookId::new(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID).expect("static hook id is valid")
+    }
+
+    fn kind(&self) -> HookKind {
+        HookKind::new("memory").expect("static hook kind is valid")
+    }
+
+    fn supported_phases(&self) -> Vec<HookPhase> {
+        vec![HookPhase::TurnPostTurn]
+    }
+
+    fn capabilities(&self) -> HookCapabilities {
+        memory_post_turn_extractor_capabilities(self.extractor_provider.is_some())
+    }
+
+    async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+        let input = turn_post_turn_input(&request)?;
+        let config = self.config.normalized();
+        let mut response = HookHandlerResponse::default();
+
+        if !config.enabled {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "config_disabled",
+                "memory post-turn extractor skipped: config disabled",
+            ));
+            return Ok(response);
+        }
+
+        if input.status != TurnPostTurnStatus::Succeeded {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "non_success_status",
+                format!(
+                    "memory post-turn extractor skipped: status={}",
+                    turn_post_turn_status_label(input.status)
+                ),
+            ));
+            return Ok(response);
+        }
+
+        let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => {
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.policy_decode_failed",
+                    format!("memory post-turn extractor skipped: policy_decode_failed {error}"),
+                ));
+                return Ok(response);
+            }
+            None => {
+                return Ok(memory_missing_policy_response(
+                    MEMORY_POST_TURN_EXTRACTOR_HOOK_ID,
+                ));
+            }
+        };
+
+        if !post_turn_policy_allows_any_extraction(&policy) {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "policy_disabled",
+                format!(
+                    "memory post-turn extractor skipped: source={} reason={}",
+                    policy.source.as_str(),
+                    policy.reason_code.as_str()
+                ),
+            ));
+            return Ok(response);
+        }
+
+        if !config.provider_enabled {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "provider_disabled",
+                "memory post-turn extractor skipped: provider disabled",
+            ));
+            return Ok(response);
+        }
+
+        let Some(write_provider) = self.write_provider.as_ref() else {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "write_provider_unavailable",
+                "memory post-turn extractor skipped: write provider unavailable",
+            ));
+            return Ok(response);
+        };
+        let Some(extractor_provider) = self.extractor_provider.as_ref() else {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "provider_unavailable",
+                "memory post-turn extractor skipped: extractor provider unavailable",
+            ));
+            return Ok(response);
+        };
+
+        let context = memory_turn_context_from_post_turn_request(&request, input, &config)?;
+        if context.input_text.trim().is_empty()
+            && input
+                .assistant_text
+                .as_ref()
+                .map(|text| text.text.trim().is_empty())
+                .unwrap_or(true)
+        {
+            response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                "empty_transcript",
+                "memory post-turn extractor skipped: empty transcript",
+            ));
+            return Ok(response);
+        }
+
+        let manifest = match write_provider
+            .load_memory_manifest(
+                context.clone(),
+                MemoryManifestRequest {
+                    max_items: config.max_manifest_items,
+                    max_item_chars: config.max_fact_content_chars,
+                },
+            )
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                response.diagnostics.push(memory_post_turn_skip_diagnostic(
+                    "manifest_failed",
+                    "memory post-turn extractor skipped: manifest loading failed",
+                ));
+                return Ok(response);
+            }
+        };
+
+        let extractor_context = memory_post_turn_extractor_context_from_turn(
+            &context,
+            input.model.clone(),
+            input.model_provider.clone(),
+        );
+        let extractor_request =
+            memory_post_turn_extractor_request_from_input(input, manifest, &config);
+        let raw_json = match extractor_provider
+            .extract_post_turn_memory_json(extractor_context, extractor_request)
+            .await
+        {
+            Ok(json) => json,
+            Err(_) => {
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.post_turn_extractor.provider_failed",
+                    "memory post-turn extractor provider failed",
+                ));
+                return Ok(response);
+            }
+        };
+
+        let parsed = match parse_memory_post_turn_extractor_json(raw_json.as_str(), &config) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                response.diagnostics.push(memory_safe_warning_diagnostic(
+                    "memory.post_turn_extractor.invalid_json",
+                    format!("memory post-turn extractor returned invalid JSON: {error}"),
+                ));
+                return Ok(response);
+            }
+        };
+
+        let mut stats = MemoryPostTurnExtractorStats {
+            raw_fact_count: parsed.raw_fact_count,
+            ..MemoryPostTurnExtractorStats::default()
+        };
+        response
+            .diagnostics
+            .extend(hook_diagnostics_from_strings(parsed.diagnostics.as_slice()));
+
+        for (index, fact) in parsed.facts.into_iter().enumerate() {
+            let Some(params) = memory_semantic_write_params_from_extracted_fact(
+                index,
+                fact,
+                &context,
+                &policy,
+                &config,
+                input.model.as_deref(),
+                input.model_provider.as_deref(),
+            ) else {
+                stats.validation_rejected_count += 1;
+                continue;
+            };
+            if !post_turn_policy_allows_fact(&policy, &params.semantic) {
+                stats.policy_rejected_count += 1;
+                continue;
+            }
+            stats.write_attempt_count += 1;
+            match write_provider
+                .write_semantic_memory(context.clone(), params)
+                .await
+            {
+                Ok(write_response) => {
+                    stats.write_success_count += 1;
+                    stats.observe_write_response(&write_response);
+                }
+                Err(_) => {
+                    stats.write_failure_count += 1;
+                    response.diagnostics.push(memory_safe_warning_diagnostic(
+                        "memory.post_turn_extractor.write_failed",
+                        "memory post-turn extractor semantic write failed",
+                    ));
+                }
+            }
+        }
+
+        response
+            .diagnostics
+            .push(memory_post_turn_stats_diagnostic(&stats));
+        response.metadata = memory_post_turn_stats_metadata(&stats);
+        Ok(response)
+    }
+}
+
 fn memory_policy_classifier_capabilities() -> HookCapabilities {
     HookCapabilities::new([
         HookCapability::new("memory").expect("static capability is valid"),
@@ -1566,6 +1967,19 @@ fn memory_prompt_contract_capabilities() -> HookCapabilities {
     ])
 }
 
+fn memory_post_turn_extractor_capabilities(provider_enabled: bool) -> HookCapabilities {
+    let mut capabilities = vec![
+        HookCapability::new("memory").expect("static capability is valid"),
+        HookCapability::new("read_domain_context").expect("static capability is valid"),
+        HookCapability::new("write_domain_context").expect("static capability is valid"),
+    ];
+    if provider_enabled {
+        capabilities
+            .push(HookCapability::new("call_provider").expect("static capability is valid"));
+    }
+    HookCapabilities::new(capabilities)
+}
+
 fn turn_pre_policy_input(request: &HookHandlerRequest) -> HookResult<&TurnPrePolicyHookInput> {
     match &request.input.payload {
         HookInputPayload::TurnPrePolicy(input) => Ok(input),
@@ -1603,6 +2017,16 @@ fn turn_pre_prompt_compile_input(
         _ => Err(memory_hook_error(
             "memory.invalid_input",
             "memory prompt contract hook expected turn pre-prompt-compile input",
+        )),
+    }
+}
+
+fn turn_post_turn_input(request: &HookHandlerRequest) -> HookResult<&TurnPostTurnHookInput> {
+    match &request.input.payload {
+        HookInputPayload::TurnPostTurn(input) => Ok(input),
+        _ => Err(memory_hook_error(
+            "memory.invalid_input",
+            "memory post-turn extractor hook expected turn post-turn input",
         )),
     }
 }
@@ -2638,6 +3062,585 @@ fn memory_recall_context_from_prompt_context_set(
     context
 }
 
+fn render_memory_manifest(manifest: &MemoryManifest) -> String {
+    let mut lines = Vec::new();
+    if manifest.active.is_empty() && manifest.candidates.is_empty() {
+        lines.push("No active or candidate memories in the bounded manifest.".to_owned());
+    }
+    for item in &manifest.active {
+        lines.push(format!(
+            "- active id={} scope={} category={} key={} updated={} status={} content={}",
+            item.memory_id,
+            scope_label(&item.scope),
+            category_label(item.category),
+            item.key.as_deref().unwrap_or("none"),
+            item.updated_at,
+            memory_status_label(item.status),
+            item.content_preview
+        ));
+    }
+    for item in &manifest.candidates {
+        lines.push(format!(
+            "- candidate id={} scope={} category={} key={} created={} status={} content={}",
+            item.candidate_id,
+            scope_label(&item.scope),
+            category_label(item.category),
+            item.key.as_deref().unwrap_or("none"),
+            item.created_at,
+            candidate_status_label(item.status),
+            item.content_preview
+        ));
+    }
+    if manifest.truncated {
+        lines.push("Manifest was truncated.".to_owned());
+    }
+    for diagnostic in &manifest.diagnostics {
+        lines.push(format!(
+            "Diagnostic: {}",
+            safe_memory_policy_diagnostic(diagnostic)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn memory_post_turn_extractor_context_from_turn(
+    context: &MemoryTurnContext,
+    model: Option<String>,
+    model_provider: Option<String>,
+) -> MemoryPostTurnExtractorContext {
+    MemoryPostTurnExtractorContext {
+        workspace_id: context.workspace_id.clone(),
+        thread_id: context.thread_id.clone(),
+        turn_id: context.turn_id.clone(),
+        mode: context.mode,
+        model,
+        model_provider,
+    }
+}
+
+fn memory_post_turn_extractor_request_from_input(
+    input: &TurnPostTurnHookInput,
+    manifest: MemoryManifest,
+    config: &MemoryPostTurnExtractorConfig,
+) -> MemoryPostTurnExtractorRequest {
+    MemoryPostTurnExtractorRequest {
+        user_text: input
+            .user_text
+            .as_ref()
+            .map(|text| truncate_chars(text.text.as_str(), config.max_input_chars))
+            .unwrap_or_default(),
+        assistant_text: input
+            .assistant_text
+            .as_ref()
+            .map(|text| truncate_chars(text.text.as_str(), config.max_input_chars))
+            .unwrap_or_default(),
+        tool_events_summary: turn_post_tool_events_summary(&input.tool_events),
+        domain_events_summary: turn_post_domain_events_summary(&input.domain_events),
+        manifest,
+        max_facts: config.max_facts_per_turn,
+    }
+}
+
+fn memory_turn_context_from_post_turn_request(
+    request: &HookHandlerRequest,
+    input: &TurnPostTurnHookInput,
+    config: &MemoryPostTurnExtractorConfig,
+) -> HookResult<MemoryTurnContext> {
+    let workspace_id = required_context_id(
+        request.context.workspace_id.as_ref().map(|id| id.as_str()),
+        "workspace_id",
+    )?;
+    let thread_id = required_context_id(
+        request.context.thread_id.as_ref().map(|id| id.as_str()),
+        "thread_id",
+    )?;
+    let turn_id = required_context_id(
+        request.context.turn_id.as_ref().map(|id| id.as_str()),
+        "turn_id",
+    )?;
+    Ok(MemoryTurnContext {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        mode: ThreadMode::Agent,
+        input_text: input
+            .user_text
+            .as_ref()
+            .map(|text| truncate_chars(text.text.as_str(), config.max_input_chars))
+            .unwrap_or_default(),
+        task_id: request
+            .context
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        agent_id: request
+            .context
+            .agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+    })
+}
+
+fn turn_post_tool_events_summary(events: &[pioneer_hooks::TurnPostTurnToolEventSummary]) -> String {
+    if events.is_empty() {
+        return String::new();
+    }
+    events
+        .iter()
+        .map(|event| {
+            format!(
+                "{} status={:?} outcome={:?} error={:?}",
+                event.tool_name, event.status, event.outcome_status, event.error_class
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn turn_post_domain_events_summary(
+    events: &[pioneer_hooks::TurnPostTurnDomainEventSummary],
+) -> String {
+    if events.is_empty() {
+        return String::new();
+    }
+    events
+        .iter()
+        .map(|event| {
+            format!(
+                "domain={:?} code={} item={} message={}",
+                event.domain,
+                event.code.as_deref().unwrap_or("none"),
+                event.item_id.as_deref().unwrap_or("none"),
+                event
+                    .message
+                    .as_ref()
+                    .map(|message| message.text.as_str())
+                    .unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug)]
+struct MemoryPostTurnParsedFacts {
+    facts: Vec<MemoryPostTurnExtractedFact>,
+    raw_fact_count: usize,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MemoryPostTurnExtractedFact {
+    semantic: MemorySemanticFields,
+    content: String,
+    value: Option<String>,
+    evidence: MemoryWriteEvidence,
+    confidence: Option<f32>,
+    importance: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryPostTurnExtractorJson {
+    #[serde(default)]
+    facts: Vec<MemoryPostTurnExtractedFactJson>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryPostTurnExtractedFactJson {
+    semantic: MemorySemanticFields,
+    content: String,
+    #[serde(default)]
+    value: Option<String>,
+    evidence: MemoryWriteEvidence,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    importance: Option<f32>,
+}
+
+fn parse_memory_post_turn_extractor_json(
+    raw: &str,
+    config: &MemoryPostTurnExtractorConfig,
+) -> Result<MemoryPostTurnParsedFacts, String> {
+    let parsed = serde_json::from_str::<MemoryPostTurnExtractorJson>(raw.trim())
+        .map_err(|error| error.to_string())?;
+    let raw_fact_count = parsed.facts.len();
+    let mut diagnostics = Vec::new();
+    let mut facts = Vec::new();
+    for (index, fact) in parsed
+        .facts
+        .into_iter()
+        .take(config.max_facts_per_turn)
+        .enumerate()
+    {
+        match validate_memory_post_turn_fact(fact, config) {
+            Ok(fact) => facts.push(fact),
+            Err(error) => diagnostics.push(format!(
+                "memory.post_turn_extractor.fact_rejected: index={index} reason={error}"
+            )),
+        }
+    }
+    if raw_fact_count > config.max_facts_per_turn {
+        diagnostics.push(format!(
+            "memory.post_turn_extractor.fact_limit: raw={} kept={}",
+            raw_fact_count, config.max_facts_per_turn
+        ));
+    }
+    Ok(MemoryPostTurnParsedFacts {
+        facts,
+        raw_fact_count,
+        diagnostics,
+    })
+}
+
+fn validate_memory_post_turn_fact(
+    fact: MemoryPostTurnExtractedFactJson,
+    config: &MemoryPostTurnExtractorConfig,
+) -> Result<MemoryPostTurnExtractedFact, &'static str> {
+    if !matches!(
+        fact.semantic.intent,
+        MemoryIntent::ExplicitStore | MemoryIntent::ImplicitCandidate
+    ) {
+        return Err("unsupported_intent");
+    }
+    if fact.semantic.explicitness == MemoryExplicitness::None {
+        return Err("missing_explicitness");
+    }
+    if matches!(
+        fact.semantic.durability,
+        MemoryDurability::Transient | MemoryDurability::SessionOnly
+    ) {
+        return Err("transient_or_session_only");
+    }
+    if matches!(
+        fact.semantic.sensitivity,
+        MemorySensitivityHint::Secret | MemorySensitivityHint::Regulated
+    ) {
+        return Err("secret_or_regulated");
+    }
+    let Some(content) = bounded_nonempty_text(fact.content.as_str(), config.max_fact_content_chars)
+    else {
+        return Err("empty_content");
+    };
+    let quote = fact
+        .evidence
+        .quote_or_span
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if quote.is_empty() {
+        return Err("missing_evidence_quote");
+    }
+    let mut evidence = fact.evidence;
+    evidence.quote_or_span = bounded_nonempty_text(quote.as_str(), config.max_evidence_chars);
+    evidence.extractor_reason = evidence
+        .extractor_reason
+        .as_deref()
+        .and_then(|reason| bounded_nonempty_text(reason, 240));
+    let confidence = fact
+        .confidence
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0));
+    let importance = fact
+        .importance
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0));
+    Ok(MemoryPostTurnExtractedFact {
+        semantic: fact.semantic,
+        content,
+        value: fact
+            .value
+            .as_deref()
+            .and_then(|value| bounded_nonempty_text(value, config.max_fact_content_chars)),
+        evidence,
+        confidence,
+        importance,
+    })
+}
+
+fn memory_semantic_write_params_from_extracted_fact(
+    index: usize,
+    fact: MemoryPostTurnExtractedFact,
+    context: &MemoryTurnContext,
+    policy: &MemoryTurnPolicy,
+    config: &MemoryPostTurnExtractorConfig,
+    model: Option<&str>,
+    model_provider: Option<&str>,
+) -> Option<MemorySemanticWriteParams> {
+    if fact.semantic.intent == MemoryIntent::ImplicitCandidate && !config.proactive_writes_enabled {
+        return None;
+    }
+    let scope = memory_scope_from_semantic_hint(context, fact.semantic.scope_hint)?;
+    let mut evidence = fact.evidence;
+    evidence.source_thread_id = evidence
+        .source_thread_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| Some(context.thread_id.clone()));
+    evidence.source_turn_id = evidence
+        .source_turn_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| Some(context.turn_id.clone()));
+    evidence.source_ref = evidence
+        .source_ref
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            Some(format!(
+                "turn.post_turn:{}:{}:fact:{index}",
+                context.thread_id, context.turn_id
+            ))
+        });
+
+    let source_kind = if fact.semantic.intent == MemoryIntent::ExplicitStore
+        || fact.semantic.explicitness == MemoryExplicitness::Explicit
+    {
+        MemorySourceKind::ExplicitUserRequest
+    } else {
+        MemorySourceKind::BackgroundExtractor
+    };
+    let provenance = MemoryProvenance {
+        source_kind,
+        source_thread_id: Some(context.thread_id.clone()),
+        source_turn_id: Some(context.turn_id.clone()),
+        source_item_id: None,
+        created_by: Some(MemoryActor {
+            kind: MemoryActorKind::Extractor,
+            id: Some(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID.to_owned()),
+        }),
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "hook_id".to_owned(),
+        serde_json::json!(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID),
+    );
+    metadata.insert(
+        "source_phase".to_owned(),
+        serde_json::json!(HookPhase::TurnPostTurn.as_str()),
+    );
+    metadata.insert(
+        "extractor_version".to_owned(),
+        serde_json::json!(MEMORY_POST_TURN_EXTRACTOR_VERSION),
+    );
+    metadata.insert("fact_index".to_owned(), serde_json::json!(index));
+    metadata.insert(
+        "policy_source".to_owned(),
+        serde_json::json!(policy.source.as_str()),
+    );
+    metadata.insert(
+        "policy_reason_code".to_owned(),
+        serde_json::json!(policy.reason_code.as_str()),
+    );
+    metadata.insert(
+        "proactive_writes_enabled".to_owned(),
+        serde_json::json!(config.proactive_writes_enabled),
+    );
+    if let Some(model) = bounded_nonempty_text(model.unwrap_or_default(), 160) {
+        metadata.insert("model".to_owned(), serde_json::json!(model));
+    }
+    if let Some(model_provider) = bounded_nonempty_text(model_provider.unwrap_or_default(), 80) {
+        metadata.insert(
+            "model_provider".to_owned(),
+            serde_json::json!(model_provider),
+        );
+    }
+
+    Some(MemorySemanticWriteParams {
+        scope,
+        semantic: fact.semantic,
+        content: fact.content,
+        value: fact.value,
+        evidence: Some(evidence),
+        provenance: Some(provenance),
+        disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
+        client_provided_key: None,
+        confidence: fact.confidence,
+        importance: fact.importance,
+        metadata,
+    })
+}
+
+fn memory_scope_from_semantic_hint(
+    context: &MemoryTurnContext,
+    hint: MemoryScopeHint,
+) -> Option<MemoryScope> {
+    match hint {
+        MemoryScopeHint::UserGlobal | MemoryScopeHint::UserWorkspace => Some(MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: MEMORY_DEFAULT_USER_SCOPE_KEY.to_owned(),
+        }),
+        MemoryScopeHint::ProjectWorkspace | MemoryScopeHint::Unknown => Some(MemoryScope {
+            kind: MemoryScopeKind::Workspace,
+            key: context.workspace_id.clone(),
+        }),
+        MemoryScopeHint::AgentWorkspace => context.agent_id.as_ref().map(|agent_id| MemoryScope {
+            kind: MemoryScopeKind::Agent,
+            key: workspace_agent_memory_scope_key(context.workspace_id.as_str(), agent_id),
+        }),
+        MemoryScopeHint::AgentGlobal => context.agent_id.as_ref().map(|agent_id| MemoryScope {
+            kind: MemoryScopeKind::Agent,
+            key: format!("global:agent:{}", agent_id.trim()),
+        }),
+    }
+}
+
+fn workspace_agent_memory_scope_key(workspace_id: &str, agent_id: &str) -> String {
+    format!(
+        "workspace:{}:agent:{}",
+        workspace_id.trim(),
+        agent_id.trim()
+    )
+}
+
+fn post_turn_policy_allows_any_extraction(policy: &MemoryTurnPolicy) -> bool {
+    policy.post_turn_extraction == MemoryExtractionPolicy::Allow || policy.explicit_remember
+}
+
+fn post_turn_policy_allows_fact(
+    policy: &MemoryTurnPolicy,
+    semantic: &MemorySemanticFields,
+) -> bool {
+    if semantic.intent == MemoryIntent::ExplicitStore
+        && semantic.explicitness == MemoryExplicitness::Explicit
+        && policy.explicit_remember
+    {
+        return true;
+    }
+    policy.post_turn_extraction == MemoryExtractionPolicy::Allow
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MemoryPostTurnExtractorStats {
+    raw_fact_count: usize,
+    validation_rejected_count: usize,
+    policy_rejected_count: usize,
+    write_attempt_count: usize,
+    write_success_count: usize,
+    write_failure_count: usize,
+    auto_approved_count: usize,
+    rejected_or_suppressed_count: usize,
+    duplicate_or_merged_count: usize,
+}
+
+impl MemoryPostTurnExtractorStats {
+    fn observe_write_response(&mut self, response: &MemorySemanticWriteResponse) {
+        if response.record.is_some() {
+            self.auto_approved_count += 1;
+        }
+        if response.evidence_merged || response.relation == MemoryWriteRelation::Duplicate {
+            self.duplicate_or_merged_count += 1;
+        }
+        if matches!(
+            response.relation,
+            MemoryWriteRelation::SuppressedByRejection | MemoryWriteRelation::Contradiction
+        ) {
+            self.rejected_or_suppressed_count += 1;
+        }
+        if let Some(candidate) = &response.candidate
+            && matches!(
+                candidate.status,
+                MemoryCandidateStatus::Rejected
+                    | MemoryCandidateStatus::AutoRejected
+                    | MemoryCandidateStatus::ReviewDisabledRejected
+                    | MemoryCandidateStatus::MergedDuplicate
+                    | MemoryCandidateStatus::Superseded
+            )
+        {
+            self.rejected_or_suppressed_count += 1;
+        }
+    }
+}
+
+fn memory_post_turn_stats_diagnostic(stats: &MemoryPostTurnExtractorStats) -> HookDiagnostic {
+    let mut diagnostic = memory_safe_info_diagnostic(
+        "memory.post_turn_extractor.completed",
+        format!(
+            "memory post-turn extractor completed: raw_facts={} validation_rejected={} policy_rejected={} write_attempts={} write_successes={} write_failures={} auto_approved={} rejected_or_suppressed={} duplicate_or_merged={}",
+            stats.raw_fact_count,
+            stats.validation_rejected_count,
+            stats.policy_rejected_count,
+            stats.write_attempt_count,
+            stats.write_success_count,
+            stats.write_failure_count,
+            stats.auto_approved_count,
+            stats.rejected_or_suppressed_count,
+            stats.duplicate_or_merged_count
+        ),
+    );
+    for (key, value) in [
+        ("raw_fact_count", stats.raw_fact_count),
+        ("validation_rejected_count", stats.validation_rejected_count),
+        ("policy_rejected_count", stats.policy_rejected_count),
+        ("write_attempt_count", stats.write_attempt_count),
+        ("write_success_count", stats.write_success_count),
+        ("write_failure_count", stats.write_failure_count),
+        ("auto_approved_count", stats.auto_approved_count),
+        (
+            "rejected_or_suppressed_count",
+            stats.rejected_or_suppressed_count,
+        ),
+        ("duplicate_or_merged_count", stats.duplicate_or_merged_count),
+    ] {
+        insert_usize_metadata(&mut diagnostic.metadata, key, value);
+    }
+    diagnostic
+}
+
+fn memory_post_turn_stats_metadata(stats: &MemoryPostTurnExtractorStats) -> HookMetadata {
+    let mut metadata = HookMetadata::default();
+    for (key, value) in [
+        ("post_turn_extractor.raw_fact_count", stats.raw_fact_count),
+        (
+            "post_turn_extractor.validation_rejected_count",
+            stats.validation_rejected_count,
+        ),
+        (
+            "post_turn_extractor.policy_rejected_count",
+            stats.policy_rejected_count,
+        ),
+        (
+            "post_turn_extractor.write_attempt_count",
+            stats.write_attempt_count,
+        ),
+        (
+            "post_turn_extractor.write_success_count",
+            stats.write_success_count,
+        ),
+        (
+            "post_turn_extractor.write_failure_count",
+            stats.write_failure_count,
+        ),
+        (
+            "post_turn_extractor.auto_approved_count",
+            stats.auto_approved_count,
+        ),
+        (
+            "post_turn_extractor.rejected_or_suppressed_count",
+            stats.rejected_or_suppressed_count,
+        ),
+        (
+            "post_turn_extractor.duplicate_or_merged_count",
+            stats.duplicate_or_merged_count,
+        ),
+    ] {
+        insert_usize_metadata(&mut metadata, key, value);
+    }
+    metadata
+}
+
+fn memory_post_turn_skip_diagnostic(
+    reason: &'static str,
+    message: impl Into<String>,
+) -> HookDiagnostic {
+    let mut diagnostic = memory_safe_info_diagnostic("memory.post_turn_extractor.skipped", message);
+    diagnostic.metadata.insert(
+        hook_metadata_key("skip_reason"),
+        HookValue::Text(reason.to_owned()),
+    );
+    diagnostic
+}
+
 fn hook_diagnostics_from_strings(messages: &[String]) -> Vec<HookDiagnostic> {
     messages
         .iter()
@@ -3058,6 +4061,40 @@ fn category_label(category: MemoryCategory) -> &'static str {
     }
 }
 
+fn memory_status_label(status: MemoryStatus) -> &'static str {
+    match status {
+        MemoryStatus::Active => "active",
+        MemoryStatus::Superseded => "superseded",
+        MemoryStatus::Deleted => "deleted",
+        MemoryStatus::Expired => "expired",
+    }
+}
+
+fn candidate_status_label(status: MemoryCandidateStatus) -> &'static str {
+    match status {
+        MemoryCandidateStatus::Pending => "pending",
+        MemoryCandidateStatus::PendingSilent => "pending_silent",
+        MemoryCandidateStatus::AskOnUse => "ask_on_use",
+        MemoryCandidateStatus::NeedsReview => "needs_review",
+        MemoryCandidateStatus::Approved => "approved",
+        MemoryCandidateStatus::Rejected => "rejected",
+        MemoryCandidateStatus::AutoRejected => "auto_rejected",
+        MemoryCandidateStatus::ReviewDisabledRejected => "review_disabled_rejected",
+        MemoryCandidateStatus::Superseded => "superseded",
+        MemoryCandidateStatus::MergedDuplicate => "merged_duplicate",
+        MemoryCandidateStatus::Expired => "expired",
+    }
+}
+
+fn turn_post_turn_status_label(status: TurnPostTurnStatus) -> &'static str {
+    match status {
+        TurnPostTurnStatus::Succeeded => "succeeded",
+        TurnPostTurnStatus::Failed => "failed",
+        TurnPostTurnStatus::ProviderFailure => "provider_failure",
+        TurnPostTurnStatus::Interrupted => "interrupted",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3067,6 +4104,7 @@ mod tests {
         HookTurnId, HookWorkspaceId, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
         TurnPreToolMaterializationHookInput,
     };
+    use pioneer_protocol::{MemoryAttribute, MemoryCanonicalKey, MemoryRecord, MemorySubject};
     use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
     use serde_json::json;
 
@@ -3112,7 +4150,7 @@ mod tests {
         assert_eq!(default_policy.detected_language, None);
         assert_eq!(
             default_policy.post_turn_extraction,
-            MemoryExtractionPolicy::Disabled
+            MemoryExtractionPolicy::Allow
         );
         assert_eq!(
             default_policy.active_memory,
@@ -3395,12 +4433,15 @@ mod tests {
                 MemoryRecallSnapshot::empty(),
             )),
             None,
+            None,
+            None,
             artifacts,
             MemoryLoopConfig {
                 active_recall: MemoryActiveRecallConfig {
                     timeout_ms: 321,
                     ..MemoryActiveRecallConfig::default()
                 },
+                ..MemoryLoopConfig::default()
             },
         )
         .expect("memory hooks install");
@@ -3430,6 +4471,32 @@ mod tests {
         );
         assert_eq!(
             subscription.visibility,
+            HookSubscriptionVisibility::Internal
+        );
+
+        let post_turn_subscription_id =
+            HookSubscriptionId::new(MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID)
+                .expect("static subscription id is valid");
+        let post_turn_subscription = runtime
+            .subscriptions()
+            .get_subscription(&post_turn_subscription_id)
+            .expect("subscription lookup succeeds")
+            .expect("post-turn extractor subscription registered");
+        assert_eq!(
+            post_turn_subscription.hook_id.as_str(),
+            MEMORY_POST_TURN_EXTRACTOR_HOOK_ID
+        );
+        assert_eq!(post_turn_subscription.phase, HookPhase::TurnPostTurn);
+        assert_eq!(
+            post_turn_subscription.execution_policy.await_policy,
+            HookAwaitPolicy::FireAndRecord
+        );
+        assert_eq!(
+            post_turn_subscription.failure_policy,
+            HookFailurePolicy::BestEffort
+        );
+        assert_eq!(
+            post_turn_subscription.visibility,
             HookSubscriptionVisibility::Internal
         );
     }
@@ -3544,6 +4611,351 @@ mod tests {
         assert!(!capabilities.contains(
             &HookCapability::new("write_domain_context").expect("static capability is valid")
         ));
+    }
+
+    #[test]
+    fn phase_19_post_turn_extractor_hook_descriptor_is_stable_and_narrow() {
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(Arc::new(TestMemoryWriteProvider::default())),
+            extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
+                r#"{"facts":[]}"#,
+            ))),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        assert_eq!(hook.id().as_str(), MEMORY_POST_TURN_EXTRACTOR_HOOK_ID);
+        assert_eq!(hook.supported_phases(), vec![HookPhase::TurnPostTurn]);
+        let capabilities = hook.capabilities();
+        assert!(
+            capabilities
+                .contains(&HookCapability::new("memory").expect("static capability is valid"))
+        );
+        assert!(capabilities.contains(
+            &HookCapability::new("read_domain_context").expect("static capability is valid")
+        ));
+        assert!(capabilities.contains(
+            &HookCapability::new("write_domain_context").expect("static capability is valid")
+        ));
+        assert!(
+            capabilities.contains(
+                &HookCapability::new("call_provider").expect("static capability is valid")
+            )
+        );
+        assert!(
+            !capabilities
+                .contains(&HookCapability::new("call_tools").expect("static capability is valid"))
+        );
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_section").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_tool_bundle").expect("static capability is valid")
+        ));
+        assert!(!capabilities.contains(
+            &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
+        ));
+    }
+
+    #[test]
+    fn phase_19_strict_json_parser_accepts_typed_semantic_fact() {
+        let parsed = parse_memory_post_turn_extractor_json(
+            valid_post_turn_extractor_json().as_str(),
+            &MemoryPostTurnExtractorConfig::default(),
+        )
+        .expect("valid extractor JSON parses");
+
+        assert_eq!(parsed.raw_fact_count, 1);
+        assert_eq!(parsed.facts.len(), 1);
+        let fact = &parsed.facts[0];
+        assert_eq!(fact.semantic.intent, MemoryIntent::ExplicitStore);
+        assert_eq!(fact.semantic.category, MemoryCategory::Identity);
+        assert_eq!(fact.semantic.subject, MemorySubject::CurrentUser);
+        assert_eq!(fact.semantic.attribute, MemoryAttribute::Name);
+        assert_eq!(fact.content, "Имя пользователя: Александр");
+        assert_eq!(fact.value.as_deref(), Some("Александр"));
+        assert_eq!(
+            fact.evidence.quote_or_span.as_deref(),
+            Some("Меня зовут Александр")
+        );
+    }
+
+    #[test]
+    fn phase_19_strict_json_parser_rejects_unknown_enums_and_keys() {
+        let unknown_enum = r#"{"facts":[{"semantic":{"intent":"write_now","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
+        assert!(
+            parse_memory_post_turn_extractor_json(
+                unknown_enum,
+                &MemoryPostTurnExtractorConfig::default(),
+            )
+            .is_err()
+        );
+
+        let canonical_key = r#"{"facts":[{"canonical_key":"user/global:identity:self:name","semantic":{"intent":"explicit_store","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
+        assert!(
+            parse_memory_post_turn_extractor_json(
+                canonical_key,
+                &MemoryPostTurnExtractorConfig::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn phase_19_parser_rejects_secrets_transient_and_missing_evidence() {
+        let secret = r#"{"facts":[{"semantic":{"intent":"implicit_candidate","explicitness":"implicit","category":"custom","subject":"current_user","attribute":"custom","custom_attribute":"api_key","scope_hint":"user_global","durability":"long_lived","sensitivity":"secret","certainty":"high"},"content":"User API key is sk-test","evidence":{"quote_or_span":"sk-test"}}]}"#;
+        let parsed = parse_memory_post_turn_extractor_json(
+            secret,
+            &MemoryPostTurnExtractorConfig::default(),
+        )
+        .expect("secret JSON shape parses but fact is rejected");
+        assert!(parsed.facts.is_empty());
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("secret_or_regulated"))
+        );
+
+        let missing_evidence = r#"{"facts":[{"semantic":{"intent":"explicit_store","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{}}]}"#;
+        let parsed = parse_memory_post_turn_extractor_json(
+            missing_evidence,
+            &MemoryPostTurnExtractorConfig::default(),
+        )
+        .expect("missing evidence JSON shape parses but fact is rejected");
+        assert!(parsed.facts.is_empty());
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("missing_evidence_quote"))
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_19_post_turn_extractor_writes_semantic_fact_through_provider() {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let response = hook
+            .execute(test_post_turn_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                "Меня зовут Александр",
+                "Понял.",
+            ))
+            .await
+            .expect("post-turn extractor executes");
+
+        assert!(response.contributions.is_empty());
+        assert_eq!(extractor_provider.call_count(), 1);
+        assert_eq!(write_provider.manifest_call_count(), 1);
+        assert_eq!(write_provider.write_call_count(), 1);
+        let params = write_provider
+            .write_params()
+            .into_iter()
+            .next()
+            .expect("write params recorded");
+        assert_eq!(
+            params.disposition,
+            Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy)
+        );
+        assert_eq!(params.client_provided_key, None);
+        assert_eq!(params.semantic.intent, MemoryIntent::ExplicitStore);
+        assert_eq!(params.scope.kind, MemoryScopeKind::User);
+        assert_eq!(params.scope.key, MEMORY_DEFAULT_USER_SCOPE_KEY);
+        assert!(
+            params
+                .evidence
+                .as_ref()
+                .and_then(|e| e.source_thread_id.as_deref())
+                .is_some()
+        );
+        assert!(params.metadata.contains_key("hook_id"));
+        assert_eq!(
+            params.metadata.get("model"),
+            Some(&serde_json::json!("test-model"))
+        );
+        assert_eq!(
+            params.metadata.get("model_provider"),
+            Some(&serde_json::json!("test-provider"))
+        );
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
+                && diagnostic.message.as_str().contains("write_successes=1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_19_post_turn_extractor_preserves_manifest_and_observes_auto_approve() {
+        let mut auto_response = test_semantic_write_response();
+        auto_response.record = Some(test_memory_record("mem_auto"));
+        auto_response.created = true;
+        let write_provider = Arc::new(TestMemoryWriteProvider {
+            response: Some(auto_response),
+            ..TestMemoryWriteProvider::default()
+        });
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let response = hook
+            .execute(test_post_turn_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                "Меня зовут Александр",
+                "Понял.",
+            ))
+            .await
+            .expect("post-turn extractor executes");
+
+        let prompt = extractor_provider
+            .prompts()
+            .into_iter()
+            .next()
+            .expect("extractor prompt recorded");
+        assert!(prompt.contains("Memory manifest:"));
+        assert!(prompt.contains("Do not generate canonical memory keys"));
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
+                && diagnostic.message.as_str().contains("auto_approved=1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_19_post_turn_extractor_skips_non_success_turns() {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+        let mut request = test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        );
+        request.input = HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts_with_model(
+            TurnPostTurnStatus::ProviderFailure,
+            Some("test-model"),
+            Some("test-provider"),
+            Some("Меня зовут Александр"),
+            None::<&str>,
+            Some("provider failed"),
+            Vec::new(),
+            Vec::new(),
+            pioneer_hooks::TurnPostTurnHookInputLimits::default(),
+        ));
+
+        let response = hook
+            .execute(request)
+            .await
+            .expect("non-success post-turn hook is best-effort");
+        assert_eq!(extractor_provider.call_count(), 0);
+        assert_eq!(write_provider.write_call_count(), 0);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
+                && diagnostic.message.as_str().contains("provider_failure")
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_19_post_turn_extractor_respects_policy_and_provider_availability() {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let no_save = hook
+            .execute(test_post_turn_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::no_save()),
+                "Меня зовут Александр",
+                "Понял.",
+            ))
+            .await
+            .expect("no-save policy is best-effort");
+        assert!(no_save.contributions.is_empty());
+        assert_eq!(extractor_provider.call_count(), 0);
+        assert_eq!(write_provider.write_call_count(), 0);
+        assert!(no_save.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("source=pre_memory_classifier")
+        }));
+
+        let provider_disabled = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig {
+                provider_enabled: false,
+                ..MemoryPostTurnExtractorConfig::default()
+            },
+        }
+        .execute(test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        ))
+        .await
+        .expect("provider-disabled policy is best-effort");
+        assert!(provider_disabled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
+                && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
+                    == Some(&HookValue::Text("provider_disabled".to_owned()))
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_19_post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            implicit_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider),
+            config: MemoryPostTurnExtractorConfig {
+                proactive_writes_enabled: false,
+                ..MemoryPostTurnExtractorConfig::default()
+            },
+        };
+
+        let response = hook
+            .execute(test_post_turn_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                "Мне нравится лаконичный стиль ответов.",
+                "Ок.",
+            ))
+            .await
+            .expect("post-turn extractor executes");
+
+        assert_eq!(write_provider.write_call_count(), 0);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
+                && diagnostic
+                    .message
+                    .as_str()
+                    .contains("validation_rejected=1")
+        }));
     }
 
     #[test]
@@ -4982,6 +6394,37 @@ mod tests {
         }
     }
 
+    fn test_post_turn_hook_request(
+        policy_set: HookPolicySet,
+        user_text: &str,
+        assistant_text: &str,
+    ) -> HookHandlerRequest {
+        HookHandlerRequest {
+            hook_id: HookId::new(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID)
+                .expect("static hook id is valid"),
+            phase: HookPhase::TurnPostTurn,
+            context: HookContext {
+                workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
+                thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
+                turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
+                ..HookContext::default()
+            },
+            input: HookInput::turn_post_turn(TurnPostTurnHookInput::from_parts_with_model(
+                TurnPostTurnStatus::Succeeded,
+                Some("test-model"),
+                Some("test-provider"),
+                Some(user_text),
+                Some(assistant_text),
+                None::<&str>,
+                Vec::new(),
+                Vec::new(),
+                pioneer_hooks::TurnPostTurnHookInputLimits::default(),
+            )),
+            policy_set,
+            prompt_context_set: HookPromptContextSet::default(),
+        }
+    }
+
     fn memory_policy_set(policy: &MemoryTurnPolicy) -> HookPolicySet {
         HookPolicySet::merge_contributions([memory_policy_contribution(policy)])
     }
@@ -5026,6 +6469,62 @@ mod tests {
             diagnostics: Vec::new(),
             truncated: false,
         }
+    }
+
+    fn valid_post_turn_extractor_json() -> String {
+        serde_json::json!({
+            "facts": [{
+                "semantic": {
+                    "intent": "explicit_store",
+                    "explicitness": "explicit",
+                    "category": "identity",
+                    "subject": "current_user",
+                    "attribute": "name",
+                    "scope_hint": "user_global",
+                    "durability": "long_lived",
+                    "sensitivity": "personal",
+                    "certainty": "high"
+                },
+                "content": "Имя пользователя: Александр",
+                "value": "Александр",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "Меня зовут Александр",
+                    "extractor_reason": "The user directly stated their name."
+                },
+                "confidence": 0.98,
+                "importance": 0.7
+            }]
+        })
+        .to_string()
+    }
+
+    fn implicit_post_turn_extractor_json() -> String {
+        serde_json::json!({
+            "facts": [{
+                "semantic": {
+                    "intent": "implicit_candidate",
+                    "explicitness": "implicit",
+                    "category": "communication_style",
+                    "subject": "current_user",
+                    "attribute": "communication_style",
+                    "scope_hint": "user_global",
+                    "durability": "long_lived",
+                    "sensitivity": "low",
+                    "certainty": "high"
+                },
+                "content": "Пользователь предпочитает лаконичный стиль ответов.",
+                "value": "лаконичный стиль ответов",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "Мне нравится лаконичный стиль ответов.",
+                    "extractor_reason": "The user stated a stable communication preference."
+                },
+                "confidence": 0.9,
+                "importance": 0.6
+            }]
+        })
+        .to_string()
     }
 
     fn prompt_context_set_from_response(response: HookHandlerResponse) -> HookPromptContextSet {
@@ -5179,6 +6678,158 @@ mod tests {
 
     fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
         tool_names.iter().map(|name| name.as_str()).collect()
+    }
+
+    #[derive(Default)]
+    struct TestMemoryWriteProvider {
+        manifest_calls: Arc<Mutex<usize>>,
+        write_calls: Arc<Mutex<usize>>,
+        write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
+        response: Option<MemorySemanticWriteResponse>,
+    }
+
+    impl TestMemoryWriteProvider {
+        fn manifest_call_count(&self) -> usize {
+            *self
+                .manifest_calls
+                .lock()
+                .expect("manifest call lock poisoned")
+        }
+
+        fn write_call_count(&self) -> usize {
+            *self.write_calls.lock().expect("write call lock poisoned")
+        }
+
+        fn write_params(&self) -> Vec<MemorySemanticWriteParams> {
+            self.write_params
+                .lock()
+                .expect("write params lock poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
+        async fn load_memory_manifest(
+            &self,
+            _context: MemoryTurnContext,
+            _request: MemoryManifestRequest,
+        ) -> Result<MemoryManifest, String> {
+            *self
+                .manifest_calls
+                .lock()
+                .expect("manifest call lock poisoned") += 1;
+            Ok(MemoryManifest::default())
+        }
+
+        async fn write_semantic_memory(
+            &self,
+            _context: MemoryTurnContext,
+            params: MemorySemanticWriteParams,
+        ) -> Result<MemorySemanticWriteResponse, String> {
+            *self.write_calls.lock().expect("write call lock poisoned") += 1;
+            self.write_params
+                .lock()
+                .expect("write params lock poisoned")
+                .push(params);
+            Ok(self
+                .response
+                .clone()
+                .unwrap_or_else(test_semantic_write_response))
+        }
+    }
+
+    struct TestPostTurnExtractorProvider {
+        json: String,
+        calls: Arc<Mutex<usize>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestPostTurnExtractorProvider {
+        fn json(json: impl Into<String>) -> Self {
+            Self {
+                json: json.into(),
+                calls: Arc::new(Mutex::new(0)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().expect("extractor call lock poisoned")
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("prompt lock poisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
+        async fn extract_post_turn_memory_json(
+            &self,
+            _context: MemoryPostTurnExtractorContext,
+            request: MemoryPostTurnExtractorRequest,
+        ) -> Result<String, String> {
+            *self.calls.lock().expect("extractor call lock poisoned") += 1;
+            self.prompts
+                .lock()
+                .expect("prompt lock poisoned")
+                .push(request.render_prompt());
+            Ok(self.json.clone())
+        }
+    }
+
+    fn test_semantic_write_response() -> MemorySemanticWriteResponse {
+        MemorySemanticWriteResponse {
+            relation: MemoryWriteRelation::Novel,
+            canonical_key: MemoryCanonicalKey {
+                key: "user/global:identity:self:name".to_owned(),
+                scope: user_scope(),
+                namespace: "identity".to_owned(),
+                category: MemoryCategory::Identity,
+                cardinality: pioneer_protocol::MemoryAttributeCardinality::SingleValue,
+            },
+            semantic_fingerprint: "fingerprint".to_owned(),
+            record: None,
+            candidate: None,
+            created: false,
+            superseded_memory_id: None,
+            evidence_merged: false,
+        }
+    }
+
+    fn test_memory_record(id: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: id.to_owned(),
+            scope: user_scope(),
+            namespace: Some("identity".to_owned()),
+            category: MemoryCategory::Identity,
+            key: Some("user/global:identity:self:name".to_owned()),
+            content: "Имя пользователя: Александр".to_owned(),
+            status: MemoryStatus::Active,
+            confidence: 0.98,
+            importance: 0.7,
+            sensitivity: pioneer_protocol::MemorySensitivity::Personal,
+            provenance: MemoryProvenance {
+                source_kind: MemorySourceKind::ExplicitUserRequest,
+                source_thread_id: Some("thr".to_owned()),
+                source_turn_id: Some("turn".to_owned()),
+                source_item_id: None,
+                created_by: Some(MemoryActor {
+                    kind: MemoryActorKind::Extractor,
+                    id: Some(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID.to_owned()),
+                }),
+            },
+            created_at: 1,
+            updated_at: 1,
+            expires_at: None,
+            last_accessed_at: None,
+            access_count: 0,
+            superseded_by: None,
+            deleted_at: None,
+            delete_reason: None,
+            metadata: BTreeMap::new(),
+        }
     }
 
     struct TestMemoryProvider {

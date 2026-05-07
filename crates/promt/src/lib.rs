@@ -19,6 +19,9 @@ pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
 pub use profile::PromptProfile;
 pub use render::{
+    memory_post_turn_extractor::{
+        MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_prompt,
+    },
     memory_recall::{
         MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
         render_memory_recall_context_block, render_memory_recall_prompt,
