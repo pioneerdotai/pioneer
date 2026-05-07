@@ -146,6 +146,7 @@ pub struct NewAgentMemoryCandidate {
     pub namespace: Option<String>,
     pub category: MemoryCategory,
     pub key: Option<String>,
+    pub status: Option<MemoryCandidateStatus>,
     pub candidate_text: String,
     pub confidence: f64,
     pub reason: String,
@@ -168,10 +169,22 @@ pub struct AgentMemoryCandidateDecisionRecord {
     pub decided_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMemoryCandidateStatusUpdateRecord {
+    pub candidate_id: String,
+    pub status: MemoryCandidateStatus,
+    pub decided_by: Option<MemoryActorRecord>,
+    pub decision_reason: Option<String>,
+    pub promoted_memory_id: Option<String>,
+    pub metadata_json: Option<String>,
+    pub decided_at_unix: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentMemoryCandidateListFilter {
     pub scopes: Vec<MemoryScope>,
     pub workspace_guard: Option<MemoryWorkspaceGuard>,
+    pub categories: Vec<MemoryCategory>,
     pub statuses: Vec<MemoryCandidateStatus>,
     pub limit: Option<u64>,
 }

@@ -1,4 +1,5 @@
 mod backend;
+mod candidate_policy;
 mod config;
 mod context;
 mod convert;
@@ -14,7 +15,10 @@ pub use backend::{
     BackendPutRequest, BackendPutResult, BackendSearchHit, BackendSearchRequest,
     BackendSearchScope, InMemoryMemoryBackend, MemoryBackend, NoopMemoryBackend,
 };
-pub use config::{MemoryRankingConfig, MemoryReadPolicy, MemoryRecallConfig, MemoryServiceConfig};
+pub use config::{
+    MemoryCandidatePolicyConfig, MemoryRankingConfig, MemoryReadPolicy, MemoryRecallConfig,
+    MemoryServiceConfig,
+};
 pub use context::{
     MemoryActiveScopes, MemoryOperationContext, MemoryResolvedScopes, MemoryScopePriority,
 };

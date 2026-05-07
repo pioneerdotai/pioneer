@@ -12,9 +12,10 @@ use crate::convention::{
     memory_source_kind_to_db,
 };
 use crate::memory::{
-    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, MemoryScopeResolution,
-    MemoryWorkspaceGuard, NewAgentMemoryCandidate, actor_id_to_db, actor_kind_to_db,
-    normalized_memory_namespace, normalized_optional_memory_key,
+    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter,
+    AgentMemoryCandidateStatusUpdateRecord, MemoryScopeResolution, MemoryWorkspaceGuard,
+    NewAgentMemoryCandidate, actor_id_to_db, actor_kind_to_db, normalized_memory_namespace,
+    normalized_optional_memory_key,
 };
 
 pub async fn insert_candidate<C: ConnectionTrait>(
@@ -58,7 +59,10 @@ pub async fn insert_candidate<C: ConnectionTrait>(
         source_item_id: Set(candidate.source_item_id),
         created_by_kind: Set(actor_kind_to_db(&candidate.created_by)),
         created_by_id: Set(actor_id_to_db(&candidate.created_by)),
-        status: Set(memory_candidate_status_to_db(MemoryCandidateStatus::Pending).to_owned()),
+        status: Set(memory_candidate_status_to_db(
+            candidate.status.unwrap_or(MemoryCandidateStatus::Pending),
+        )
+        .to_owned()),
         dedupe_key: Set(candidate.dedupe_key),
         created_at: Set(now),
         decided_at: Set(None),
@@ -104,6 +108,18 @@ pub async fn list_candidates<C: ConnectionTrait>(
     };
     query = query.filter(agent_memory_candidate::Column::Status.is_in(statuses));
 
+    if !filter.categories.is_empty() {
+        query = query.filter(
+            agent_memory_candidate::Column::Category.is_in(
+                filter
+                    .categories
+                    .iter()
+                    .map(|category| memory_category_to_db(*category).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+
     if let Some(limit) = filter.limit {
         query = query.limit(limit);
     }
@@ -113,6 +129,16 @@ pub async fn list_candidates<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list memory candidates")
+}
+
+pub async fn find_candidate_by_id<C: ConnectionTrait>(
+    db: &C,
+    candidate_id: &str,
+) -> Result<Option<agent_memory_candidate::Model>> {
+    agent_memory_candidate::Entity::find_by_id(candidate_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to find memory candidate `{candidate_id}`"))
 }
 
 pub async fn find_candidate_by_dedupe<C: ConnectionTrait>(
@@ -146,6 +172,62 @@ pub async fn find_candidate_by_dedupe<C: ConnectionTrait>(
         .one(db)
         .await
         .with_context(|| format!("failed to find memory candidate by dedupe key `{dedupe_key}`"))
+}
+
+pub async fn update_candidate_status<C: ConnectionTrait>(
+    db: &C,
+    update: AgentMemoryCandidateStatusUpdateRecord,
+) -> Result<Option<agent_memory_candidate::Model>> {
+    let decided_at = crate::util::unix_to_datetime(update.decided_at_unix);
+    let mut statement = agent_memory_candidate::Entity::update_many()
+        .col_expr(
+            agent_memory_candidate::Column::Status,
+            Expr::value(memory_candidate_status_to_db(update.status).to_owned()),
+        )
+        .col_expr(
+            agent_memory_candidate::Column::DecidedAt,
+            Expr::value(Some(decided_at)),
+        )
+        .col_expr(
+            agent_memory_candidate::Column::DecidedByKind,
+            Expr::value(actor_kind_to_db(&update.decided_by)),
+        )
+        .col_expr(
+            agent_memory_candidate::Column::DecidedById,
+            Expr::value(actor_id_to_db(&update.decided_by)),
+        )
+        .col_expr(
+            agent_memory_candidate::Column::DecisionReason,
+            Expr::value(update.decision_reason),
+        )
+        .col_expr(
+            agent_memory_candidate::Column::PromotedMemoryId,
+            Expr::value(update.promoted_memory_id),
+        )
+        .filter(agent_memory_candidate::Column::Id.eq(update.candidate_id.clone()));
+    if let Some(metadata_json) = update.metadata_json {
+        statement = statement.col_expr(
+            agent_memory_candidate::Column::MetadataJson,
+            Expr::value(Some(metadata_json)),
+        );
+    }
+    let affected = statement
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to update memory candidate `{}` status",
+                update.candidate_id
+            )
+        })?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(None);
+    }
+    agent_memory_candidate::Entity::find_by_id(update.candidate_id)
+        .one(db)
+        .await
+        .context("failed to reload updated memory candidate")
 }
 
 pub async fn update_candidate_metadata<C: ConnectionTrait>(
@@ -213,11 +295,7 @@ pub async fn decide_candidate<C: ConnectionTrait>(
             Expr::value(decision.promoted_memory_id),
         )
         .filter(agent_memory_candidate::Column::Id.eq(decision.candidate_id.clone()))
-        .filter(
-            agent_memory_candidate::Column::Status.eq(memory_candidate_status_to_db(
-                MemoryCandidateStatus::Pending,
-            )),
-        )
+        .filter(agent_memory_candidate::Column::Status.is_in(pending_like_statuses()))
         .exec(db)
         .await
         .with_context(|| {
@@ -236,6 +314,18 @@ pub async fn decide_candidate<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to reload decided memory candidate")
+}
+
+fn pending_like_statuses() -> Vec<String> {
+    [
+        MemoryCandidateStatus::Pending,
+        MemoryCandidateStatus::PendingSilent,
+        MemoryCandidateStatus::AskOnUse,
+        MemoryCandidateStatus::NeedsReview,
+    ]
+    .into_iter()
+    .map(|status| memory_candidate_status_to_db(status).to_owned())
+    .collect()
 }
 
 async fn find_any_candidate_by_dedupe<C: ConnectionTrait>(

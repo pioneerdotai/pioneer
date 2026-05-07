@@ -469,9 +469,86 @@ pub struct MemoryForgetResponse {
 #[serde(rename_all = "snake_case")]
 pub enum MemoryCandidateStatus {
     Pending,
+    PendingSilent,
+    AskOnUse,
+    NeedsReview,
     Approved,
     Rejected,
+    AutoRejected,
+    ReviewDisabledRejected,
+    Superseded,
+    MergedDuplicate,
     Expired,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCandidatePolicyDecision {
+    AutoApprove,
+    PendingSilent,
+    AskOnUse,
+    NeedsReview,
+    AutoReject,
+    RejectReviewDisabled,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCandidateScoreBucket {
+    High,
+    Middle,
+    ExtremelyLow,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidateScore {
+    pub total_score: f32,
+    pub bucket: MemoryCandidateScoreBucket,
+    pub explicitness_score: f32,
+    pub durability_score: f32,
+    pub scope_score: f32,
+    pub evidence_score: f32,
+    pub certainty_score: f32,
+    pub sensitivity_score: f32,
+    pub relation_score: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScopeClarity {
+    Clear,
+    Inferred,
+    Unclear,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatePolicyInput {
+    pub semantic: MemorySemanticFields,
+    pub relation: MemoryWriteRelation,
+    pub scope: MemoryScope,
+    pub scope_clarity: MemoryScopeClarity,
+    pub evidence_count: u32,
+    pub has_contradiction: bool,
+    pub has_duplicate: bool,
+    pub has_rejected_duplicate: bool,
+    pub sensitivity: MemorySensitivity,
+    pub active_no_memory_policy: bool,
+    pub source_kind: MemorySourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_run_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatePolicyOutput {
+    pub input: MemoryCandidatePolicyInput,
+    pub score: MemoryCandidateScore,
+    pub decision: MemoryCandidatePolicyDecision,
+    pub status: MemoryCandidateStatus,
+    pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -508,11 +585,24 @@ pub struct MemoryCandidatesListParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<MemoryScope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<MemoryCategory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statuses: Vec<MemoryCandidateStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesGetParams {
+    pub candidate_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
+pub struct MemoryCandidatesGetResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<MemoryCandidate>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
@@ -538,6 +628,82 @@ pub struct MemoryCandidatesDecideResponse {
     pub candidate: MemoryCandidate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<MemoryRecord>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesApproveParams {
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatesApproveResponse {
+    pub candidate: MemoryCandidate,
+    pub record: MemoryRecord,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesRejectParams {
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatesRejectResponse {
+    pub candidate: MemoryCandidate,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesEditAndApproveParams {
+    pub candidate_id: String,
+    pub edited_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatesEditAndApproveResponse {
+    pub candidate: MemoryCandidate,
+    pub record: MemoryRecord,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesMergeParams {
+    pub candidate_id: String,
+    pub target_candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatesMergeResponse {
+    pub candidate: MemoryCandidate,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidatesSuppressSimilarParams {
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<MemoryActor>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryCandidatesSuppressSimilarResponse {
+    pub candidate: MemoryCandidate,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,11 +741,13 @@ pub struct MemoryForgottenNotification {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryAttribute, MemoryCandidateDecision, MemoryCategory, MemoryDurability,
-        MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetTarget, MemoryIntent,
-        MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams,
-        MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
-        MemorySensitivityHint, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+        MemoryAttribute, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
+        MemoryCandidateScore, MemoryCandidateScoreBucket, MemoryCandidateStatus, MemoryCategory,
+        MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetTarget,
+        MemoryIntent, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
+        MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
+        MemorySemanticWriteParams, MemorySensitivityHint, MemorySubject, MemoryWriteEvidence,
+        MemoryWriteRelation,
     };
     use crate::constants;
     use serde_json::json;
@@ -687,6 +855,41 @@ mod tests {
     }
 
     #[test]
+    fn candidate_policy_contract_uses_typed_snake_case_fields() {
+        assert_eq!(
+            serde_json::to_value(MemoryCandidateStatus::ReviewDisabledRejected)
+                .expect("candidate status encode"),
+            json!("review_disabled_rejected")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryCandidatePolicyDecision::RejectReviewDisabled)
+                .expect("policy decision encode"),
+            json!("reject_review_disabled")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryCandidateScoreBucket::ExtremelyLow)
+                .expect("score bucket encode"),
+            json!("extremely_low")
+        );
+
+        let score = MemoryCandidateScore {
+            total_score: 0.92,
+            bucket: MemoryCandidateScoreBucket::High,
+            explicitness_score: 0.25,
+            durability_score: 0.2,
+            scope_score: 0.15,
+            evidence_score: 0.1,
+            certainty_score: 0.15,
+            sensitivity_score: 0.1,
+            relation_score: 0.05,
+            reasons: vec!["explicit".to_owned()],
+        };
+        let encoded = serde_json::to_value(score).expect("score encode");
+        assert_eq!(encoded["bucket"], json!("high"));
+        assert_eq!(encoded["reasons"], json!(["explicit"]));
+    }
+
+    #[test]
     fn semantic_write_contract_uses_typed_snake_case_fields() {
         assert_eq!(
             serde_json::to_value(MemoryIntent::ExplicitStore).expect("intent encode"),
@@ -774,7 +977,10 @@ mod tests {
             "memory_semantic_write_params.json",
             "memory_semantic_write_response.json",
             "memory_candidate.json",
+            "memory_candidate_score.json",
+            "memory_candidate_policy_decision.json",
             "memory_candidates_decide_params.json",
+            "memory_candidates_approve_params.json",
             "memory_changed_notification.json",
         ] {
             assert!(

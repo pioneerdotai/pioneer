@@ -10,7 +10,8 @@ use pioneer_memory::{
     MemoryRecallParams, MemoryService, MemoryServiceConfig,
 };
 use pioneer_protocol::{
-    MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus, MemoryCategory,
+    MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
+    MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
     MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
     MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryRememberParams,
     MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
@@ -693,7 +694,7 @@ async fn semantic_pending_candidate_duplicates_merge_evidence() {
 }
 
 #[tokio::test]
-async fn semantic_route_to_candidate_policy_is_dormant_boundary() {
+async fn semantic_route_to_candidate_policy_applies_default_review_disabled_policy() {
     let (_store, _backend, service) = setup_service().await;
     let response = service
         .write_semantic_memory(
@@ -710,7 +711,258 @@ async fn semantic_route_to_candidate_policy_is_dormant_boundary() {
         .expect("policy boundary write");
     assert_eq!(response.relation, MemoryWriteRelation::Novel);
     assert!(response.record.is_none());
+    let candidate = response.candidate.expect("review-disabled candidate");
+    assert_eq!(
+        candidate.status,
+        MemoryCandidateStatus::ReviewDisabledRejected
+    );
+    assert_eq!(
+        candidate
+            .metadata
+            .get("candidate_policy_reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some("implicit_auto_approve_disabled")
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_explicit_durable_fact_auto_approves() {
+    let (store, _backend, service) = setup_service().await;
+    let response = service
+        .write_semantic_memory(
+            user_context(366),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "Запомни, меня зовут Александр.",
+                "Александр",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_auto_approve",
+            ),
+        )
+        .await
+        .expect("policy write");
+
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
     assert!(response.candidate.is_none());
+    let record = response.record.expect("auto-approved record");
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_score_bucket")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_policy_decision")
+            .and_then(serde_json::Value::as_str),
+        Some("auto_approve")
+    );
+
+    let decisions = store
+        .list_agent_memory_policy_decisions_for_memory(record.id.as_str(), 20)
+        .await
+        .expect("policy decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.action == "candidate_policy" && decision.decision == "auto_approve"
+    }));
+}
+
+#[tokio::test]
+async fn semantic_route_implicit_durable_fact_auto_approves_when_enabled() {
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.allow_implicit_auto_approve = true;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+
+    let response = service
+        .write_semantic_memory(
+            user_context(367),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_implicit_auto_approve",
+            ),
+        )
+        .await
+        .expect("policy write");
+
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
+    assert!(response.candidate.is_none());
+    assert!(response.record.is_some());
+}
+
+#[tokio::test]
+async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut transient_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+    transient_semantic.durability = MemoryDurability::Transient;
+    let transient = service
+        .write_semantic_memory(
+            user_context(368),
+            semantic_write_params(
+                transient_semantic,
+                "Right now the user might be called Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_transient",
+            ),
+        )
+        .await
+        .expect("transient policy write");
+    let transient_candidate = transient.candidate.expect("transient candidate");
+    assert_eq!(
+        transient_candidate.status,
+        MemoryCandidateStatus::AutoRejected
+    );
+    assert_eq!(
+        transient_candidate
+            .metadata
+            .get("candidate_policy_reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some("transient_or_session_only")
+    );
+
+    let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+    secret_semantic.sensitivity = MemorySensitivityHint::Secret;
+    let secret = service
+        .write_semantic_memory(
+            user_context(369),
+            semantic_write_params(
+                secret_semantic,
+                "User token is abc123.",
+                "abc123",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_secret",
+            ),
+        )
+        .await
+        .expect("secret policy write");
+    let secret_candidate = secret.candidate.expect("secret candidate");
+    assert_eq!(secret_candidate.status, MemoryCandidateStatus::AutoRejected);
+    assert_eq!(
+        secret_candidate
+            .metadata
+            .get("candidate_policy_reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some("secret_like_or_regulated")
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_middle_fact_rejects_by_default_and_routes_when_review_enabled() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+    middle_semantic.intent = MemoryIntent::ImplicitCandidate;
+    middle_semantic.durability = MemoryDurability::Unknown;
+    middle_semantic.certainty = MemoryExtractorCertainty::Medium;
+    middle_semantic.scope_hint = MemoryScopeHint::Unknown;
+
+    let default_response = service
+        .write_semantic_memory(
+            user_context(372),
+            semantic_write_params(
+                middle_semantic.clone(),
+                "Maybe the user prefers terse answers.",
+                "terse answers",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_middle",
+            ),
+        )
+        .await
+        .expect("middle policy write");
+    let default_candidate = default_response.candidate.expect("middle candidate");
+    assert_eq!(
+        default_candidate.status,
+        MemoryCandidateStatus::ReviewDisabledRejected
+    );
+    assert_eq!(
+        default_candidate
+            .metadata
+            .get("candidate_policy_reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some("review_disabled_middle_confidence")
+    );
+
+    let listed = service
+        .list_candidates(
+            user_context(373),
+            pioneer_protocol::MemoryCandidatesListParams::default(),
+        )
+        .await
+        .expect("default list candidates");
+    assert!(listed.candidates.iter().all(|candidate| !matches!(
+        candidate.status,
+        MemoryCandidateStatus::PendingSilent
+            | MemoryCandidateStatus::AskOnUse
+            | MemoryCandidateStatus::NeedsReview
+    )));
+
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.review_enabled = true;
+    let (_store, _backend, review_service) = setup_service_with_config(config).await;
+    let review_response = review_service
+        .write_semantic_memory(
+            user_context(374),
+            semantic_write_params(
+                middle_semantic,
+                "Maybe the user prefers terse answers.",
+                "terse answers",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_middle_review",
+            ),
+        )
+        .await
+        .expect("review policy write");
+    assert_eq!(
+        review_response.candidate.expect("review candidate").status,
+        MemoryCandidateStatus::PendingSilent
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_contradiction_routes_to_dormant_review_only_when_enabled() {
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.review_enabled = true;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+    service
+        .write_semantic_memory(
+            user_context(375),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_semantic_policy_contradiction_base",
+            ),
+        )
+        .await
+        .expect("base memory");
+
+    let contradiction = service
+        .write_semantic_memory(
+            user_context(376),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name may be Alexey.",
+                "Alexey",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_policy_contradiction",
+            ),
+        )
+        .await
+        .expect("contradiction");
+    assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
+    assert_eq!(
+        contradiction
+            .candidate
+            .expect("ask-on-use candidate")
+            .status,
+        MemoryCandidateStatus::AskOnUse
+    );
+    assert!(contradiction.record.is_none());
 }
 
 #[tokio::test]
@@ -751,6 +1003,192 @@ async fn semantic_rejected_candidate_suppresses_repeat_suggestion() {
     assert_eq!(second.relation, MemoryWriteRelation::SuppressedByRejection);
     assert!(second.candidate.is_none());
     assert!(second.record.is_none());
+}
+
+#[tokio::test]
+async fn candidate_approval_uses_semantic_canonical_pipeline() {
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.review_enabled = true;
+    let (_store, _backend, service) = setup_service_with_config(config).await;
+    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+    middle_semantic.intent = MemoryIntent::ImplicitCandidate;
+    middle_semantic.durability = MemoryDurability::Unknown;
+    middle_semantic.certainty = MemoryExtractorCertainty::Medium;
+
+    let candidate = service
+        .write_semantic_memory(
+            user_context(390),
+            semantic_write_params(
+                middle_semantic,
+                "Maybe the user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_candidate_approval",
+            ),
+        )
+        .await
+        .expect("candidate write")
+        .candidate
+        .expect("candidate");
+    assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
+
+    let approved = service
+        .approve_candidate(
+            user_context(391),
+            MemoryCandidatesApproveParams {
+                candidate_id: candidate.id.clone(),
+                reason: Some("approved in test".to_owned()),
+                actor: None,
+            },
+        )
+        .await
+        .expect("approve candidate");
+
+    assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
+    assert_eq!(
+        approved.record.key.as_deref(),
+        Some("user/global:identity:self:name")
+    );
+    assert_eq!(
+        approved
+            .record
+            .metadata
+            .get("approved_candidate_id")
+            .and_then(serde_json::Value::as_str),
+        Some(candidate.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.review_enabled = true;
+    let (store, _backend, service) = setup_service_with_config(config).await;
+    let first = service
+        .write_semantic_memory(
+            user_context(392),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_candidate_edit_base",
+            ),
+        )
+        .await
+        .expect("base memory")
+        .record
+        .expect("record");
+
+    let candidate = service
+        .write_semantic_memory(
+            user_context(393),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Implicit),
+                "The user's name may be Alexey.",
+                "Alexey",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_candidate_edit_candidate",
+            ),
+        )
+        .await
+        .expect("candidate")
+        .candidate
+        .expect("candidate");
+    assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
+
+    let approved = service
+        .edit_and_approve_candidate(
+            user_context(394),
+            MemoryCandidatesEditAndApproveParams {
+                candidate_id: candidate.id,
+                edited_text: "The user's name is Alex.".to_owned(),
+                edited_value: Some("Alex".to_owned()),
+                reason: Some("corrected candidate".to_owned()),
+                actor: None,
+            },
+        )
+        .await
+        .expect("edit and approve");
+    assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
+    assert_eq!(approved.record.content, "The user's name is Alex.");
+
+    let old = store
+        .get_agent_memory_record(first.id.as_str(), true)
+        .await
+        .expect("load old")
+        .expect("old record");
+    assert_eq!(old.status, MemoryStatus::Superseded);
+}
+
+#[tokio::test]
+async fn candidate_api_preserves_workspace_isolation_and_score_audit() {
+    let mut config = MemoryServiceConfig::default();
+    config.candidate_policy.review_enabled = true;
+    let (store, _backend, service) = setup_service_with_config(config).await;
+    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+    middle_semantic.intent = MemoryIntent::ImplicitCandidate;
+    middle_semantic.durability = MemoryDurability::Unknown;
+    middle_semantic.certainty = MemoryExtractorCertainty::Medium;
+    middle_semantic.scope_hint = MemoryScopeHint::ProjectWorkspace;
+    let mut params = semantic_write_params(
+        middle_semantic,
+        "Maybe this workspace prefers migration changes in one file.",
+        "migration changes in one file",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_candidate_scope",
+    );
+    params.scope = scope(MemoryScopeKind::Workspace, "ws_memory_a");
+
+    let candidate = service
+        .write_semantic_memory(workspace_context("ws_memory_a", 395), params)
+        .await
+        .expect("workspace candidate")
+        .candidate
+        .expect("candidate");
+    assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
+    assert_eq!(
+        candidate
+            .metadata
+            .get("candidate_score_bucket")
+            .and_then(serde_json::Value::as_str),
+        Some("middle")
+    );
+
+    let visible = service
+        .get_candidate(
+            workspace_context("ws_memory_a", 396),
+            pioneer_protocol::MemoryCandidatesGetParams {
+                candidate_id: candidate.id.clone(),
+            },
+        )
+        .await
+        .expect("get visible");
+    assert!(visible.candidate.is_some());
+
+    let hidden = service
+        .get_candidate(
+            workspace_context("ws_memory_b", 397),
+            pioneer_protocol::MemoryCandidatesGetParams {
+                candidate_id: candidate.id.clone(),
+            },
+        )
+        .await
+        .expect("get hidden");
+    assert!(hidden.candidate.is_none());
+
+    let decisions = store
+        .list_agent_memory_policy_decisions_for_candidate(candidate.id.as_str(), 20)
+        .await
+        .expect("candidate policy decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.action == "candidate_policy"
+            && decision.reason_code.as_deref() == Some("review_enabled_middle_confidence")
+            && decision
+                .details_json
+                .as_deref()
+                .is_some_and(|details| details.contains("\"bucket\":\"middle\""))
+    }));
 }
 
 #[tokio::test]

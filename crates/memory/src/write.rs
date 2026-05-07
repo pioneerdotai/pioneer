@@ -112,6 +112,8 @@ pub(crate) fn semantic_metadata(
         json!({
             "canonical_key": prepared.canonical.key,
             "canonical_namespace": prepared.canonical.namespace,
+            "canonical": prepared.canonical,
+            "fields": semantic,
             "semantic_fingerprint": prepared.semantic_fingerprint,
             "dedupe_key": prepared.dedupe_key,
             "normalized_value": prepared.normalized_value,

@@ -237,8 +237,15 @@ pub fn memory_actor_kind_from_db(value: &str) -> Result<MemoryActorKind> {
 pub fn memory_candidate_status_to_db(status: MemoryCandidateStatus) -> &'static str {
     match status {
         MemoryCandidateStatus::Pending => "pending",
+        MemoryCandidateStatus::PendingSilent => "pending_silent",
+        MemoryCandidateStatus::AskOnUse => "ask_on_use",
+        MemoryCandidateStatus::NeedsReview => "needs_review",
         MemoryCandidateStatus::Approved => "approved",
         MemoryCandidateStatus::Rejected => "rejected",
+        MemoryCandidateStatus::AutoRejected => "auto_rejected",
+        MemoryCandidateStatus::ReviewDisabledRejected => "review_disabled_rejected",
+        MemoryCandidateStatus::Superseded => "superseded",
+        MemoryCandidateStatus::MergedDuplicate => "merged_duplicate",
         MemoryCandidateStatus::Expired => "expired",
     }
 }
@@ -246,8 +253,15 @@ pub fn memory_candidate_status_to_db(status: MemoryCandidateStatus) -> &'static 
 pub fn memory_candidate_status_from_db(value: &str) -> Result<MemoryCandidateStatus> {
     match value {
         "pending" => Ok(MemoryCandidateStatus::Pending),
+        "pending_silent" => Ok(MemoryCandidateStatus::PendingSilent),
+        "ask_on_use" => Ok(MemoryCandidateStatus::AskOnUse),
+        "needs_review" => Ok(MemoryCandidateStatus::NeedsReview),
         "approved" => Ok(MemoryCandidateStatus::Approved),
         "rejected" => Ok(MemoryCandidateStatus::Rejected),
+        "auto_rejected" => Ok(MemoryCandidateStatus::AutoRejected),
+        "review_disabled_rejected" => Ok(MemoryCandidateStatus::ReviewDisabledRejected),
+        "superseded" => Ok(MemoryCandidateStatus::Superseded),
+        "merged_duplicate" => Ok(MemoryCandidateStatus::MergedDuplicate),
         "expired" => Ok(MemoryCandidateStatus::Expired),
         _ => bail!("unknown memory candidate status `{value}`"),
     }

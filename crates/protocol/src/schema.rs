@@ -24,13 +24,20 @@ use crate::{
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, MemoryActor,
     MemoryActorKind, MemoryAttribute, MemoryAttributeCardinality, MemoryCandidate,
-    MemoryCandidateCreatedNotification, MemoryCandidateDecision, MemoryCandidateStatus,
-    MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse, MemoryCandidatesListParams,
-    MemoryCandidatesListResponse, MemoryCanonicalKey, MemoryCategory, MemoryChangeKind,
-    MemoryChangedNotification, MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty,
-    MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification,
-    MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
-    MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
+    MemoryCandidateCreatedNotification, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
+    MemoryCandidatePolicyInput, MemoryCandidatePolicyOutput, MemoryCandidateScore,
+    MemoryCandidateScoreBucket, MemoryCandidateStatus, MemoryCandidatesApproveParams,
+    MemoryCandidatesApproveResponse, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesEditAndApproveParams, MemoryCandidatesEditAndApproveResponse,
+    MemoryCandidatesGetParams, MemoryCandidatesGetResponse, MemoryCandidatesListParams,
+    MemoryCandidatesListResponse, MemoryCandidatesMergeParams, MemoryCandidatesMergeResponse,
+    MemoryCandidatesRejectParams, MemoryCandidatesRejectResponse,
+    MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse,
+    MemoryCanonicalKey, MemoryCategory, MemoryChangeKind, MemoryChangedNotification,
+    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
+    MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse, MemoryProvenance,
+    MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity,
     MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceKind,
@@ -183,8 +190,34 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("memory_forget_params.json", MemoryForgetParams),
         schema_doc!("memory_forget_response.json", MemoryForgetResponse),
         schema_doc!("memory_candidate_status.json", MemoryCandidateStatus),
+        schema_doc!(
+            "memory_candidate_policy_decision.json",
+            MemoryCandidatePolicyDecision
+        ),
+        schema_doc!(
+            "memory_candidate_score_bucket.json",
+            MemoryCandidateScoreBucket
+        ),
+        schema_doc!("memory_candidate_score.json", MemoryCandidateScore),
+        schema_doc!("memory_scope_clarity.json", MemoryScopeClarity),
+        schema_doc!(
+            "memory_candidate_policy_input.json",
+            MemoryCandidatePolicyInput
+        ),
+        schema_doc!(
+            "memory_candidate_policy_output.json",
+            MemoryCandidatePolicyOutput
+        ),
         schema_doc!("memory_candidate.json", MemoryCandidate),
         schema_doc!("memory_candidate_decision.json", MemoryCandidateDecision),
+        schema_doc!(
+            "memory_candidates_get_params.json",
+            MemoryCandidatesGetParams
+        ),
+        schema_doc!(
+            "memory_candidates_get_response.json",
+            MemoryCandidatesGetResponse
+        ),
         schema_doc!(
             "memory_candidates_list_params.json",
             MemoryCandidatesListParams
@@ -200,6 +233,46 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "memory_candidates_decide_response.json",
             MemoryCandidatesDecideResponse
+        ),
+        schema_doc!(
+            "memory_candidates_approve_params.json",
+            MemoryCandidatesApproveParams
+        ),
+        schema_doc!(
+            "memory_candidates_approve_response.json",
+            MemoryCandidatesApproveResponse
+        ),
+        schema_doc!(
+            "memory_candidates_reject_params.json",
+            MemoryCandidatesRejectParams
+        ),
+        schema_doc!(
+            "memory_candidates_reject_response.json",
+            MemoryCandidatesRejectResponse
+        ),
+        schema_doc!(
+            "memory_candidates_edit_and_approve_params.json",
+            MemoryCandidatesEditAndApproveParams
+        ),
+        schema_doc!(
+            "memory_candidates_edit_and_approve_response.json",
+            MemoryCandidatesEditAndApproveResponse
+        ),
+        schema_doc!(
+            "memory_candidates_merge_params.json",
+            MemoryCandidatesMergeParams
+        ),
+        schema_doc!(
+            "memory_candidates_merge_response.json",
+            MemoryCandidatesMergeResponse
+        ),
+        schema_doc!(
+            "memory_candidates_suppress_similar_params.json",
+            MemoryCandidatesSuppressSimilarParams
+        ),
+        schema_doc!(
+            "memory_candidates_suppress_similar_response.json",
+            MemoryCandidatesSuppressSimilarResponse
         ),
         schema_doc!("memory_change_kind.json", MemoryChangeKind),
         schema_doc!(

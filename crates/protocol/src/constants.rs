@@ -55,7 +55,13 @@ pub mod methods {
     pub const MEMORY_REMEMBER: &str = "memory/remember";
     pub const MEMORY_FORGET: &str = "memory/forget";
     pub const MEMORY_CANDIDATES_LIST: &str = "memory/candidates/list";
+    pub const MEMORY_CANDIDATES_GET: &str = "memory/candidates/get";
     pub const MEMORY_CANDIDATES_DECIDE: &str = "memory/candidates/decide";
+    pub const MEMORY_CANDIDATES_APPROVE: &str = "memory/candidates/approve";
+    pub const MEMORY_CANDIDATES_REJECT: &str = "memory/candidates/reject";
+    pub const MEMORY_CANDIDATES_EDIT_AND_APPROVE: &str = "memory/candidates/edit_and_approve";
+    pub const MEMORY_CANDIDATES_MERGE: &str = "memory/candidates/merge";
+    pub const MEMORY_CANDIDATES_SUPPRESS_SIMILAR: &str = "memory/candidates/suppress_similar";
 }
 
 pub mod events {

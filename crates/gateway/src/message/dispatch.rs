@@ -1,7 +1,9 @@
 use super::*;
 use pioneer_protocol::{
-    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesDecideParams,
-    MemoryCandidatesListParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
+    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
+    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
+    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
@@ -220,50 +222,44 @@ impl MessageProcessor {
                 }
             }
             methods::MEMORY_CANDIDATES_LIST => {
-                let params_value = request.params.unwrap_or_else(empty_object_value);
-                match serde_json::from_value::<MemoryCandidatesListParams>(params_value) {
-                    Ok(params) => {
-                        self.memory_candidates_list(connection_id, request.id, params)
-                            .await;
-                    }
-                    Err(error) => {
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request.id),
-                                INVALID_PARAMS_CODE,
-                                format!(
-                                    "invalid params for `{}`: {error}",
-                                    methods::MEMORY_CANDIDATES_LIST
-                                ),
-                            ),
-                        )
-                        .await;
-                    }
-                }
+                self.dispatch_memory_candidates_list(connection_id, request.id, request.params)
+                    .await;
+            }
+            methods::MEMORY_CANDIDATES_GET => {
+                self.dispatch_memory_candidates_get(connection_id, request.id, request.params)
+                    .await;
             }
             methods::MEMORY_CANDIDATES_DECIDE => {
-                let params_value = request.params.unwrap_or_else(empty_object_value);
-                match serde_json::from_value::<MemoryCandidatesDecideParams>(params_value) {
-                    Ok(params) => {
-                        self.memory_candidates_decide(connection_id, request.id, params)
-                            .await;
-                    }
-                    Err(error) => {
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request.id),
-                                INVALID_PARAMS_CODE,
-                                format!(
-                                    "invalid params for `{}`: {error}",
-                                    methods::MEMORY_CANDIDATES_DECIDE
-                                ),
-                            ),
-                        )
-                        .await;
-                    }
-                }
+                self.dispatch_memory_candidates_decide(connection_id, request.id, request.params)
+                    .await;
+            }
+            methods::MEMORY_CANDIDATES_APPROVE => {
+                self.dispatch_memory_candidates_approve(connection_id, request.id, request.params)
+                    .await;
+            }
+            methods::MEMORY_CANDIDATES_REJECT => {
+                self.dispatch_memory_candidates_reject(connection_id, request.id, request.params)
+                    .await;
+            }
+            methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE => {
+                self.dispatch_memory_candidates_edit_and_approve(
+                    connection_id,
+                    request.id,
+                    request.params,
+                )
+                .await;
+            }
+            methods::MEMORY_CANDIDATES_MERGE => {
+                self.dispatch_memory_candidates_merge(connection_id, request.id, request.params)
+                    .await;
+            }
+            methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR => {
+                self.dispatch_memory_candidates_suppress_similar(
+                    connection_id,
+                    request.id,
+                    request.params,
+                )
+                .await;
             }
             methods::THREAD_START => {
                 let params_value = request.params.unwrap_or_else(empty_object_value);
@@ -1227,6 +1223,216 @@ impl MessageProcessor {
                 .await;
             }
         }
+    }
+
+    async fn dispatch_memory_candidates_list(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesListParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_list(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_LIST,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_get(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesGetParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_get(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_GET,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_decide(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesDecideParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_decide(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_DECIDE,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_approve(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesApproveParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_approve(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_APPROVE,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_reject(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesRejectParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_reject(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_REJECT,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_edit_and_approve(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesEditAndApproveParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_edit_and_approve(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_merge(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesMergeParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_merge(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_MERGE,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn dispatch_memory_candidates_suppress_similar(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: Option<JsonValue>,
+    ) {
+        let params_value = params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<MemoryCandidatesSuppressSimilarParams>(params_value) {
+            Ok(params) => {
+                self.memory_candidates_suppress_similar(connection_id, request_id, params)
+                    .await;
+            }
+            Err(error) => {
+                self.send_invalid_params_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn send_invalid_params_error(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        method: &'static str,
+        error: serde_json::Error,
+    ) {
+        self.send_error(
+            connection_id,
+            JsonRpcErrorResponse::new(
+                Some(request_id),
+                INVALID_PARAMS_CODE,
+                format!("invalid params for `{method}`: {error}"),
+            ),
+        )
+        .await;
     }
 
     pub async fn connection_closed(&self, connection_id: ConnectionId) {

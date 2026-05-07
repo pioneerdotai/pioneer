@@ -67,12 +67,12 @@ use crate::turn_item_terminal::{
 
 pub use crate::memory::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
-    AgentMemoryCapsuleRecord, AgentMemoryControlRecord, AgentMemoryEventRecord,
-    AgentMemoryListFilter, AgentMemoryPolicyDecisionRecord, AgentMemoryRepairJobRecord,
-    MemoryActorRecord, MemoryScopeResolution, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
-    NewAgentMemoryControlRecord, NewAgentMemoryEvent, NewAgentMemoryPolicyDecision,
-    NewAgentMemoryRepairJob, global_agent_memory_scope_key, memory_scope_key_hash,
-    workspace_agent_memory_scope_key,
+    AgentMemoryCandidateStatusUpdateRecord, AgentMemoryCapsuleRecord, AgentMemoryControlRecord,
+    AgentMemoryEventRecord, AgentMemoryListFilter, AgentMemoryPolicyDecisionRecord,
+    AgentMemoryRepairJobRecord, MemoryActorRecord, MemoryScopeResolution, MemoryWorkspaceGuard,
+    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryEvent,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob, global_agent_memory_scope_key,
+    memory_scope_key_hash, workspace_agent_memory_scope_key,
 };
 pub use crate::repositories::hook_run::{
     HOOK_RUN_CONTRIBUTION_HASH_MAX_COUNT, HOOK_RUN_DIAGNOSTIC_MESSAGE_MAX_CHARS,
@@ -86,6 +86,22 @@ use crate::util::{
     optional_typed_json_from_db, typed_json_from_db, unix_ms_to_datetime, unix_to_datetime,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+
+fn memory_candidate_status_event_kind(status: MemoryCandidateStatus) -> &'static str {
+    match status {
+        MemoryCandidateStatus::Approved => MEMORY_EVENT_CANDIDATE_APPROVED,
+        MemoryCandidateStatus::Rejected
+        | MemoryCandidateStatus::AutoRejected
+        | MemoryCandidateStatus::ReviewDisabledRejected => MEMORY_EVENT_CANDIDATE_REJECTED,
+        MemoryCandidateStatus::Expired => MEMORY_EVENT_CANDIDATE_EXPIRED,
+        MemoryCandidateStatus::Pending
+        | MemoryCandidateStatus::PendingSilent
+        | MemoryCandidateStatus::AskOnUse
+        | MemoryCandidateStatus::NeedsReview => MEMORY_EVENT_CANDIDATE_CREATED,
+        MemoryCandidateStatus::Superseded => "candidate_superseded",
+        MemoryCandidateStatus::MergedDuplicate => "candidate_merged_duplicate",
+    }
+}
 
 /// A single turn's conversation content: user input + assistant reply.
 #[derive(Debug, Clone)]
@@ -1117,6 +1133,29 @@ impl CrudStore {
         Ok(Some(record))
     }
 
+    pub async fn get_agent_memory_candidate(
+        &self,
+        candidate_id: &str,
+        workspace_guard: Option<MemoryWorkspaceGuard>,
+    ) -> Result<Option<AgentMemoryCandidateRecord>> {
+        let Some(row) =
+            agent_memory_candidate::find_candidate_by_id(&self.connection, candidate_id).await?
+        else {
+            return Ok(None);
+        };
+        let record = crate::memory::agent_memory_candidate_record_from_model(row)?;
+        if let Some(guard) = workspace_guard
+            && !crate::memory::workspace_allowed_by_guard(
+                record.scope.kind,
+                &record.workspace_id,
+                &guard,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
     pub async fn update_agent_memory_candidate_metadata(
         &self,
         candidate_id: &str,
@@ -1151,6 +1190,58 @@ impl CrudStore {
                     .commit()
                     .await
                     .context("failed to commit memory candidate metadata update transaction")?;
+                Ok(Some(
+                    crate::memory::agent_memory_candidate_record_from_model(row)?,
+                ))
+            }
+        })
+        .await
+    }
+
+    pub async fn update_agent_memory_candidate_status(
+        &self,
+        update: AgentMemoryCandidateStatusUpdateRecord,
+    ) -> Result<Option<AgentMemoryCandidateRecord>> {
+        self.run_serialized_write(|| {
+            let update = update.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory candidate status update transaction")?;
+                let Some(row) =
+                    agent_memory_candidate::update_candidate_status(&transaction, update.clone())
+                        .await?
+                else {
+                    transaction.commit().await.context(
+                        "failed to commit empty memory candidate status update transaction",
+                    )?;
+                    return Ok(None);
+                };
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: update.promoted_memory_id.clone(),
+                        candidate_id: Some(row.id.clone()),
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: memory_candidate_status_event_kind(update.status).to_owned(),
+                        actor: update.decided_by.clone(),
+                        thread_id: row.source_thread_id.clone(),
+                        turn_id: row.source_turn_id.clone(),
+                        item_id: row.source_item_id.clone(),
+                        details_json: update
+                            .decision_reason
+                            .clone()
+                            .map(|reason| serde_json::json!({ "reason": reason }).to_string()),
+                        created_at_unix: update.decided_at_unix,
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory candidate status update transaction")?;
                 Ok(Some(
                     crate::memory::agent_memory_candidate_record_from_model(row)?,
                 ))

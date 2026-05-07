@@ -498,6 +498,7 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         namespace: None,
         category: MemoryCategory::ProjectFact,
         key: Some("project.memory".to_owned()),
+        status: None,
         candidate_text: "Use memvid for agent memory.".to_owned(),
         confidence: 0.9,
         reason: "Repeated explicit project instruction.".to_owned(),
@@ -528,6 +529,18 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         .await
         .expect("list pending candidates");
     assert_eq!(pending.len(), 1);
+
+    let category_filtered = store
+        .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
+            scopes: vec![scope(MemoryScopeKind::Workspace, "ws_memory_a")],
+            categories: vec![MemoryCategory::ProjectFact],
+            statuses: vec![MemoryCandidateStatus::Pending],
+            limit: None,
+            workspace_guard: None,
+        })
+        .await
+        .expect("list candidates by category");
+    assert_eq!(category_filtered.len(), 1);
 
     let rejected = store
         .decide_agent_memory_candidate(AgentMemoryCandidateDecisionRecord {

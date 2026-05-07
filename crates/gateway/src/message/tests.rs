@@ -10914,8 +10914,25 @@ async fn memory_bridge_not_bound_when_runtime_disabled() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
+#[test]
+fn agent_memory_remember_russian_name_recalls_in_new_thread() {
+    std::thread::Builder::new()
+        .name("agent_memory_remember_russian_name".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(agent_memory_remember_russian_name_recalls_in_new_thread_impl());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should finish");
+}
+
+async fn agent_memory_remember_russian_name_recalls_in_new_thread_impl() {
     let remember_provider = Arc::new(MemoryAgentE2eProvider::new(
         "memory-remember-name",
         MemoryAgentE2eScript::RememberName,
@@ -11022,8 +11039,25 @@ async fn agent_memory_remember_russian_name_recalls_in_new_thread() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
+#[test]
+fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
+    std::thread::Builder::new()
+        .name("agent_memory_forget_russian_birthday".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(agent_memory_forget_russian_birthday_suppresses_future_recall_impl());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should finish");
+}
+
+async fn agent_memory_forget_russian_birthday_suppresses_future_recall_impl() {
     let seed_provider = Arc::new(MemoryAgentE2eProvider::new(
         "memory-seed-birthday",
         MemoryAgentE2eScript::RememberBirthday,
@@ -11188,8 +11222,25 @@ async fn agent_memory_forget_russian_birthday_suppresses_future_recall() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_mode_russian_remember_does_not_mutate_agent_memory() {
+#[test]
+fn chat_mode_russian_remember_does_not_mutate_agent_memory() {
+    std::thread::Builder::new()
+        .name("chat_mode_russian_remember".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(chat_mode_russian_remember_does_not_mutate_agent_memory_impl());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should finish");
+}
+
+async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
     let chat_provider = Arc::new(MemoryAgentE2eProvider::new(
         "memory-chat",
         MemoryAgentE2eScript::ChatCapture,
@@ -11653,6 +11704,7 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
                     namespace: None,
                     category: MemoryCategory::Preference,
                     key: Some(candidate_id_suffix.to_owned()),
+                    status: None,
                     candidate_text: format!("phase06 candidate text {candidate_id_suffix}"),
                     confidence: 0.82,
                     reason: "test candidate".to_owned(),
@@ -11665,7 +11717,26 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
                         id: Some("tester".to_owned()),
                     }),
                     dedupe_key: None,
-                    metadata_json: None,
+                    metadata_json: (candidate_id_suffix == "candidate_approve").then(|| {
+                        serde_json::json!({
+                            "semantic": {
+                                "fields": {
+                                    "intent": "explicit_store",
+                                    "explicitness": "explicit",
+                                    "category": "preference",
+                                    "subject": "workspace",
+                                    "attribute": "custom",
+                                    "custom_attribute": "phase06_preference",
+                                    "scope_hint": "project_workspace",
+                                    "durability": "project_lifetime",
+                                    "sensitivity": "none",
+                                    "certainty": "high"
+                                },
+                                "normalized_value": format!("phase06 candidate text {candidate_id_suffix}")
+                            }
+                        })
+                        .to_string()
+                    }),
                 },
                 now,
             )
@@ -11681,6 +11752,7 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
             list_id.clone(),
             MemoryCandidatesListParams {
                 scopes: Vec::new(),
+                categories: Vec::new(),
                 statuses: Vec::new(),
                 limit: Some(10),
                 cursor: None,
@@ -11723,10 +11795,11 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
                 MemoryCandidateDecision::Expire => MemoryCandidateStatus::Expired,
             }
         );
-        assert!(
-            decide_payload.record.is_none(),
-            "Phase 06 candidate approve is status-only; promotion belongs to a later extractor/review phase"
-        );
+        if decision == MemoryCandidateDecision::Approve {
+            assert!(decide_payload.record.is_some());
+        } else {
+            assert!(decide_payload.record.is_none());
+        }
     }
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);

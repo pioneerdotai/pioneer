@@ -3,6 +3,7 @@ use crate::backend::{
     BackendDeleteRequest, BackendGetRequest, BackendPayload, BackendPutRequest,
     BackendSearchRequest, BackendSearchScope, MemoryBackend,
 };
+use crate::candidate_policy::MemoryCandidatePolicyEngine;
 use crate::config::MemoryServiceConfig;
 use crate::context::MemoryOperationContext;
 use crate::convert::{
@@ -23,19 +24,28 @@ use crate::write::{
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
-    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryControlRecord,
-    AgentMemoryListFilter, AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryCandidate,
-    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
+    AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
+    AgentMemoryCandidateStatusUpdateRecord, AgentMemoryControlRecord, AgentMemoryListFilter,
+    AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryCandidate, NewAgentMemoryControlRecord,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
-    MemoryCandidate, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryRecord,
-    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchHit,
-    MemorySearchParams, MemorySearchResponse, MemorySemanticWriteDisposition,
+    MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
+    MemoryCandidatePolicyInput, MemoryCandidatePolicyOutput, MemoryCandidateStatus,
+    MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesEditAndApproveParams,
+    MemoryCandidatesEditAndApproveResponse, MemoryCandidatesGetParams, MemoryCandidatesGetResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCandidatesMergeParams,
+    MemoryCandidatesMergeResponse, MemoryCandidatesRejectParams, MemoryCandidatesRejectResponse,
+    MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
+    MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
+    MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
+    MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
+    MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
     MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceKind, MemoryStatus, MemoryWriteRelation, generate_id,
+    MemorySensitivityHint, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
+    MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -55,6 +65,7 @@ pub struct MemoryService {
     backend: Arc<dyn MemoryBackend>,
     config: MemoryServiceConfig,
     policy: MemoryPolicyEngine,
+    candidate_policy: MemoryCandidatePolicyEngine,
 }
 
 impl MemoryService {
@@ -63,12 +74,18 @@ impl MemoryService {
         backend: Arc<dyn MemoryBackend>,
         config: MemoryServiceConfig,
     ) -> Self {
+        config
+            .candidate_policy
+            .validate()
+            .expect("invalid memory candidate policy config");
         let policy = MemoryPolicyEngine::new(config.clone());
+        let candidate_policy = MemoryCandidatePolicyEngine::new(config.candidate_policy.clone());
         Self {
             store,
             backend,
             config,
             policy,
+            candidate_policy,
         }
     }
 
@@ -250,14 +267,14 @@ impl MemoryService {
         params: MemorySemanticWriteParams,
     ) -> Result<MemorySemanticWriteResponse> {
         let now = context.now_or(current_unix());
-        let content = params.content.trim();
+        let content = params.content.trim().to_owned();
         if content.is_empty() {
             bail!("semantic memory content cannot be empty");
         }
         if params.evidence.is_none() {
             bail!("semantic memory write requires evidence");
         }
-        let value = params.value.as_deref().unwrap_or(content);
+        let value = params.value.as_deref().unwrap_or(content.as_str());
         let prepared = prepare_semantic_write(&params.scope, &params.semantic, value)?;
         let disposition = params
             .disposition
@@ -348,7 +365,7 @@ impl MemoryService {
                             category: prepared.canonical.category,
                             namespace: Some(prepared.canonical.namespace.clone()),
                             key: Some(prepared.canonical.key.clone()),
-                            content: content.to_owned(),
+                            content: content.clone(),
                             sensitivity: Some(sensitivity),
                             confidence: params.confidence,
                             importance: params.importance,
@@ -386,7 +403,7 @@ impl MemoryService {
                     &context,
                     &params,
                     &prepared,
-                    content,
+                    content.as_str(),
                     metadata_json,
                     disposition,
                     now,
@@ -414,19 +431,17 @@ impl MemoryService {
             });
         }
 
-        if let Some(rejected) = self
-            .store
-            .get_agent_memory_candidate_by_dedupe(
-                params.scope.clone(),
-                Some(prepared.canonical.namespace.as_str()),
-                prepared.dedupe_key.as_str(),
-                vec![
-                    MemoryCandidateStatus::Rejected,
-                    MemoryCandidateStatus::Expired,
-                ],
-                context.workspace_guard(),
-            )
-            .await?
+        if disposition != MemorySemanticWriteDisposition::AcceptActive
+            && let Some(rejected) = self
+                .store
+                .get_agent_memory_candidate_by_dedupe(
+                    params.scope.clone(),
+                    Some(prepared.canonical.namespace.as_str()),
+                    prepared.dedupe_key.as_str(),
+                    rejected_candidate_statuses(),
+                    context.workspace_guard(),
+                )
+                .await?
         {
             self.record_semantic_write_relation(
                 MemoryWriteRelation::SuppressedByRejection,
@@ -449,16 +464,17 @@ impl MemoryService {
             });
         }
 
-        if let Some(pending) = self
-            .store
-            .get_agent_memory_candidate_by_dedupe(
-                params.scope.clone(),
-                Some(prepared.canonical.namespace.as_str()),
-                prepared.dedupe_key.as_str(),
-                vec![MemoryCandidateStatus::Pending],
-                context.workspace_guard(),
-            )
-            .await?
+        if disposition != MemorySemanticWriteDisposition::AcceptActive
+            && let Some(pending) = self
+                .store
+                .get_agent_memory_candidate_by_dedupe(
+                    params.scope.clone(),
+                    Some(prepared.canonical.namespace.as_str()),
+                    prepared.dedupe_key.as_str(),
+                    pending_candidate_statuses(),
+                    context.workspace_guard(),
+                )
+                .await?
         {
             let merged_metadata = merge_metadata(
                 pending.metadata_json.as_deref(),
@@ -513,7 +529,7 @@ impl MemoryService {
                             category: prepared.canonical.category,
                             namespace: Some(prepared.canonical.namespace.clone()),
                             key: Some(prepared.canonical.key.clone()),
-                            content: content.to_owned(),
+                            content: content.clone(),
                             sensitivity: Some(sensitivity),
                             confidence: params.confidence,
                             importance: params.importance,
@@ -552,11 +568,16 @@ impl MemoryService {
                         &context,
                         &params,
                         &prepared,
-                        content,
+                        content.as_str(),
                         metadata_json,
-                        disposition == MemorySemanticWriteDisposition::RejectSuppressed,
+                        if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
+                            MemoryCandidateStatus::Rejected
+                        } else {
+                            MemoryCandidateStatus::Pending
+                        },
                         now,
                         "semantic_candidate",
+                        None,
                     )
                     .await?;
                 self.record_semantic_write_relation(
@@ -584,25 +605,17 @@ impl MemoryService {
                 })
             }
             MemorySemanticWriteDisposition::RouteToCandidatePolicy => {
-                self.record_semantic_write_relation(
+                self.route_semantic_candidate_policy(
+                    context,
+                    params,
+                    prepared,
+                    content.as_str(),
+                    metadata_json,
                     MemoryWriteRelation::Novel,
-                    "candidate_policy_boundary",
-                    &context,
                     None,
-                    context.workspace_id.clone(),
                     now,
                 )
-                .await?;
-                Ok(MemorySemanticWriteResponse {
-                    relation: MemoryWriteRelation::Novel,
-                    canonical_key: prepared.canonical,
-                    semantic_fingerprint: prepared.semantic_fingerprint,
-                    record: None,
-                    candidate: None,
-                    created: false,
-                    superseded_memory_id: None,
-                    evidence_merged: false,
-                })
+                .await
             }
         }
     }
@@ -993,6 +1006,7 @@ impl MemoryService {
             .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
                 scopes: context.effective_scopes(&params.scopes),
                 workspace_guard: context.workspace_guard(),
+                categories: params.categories.clone(),
                 statuses: params.statuses.clone(),
                 limit: Some(u64::from(self.normalized_limit(params.limit))),
             })
@@ -1009,17 +1023,270 @@ impl MemoryService {
         })
     }
 
+    pub async fn get_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesGetParams,
+    ) -> Result<MemoryCandidatesGetResponse> {
+        let candidate = self
+            .store
+            .get_agent_memory_candidate(params.candidate_id.as_str(), context.workspace_guard())
+            .await?
+            .map(crud_candidate_to_protocol)
+            .transpose()?;
+        Ok(MemoryCandidatesGetResponse { candidate })
+    }
+
+    pub async fn approve_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesApproveParams,
+    ) -> Result<MemoryCandidatesApproveResponse> {
+        let candidate = self
+            .load_visible_candidate(&context, params.candidate_id.as_str())
+            .await?;
+        let mut action_context = context.clone();
+        if params.actor.is_some() {
+            action_context.actor = params.actor.clone();
+        }
+        let write_params =
+            candidate_semantic_write_params(&candidate, None, None, Some("candidate_approve"))?;
+        let response = self
+            .write_semantic_memory(action_context.clone(), write_params)
+            .await?;
+        let record = response.record.with_context(|| {
+            format!(
+                "candidate `{}` approval did not produce memory",
+                candidate.id
+            )
+        })?;
+        let updated = self
+            .update_candidate_status(
+                &action_context,
+                candidate,
+                MemoryCandidateStatus::Approved,
+                params
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "approved".to_owned()),
+                Some(record.id.clone()),
+                None,
+                action_context.now_or(current_unix()),
+            )
+            .await?;
+        Ok(MemoryCandidatesApproveResponse {
+            candidate: crud_candidate_to_protocol(updated)?,
+            record,
+        })
+    }
+
+    pub async fn reject_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesRejectParams,
+    ) -> Result<MemoryCandidatesRejectResponse> {
+        let candidate = self
+            .load_visible_candidate(&context, params.candidate_id.as_str())
+            .await?;
+        let mut action_context = context.clone();
+        if params.actor.is_some() {
+            action_context.actor = params.actor.clone();
+        }
+        let updated = self
+            .update_candidate_status(
+                &action_context,
+                candidate,
+                MemoryCandidateStatus::Rejected,
+                params.reason.unwrap_or_else(|| "rejected".to_owned()),
+                None,
+                None,
+                action_context.now_or(current_unix()),
+            )
+            .await?;
+        Ok(MemoryCandidatesRejectResponse {
+            candidate: crud_candidate_to_protocol(updated)?,
+        })
+    }
+
+    pub async fn edit_and_approve_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesEditAndApproveParams,
+    ) -> Result<MemoryCandidatesEditAndApproveResponse> {
+        let edited_text = params.edited_text.trim();
+        if edited_text.is_empty() {
+            bail!("edited memory candidate text cannot be empty");
+        }
+        let candidate = self
+            .load_visible_candidate(&context, params.candidate_id.as_str())
+            .await?;
+        let mut action_context = context.clone();
+        if params.actor.is_some() {
+            action_context.actor = params.actor.clone();
+        }
+        let write_params = candidate_semantic_write_params(
+            &candidate,
+            Some(edited_text.to_owned()),
+            params.edited_value.clone(),
+            Some("candidate_edit_and_approve"),
+        )?;
+        let response = self
+            .write_semantic_memory(action_context.clone(), write_params)
+            .await?;
+        let record = response.record.with_context(|| {
+            format!(
+                "candidate `{}` edit-and-approval did not produce memory",
+                candidate.id
+            )
+        })?;
+        let metadata_json = candidate_metadata_with_lifecycle(
+            candidate.metadata_json.as_deref(),
+            serde_json::json!({
+                "edited_text": edited_text,
+                "edited_value": params.edited_value,
+            }),
+        )?;
+        let updated = self
+            .update_candidate_status(
+                &action_context,
+                candidate,
+                MemoryCandidateStatus::Approved,
+                params
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "edit_and_approved".to_owned()),
+                Some(record.id.clone()),
+                Some(metadata_json),
+                action_context.now_or(current_unix()),
+            )
+            .await?;
+        Ok(MemoryCandidatesEditAndApproveResponse {
+            candidate: crud_candidate_to_protocol(updated)?,
+            record,
+        })
+    }
+
+    pub async fn merge_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesMergeParams,
+    ) -> Result<MemoryCandidatesMergeResponse> {
+        let candidate = self
+            .load_visible_candidate(&context, params.candidate_id.as_str())
+            .await?;
+        self.load_visible_candidate(&context, params.target_candidate_id.as_str())
+            .await?;
+        let mut action_context = context.clone();
+        if params.actor.is_some() {
+            action_context.actor = params.actor.clone();
+        }
+        let metadata_json = candidate_metadata_with_lifecycle(
+            candidate.metadata_json.as_deref(),
+            serde_json::json!({
+                "merged_into_candidate_id": params.target_candidate_id,
+            }),
+        )?;
+        let updated = self
+            .update_candidate_status(
+                &action_context,
+                candidate,
+                MemoryCandidateStatus::MergedDuplicate,
+                params
+                    .reason
+                    .unwrap_or_else(|| "merged_duplicate".to_owned()),
+                None,
+                Some(metadata_json),
+                action_context.now_or(current_unix()),
+            )
+            .await?;
+        Ok(MemoryCandidatesMergeResponse {
+            candidate: crud_candidate_to_protocol(updated)?,
+        })
+    }
+
+    pub async fn suppress_similar_candidate(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryCandidatesSuppressSimilarParams,
+    ) -> Result<MemoryCandidatesSuppressSimilarResponse> {
+        let candidate = self
+            .load_visible_candidate(&context, params.candidate_id.as_str())
+            .await?;
+        let mut action_context = context.clone();
+        if params.actor.is_some() {
+            action_context.actor = params.actor.clone();
+        }
+        let metadata_json = candidate_metadata_with_lifecycle(
+            candidate.metadata_json.as_deref(),
+            serde_json::json!({
+                "suppress_similar": true,
+            }),
+        )?;
+        let updated = self
+            .update_candidate_status(
+                &action_context,
+                candidate,
+                MemoryCandidateStatus::AutoRejected,
+                params
+                    .reason
+                    .unwrap_or_else(|| "suppress_similar".to_owned()),
+                None,
+                Some(metadata_json),
+                action_context.now_or(current_unix()),
+            )
+            .await?;
+        Ok(MemoryCandidatesSuppressSimilarResponse {
+            candidate: crud_candidate_to_protocol(updated)?,
+        })
+    }
+
     pub async fn decide_candidate(
         &self,
         context: MemoryOperationContext,
         params: MemoryCandidatesDecideParams,
     ) -> Result<MemoryCandidatesDecideResponse> {
+        match params.decision {
+            MemoryCandidateDecision::Approve => {
+                let response = self
+                    .approve_candidate(
+                        context,
+                        MemoryCandidatesApproveParams {
+                            candidate_id: params.candidate_id,
+                            reason: params.reason,
+                            actor: params.actor,
+                        },
+                    )
+                    .await?;
+                return Ok(MemoryCandidatesDecideResponse {
+                    candidate: response.candidate,
+                    record: Some(response.record),
+                });
+            }
+            MemoryCandidateDecision::Reject => {
+                let response = self
+                    .reject_candidate(
+                        context,
+                        MemoryCandidatesRejectParams {
+                            candidate_id: params.candidate_id,
+                            reason: params.reason,
+                            actor: params.actor,
+                        },
+                    )
+                    .await?;
+                return Ok(MemoryCandidatesDecideResponse {
+                    candidate: response.candidate,
+                    record: None,
+                });
+            }
+            MemoryCandidateDecision::Expire => {}
+        }
         let visible_pending = self
             .store
             .list_agent_memory_candidates(AgentMemoryCandidateListFilter {
                 scopes: Vec::new(),
                 workspace_guard: context.workspace_guard(),
-                statuses: vec![MemoryCandidateStatus::Pending],
+                categories: Vec::new(),
+                statuses: pending_candidate_statuses(),
                 limit: None,
             })
             .await?;
@@ -1057,6 +1324,61 @@ impl MemoryService {
             candidate: crud_candidate_to_protocol(decided)?,
             record: None,
         })
+    }
+
+    async fn load_visible_candidate(
+        &self,
+        context: &MemoryOperationContext,
+        candidate_id: &str,
+    ) -> Result<AgentMemoryCandidateRecord> {
+        self.store
+            .get_agent_memory_candidate(candidate_id, context.workspace_guard())
+            .await?
+            .with_context(|| format!("memory candidate `{candidate_id}` was not found"))
+    }
+
+    async fn update_candidate_status(
+        &self,
+        context: &MemoryOperationContext,
+        candidate: AgentMemoryCandidateRecord,
+        status: MemoryCandidateStatus,
+        reason: String,
+        promoted_memory_id: Option<String>,
+        metadata_json: Option<String>,
+        now: i64,
+    ) -> Result<AgentMemoryCandidateRecord> {
+        let updated = self
+            .store
+            .update_agent_memory_candidate_status(AgentMemoryCandidateStatusUpdateRecord {
+                candidate_id: candidate.id.clone(),
+                status,
+                decided_by: protocol_actor_to_crud(context.actor.clone()),
+                decision_reason: Some(reason.clone()),
+                promoted_memory_id: promoted_memory_id.clone(),
+                metadata_json,
+                decided_at_unix: now,
+            })
+            .await?
+            .with_context(|| format!("memory candidate `{}` disappeared", candidate.id))?;
+        self.store
+            .insert_agent_memory_policy_decision(NewAgentMemoryPolicyDecision {
+                memory_id: promoted_memory_id,
+                candidate_id: Some(updated.id.clone()),
+                workspace_id: updated.workspace_id.clone(),
+                action: "candidate_lifecycle".to_owned(),
+                decision: candidate_status_label(status).to_owned(),
+                reason_code: Some(reason.clone()),
+                reason: Some(reason),
+                policy_version: self.config.policy_version.clone(),
+                actor: protocol_actor_to_crud(context.actor.clone()),
+                thread_id: context.thread_id.clone(),
+                turn_id: None,
+                item_id: None,
+                details_json: updated.metadata_json.clone(),
+                created_at_unix: now,
+            })
+            .await?;
+        Ok(updated)
     }
 
     pub async fn enqueue_repair_job(
@@ -1112,6 +1434,171 @@ impl MemoryService {
             .await
     }
 
+    async fn remember_semantic_active(
+        &self,
+        context: MemoryOperationContext,
+        params: &MemorySemanticWriteParams,
+        prepared: &SemanticWritePrepared,
+        content: &str,
+        sensitivity: MemorySensitivity,
+        provenance: MemoryProvenance,
+        metadata_json: String,
+        supersedes: Option<String>,
+    ) -> Result<MemoryRememberResponse> {
+        self.remember(
+            context,
+            MemoryRememberParams {
+                scope: params.scope.clone(),
+                category: prepared.canonical.category,
+                namespace: Some(prepared.canonical.namespace.clone()),
+                key: Some(prepared.canonical.key.clone()),
+                content: content.to_owned(),
+                sensitivity: Some(sensitivity),
+                confidence: params.confidence,
+                importance: params.importance,
+                provenance: Some(provenance),
+                idempotency_key: None,
+                supersedes,
+                metadata: serde_json::from_str(metadata_json.as_str())
+                    .context("semantic metadata must decode")?,
+            },
+        )
+        .await
+    }
+
+    async fn route_semantic_candidate_policy(
+        &self,
+        context: MemoryOperationContext,
+        params: MemorySemanticWriteParams,
+        prepared: SemanticWritePrepared,
+        content: &str,
+        metadata_json: String,
+        relation: MemoryWriteRelation,
+        supersedes: Option<String>,
+        now: i64,
+    ) -> Result<MemorySemanticWriteResponse> {
+        let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
+        let provenance = semantic_write_provenance(&params, &context);
+        let policy_input = MemoryCandidatePolicyInput {
+            semantic: params.semantic.clone(),
+            relation,
+            scope: params.scope.clone(),
+            scope_clarity: scope_clarity_from_hint(params.semantic.scope_hint),
+            evidence_count: metadata_evidence_count(metadata_json.as_str()).max(1) as u32,
+            has_contradiction: relation == MemoryWriteRelation::Contradiction,
+            has_duplicate: relation == MemoryWriteRelation::Duplicate,
+            has_rejected_duplicate: relation == MemoryWriteRelation::SuppressedByRejection,
+            sensitivity,
+            active_no_memory_policy: false,
+            source_kind: provenance.source_kind,
+            hook_run_id: params
+                .metadata
+                .get("hook_run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        };
+        let policy_output = self.candidate_policy.decide(policy_input);
+        let reason_code = policy_output.reason_code.clone();
+        let policy_metadata_json =
+            metadata_json_with_candidate_policy(metadata_json, &policy_output)?;
+
+        if policy_output.decision == MemoryCandidatePolicyDecision::AutoApprove {
+            let relation_context = context.clone();
+            let response = self
+                .remember_semantic_active(
+                    context,
+                    &params,
+                    &prepared,
+                    content,
+                    sensitivity,
+                    provenance,
+                    policy_metadata_json,
+                    supersedes,
+                )
+                .await?;
+            self.record_candidate_policy_decision(
+                &policy_output,
+                &relation_context,
+                Some(response.record.id.clone()),
+                None,
+                relation_context.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            self.record_semantic_write_relation(
+                relation,
+                "candidate_policy_auto_approved",
+                &relation_context,
+                Some(response.record.id.clone()),
+                relation_context.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(MemorySemanticWriteResponse {
+                relation,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: Some(response.record),
+                candidate: None,
+                created: response.created,
+                superseded_memory_id: response.superseded_memory_id,
+                evidence_merged: false,
+            });
+        }
+
+        let candidate = self
+            .create_semantic_candidate(
+                &context,
+                &params,
+                &prepared,
+                content,
+                policy_metadata_json,
+                policy_output.status,
+                now,
+                reason_code.as_str(),
+                None,
+            )
+            .await?;
+        self.record_candidate_policy_decision(
+            &policy_output,
+            &context,
+            None,
+            Some(candidate.id.clone()),
+            context.workspace_id.clone(),
+            now,
+        )
+        .await?;
+        self.record_semantic_write_relation(
+            relation,
+            match policy_output.decision {
+                MemoryCandidatePolicyDecision::AutoReject => "candidate_policy_auto_rejected",
+                MemoryCandidatePolicyDecision::RejectReviewDisabled => {
+                    "candidate_policy_review_disabled_rejected"
+                }
+                MemoryCandidatePolicyDecision::PendingSilent
+                | MemoryCandidatePolicyDecision::AskOnUse
+                | MemoryCandidatePolicyDecision::NeedsReview => "candidate_policy_review_routed",
+                MemoryCandidatePolicyDecision::AutoApprove => "candidate_policy_auto_approved",
+            },
+            &context,
+            None,
+            context.workspace_id.clone(),
+            now,
+        )
+        .await?;
+
+        Ok(MemorySemanticWriteResponse {
+            relation,
+            canonical_key: prepared.canonical,
+            semantic_fingerprint: prepared.semantic_fingerprint,
+            record: None,
+            candidate: Some(candidate),
+            created: true,
+            superseded_memory_id: None,
+            evidence_merged: false,
+        })
+    }
+
     async fn maybe_route_semantic_candidate(
         &self,
         context: &MemoryOperationContext,
@@ -1131,9 +1618,10 @@ impl MemoryService {
                     prepared,
                     content,
                     metadata_json,
-                    false,
+                    MemoryCandidateStatus::Pending,
                     now,
                     reason,
+                    None,
                 )
                 .await
                 .map(Some),
@@ -1145,13 +1633,26 @@ impl MemoryService {
                     prepared,
                     content,
                     metadata_json,
-                    true,
+                    MemoryCandidateStatus::Rejected,
                     now,
                     reason,
+                    None,
                 )
                 .await
                 .map(Some),
-            MemorySemanticWriteDisposition::RouteToCandidatePolicy => Ok(None),
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy => self
+                .route_semantic_candidate_policy(
+                    context.clone(),
+                    params.clone(),
+                    prepared.clone(),
+                    content,
+                    metadata_json,
+                    MemoryWriteRelation::Contradiction,
+                    None,
+                    now,
+                )
+                .await
+                .map(|response| response.candidate),
         }
     }
 
@@ -1162,11 +1663,17 @@ impl MemoryService {
         prepared: &SemanticWritePrepared,
         content: &str,
         metadata_json: String,
-        reject: bool,
+        status: MemoryCandidateStatus,
         now: i64,
         reason: &str,
+        policy_output: Option<&MemoryCandidatePolicyOutput>,
     ) -> Result<MemoryCandidate> {
         let provenance = semantic_write_provenance(params, context);
+        let metadata_json = if let Some(policy_output) = policy_output {
+            metadata_json_with_candidate_policy(metadata_json, policy_output)?
+        } else {
+            metadata_json
+        };
         let candidate = self
             .store
             .insert_agent_memory_candidate(
@@ -1176,6 +1683,7 @@ impl MemoryService {
                     namespace: Some(prepared.canonical.namespace.clone()),
                     category: prepared.canonical.category,
                     key: Some(prepared.canonical.key.clone()),
+                    status: Some(status),
                     candidate_text: content.to_owned(),
                     confidence: f64::from(params.confidence.unwrap_or(0.5).clamp(0.0, 1.0)),
                     reason: reason.to_owned(),
@@ -1190,22 +1698,7 @@ impl MemoryService {
                 now,
             )
             .await?;
-        if !reject {
-            return crud_candidate_to_protocol(candidate);
-        }
-        let rejected = self
-            .store
-            .decide_agent_memory_candidate(AgentMemoryCandidateDecisionRecord {
-                candidate_id: candidate.id.clone(),
-                decision: MemoryCandidateDecision::Reject,
-                decided_by: protocol_actor_to_crud(context.actor.clone()),
-                decision_reason: Some("review_disabled_or_suppressed".to_owned()),
-                promoted_memory_id: None,
-                decided_at_unix: now,
-            })
-            .await?
-            .unwrap_or(candidate);
-        crud_candidate_to_protocol(rejected)
+        crud_candidate_to_protocol(candidate)
     }
 
     async fn resolve_forget_targets(
@@ -1477,6 +1970,36 @@ impl MemoryService {
         .await
     }
 
+    async fn record_candidate_policy_decision(
+        &self,
+        output: &MemoryCandidatePolicyOutput,
+        context: &MemoryOperationContext,
+        memory_id: Option<String>,
+        candidate_id: Option<String>,
+        workspace_id: Option<String>,
+        now: i64,
+    ) -> Result<()> {
+        self.store
+            .insert_agent_memory_policy_decision(NewAgentMemoryPolicyDecision {
+                memory_id,
+                candidate_id,
+                workspace_id,
+                action: "candidate_policy".to_owned(),
+                decision: candidate_policy_decision_label(output.decision).to_owned(),
+                reason_code: Some(output.reason_code.clone()),
+                reason: output.reason.clone(),
+                policy_version: self.config.policy_version.clone(),
+                actor: protocol_actor_to_crud(context.actor.clone()),
+                thread_id: context.thread_id.clone(),
+                turn_id: None,
+                item_id: None,
+                details_json: Some(serde_json::to_string(output)?),
+                created_at_unix: now,
+            })
+            .await?;
+        Ok(())
+    }
+
     fn normalized_limit(&self, limit: Option<u32>) -> u32 {
         limit
             .unwrap_or(self.config.default_limit)
@@ -1649,6 +2172,216 @@ fn memory_write_relation_to_policy_decision(relation: MemoryWriteRelation) -> &'
         MemoryWriteRelation::Novel => "novel",
         MemoryWriteRelation::SuppressedByRejection => "suppressed_by_rejection",
     }
+}
+
+fn candidate_policy_decision_label(decision: MemoryCandidatePolicyDecision) -> &'static str {
+    match decision {
+        MemoryCandidatePolicyDecision::AutoApprove => "auto_approve",
+        MemoryCandidatePolicyDecision::PendingSilent => "pending_silent",
+        MemoryCandidatePolicyDecision::AskOnUse => "ask_on_use",
+        MemoryCandidatePolicyDecision::NeedsReview => "needs_review",
+        MemoryCandidatePolicyDecision::AutoReject => "auto_reject",
+        MemoryCandidatePolicyDecision::RejectReviewDisabled => "reject_review_disabled",
+    }
+}
+
+fn candidate_status_label(status: MemoryCandidateStatus) -> &'static str {
+    match status {
+        MemoryCandidateStatus::Pending => "pending",
+        MemoryCandidateStatus::PendingSilent => "pending_silent",
+        MemoryCandidateStatus::AskOnUse => "ask_on_use",
+        MemoryCandidateStatus::NeedsReview => "needs_review",
+        MemoryCandidateStatus::Approved => "approved",
+        MemoryCandidateStatus::Rejected => "rejected",
+        MemoryCandidateStatus::AutoRejected => "auto_rejected",
+        MemoryCandidateStatus::ReviewDisabledRejected => "review_disabled_rejected",
+        MemoryCandidateStatus::Superseded => "superseded",
+        MemoryCandidateStatus::MergedDuplicate => "merged_duplicate",
+        MemoryCandidateStatus::Expired => "expired",
+    }
+}
+
+fn metadata_json_with_candidate_policy(
+    metadata_json: String,
+    output: &MemoryCandidatePolicyOutput,
+) -> Result<String> {
+    let mut metadata =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(metadata_json.as_str())
+            .with_context(|| format!("invalid semantic metadata JSON `{metadata_json}`"))?;
+    metadata.insert(
+        "candidate_policy".to_owned(),
+        serde_json::to_value(output).context("failed to encode memory candidate policy output")?,
+    );
+    metadata.insert(
+        "candidate_score".to_owned(),
+        serde_json::to_value(&output.score).context("failed to encode memory candidate score")?,
+    );
+    metadata.insert(
+        "candidate_score_bucket".to_owned(),
+        serde_json::json!(score_bucket_label(output.score.bucket)),
+    );
+    metadata.insert(
+        "candidate_policy_decision".to_owned(),
+        serde_json::json!(candidate_policy_decision_label(output.decision)),
+    );
+    metadata.insert(
+        "candidate_policy_reason_code".to_owned(),
+        serde_json::json!(output.reason_code.as_str()),
+    );
+    Ok(serde_json::Value::Object(metadata).to_string())
+}
+
+fn candidate_semantic_write_params(
+    candidate: &AgentMemoryCandidateRecord,
+    content_override: Option<String>,
+    value_override: Option<String>,
+    lifecycle_source: Option<&str>,
+) -> Result<MemorySemanticWriteParams> {
+    let mut metadata = candidate_metadata_map(candidate.metadata_json.as_deref())?;
+    let semantic_value = metadata.get("semantic").with_context(|| {
+        format!(
+            "memory candidate `{}` has no semantic metadata",
+            candidate.id
+        )
+    })?;
+    let mut semantic = semantic_value
+        .get("fields")
+        .cloned()
+        .map(serde_json::from_value::<MemorySemanticFields>)
+        .transpose()
+        .context("failed to decode candidate semantic fields")?
+        .with_context(|| {
+            format!(
+                "memory candidate `{}` has no typed semantic fields",
+                candidate.id
+            )
+        })?;
+    semantic.intent = MemoryIntent::ExplicitStore;
+    semantic.explicitness = MemoryExplicitness::Explicit;
+
+    let content = content_override.unwrap_or_else(|| candidate.candidate_text.clone());
+    let value = value_override.or_else(|| {
+        semantic_value
+            .get("normalized_value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    let evidence = MemoryWriteEvidence {
+        source_thread_id: candidate.source_thread_id.clone(),
+        source_turn_id: candidate.source_turn_id.clone(),
+        source_item_id: candidate.source_item_id.clone(),
+        source_ref: Some(format!("memory_candidate:{}", candidate.id)),
+        quote_or_span: Some(candidate.candidate_text.clone()),
+        extractor_reason: Some("candidate approved through memory service lifecycle".to_owned()),
+    };
+    let provenance = MemoryProvenance {
+        source_kind: candidate.source_kind,
+        source_thread_id: candidate.source_thread_id.clone(),
+        source_turn_id: candidate.source_turn_id.clone(),
+        source_item_id: candidate.source_item_id.clone(),
+        created_by: candidate
+            .created_by
+            .as_ref()
+            .map(|actor| pioneer_protocol::MemoryActor {
+                kind: actor.kind,
+                id: actor.id.clone(),
+            }),
+    };
+    if let Some(lifecycle_source) = lifecycle_source {
+        metadata.insert(
+            "candidate_lifecycle_source".to_owned(),
+            serde_json::json!(lifecycle_source),
+        );
+        metadata.insert(
+            "approved_candidate_id".to_owned(),
+            serde_json::json!(candidate.id),
+        );
+    }
+
+    Ok(MemorySemanticWriteParams {
+        scope: candidate.scope.clone(),
+        semantic,
+        content,
+        value,
+        evidence: Some(evidence),
+        provenance: Some(provenance),
+        disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
+        client_provided_key: None,
+        confidence: Some(candidate.confidence.clamp(0.0, 1.0) as f32),
+        importance: None,
+        metadata,
+    })
+}
+
+fn candidate_metadata_with_lifecycle(
+    metadata_json: Option<&str>,
+    lifecycle: serde_json::Value,
+) -> Result<String> {
+    let mut metadata = candidate_metadata_map(metadata_json)?;
+    metadata.insert("candidate_lifecycle".to_owned(), lifecycle);
+    Ok(serde_json::to_string(&metadata)?)
+}
+
+fn candidate_metadata_map(
+    metadata_json: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    match metadata_json {
+        Some(metadata_json) if !metadata_json.trim().is_empty() => {
+            serde_json::from_str(metadata_json).with_context(|| {
+                format!("invalid memory candidate metadata JSON `{metadata_json}`")
+            })
+        }
+        _ => Ok(std::collections::BTreeMap::new()),
+    }
+}
+
+fn score_bucket_label(bucket: pioneer_protocol::MemoryCandidateScoreBucket) -> &'static str {
+    match bucket {
+        pioneer_protocol::MemoryCandidateScoreBucket::High => "high",
+        pioneer_protocol::MemoryCandidateScoreBucket::Middle => "middle",
+        pioneer_protocol::MemoryCandidateScoreBucket::ExtremelyLow => "extremely_low",
+    }
+}
+
+fn metadata_evidence_count(metadata_json: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("evidence")
+                .and_then(|evidence| evidence.get("count"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0)
+}
+
+fn scope_clarity_from_hint(scope_hint: MemoryScopeHint) -> MemoryScopeClarity {
+    match scope_hint {
+        MemoryScopeHint::Unknown => MemoryScopeClarity::Unclear,
+        MemoryScopeHint::UserGlobal
+        | MemoryScopeHint::UserWorkspace
+        | MemoryScopeHint::AgentGlobal
+        | MemoryScopeHint::AgentWorkspace
+        | MemoryScopeHint::ProjectWorkspace => MemoryScopeClarity::Clear,
+    }
+}
+
+fn pending_candidate_statuses() -> Vec<MemoryCandidateStatus> {
+    vec![
+        MemoryCandidateStatus::Pending,
+        MemoryCandidateStatus::PendingSilent,
+        MemoryCandidateStatus::AskOnUse,
+        MemoryCandidateStatus::NeedsReview,
+    ]
+}
+
+fn rejected_candidate_statuses() -> Vec<MemoryCandidateStatus> {
+    vec![
+        MemoryCandidateStatus::Rejected,
+        MemoryCandidateStatus::AutoRejected,
+        MemoryCandidateStatus::ReviewDisabledRejected,
+        MemoryCandidateStatus::Expired,
+    ]
 }
 
 fn current_unix() -> i64 {

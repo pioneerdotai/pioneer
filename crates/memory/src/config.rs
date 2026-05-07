@@ -10,6 +10,7 @@ pub struct MemoryServiceConfig {
     pub default_read_policy: MemoryReadPolicy,
     pub ranking: MemoryRankingConfig,
     pub recall: MemoryRecallConfig,
+    pub candidate_policy: MemoryCandidatePolicyConfig,
 }
 
 impl Default for MemoryServiceConfig {
@@ -23,7 +24,49 @@ impl Default for MemoryServiceConfig {
             default_read_policy: MemoryReadPolicy::default(),
             ranking: MemoryRankingConfig::default(),
             recall: MemoryRecallConfig::default(),
+            candidate_policy: MemoryCandidatePolicyConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryCandidatePolicyConfig {
+    pub review_enabled: bool,
+    pub auto_approve_min_score: f32,
+    pub auto_reject_max_score: f32,
+    pub allow_explicit_auto_approve: bool,
+    pub allow_implicit_auto_approve: bool,
+}
+
+impl Default for MemoryCandidatePolicyConfig {
+    fn default() -> Self {
+        Self {
+            review_enabled: false,
+            auto_approve_min_score: 0.90,
+            auto_reject_max_score: 0.20,
+            allow_explicit_auto_approve: true,
+            allow_implicit_auto_approve: false,
+        }
+    }
+}
+
+impl MemoryCandidatePolicyConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.auto_approve_min_score.is_finite() || !self.auto_reject_max_score.is_finite() {
+            anyhow::bail!("memory candidate score thresholds must be finite");
+        }
+        if !(0.0..=1.0).contains(&self.auto_reject_max_score) {
+            anyhow::bail!("memory candidate auto_reject_max_score must be between 0.0 and 1.0");
+        }
+        if !(0.0..=1.0).contains(&self.auto_approve_min_score) {
+            anyhow::bail!("memory candidate auto_approve_min_score must be between 0.0 and 1.0");
+        }
+        if self.auto_reject_max_score >= self.auto_approve_min_score {
+            anyhow::bail!(
+                "memory candidate auto_reject_max_score must be lower than auto_approve_min_score"
+            );
+        }
+        Ok(())
     }
 }
 

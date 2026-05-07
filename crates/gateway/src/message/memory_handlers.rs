@@ -2,10 +2,14 @@ use super::*;
 use anyhow::{Result, anyhow};
 use pioneer_memory::MemoryOperationContext;
 use pioneer_protocol::{
-    MemoryActor, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgottenNotification, MemoryGetParams, MemoryListParams,
-    MemoryRememberParams, MemoryRememberResponse, MemoryScopeKind, MemorySearchParams,
+    MemoryActor, MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse,
+    MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesEditAndApproveParams, MemoryCandidatesEditAndApproveResponse,
+    MemoryCandidatesGetParams, MemoryCandidatesListParams, MemoryCandidatesMergeParams,
+    MemoryCandidatesRejectParams, MemoryCandidatesSuppressSimilarParams, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse,
+    MemoryForgottenNotification, MemoryGetParams, MemoryListParams, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScopeKind, MemorySearchParams,
 };
 
 impl MessageProcessor {
@@ -287,6 +291,54 @@ impl MessageProcessor {
         .await;
     }
 
+    pub(super) async fn memory_candidates_get(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesGetParams,
+    ) {
+        let context = match self.memory_context(connection_id, None).await {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_GET,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let response = match self
+            .run_memory_request(methods::MEMORY_CANDIDATES_GET, |service| async move {
+                service.get_candidate(context, params).await
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_GET,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_GET,
+            &response,
+        )
+        .await;
+    }
+
     pub(super) async fn memory_candidates_decide(
         &self,
         connection_id: ConnectionId,
@@ -339,6 +391,273 @@ impl MessageProcessor {
         .await;
         self.send_memory_changed_after_candidate_decide(connection_id, &notify_context, &response)
             .await;
+    }
+
+    pub(super) async fn memory_candidates_approve(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesApproveParams,
+    ) {
+        let context = match self
+            .memory_context(connection_id, params.actor.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_APPROVE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+        let notify_context = context.clone();
+
+        let response = match self
+            .run_memory_request(methods::MEMORY_CANDIDATES_APPROVE, |service| async move {
+                service.approve_candidate(context, params).await
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_APPROVE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_APPROVE,
+            &response,
+        )
+        .await;
+        self.send_memory_changed_after_candidate_approve(connection_id, &notify_context, &response)
+            .await;
+    }
+
+    pub(super) async fn memory_candidates_reject(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesRejectParams,
+    ) {
+        let context = match self
+            .memory_context(connection_id, params.actor.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_REJECT,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let response = match self
+            .run_memory_request(methods::MEMORY_CANDIDATES_REJECT, |service| async move {
+                service.reject_candidate(context, params).await
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_REJECT,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_REJECT,
+            &response,
+        )
+        .await;
+    }
+
+    pub(super) async fn memory_candidates_edit_and_approve(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesEditAndApproveParams,
+    ) {
+        let context = match self
+            .memory_context(connection_id, params.actor.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+        let notify_context = context.clone();
+
+        let response = match self
+            .run_memory_request(
+                methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+                |service| async move { service.edit_and_approve_candidate(context, params).await },
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_EDIT_AND_APPROVE,
+            &response,
+        )
+        .await;
+        self.send_memory_changed_after_candidate_edit_and_approve(
+            connection_id,
+            &notify_context,
+            &response,
+        )
+        .await;
+    }
+
+    pub(super) async fn memory_candidates_merge(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesMergeParams,
+    ) {
+        let context = match self
+            .memory_context(connection_id, params.actor.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_MERGE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let response = match self
+            .run_memory_request(methods::MEMORY_CANDIDATES_MERGE, |service| async move {
+                service.merge_candidate(context, params).await
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_MERGE,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_MERGE,
+            &response,
+        )
+        .await;
+    }
+
+    pub(super) async fn memory_candidates_suppress_similar(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: MemoryCandidatesSuppressSimilarParams,
+    ) {
+        let context = match self
+            .memory_context(connection_id, params.actor.clone())
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let response = match self
+            .run_memory_request(
+                methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+                |service| async move { service.suppress_similar_candidate(context, params).await },
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_memory_service_error(
+                    connection_id,
+                    request_id,
+                    methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+                    error,
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.send_memory_response(
+            connection_id,
+            request_id,
+            methods::MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
+            &response,
+        )
+        .await;
     }
 
     async fn run_memory_request<F, Fut, T>(&self, _method: &'static str, operation: F) -> Result<T>
@@ -482,6 +801,40 @@ impl MessageProcessor {
             scope: record.scope.clone(),
             change_kind: MemoryChangeKind::Created,
             record: Some(record.clone()),
+        };
+
+        self.send_memory_changed_notification(connection_id, context, &notification)
+            .await;
+    }
+
+    async fn send_memory_changed_after_candidate_approve(
+        &self,
+        connection_id: ConnectionId,
+        context: &MemoryOperationContext,
+        response: &MemoryCandidatesApproveResponse,
+    ) {
+        let notification = MemoryChangedNotification {
+            memory_id: response.record.id.clone(),
+            scope: response.record.scope.clone(),
+            change_kind: MemoryChangeKind::Created,
+            record: Some(response.record.clone()),
+        };
+
+        self.send_memory_changed_notification(connection_id, context, &notification)
+            .await;
+    }
+
+    async fn send_memory_changed_after_candidate_edit_and_approve(
+        &self,
+        connection_id: ConnectionId,
+        context: &MemoryOperationContext,
+        response: &MemoryCandidatesEditAndApproveResponse,
+    ) {
+        let notification = MemoryChangedNotification {
+            memory_id: response.record.id.clone(),
+            scope: response.record.scope.clone(),
+            change_kind: MemoryChangeKind::Created,
+            record: Some(response.record.clone()),
         };
 
         self.send_memory_changed_notification(connection_id, context, &notification)
