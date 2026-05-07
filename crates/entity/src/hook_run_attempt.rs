@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    #[sea_orm(unique_key = "uidx_hook_run_attempt_run_number")]
     pub hook_run_id: String,
+    #[sea_orm(unique_key = "uidx_hook_run_attempt_run_number")]
     pub attempt_number: i64,
     pub status: String,
     pub contribution_count: i64,
