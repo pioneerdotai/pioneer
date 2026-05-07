@@ -1,6 +1,5 @@
 use super::*;
 use anyhow::Result;
-use rand::Rng;
 
 const ACTIVE_TURN_LLM_CONTEXT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
@@ -110,7 +109,7 @@ fn tool_result_view_from_protocol(
 fn title_retry_backoff(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(10);
     let base = TITLE_JOB_BASE_BACKOFF_MS.saturating_mul(1_u64 << exponent);
-    let jitter = rand::thread_rng().gen_range(0..=TITLE_JOB_MAX_JITTER_MS);
+    let jitter = rand::random_range(0..=TITLE_JOB_MAX_JITTER_MS);
     Duration::from_millis(base.saturating_add(jitter))
 }
 

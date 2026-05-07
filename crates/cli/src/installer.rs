@@ -743,7 +743,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()> {

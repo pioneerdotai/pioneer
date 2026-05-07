@@ -220,7 +220,7 @@ pub fn sniff_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
 pub fn hash_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub fn hash_string(value: &str) -> String {

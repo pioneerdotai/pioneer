@@ -6,8 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-db-keystore = "0.4.1"
-keyring-core = "0.7.2"
+db-keystore = "0.4.2-pre.2"
+keyring-core = "1"
 serde.workspace = true
 serde_json.workspace = true
 zeroize = "1"

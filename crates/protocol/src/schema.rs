@@ -1,4 +1,4 @@
-use schemars::{schema::RootSchema, schema_for};
+use schemars::{Schema, schema_for};
 use std::fs;
 use std::path::Path;
 
@@ -114,7 +114,7 @@ use crate::{
 
 pub struct SchemaDocument {
     pub file_name: &'static str,
-    pub schema: RootSchema,
+    pub schema: Schema,
 }
 
 macro_rules! schema_doc {

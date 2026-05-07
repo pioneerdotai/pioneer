@@ -909,7 +909,7 @@ async fn download_to_file(
         status_code,
         content_type,
         bytes_written,
-        sha256: format!("{:x}", hasher.finalize()),
+        sha256: hex::encode(hasher.finalize()),
         truncated: false,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })

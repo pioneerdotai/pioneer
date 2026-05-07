@@ -5,8 +5,6 @@ use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore,
 };
-use rand::RngCore;
-use rand::rngs::OsRng;
 use tracing::warn;
 
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
@@ -154,7 +152,7 @@ impl GatewaySecrets {
         }
 
         let mut material = vec![0u8; size_bytes];
-        OsRng.fill_bytes(material.as_mut_slice());
+        rand::fill(material.as_mut_slice());
 
         let now = current_unix_i64()?;
         self.store
@@ -199,7 +197,7 @@ impl GatewaySecrets {
         };
 
         let mut material = vec![0u8; size_bytes];
-        OsRng.fill_bytes(material.as_mut_slice());
+        rand::fill(material.as_mut_slice());
 
         self.store
             .put_string(

@@ -57,13 +57,13 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-toml = "0.8"
-schemars = { version = "0.8", features = ["derive"] }
+toml = "1.1"
+schemars = { version = "1.2", features = ["derive"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Async
-tokio = { version = "1.50", features = ["full"] }
-tokio-tungstenite = "0.28"
+tokio = { version = "1.52", features = ["full"] }
+tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["full"] }
 
 # Tracing
@@ -78,19 +78,19 @@ gpui-terminal = "0.1.0"
 markdown = "1"
 
 # Tokenization
-tiktoken-rs = "0.6"
+tiktoken-rs = "0.11"
 
 # Utils
-nanoid = "0.4"
+nanoid = "0.5"
 futures-util = "0.3"
 futures-timer = "3"
 async-trait = "0.1"
 tokio-stream = "0.1"
 config = "0.15"
 dirs = "6"
-rand = "0.8"
+rand = "0.10"
 webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-core", default-features = false }
-scraper = "0.22"
+scraper = "0.26"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 enigo = "0.6.1"
@@ -98,22 +98,22 @@ xcap = "0.9.4"
 tempfile = "3"
 
 # Agent memory capsule store
-memvid-core = { version = "=2.0.139", default-features = false, features = ["lex", "vec", "temporal_track", "simd"] }
+memvid-core = { version = "2.0", default-features = false, features = ["lex", "vec", "temporal_track", "simd"] }
 
 # Embed
 rust-embed = "8"
 
 # Locale
-rust-i18n = "3"
+rust-i18n = "4"
 sys-locale = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking"] }
 http = "1"
 
 # Crypto
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 url = "2"
@@ -123,9 +123,9 @@ flate2 = "1"
 tar = "0.4"
 
 # Database
-sea-orm = "2.0.0-rc.37"
-sea-orm-migration = "2.0.0-rc.37"
+sea-orm = "2.0.0-rc.38"
+sea-orm-migration = "2.0.0-rc.38"
 
 # MCP
-rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "1.6.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "9.1.0", features = ["tokio1"] }

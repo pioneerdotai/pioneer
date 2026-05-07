@@ -7,11 +7,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskCreateParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .create_task(pioneer_tasks::TaskCreateContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -167,11 +168,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskCancelParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .cancel_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .cancel_task(pioneer_tasks::TaskMutationContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -197,11 +199,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskDetachParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .detach_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .detach_task(pioneer_tasks::TaskMutationContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -227,11 +230,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskRescheduleParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .reschedule_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .reschedule_task(pioneer_tasks::TaskMutationContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -257,11 +261,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskPauseParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .pause_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .pause_task(pioneer_tasks::TaskMutationContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -287,11 +292,12 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskResumeParams,
     ) {
-        match self
-            .task_runtime
-            .service()
-            .resume_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
+        match Box::pin(
+            self.task_runtime
+                .service()
+                .resume_task(pioneer_tasks::TaskMutationContext::default(), params),
+        )
+        .await
         {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)

@@ -659,7 +659,7 @@ fn delivery_mode_key(mode: TaskDeliveryMode) -> &'static str {
 fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {

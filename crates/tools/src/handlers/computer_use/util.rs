@@ -495,7 +495,7 @@ fn normalize_hotkey_token(value: &str) -> String {
 pub(crate) fn compute_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub(crate) fn now_unix_ms() -> i64 {

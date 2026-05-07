@@ -688,8 +688,7 @@ fn fallback_description(body: &str) -> String {
 fn fingerprint_for_content(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    let digest = hasher.finalize();
-    format!("{:x}", digest)
+    hex::encode(hasher.finalize())
 }
 
 pub fn qualified_skill_slug(owner: &str, slug: &str) -> String {
