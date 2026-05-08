@@ -249,21 +249,24 @@ fn resolve_login_shell_path() -> Option<String> {
 }
 
 fn shell_candidates() -> Vec<String> {
+    shell_candidates_from_env(std::env::var("SHELL").ok().as_deref())
+}
+
+fn shell_candidates_from_env(shell: Option<&str>) -> Vec<String> {
     let mut candidates = Vec::new();
-    if let Ok(shell) = std::env::var("SHELL") {
-        let shell = shell.trim();
-        if !shell.is_empty() {
-            candidates.push(shell.to_owned());
-        }
+    if let Some(shell) = shell.map(str::trim).filter(|shell| !shell.is_empty()) {
+        push_shell_candidate(&mut candidates, shell);
     }
-    candidates.extend(
-        ["/bin/zsh", "/bin/bash", "/bin/sh"]
-            .iter()
-            .map(|value| (*value).to_owned()),
-    );
-    candidates.sort();
-    candidates.dedup();
+    for fallback in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+        push_shell_candidate(&mut candidates, fallback);
+    }
     candidates
+}
+
+fn push_shell_candidate(candidates: &mut Vec<String>, shell: &str) {
+    if !candidates.iter().any(|candidate| candidate == shell) {
+        candidates.push(shell.to_owned());
+    }
 }
 
 fn is_gateway_reachable(address: &str, connect_timeout: Duration) -> Result<bool> {
@@ -295,6 +298,47 @@ fn normalize_unspecified_addr(addr: SocketAddr) -> SocketAddr {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), v6.port())
         }
         _ => addr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_candidates_from_env;
+
+    #[test]
+    fn shell_candidates_keep_user_shell_first() {
+        assert_eq!(
+            shell_candidates_from_env(Some("/bin/zsh")),
+            vec![
+                "/bin/zsh".to_owned(),
+                "/bin/bash".to_owned(),
+                "/bin/sh".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_candidates_keep_bash_first_when_user_shell_is_bash() {
+        assert_eq!(
+            shell_candidates_from_env(Some("/bin/bash")),
+            vec![
+                "/bin/bash".to_owned(),
+                "/bin/zsh".to_owned(),
+                "/bin/sh".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_candidates_ignore_empty_shell_and_dedup_without_sorting() {
+        assert_eq!(
+            shell_candidates_from_env(Some("  ")),
+            vec![
+                "/bin/zsh".to_owned(),
+                "/bin/bash".to_owned(),
+                "/bin/sh".to_owned(),
+            ]
+        );
     }
 }
 
