@@ -22,7 +22,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset_name: pioneer-gateway-linux-x86_64.gz
             archive: gz
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_name: pioneer-gateway-linux-aarch64.gz
             archive: gz
@@ -52,10 +52,23 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: setup-zig-for-linux-aarch64
-        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu' && runner.arch != 'ARM64'
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.13.0
+
+      - name: install-linux-build-dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgbm-dev \
+            libpipewire-0.3-dev \
+            libwayland-dev \
+            libxkbcommon-dev
 
       - name: build-unix-target
         if: runner.os != 'Windows'
@@ -63,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" && "${RUNNER_ARCH:-}" != "ARM64" ]]; then
             cargo install cargo-zigbuild --locked --quiet
             cargo zigbuild --release -p pioneer-cli --target "${{ matrix.target }}"
           else

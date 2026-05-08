@@ -43,6 +43,19 @@ jobs:
           set -euo pipefail
           cargo fmt --all --check
 
+      - name: install-linux-build-dependencies
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgbm-dev \
+            libpipewire-0.3-dev \
+            libwayland-dev \
+            libxkbcommon-dev
+
       - name: cargo-check-workspace
         shell: bash
         run: |
