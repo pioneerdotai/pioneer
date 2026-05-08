@@ -1,7 +1,7 @@
 use crate::providers::{
-    AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, ClaudeCodeProvider,
-    CopilotProvider, GeminiCliProvider, GeminiProvider, GlmProvider, KiloCliProvider,
-    OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider, OpenRouterProvider, TelnyxProvider,
+    AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, CopilotProvider,
+    GeminiProvider, GlmProvider, OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider,
+    OpenRouterProvider, TelnyxProvider,
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities};
@@ -41,9 +41,9 @@ pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Pro
         }
 
         // ── CLI providers ───────────────────────────────────────────────
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new())),
-        "gemini-cli" => Ok(Box::new(GeminiCliProvider::new())),
-        "kilocli" | "kilo" => Ok(Box::new(KiloCliProvider::new())),
+        // "claude-code" => Ok(Box::new(ClaudeCodeProvider::new())),
+        // "gemini-cli" => Ok(Box::new(GeminiCliProvider::new())),
+        // "kilocli" | "kilo" => Ok(Box::new(KiloCliProvider::new())),
 
         // ── OpenAI-compatible providers ─────────────────────────────────
         "groq" => Ok(Box::new(compat(

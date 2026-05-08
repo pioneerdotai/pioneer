@@ -36,11 +36,6 @@ pub(super) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         &["azure_openai", "azure"],
     ),
     ProviderCatalogEntry::new(
-        "claude-code",
-        "logos/providers/claude-code.svg",
-        &["claude_code"],
-    ),
-    ProviderCatalogEntry::new(
         "copilot",
         "logos/providers/copilot.svg",
         &["github-copilot"],
@@ -50,11 +45,6 @@ pub(super) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         "gemini",
         "logos/providers/gemini.svg",
         &["google", "google-gemini"],
-    ),
-    ProviderCatalogEntry::new(
-        "gemini-cli",
-        "logos/providers/gemini-cli.svg",
-        &["gemini_cli"],
     ),
     ProviderCatalogEntry::new(
         "glm",
@@ -128,9 +118,4 @@ pub(super) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry::new("sglang", "logos/providers/sglang.svg", &[]),
     ProviderCatalogEntry::new("vllm", "logos/providers/vllm.svg", &[]),
     ProviderCatalogEntry::new("osaurus", "logos/providers/osaurus.svg", &[]),
-    ProviderCatalogEntry::new(
-        "kilocli",
-        "logos/providers/kilocli.svg",
-        &["kilo", "kilo-cli", "kilo_cli"],
-    ),
 ];
