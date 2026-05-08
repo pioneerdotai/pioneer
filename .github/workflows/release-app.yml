@@ -75,6 +75,7 @@ jobs:
             pkg-config \
             libasound2-dev \
             libgbm-dev \
+            libssl-dev \
             libpipewire-0.3-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -86,6 +87,8 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libgl1-mesa-dev
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
       - name: setup-macos-signing-keychain
         if: matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
