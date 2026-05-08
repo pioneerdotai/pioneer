@@ -26,6 +26,9 @@ use pioneer_protocol::{
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const APP_REFERER: &str = "https://getpioneer.dev";
+const APP_TITLE: &str = "Pioneer";
+const APP_CATEGORIES: &str = "personal-agent,general-chat";
 
 pub struct OpenRouterProvider {
     api_key: String,
@@ -530,6 +533,13 @@ impl OpenRouterProvider {
         format!("{}/models", self.base_url)
     }
 
+    fn with_app_attribution(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("HTTP-Referer", APP_REFERER)
+            .header("X-OpenRouter-Title", APP_TITLE)
+            .header("X-OpenRouter-Categories", APP_CATEGORIES)
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = response
@@ -577,12 +587,14 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn warmup(&self) -> Result<()> {
-        self.client
-            .get(self.auth_key_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?
-            .error_for_status()?;
+        Self::with_app_attribution(
+            self.client
+                .get(self.auth_key_url())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -613,13 +625,14 @@ impl crate::traits::Provider for OpenRouterProvider {
             stream: false,
         };
 
-        let response = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request)
-            .send()
-            .await?;
+        let response = Self::with_app_attribution(
+            self.client
+                .post(self.chat_completions_url())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .json(&api_request)
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -701,13 +714,14 @@ impl crate::traits::Provider for OpenRouterProvider {
             stream: true,
         };
 
-        let response = self
-            .client
-            .post(self.chat_completions_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request)
-            .send()
-            .await?;
+        let response = Self::with_app_attribution(
+            self.client
+                .post(self.chat_completions_url())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .json(&api_request)
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -813,12 +827,13 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self
-            .client
-            .get(self.models_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let response = Self::with_app_attribution(
+            self.client
+                .get(self.models_url())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -889,6 +904,45 @@ mod tests {
         assert_eq!(
             provider.chat_completions_url(),
             "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn app_attribution_headers_are_added_to_requests() {
+        let provider = OpenRouterProvider::new("key");
+        let request = OpenRouterProvider::with_app_attribution(
+            provider
+                .client
+                .get("https://openrouter.ai/api/v1/models")
+                .header("Authorization", "Bearer key"),
+        )
+        .build()
+        .unwrap();
+
+        let headers = request.headers();
+        assert_eq!(
+            headers
+                .get("HTTP-Referer")
+                .and_then(|value| value.to_str().ok()),
+            Some(APP_REFERER)
+        );
+        assert_eq!(
+            headers
+                .get("X-OpenRouter-Title")
+                .and_then(|value| value.to_str().ok()),
+            Some(APP_TITLE)
+        );
+        assert_eq!(
+            headers
+                .get("X-OpenRouter-Categories")
+                .and_then(|value| value.to_str().ok()),
+            Some(APP_CATEGORIES)
+        );
+        assert_eq!(
+            headers
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer key")
         );
     }
 
