@@ -98,7 +98,7 @@ xcap = "0.9.4"
 tempfile = "3"
 
 # Agent memory capsule store
-memvid-core = { version = "2.0", default-features = false, features = ["lex", "vec", "temporal_track", "simd"] }
+memvid-core = { version = "2.0", default-features = false, features = ["lex", "temporal_track", "simd"] }
 
 # Embed
 rust-embed = "8"
