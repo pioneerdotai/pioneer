@@ -60,6 +60,30 @@ require_cmd() {
   }
 }
 
+create_applications_link() {
+  local stage_dir="$1"
+  local alias_path="$stage_dir/Applications"
+
+  rm -rf "$alias_path"
+
+  if command -v osascript >/dev/null 2>&1; then
+    if PIONEER_DMG_STAGE_DIR="$stage_dir" osascript <<'OSA' >/dev/null 2>&1; then
+set stageDir to system attribute "PIONEER_DMG_STAGE_DIR"
+tell application "Finder"
+  set applicationsFolder to POSIX file "/Applications" as alias
+  set destinationFolder to POSIX file stageDir as alias
+  make new alias file to applicationsFolder at destinationFolder with properties {name:"Applications"}
+end tell
+OSA
+      if [[ -e "$alias_path" ]]; then
+        return 0
+      fi
+    fi
+  fi
+
+  ln -s /Applications "$alias_path"
+}
+
 sha256_file() {
   local path="$1"
   if command -v shasum >/dev/null 2>&1; then
@@ -285,7 +309,7 @@ DMG_PATH="$OUT_DIR/$DMG_NAME"
 DMG_STAGE_DIR="$WORK_DIR/dmg-root"
 mkdir -p "$DMG_STAGE_DIR"
 cp -R "$APP_DIR" "$DMG_STAGE_DIR/${APP_NAME}.app"
-ln -s /Applications "$DMG_STAGE_DIR/Applications"
+create_applications_link "$DMG_STAGE_DIR"
 
 hdiutil create \
   -volname "$APP_NAME" \
