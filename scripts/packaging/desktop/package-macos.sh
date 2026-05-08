@@ -60,6 +60,31 @@ require_cmd() {
   }
 }
 
+apply_applications_link_icon() {
+  local alias_path="$1"
+  local work_dir="$2"
+  local icon_source="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns"
+  local icon_work="$work_dir/.ApplicationsFolderIcon.icns"
+  local icon_rsrc="$work_dir/.ApplicationsFolderIcon.rsrc"
+
+  [[ -f "$icon_source" ]] || return 0
+  command -v sips >/dev/null 2>&1 || return 0
+  command -v DeRez >/dev/null 2>&1 || return 0
+  command -v Rez >/dev/null 2>&1 || return 0
+  command -v SetFile >/dev/null 2>&1 || return 0
+
+  # Finder can render DMG aliases as blank placeholders unless the alias carries an icon resource.
+  {
+    cp "$icon_source" "$icon_work" &&
+      sips -i "$icon_work" >/dev/null 2>&1 &&
+      DeRez -only icns "$icon_work" > "$icon_rsrc" 2>/dev/null &&
+      Rez -append "$icon_rsrc" -o "$alias_path" >/dev/null 2>&1 &&
+      SetFile -a C "$alias_path" >/dev/null 2>&1
+  } || true
+
+  rm -f "$icon_work" "$icon_rsrc"
+}
+
 create_applications_link() {
   local stage_dir="$1"
   local alias_path="$stage_dir/Applications"
@@ -76,6 +101,7 @@ tell application "Finder"
 end tell
 OSA
       if [[ -e "$alias_path" ]]; then
+        apply_applications_link_icon "$alias_path" "$stage_dir"
         return 0
       fi
     fi
