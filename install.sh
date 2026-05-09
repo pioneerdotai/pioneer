@@ -5,6 +5,7 @@ CHANNEL="stable"
 VERSION=""
 NO_START=0
 FORCE_START=0
+WORK_DIR=""
 
 REPO="${PIONEER_RELEASE_REPO:-pioneerdotai/pioneer}"
 API_BASE="${PIONEER_RELEASE_API_BASE:-https://api.github.com/repos/${REPO}/releases}"
@@ -38,6 +39,12 @@ log() {
 fail() {
   printf '[pioneer-install] error: %s\n' "$*" >&2
   exit 1
+}
+
+cleanup() {
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
 }
 
 need_cmd() {
@@ -113,8 +120,12 @@ resolve_release_tag() {
   fi
 
   if [[ "$CHANNEL" == "stable" ]]; then
-    curl -fsSL "${API_BASE}/latest" | python3 -c 'import json,sys; payload=json.load(sys.stdin); tag=payload.get("tag_name","").strip(); 
-if not tag: raise SystemExit("latest release does not include tag_name"); print(tag)'
+    curl -fsSL "${API_BASE}/latest" | python3 -c 'import json,sys
+payload=json.load(sys.stdin)
+tag=payload.get("tag_name","").strip()
+if not tag:
+    raise SystemExit("latest release does not include tag_name")
+print(tag)'
     return
   fi
 
@@ -193,9 +204,8 @@ main() {
   parse_args "$@"
   read -r os arch < <(detect_platform)
 
-  local work_dir
-  work_dir="$(mktemp -d)"
-  trap 'rm -rf "$work_dir"' EXIT
+  WORK_DIR="$(mktemp -d)"
+  trap cleanup EXIT
 
   local asset_name tag asset_file checksums_file
   if [[ -n "${PIONEER_LOCAL_ASSET_FILE:-}" || -n "${PIONEER_LOCAL_CHECKSUMS_FILE:-}" ]]; then
@@ -210,8 +220,9 @@ main() {
   else
     asset_name="pioneer-gateway-${os}-${arch}.gz"
     tag="$(resolve_release_tag)"
-    asset_file="${work_dir}/${asset_name}"
-    checksums_file="${work_dir}/SHA256SUMS"
+    [[ -n "$tag" ]] || fail "resolved release tag is empty"
+    asset_file="${WORK_DIR}/${asset_name}"
+    checksums_file="${WORK_DIR}/SHA256SUMS"
     download_release_asset "$tag" "$asset_name" "$asset_file"
     download_release_asset "$tag" "SHA256SUMS" "$checksums_file"
   fi
@@ -221,7 +232,7 @@ main() {
   actual="$(sha256_file "$asset_file")"
   [[ "$expected" == "$actual" ]] || fail "checksum mismatch for ${asset_name}"
 
-  run_bootstrap_installer "$asset_file" "$checksums_file" "$work_dir"
+  run_bootstrap_installer "$asset_file" "$checksums_file" "$WORK_DIR"
 }
 
 main "$@"
