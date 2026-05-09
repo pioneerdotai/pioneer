@@ -314,13 +314,18 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self
+        let active_gateway_id = self
             .gateway
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.active_gateway_id())
-            == Some(gateway_id.as_str())
-        {
+            .and_then(|runtime| runtime.active_gateway_id());
+
+        if gateway_activation_is_noop(
+            active_gateway_id,
+            gateway_id.as_str(),
+            self.gateway.connection_state,
+            self.gateway.ws_connection_id,
+        ) {
             return false;
         }
 

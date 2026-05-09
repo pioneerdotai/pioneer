@@ -27,12 +27,13 @@ use super::thread_list::{
     TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
 };
 use super::{
-    build_ws_connect_spec, default_user_command_bin_dir_label,
-    gateway_activation_requires_local_start, is_transient_thread_start_error,
-    normalize_workspace_id, should_apply_gateway_operation_result, should_apply_ws_event,
-    should_refresh_workspace_bound_data, thread_start_retry_delay, turn_resume_retry_delay,
-    warning_notification_messages,
+    build_ws_connect_spec, default_user_command_bin_dir_label, gateway_activation_is_noop,
+    gateway_activation_requires_local_start, gateway_has_ready_ws_connection,
+    is_transient_thread_start_error, normalize_workspace_id, should_apply_gateway_operation_result,
+    should_apply_ws_event, should_refresh_workspace_bound_data, thread_start_retry_delay,
+    turn_resume_retry_delay, warning_notification_messages,
 };
+use crate::app::root::GatewayConnectionState;
 use crate::gateway::{
     GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning, GatewayRuntime, GatewayWsEvent,
 };
@@ -95,6 +96,44 @@ fn gateway_activation_requires_local_start_only_for_local_endpoint() {
         GatewayEndpointKind::Remote
     )));
     assert!(!gateway_activation_requires_local_start(None));
+}
+
+#[test]
+fn active_gateway_activation_is_noop_only_when_ws_is_ready() {
+    assert!(gateway_activation_is_noop(
+        Some("local"),
+        "local",
+        GatewayConnectionState::Connected,
+        Some(7),
+    ));
+    assert!(!gateway_activation_is_noop(
+        Some("local"),
+        "local",
+        GatewayConnectionState::Disconnected,
+        None,
+    ));
+    assert!(!gateway_activation_is_noop(
+        Some("local"),
+        "remote",
+        GatewayConnectionState::Connected,
+        Some(7),
+    ));
+}
+
+#[test]
+fn ready_ws_connection_requires_connected_state_and_connection_id() {
+    assert!(gateway_has_ready_ws_connection(
+        GatewayConnectionState::Connected,
+        Some(7),
+    ));
+    assert!(!gateway_has_ready_ws_connection(
+        GatewayConnectionState::Connected,
+        None,
+    ));
+    assert!(!gateway_has_ready_ws_connection(
+        GatewayConnectionState::Reconnecting,
+        Some(7),
+    ));
 }
 
 #[test]

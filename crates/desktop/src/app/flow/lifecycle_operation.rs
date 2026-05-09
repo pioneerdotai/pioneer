@@ -127,18 +127,28 @@ impl PioneerDesktop {
                     self.gateway.connection_state = GatewayConnectionState::Idle;
                 }
                 Ok(ActiveGatewayState::Connected) => {
-                    if let Some(active) = runtime.active_gateway() {
-                        self.gateway.status = format!(
-                            "{}: {} ({})",
-                            t!("gateway.status.connected"),
-                            active.name.as_str(),
-                            active.address.as_str()
-                        );
+                    if gateway_has_ready_ws_connection(
+                        self.gateway.connection_state,
+                        self.gateway.ws_connection_id,
+                    ) {
+                        if let Some(active) = runtime.active_gateway() {
+                            self.gateway.status = format!(
+                                "{}: {} ({})",
+                                t!("gateway.status.connected"),
+                                active.name.as_str(),
+                                active.address.as_str()
+                            );
+                        } else {
+                            self.gateway.status = t!("gateway.status.connected").to_string();
+                        }
+                        self.gateway.status_level = GatewayStatusLevel::Connected;
+                        self.gateway.connection_state = GatewayConnectionState::Connected;
+                        self.gateway.error = None;
                     } else {
-                        self.gateway.status = t!("gateway.status.connected").to_string();
+                        self.gateway.status = t!("gateway.status.unavailable").to_string();
+                        self.gateway.status_level = GatewayStatusLevel::Failed;
+                        self.gateway.connection_state = GatewayConnectionState::Disconnected;
                     }
-                    self.gateway.status_level = GatewayStatusLevel::Connected;
-                    self.gateway.connection_state = GatewayConnectionState::Connected;
                 }
                 Ok(ActiveGatewayState::Unreachable) => {
                     if let Some(active) = runtime.active_gateway() {

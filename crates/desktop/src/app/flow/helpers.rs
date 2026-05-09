@@ -119,6 +119,23 @@ pub(crate) fn gateway_activation_requires_local_start(
     endpoint_kind == Some(GatewayEndpointKind::Local)
 }
 
+pub(crate) fn gateway_has_ready_ws_connection(
+    connection_state: GatewayConnectionState,
+    ws_connection_id: Option<u64>,
+) -> bool {
+    connection_state == GatewayConnectionState::Connected && ws_connection_id.is_some()
+}
+
+pub(crate) fn gateway_activation_is_noop(
+    active_gateway_id: Option<&str>,
+    gateway_id: &str,
+    connection_state: GatewayConnectionState,
+    ws_connection_id: Option<u64>,
+) -> bool {
+    active_gateway_id == Some(gateway_id)
+        && gateway_has_ready_ws_connection(connection_state, ws_connection_id)
+}
+
 pub(crate) fn warning_notification_messages(warnings: &[GatewayInstallWarning]) -> Vec<String> {
     warnings
         .iter()
