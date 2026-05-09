@@ -121,6 +121,7 @@ libc = "0.2"
 mime_guess = "2"
 flate2 = "1"
 tar = "0.4"
+windows-sys = "0.61"
 
 # Database
 sea-orm = "2.0.0-rc.38"

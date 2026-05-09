@@ -1370,7 +1370,9 @@ mod tests {
 
         assert_eq!(
             asset_name,
-            format!("pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}")
+            format!(
+                "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
+            )
         );
     }
 
