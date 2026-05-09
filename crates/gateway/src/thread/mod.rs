@@ -373,12 +373,17 @@ impl ThreadManager {
         merge_thread_metadata(&mut entry.thread, thread);
     }
 
-    pub async fn list_threads_for_workspace(&self, workspace_id: &str) -> Vec<Thread> {
+    pub async fn list_threads_for_workspace_visible_to(
+        &self,
+        workspace_id: &str,
+        connection_id: Option<ConnectionId>,
+    ) -> Vec<Thread> {
         let state = self.state.read().await;
         state
             .threads
             .values()
             .filter(|entry| entry.thread.workspace_id == workspace_id)
+            .filter(|entry| thread_visible_to_connection(entry, connection_id))
             .map(|entry| entry.thread.clone())
             .collect()
     }
@@ -783,6 +788,28 @@ fn has_in_progress_turn(thread: &Thread) -> bool {
         .turns
         .iter()
         .any(|turn| turn.status == TurnStatus::InProgress)
+}
+
+fn thread_visible_to_connection(entry: &ThreadEntry, connection_id: Option<ConnectionId>) -> bool {
+    if !is_empty_unnamed_draft_thread(&entry.thread) {
+        return true;
+    }
+
+    if entry.connection_ids.is_empty() {
+        return true;
+    }
+
+    connection_id.is_some_and(|connection_id| entry.connection_ids.contains(&connection_id))
+}
+
+fn is_empty_unnamed_draft_thread(thread: &Thread) -> bool {
+    thread.status == ThreadStatus::Idle
+        && thread.turns.is_empty()
+        && thread.preview.trim().is_empty()
+        && thread
+            .name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
 }
 
 fn merge_thread_metadata(existing_thread: &mut Thread, incoming_thread: &Thread) {

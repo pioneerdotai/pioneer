@@ -2512,6 +2512,8 @@ fn force_fail_tool_item_marks_in_progress_tool_as_failed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
     let session_manager = Arc::new(SessionManager::new());
+    let (tx, _rx) = mpsc::channel(8);
+    let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = Arc::new(MessageProcessor::new(
@@ -2557,7 +2559,7 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     assert_eq!(child_thread.name.as_deref(), Some(child_title));
 
     let tree_threads = processor
-        .list_threads_snapshot(workspace_id.as_str(), 100)
+        .list_threads_snapshot_for_connection(workspace_id.as_str(), 100, connection_id)
         .await
         .expect("thread tree snapshot should load");
     assert!(
@@ -3733,6 +3735,82 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
     assert!(
         foreign_message.is_err(),
         "foreign connection must not receive unrelated thread/started"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_tree_hides_foreign_empty_draft_threads() {
+    let (tx_a, mut rx_a) = mpsc::channel(16);
+    let (tx_b, mut rx_b) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_a = session_manager.register_connection(tx_a).await;
+    let connection_b = session_manager.register_connection(tx_b).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thr_000000000000000122";
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": "startdraftthread00001",
+        "method": "thread/start",
+        "params": {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id
+        }
+    });
+
+    processor
+        .process_request(connection_a, &thread_start_request.to_string())
+        .await;
+    let _response = recv_response_by_id(&mut rx_a, "startdraftthread00001").await;
+    let _notification = recv_notification_by_method(&mut rx_a, events::THREAD_STARTED).await;
+
+    let tree_request_b = json!({
+        "jsonrpc": "2.0",
+        "id": "treerequestclientb001",
+        "method": "thread/tree",
+        "params": {
+            "workspace_id": workspace_id
+        }
+    });
+    processor
+        .process_request(connection_b, &tree_request_b.to_string())
+        .await;
+    let tree_response_b = recv_response_by_id(&mut rx_b, "treerequestclientb001").await;
+    let tree_b: ThreadTreeResponse =
+        serde_json::from_value(tree_response_b.result).expect("thread/tree B result decode");
+    assert!(
+        tree_b.threads.iter().all(|thread| thread.id != thread_id),
+        "foreign client must not see another connection's empty draft thread"
+    );
+
+    let tree_request_a = json!({
+        "jsonrpc": "2.0",
+        "id": "treerequestclienta001",
+        "method": "thread/tree",
+        "params": {
+            "workspace_id": workspace_id
+        }
+    });
+    processor
+        .process_request(connection_a, &tree_request_a.to_string())
+        .await;
+    let tree_response_a = recv_response_by_id(&mut rx_a, "treerequestclienta001").await;
+    let tree_a: ThreadTreeResponse =
+        serde_json::from_value(tree_response_a.result).expect("thread/tree A result decode");
+    assert!(
+        tree_a.threads.iter().any(|thread| thread.id == thread_id),
+        "own client should still see its local empty draft thread"
     );
 }
 

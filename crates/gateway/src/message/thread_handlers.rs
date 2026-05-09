@@ -253,7 +253,10 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
 
-        let threads = match self.list_threads_snapshot(workspace_id.as_str(), 500).await {
+        let threads = match self
+            .list_threads_snapshot_for_connection(workspace_id.as_str(), 500, connection_id)
+            .await
+        {
             Ok(threads) => threads,
             Err(error) => {
                 self.send_error(
@@ -536,10 +539,21 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn list_threads_snapshot(
+    pub(super) async fn list_threads_snapshot_for_connection(
         &self,
         workspace_id: &str,
         limit: u64,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
+        self.list_threads_snapshot_internal(workspace_id, limit, Some(connection_id))
+            .await
+    }
+
+    async fn list_threads_snapshot_internal(
+        &self,
+        workspace_id: &str,
+        limit: u64,
+        connection_id: Option<ConnectionId>,
     ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
         let persisted_threads = self
             .crud_store
@@ -553,7 +567,7 @@ impl MessageProcessor {
 
         for thread in self
             .thread_manager
-            .list_threads_for_workspace(workspace_id)
+            .list_threads_for_workspace_visible_to(workspace_id, connection_id)
             .await
         {
             match threads_by_id.get(thread.id.as_str()) {
