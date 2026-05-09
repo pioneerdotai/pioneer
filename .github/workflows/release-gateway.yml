@@ -123,16 +123,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          features_args=()
-          if [[ -n "${{ matrix.cargo_features }}" ]]; then
-            features_args+=(--features "${{ matrix.cargo_features }}")
-          fi
 
           if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" && "${RUNNER_ARCH:-}" != "ARM64" ]]; then
             cargo install cargo-zigbuild --locked --quiet
-            cargo zigbuild --release -p pioneer-cli "${features_args[@]}" --target "${{ matrix.target }}"
+            if [[ -n "${{ matrix.cargo_features }}" ]]; then
+              cargo zigbuild --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
+            else
+              cargo zigbuild --release -p pioneer-cli --target "${{ matrix.target }}"
+            fi
           else
-            cargo build --release -p pioneer-cli "${features_args[@]}" --target "${{ matrix.target }}"
+            if [[ -n "${{ matrix.cargo_features }}" ]]; then
+              cargo build --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
+            else
+              cargo build --release -p pioneer-cli --target "${{ matrix.target }}"
+            fi
           fi
 
       - name: build-windows-target
