@@ -9,8 +9,6 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecCommandArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cmd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
@@ -22,10 +20,6 @@ pub struct ExecCommandArgs {
     pub yield_time_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tty: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,13 +71,11 @@ impl ToolPayload {
             } => {
                 format!("{server}:{tool} {arguments}")
             }
-            Self::LocalShell(LocalShellPayload::ExecCommand(args)) => {
-                if let Some(command) = args.command.as_ref() {
-                    command.join(" ")
-                } else {
-                    args.cmd.clone().unwrap_or_default()
-                }
-            }
+            Self::LocalShell(LocalShellPayload::ExecCommand(args)) => args
+                .command
+                .as_ref()
+                .map(|command| command.join(" "))
+                .unwrap_or_default(),
             Self::LocalShell(LocalShellPayload::WriteStdin(args)) => {
                 format!(
                     "session={} chars={}",

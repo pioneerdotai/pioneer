@@ -1175,7 +1175,7 @@ runtime:
       parameters:
         type: object
       config:
-        command: ["sh", "-lc", "printf ok"]
+        command: ["/bin/sh", "-c", "printf ok"]
       output_policy:
         timeline:
           mode: full

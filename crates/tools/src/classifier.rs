@@ -716,7 +716,7 @@ mod tests {
             stdout: String::new(),
             stderr: "du: invalid option -- b\nusage: du ...".to_owned(),
             session_id: None,
-            command: vec!["zsh".to_owned(), "-lc".to_owned(), "du -bc".to_owned()],
+            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "du -bc".to_owned()],
             max_output_tokens: None,
             force_truncated_stdout: false,
             force_truncated_stderr: false,

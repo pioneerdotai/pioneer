@@ -6764,7 +6764,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         type: object
       execution_class: session_scoped
       config:
-        command: ["sh", "-lc", "printf shell-ok"]
+        command: ["/bin/sh", "-c", "printf shell-ok"]
       output_policy:
         timeline:
           mode: full
@@ -6928,7 +6928,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
         type: object
       execution_class: session_scoped
       config:
-        command: ["sh", "-lc", "sleep 3"]"#,
+        command: ["/bin/sh", "-c", "sleep 3"]"#,
         ),
     );
 
@@ -7068,7 +7068,7 @@ runtime:
         type: object
       execution_class: session_scoped
       config:
-        command: ["sh", "-lc", "printf shell-ok"]"#,
+        command: ["/bin/sh", "-c", "printf shell-ok"]"#,
         ),
     );
 

@@ -811,32 +811,7 @@ fn build_command(args: &ExecCommandArgs, cwd: &Path) -> Result<(Vec<String>, Com
         return Ok((command, cmd));
     }
 
-    if let Some(cmd_text) = args.cmd.as_ref() {
-        let shell = args.shell.clone().unwrap_or_else(|| "zsh".to_owned());
-        let login = args.login.unwrap_or(true);
-        let cmd_for_exec = maybe_prefix_pipefail(cmd_text.as_str(), shell.as_str());
-
-        let mut argv = Vec::new();
-        argv.push(shell.clone());
-        if login {
-            argv.push("-l".to_owned());
-        }
-        argv.push("-c".to_owned());
-        argv.push(cmd_text.clone());
-
-        let mut cmd = Command::new(shell);
-        if login {
-            cmd.arg("-l");
-        }
-        cmd.arg("-c").arg(cmd_for_exec);
-        cmd.current_dir(cwd);
-        configure_process_group(&mut cmd)?;
-        return Ok((argv, cmd));
-    }
-
-    Err(ToolError::invalid_arguments(
-        "either `cmd` or `command` is required",
-    ))
+    Err(ToolError::invalid_arguments("`command` argv is required"))
 }
 
 fn maybe_prefix_pipefail_for_argv(command: &[String]) -> Vec<String> {
@@ -876,11 +851,15 @@ fn maybe_prefix_pipefail(script: &str, shell: &str) -> String {
 }
 
 fn supports_pipefail(shell: &str) -> bool {
-    let shell_name = Path::new(shell)
+    let shell_name = shell_basename(shell);
+    matches!(shell_name, "zsh" | "bash" | "ksh" | "mksh")
+}
+
+fn shell_basename(shell: &str) -> &str {
+    Path::new(shell)
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or(shell);
-    matches!(shell_name, "zsh" | "bash" | "ksh" | "mksh")
+        .unwrap_or(shell)
 }
 
 fn resolve_workdir(base_dir: &Path, requested: Option<&str>) -> PathBuf {
@@ -1124,7 +1103,6 @@ mod tests {
         let handler = UnifiedExecHandler::default();
 
         let exec_args = ExecCommandArgs {
-            cmd: None,
             command: Some(vec![
                 "sh".to_owned(),
                 "-c".to_owned(),
@@ -1135,8 +1113,6 @@ mod tests {
             max_output_tokens: None,
             yield_time_ms: Some(50),
             tty: Some(true),
-            login: Some(false),
-            shell: None,
         };
         let exec_output = handler
             .handle(
@@ -1203,7 +1179,6 @@ mod tests {
                 invocation(
                     "exec_command",
                     ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                        cmd: None,
                         command: Some(vec![
                             "sh".to_owned(),
                             "-c".to_owned(),
@@ -1214,8 +1189,6 @@ mod tests {
                         max_output_tokens: None,
                         yield_time_ms: None,
                         tty: Some(false),
-                        login: None,
-                        shell: None,
                     })),
                 ),
                 trace("exec_command"),
@@ -1242,7 +1215,6 @@ mod tests {
                 invocation(
                     "exec_command",
                     ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                        cmd: None,
                         command: Some(vec![
                             "sh".to_owned(),
                             "-c".to_owned(),
@@ -1253,8 +1225,6 @@ mod tests {
                         max_output_tokens: None,
                         yield_time_ms: Some(120),
                         tty: Some(true),
-                        login: None,
-                        shell: None,
                     })),
                 ),
                 trace("exec_command"),
@@ -1301,7 +1271,6 @@ mod tests {
                 invocation(
                     "exec_command",
                     ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                        cmd: None,
                         command: Some(vec![
                             "sh".to_owned(),
                             "-c".to_owned(),
@@ -1312,8 +1281,6 @@ mod tests {
                         max_output_tokens: None,
                         yield_time_ms: None,
                         tty: Some(false),
-                        login: None,
-                        shell: None,
                     })),
                 ),
                 trace("exec_command"),
@@ -1331,13 +1298,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_command_rejects_missing_command() {
+        let handler = UnifiedExecHandler::default();
+        let result = handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: None,
+                        workdir: None,
+                        timeout_ms: None,
+                        max_output_tokens: None,
+                        yield_time_ms: None,
+                        tty: Some(false),
+                    })),
+                ),
+                trace("exec_command"),
+            )
+            .await;
+
+        let error = match result {
+            Ok(output) => panic!(
+                "missing command should be rejected, got output: {}",
+                output.raw_text()
+            ),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(error.to_string().contains("`command` argv is required"));
+    }
+
+    #[tokio::test]
     async fn exec_command_cancellation_terminates_one_shot_process() {
         let handler = UnifiedExecHandler::default();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let mut tool_invocation = invocation(
             "exec_command",
             ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                cmd: None,
                 command: Some(vec![
                     "sh".to_owned(),
                     "-c".to_owned(),
@@ -1348,8 +1345,6 @@ mod tests {
                 max_output_tokens: None,
                 yield_time_ms: None,
                 tty: Some(false),
-                login: None,
-                shell: None,
             })),
         );
         tool_invocation.cancellation = cancellation.clone();
@@ -1383,7 +1378,6 @@ mod tests {
         let mut tool_invocation = invocation(
             "exec_command",
             ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                cmd: None,
                 command: Some(vec![
                     "sh".to_owned(),
                     "-c".to_owned(),
@@ -1394,8 +1388,6 @@ mod tests {
                 max_output_tokens: None,
                 yield_time_ms: Some(1_000),
                 tty: Some(true),
-                login: Some(false),
-                shell: None,
             })),
         );
         tool_invocation.cancellation = cancellation.clone();
@@ -1436,15 +1428,12 @@ mod tests {
                 invocation(
                     "exec_command",
                     ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                        cmd: None,
                         command: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 2".to_owned()]),
                         workdir: None,
                         timeout_ms: None,
                         max_output_tokens: None,
                         yield_time_ms: Some(10),
                         tty: Some(true),
-                        login: Some(false),
-                        shell: None,
                     })),
                 ),
                 trace("exec_command"),

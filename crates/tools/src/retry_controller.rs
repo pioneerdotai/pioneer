@@ -856,7 +856,7 @@ mod tests {
         let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
         let decision = controller.decide(&[observation(
             "exec_command",
-            r#"{"cmd":"false"}"#,
+            r#"{"command":["false"]}"#,
             recoverable(ToolErrorClass::ExecutionFailed),
         )]);
 
@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(entries[0].error_class, ToolErrorClass::ExecutionFailed);
         assert_eq!(
             entries[0].failure_signature_fingerprint,
-            r#"{"cmd":"false"}"#
+            r#"{"command":["false"]}"#
         );
         assert_eq!(entries[0].episode_retry_used, 1);
         assert_eq!(entries[0].class_retry_used, 1);
@@ -930,7 +930,7 @@ mod tests {
         let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
         let observation = observation(
             "exec_command",
-            r#"{"cmd":"false"}"#,
+            r#"{"command":["false"]}"#,
             recoverable(ToolErrorClass::ExecutionFailed),
         )
         .with_recovery_view(Some(ToolRecoveryView {
@@ -984,7 +984,7 @@ mod tests {
         retry_decision(&mut controller, ToolErrorClass::ExecutionFailed);
         let decision = controller.decide(&[observation(
             "exec_command",
-            r#"{"cmd":"false"}"#,
+            r#"{"command":["false"]}"#,
             recoverable(ToolErrorClass::ExecutionFailed),
         )]);
 
@@ -1038,7 +1038,7 @@ mod tests {
         retry_decision(&mut controller, ToolErrorClass::ExecutionFailed);
         let decision = controller.decide(&[observation(
             "exec_command",
-            r#"{"cmd":"pwd"}"#,
+            r#"{"command":["pwd"]}"#,
             recoverable(ToolErrorClass::NotFound),
         )]);
 

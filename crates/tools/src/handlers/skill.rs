@@ -629,13 +629,9 @@ impl ToolHandler for SkillShellToolHandler {
                 .filter_map(JsonValue::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
-        } else if let Some(cmd) = arguments.get("cmd").and_then(JsonValue::as_str) {
-            vec!["sh".to_owned(), "-lc".to_owned(), cmd.to_owned()]
-        } else if let Some(cmd) = config.get("cmd").and_then(JsonValue::as_str) {
-            vec!["sh".to_owned(), "-lc".to_owned(), cmd.to_owned()]
         } else {
             return Err(ToolError::invalid_arguments(
-                "shell skill tool requires `command` array or `cmd` string",
+                "shell skill tool requires `command` array",
             ));
         };
 

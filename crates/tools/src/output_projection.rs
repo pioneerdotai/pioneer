@@ -1563,7 +1563,7 @@ mod tests {
     #[test]
     fn dynamic_shell_full_policy_persists_bounded_shell_output() {
         let payload = serde_json::json!({
-            "command": ["sh", "-lc", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
+            "command": ["/bin/sh", "-c", "printf VISIBLE_DYNAMIC_SHELL_SENTINEL"],
             "exit_code": 0,
             "stdout": "VISIBLE_DYNAMIC_SHELL_SENTINEL",
             "stderr": "",
@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn dynamic_shell_without_full_policy_hashes_shell_output_for_storage() {
         let payload = serde_json::json!({
-            "command": ["sh", "-lc", "printf hidden-output"],
+            "command": ["/bin/sh", "-c", "printf hidden-output"],
             "exit_code": 0,
             "stdout": "SECRET_DYNAMIC_SHELL_SENTINEL",
             "stderr": "",
@@ -1714,7 +1714,7 @@ mod tests {
     #[test]
     fn dynamic_function_proxy_to_exec_command_can_preserve_bounded_shell_output() {
         let payload = serde_json::json!({
-            "command": ["sh", "-lc", "printf PROXY_SHELL_SENTINEL"],
+            "command": ["/bin/sh", "-c", "printf PROXY_SHELL_SENTINEL"],
             "exit_code": 0,
             "stdout": "PROXY_SHELL_SENTINEL",
             "stderr": "",

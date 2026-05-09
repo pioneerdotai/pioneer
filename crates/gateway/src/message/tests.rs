@@ -1831,7 +1831,7 @@ fn command_execution_item(item_id: &str) -> TurnItem {
     TurnItem::CommandExecution {
         id: item_id.to_owned(),
         tool_name: "exec_command".to_owned(),
-        arguments: json!({ "cmd": "echo hello" }),
+        arguments: json!({ "command": ["echo", "hello"] }),
         status: ToolCallStatus::InProgress,
         recovery_policy: None,
         output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
@@ -6581,7 +6581,7 @@ runtime:
         type: object
       execution_class: session_scoped
       config:
-        command: ["sh", "-lc", "printf gw-shell-ok"]
+        command: ["/bin/sh", "-c", "printf gw-shell-ok"]
       output_policy:
         timeline:
           mode: full

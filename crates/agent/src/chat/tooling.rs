@@ -471,12 +471,7 @@ fn argument_command(arguments: &JsonValue) -> Vec<String> {
         return from_array;
     }
 
-    arguments
-        .get("cmd")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| vec!["zsh".to_owned(), "-lc".to_owned(), value.to_owned()])
-        .unwrap_or_default()
+    Vec::new()
 }
 
 fn protocol_outcome_from_tool_outcome(outcome: &ToolOutcome) -> pioneer_protocol::ToolOutcome {

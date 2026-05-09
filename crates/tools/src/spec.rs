@@ -355,22 +355,21 @@ fn configured_builtin_spec(
 fn exec_command_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
-        "description": "Execute a shell command. Provide `cmd` (string) or `command` (argv array).",
+        "description": "Execute a command by direct argv. For shell syntax such as pipes, redirects, globbing, or expansions, call an explicit shell in `command`, for example [\"/bin/sh\", \"-c\", \"printf ok | cat\"].",
         "properties": {
-            "cmd": { "type": "string", "description": "Shell command string (zsh -lc)." },
             "command": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Command argv form."
+                "minItems": 1,
+                "description": "Command argv. The first item is the executable; remaining items are passed as arguments without implicit shell wrapping."
             },
             "workdir": { "type": "string" },
             "timeout_ms": { "type": "integer", "minimum": 1 },
             "max_output_tokens": { "type": "integer", "minimum": 1 },
             "yield_time_ms": { "type": "integer", "minimum": 0 },
-            "tty": { "type": "boolean" },
-            "login": { "type": "boolean" },
-            "shell": { "type": "string" }
+            "tty": { "type": "boolean" }
         },
+        "required": ["command"],
         "additionalProperties": false
     })
 }
@@ -670,6 +669,27 @@ mod tests {
             Some(&ExecutionClass::SessionScoped)
         );
         assert_eq!(by_name.get("read_file"), Some(&ExecutionClass::Shared));
+    }
+
+    #[test]
+    fn exec_command_model_schema_requires_direct_argv() {
+        let specs = builtin_tool_specs();
+        let exec = specs
+            .iter()
+            .find(|configured| configured.spec.name == "exec_command")
+            .expect("exec_command spec should exist");
+        let properties = exec.spec.parameters["properties"]
+            .as_object()
+            .expect("properties should be an object");
+
+        assert!(properties.contains_key("command"));
+        assert!(!properties.contains_key("cmd"));
+        assert!(!properties.contains_key("shell"));
+        assert!(!properties.contains_key("login"));
+        assert_eq!(
+            exec.spec.parameters["required"],
+            serde_json::json!(["command"])
+        );
     }
 
     #[test]

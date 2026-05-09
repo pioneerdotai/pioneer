@@ -160,7 +160,7 @@ mod tests {
             stdout: "ok\n".to_owned(),
             stderr: String::new(),
             session_id: None,
-            command: vec!["zsh".to_owned(), "-lc".to_owned(), "echo ok".to_owned()],
+            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
             max_output_tokens: None,
             force_truncated_stdout: false,
             force_truncated_stderr: false,
@@ -180,8 +180,8 @@ mod tests {
                 "aggregated_output": false
             },
             "command": [
-                "zsh",
-                "-lc",
+                "/bin/sh",
+                "-c",
                 "echo ok"
             ]
             }"#,

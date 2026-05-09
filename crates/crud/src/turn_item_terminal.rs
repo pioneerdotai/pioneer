@@ -320,7 +320,7 @@ mod tests {
         TurnItem::CommandExecution {
             id: id.to_owned(),
             tool_name: "exec_command".to_owned(),
-            arguments: json!({"cmd":"echo ok"}),
+            arguments: json!({"command":["echo", "ok"]}),
             status: ToolCallStatus::InProgress,
             recovery_policy: None,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
@@ -332,7 +332,7 @@ mod tests {
                 metadata: ToolMetadata::empty(),
             },
             recovery: None,
-            command: vec!["sh".to_owned(), "-lc".to_owned(), "echo ok".to_owned()],
+            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo ok".to_owned()],
             cwd: None,
             success: None,
             outcome: None,
