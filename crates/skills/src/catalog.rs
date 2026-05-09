@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 pub struct SkillCatalogLoadParams {
     pub system_roots: Vec<PathBuf>,
     pub user_roots: Vec<PathBuf>,
-    pub workspace_roots: Vec<PathBuf>,
     pub registry_roots: Vec<PathBuf>,
     pub max_skills_per_source: usize,
     pub max_file_bytes: usize,
@@ -246,20 +245,6 @@ pub fn load_catalog(params: &SkillCatalogLoadParams) -> Result<SkillCatalogSnaps
         }
     }
 
-    for root in &params.workspace_roots {
-        for skill in scan_root(
-            root.as_path(),
-            SkillSourceKind::Workspace,
-            max_skills,
-            max_file_bytes,
-        ) {
-            merged.insert(
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()),
-                skill,
-            );
-        }
-    }
-
     let mut skills = merged.into_values().collect::<Vec<_>>();
 
     skills.sort_by(|left, right| {
@@ -291,10 +276,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_overrides_user_and_system() {
+    fn user_overrides_registry_and_system() {
         let system = temp_case("system");
         let user = temp_case("user");
-        let workspace = temp_case("workspace");
         let registry = temp_case("registry");
 
         let write_skill = |root: &std::path::Path, name: &str, description: &str| {
@@ -310,14 +294,12 @@ mod tests {
         };
 
         write_skill(system.as_path(), "System", "System version");
-        write_skill(user.as_path(), "User", "User version");
-        write_skill(workspace.as_path(), "Workspace", "Workspace version");
         write_skill(registry.as_path(), "Registry", "Registry version");
+        write_skill(user.as_path(), "User", "User version");
 
         let snapshot = load_catalog(&SkillCatalogLoadParams {
             system_roots: vec![system.clone()],
             user_roots: vec![user.clone()],
-            workspace_roots: vec![workspace.clone()],
             registry_roots: vec![registry.clone()],
             max_skills_per_source: 32,
             max_file_bytes: 64 * 1024,
@@ -325,10 +307,10 @@ mod tests {
         .expect("load catalog");
 
         assert_eq!(snapshot.skills.len(), 1);
-        assert_eq!(snapshot.skills[0].identity.name, "Workspace");
+        assert_eq!(snapshot.skills[0].identity.name, "User");
 
         let _ = fs::remove_dir_all(system);
         let _ = fs::remove_dir_all(user);
-        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(registry);
     }
 }

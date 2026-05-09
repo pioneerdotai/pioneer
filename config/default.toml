@@ -78,10 +78,9 @@ prompt_max_chars = 24000
 allow_implicit_invocation = false
 
 [gateway.skills.paths]
-system = ["{homeDirectory}/skills/system"]
-user = ["{homeDirectory}/skills/user"]
-workspace = ["{homeDirectory}/skills/workspace/{workspaceId}"]
-registry = ["{homeDirectory}/skills/registry"]
+system = []
+user = ["{homeDirectory}/skills/workspace/{workspaceId}/user"]
+registry = ["{homeDirectory}/skills/workspace/{workspaceId}/registry"]
 
 [gateway.skills.validation]
 strict_agentskills = true

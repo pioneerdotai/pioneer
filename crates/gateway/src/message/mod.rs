@@ -676,12 +676,13 @@ impl MessageProcessor {
                     max_skill_file_bytes: 1024 * 1024,
                     prompt_max_chars: 24_000,
                     allow_implicit_invocation: false,
-                    system_roots: vec!["{homeDirectory}/skills/system".to_owned()],
-                    user_roots: vec!["{homeDirectory}/skills/user".to_owned()],
-                    workspace_roots: vec![
-                        "{homeDirectory}/skills/workspace/{workspaceId}".to_owned(),
+                    system_roots: Vec::new(),
+                    user_roots: vec![
+                        "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
                     ],
-                    registry_roots: vec!["{homeDirectory}/skills/registry".to_owned()],
+                    registry_roots: vec![
+                        "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+                    ],
                     validation: pioneer_agent::SkillsValidationLoopConfig {
                         strict_agentskills: true,
                         accept_openclaw_profile: true,

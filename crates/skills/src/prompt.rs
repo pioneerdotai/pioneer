@@ -140,7 +140,7 @@ mod tests {
             display_name: slug.to_owned(),
             description: description.to_owned(),
             body: "body".to_owned(),
-            source_kind: SkillSourceKind::Workspace,
+            source_kind: SkillSourceKind::User,
             source_root: "/tmp".to_owned(),
             skill_dir: format!("/tmp/{slug}"),
             skill_file: format!("/tmp/{slug}/SKILL.md"),

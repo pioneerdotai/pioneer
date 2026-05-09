@@ -13,9 +13,6 @@ impl MessageProcessor {
                 self.tool_loop_config.skills.user_roots.as_slice(),
             ))
             .chain(watch_roots(
-                self.tool_loop_config.skills.workspace_roots.as_slice(),
-            ))
-            .chain(watch_roots(
                 self.tool_loop_config.skills.registry_roots.as_slice(),
             ))
             .collect::<Vec<_>>();

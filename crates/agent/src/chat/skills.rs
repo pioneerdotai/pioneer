@@ -158,11 +158,6 @@ pub(super) fn resolve_turn_skills(
             .iter()
             .map(|raw| resolve_root_path(raw, workdir, workspace_id))
             .collect(),
-        workspace_roots: skills
-            .workspace_roots
-            .iter()
-            .map(|raw| resolve_root_path(raw, workdir, workspace_id))
-            .collect(),
         registry_roots: skills
             .registry_roots
             .iter()
@@ -356,8 +351,7 @@ mod tests {
             prompt_max_chars: 24_000,
             allow_implicit_invocation: false,
             system_roots: Vec::new(),
-            user_roots: Vec::new(),
-            workspace_roots: vec![root.display().to_string()],
+            user_roots: vec![root.display().to_string()],
             registry_roots: Vec::new(),
             validation: SkillsValidationLoopConfig {
                 strict_agentskills: true,

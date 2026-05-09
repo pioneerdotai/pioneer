@@ -73,11 +73,6 @@ impl MessageProcessor {
                 .iter()
                 .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
                 .collect(),
-            workspace_roots: skills
-                .workspace_roots
-                .iter()
-                .map(|raw| resolve_root_path(raw.as_str(), workspace_id))
-                .collect(),
             registry_roots: skills
                 .registry_roots
                 .iter()

@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn workspace_overrides_global() {
         let mut set = SkillPolicySet::default();
-        let key = SkillPolicyKey::new("pioneer/test", "workspace");
+        let key = SkillPolicyKey::new("pioneer/test", "user");
         set.global_by_key.insert(
             key.clone(),
             SkillPolicy {
@@ -87,7 +87,7 @@ mod tests {
             },
         );
 
-        let effective = merge_policy("pioneer/test", "workspace", &set);
+        let effective = merge_policy("pioneer/test", "user", &set);
         assert!(!effective.enabled);
         assert!(effective.allow_implicit_invocation);
     }

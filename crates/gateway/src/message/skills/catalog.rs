@@ -79,6 +79,7 @@ impl MessageProcessor {
 
         let installation_by_key = installations
             .into_iter()
+            .filter(|row| row.scope_key.as_str() == workspace_id.as_str())
             .map(|row| (skill_key(row.slug.as_str(), row.source_kind.as_str()), row))
             .collect::<HashMap<_, _>>();
 

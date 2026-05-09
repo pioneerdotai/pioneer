@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uq_skill_installation_slug_source")]
+    #[sea_orm(unique_key = "uq_skill_installation_slug_source_scope")]
     pub slug: String,
     pub version: Option<String>,
-    #[sea_orm(unique_key = "uq_skill_installation_slug_source")]
+    #[sea_orm(unique_key = "uq_skill_installation_slug_source_scope")]
     pub source_kind: String,
+    #[sea_orm(unique_key = "uq_skill_installation_slug_source_scope")]
+    pub scope_key: String,
     #[sea_orm(column_type = "Text")]
     pub source_ref: String,
     #[sea_orm(column_type = "Text")]

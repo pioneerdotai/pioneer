@@ -294,8 +294,6 @@ pub struct GatewaySkillsPathsConfig {
     pub system: Vec<String>,
     #[serde(default = "default_skills_user_paths")]
     pub user: Vec<String>,
-    #[serde(default = "default_skills_workspace_paths")]
-    pub workspace: Vec<String>,
     #[serde(default = "default_skills_registry_paths")]
     pub registry: Vec<String>,
 }
@@ -305,7 +303,6 @@ impl Default for GatewaySkillsPathsConfig {
         Self {
             system: default_skills_system_paths(),
             user: default_skills_user_paths(),
-            workspace: default_skills_workspace_paths(),
             registry: default_skills_registry_paths(),
         }
     }
@@ -870,19 +867,15 @@ const fn default_skills_dependencies_runtime_recheck_on_tool_call() -> bool {
 }
 
 fn default_skills_system_paths() -> Vec<String> {
-    vec!["{homeDirectory}/skills/system".to_owned()]
+    Vec::new()
 }
 
 fn default_skills_user_paths() -> Vec<String> {
-    vec!["{homeDirectory}/skills/user".to_owned()]
-}
-
-fn default_skills_workspace_paths() -> Vec<String> {
-    vec!["{homeDirectory}/skills/workspace/{workspaceId}".to_owned()]
+    vec!["{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned()]
 }
 
 fn default_skills_registry_paths() -> Vec<String> {
-    vec!["{homeDirectory}/skills/registry".to_owned()]
+    vec!["{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned()]
 }
 
 const fn default_skills_runtime_enable_dynamic_tools() -> bool {
@@ -1453,21 +1446,14 @@ service_name = "com.pioneer.gateway.env"
         let config =
             load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
 
-        assert_eq!(
-            config.gateway.skills.paths.system,
-            vec!["{homeDirectory}/skills/system".to_owned()]
-        );
+        assert!(config.gateway.skills.paths.system.is_empty());
         assert_eq!(
             config.gateway.skills.paths.user,
-            vec!["{homeDirectory}/skills/user".to_owned()]
-        );
-        assert_eq!(
-            config.gateway.skills.paths.workspace,
-            vec!["{homeDirectory}/skills/workspace/{workspaceId}".to_owned()]
+            vec!["{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned()]
         );
         assert_eq!(
             config.gateway.skills.paths.registry,
-            vec!["{homeDirectory}/skills/registry".to_owned()]
+            vec!["{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned()]
         );
         assert!(config.gateway.skills.runtime.enable_dynamic_tools);
         assert!(config.gateway.skills.runtime.enable_read_skill);

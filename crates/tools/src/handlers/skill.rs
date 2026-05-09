@@ -811,7 +811,7 @@ mod tests {
             description: "Skill description".to_owned(),
             body: "Skill body".to_owned(),
             fingerprint: "fingerprint".to_owned(),
-            source_kind: "workspace".to_owned(),
+            source_kind: "user".to_owned(),
         }
     }
 

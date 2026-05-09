@@ -15,6 +15,7 @@ pub async fn upsert_skill_installation<C: ConnectionTrait>(
         slug: Set(record.slug.clone()),
         version: Set(record.version.clone()),
         source_kind: Set(record.source_kind.clone()),
+        scope_key: Set(record.scope_key.clone()),
         source_ref: Set(record.source_ref.clone()),
         install_path: Set(record.install_path.clone()),
         trust_level: Set(record.trust_level.clone()),
@@ -26,6 +27,7 @@ pub async fn upsert_skill_installation<C: ConnectionTrait>(
         OnConflict::columns([
             skill_installation::Column::Slug,
             skill_installation::Column::SourceKind,
+            skill_installation::Column::ScopeKey,
         ])
         .update_columns([
             skill_installation::Column::Version,
@@ -41,8 +43,8 @@ pub async fn upsert_skill_installation<C: ConnectionTrait>(
     .await
     .with_context(|| {
         format!(
-            "failed to upsert skill installation `{}` ({})",
-            record.slug, record.source_kind
+            "failed to upsert skill installation `{}` ({}/{})",
+            record.slug, record.source_kind, record.scope_key
         )
     })?;
 
@@ -55,6 +57,7 @@ pub async fn list_skill_installations<C: ConnectionTrait>(
     skill_installation::Entity::find()
         .order_by_asc(skill_installation::Column::Slug)
         .order_by_asc(skill_installation::Column::SourceKind)
+        .order_by_asc(skill_installation::Column::ScopeKey)
         .all(db)
         .await
         .context("failed to query skill installations")
@@ -64,25 +67,33 @@ pub async fn find_skill_installation<C: ConnectionTrait>(
     db: &C,
     slug: &str,
     source_kind: &str,
+    scope_key: &str,
 ) -> Result<Option<skill_installation::Model>> {
     skill_installation::Entity::find()
         .filter(skill_installation::Column::Slug.eq(slug.to_owned()))
         .filter(skill_installation::Column::SourceKind.eq(source_kind.to_owned()))
+        .filter(skill_installation::Column::ScopeKey.eq(scope_key.to_owned()))
         .one(db)
         .await
-        .with_context(|| format!("failed to query skill installation `{slug}` ({source_kind})"))
+        .with_context(|| {
+            format!("failed to query skill installation `{slug}` ({source_kind}/{scope_key})")
+        })
 }
 
 pub async fn delete_skill_installation<C: ConnectionTrait>(
     db: &C,
     slug: &str,
     source_kind: &str,
+    scope_key: &str,
 ) -> Result<()> {
     skill_installation::Entity::delete_many()
         .filter(skill_installation::Column::Slug.eq(slug.to_owned()))
         .filter(skill_installation::Column::SourceKind.eq(source_kind.to_owned()))
+        .filter(skill_installation::Column::ScopeKey.eq(scope_key.to_owned()))
         .exec(db)
         .await
-        .with_context(|| format!("failed to delete skill installation `{slug}` ({source_kind})"))?;
+        .with_context(|| {
+            format!("failed to delete skill installation `{slug}` ({source_kind}/{scope_key})")
+        })?;
     Ok(())
 }

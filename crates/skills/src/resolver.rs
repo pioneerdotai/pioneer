@@ -459,8 +459,8 @@ mod tests {
             version: 1,
             generated_at_unix: 1,
             skills: vec![
-                skill("path-skill", &["src/**"], SkillSourceKind::Workspace),
-                skill("explicit-skill", &[], SkillSourceKind::Workspace),
+                skill("path-skill", &["src/**"], SkillSourceKind::User),
+                skill("explicit-skill", &[], SkillSourceKind::User),
             ],
         };
 
@@ -491,12 +491,12 @@ mod tests {
         let catalog = SkillCatalogSnapshot {
             version: 1,
             generated_at_unix: 1,
-            skills: vec![skill("explicit-skill", &[], SkillSourceKind::Workspace)],
+            skills: vec![skill("explicit-skill", &[], SkillSourceKind::User)],
         };
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/explicit-skill", "workspace"),
+            SkillPolicyKey::new("workspace/explicit-skill", "user"),
             SkillPolicy {
                 enabled: Some(false),
                 allow_implicit_invocation: None,
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn metadata_command_dependency_missing_excludes_skill() {
-        let mut skill = skill("agent-browser", &[], SkillSourceKind::Workspace);
+        let mut skill = skill("agent-browser", &[], SkillSourceKind::User);
         skill.dependencies.commands = vec!["non-existent-pioneer-test-binary".to_owned()];
 
         let catalog = SkillCatalogSnapshot {
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn untrusted_skill_is_blocked_when_policy_disallows_untrusted_install() {
-        let mut untrusted = skill("untrusted", &[], SkillSourceKind::Workspace);
+        let mut untrusted = skill("untrusted", &[], SkillSourceKind::User);
         untrusted.runtime.trust_level = SkillTrustLevel::Untrusted;
 
         let catalog = SkillCatalogSnapshot {
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn metadata_shape_errors_block_activation() {
-        let mut skill = skill("agent-browser", &[], SkillSourceKind::Workspace);
+        let mut skill = skill("agent-browser", &[], SkillSourceKind::User);
         skill.policy_hints.activation_blocked = true;
         skill.policy_hints.block_issue_codes = vec!["openclaw.metadata.clawdbot.type".to_owned()];
 
@@ -726,9 +726,9 @@ mod tests {
             version: 1,
             generated_at_unix: 1,
             skills: vec![
-                skill("zeta", &["docs/**"], SkillSourceKind::Workspace),
-                skill("alpha", &[], SkillSourceKind::Workspace),
-                skill("beta", &["src/**"], SkillSourceKind::Workspace),
+                skill("zeta", &["docs/**"], SkillSourceKind::User),
+                skill("alpha", &[], SkillSourceKind::User),
+                skill("beta", &["src/**"], SkillSourceKind::User),
             ],
         };
 
@@ -776,12 +776,12 @@ mod tests {
         let catalog = SkillCatalogSnapshot {
             version: 1,
             generated_at_unix: 1,
-            skills: vec![skill("implicit-skill", &[], SkillSourceKind::Workspace)],
+            skills: vec![skill("implicit-skill", &[], SkillSourceKind::User)],
         };
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/implicit-skill", "workspace"),
+            SkillPolicyKey::new("workspace/implicit-skill", "user"),
             SkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(true),
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn implicit_resolution_respects_disable_model_invocation() {
-        let mut implicit_blocked = skill("implicit-blocked", &[], SkillSourceKind::Workspace);
+        let mut implicit_blocked = skill("implicit-blocked", &[], SkillSourceKind::User);
         implicit_blocked.runtime.disable_model_invocation = true;
 
         let catalog = SkillCatalogSnapshot {
@@ -815,7 +815,7 @@ mod tests {
 
         let mut policy = SkillPolicySet::default();
         policy.workspace_by_key.insert(
-            SkillPolicyKey::new("workspace/implicit-blocked", "workspace"),
+            SkillPolicyKey::new("workspace/implicit-blocked", "user"),
             SkillPolicy {
                 enabled: Some(true),
                 allow_implicit_invocation: Some(true),

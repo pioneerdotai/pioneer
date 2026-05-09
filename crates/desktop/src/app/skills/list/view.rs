@@ -430,7 +430,6 @@ impl PioneerDesktop {
         match source_kind {
             "system" => t!("skills.source.system").to_string(),
             "user" => t!("skills.source.user").to_string(),
-            "workspace" => t!("skills.source.workspace").to_string(),
             "registry" => t!("skills.source.registry").to_string(),
             _ => source_kind.to_owned(),
         }

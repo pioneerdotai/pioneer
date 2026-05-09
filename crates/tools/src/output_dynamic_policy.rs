@@ -635,7 +635,7 @@ mod tests {
             canonical_tool_name: "skill.workspace-tool.test".to_owned(),
             skill_slug: "workspace/tool".to_owned(),
             skill_fingerprint: "fp".to_owned(),
-            source_kind: SkillSourceKind::Workspace,
+            source_kind: SkillSourceKind::User,
             trust_level,
             kind,
             target_tool_name: None,

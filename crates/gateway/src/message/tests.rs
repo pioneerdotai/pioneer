@@ -1390,10 +1390,11 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             max_skill_file_bytes: 1024 * 1024,
             prompt_max_chars: 24_000,
             allow_implicit_invocation: false,
-            system_roots: vec!["{homeDirectory}/skills/system".to_owned()],
-            user_roots: vec!["{homeDirectory}/skills/user".to_owned()],
-            workspace_roots: vec!["{homeDirectory}/skills/workspace/{workspaceId}".to_owned()],
-            registry_roots: vec!["{homeDirectory}/skills/registry".to_owned()],
+            system_roots: Vec::new(),
+            user_roots: vec!["{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned()],
+            registry_roots: vec![
+                "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+            ],
             validation: pioneer_agent::SkillsValidationLoopConfig {
                 strict_agentskills: true,
                 accept_openclaw_profile: true,
@@ -1442,13 +1443,12 @@ fn test_tool_loop_config() -> ToolLoopConfig {
 fn test_tool_loop_config_with_roots(
     system_root: &std::path::Path,
     user_root: &std::path::Path,
-    workspace_root: &std::path::Path,
+    _workspace_root: &std::path::Path,
     registry_root: &std::path::Path,
 ) -> ToolLoopConfig {
     let mut config = test_tool_loop_config();
     config.skills.system_roots = vec![system_root.display().to_string()];
     config.skills.user_roots = vec![user_root.display().to_string()];
-    config.skills.workspace_roots = vec![workspace_root.display().to_string()];
     config.skills.registry_roots = vec![registry_root.display().to_string()];
     config
 }
@@ -4597,8 +4597,8 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = vec!["/tmp/pioneer-skills-missing-system".to_owned()];
     tool_loop_config.skills.user_roots = vec!["/tmp/pioneer-skills-missing-user".to_owned()];
-    tool_loop_config.skills.workspace_roots =
-        vec!["/tmp/pioneer-skills-missing-workspace".to_owned()];
+    tool_loop_config.skills.registry_roots =
+        vec!["/tmp/pioneer-skills-missing-registry".to_owned()];
 
     let processor = MessageProcessor::new(
         thread_manager.clone(),
@@ -4700,7 +4700,7 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
                 skill_slug: "pioneer/my-skill".to_owned(),
                 skill_version: Some("1.2.3".to_owned()),
                 fingerprint: "fp-my-skill".to_owned(),
-                source_kind: "workspace".to_owned(),
+                source_kind: "user".to_owned(),
                 resolved_reason: "explicit_mention".to_owned(),
             }],
         })
@@ -4741,7 +4741,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
             events: vec![
                 ProtocolSkillAuditEvent {
                     skill_slug: "pioneer/my-skill".to_owned(),
-                    source_kind: "workspace".to_owned(),
+                    source_kind: "user".to_owned(),
                     action: "resolve_allowed".to_owned(),
                     decision: "allowed".to_owned(),
                     reason_code: None,
@@ -4750,7 +4750,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
                 },
                 ProtocolSkillAuditEvent {
                     skill_slug: "pioneer/my-skill".to_owned(),
-                    source_kind: "workspace".to_owned(),
+                    source_kind: "user".to_owned(),
                     action: "runtime_blocked".to_owned(),
                     decision: "blocked".to_owned(),
                     reason_code: Some("runtime.dependency_missing".to_owned()),
@@ -6614,7 +6614,7 @@ Gateway skill body"#,
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.runtime.allow_shell_tools = true;
     tool_loop_config.skills.security.min_trust_for_shell_tools = SkillTrustLevel::Community;
     let crud_store_for_assert = crud_store.clone();
@@ -6922,7 +6922,7 @@ Gateway HTTP skill body"#
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.runtime.allow_http_tools = true;
     tool_loop_config.skills.security.min_trust_for_http_tools = SkillTrustLevel::Community;
     let crud_store_for_assert = crud_store.clone();
@@ -7074,7 +7074,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
 
     write_test_skill(&system_root, "sys-b", "", "system skill body");
     write_test_skill(&user_root, "user-a", "", "user skill body");
-    write_test_skill(&workspace_root, "workspace-c", "", "workspace skill body");
+    write_test_skill(&registry_root, "registry-c", "", "registry skill body");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -7144,7 +7144,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         payload
             .skills
             .iter()
-            .any(|skill| skill.source_kind == "workspace" && skill.slug == "tests/workspace-c")
+            .any(|skill| skill.source_kind == "registry" && skill.slug == "tests/registry-c")
     );
 
     let _ = std::fs::remove_dir_all(base_dir);
@@ -7162,7 +7162,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
-    write_test_skill(&workspace_root, "policy-skill", "", "policy skill body");
+    write_test_skill(&user_root, "policy-skill", "", "policy skill body");
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -7189,7 +7189,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         "params": {
             "workspace_id": workspace_id,
             "skill_slug": "tests/policy-skill",
-            "source_kind": "workspace",
+            "source_kind": "user",
             "enabled": false,
             "allow_implicit_invocation": false
         }
@@ -7202,7 +7202,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     let set_payload: SkillsPolicySetResponse =
         serde_json::from_value(set_response.result).expect("skills/policy/set decode");
     assert_eq!(set_payload.policy.skill_slug, "tests/policy-skill");
-    assert_eq!(set_payload.policy.source_kind, "workspace");
+    assert_eq!(set_payload.policy.source_kind, "user");
     assert_eq!(set_payload.policy.enabled, Some(false));
     assert_eq!(set_payload.policy.allow_implicit_invocation, Some(false));
 
@@ -7241,7 +7241,7 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
     let policy_skill = list_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/policy-skill" && skill.source_kind == "workspace")
+        .find(|skill| skill.slug == "tests/policy-skill" && skill.source_kind == "user")
         .expect("policy-skill should exist in skills/list");
     assert!(!policy_skill.policy.enabled);
     assert_eq!(policy_skill.status, "disabled");
@@ -7285,6 +7285,15 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let crud_store_for_assert = crud_store.clone();
 
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    tool_loop_config.skills.registry_roots = vec![format!(
+        "{}/{{workspaceId}}/registry",
+        workspace_root.display()
+    )];
+
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -7294,7 +7303,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+        tool_loop_config,
     );
 
     let install_upload_id = create_finalized_skill_upload(
@@ -7339,7 +7348,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     assert_eq!(install_changed_payload.reason, "installed");
 
     let installed_row = crud_store_for_assert
-        .find_skill_installation("pioneer/registry-skill", "registry")
+        .find_skill_installation("pioneer/registry-skill", "registry", workspace_id.as_str())
         .await
         .expect("read installed row should succeed");
     assert!(
@@ -7451,7 +7460,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
     );
 
     let removed_row = crud_store_for_assert
-        .find_skill_installation("pioneer/registry-skill", "registry")
+        .find_skill_installation("pioneer/registry-skill", "registry", workspace_id.as_str())
         .await
         .expect("read removed row should succeed");
     assert!(
@@ -7484,7 +7493,7 @@ async fn skills_health_returns_dependency_diagnostics() {
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
     write_test_skill(
-        &workspace_root,
+        &user_root,
         "dep-skill",
         "dependencies:\n  bins:\n    - pioneer_missing_bin_for_health_test",
         "dep skill body",
@@ -7528,7 +7537,7 @@ async fn skills_health_returns_dependency_diagnostics() {
     let dep_skill = health_payload
         .skills
         .iter()
-        .find(|skill| skill.slug == "tests/dep-skill" && skill.source_kind == "workspace")
+        .find(|skill| skill.slug == "tests/dep-skill" && skill.source_kind == "user")
         .expect("dep-skill should exist in health payload");
     assert!(
         dep_skill
@@ -7630,6 +7639,15 @@ async fn skills_upload_abort_is_connection_bound() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let crud_store_for_assert = crud_store.clone();
 
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    tool_loop_config.skills.registry_roots = vec![format!(
+        "{}/{{workspaceId}}/registry",
+        workspace_root.display()
+    )];
+
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -7639,7 +7657,7 @@ async fn skills_upload_abort_is_connection_bound() {
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+        tool_loop_config,
     );
 
     let start_request_id = generate_test_request_id("skillabort", "start");
@@ -7846,6 +7864,15 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let crud_store_for_assert = crud_store.clone();
 
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_root.display())];
+    tool_loop_config.skills.registry_roots = vec![format!(
+        "{}/{{workspaceId}}/registry",
+        workspace_root.display()
+    )];
+
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -7855,7 +7882,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+        tool_loop_config,
     );
 
     let request_id = "skillsinstalluser0001";
@@ -7891,11 +7918,15 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
     assert_eq!(payload.status, "installed");
     assert_eq!(payload.skill.source_kind, "user");
     assert!(
-        payload
-            .skill
-            .install_path
-            .starts_with(user_root.display().to_string().as_str()),
-        "user-target install path must be under user root"
+        payload.skill.install_path.starts_with(
+            workspace_root
+                .join(&workspace_id)
+                .join("user")
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "user-target install path must be under workspace user root"
     );
 
     let changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
@@ -7909,7 +7940,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
     }));
 
     let user_row = crud_store_for_assert
-        .find_skill_installation("pioneer/user-target-skill", "user")
+        .find_skill_installation("pioneer/user-target-skill", "user", workspace_id.as_str())
         .await
         .expect("read installed user row should succeed");
     assert!(
@@ -7917,7 +7948,11 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         "install should persist skill_installation for user source kind"
     );
     let registry_row = crud_store_for_assert
-        .find_skill_installation("pioneer/user-target-skill", "registry")
+        .find_skill_installation(
+            "pioneer/user-target-skill",
+            "registry",
+            workspace_id.as_str(),
+        )
         .await
         .expect("read installed registry row should succeed");
     assert!(
@@ -7935,6 +7970,155 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         .expect("default user policy should be persisted on install");
     assert_eq!(user_policy.enabled, Some(true));
     assert_eq!(user_policy.allow_implicit_invocation, Some(true));
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
+    let base_dir = unique_temp_dir("skills_install_user_default");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_base = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    let source_root = base_dir.join("source");
+    std::fs::create_dir_all(&system_root).expect("must create system root");
+    std::fs::create_dir_all(&user_root).expect("must create user root");
+    std::fs::create_dir_all(&workspace_base).expect("must create workspace base");
+    std::fs::create_dir_all(&registry_root).expect("must create registry root");
+    std::fs::create_dir_all(&source_root).expect("must create source root");
+
+    let source_path = write_test_skill(
+        &source_root,
+        "user-default-skill",
+        "owner: pioneer\nversion: \"1.0.0\"",
+        "user default skill body",
+    );
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_a) = setup_workspace_manager().await;
+    let workspace_b = "ws_skills_scope_b".to_owned();
+    workspace_manager
+        .create_workspace(workspace_b.as_str(), Some("Skills Scope B"))
+        .await
+        .expect("workspace B should be created");
+    let crud_store_for_assert = crud_store.clone();
+
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_base, &registry_root);
+    tool_loop_config.skills.user_roots =
+        vec![format!("{}/{{workspaceId}}/user", workspace_base.display())];
+    tool_loop_config.skills.registry_roots = vec![format!(
+        "{}/{{workspaceId}}/registry",
+        workspace_base.display()
+    )];
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    );
+
+    let upload_id = create_finalized_skill_upload(
+        &processor,
+        &mut rx,
+        connection_id,
+        workspace_a.as_str(),
+        source_path.as_path(),
+        "skillwsdefupl",
+    )
+    .await;
+    let install_request_id = generate_test_request_id("skillwsdef", "install");
+    let install_request = json!({
+        "jsonrpc": "2.0",
+        "id": install_request_id,
+        "method": "skills/install",
+        "params": {
+            "workspace_id": workspace_a.clone(),
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": upload_id
+            }
+        }
+    });
+    processor
+        .process_request(connection_id, &install_request.to_string())
+        .await;
+
+    let install_response = recv_response_by_id(&mut rx, install_request_id.as_str()).await;
+    let install_payload: SkillsInstallResponse =
+        serde_json::from_value(install_response.result).expect("skills/install payload decode");
+    assert_eq!(install_payload.status, "installed");
+    assert_eq!(install_payload.skill.source_kind, "user");
+    assert!(
+        install_payload.skill.install_path.starts_with(
+            workspace_base
+                .join(&workspace_a)
+                .join("user")
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "user install path must be under the current workspace user root"
+    );
+
+    let workspace_row = crud_store_for_assert
+        .find_skill_installation("pioneer/user-default-skill", "user", workspace_a.as_str())
+        .await
+        .expect("read installed workspace row should succeed");
+    assert!(
+        workspace_row.is_some(),
+        "install should persist skill_installation for the installing workspace"
+    );
+    let other_workspace_row = crud_store_for_assert
+        .find_skill_installation("pioneer/user-default-skill", "user", workspace_b.as_str())
+        .await
+        .expect("read other workspace row should succeed");
+    assert!(
+        other_workspace_row.is_none(),
+        "install should not persist a row for another workspace"
+    );
+
+    write_test_skill(
+        workspace_base.join(&workspace_b).join("user").as_path(),
+        "user-default-skill",
+        "owner: pioneer\nversion: \"1.0.0\"",
+        "same slug in another workspace",
+    );
+
+    let list_b_request_id = generate_test_request_id("skillwsdef", "listb");
+    let list_b_request = json!({
+        "jsonrpc": "2.0",
+        "id": list_b_request_id,
+        "method": "skills/list",
+        "params": {
+            "workspace_id": workspace_b
+        }
+    });
+    processor
+        .process_request(connection_id, &list_b_request.to_string())
+        .await;
+    let list_b_response = recv_response_by_id(&mut rx, list_b_request_id.as_str()).await;
+    let list_b_payload: SkillListResponse =
+        serde_json::from_value(list_b_response.result).expect("skills/list payload decode");
+    let workspace_b_skill = list_b_payload
+        .skills
+        .iter()
+        .find(|skill| skill.slug == "pioneer/user-default-skill" && skill.source_kind == "user")
+        .expect("workspace B should discover its local skill file");
+    assert!(
+        !workspace_b_skill.install.installed,
+        "workspace A installation must not mark workspace B skill as installed"
+    );
 
     let _ = std::fs::remove_dir_all(base_dir);
 }

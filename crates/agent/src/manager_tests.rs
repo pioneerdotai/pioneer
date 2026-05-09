@@ -76,10 +76,13 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             max_skill_file_bytes: 1024 * 1024,
             prompt_max_chars: 24_000,
             allow_implicit_invocation: false,
-            system_roots: vec!["{homeDirectory}/skills/system".to_owned()],
-            user_roots: vec!["{homeDirectory}/skills/user".to_owned()],
-            workspace_roots: vec!["{homeDirectory}/skills/workspace/{workspaceId}".to_owned()],
-            registry_roots: vec!["{homeDirectory}/skills/registry".to_owned()],
+            system_roots: Vec::new(),
+            user_roots: vec![
+                "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
+            ],
+            registry_roots: vec![
+                "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+            ],
             validation: super::SkillsValidationLoopConfig {
                 strict_agentskills: true,
                 accept_openclaw_profile: true,
@@ -6431,7 +6434,7 @@ async fn explicit_skill_input_injects_skill_prompt_and_binding() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     let thread_id = "thr_000000000000000010";
@@ -6530,7 +6533,7 @@ async fn explicit_skill_input_injects_prompt_for_non_tool_calling_provider() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     let thread_id = "thr_000000000000000011";
@@ -6685,7 +6688,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     manager
@@ -6792,7 +6795,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.runtime.allow_shell_tools = true;
     tool_loop_config.skills.security.min_trust_for_shell_tools = SkillTrustLevel::Community;
 
@@ -6946,7 +6949,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.runtime.allow_shell_tools = true;
     tool_loop_config.skills.security.min_trust_for_shell_tools = SkillTrustLevel::Community;
 
@@ -7085,7 +7088,7 @@ runtime:
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.runtime.allow_shell_tools = true;
     tool_loop_config.skills.security.min_trust_for_shell_tools = SkillTrustLevel::Community;
     tool_loop_config.skills.dependencies.preflight_on_resolve = false;
@@ -7180,7 +7183,7 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
     tool_loop_config.skills.dependencies.preflight_on_resolve = true;
 
     let manager = AgentManager::new(registry, tool_loop_config);
@@ -7287,7 +7290,7 @@ async fn read_skill_returns_active_skill_body() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     manager
@@ -7415,7 +7418,7 @@ async fn read_skill_rejects_non_active_slug() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     manager
@@ -7525,7 +7528,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     manager
@@ -7621,7 +7624,7 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
-    tool_loop_config.skills.workspace_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
 
     let manager = AgentManager::new(registry, tool_loop_config);
     manager

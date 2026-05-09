@@ -488,3 +488,20 @@ impl McpChangedAction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn install_params_default_to_workspace_scope() {
+        let params: McpInstallParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "config_json": "{\"mcpServers\":{}}"
+        }))
+        .expect("mcp install params should decode without scope_kind");
+
+        assert_eq!(params.scope_kind, McpScopeKind::Workspace);
+    }
+}

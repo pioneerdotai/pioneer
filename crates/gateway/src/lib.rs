@@ -215,10 +215,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     );
     let skill_user_roots =
         expand_home_directory_templates(skills_cfg.paths.user.as_slice(), &runtime_home_directory);
-    let skill_workspace_roots = expand_home_directory_templates(
-        skills_cfg.paths.workspace.as_slice(),
-        &runtime_home_directory,
-    );
     let skill_registry_roots = expand_home_directory_templates(
         skills_cfg.paths.registry.as_slice(),
         &runtime_home_directory,
@@ -283,7 +279,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             allow_implicit_invocation: skills_cfg.allow_implicit_invocation,
             system_roots: skill_system_roots,
             user_roots: skill_user_roots,
-            workspace_roots: skill_workspace_roots,
             registry_roots: skill_registry_roots,
             validation: pioneer_agent::SkillsValidationLoopConfig {
                 strict_agentskills: skills_cfg.validation.strict_agentskills,
@@ -490,8 +485,8 @@ mod tests {
     fn path_templates_expand_home_directory_token() {
         let expanded = expand_home_directory_templates(
             &[
-                "{homeDirectory}/skills/system".to_owned(),
-                "{homeDirectory}/skills/workspace/{workspaceId}".to_owned(),
+                "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
+                "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
             ],
             "/Users/alexander/.pioneer.local",
         );
@@ -499,8 +494,9 @@ mod tests {
         assert_eq!(
             expanded,
             vec![
-                "/Users/alexander/.pioneer.local/skills/system".to_owned(),
-                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}".to_owned(),
+                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/user".to_owned(),
+                "/Users/alexander/.pioneer.local/skills/workspace/{workspaceId}/registry"
+                    .to_owned(),
             ]
         );
     }

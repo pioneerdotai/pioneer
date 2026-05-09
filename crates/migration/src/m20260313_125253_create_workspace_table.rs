@@ -1295,6 +1295,7 @@ impl MigrationTrait for Migration {
                     .col(string("slug").string_len(255))
                     .col(string("version").string_len(64).null())
                     .col(string("source_kind").string_len(32))
+                    .col(string("scope_key").string_len(255))
                     .col(text("source_ref"))
                     .col(text("install_path"))
                     .col(string("trust_level").string_len(32))
@@ -1308,11 +1309,22 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
-                    .name("uq_skill_installation_slug_source")
+                    .name("uq_skill_installation_slug_source_scope")
                     .table("skill_installation")
                     .col("slug")
                     .col("source_kind")
+                    .col("scope_key")
                     .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_skill_installation_scope")
+                    .table("skill_installation")
+                    .col("scope_key")
                     .to_owned(),
             )
             .await?;

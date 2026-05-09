@@ -42,6 +42,7 @@ impl MessageProcessor {
                 }
             };
         let target_source_kind_db = target_source_kind.as_db_value().to_owned();
+        let scope_key = skill_installation_scope_key(&target_source_kind, workspace_id.as_str());
 
         let context = match self.skills_runtime_context(workspace_id.as_str()) {
             Ok(context) => context,
@@ -156,7 +157,11 @@ impl MessageProcessor {
 
         let existing = match self
             .crud_store
-            .find_skill_installation(preview_slug.as_str(), target_source_kind_db.as_str())
+            .find_skill_installation(
+                preview_slug.as_str(),
+                target_source_kind_db.as_str(),
+                scope_key.as_str(),
+            )
             .await
         {
             Ok(row) => row,
@@ -300,6 +305,7 @@ impl MessageProcessor {
             ),
             version: install_result.definition.identity.version_hint.clone(),
             source_kind: target_source_kind_db.clone(),
+            scope_key: scope_key.clone(),
             source_ref,
             install_path: install_path.clone(),
             trust_level: trust_level_as_str(&install_result.definition.runtime.trust_level)

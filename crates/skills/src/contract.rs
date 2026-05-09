@@ -19,7 +19,6 @@ use std::path::Path;
 pub enum SkillSourceKind {
     System,
     User,
-    Workspace,
     Registry,
 }
 
@@ -28,7 +27,6 @@ impl SkillSourceKind {
         match self {
             Self::System => "system",
             Self::User => "user",
-            Self::Workspace => "workspace",
             Self::Registry => "registry",
         }
     }
@@ -579,7 +577,6 @@ fn default_owner_for_source_kind(source_kind: &SkillSourceKind) -> &'static str 
     match source_kind {
         SkillSourceKind::System => "pioneer",
         SkillSourceKind::User => "pioneer",
-        SkillSourceKind::Workspace => "pioneer",
         SkillSourceKind::Registry => "pioneer",
     }
 }
@@ -908,7 +905,7 @@ Instructions
 
         let skill = parse_skill_from_file(
             skill_file.as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             1024 * 1024,
         )
@@ -944,7 +941,7 @@ Instructions
 
         let skill = parse_skill_from_file(
             skill_file.as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             1024 * 1024,
         )
@@ -976,7 +973,7 @@ Instructions
 
         let skill = parse_skill_from_file(
             skill_file.as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             1024 * 1024,
         )
@@ -1039,7 +1036,7 @@ body
 
         let workspace = parse_skill_from_file(
             skill_file.as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             1024 * 1024,
         )
@@ -1081,7 +1078,7 @@ Body"#,
 
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             4 * 1024,
         )
@@ -1135,7 +1132,7 @@ Body"#,
 
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             4 * 1024,
         )
@@ -1197,7 +1194,7 @@ Body"#,
 
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             4 * 1024,
         )
@@ -1264,7 +1261,7 @@ Body"#,
 
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             4 * 1024,
         )
@@ -1312,7 +1309,7 @@ Body"#,
 
         let skill = parse_skill_from_file(
             skill_dir.join("SKILL.md").as_path(),
-            SkillSourceKind::Workspace,
+            SkillSourceKind::User,
             dir.as_path(),
             4 * 1024,
         )

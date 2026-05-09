@@ -1875,7 +1875,6 @@ mod tests {
                 allow_implicit_invocation: false,
                 system_roots: Vec::new(),
                 user_roots: Vec::new(),
-                workspace_roots: Vec::new(),
                 registry_roots: Vec::new(),
                 validation: SkillsValidationLoopConfig {
                     strict_agentskills: true,

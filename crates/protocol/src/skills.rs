@@ -9,6 +9,10 @@ fn default_health_audit_limit() -> u64 {
     16
 }
 
+fn default_user_skill_source_kind() -> String {
+    "user".to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SkillLifecycleSource {
@@ -187,6 +191,7 @@ pub struct SkillValidationDiagnostic {
 pub struct SkillsInstallParams {
     pub workspace_id: String,
     pub source: SkillLifecycleSource,
+    #[serde(default = "default_user_skill_source_kind")]
     pub target_source_kind: String,
 }
 
@@ -390,6 +395,20 @@ mod tests {
             serde_json::from_value::<SkillLifecycleSource>(legacy).is_err(),
             "path lifecycle source must not be accepted"
         );
+    }
+
+    #[test]
+    fn install_params_default_to_user_target_source_kind() {
+        let params: SkillsInstallParams = serde_json::from_value(json!({
+            "workspace_id": "ws_000000000000000001",
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": "upload_00000000000001"
+            }
+        }))
+        .expect("install params should decode without target_source_kind");
+
+        assert_eq!(params.target_source_kind, "user");
     }
 
     #[test]

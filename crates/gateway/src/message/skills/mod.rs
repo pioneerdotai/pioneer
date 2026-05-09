@@ -167,6 +167,15 @@ fn parse_installable_source_kind(raw: &str) -> Option<SkillSourceKind> {
     }
 }
 
+fn skill_installation_scope_key(source_kind: &SkillSourceKind, workspace_id: &str) -> String {
+    match source_kind {
+        SkillSourceKind::User | SkillSourceKind::Registry => workspace_id.to_owned(),
+        SkillSourceKind::System => {
+            unreachable!("only user and registry skill installations are supported")
+        }
+    }
+}
+
 fn install_location_for_source_kind(
     context: &SkillsRuntimeContext,
     source_kind: &SkillSourceKind,
@@ -180,7 +189,7 @@ fn install_location_for_source_kind(
             install_root: context.registry_root.clone(),
             lock_path: context.registry_lock_path.clone(),
         }),
-        SkillSourceKind::System | SkillSourceKind::Workspace => None,
+        SkillSourceKind::System => None,
     }
 }
 

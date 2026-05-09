@@ -206,6 +206,7 @@ pub struct SkillInstallationRecord {
     pub slug: String,
     pub version: Option<String>,
     pub source_kind: String,
+    pub scope_key: String,
     pub source_ref: String,
     pub install_path: String,
     pub trust_level: String,
@@ -2864,9 +2865,20 @@ impl CrudStore {
         .await
     }
 
-    pub async fn delete_skill_installation(&self, slug: &str, source_kind: &str) -> Result<()> {
+    pub async fn delete_skill_installation(
+        &self,
+        slug: &str,
+        source_kind: &str,
+        scope_key: &str,
+    ) -> Result<()> {
         self.run_serialized_write(|| async {
-            skill_installation::delete_skill_installation(&self.connection, slug, source_kind).await
+            skill_installation::delete_skill_installation(
+                &self.connection,
+                slug,
+                source_kind,
+                scope_key,
+            )
+            .await
         })
         .await
     }
@@ -2875,13 +2887,20 @@ impl CrudStore {
         &self,
         slug: &str,
         source_kind: &str,
+        scope_key: &str,
     ) -> Result<Option<SkillInstallationRecord>> {
-        let row = skill_installation::find_skill_installation(&self.connection, slug, source_kind)
-            .await?;
+        let row = skill_installation::find_skill_installation(
+            &self.connection,
+            slug,
+            source_kind,
+            scope_key,
+        )
+        .await?;
         Ok(row.map(|model| SkillInstallationRecord {
             slug: model.slug,
             version: model.version,
             source_kind: model.source_kind,
+            scope_key: model.scope_key,
             source_ref: model.source_ref,
             install_path: model.install_path,
             trust_level: model.trust_level,
@@ -2898,6 +2917,7 @@ impl CrudStore {
                 slug: model.slug,
                 version: model.version,
                 source_kind: model.source_kind,
+                scope_key: model.scope_key,
                 source_ref: model.source_ref,
                 install_path: model.install_path,
                 trust_level: model.trust_level,
@@ -8001,7 +8021,7 @@ mod tests {
                 skill_slug: "pioneer/alpha-skill".to_owned(),
                 skill_version: Some("1.0.0".to_owned()),
                 fingerprint: "fp-alpha".to_owned(),
-                source_kind: "workspace".to_owned(),
+                source_kind: "registry".to_owned(),
                 resolved_reason: "explicit_mention".to_owned(),
             },
             TurnSkillBindingRecord {
@@ -8045,7 +8065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_installation_upsert_is_unique_by_slug_and_source() {
+    async fn skill_installation_upsert_is_unique_by_slug_source_and_scope() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -8059,6 +8079,7 @@ mod tests {
             slug: "pioneer/agent-browser".to_owned(),
             version: Some("1.0.0".to_owned()),
             source_kind: "registry".to_owned(),
+            scope_key: "ws_one".to_owned(),
             source_ref: "github.com/example/agent-browser".to_owned(),
             install_path: "/tmp/skills/pioneer/agent-browser".to_owned(),
             trust_level: "verified".to_owned(),
@@ -8087,6 +8108,22 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].fingerprint, "fp-2");
         assert_eq!(rows[0].version.as_deref(), Some("1.1.0"));
+
+        let scoped = SkillInstallationRecord {
+            scope_key: "ws_two".to_owned(),
+            fingerprint: "fp-3".to_owned(),
+            ..first.clone()
+        };
+        store
+            .upsert_skill_installation(&scoped, 1_700_000_200)
+            .await
+            .expect("scoped upsert");
+
+        let rows = store
+            .list_skill_installations()
+            .await
+            .expect("list scoped skill installations");
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]

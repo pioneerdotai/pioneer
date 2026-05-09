@@ -16,7 +16,7 @@ fn parse_fixture(dir_name: &str) -> pioneer_skills::SkillDefinition {
     let skill_file = root.join(dir_name).join("SKILL.md");
     parse_skill_from_file(
         skill_file.as_path(),
-        SkillSourceKind::Workspace,
+        SkillSourceKind::User,
         root.as_path(),
         1024 * 1024,
     )
@@ -171,7 +171,7 @@ fn local_and_registry_sources_compile_to_equivalent_runtime_manifest() {
 
     let local = parse_skill_from_file(
         skill_file.as_path(),
-        SkillSourceKind::Workspace,
+        SkillSourceKind::User,
         root.as_path(),
         1024 * 1024,
     )
