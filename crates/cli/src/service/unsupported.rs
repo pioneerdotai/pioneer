@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 
-use super::ServiceSettings;
+use super::{GatewayServiceWarning, ServiceSettings};
 
-pub fn start_gateway_service(_settings: &ServiceSettings) -> Result<()> {
+pub fn start_gateway_service(_settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
     bail!("`pioneer start` is not supported on this operating system");
 }
 

@@ -3,9 +3,13 @@ use std::env;
 use std::process::{Command, Output};
 use tracing::info;
 
-use super::{SERVICE_MODE_ARG, ServiceSettings};
+use pioneer_config::InstallManagedBy;
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
+use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+
+const WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE: &str = "windows_logon_task_login_session_scoped";
+
+pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
     let task_name = settings.service_name.as_str();
     let task_name_escaped = powershell_escape_single_quoted(task_name);
     let executable = env::current_exe().context("failed to determine current executable path")?;
@@ -38,9 +42,9 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
 
     info!(
         service = task_name,
-        "gateway service is running and will auto-start after reboot"
+        "gateway scheduled task is running and will auto-start at user logon"
     );
-    Ok(())
+    Ok(logon_task_scope_warnings(settings))
 }
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
@@ -121,6 +125,17 @@ fn render_gateway_runner_script(executable: &str, path_env: Option<&str>) -> Str
     }
 }
 
+fn logon_task_scope_warnings(settings: &ServiceSettings) -> Vec<GatewayServiceWarning> {
+    if matches!(settings.managed_by, InstallManagedBy::Desktop) {
+        return Vec::new();
+    }
+
+    vec![GatewayServiceWarning::new(
+        WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE,
+        "Windows gateway installs as a current-user Scheduled Task triggered at logon. It starts after the user logs in and is not available as a boot-time Windows Service before login.",
+    )]
+}
+
 fn output_details(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -131,5 +146,38 @@ fn output_details(output: &Output) -> String {
         stdout
     } else {
         format!("exit status {}", output.status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE, logon_task_scope_warnings};
+    use crate::service::ServiceSettings;
+    use pioneer_config::InstallManagedBy;
+    use std::path::PathBuf;
+
+    #[test]
+    fn logon_task_scope_warning_is_suppressed_for_desktop_managed_installs() {
+        let warnings = logon_task_scope_warnings(&test_settings(InstallManagedBy::Desktop));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn logon_task_scope_warning_is_reported_for_script_installs() {
+        let warnings = logon_task_scope_warnings(&test_settings(InstallManagedBy::Script));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE);
+        assert!(warnings[0].message.contains("Scheduled Task"));
+    }
+
+    fn test_settings(managed_by: InstallManagedBy) -> ServiceSettings {
+        ServiceSettings {
+            service_name: "com.pioneer.gateway.test".to_owned(),
+            legacy_service_names: Vec::new(),
+            runtime_home_dir: PathBuf::from("C:\\Users\\Test\\Pioneer"),
+            macos_background_item_name: "Pioneer".to_owned(),
+            macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
+            managed_by,
+        }
     }
 }

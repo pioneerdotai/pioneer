@@ -263,6 +263,7 @@ fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimings) -> Resu
 fn make_pioneer_start_command() -> Command {
     let mut command = Command::new(configured_pioneer_command_file_name());
     command.arg("start");
+    command.arg("--json");
     apply_desktop_command_env(&mut command);
     command
 }
@@ -275,12 +276,13 @@ fn make_managed_pioneer_start_command() -> Option<Command> {
 
     let mut command = Command::new(install.binary_path);
     command.arg("start");
+    command.arg("--json");
     apply_desktop_command_env(&mut command);
     Some(command)
 }
 
 fn make_development_pioneer_start_command() -> Option<Command> {
-    make_development_pioneer_command("start")
+    make_development_pioneer_command("start", true)
 }
 
 fn make_pioneer_issue_superuser_token_command() -> Command {
@@ -303,10 +305,13 @@ fn make_managed_pioneer_issue_superuser_token_command() -> Option<Command> {
 }
 
 fn make_development_pioneer_issue_superuser_token_command() -> Option<Command> {
-    make_development_pioneer_command("issue-superuser-token")
+    make_development_pioneer_command("issue-superuser-token", false)
 }
 
-fn make_development_pioneer_command(subcommand: &'static str) -> Option<Command> {
+fn make_development_pioneer_command(
+    subcommand: &'static str,
+    json_output: bool,
+) -> Option<Command> {
     if !cfg!(debug_assertions) {
         return None;
     }
@@ -323,6 +328,9 @@ fn make_development_pioneer_command(subcommand: &'static str) -> Option<Command>
     command.arg("pioneer-dev");
     command.arg("--");
     command.arg(subcommand);
+    if json_output {
+        command.arg("--json");
+    }
     command.current_dir(workspace_root);
     apply_desktop_command_env(&mut command);
     Some(command)
@@ -647,7 +655,7 @@ mod tests {
     #[test]
     fn start_commands_use_desktop_managed_context() {
         let pioneer_command = make_pioneer_start_command();
-        assert_eq!(command_args(&pioneer_command), vec!["start"]);
+        assert_eq!(command_args(&pioneer_command), vec!["start", "--json"]);
         assert_eq!(
             command_env(&pioneer_command, OsStr::new("PIONEER_MANAGED_BY")),
             Some(DESKTOP_MANAGED_BY.to_owned())

@@ -114,6 +114,14 @@ curl -fsSL https://getpioneer.dev/install.cmd -o install.cmd && install.cmd && d
 
 The bootstrap scripts download a release asset, verify checksums, and then run the native installer path through `pioneer install --source local`. The installer registers a user-level gateway service and exposes the `pioneer` command.
 
+On Linux, the gateway is installed as a `systemd --user` service. For server and headless installs, that service must be allowed to run without an active login session. The installer validates/enables systemd lingering for the current user; if the OS denies that operation, run this once on the server and then rerun the installer:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+On macOS, the gateway is installed as a per-user LaunchAgent. On Windows, it is installed as a current-user Scheduled Task triggered at logon. Those modes run as the current user and auto-start after user login; they are not boot-time LaunchDaemon/Windows Service installs before login.
+
 Install scripts support:
 
 ```bash

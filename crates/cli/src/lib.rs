@@ -49,9 +49,9 @@ fn run() -> Result<()> {
         }
         Some("start") => {
             let json_output = parse_optional_json_flag(args)?;
-            service::start_gateway_service()?;
+            let warnings = service::start_gateway_service()?;
             if json_output {
-                print_start_report()
+                print_start_report(warnings)
             } else {
                 Ok(())
             }
@@ -319,6 +319,9 @@ fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &
     if error_text.contains("persist install-state") {
         return "install_state_persist_failed";
     }
+    if error_text.contains("systemd linger") {
+        return "linux_linger_required";
+    }
     if error_text.contains("Permission denied") || error_text.contains("Access is denied") {
         return "insufficient_privileges";
     }
@@ -329,7 +332,7 @@ fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &
     }
 }
 
-fn print_start_report() -> Result<()> {
+fn print_start_report(warnings: Vec<service::GatewayServiceWarning>) -> Result<()> {
     let status = service::gateway_service_status()?;
     let payload = json!({
         "phase": "started",
@@ -338,6 +341,7 @@ fn print_start_report() -> Result<()> {
         "gateway_reachable": status.gateway_reachable,
         "rollback_performed": false,
         "error_code": serde_json::Value::Null,
+        "warnings": warnings,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())

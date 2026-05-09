@@ -6,9 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tracing::info;
 
-use super::{SERVICE_MODE_ARG, ServiceSettings};
+use pioneer_config::InstallManagedBy;
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
+use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+
+const MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE: &str = "macos_launch_agent_login_session_scoped";
+
+pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
     let service_label = settings.service_name.as_str();
     let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
     let executable = env::current_exe().context("failed to determine current executable path")?;
@@ -55,9 +59,9 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
 
     info!(
         service = service_label,
-        "gateway service is running and will auto-start after reboot"
+        "gateway launch agent is running and will auto-start at user login"
     );
-    Ok(())
+    Ok(launch_agent_scope_warnings(settings))
 }
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
@@ -293,6 +297,17 @@ fn launch_agents_dir() -> Result<PathBuf> {
     Ok(home.join("Library").join("LaunchAgents"))
 }
 
+fn launch_agent_scope_warnings(settings: &ServiceSettings) -> Vec<GatewayServiceWarning> {
+    if matches!(settings.managed_by, InstallManagedBy::Desktop) {
+        return Vec::new();
+    }
+
+    vec![GatewayServiceWarning::new(
+        MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE,
+        "macOS gateway installs as a per-user LaunchAgent. It starts after the user logs in and is not available as a boot-time LaunchDaemon before login.",
+    )]
+}
+
 fn user_logs_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("Library"))
 }
@@ -344,8 +359,13 @@ fn output_details(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_launchd_plist;
+    use super::{
+        MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE, launch_agent_scope_warnings, render_launchd_plist,
+    };
+    use crate::service::ServiceSettings;
+    use pioneer_config::InstallManagedBy;
     use std::path::Path;
+    use std::path::PathBuf;
 
     #[test]
     fn launchd_plist_includes_path_environment_when_provided() {
@@ -362,5 +382,30 @@ mod tests {
         assert!(plist.contains("/opt/homebrew/bin:/usr/bin:/bin"));
         assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
         assert!(plist.contains("ai.pioneer.test"));
+    }
+
+    #[test]
+    fn launch_agent_scope_warning_is_suppressed_for_desktop_managed_installs() {
+        let warnings = launch_agent_scope_warnings(&test_settings(InstallManagedBy::Desktop));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn launch_agent_scope_warning_is_reported_for_script_installs() {
+        let warnings = launch_agent_scope_warnings(&test_settings(InstallManagedBy::Script));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE);
+        assert!(warnings[0].message.contains("LaunchAgent"));
+    }
+
+    fn test_settings(managed_by: InstallManagedBy) -> ServiceSettings {
+        ServiceSettings {
+            service_name: "com.pioneer.gateway.test".to_owned(),
+            legacy_service_names: Vec::new(),
+            runtime_home_dir: PathBuf::from("/tmp/pioneer-test"),
+            macos_background_item_name: "Pioneer".to_owned(),
+            macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
+            managed_by,
+        }
     }
 }

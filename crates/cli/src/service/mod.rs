@@ -17,6 +17,8 @@ pub(crate) struct ServiceSettings {
     pub runtime_home_dir: PathBuf,
     pub macos_background_item_name: String,
     pub macos_associated_bundle_identifier: String,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub managed_by: InstallManagedBy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,21 @@ pub struct GatewayServiceStatus {
     pub install_state: Option<InstallState>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayServiceWarning {
+    pub code: String,
+    pub message: String,
+}
+
+impl GatewayServiceWarning {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
 pub fn run_gateway_service() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -38,11 +55,12 @@ pub fn run_gateway_service() -> Result<()> {
     runtime.block_on(pioneer_gateway::run_gateway_until_shutdown())
 }
 
-pub fn start_gateway_service() -> Result<()> {
+pub fn start_gateway_service() -> Result<Vec<GatewayServiceWarning>> {
     let config = AppConfig::load().context("failed to load app config")?;
     let settings = load_service_settings_from_config(&config)?;
-    platform::start_gateway_service(&settings)?;
-    save_install_state_from_current_context(&config)
+    let warnings = platform::start_gateway_service(&settings)?;
+    save_install_state_from_current_context(&config)?;
+    Ok(warnings)
 }
 
 pub fn stop_gateway_service() -> Result<()> {
@@ -163,6 +181,7 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
             .macos_associated_bundle_identifier
             .trim()
             .to_owned(),
+        managed_by: install_managed_by_from_env().unwrap_or(InstallManagedBy::Manual),
     })
 }
 

@@ -5,9 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tracing::info;
 
-use super::{SERVICE_MODE_ARG, ServiceSettings};
+use pioneer_config::InstallManagedBy;
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
+use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+
+const LINUX_LINGER_WARNING_CODE: &str = "linux_linger_enable_failed";
+
+pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
+    let warnings = ensure_persistent_user_service(settings)?;
     let service_unit = service_unit(settings.service_name.as_str());
     let service_path = user_service_path(service_unit.as_str())?;
     let service_dir = service_path
@@ -38,7 +43,7 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<()> {
         service = settings.service_name.as_str(),
         "gateway service is running and will auto-start after reboot"
     );
-    Ok(())
+    Ok(warnings)
 }
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
@@ -80,6 +85,141 @@ pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
 pub fn is_gateway_service_active(settings: &ServiceSettings) -> Result<bool> {
     let service_unit = service_unit(settings.service_name.as_str());
     Ok(run_systemctl_user(&["is-active", service_unit.as_str()]).is_ok())
+}
+
+fn ensure_persistent_user_service(
+    settings: &ServiceSettings,
+) -> Result<Vec<GatewayServiceWarning>> {
+    let user = match current_user_name() {
+        Ok(user) if !user.is_empty() => user,
+        Ok(_) => bail!("failed to resolve current user: `id -un` returned an empty user name"),
+        Err(error) => {
+            return Err(error).context("failed to resolve current user for Linux service");
+        }
+    };
+
+    match is_linger_enabled(user.as_str()) {
+        Ok(true) => return Ok(Vec::new()),
+        Ok(false) => {}
+        Err(error) => {
+            return handle_persistence_setup_failure(
+                settings,
+                user.as_str(),
+                format!("failed to inspect systemd linger state: {error:#}"),
+            );
+        }
+    }
+
+    match enable_linger(user.as_str()) {
+        Ok(()) => {
+            if is_linger_enabled(user.as_str()).unwrap_or(true) {
+                info!(
+                    user = user.as_str(),
+                    "enabled systemd linger for gateway service"
+                );
+                return Ok(Vec::new());
+            }
+            handle_persistence_setup_failure(
+                settings,
+                user.as_str(),
+                "`loginctl enable-linger` completed but Linger is still not enabled".to_owned(),
+            )
+        }
+        Err(error) => handle_persistence_setup_failure(
+            settings,
+            user.as_str(),
+            format!("`loginctl enable-linger` failed: {error:#}"),
+        ),
+    }
+}
+
+fn current_user_name() -> Result<String> {
+    let args = vec!["-un".to_owned()];
+    let output = Command::new("id")
+        .args(args.as_slice())
+        .output()
+        .with_context(|| format!("failed to run `{}`", render_command("id", args.as_slice())))?;
+
+    if !output.status.success() {
+        bail!(
+            "`{}` failed: {}",
+            render_command("id", args.as_slice()),
+            output_details(&output)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn is_linger_enabled(user: &str) -> Result<bool> {
+    let args = vec![
+        "show-user".to_owned(),
+        user.to_owned(),
+        "-p".to_owned(),
+        "Linger".to_owned(),
+    ];
+    let output = Command::new("loginctl")
+        .args(args.as_slice())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run `{}`",
+                render_command("loginctl", args.as_slice())
+            )
+        })?;
+
+    if !output.status.success() {
+        bail!(
+            "`{}` failed: {}",
+            render_command("loginctl", args.as_slice()),
+            output_details(&output)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_linger_enabled(stdout.as_ref()).with_context(|| {
+        format!(
+            "unexpected output from `{}`: {}",
+            render_command("loginctl", args.as_slice()),
+            stdout.trim()
+        )
+    })
+}
+
+fn parse_linger_enabled(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let value = line.trim();
+        match value {
+            "Linger=yes" | "yes" => return Some(true),
+            "Linger=no" | "no" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn enable_linger(user: &str) -> Result<()> {
+    let args = vec!["enable-linger".to_owned(), user.to_owned()];
+    run_command_checked("loginctl", args.as_slice())
+}
+
+fn handle_persistence_setup_failure(
+    settings: &ServiceSettings,
+    user: &str,
+    detail: String,
+) -> Result<Vec<GatewayServiceWarning>> {
+    let message = format!(
+        "Linux user-level gateway services require systemd linger to survive logout and start after reboot. Run `sudo loginctl enable-linger {user}` on this machine, then run `pioneer start` again. Detail: {detail}"
+    );
+
+    if matches!(settings.managed_by, InstallManagedBy::Desktop) {
+        return Ok(vec![GatewayServiceWarning::new(
+            LINUX_LINGER_WARNING_CODE,
+            message,
+        )]);
+    }
+
+    bail!("{message}")
 }
 
 fn render_linux_systemd_service(executable: &Path, path_env: Option<&str>) -> String {
@@ -186,4 +326,26 @@ fn user_service_path(service_unit: &str) -> Result<PathBuf> {
         .join("systemd")
         .join("user")
         .join(service_unit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_linger_enabled;
+
+    #[test]
+    fn parses_linger_show_user_property_output() {
+        assert_eq!(parse_linger_enabled("Linger=yes\n"), Some(true));
+        assert_eq!(parse_linger_enabled("Linger=no\n"), Some(false));
+    }
+
+    #[test]
+    fn parses_linger_show_user_value_output() {
+        assert_eq!(parse_linger_enabled("yes\n"), Some(true));
+        assert_eq!(parse_linger_enabled("no\n"), Some(false));
+    }
+
+    #[test]
+    fn ignores_unrelated_linger_output() {
+        assert_eq!(parse_linger_enabled("Name=oskin\nState=active\n"), None);
+    }
 }

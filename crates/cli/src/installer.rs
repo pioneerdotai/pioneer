@@ -113,6 +113,12 @@ struct StatusOutput {
 }
 
 #[derive(Debug, Deserialize)]
+struct StartOutput {
+    #[serde(default)]
+    warnings: Vec<InstallWarning>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
 }
@@ -249,23 +255,20 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     warnings.extend(link_result.warnings);
 
     if should_start {
-        if let Err(error) = run_gateway_command(
-            &target_binary,
-            &["start"],
-            &options.managed_by,
-            false,
-            "start",
-        ) {
-            rollback_and_restore(
-                &target_binary,
-                &rollback_binary,
-                runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
-                was_active,
-                &options.managed_by,
-            );
-            bail!("failed to start gateway after update: {error:#}; update rolled back");
-        }
+        match run_gateway_start_command(&target_binary, &options.managed_by) {
+            Ok(start_warnings) => warnings.extend(start_warnings),
+            Err(error) => {
+                rollback_and_restore(
+                    &target_binary,
+                    &rollback_binary,
+                    runtime_home.as_deref(),
+                    config_backup_dir.as_deref(),
+                    was_active,
+                    &options.managed_by,
+                );
+                bail!("failed to start gateway after update: {error:#}; update rolled back");
+            }
+        };
 
         if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
             let _ = run_gateway_command(
@@ -642,6 +645,39 @@ fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
         thread::sleep(Duration::from_secs(1));
     }
     false
+}
+
+fn run_gateway_start_command(
+    binary: &Path,
+    managed_by: &InstallManagedBy,
+) -> Result<Vec<InstallWarning>> {
+    let args = ["start", "--json"];
+    let mut command = Command::new(binary);
+    command.args(args.as_slice());
+    command.env("PIONEER_MANAGED_BY", managed_by_label(managed_by));
+
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to run `{}`",
+            render_binary_command(binary, args.as_slice())
+        )
+    })?;
+
+    if output.status.success() {
+        return Ok(parse_start_warnings(&output.stdout));
+    }
+
+    bail!(
+        "command `{}` failed during start: {}",
+        render_binary_command(binary, args.as_slice()),
+        command_output_details(&output)
+    )
+}
+
+fn parse_start_warnings(stdout: &[u8]) -> Vec<InstallWarning> {
+    serde_json::from_slice::<StartOutput>(stdout)
+        .map(|output| output.warnings)
+        .unwrap_or_default()
 }
 
 fn run_gateway_command(
@@ -1404,6 +1440,7 @@ fn unix_timestamp_secs() -> Result<u64> {
 mod tests {
     use super::{
         ensure_unix_user_path_configured, expected_checksum_for_asset, force_path_update_warning,
+        parse_start_warnings,
     };
     use std::fs;
     #[cfg(not(windows))]
@@ -1477,6 +1514,28 @@ mod tests {
                 "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
             )
         );
+    }
+
+    #[test]
+    fn parses_start_warnings_from_json() {
+        let warnings = parse_start_warnings(
+            br#"{
+                "phase":"started",
+                "warnings":[
+                    {"code":"linux_linger_enable_failed","message":"run loginctl"}
+                ]
+            }"#,
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "linux_linger_enable_failed");
+        assert_eq!(warnings[0].message, "run loginctl");
+    }
+
+    #[test]
+    fn ignores_missing_or_invalid_start_warnings() {
+        assert!(parse_start_warnings(br#"{"phase":"started"}"#).is_empty());
+        assert!(parse_start_warnings(b"not json").is_empty());
     }
 
     #[cfg(not(windows))]
