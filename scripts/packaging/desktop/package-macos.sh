@@ -110,6 +110,62 @@ OSA
   ln -s /Applications "$alias_path"
 }
 
+configure_dmg_finder_layout() {
+  local mount_dir="$1"
+  local background_file="$2"
+
+  command -v osascript >/dev/null 2>&1 || return 0
+
+  PIONEER_DMG_MOUNT_DIR="$mount_dir" \
+    PIONEER_DMG_BACKGROUND_FILE="$background_file" \
+    PIONEER_DMG_APP_ITEM="${APP_NAME}.app" \
+    osascript <<'OSA' >/dev/null 2>&1 || true
+set mountDir to system attribute "PIONEER_DMG_MOUNT_DIR"
+set backgroundFilePath to system attribute "PIONEER_DMG_BACKGROUND_FILE"
+set appItemName to system attribute "PIONEER_DMG_APP_ITEM"
+
+tell application "Finder"
+  set mountedFolder to POSIX file mountDir as alias
+  set backgroundFile to POSIX file backgroundFilePath as alias
+
+  open mountedFolder
+  delay 1
+
+  set dmgWindow to container window of mountedFolder
+  set current view of dmgWindow to icon view
+  set toolbar visible of dmgWindow to false
+  set statusbar visible of dmgWindow to false
+  set bounds of dmgWindow to {200, 120, 700, 420}
+
+  set viewOptions to icon view options of dmgWindow
+  set arrangement of viewOptions to not arranged
+  set icon size of viewOptions to 80
+  set background picture of viewOptions to backgroundFile
+
+  set position of item appItemName of mountedFolder to {155, 174}
+  set position of item "Applications" of mountedFolder to {355, 174}
+
+  update mountedFolder without registering applications
+  delay 1
+  close dmgWindow
+end tell
+OSA
+}
+
+detach_dmg() {
+  local mount_dir="$1"
+  local attempt
+
+  for attempt in 1 2 3 4 5; do
+    if hdiutil detach "$mount_dir" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  hdiutil detach -force "$mount_dir"
+}
+
 sha256_file() {
   local path="$1"
   if command -v shasum >/dev/null 2>&1; then
@@ -250,7 +306,14 @@ cargo build --release -p pioneer-desktop --target "$TARGET"
 cargo build --release -p pioneer-cli --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+DMG_MOUNT_DIR=""
+cleanup_work_dir() {
+  if [[ -n "${DMG_MOUNT_DIR:-}" ]]; then
+    hdiutil detach "$DMG_MOUNT_DIR" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK_DIR"
+}
+trap cleanup_work_dir EXIT
 
 APP_NAME="Pioneer"
 APP_DIR="$WORK_DIR/${APP_NAME}.app"
@@ -260,11 +323,17 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 DESKTOP_EXECUTABLE_NAME="pioneer-app"
 MACOS_ICON_NAME="Pioneer.icns"
 MACOS_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon.icns"
+DMG_BACKGROUND_SOURCE="$REPO_ROOT/assets/dmg-backgrond@2x.png"
+DMG_BACKGROUND_NAME="background@2x.png"
 MACOS_DMG_SIGN_IDENTITY="${MACOS_DMG_SIGN_IDENTITY:-${MACOS_DESKTOP_SIGN_IDENTITY:-}}"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 if [[ ! -f "$MACOS_ICON_SOURCE" ]]; then
   echo "missing macOS app icon: $MACOS_ICON_SOURCE" >&2
+  exit 1
+fi
+if [[ ! -f "$DMG_BACKGROUND_SOURCE" ]]; then
+  echo "missing macOS DMG background: $DMG_BACKGROUND_SOURCE" >&2
   exit 1
 fi
 cp "$MACOS_ICON_SOURCE" "$RESOURCES_DIR/$MACOS_ICON_NAME"
@@ -332,17 +401,41 @@ fi
 
 DMG_NAME="Pioneer-${ARCH}.dmg"
 DMG_PATH="$OUT_DIR/$DMG_NAME"
-DMG_STAGE_DIR="$WORK_DIR/dmg-root"
-mkdir -p "$DMG_STAGE_DIR"
-cp -R "$APP_DIR" "$DMG_STAGE_DIR/${APP_NAME}.app"
-create_applications_link "$DMG_STAGE_DIR"
+DMG_RW_PATH="$WORK_DIR/Pioneer-${ARCH}.rw.dmg"
+DMG_MOUNT_DIR="$WORK_DIR/dmg-mount"
+DMG_APP_SIZE_MB="$(du -sm "$APP_DIR" | awk '{print $1}')"
+DMG_SIZE_MB=$((DMG_APP_SIZE_MB + 128))
+mkdir -p "$DMG_MOUNT_DIR"
 
 hdiutil create \
   -volname "$APP_NAME" \
-  -srcfolder "$DMG_STAGE_DIR" \
+  -fs HFS+ \
+  -size "${DMG_SIZE_MB}m" \
+  "$DMG_RW_PATH"
+
+hdiutil attach \
+  -readwrite \
+  -noverify \
+  -noautoopen \
+  -mountpoint "$DMG_MOUNT_DIR" \
+  "$DMG_RW_PATH"
+
+cp -R "$APP_DIR" "$DMG_MOUNT_DIR/${APP_NAME}.app"
+create_applications_link "$DMG_MOUNT_DIR"
+mkdir -p "$DMG_MOUNT_DIR/.background"
+cp "$DMG_BACKGROUND_SOURCE" "$DMG_MOUNT_DIR/.background/$DMG_BACKGROUND_NAME"
+chflags hidden "$DMG_MOUNT_DIR/.background" || true
+configure_dmg_finder_layout "$DMG_MOUNT_DIR" "$DMG_MOUNT_DIR/.background/$DMG_BACKGROUND_NAME"
+sync
+detach_dmg "$DMG_MOUNT_DIR"
+DMG_MOUNT_DIR=""
+
+rm -f "$DMG_PATH"
+hdiutil convert "$DMG_RW_PATH" \
   -ov \
   -format UDZO \
-  "$DMG_PATH"
+  -imagekey zlib-level=9 \
+  -o "$DMG_PATH"
 
 if [[ -n "$MACOS_DMG_SIGN_IDENTITY" ]]; then
   require_cmd codesign
