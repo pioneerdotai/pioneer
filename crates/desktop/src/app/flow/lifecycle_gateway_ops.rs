@@ -402,13 +402,18 @@ impl PioneerDesktop {
                                 install_warnings = local_start.warnings;
                             }
                             let spec = build_ws_connect_spec(&runtime, &endpoint)?;
-                            let connection_id = ws_sender.connect_and_wait(spec)?;
+                            let (connection_id, ws_connected_ready) =
+                                if endpoint.kind == GatewayEndpointKind::Remote {
+                                    (ws_sender.connect_with_retry(spec)?, false)
+                                } else {
+                                    (ws_sender.connect_and_wait(spec)?, true)
+                                };
                             runtime.activate_gateway(endpoint.id.as_str())?;
 
                             Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
                                 runtime,
                                 ws_connection_id: Some(connection_id),
-                                ws_connected_ready: true,
+                                ws_connected_ready,
                                 install_warnings,
                             })
                         })

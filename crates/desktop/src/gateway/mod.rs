@@ -9,6 +9,7 @@ mod ws;
 
 pub(crate) use connectivity::normalize_address;
 pub(crate) use control::GatewayInstallWarning;
+pub(crate) use timings::GatewayWsTimings;
 
 pub use runtime::{ActiveGatewayState, GatewayRuntime, ensure_runtime_home_dir};
 pub use types::{GatewayEndpoint, GatewayEndpointKind};

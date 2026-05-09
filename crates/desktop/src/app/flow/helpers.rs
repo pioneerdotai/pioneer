@@ -10,7 +10,7 @@ pub(crate) fn build_ws_connect_spec(
         endpoint_kind: endpoint.kind,
         address: endpoint.address.clone(),
         auth_token: runtime.gateway_auth_token_for_endpoint(endpoint)?,
-        timings: runtime.ws_timings(),
+        timings: ws_timings_for_endpoint(runtime, endpoint.kind),
     })
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn build_remote_candidate_ws_connect_spec(
                 Some(token.to_owned())
             }
         },
-        timings: runtime.ws_timings(),
+        timings: ws_timings_for_endpoint(runtime, GatewayEndpointKind::Remote),
     }
 }
 
@@ -117,6 +117,20 @@ pub(crate) fn gateway_activation_requires_local_start(
     endpoint_kind: Option<GatewayEndpointKind>,
 ) -> bool {
     endpoint_kind == Some(GatewayEndpointKind::Local)
+}
+
+fn ws_timings_for_endpoint(
+    runtime: &GatewayRuntime,
+    endpoint_kind: GatewayEndpointKind,
+) -> crate::gateway::GatewayWsTimings {
+    let mut timings = runtime.ws_timings();
+    if endpoint_kind == GatewayEndpointKind::Remote {
+        let minimum = Duration::from_millis(REMOTE_WS_CONNECT_TIMEOUT_MIN_MS);
+        if timings.connect_timeout < minimum {
+            timings.connect_timeout = minimum;
+        }
+    }
+    timings
 }
 
 pub(crate) fn gateway_has_ready_ws_connection(

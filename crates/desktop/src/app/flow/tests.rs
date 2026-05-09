@@ -27,7 +27,8 @@ use super::thread_list::{
     TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
 };
 use super::{
-    build_ws_connect_spec, default_user_command_bin_dir_label, gateway_activation_is_noop,
+    build_remote_candidate_ws_connect_spec, build_ws_connect_spec,
+    default_user_command_bin_dir_label, gateway_activation_is_noop,
     gateway_activation_requires_local_start, gateway_has_ready_ws_connection,
     is_transient_thread_start_error, normalize_workspace_id, should_apply_gateway_operation_result,
     should_apply_ws_event, should_refresh_workspace_bound_data, thread_start_retry_delay,
@@ -79,6 +80,48 @@ fn ws_connect_spec_uses_resolved_in_memory_auth_token() {
     let spec = build_ws_connect_spec(&runtime, &endpoint).expect("build ws spec");
 
     assert_eq!(spec.auth_token.as_deref(), Some("resolved-token"));
+}
+
+#[test]
+fn remote_ws_connect_spec_uses_remote_timeout_floor() {
+    let runtime = GatewayRuntime::for_ws_spec_tests();
+    let endpoint = GatewayEndpoint {
+        id: "remote-123".to_owned(),
+        name: "Remote".to_owned(),
+        address: "127.0.0.1:22000".to_owned(),
+        kind: GatewayEndpointKind::Remote,
+        auth_token_ref: None,
+        workspace_id: None,
+        service_name: None,
+    };
+
+    let spec = build_ws_connect_spec(&runtime, &endpoint).expect("build remote ws spec");
+    let candidate =
+        build_remote_candidate_ws_connect_spec(&runtime, "Remote", "127.0.0.1:22000", "");
+
+    assert_eq!(spec.timings.connect_timeout, Duration::from_millis(5_000));
+    assert_eq!(
+        candidate.timings.connect_timeout,
+        Duration::from_millis(5_000)
+    );
+}
+
+#[test]
+fn local_ws_connect_spec_keeps_configured_timeout() {
+    let runtime = GatewayRuntime::for_ws_spec_tests();
+    let endpoint = GatewayEndpoint {
+        id: "local".to_owned(),
+        name: "Local".to_owned(),
+        address: "0.0.0.0:17878".to_owned(),
+        kind: GatewayEndpointKind::Local,
+        auth_token_ref: None,
+        workspace_id: None,
+        service_name: Some("com.pioneer.gateway".to_owned()),
+    };
+
+    let spec = build_ws_connect_spec(&runtime, &endpoint).expect("build local ws spec");
+
+    assert_eq!(spec.timings.connect_timeout, Duration::from_millis(300));
 }
 
 #[test]
