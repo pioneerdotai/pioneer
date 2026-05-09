@@ -14,7 +14,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 pioneer-config.workspace = true
-pioneer-gateway.workspace = true
+pioneer-gateway = { workspace = true, features = ["computer-use"] }
 pioneer-keystore.workspace = true
 pioneer-protocol.workspace = true
 pioneer-skills.workspace = true

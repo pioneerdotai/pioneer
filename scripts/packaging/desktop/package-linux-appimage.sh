@@ -96,7 +96,7 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
 fi
 
 cargo build --release -p pioneer-desktop --target "$TARGET"
-cargo build --release -p pioneer-cli --target "$TARGET"
+cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT

@@ -82,10 +82,13 @@ pub use web::{
     render_web_fetch_ui_text, render_web_search_ui_text,
 };
 
+#[cfg(feature = "computer-use")]
+use handlers::ComputerUseHandler;
+
 use handlers::{
-    ApplyPatchHandler, ComputerUseHandler, DownloadUrlHandler, GrepHandler, ListDirHandler,
-    ReadFileHandler, ToolDiscoveryPolicy, ToolSearchHandler, ToolSuggestHandler,
-    UnifiedExecHandler, WebFetchHandler, WebSearchHandler,
+    ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
+    ToolDiscoveryPolicy, ToolSearchHandler, ToolSuggestHandler, UnifiedExecHandler,
+    WebFetchHandler, WebSearchHandler,
 };
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -288,7 +291,12 @@ pub fn build_tools(
 ) -> Result<BuiltinTools, BuildToolsError> {
     let turn_id = turn_id.into();
     let web_tools_config = web_tools_config.normalized();
+
+    #[cfg(feature = "computer-use")]
     let computer_use_tools_config = computer_use_tools_config.normalized();
+
+    #[cfg(not(feature = "computer-use"))]
+    let _ = computer_use_tools_config;
 
     let mut configured_specs = builtin_tool_specs();
     let builtin_tool_names = configured_specs
@@ -363,6 +371,8 @@ pub fn build_tools(
         "download_url",
         Arc::new(DownloadUrlHandler::new(web_tools_config)),
     );
+
+    #[cfg(feature = "computer-use")]
     builder.register_handler(
         "computer_use",
         Arc::new(ComputerUseHandler::new(computer_use_tools_config)),

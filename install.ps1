@@ -9,6 +9,10 @@ param(
 
     [switch]$ForceStart,
 
+    [switch]$ComputerUse,
+
+    [switch]$Headless,
+
     [string]$LocalAssetFile,
 
     [string]$LocalChecksumsFile
@@ -128,7 +132,22 @@ $releaseDownloadBase = if ($env:PIONEER_RELEASE_DOWNLOAD_BASE) { $env:PIONEER_RE
 $assetPath = ""
 $checksumsPath = ""
 $arch = Get-ArchSuffix
-$assetName = "pioneer-gateway-windows-$arch.zip"
+$computerUseEnabled = $false
+if ($env:PIONEER_INSTALL_COMPUTER_USE) {
+    switch -Regex ($env:PIONEER_INSTALL_COMPUTER_USE) {
+        "^(1|true|yes|on)$" { $computerUseEnabled = $true; break }
+        "^(0|false|no|off)$" { $computerUseEnabled = $false; break }
+        default { Fail "invalid PIONEER_INSTALL_COMPUTER_USE value; expected 1/true/yes or 0/false/no" }
+    }
+}
+if ($ComputerUse.IsPresent) {
+    $computerUseEnabled = $true
+}
+if ($Headless.IsPresent) {
+    $computerUseEnabled = $false
+}
+$assetSuffix = if ($computerUseEnabled) { "-computer-use" } else { "" }
+$assetName = "pioneer-gateway-windows-$arch$assetSuffix.zip"
 
 $tempDir = Join-Path $env:TEMP ("pioneer-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tempDir | Out-Null

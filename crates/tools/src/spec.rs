@@ -156,7 +156,7 @@ impl ConfiguredToolSpec {
 }
 
 pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
-    vec![
+    let specs = vec![
         configured_builtin_spec(
             "exec_command",
             "Run a command (optionally interactive) and return output or a session id.",
@@ -288,19 +288,6 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
             },
         ),
         configured_builtin_spec(
-            "computer_use",
-            "Remote desktop control loop. Required call shapes: start {action,goal}; snapshot {action,session_id}; act {action,session_id,act:{type,...}}; status {action,session_id}; stop {action,session_id}. For action=act, nested act object is mandatory.",
-            computer_use_schema(),
-            PayloadKind::Function,
-            ExecutionClass::SessionScoped,
-            ToolRecoveryMetadata {
-                retry_class: ToolRetryClass::Session,
-                idempotency_mode: ToolIdempotencyMode::SessionBound,
-                max_attempts: 2,
-                can_resume: true,
-            },
-        ),
-        configured_builtin_spec(
             "download_url",
             "Download a URL to local disk and report file metadata.",
             download_url_schema(),
@@ -313,7 +300,33 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 can_resume: true,
             },
         ),
-    ]
+    ];
+
+    with_optional_builtin_tool_specs(specs)
+}
+
+#[cfg(feature = "computer-use")]
+fn with_optional_builtin_tool_specs(mut specs: Vec<ConfiguredToolSpec>) -> Vec<ConfiguredToolSpec> {
+    specs.push(configured_builtin_spec(
+        "computer_use",
+        "Remote desktop control loop. Required call shapes: start {action,goal}; snapshot {action,session_id}; act {action,session_id,act:{type,...}}; status {action,session_id}; stop {action,session_id}. For action=act, nested act object is mandatory.",
+        computer_use_schema(),
+        PayloadKind::Function,
+        ExecutionClass::SessionScoped,
+        ToolRecoveryMetadata {
+            retry_class: ToolRetryClass::Session,
+            idempotency_mode: ToolIdempotencyMode::SessionBound,
+            max_attempts: 2,
+            can_resume: true,
+        },
+    ));
+
+    specs
+}
+
+#[cfg(not(feature = "computer-use"))]
+fn with_optional_builtin_tool_specs(specs: Vec<ConfiguredToolSpec>) -> Vec<ConfiguredToolSpec> {
+    specs
 }
 
 pub fn builtin_tool_recovery_metadata(tool_name: &str) -> Option<ToolRecoveryMetadata> {
@@ -518,6 +531,7 @@ fn download_url_schema() -> JsonValue {
     })
 }
 
+#[cfg(feature = "computer-use")]
 fn computer_use_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",

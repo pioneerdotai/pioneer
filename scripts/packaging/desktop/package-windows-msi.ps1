@@ -276,7 +276,7 @@ if (-not (Test-Path -Path $appIconPath)) {
 }
 
 cargo build --release -p pioneer-desktop --target $Target
-cargo build --release -p pioneer-cli --target $Target
+cargo build --release -p pioneer-cli --features computer-use --target $Target
 
 $workDir = Join-Path $env:TEMP ("pioneer-msi-" + [Guid]::NewGuid().ToString("N"))
 $stageDir = Join-Path $workDir "stage"

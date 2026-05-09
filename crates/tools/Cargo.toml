@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+computer-use = ["dep:enigo", "dep:xcap"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -25,5 +29,5 @@ libc.workspace = true
 scraper.workspace = true
 webclaw-core.workspace = true
 futures-util.workspace = true
-enigo.workspace = true
-xcap.workspace = true
+enigo = { workspace = true, optional = true }
+xcap = { workspace = true, optional = true }

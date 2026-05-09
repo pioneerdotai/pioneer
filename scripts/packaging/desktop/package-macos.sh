@@ -303,7 +303,7 @@ fi
 mkdir -p "$OUT_DIR"
 
 cargo build --release -p pioneer-desktop --target "$TARGET"
-cargo build --release -p pioneer-cli --target "$TARGET"
+cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
 DMG_MOUNT_DIR=""

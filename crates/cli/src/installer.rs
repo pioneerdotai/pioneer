@@ -497,8 +497,13 @@ fn gateway_asset_file_name() -> Result<String> {
         other => bail!("unsupported OS `{other}` for release installer source"),
     };
 
+    let variant = if cfg!(feature = "computer-use") {
+        "-computer-use"
+    } else {
+        ""
+    };
     let ext = if os == "windows" { "zip" } else { "gz" };
-    Ok(format!("pioneer-gateway-{os}-{arch}.{ext}"))
+    Ok(format!("pioneer-gateway-{os}-{arch}{variant}.{ext}"))
 }
 
 fn persist_install_state(
@@ -1339,6 +1344,34 @@ mod tests {
 
         assert!(format!("{error:#}").contains("checksum for"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn release_asset_name_matches_build_variant() {
+        let asset_name = super::gateway_asset_file_name().expect("asset name");
+
+        let expected_os = match std::env::consts::OS {
+            "linux" => "linux",
+            "macos" => "macos",
+            "windows" => "windows",
+            other => panic!("unexpected test OS: {other}"),
+        };
+        let expected_arch = match std::env::consts::ARCH {
+            "x86_64" | "amd64" => "x86_64",
+            "aarch64" | "arm64" => "aarch64",
+            other => panic!("unexpected test arch: {other}"),
+        };
+        let expected_variant = if cfg!(feature = "computer-use") {
+            "-computer-use"
+        } else {
+            ""
+        };
+        let expected_ext = if cfg!(windows) { "zip" } else { "gz" };
+
+        assert_eq!(
+            asset_name,
+            format!("pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}")
+        );
     }
 
     #[cfg(not(windows))]

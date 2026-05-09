@@ -88,10 +88,22 @@ macOS and Linux:
 curl -fsSL https://getpioneer.dev/install.sh | bash
 ```
 
+Install the native computer-use gateway variant without installing the desktop app:
+
+```bash
+curl -fsSL https://getpioneer.dev/install.sh | bash -s -- --computer-use
+```
+
 Windows PowerShell:
 
 ```powershell
 iwr -useb https://getpioneer.dev/install.ps1 | iex
+```
+
+Install the native computer-use gateway variant without installing the desktop app:
+
+```powershell
+$env:PIONEER_INSTALL_COMPUTER_USE="1"; iwr -useb https://getpioneer.dev/install.ps1 | iex
 ```
 
 Windows CMD:
@@ -107,11 +119,13 @@ Install scripts support:
 ```bash
 --channel stable|beta|canary
 --version x.y.z
+--computer-use
+--headless
 --no-start
 --force-start
 ```
 
-Channel/version selection depends on matching release assets being published for the target platform.
+Channel/version and gateway variant selection depend on matching release assets being published for the target platform.
 
 After first install, open a new shell session so the updated user `PATH` is picked up. If automatic PATH profile update is skipped, gateway install/start can still succeed and the service remains reachable.
 
@@ -181,7 +195,7 @@ pioneer install --source local --asset <path> --checksums <path>
 pioneer install --source release --channel stable
 ```
 
-The same options are available through `pioneer update`. Release-based install/update requires a published gateway asset and matching `SHA256SUMS` for the current OS and architecture.
+The same options are available through `pioneer update`. Release-based install/update requires a published gateway asset and matching `SHA256SUMS` for the current OS, architecture, and gateway variant. A headless gateway updates from the standard asset name; a computer-use gateway updates from the `-computer-use` asset name.
 
 ## Security Note
 

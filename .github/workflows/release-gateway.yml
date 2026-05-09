@@ -22,26 +22,62 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset_name: pioneer-gateway-linux-x86_64.gz
             archive: gz
+            cargo_features: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: pioneer-gateway-linux-x86_64-computer-use.gz
+            archive: gz
+            cargo_features: computer-use
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_name: pioneer-gateway-linux-aarch64.gz
             archive: gz
+            cargo_features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_name: pioneer-gateway-linux-aarch64-computer-use.gz
+            archive: gz
+            cargo_features: computer-use
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: pioneer-gateway-macos-aarch64.gz
             archive: gz
+            cargo_features: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: pioneer-gateway-macos-aarch64-computer-use.gz
+            archive: gz
+            cargo_features: computer-use
           - os: macos-latest
             target: x86_64-apple-darwin
             asset_name: pioneer-gateway-macos-x86_64.gz
             archive: gz
+            cargo_features: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: pioneer-gateway-macos-x86_64-computer-use.gz
+            archive: gz
+            cargo_features: computer-use
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: pioneer-gateway-windows-x86_64.zip
             archive: zip
+            cargo_features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: pioneer-gateway-windows-x86_64-computer-use.zip
+            archive: zip
+            cargo_features: computer-use
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             asset_name: pioneer-gateway-windows-aarch64.zip
             archive: zip
+            cargo_features: ""
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            asset_name: pioneer-gateway-windows-aarch64-computer-use.zip
+            archive: zip
+            cargo_features: computer-use
 
     steps:
       - uses: actions/checkout@v5
@@ -62,36 +98,53 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          packages=(
+            pkg-config
+            libssl-dev
+          )
+          if [[ -n "${{ matrix.cargo_features }}" ]]; then
+            packages+=(
+              libegl1-mesa-dev
+              libgbm-dev
+              libpipewire-0.3-dev
+              libwayland-dev
+              libxkbcommon-dev
+            )
+          fi
           sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libssl-dev \
-            libpipewire-0.3-dev \
-            libwayland-dev \
-            libxkbcommon-dev
-          multiarch="$(gcc -print-multiarch)"
-          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+          sudo apt-get install -y "${packages[@]}"
+          if [[ -n "${{ matrix.cargo_features }}" ]]; then
+            multiarch="$(gcc -print-multiarch)"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+          fi
 
       - name: build-unix-target
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
+          features_args=()
+          if [[ -n "${{ matrix.cargo_features }}" ]]; then
+            features_args+=(--features "${{ matrix.cargo_features }}")
+          fi
 
           if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" && "${RUNNER_ARCH:-}" != "ARM64" ]]; then
             cargo install cargo-zigbuild --locked --quiet
-            cargo zigbuild --release -p pioneer-cli --target "${{ matrix.target }}"
+            cargo zigbuild --release -p pioneer-cli "${features_args[@]}" --target "${{ matrix.target }}"
           else
-            cargo build --release -p pioneer-cli --target "${{ matrix.target }}"
+            cargo build --release -p pioneer-cli "${features_args[@]}" --target "${{ matrix.target }}"
           fi
 
       - name: build-windows-target
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo build --release -p pioneer-cli --target "${{ matrix.target }}"
+          $cargoArgs = @("build", "--release", "-p", "pioneer-cli")
+          if (-not [string]::IsNullOrWhiteSpace("${{ matrix.cargo_features }}")) {
+            $cargoArgs += @("--features", "${{ matrix.cargo_features }}")
+          }
+          $cargoArgs += @("--target", "${{ matrix.target }}")
+          cargo @cargoArgs
 
       - name: package-unix-artifact
         if: runner.os != 'Windows'

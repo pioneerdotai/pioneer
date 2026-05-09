@@ -1,5 +1,7 @@
-mod apply_patch;
+#[cfg(feature = "computer-use")]
 mod computer_use;
+
+mod apply_patch;
 mod files;
 mod http;
 mod mcp;
@@ -8,8 +10,10 @@ mod shell;
 mod skill;
 mod web;
 
-pub use apply_patch::ApplyPatchHandler;
+#[cfg(feature = "computer-use")]
 pub use computer_use::ComputerUseHandler;
+
+pub use apply_patch::ApplyPatchHandler;
 pub use files::{GrepHandler, ListDirHandler, ReadFileHandler};
 pub use mcp::{
     ExcludedMcpRuntimeTool, McpDynamicToolAnnotations, McpDynamicToolBinding,

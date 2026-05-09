@@ -7,7 +7,9 @@ authors.workspace = true
 default-run = "pioneer"
 
 [features]
+default = []
 dev = []
+computer-use = ["pioneer-gateway/computer-use"]
 
 [[bin]]
 name = "pioneer"
