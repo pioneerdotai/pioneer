@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use pioneer_config::AppConfig;
 use pioneer_protocol::generate_id;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(test)]
 pub(crate) use compat::is_same_gateway_version;
@@ -117,7 +117,9 @@ impl GatewayRuntime {
 
     pub fn endpoints(&self) -> Vec<GatewayEndpoint> {
         let mut endpoints = Vec::with_capacity(self.registry.remotes.len() + 1);
-        endpoints.push(self.registry.local.clone());
+        if self.local_gateway_is_selectable() {
+            endpoints.push(self.registry.local.clone());
+        }
         endpoints.extend(self.registry.remotes.clone());
         endpoints
     }
@@ -370,6 +372,25 @@ impl GatewayRuntime {
 
     fn local_gateway_id(&self) -> &str {
         self.config.desktop.gateway.local_gateway_id.trim()
+    }
+
+    fn local_gateway_is_selectable(&self) -> bool {
+        let local_gateway_id = self.local_gateway_id();
+        if self.registry.active_gateway_id.as_deref() == Some(local_gateway_id) {
+            return true;
+        }
+
+        match self.gateway_auth_token_for_endpoint(&self.registry.local) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to determine whether local gateway should be shown"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -631,6 +652,78 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
+    #[test]
+    fn endpoints_hide_uncreated_local_gateway() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path, secrets);
+        let remote = test_remote_endpoint("remote-main");
+        runtime.registry.active_gateway_id = Some(remote.id.clone());
+        runtime.registry.remotes.push(remote.clone());
+
+        let endpoints = runtime.endpoints();
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].id, remote.id);
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| endpoint.kind == GatewayEndpointKind::Remote)
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn endpoints_include_local_gateway_after_local_token_is_saved() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path, secrets);
+        let remote = test_remote_endpoint("remote-main");
+        runtime.registry.active_gateway_id = Some(remote.id.clone());
+        runtime.registry.remotes.push(remote);
+        assert!(
+            runtime
+                .store_local_auth_token("local-token".to_owned())
+                .expect("store local token")
+        );
+
+        let endpoints = runtime.endpoints();
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].id, runtime.local_gateway_id());
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Local);
+        assert!(
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == GatewayEndpointKind::Remote)
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn endpoints_keep_active_local_gateway_visible_without_saved_token() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path, secrets);
+        runtime.registry.active_gateway_id = Some(runtime.local_gateway_id().to_owned());
+
+        let endpoints = runtime.endpoints();
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].id, runtime.local_gateway_id());
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Local);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
     fn reachable_test_address(connection_count: usize) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let address = listener.local_addr().expect("local address").to_string();
@@ -640,5 +733,17 @@ mod tests {
             }
         });
         (address, handle)
+    }
+
+    fn test_remote_endpoint(id: &str) -> GatewayEndpoint {
+        GatewayEndpoint {
+            id: id.to_owned(),
+            name: "Remote".to_owned(),
+            address: "127.0.0.1:22000".to_owned(),
+            kind: GatewayEndpointKind::Remote,
+            auth_token_ref: Some(id.to_owned()),
+            workspace_id: None,
+            service_name: None,
+        }
     }
 }
