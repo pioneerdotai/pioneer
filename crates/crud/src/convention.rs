@@ -902,6 +902,7 @@ pub fn input_type_and_text(item: &UserInput) -> (&'static str, Option<String>) {
         UserInput::LocalAudio { .. } => ("local_audio", None),
         UserInput::Video { .. } => ("video", None),
         UserInput::LocalVideo { .. } => ("local_video", None),
+        UserInput::Artifact { .. } => ("artifact", None),
         UserInput::Skill { .. } => ("skill", None),
         UserInput::Mention { .. } => ("mention", None),
     }

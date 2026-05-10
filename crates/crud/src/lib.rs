@@ -10,22 +10,23 @@ mod util;
 
 use anyhow::{Context, Result};
 use pioneer_protocol::{
-    MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind, PromptManifest,
-    ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
-    TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
-    TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams, TaskRun, TaskRunStatus,
-    TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
-    UserInput, generate_id,
+    ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
+    ArtifactSummary, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
+    PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams,
+    TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
+    TaskDeliveryAttempt, TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams,
+    TaskRun, TaskRunStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage,
+    ThreadPlacement, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
+    Turn, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsResponse, UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
 use crate::convention::{
@@ -49,15 +50,23 @@ use crate::convention::{
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
+pub use crate::repositories::artifact::{
+    ArtifactBindingTargetRecord, ArtifactBlobRecord, ArtifactCrudError, ArtifactExternalRefKey,
+    ArtifactExternalRefRecord, ArtifactGcBlobCandidateRecord, ArtifactGcPlanRecord,
+    ArtifactListFilterRecord, ArtifactListPageRecord, ArtifactProjectionRecord, ArtifactRecord,
+    ArtifactVersionBlobRecord, ArtifactVersionRecord, ArtifactWorkspaceUsageRecord,
+    IngestArtifactMetadataRecord, IngestedArtifactRecord, NewArtifactBlobRecord,
+    UpsertArtifactExternalRefRequest,
+};
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
-    agent_memory_policy_decision, agent_memory_repair_job, attachment_upload_registry, hook_run,
-    mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
-    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_upload_session,
-    skill_workspace_policy, task as task_repository, task_agent_spec, task_delivery,
-    task_dependency, task_event, task_run, task_trigger, task_write_lock, thread, thread_lineage,
-    thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding,
-    turn_skill_binding,
+    agent_memory_policy_decision, agent_memory_repair_job, artifact as artifact_repository,
+    hook_run, mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy,
+    recovery_job, skill_audit_event, skill_dependency_snapshot, skill_installation,
+    skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
+    task_delivery, task_dependency, task_event, task_run, task_trigger, task_write_lock, thread,
+    thread_lineage, thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context,
+    turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -82,9 +91,7 @@ pub use crate::repositories::hook_run::{
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
-use crate::util::{
-    optional_typed_json_from_db, typed_json_from_db, unix_ms_to_datetime, unix_to_datetime,
-};
+use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 fn memory_candidate_status_event_kind(status: MemoryCandidateStatus) -> &'static str {
@@ -312,22 +319,6 @@ pub struct TurnMcpBindingRecord {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachmentUploadRegistryRecord {
-    pub registry_key: String,
-    pub provider: String,
-    pub model_family: String,
-    pub transport_kind: String,
-    pub sha256: String,
-    pub provider_file_id: String,
-    pub uploaded_at_unix_ms: i64,
-    pub ttl_secs: u64,
-    pub expires_at_unix_ms: i64,
-    pub mime_type: String,
-    pub size_bytes: usize,
-    pub file_name: String,
-}
-
 #[derive(Clone)]
 pub struct CrudStore {
     connection: DatabaseConnection,
@@ -368,6 +359,10 @@ impl CrudStore {
         }
     }
 
+    pub fn database_connection(&self) -> DatabaseConnection {
+        self.connection.clone()
+    }
+
     pub async fn insert_turn_llm_context(
         &self,
         entry: NewTurnLlmContextEntry,
@@ -389,6 +384,435 @@ impl CrudStore {
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
         turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
+    }
+
+    pub async fn ingest_artifact_metadata(
+        &self,
+        blob: NewArtifactBlobRecord,
+        artifact: IngestArtifactMetadataRecord,
+        binding: Option<ArtifactBindingTargetRecord>,
+        version_metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<IngestedArtifactRecord> {
+        self.run_serialized_write(|| {
+            let blob = blob.clone();
+            let artifact = artifact.clone();
+            let binding = binding.clone();
+            let version_metadata = version_metadata.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin artifact ingest transaction")?;
+                let repository = artifact_repository::ArtifactRepository::new();
+                let result = async {
+                    let blob = repository.find_or_create_blob(&transaction, blob).await?;
+                    let artifact = repository.create_artifact(&transaction, &artifact).await?;
+                    let version = repository
+                        .create_version(
+                            &transaction,
+                            &artifact,
+                            &blob,
+                            binding.as_ref(),
+                            &version_metadata,
+                        )
+                        .await?;
+                    let artifact = repository
+                        .update_current_version(&transaction, artifact, &version.id)
+                        .await?;
+                    if let Some(binding) = &binding {
+                        repository
+                            .create_binding(
+                                &transaction,
+                                &artifact.workspace_id,
+                                &artifact.id,
+                                Some(&version.id),
+                                binding,
+                                &BTreeMap::new(),
+                            )
+                            .await?;
+                    }
+                    Ok::<_, ArtifactCrudError>(IngestedArtifactRecord {
+                        artifact,
+                        version,
+                        blob,
+                    })
+                }
+                .await;
+
+                let record = match result {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error.into());
+                    }
+                };
+
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit artifact ingest transaction")?;
+                Ok(record)
+            }
+        })
+        .await
+    }
+
+    pub async fn bind_artifact(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+        target: ArtifactBindingTargetRecord,
+        metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<ArtifactBindingSummary> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let artifact_id = artifact_id.to_owned();
+            let version_id = version_id.map(ToOwned::to_owned);
+            let target = target.clone();
+            let metadata = metadata.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin artifact bind transaction")?;
+                let repository = artifact_repository::ArtifactRepository::new();
+                let result = async {
+                    let summary = repository
+                        .get_artifact_summary(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            version_id.as_deref(),
+                        )
+                        .await?;
+                    let resolved_version_id = version_id
+                        .as_deref()
+                        .or(summary.artifact.version_id.as_deref())
+                        .map(ToOwned::to_owned);
+                    repository
+                        .create_binding(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            resolved_version_id.as_deref(),
+                            &target,
+                            &metadata,
+                        )
+                        .await
+                }
+                .await;
+
+                let binding = match result {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error.into());
+                    }
+                };
+
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit artifact bind transaction")?;
+                Ok(binding)
+            }
+        })
+        .await
+    }
+
+    pub async fn get_artifact_summary(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+    ) -> Result<ArtifactSummary> {
+        artifact_repository::ArtifactRepository::new()
+            .get_artifact_summary(&self.connection, workspace_id, artifact_id, version_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn get_artifact_version_blob(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+    ) -> Result<ArtifactVersionBlobRecord> {
+        artifact_repository::ArtifactRepository::new()
+            .get_artifact_version_blob(&self.connection, workspace_id, artifact_id, version_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_thread_artifacts(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        filter: ArtifactListFilterRecord,
+    ) -> Result<ArtifactListPageRecord> {
+        artifact_repository::ArtifactRepository::new()
+            .list_thread_artifacts(&self.connection, workspace_id, thread_id, filter)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_artifacts(
+        &self,
+        workspace_id: &str,
+        filter: ArtifactListFilterRecord,
+    ) -> Result<ArtifactListPageRecord> {
+        artifact_repository::ArtifactRepository::new()
+            .list_artifacts(&self.connection, workspace_id, filter)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn update_artifact_status(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        status: ArtifactStatus,
+        deleted_at: Option<DateTimeWithTimeZone>,
+    ) -> Result<ArtifactRecord> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let artifact_id = artifact_id.to_owned();
+            let deleted_at = deleted_at.clone();
+            async move {
+                artifact_repository::ArtifactRepository::new()
+                    .update_artifact_status(
+                        &self.connection,
+                        &workspace_id,
+                        &artifact_id,
+                        status,
+                        deleted_at,
+                    )
+                    .await
+                    .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn replace_artifact_projection(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        artifact_version_id: &str,
+        projection_kind: ArtifactProjectionKind,
+        status: ArtifactProjectionStatus,
+        text_content: Option<String>,
+        metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<ArtifactProjectionRecord> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let artifact_id = artifact_id.to_owned();
+            let artifact_version_id = artifact_version_id.to_owned();
+            let text_content = text_content.clone();
+            let metadata = metadata.clone();
+            async move {
+                artifact_repository::replace_projection(
+                    &self.connection,
+                    &workspace_id,
+                    &artifact_id,
+                    &artifact_version_id,
+                    projection_kind,
+                    status,
+                    text_content,
+                    metadata,
+                )
+                .await
+                .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn list_artifact_projections(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        artifact_version_id: Option<&str>,
+    ) -> Result<Vec<ArtifactProjectionRecord>> {
+        artifact_repository::list_projections(
+            &self.connection,
+            workspace_id,
+            artifact_id,
+            artifact_version_id,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_active_artifact_external_ref(
+        &self,
+        key: &ArtifactExternalRefKey,
+        now_unix_ms: i64,
+    ) -> Result<Option<ArtifactExternalRefRecord>> {
+        artifact_repository::find_active_external_ref(&self.connection, key, now_unix_ms)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn upsert_artifact_external_ref(
+        &self,
+        request: UpsertArtifactExternalRefRequest,
+    ) -> Result<ArtifactExternalRefRecord> {
+        self.run_serialized_write(|| {
+            let request = request.clone();
+            async move {
+                artifact_repository::upsert_external_ref(&self.connection, request)
+                    .await
+                    .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn prune_expired_artifact_external_refs(
+        &self,
+        workspace_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                artifact_repository::prune_expired_external_refs(
+                    &self.connection,
+                    &workspace_id,
+                    now_unix_ms,
+                )
+                .await
+                .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn artifact_workspace_usage(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ArtifactWorkspaceUsageRecord> {
+        artifact_repository::workspace_usage(&self.connection, workspace_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn plan_artifact_gc(
+        &self,
+        workspace_id: &str,
+        now_unix_ms: i64,
+        grace_secs: u64,
+    ) -> Result<ArtifactGcPlanRecord> {
+        artifact_repository::plan_gc_with_grace(
+            &self.connection,
+            workspace_id,
+            now_unix_ms,
+            grace_secs,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn delete_artifact_blob_row(&self, workspace_id: &str, blob_id: &str) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let blob_id = blob_id.to_owned();
+            async move {
+                artifact_repository::delete_blob_row(&self.connection, &workspace_id, &blob_id)
+                    .await
+                    .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_artifact_projection_row(
+        &self,
+        workspace_id: &str,
+        projection_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let projection_id = projection_id.to_owned();
+            async move {
+                artifact_repository::delete_projection_row(
+                    &self.connection,
+                    &workspace_id,
+                    &projection_id,
+                )
+                .await
+                .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn count_artifacts_by_workspace(&self, workspace_id: &str) -> Result<u64> {
+        artifact_repository::count_artifacts_by_workspace(&self.connection, workspace_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn count_artifact_blobs_by_workspace(&self, workspace_id: &str) -> Result<u64> {
+        artifact_repository::count_blobs_by_workspace(&self.connection, workspace_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn count_artifact_versions_by_workspace(&self, workspace_id: &str) -> Result<u64> {
+        artifact_repository::count_versions_by_workspace(&self.connection, workspace_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn count_artifact_bindings_by_workspace(&self, workspace_id: &str) -> Result<u64> {
+        artifact_repository::count_bindings_by_workspace(&self.connection, workspace_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn insert_test_artifact_blob(
+        &self,
+        record: NewArtifactBlobRecord,
+        created_at_unix_ms: i64,
+        id: String,
+    ) -> Result<ArtifactBlobRecord> {
+        self.run_serialized_write(|| {
+            let record = record.clone();
+            let id = id.clone();
+            async move {
+                artifact_repository::insert_test_blob(
+                    &self.connection,
+                    record,
+                    created_at_unix_ms,
+                    id,
+                )
+                .await
+                .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
+    pub async fn update_test_artifact_status(&self, artifact_id: &str, status: &str) -> Result<()> {
+        self.run_serialized_write(|| {
+            let artifact_id = artifact_id.to_owned();
+            let status = status.to_owned();
+            async move {
+                artifact_repository::update_test_artifact_status(
+                    &self.connection,
+                    &artifact_id,
+                    &status,
+                )
+                .await
+                .map_err(Into::into)
+            }
+        })
+        .await
     }
 
     pub async fn create_hook_run(
@@ -3558,45 +3982,6 @@ impl CrudStore {
                 created_at_unix: model.created_at.timestamp(),
             })
             .collect())
-    }
-
-    pub async fn lookup_attachment_upload_reference(
-        &self,
-        registry_key: &str,
-        now_unix_ms: i64,
-    ) -> Result<Option<String>> {
-        self.run_serialized_write(|| async {
-            attachment_upload_registry::prune_expired_entries(&self.connection, now_unix_ms)
-                .await?;
-            attachment_upload_registry::find_active_file_id_by_key(
-                &self.connection,
-                registry_key,
-                now_unix_ms,
-            )
-            .await
-        })
-        .await
-    }
-
-    pub async fn upsert_attachment_upload_registry_record(
-        &self,
-        record: &AttachmentUploadRegistryRecord,
-    ) -> Result<()> {
-        self.run_serialized_write(|| async {
-            attachment_upload_registry::prune_expired_entries(
-                &self.connection,
-                record.uploaded_at_unix_ms,
-            )
-            .await?;
-            attachment_upload_registry::upsert_entry(
-                &self.connection,
-                record,
-                unix_ms_to_datetime(record.uploaded_at_unix_ms),
-                unix_ms_to_datetime(record.uploaded_at_unix_ms),
-            )
-            .await
-        })
-        .await
     }
 
     pub async fn get_thread_by_id(
