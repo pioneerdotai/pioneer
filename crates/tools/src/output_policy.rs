@@ -291,6 +291,7 @@ fn attachment_part_from_llm_context(payload: &JsonValue) -> Option<MessageConten
         size_bytes,
         sha256,
         source: AttachmentDataSource::Path { path },
+        artifact: None,
     };
 
     if mime.starts_with("image/") {
