@@ -24,8 +24,9 @@ pub use summary::SummaryConfig;
 use crate::hook_run_store::CrudHookRunStore;
 use crate::tokenizer::count_tokens;
 use pioneer_agent::{AgentManager, ToolLoopConfig};
+use pioneer_config::GatewayHookRecoveryConfig;
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
-use pioneer_hooks::HookRuntime;
+use pioneer_hooks::{HookRecoveryOptions, HookRegistry, HookRuntime, HookSubscriptionRegistry};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ContextCompressedNotification,
     ContextCompressingNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, ItemDeltaStream,
@@ -133,6 +134,7 @@ pub struct MessageProcessor {
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
     resilience_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    hook_recovery_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     skills_watcher_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     tool_loop_config: ToolLoopConfig,
@@ -145,6 +147,7 @@ pub struct MessageProcessor {
     pub(crate) task_runtime: Arc<TaskRuntime>,
     memory_runtime: Arc<GatewayMemoryRuntime>,
     hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
+    hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
 }
 
 impl MessageProcessor {
@@ -207,6 +210,7 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             resilience_worker: Arc::new(Mutex::new(None)),
+            hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
             skills_watcher_worker: Arc::new(Mutex::new(None)),
             tool_loop_config,
@@ -219,7 +223,12 @@ impl MessageProcessor {
             task_runtime,
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
+            hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
         }
+    }
+
+    pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
+        *self.hook_recovery_config.write().await = config;
     }
 
     #[allow(dead_code)]
@@ -236,6 +245,17 @@ impl MessageProcessor {
             });
         *self.hook_runtime.write().await = runtime.clone();
         self.agent_manager.set_hook_runtime(runtime).await;
+    }
+
+    pub async fn ensure_hook_runtime_with_run_store(&self) {
+        if self.hook_runtime.read().await.is_some() {
+            return;
+        }
+        self.set_hook_runtime(Some(Arc::new(HookRuntime::new(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        ))))
+        .await;
     }
 
     #[allow(dead_code)]
@@ -256,6 +276,7 @@ impl MessageProcessor {
     }
 
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
+        self.ensure_hook_runtime_with_run_store().await;
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
@@ -275,6 +296,19 @@ impl MessageProcessor {
                 ),
             )))
             .await;
+        match self
+            .agent_manager
+            .ensure_hook_runtime_with_current_providers()
+            .await
+        {
+            Ok(Some(runtime)) => {
+                *self.hook_runtime.write().await = Some(runtime);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(error = %error, "failed to install memory hooks into hook runtime");
+            }
+        }
     }
 
     pub async fn bind_memory_bridge_if_enabled(self: &Arc<Self>) {
@@ -326,6 +360,7 @@ impl MessageProcessor {
             warn!(error = %format!("{error:#}"), "failed to start task runtime");
         }
         self.start_task_event_listener().await;
+        self.start_hook_recovery_worker().await;
         let mut guard = self.resilience_worker.lock().await;
         if guard.is_some() {
             return;
@@ -372,6 +407,76 @@ impl MessageProcessor {
         });
 
         *guard = Some(handle);
+    }
+
+    pub async fn start_hook_recovery_worker(self: &Arc<Self>) {
+        {
+            let config = self.hook_recovery_config.read().await.clone();
+            if !config.enabled {
+                return;
+            }
+        }
+
+        let mut guard = self.hook_recovery_worker.lock().await;
+        if guard.is_some() {
+            return;
+        }
+
+        let this = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut first_pass = true;
+            loop {
+                let config = this.hook_recovery_config.read().await.clone();
+                if config.enabled && (!first_pass || config.startup_scan) {
+                    this.run_hook_recovery_pass(config.clone()).await;
+                }
+                first_pass = false;
+                sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
+            }
+        });
+
+        *guard = Some(handle);
+    }
+
+    async fn run_hook_recovery_pass(&self, config: GatewayHookRecoveryConfig) {
+        let Some(runtime) = self.hook_runtime.read().await.clone() else {
+            return;
+        };
+        if !runtime.has_run_store() {
+            return;
+        }
+        let options = HookRecoveryOptions {
+            now_unix_ms: now_timestamp_millis(),
+            batch_size: config.batch_size,
+            max_concurrent: config.max_concurrent,
+            stale_running_after_ms: config.stale_running_after_ms,
+            strict_debug: config.strict_debug,
+        };
+        match runtime.recover_background_runs_once(options).await {
+            Ok(summary) => {
+                if summary.scanned_count > 0
+                    || summary.retried_count > 0
+                    || summary.unrecoverable_count > 0
+                    || summary.timed_out_count > 0
+                {
+                    info!(
+                        scanned = summary.scanned_count,
+                        recovered = summary.recovered_count,
+                        executed = summary.executed_count,
+                        retried = summary.retried_count,
+                        timed_out = summary.timed_out_count,
+                        unrecoverable = summary.unrecoverable_count,
+                        skipped = summary.skipped_count,
+                        "hook recovery pass completed"
+                    );
+                } else {
+                    debug!("hook recovery pass completed with no recoverable runs");
+                }
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "hook recovery pass failed");
+            }
+        }
     }
 
     async fn start_task_event_listener(self: &Arc<Self>) {
@@ -439,6 +544,13 @@ fn empty_object_value() -> JsonValue {
 pub(crate) fn now_timestamp_secs() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+pub(crate) fn now_timestamp_millis() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
 }
@@ -644,6 +756,7 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             resilience_worker: Arc::new(Mutex::new(None)),
+            hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
             skills_watcher_worker: Arc::new(Mutex::new(None)),
             tool_loop_config: ToolLoopConfig {
@@ -737,6 +850,7 @@ impl MessageProcessor {
             task_runtime,
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
+            hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
         }
     }
 }

@@ -582,6 +582,7 @@ mod tests {
                     run_migrations_on_startup: true,
                 },
                 memory: GatewayMemoryConfig::default(),
+                hooks: Default::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),

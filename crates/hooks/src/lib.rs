@@ -76,11 +76,14 @@ pub use request::{
 };
 pub use runtime::{
     HookAttemptSummary, HookBackgroundDrainSummary, HookBackgroundRunSummary, HookPhaseRequest,
-    HookPhaseResponse, HookRunErrorSummary, HookRunStatus, HookRunSummary, HookRuntime,
-    HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
+    HookPhaseResponse, HookRecoveredRunSummary, HookRecoveryOptions, HookRecoverySummary,
+    HookRunErrorSummary, HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError,
+    HookRuntimeOptions, HookRuntimeResult,
 };
 pub use store::{
-    HookAuditEventStoreRecord, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
+    HOOK_RUN_RESUME_SCHEMA_VERSION, HookAuditEventStoreRecord, HookRecoverableRunRecord,
+    HookRecoveryScan, HookRetrySchedule, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
+    HookRunInputSnapshot, HookRunResumePayload, HookRunResumeReference, HookRunResumeState,
     HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
     HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
     NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,

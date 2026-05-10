@@ -18,6 +18,15 @@ service_name = "com.pioneer.gateway"
 listen_addr = "0.0.0.0:17878"
 outbound_queue_capacity = 128
 
+[gateway.hooks.recovery]
+enabled = true
+startup_scan = true
+poll_interval_ms = 2000
+batch_size = 64
+max_concurrent = 4
+stale_running_after_ms = 120000
+strict_debug = false
+
 [gateway.thread]
 default_model = "google/gemini-3-flash-preview"
 default_model_provider = "openrouter"

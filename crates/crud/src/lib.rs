@@ -79,7 +79,7 @@ pub use crate::repositories::hook_run::{
     HOOK_RUN_DIAGNOSTIC_PREVIEW_MAX_COUNT, HOOK_RUN_ERROR_MESSAGE_MAX_CHARS,
     HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookAuditEventRecord, HookRunAttemptCompletionRecord,
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
-    NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord,
+    NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{
@@ -479,6 +479,63 @@ impl CrudStore {
         run_id: &pioneer_hooks::HookRunId,
     ) -> Result<Vec<HookRunAttemptRecord>> {
         hook_run::list_hook_run_attempts(&self.connection, run_id).await
+    }
+
+    pub async fn list_recoverable_hook_runs(
+        &self,
+        scan: pioneer_hooks::HookRecoveryScan,
+    ) -> Result<Vec<RecoverableHookRunRecord>> {
+        hook_run::list_recoverable_hook_runs(&self.connection, scan).await
+    }
+
+    pub async fn schedule_hook_run_retry(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+        schedule: pioneer_hooks::HookRetrySchedule,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunRecord>> {
+        self.run_serialized_write(|| {
+            let schedule = schedule.clone();
+            let now = now.clone();
+            async move {
+                hook_run::schedule_hook_run_retry(&self.connection, run_id, schedule, now).await
+            }
+        })
+        .await
+    }
+
+    pub async fn mark_stale_hook_run_timed_out(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+        completion: HookRunCompletionRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunRecord>> {
+        self.run_serialized_write(|| {
+            let completion = completion.clone();
+            let now = now.clone();
+            async move {
+                hook_run::mark_stale_hook_run_timed_out(&self.connection, run_id, completion, now)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn mark_hook_run_unrecoverable(
+        &self,
+        run_id: &pioneer_hooks::HookRunId,
+        completion: HookRunCompletionRecord,
+        now: DateTimeWithTimeZone,
+    ) -> Result<Option<HookRunRecord>> {
+        self.run_serialized_write(|| {
+            let completion = completion.clone();
+            let now = now.clone();
+            async move {
+                hook_run::mark_hook_run_unrecoverable(&self.connection, run_id, completion, now)
+                    .await
+            }
+        })
+        .await
     }
 
     pub async fn append_hook_audit_events(

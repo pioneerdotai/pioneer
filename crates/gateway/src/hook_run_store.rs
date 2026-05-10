@@ -11,10 +11,11 @@ use pioneer_crud::{
     NewHookRunRecord as CrudNewHookRunRecord,
 };
 use pioneer_hooks::{
-    HookAuditEventStoreRecord, HookRunAttemptId, HookRunAttemptStoreCompletion,
-    HookRunAttemptStoreRecord, HookRunId, HookRunScope, HookRunScopeKind, HookRunStore,
-    HookRunStoreCompletion, HookRunStoreError, HookRunStoreRecord, HookRunStoreResult,
-    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookAuditEventStoreRecord, HookRecoverableRunRecord, HookRecoveryScan, HookRetrySchedule,
+    HookRunAttemptId, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunId,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
+    HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
+    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ impl HookRunStore for CrudHookRunStore {
             started_at: run.started_at_unix_ms.map(unix_ms_to_datetime),
             completed_at: run.completed_at_unix_ms.map(unix_ms_to_datetime),
             deadline_at: run.deadline_at_unix_ms.map(unix_ms_to_datetime),
+            resume_state: run.resume_state,
         };
 
         match self.crud_store.create_hook_run(create, now).await {
@@ -217,6 +219,101 @@ impl HookRunStore for CrudHookRunStore {
             .map(crud_audit_to_store_record)
             .collect()
     }
+
+    async fn list_recoverable_runs(
+        &self,
+        scan: HookRecoveryScan,
+    ) -> HookRunStoreResult<Vec<HookRecoverableRunRecord>> {
+        self.crud_store
+            .list_recoverable_hook_runs(scan)
+            .await
+            .map_err(|_| HookRunStoreError::internal("failed to list recoverable hook runs"))?
+            .into_iter()
+            .map(|record| {
+                let attempts = record
+                    .attempts
+                    .into_iter()
+                    .map(crud_attempt_to_store_record)
+                    .collect::<HookRunStoreResult<Vec<_>>>()?;
+                let run = crud_run_to_store_record(record.run)?;
+                Ok(HookRecoverableRunRecord {
+                    resume_state: record.resume_state,
+                    run,
+                    attempts,
+                })
+            })
+            .collect()
+    }
+
+    async fn schedule_run_retry(
+        &self,
+        run_id: &HookRunId,
+        schedule: HookRetrySchedule,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        let Some(record) = self
+            .crud_store
+            .schedule_hook_run_retry(run_id, schedule, unix_ms_to_datetime(current_unix_ms()))
+            .await
+            .map_err(|_| HookRunStoreError::internal("failed to schedule hook run retry"))?
+        else {
+            return Err(HookRunStoreError::invalid_record("hook run not found"));
+        };
+        crud_run_to_store_record(record)
+    }
+
+    async fn mark_stale_run_timed_out(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        let completed_at = unix_ms_to_datetime(completion.completed_at_unix_ms);
+        let Some(record) = self
+            .crud_store
+            .mark_stale_hook_run_timed_out(
+                run_id,
+                CrudHookRunCompletionRecord {
+                    status: completion.status,
+                    contribution_hashes: completion.contribution_hashes,
+                    diagnostic_previews: completion.diagnostic_previews,
+                    error: completion.error,
+                    completed_at: Some(completed_at),
+                },
+                completed_at,
+            )
+            .await
+            .map_err(|_| HookRunStoreError::internal("failed to mark stale hook run timed out"))?
+        else {
+            return Err(HookRunStoreError::invalid_record("hook run not found"));
+        };
+        crud_run_to_store_record(record)
+    }
+
+    async fn mark_run_unrecoverable(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        let completed_at = unix_ms_to_datetime(completion.completed_at_unix_ms);
+        let Some(record) = self
+            .crud_store
+            .mark_hook_run_unrecoverable(
+                run_id,
+                CrudHookRunCompletionRecord {
+                    status: completion.status,
+                    contribution_hashes: completion.contribution_hashes,
+                    diagnostic_previews: completion.diagnostic_previews,
+                    error: completion.error,
+                    completed_at: Some(completed_at),
+                },
+                completed_at,
+            )
+            .await
+            .map_err(|_| HookRunStoreError::internal("failed to mark hook run unrecoverable"))?
+        else {
+            return Err(HookRunStoreError::invalid_record("hook run not found"));
+        };
+        crud_run_to_store_record(record)
+    }
 }
 
 fn crud_run_to_store_record(record: CrudHookRunRecord) -> HookRunStoreResult<HookRunStoreRecord> {
@@ -239,6 +336,7 @@ fn crud_run_to_store_record(record: CrudHookRunRecord) -> HookRunStoreResult<Hoo
         started_at_unix_ms: record.started_at.map(datetime_to_unix_ms),
         completed_at_unix_ms: record.completed_at.map(datetime_to_unix_ms),
         deadline_at_unix_ms: record.deadline_at.map(datetime_to_unix_ms),
+        resume_state: record.resume_state,
     })
 }
 
@@ -346,9 +444,11 @@ mod tests {
         HookContext, HookContribution, HookDiagnosticCode, HookDiagnosticMessage, HookDomain,
         HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
         HookHandlerResponse, HookId, HookInput, HookInputKind, HookKind, HookPhase,
-        HookPhaseRequest, HookPromptContent, HookRegistry, HookRunIdempotencyKey, HookRunScopeId,
-        HookRunStatus, HookRuntime, HookRuntimeOptions, HookSectionId, HookSubscription,
-        HookSubscriptionId, HookSubscriptionRegistry, HookValue, PromptSectionContribution,
+        HookPhaseRequest, HookPolicySet, HookPromptContent, HookPromptContextSet, HookRecoveryScan,
+        HookRegistry, HookRetryPolicy, HookRetrySchedule, HookRunIdempotencyKey,
+        HookRunInputSnapshot, HookRunResumeState, HookRunScopeId, HookRunStatus, HookRuntime,
+        HookRuntimeOptions, HookSectionId, HookSubscription, HookSubscriptionId,
+        HookSubscriptionRegistry, HookValue, PromptSectionContribution,
     };
     use sea_orm::{Database, DatabaseConnection, EntityTrait};
     use std::time::Duration;
@@ -529,6 +629,7 @@ mod tests {
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             deadline_at_unix_ms: None,
+            resume_state: None,
         }
     }
 
@@ -537,6 +638,30 @@ mod tests {
             HookPhase::TurnPrePromptCompile,
             HookContext::default(),
             HookInput::empty(HookInputKind::TurnPrePromptCompile),
+        )
+    }
+
+    fn phase_21_resume_state() -> HookRunResumeState {
+        let execution_policy = HookExecutionPolicy {
+            await_policy: HookAwaitPolicy::Background,
+            timeout_ms: Some(10_000),
+            max_parallelism: None,
+        };
+        let input = HookInput::empty(HookInputKind::TurnPostTurn);
+        HookRunResumeState::input_snapshot(
+            execution_policy,
+            HookFailurePolicy::BestEffort,
+            HookRetryPolicy::default(),
+            1,
+            1,
+            1,
+            HookRunInputSnapshot::new(
+                HookPhase::TurnPostTurn,
+                HookContext::default(),
+                input,
+                HookPolicySet::empty(),
+                HookPromptContextSet::empty(),
+            ),
         )
     }
 
@@ -640,6 +765,172 @@ mod tests {
             .expect("second create should load");
 
         assert_eq!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn phase_21_crud_hook_run_store_lists_due_recoverable_queued_runs() {
+        let (_connection, _crud_store, hook_store) = migrated_store().await;
+        let mut run = new_store_run("gateway:hook:recoverable:queued");
+        run.phase = HookPhase::TurnPostTurn;
+        run.queued_at_unix_ms = Some(1_000);
+        run.resume_state = Some(phase_21_resume_state());
+        let created = hook_store
+            .create_or_load_run(run)
+            .await
+            .expect("run should create");
+
+        let records = hook_store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: 1_001,
+                batch_size: 10,
+                stale_running_after_ms: 1_000,
+                phases: Some(vec![HookPhase::TurnPostTurn]),
+            })
+            .await
+            .expect("recoverable runs should list");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run.id, created.id);
+        assert!(records[0].resume_state.is_some());
+        assert!(records[0].attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn phase_21_crud_hook_run_store_does_not_list_future_retry() {
+        let (_connection, _crud_store, hook_store) = migrated_store().await;
+        let mut run = new_store_run("gateway:hook:recoverable:future");
+        run.phase = HookPhase::TurnPostTurn;
+        run.queued_at_unix_ms = Some(5_000);
+        run.resume_state = Some(phase_21_resume_state());
+        hook_store
+            .create_or_load_run(run)
+            .await
+            .expect("run should create");
+
+        let records = hook_store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: 4_999,
+                batch_size: 10,
+                stale_running_after_ms: 1_000,
+                phases: Some(vec![HookPhase::TurnPostTurn]),
+            })
+            .await
+            .expect("recoverable runs should list");
+
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn phase_21_crud_hook_run_store_schedules_retry_and_lists_when_due() {
+        let (_connection, _crud_store, hook_store) = migrated_store().await;
+        let mut run = new_store_run("gateway:hook:recoverable:retry");
+        run.phase = HookPhase::TurnPostTurn;
+        run.queued_at_unix_ms = Some(1_000);
+        run.resume_state = Some(phase_21_resume_state());
+        let created = hook_store
+            .create_or_load_run(run)
+            .await
+            .expect("run should create");
+
+        let scheduled = hook_store
+            .schedule_run_retry(
+                &created.id,
+                HookRetrySchedule {
+                    queued_at_unix_ms: 3_000,
+                    deadline_at_unix_ms: None,
+                    diagnostic_previews: Vec::new(),
+                },
+            )
+            .await
+            .expect("retry should schedule");
+        assert_eq!(scheduled.status, HookRunStatus::Queued);
+
+        let before_due = hook_store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: 2_999,
+                batch_size: 10,
+                stale_running_after_ms: 1_000,
+                phases: Some(vec![HookPhase::TurnPostTurn]),
+            })
+            .await
+            .expect("recoverable runs should list");
+        assert!(before_due.is_empty());
+
+        let after_due = hook_store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: 3_000,
+                batch_size: 10,
+                stale_running_after_ms: 1_000,
+                phases: Some(vec![HookPhase::TurnPostTurn]),
+            })
+            .await
+            .expect("recoverable runs should list");
+        assert_eq!(after_due.len(), 1);
+        assert_eq!(after_due[0].run.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn phase_21_crud_hook_run_store_marks_stale_running_timed_out() {
+        let (_connection, _crud_store, hook_store) = migrated_store().await;
+        let mut run = new_store_run("gateway:hook:recoverable:stale");
+        run.phase = HookPhase::TurnPostTurn;
+        run.resume_state = Some(phase_21_resume_state());
+        let created = hook_store
+            .create_or_load_run(run)
+            .await
+            .expect("run should create");
+        hook_store
+            .mark_run_running(&created.id, 1_000)
+            .await
+            .expect("run should mark running");
+        let attempt = hook_store
+            .append_attempt(NewHookRunAttemptStoreRecord {
+                hook_run_id: created.id.clone(),
+                attempt_number: 1,
+                status: HookRunStatus::Running,
+                contribution_hashes: Vec::new(),
+                diagnostic_previews: Vec::new(),
+                error: None,
+                started_at_unix_ms: Some(1_000),
+                completed_at_unix_ms: None,
+                duration_ms: None,
+            })
+            .await
+            .expect("attempt should append");
+
+        let records = hook_store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: 3_000,
+                batch_size: 10,
+                stale_running_after_ms: 1_000,
+                phases: Some(vec![HookPhase::TurnPostTurn]),
+            })
+            .await
+            .expect("recoverable runs should list");
+        assert_eq!(records.len(), 1);
+
+        let completed = hook_store
+            .mark_stale_run_timed_out(
+                &created.id,
+                HookRunStoreCompletion {
+                    status: HookRunStatus::TimedOut,
+                    contribution_hashes: Vec::new(),
+                    diagnostic_previews: Vec::new(),
+                    error: None,
+                    completed_at_unix_ms: 3_000,
+                },
+            )
+            .await
+            .expect("stale run should mark timed out");
+        assert_eq!(completed.status, HookRunStatus::TimedOut);
+
+        let attempts = _crud_store
+            .list_hook_run_attempts(&created.id)
+            .await
+            .expect("attempts should list");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].id, attempt.id);
+        assert_eq!(attempts[0].status, HookRunStatus::TimedOut);
     }
 
     #[tokio::test]

@@ -523,6 +523,7 @@ pub(crate) fn test_config() -> AppConfig {
             },
             skills: GatewaySkillsConfig::default(),
             memory: GatewayMemoryConfig::default(),
+            hooks: Default::default(),
             provider: GatewayProviderConfig {
                 default_timeout_secs: 120,
                 attachments: Default::default(),

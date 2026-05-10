@@ -48,6 +48,8 @@ pub struct GatewayConfig {
     pub database: GatewayDatabaseConfig,
     #[serde(default)]
     pub memory: GatewayMemoryConfig,
+    #[serde(default)]
+    pub hooks: GatewayHooksConfig,
     pub auth: GatewayAuthConfig,
 }
 
@@ -79,6 +81,52 @@ impl GatewayMemoryConfig {
         let capsules_dir =
             normalize_runtime_dir_path(self.capsules_dir.as_str(), "gateway.memory.capsules_dir")?;
         Ok(runtime_home.join(capsules_dir))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayHooksConfig {
+    #[serde(default)]
+    pub recovery: GatewayHookRecoveryConfig,
+}
+
+impl Default for GatewayHooksConfig {
+    fn default() -> Self {
+        Self {
+            recovery: GatewayHookRecoveryConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayHookRecoveryConfig {
+    #[serde(default = "default_gateway_hook_recovery_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gateway_hook_recovery_startup_scan")]
+    pub startup_scan: bool,
+    #[serde(default = "default_gateway_hook_recovery_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_gateway_hook_recovery_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_gateway_hook_recovery_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_gateway_hook_recovery_stale_running_after_ms")]
+    pub stale_running_after_ms: u64,
+    #[serde(default)]
+    pub strict_debug: bool,
+}
+
+impl Default for GatewayHookRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gateway_hook_recovery_enabled(),
+            startup_scan: default_gateway_hook_recovery_startup_scan(),
+            poll_interval_ms: default_gateway_hook_recovery_poll_interval_ms(),
+            batch_size: default_gateway_hook_recovery_batch_size(),
+            max_concurrent: default_gateway_hook_recovery_max_concurrent(),
+            stale_running_after_ms: default_gateway_hook_recovery_stale_running_after_ms(),
+            strict_debug: false,
+        }
     }
 }
 
@@ -652,6 +700,30 @@ const fn default_gateway_memory_allow_global_user() -> bool {
 
 const fn default_gateway_memory_allow_global_agent() -> bool {
     false
+}
+
+const fn default_gateway_hook_recovery_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_hook_recovery_startup_scan() -> bool {
+    true
+}
+
+const fn default_gateway_hook_recovery_poll_interval_ms() -> u64 {
+    2_000
+}
+
+const fn default_gateway_hook_recovery_batch_size() -> usize {
+    64
+}
+
+const fn default_gateway_hook_recovery_max_concurrent() -> usize {
+    4
+}
+
+const fn default_gateway_hook_recovery_stale_running_after_ms() -> u64 {
+    120_000
 }
 
 const fn default_computer_use_snapshot_transport_max_bytes() -> usize {

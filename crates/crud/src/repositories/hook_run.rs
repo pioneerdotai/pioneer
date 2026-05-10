@@ -1,21 +1,26 @@
 use anyhow::{Context, Result, bail, ensure};
+use chrono::Duration as ChronoDuration;
 use pioneer_entity::{hook_audit_event, hook_run, hook_run_attempt};
 use pioneer_hooks::{
     HookActor, HookActorKind, HookAgentId, HookAuditEventKind, HookContext, HookContextMode,
     HookContributionHash, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview, HookId,
-    HookIdError, HookMetadata, HookPhase, HookRunAttemptId, HookRunErrorSummary, HookRunId,
-    HookRunIdempotencyKey, HookRunScopeId, HookRunStatus, HookSubscriptionId, HookTaskId,
-    HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
+    HookIdError, HookMetadata, HookPhase, HookRecoveryScan, HookRetrySchedule, HookRunAttemptId,
+    HookRunErrorSummary, HookRunId, HookRunIdempotencyKey, HookRunResumeState, HookRunScopeId,
+    HookRunStatus, HookSubscriptionId, HookTaskId, HookThreadId, HookTurnId, HookValue,
+    HookWorkspaceId,
 };
 use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use crate::convention::{DB_ID_LEN, hook_run_status_from_db, hook_run_status_to_db};
+use crate::util::unix_ms_to_datetime;
 
 pub const HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS: usize = 255;
 pub const HOOK_RUN_DIAGNOSTIC_PREVIEW_MAX_COUNT: usize = 40;
@@ -108,6 +113,7 @@ pub struct NewHookRunRecord {
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub deadline_at: Option<DateTimeWithTimeZone>,
+    pub resume_state: Option<HookRunResumeState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +138,14 @@ pub struct HookRunRecord {
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub deadline_at: Option<DateTimeWithTimeZone>,
+    pub resume_state: Option<HookRunResumeState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoverableHookRunRecord {
+    pub run: HookRunRecord,
+    pub resume_state: Option<HookRunResumeState>,
+    pub attempts: Vec<HookRunAttemptRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,6 +249,7 @@ pub async fn create_hook_run<C: ConnectionTrait>(
         error_columns(error);
     let queued_at = run.queued_at.or(Some(now));
     let metadata_json = serialize_metadata(&run.context.metadata)?;
+    let resume_state_json = optional_serialize_resume_state(&run.resume_state)?;
     let scope_kind = run
         .scope
         .as_ref()
@@ -279,6 +294,7 @@ pub async fn create_hook_run<C: ConnectionTrait>(
         error_retryable: Set(error_retryable),
         error_safe_for_user: Set(error_safe_for_user),
         metadata_json: Set(metadata_json),
+        resume_state_json: Set(resume_state_json),
         created_at: Set(now),
         updated_at: Set(now),
         queued_at: Set(queued_at),
@@ -579,6 +595,166 @@ pub async fn list_hook_run_attempts<C: ConnectionTrait>(
         .collect()
 }
 
+pub async fn list_recoverable_hook_runs<C: ConnectionTrait>(
+    db: &C,
+    scan: HookRecoveryScan,
+) -> Result<Vec<RecoverableHookRunRecord>> {
+    let now = unix_ms_to_datetime(scan.now_unix_ms);
+    let stale_started_before = now
+        .checked_sub_signed(ChronoDuration::milliseconds(
+            i64::try_from(scan.stale_running_after_ms).unwrap_or(i64::MAX),
+        ))
+        .unwrap_or(now);
+    let mut condition = Condition::any()
+        .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Queued)))
+        .add(hook_run::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)));
+    if let Some(phases) = scan.phases {
+        let phase_values = phases
+            .into_iter()
+            .map(|phase| phase.as_str().to_owned())
+            .collect::<Vec<_>>();
+        condition = Condition::all()
+            .add(condition)
+            .add(hook_run::Column::Phase.is_in(phase_values));
+    }
+    let limit = u64::try_from(scan.batch_size.max(1)).unwrap_or(u64::MAX);
+    let rows = hook_run::Entity::find()
+        .filter(condition)
+        .filter(hook_run::Column::ResumeStateJson.is_not_null())
+        .order_by_asc(hook_run::Column::QueuedAt)
+        .order_by_asc(hook_run::Column::CreatedAt)
+        .limit(limit.saturating_mul(4))
+        .all(db)
+        .await
+        .context("failed to list recoverable hook runs")?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let due = match row.status.as_str() {
+            "queued" => row.queued_at.is_none_or(|queued_at| queued_at <= now),
+            "running" => {
+                row.deadline_at
+                    .is_some_and(|deadline_at| deadline_at <= now)
+                    || row
+                        .started_at
+                        .is_some_and(|started_at| started_at <= stale_started_before)
+            }
+            _ => false,
+        };
+        if !due {
+            continue;
+        }
+        let run = hook_run_record_from_model(row)?;
+        let attempts = list_hook_run_attempts(db, &run.id).await?;
+        records.push(RecoverableHookRunRecord {
+            resume_state: run.resume_state.clone(),
+            run,
+            attempts,
+        });
+        if records.len() >= scan.batch_size.max(1) {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+pub async fn schedule_hook_run_retry<C: ConnectionTrait>(
+    db: &C,
+    run_id: &HookRunId,
+    schedule: HookRetrySchedule,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<HookRunRecord>> {
+    let diagnostic_previews = bounded_diagnostic_previews(schedule.diagnostic_previews);
+    let queued_at = unix_ms_to_datetime(schedule.queued_at_unix_ms);
+    let deadline_at = schedule.deadline_at_unix_ms.map(unix_ms_to_datetime);
+    let affected = hook_run::Entity::update_many()
+        .col_expr(
+            hook_run::Column::Status,
+            Expr::value(hook_run_status_to_db(HookRunStatus::Queued).to_owned()),
+        )
+        .col_expr(
+            hook_run::Column::DiagnosticCount,
+            Expr::value(usize_to_i64(diagnostic_previews.len(), "diagnostic_count")?),
+        )
+        .col_expr(
+            hook_run::Column::DiagnosticPreviewsJson,
+            Expr::value(serialize_diagnostic_previews(&diagnostic_previews)?),
+        )
+        .col_expr(
+            hook_run::Column::ErrorCode,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            hook_run::Column::ErrorMessagePreview,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(hook_run::Column::ErrorRetryable, Expr::value(false))
+        .col_expr(hook_run::Column::ErrorSafeForUser, Expr::value(true))
+        .col_expr(hook_run::Column::QueuedAt, Expr::value(Some(queued_at)))
+        .col_expr(
+            hook_run::Column::StartedAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            hook_run::Column::CompletedAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(hook_run::Column::DeadlineAt, Expr::value(deadline_at))
+        .col_expr(hook_run::Column::UpdatedAt, Expr::value(now))
+        .filter(hook_run::Column::Id.eq(run_id.as_str().to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to schedule hook run `{run_id}` retry"))?
+        .rows_affected;
+    if affected == 0 {
+        return Ok(None);
+    }
+    find_hook_run_by_id(db, run_id).await
+}
+
+pub async fn mark_stale_hook_run_timed_out<C: ConnectionTrait>(
+    db: &C,
+    run_id: &HookRunId,
+    completion: HookRunCompletionRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<HookRunRecord>> {
+    let latest_running_attempt = hook_run_attempt::Entity::find()
+        .filter(hook_run_attempt::Column::HookRunId.eq(run_id.as_str().to_owned()))
+        .filter(hook_run_attempt::Column::Status.eq(hook_run_status_to_db(HookRunStatus::Running)))
+        .order_by_desc(hook_run_attempt::Column::AttemptNumber)
+        .one(db)
+        .await
+        .with_context(|| format!("failed to find stale running hook attempt for `{run_id}`"))?;
+    if let Some(attempt) = latest_running_attempt {
+        let attempt_id =
+            HookRunAttemptId::new(attempt.id).context("invalid stale hook run attempt id")?;
+        let _ = complete_hook_run_attempt(
+            db,
+            &attempt_id,
+            HookRunAttemptCompletionRecord {
+                status: HookRunStatus::TimedOut,
+                contribution_hashes: completion.contribution_hashes.clone(),
+                diagnostic_previews: completion.diagnostic_previews.clone(),
+                error: completion.error.clone(),
+                completed_at: completion.completed_at,
+                duration_ms: None,
+            },
+            now,
+        )
+        .await?;
+    }
+    complete_hook_run(db, run_id, completion, now).await
+}
+
+pub async fn mark_hook_run_unrecoverable<C: ConnectionTrait>(
+    db: &C,
+    run_id: &HookRunId,
+    completion: HookRunCompletionRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<HookRunRecord>> {
+    complete_hook_run(db, run_id, completion, now).await
+}
+
 pub async fn append_hook_audit_events<C: ConnectionTrait>(
     db: &C,
     records: Vec<NewHookAuditEventRecord>,
@@ -730,6 +906,7 @@ fn hook_run_record_from_model(model: hook_run::Model) -> Result<HookRunRecord> {
         started_at: model.started_at,
         completed_at: model.completed_at,
         deadline_at: model.deadline_at,
+        resume_state: optional_deserialize_resume_state(model.resume_state_json)?,
     })
 }
 
@@ -963,6 +1140,23 @@ fn deserialize_metadata(value: &str) -> Result<HookMetadata> {
     serde_json::from_str(value).context("failed to deserialize hook run metadata")
 }
 
+fn optional_serialize_resume_state(value: &Option<HookRunResumeState>) -> Result<Option<String>> {
+    value
+        .as_ref()
+        .map(|state| serde_json::to_string(state).context("failed to serialize hook resume state"))
+        .transpose()
+}
+
+fn optional_deserialize_resume_state(value: Option<String>) -> Result<Option<HookRunResumeState>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(value.as_str()).context("failed to deserialize hook resume state")
+}
+
 fn serialize_hook_value(value: &HookValue) -> Result<String> {
     serde_json::to_string(value).context("failed to serialize hook value")
 }
@@ -1066,6 +1260,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             deadline_at: Some(timestamp(60)),
+            resume_state: None,
         }
     }
 

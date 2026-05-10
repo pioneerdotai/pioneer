@@ -1,13 +1,15 @@
 use crate::{
-    HookAwaitPolicy, HookContext, HookContribution, HookContributionHash, HookDiagnostic,
-    HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
+    HookAwaitPolicy, HookCapability, HookContext, HookContribution, HookContributionHash,
+    HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticPreview,
     HookDiagnosticRedactionPolicy, HookDiagnosticSeverity, HookError, HookFailurePolicy,
     HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInput, HookInputPayload,
-    HookMetadata, HookPhase, HookPolicySet, HookPromptContextSet, HookRegistry, HookRegistryError,
-    HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord, HookRunIdempotencyKey, HookRunScope,
-    HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreRecord, HookSubscription,
-    HookSubscriptionId, HookSubscriptionRegistry, NewHookAuditEventStoreRecord,
-    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookMetadata, HookMetadataKey, HookPhase, HookPolicySet, HookPromptContextSet,
+    HookRecoverableRunRecord, HookRecoveryScan, HookRegistry, HookRegistryError, HookRetryBackoff,
+    HookRetrySchedule, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
+    HookRunIdempotencyKey, HookRunInputSnapshot, HookRunResumePayload, HookRunResumeState,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreRecord,
+    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue,
+    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 use futures_timer::Delay;
 use futures_util::future::{Either, join_all, select};
@@ -325,6 +327,87 @@ impl HookBackgroundDrainSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRecoveryOptions {
+    pub now_unix_ms: i64,
+    pub batch_size: usize,
+    pub max_concurrent: usize,
+    pub stale_running_after_ms: u64,
+    pub strict_debug: bool,
+}
+
+impl Default for HookRecoveryOptions {
+    fn default() -> Self {
+        Self {
+            now_unix_ms: current_unix_ms(),
+            batch_size: 64,
+            max_concurrent: 4,
+            stale_running_after_ms: 120_000,
+            strict_debug: false,
+        }
+    }
+}
+
+impl HookRecoveryOptions {
+    fn normalized(mut self) -> Self {
+        self.batch_size = self.batch_size.max(1);
+        self.max_concurrent = self.max_concurrent.max(1);
+        self.stale_running_after_ms = self.stale_running_after_ms.max(1);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HookRecoverySummary {
+    pub scanned_count: usize,
+    pub recovered_count: usize,
+    pub executed_count: usize,
+    pub retried_count: usize,
+    pub timed_out_count: usize,
+    pub unrecoverable_count: usize,
+    pub skipped_count: usize,
+}
+
+impl HookRecoverySummary {
+    fn record(&mut self, run: &HookRecoveredRunSummary) {
+        match run.status {
+            HookRunStatus::Succeeded => {
+                self.recovered_count += 1;
+                self.executed_count += 1;
+            }
+            HookRunStatus::Failed => {
+                self.executed_count += usize::from(run.executed);
+                if run.unrecoverable {
+                    self.unrecoverable_count += 1;
+                }
+            }
+            HookRunStatus::TimedOut => {
+                self.timed_out_count += 1;
+                self.executed_count += usize::from(run.executed);
+            }
+            HookRunStatus::Skipped => self.skipped_count += 1,
+            HookRunStatus::Queued => {
+                if run.retried {
+                    self.retried_count += 1;
+                }
+            }
+            HookRunStatus::Running => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRecoveredRunSummary {
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub status: HookRunStatus,
+    pub executed: bool,
+    pub retried: bool,
+    pub unrecoverable: bool,
+    pub diagnostic_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRuntimeOptions {
     pub default_deadline_timeout_ms: u64,
@@ -576,6 +659,46 @@ impl HookRuntime {
             summary.record(&run_summary);
         }
         Ok(summary)
+    }
+
+    pub async fn recover_background_runs_once(
+        &self,
+        options: HookRecoveryOptions,
+    ) -> HookRuntimeResult<HookRecoverySummary> {
+        let options = options.normalized();
+        let Some(store) = self.run_store.as_ref() else {
+            return Ok(HookRecoverySummary::default());
+        };
+        let records = store
+            .list_recoverable_runs(HookRecoveryScan {
+                now_unix_ms: options.now_unix_ms,
+                batch_size: options.batch_size,
+                stale_running_after_ms: options.stale_running_after_ms,
+                phases: None,
+            })
+            .await
+            .unwrap_or_default();
+        let mut summary = HookRecoverySummary {
+            scanned_count: records.len(),
+            ..HookRecoverySummary::default()
+        };
+        for chunk in records.chunks(options.max_concurrent) {
+            for record in chunk {
+                let run_summary = self
+                    .recover_background_run(record.clone(), options.clone())
+                    .await?;
+                summary.record(&run_summary);
+            }
+        }
+        Ok(summary)
+    }
+
+    pub async fn recover_background_run(
+        &self,
+        record: HookRecoverableRunRecord,
+        options: HookRecoveryOptions,
+    ) -> HookRuntimeResult<HookRecoveredRunSummary> {
+        recover_background_run(self, record, options.normalized()).await
     }
 }
 
@@ -1091,11 +1214,329 @@ async fn execute_queued_background_run(
             Err(error) => HookNodeOutcome::Failed(error),
         };
     }
-    let summary = background_run_summary(&run, &outcome);
-    run.persistence
-        .complete_for_outcome(&run.node.subscription, run.request.phase, &outcome, options)
+    let status = run
+        .persistence
+        .complete_background_for_outcome(&run.node, run.request.phase, &outcome, options)
         .await;
-    Ok(summary)
+    Ok(background_run_summary(&run, &outcome, status))
+}
+
+async fn recover_background_run(
+    runtime: &HookRuntime,
+    mut record: HookRecoverableRunRecord,
+    options: HookRecoveryOptions,
+) -> HookRuntimeResult<HookRecoveredRunSummary> {
+    let Some(store) = runtime.run_store.clone() else {
+        return Ok(recovered_run_summary(
+            &record.run,
+            HookRunStatus::Skipped,
+            false,
+            false,
+            false,
+            0,
+        ));
+    };
+
+    let resolved = resolve_recovered_background_run(runtime, &record);
+    let (node, request, await_policy) = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            mark_recovered_run_unrecoverable(store.as_ref(), &record.run, error, &runtime.options)
+                .await;
+            return Ok(recovered_run_summary(
+                &record.run,
+                HookRunStatus::Failed,
+                false,
+                false,
+                true,
+                1,
+            ));
+        }
+    };
+
+    if record.run.status == HookRunStatus::Running {
+        let stale_error = timeout_error(
+            node.subscription
+                .execution_policy
+                .timeout_ms
+                .unwrap_or(runtime.options.default_deadline_timeout_ms),
+        );
+        let current_attempt = record.run.attempt_count.max(
+            record
+                .attempts
+                .iter()
+                .map(|attempt| attempt.attempt_number)
+                .max()
+                .unwrap_or(0),
+        );
+        let can_retry = should_retry_background_outcome(
+            &node,
+            current_attempt,
+            HookRunStatus::TimedOut,
+            &stale_error,
+        );
+        let stale_completion = error_completion(
+            HookRunStatus::TimedOut,
+            stale_error.clone(),
+            &runtime.options,
+            options.now_unix_ms,
+        );
+        let _ = store
+            .mark_stale_run_timed_out(&record.run.id, stale_completion)
+            .await;
+        if !can_retry {
+            return Ok(recovered_run_summary(
+                &record.run,
+                HookRunStatus::TimedOut,
+                false,
+                false,
+                false,
+                1,
+            ));
+        }
+        let queued_at_unix_ms = options.now_unix_ms.saturating_add(retry_delay_ms(
+            &node.subscription.retry_policy,
+            current_attempt,
+        ));
+        let deadline_at_unix_ms = node
+            .subscription
+            .execution_policy
+            .timeout_ms
+            .map(|timeout_ms| queued_at_unix_ms.saturating_add(u64_to_i64_saturating(timeout_ms)));
+        if let Ok(updated) = store
+            .schedule_run_retry(
+                &record.run.id,
+                HookRetrySchedule {
+                    queued_at_unix_ms,
+                    deadline_at_unix_ms,
+                    diagnostic_previews: vec![
+                        diagnostic_from_error(&stale_error, HookRunStatus::TimedOut)
+                            .preview(&runtime.options.diagnostic_redaction_policy()),
+                    ],
+                },
+            )
+            .await
+        {
+            record.run = updated;
+        }
+    }
+
+    let run = HookQueuedBackgroundRun {
+        await_policy,
+        node,
+        request,
+        persistence: HookRunPersistence::from_existing(store, record.run.clone()),
+    };
+    let summary = execute_queued_background_run(run, &runtime.options).await?;
+    Ok(HookRecoveredRunSummary {
+        subscription_id: summary.subscription_id,
+        hook_id: summary.hook_id,
+        phase: summary.phase,
+        status: summary.status,
+        executed: true,
+        retried: summary.status == HookRunStatus::Queued,
+        unrecoverable: false,
+        diagnostic_count: summary.diagnostic_count,
+    })
+}
+
+fn resolve_recovered_background_run(
+    runtime: &HookRuntime,
+    record: &HookRecoverableRunRecord,
+) -> Result<
+    (
+        HookExecutionNode,
+        HookPhaseRequest,
+        HookQueuedBackgroundPolicy,
+    ),
+    HookError,
+> {
+    let resume_state = record
+        .resume_state
+        .as_ref()
+        .or(record.run.resume_state.as_ref())
+        .ok_or_else(|| {
+            recovery_error(
+                "hook.recovery_resume_missing",
+                "hook recovery resume state is missing",
+            )
+        })?;
+    if resume_state.schema_version != crate::HOOK_RUN_RESUME_SCHEMA_VERSION {
+        return Err(recovery_error(
+            "hook.recovery_resume_unsupported",
+            "hook recovery resume schema version is unsupported",
+        ));
+    }
+    let await_policy =
+        HookQueuedBackgroundPolicy::from_await_policy(resume_state.execution_policy.await_policy)
+            .ok_or_else(|| {
+            recovery_error(
+                "hook.recovery_not_background",
+                "hook recovery requires a background-like await policy",
+            )
+        })?;
+    let mut subscription = runtime
+        .subscriptions
+        .get_subscription(&record.run.subscription_id)
+        .map_err(|_| {
+            recovery_error(
+                "hook.recovery_subscription_failed",
+                "hook recovery could not read subscription",
+            )
+        })?
+        .ok_or_else(|| {
+            recovery_error(
+                "hook.recovery_subscription_missing",
+                "hook recovery subscription is missing",
+            )
+        })?;
+    if subscription.hook_id != record.run.hook_id || subscription.phase != record.run.phase {
+        return Err(recovery_error(
+            "hook.recovery_subscription_mismatch",
+            "hook recovery subscription no longer matches persisted run",
+        ));
+    }
+    if !subscription.enabled {
+        return Err(recovery_error(
+            "hook.recovery_subscription_disabled",
+            "hook recovery subscription is disabled",
+        ));
+    }
+    subscription.execution_policy = resume_state.execution_policy.clone();
+    subscription.failure_policy = resume_state.failure_policy;
+    subscription.retry_policy = resume_state.retry_policy.clone();
+    let handler = runtime
+        .handlers
+        .get_handler(&record.run.hook_id)
+        .map_err(|_| {
+            recovery_error(
+                "hook.recovery_handler_failed",
+                "hook recovery could not read handler",
+            )
+        })?
+        .ok_or_else(|| {
+            recovery_error(
+                "hook.recovery_handler_missing",
+                "hook recovery handler is missing",
+            )
+        })?;
+    if !handler.supported_phases().contains(&record.run.phase) {
+        return Err(recovery_error(
+            "hook.recovery_phase_unsupported",
+            "hook recovery handler no longer supports persisted phase",
+        ));
+    }
+    if handler.version() != resume_state.handler_version
+        || handler.input_contract_version() != resume_state.input_contract_version
+        || handler.output_contract_version() != resume_state.output_contract_version
+    {
+        return Err(recovery_error(
+            "hook.recovery_contract_mismatch",
+            "hook recovery handler contract version no longer matches persisted run",
+        ));
+    }
+    let request = match &resume_state.payload {
+        HookRunResumePayload::InputSnapshot(snapshot) => request_from_snapshot(snapshot)?,
+        HookRunResumePayload::Reference(_) => {
+            return Err(recovery_error(
+                "hook.recovery_reference_unsupported",
+                "hook recovery reference reconstruction is not available",
+            ));
+        }
+    };
+    Ok((
+        HookExecutionNode {
+            order_index: 0,
+            subscription,
+            handler,
+        },
+        request,
+        await_policy,
+    ))
+}
+
+fn request_from_snapshot(snapshot: &HookRunInputSnapshot) -> Result<HookPhaseRequest, HookError> {
+    let expected_hash = HookRunInputSnapshot::hash_parts(
+        snapshot.phase,
+        &snapshot.context,
+        &snapshot.input,
+        &snapshot.policy_set,
+        &snapshot.prompt_context_set,
+    );
+    if expected_hash != snapshot.snapshot_hash {
+        return Err(recovery_error(
+            "hook.recovery_snapshot_hash_mismatch",
+            "hook recovery input snapshot hash does not match",
+        ));
+    }
+    Ok(HookPhaseRequest::new(
+        snapshot.phase,
+        snapshot.context.clone(),
+        snapshot.input.clone(),
+    )
+    .with_policy_set(snapshot.policy_set.clone())
+    .with_prompt_context_set(snapshot.prompt_context_set.clone()))
+}
+
+async fn mark_recovered_run_unrecoverable(
+    store: &dyn HookRunStore,
+    run: &HookRunStoreRecord,
+    error: HookError,
+    options: &HookRuntimeOptions,
+) {
+    let _ = store
+        .mark_run_unrecoverable(
+            &run.id,
+            error_completion(HookRunStatus::Failed, error, options, current_unix_ms()),
+        )
+        .await;
+}
+
+fn error_completion(
+    status: HookRunStatus,
+    error: HookError,
+    options: &HookRuntimeOptions,
+    completed_at_unix_ms: i64,
+) -> HookRunStoreCompletion {
+    let policy = options.diagnostic_redaction_policy();
+    let diagnostic = diagnostic_from_error(&error, status);
+    let diagnostic_preview = diagnostic.preview(&policy);
+    let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+    HookRunStoreCompletion {
+        status,
+        contribution_hashes: Vec::new(),
+        diagnostic_previews: vec![diagnostic_preview],
+        error: Some(error_summary),
+        completed_at_unix_ms,
+    }
+}
+
+fn recovery_error(code: &'static str, message: &'static str) -> HookError {
+    HookError::new(
+        HookDiagnosticCode::new(code).expect("static diagnostic code is valid"),
+        HookDiagnosticMessage::new(message).expect("static diagnostic message is valid"),
+    )
+    .with_safe_for_user(true)
+}
+
+fn recovered_run_summary(
+    run: &HookRunStoreRecord,
+    status: HookRunStatus,
+    executed: bool,
+    retried: bool,
+    unrecoverable: bool,
+    diagnostic_count: usize,
+) -> HookRecoveredRunSummary {
+    HookRecoveredRunSummary {
+        subscription_id: run.subscription_id.clone(),
+        hook_id: run.hook_id.clone(),
+        phase: run.phase,
+        status,
+        executed,
+        retried,
+        unrecoverable,
+        diagnostic_count,
+    }
 }
 
 struct HookRunPersistence {
@@ -1140,6 +1581,7 @@ impl HookRunPersistence {
                         queued_at_unix_ms.saturating_add(u64_to_i64_saturating(timeout_ms))
                     },
                 ),
+                resume_state: background_resume_state(node, request),
             })
             .await
             .ok();
@@ -1156,6 +1598,15 @@ impl HookRunPersistence {
         Self {
             store: None,
             run: None,
+            attempt: None,
+            attempt_started_instant: None,
+        }
+    }
+
+    fn from_existing(store: Arc<dyn HookRunStore>, run: HookRunStoreRecord) -> Self {
+        Self {
+            store: Some(store),
+            run: Some(run),
             attempt: None,
             attempt_started_instant: None,
         }
@@ -1275,6 +1726,150 @@ impl HookRunPersistence {
             }
             HookNodeOutcome::Queued => {}
         }
+    }
+
+    async fn complete_background_for_outcome(
+        &mut self,
+        node: &HookExecutionNode,
+        phase: HookPhase,
+        outcome: &HookNodeOutcome,
+        options: &HookRuntimeOptions,
+    ) -> HookRunStatus {
+        match outcome {
+            HookNodeOutcome::Succeeded(response) => {
+                let policy = options.diagnostic_redaction_policy();
+                let contribution_hashes = hash_contributions(&response.contributions);
+                let diagnostic_previews = diagnostic_previews(&response.diagnostics, &policy);
+                self.complete_attempt_and_run(
+                    HookRunStatus::Succeeded,
+                    contribution_hashes,
+                    diagnostic_previews,
+                    None,
+                    current_unix_ms(),
+                )
+                .await;
+                self.persist_audit_contributions(
+                    &node.subscription,
+                    phase,
+                    response.contributions.as_slice(),
+                    current_unix_ms(),
+                )
+                .await;
+                HookRunStatus::Succeeded
+            }
+            HookNodeOutcome::Failed(error) => {
+                self.complete_background_error_or_retry(
+                    node,
+                    phase,
+                    HookRunStatus::Failed,
+                    error.clone(),
+                    options,
+                )
+                .await
+            }
+            HookNodeOutcome::TimedOut { timeout_ms } => {
+                self.complete_background_error_or_retry(
+                    node,
+                    phase,
+                    HookRunStatus::TimedOut,
+                    timeout_error(*timeout_ms),
+                    options,
+                )
+                .await
+            }
+            HookNodeOutcome::Skipped => {
+                self.complete_run(
+                    HookRunStatus::Skipped,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    current_unix_ms(),
+                )
+                .await;
+                HookRunStatus::Skipped
+            }
+            HookNodeOutcome::Queued => HookRunStatus::Queued,
+        }
+    }
+
+    async fn complete_background_error_or_retry(
+        &mut self,
+        node: &HookExecutionNode,
+        phase: HookPhase,
+        status: HookRunStatus,
+        error: HookError,
+        options: &HookRuntimeOptions,
+    ) -> HookRunStatus {
+        let policy = options.diagnostic_redaction_policy();
+        let diagnostic = diagnostic_from_error(&error, status);
+        let diagnostic_preview = diagnostic.preview(&policy);
+        let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+        let completed_at_unix_ms = current_unix_ms();
+        self.complete_attempt(
+            status,
+            Vec::new(),
+            vec![diagnostic_preview.clone()],
+            Some(error_summary.clone()),
+            completed_at_unix_ms,
+        )
+        .await;
+
+        if should_retry_background_outcome(node, self.current_attempt_number(), status, &error) {
+            let queued_at_unix_ms = completed_at_unix_ms.saturating_add(retry_delay_ms(
+                &node.subscription.retry_policy,
+                self.current_attempt_number(),
+            ));
+            let deadline_at_unix_ms =
+                node.subscription
+                    .execution_policy
+                    .timeout_ms
+                    .map(|timeout_ms| {
+                        queued_at_unix_ms.saturating_add(u64_to_i64_saturating(timeout_ms))
+                    });
+            if let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) {
+                if let Ok(updated) = store
+                    .schedule_run_retry(
+                        &run.id,
+                        HookRetrySchedule {
+                            queued_at_unix_ms,
+                            deadline_at_unix_ms,
+                            diagnostic_previews: vec![diagnostic_preview.clone()],
+                        },
+                    )
+                    .await
+                {
+                    self.run = Some(updated);
+                    return HookRunStatus::Queued;
+                }
+            }
+        }
+
+        self.complete_run(
+            status,
+            Vec::new(),
+            vec![diagnostic_preview],
+            Some(error_summary),
+            completed_at_unix_ms,
+        )
+        .await;
+        if node.subscription.failure_policy == HookFailurePolicy::Fallback {
+            self.persist_audit_contributions(
+                &node.subscription,
+                phase,
+                node.subscription.fallback_contributions.as_slice(),
+                current_unix_ms(),
+            )
+            .await;
+        }
+        status
+    }
+
+    fn current_attempt_number(&self) -> u16 {
+        self.attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_number)
+            .or_else(|| self.run.as_ref().map(|run| run.attempt_count))
+            .unwrap_or(0)
     }
 
     async fn complete_error_outcome(
@@ -1495,6 +2090,47 @@ fn hook_run_idempotency_key(
     HookRunIdempotencyKey::new(key).expect("sha256 hook run idempotency key is valid")
 }
 
+fn background_resume_state(
+    node: &HookExecutionNode,
+    request: &HookPhaseRequest,
+) -> Option<HookRunResumeState> {
+    if !is_background_like(node.subscription.execution_policy.await_policy) {
+        return None;
+    }
+    let snapshot = recoverable_background_input_snapshot(request)?;
+    Some(HookRunResumeState::input_snapshot(
+        node.subscription.execution_policy.clone(),
+        node.subscription.failure_policy,
+        node.subscription.retry_policy.clone(),
+        node.handler.version(),
+        node.handler.input_contract_version(),
+        node.handler.output_contract_version(),
+        snapshot,
+    ))
+}
+
+fn recoverable_background_input_snapshot(
+    request: &HookPhaseRequest,
+) -> Option<HookRunInputSnapshot> {
+    match &request.input.payload {
+        HookInputPayload::TurnPostTurn(_) | HookInputPayload::Empty => {
+            Some(HookRunInputSnapshot::new(
+                request.phase,
+                request.context.clone(),
+                request.input.clone(),
+                request.policy_set.clone(),
+                request.prompt_context_set.clone(),
+            ))
+        }
+        HookInputPayload::TurnPrePolicy(_)
+        | HookInputPayload::TurnPrePromptContext(_)
+        | HookInputPayload::TurnPreToolMaterialization(_)
+        | HookInputPayload::TurnPrePromptCompile(_)
+        | HookInputPayload::TurnPreCompaction(_)
+        | HookInputPayload::Custom(_) => None,
+    }
+}
+
 fn hash_segment(hasher: &mut Sha256, key: &str, value: &str) {
     hasher.update(key.as_bytes());
     hasher.update([0]);
@@ -1624,20 +2260,71 @@ fn background_contribution_allowed(contribution: &HookContribution) -> bool {
     )
 }
 
+fn should_retry_background_outcome(
+    node: &HookExecutionNode,
+    attempt_number: u16,
+    status: HookRunStatus,
+    error: &HookError,
+) -> bool {
+    if !is_background_like(node.subscription.execution_policy.await_policy) {
+        return false;
+    }
+    if attempt_number >= node.subscription.retry_policy.max_attempts {
+        return false;
+    }
+    match status {
+        HookRunStatus::Failed if !error.retryable => return false,
+        HookRunStatus::Failed | HookRunStatus::TimedOut => {}
+        HookRunStatus::Queued
+        | HookRunStatus::Running
+        | HookRunStatus::Succeeded
+        | HookRunStatus::Skipped => {
+            return false;
+        }
+    }
+    if node.subscription.retry_policy.idempotency_required && !retry_idempotency_satisfied(node) {
+        return false;
+    }
+    true
+}
+
+fn retry_idempotency_satisfied(node: &HookExecutionNode) -> bool {
+    let capability =
+        HookCapability::new("idempotent_side_effect").expect("static hook capability is valid");
+    if node.handler.capabilities().contains(&capability) {
+        return true;
+    }
+    let key =
+        HookMetadataKey::new("idempotent_side_effect").expect("static hook metadata key is valid");
+    matches!(
+        node.subscription.metadata.get(&key),
+        Some(HookValue::Bool(true))
+    )
+}
+
+fn retry_delay_ms(policy: &crate::HookRetryPolicy, attempt_number: u16) -> i64 {
+    let base = u64_to_i64_saturating(policy.initial_delay_ms.unwrap_or(1_000));
+    match policy.backoff {
+        HookRetryBackoff::None => 0,
+        HookRetryBackoff::Fixed => base,
+        HookRetryBackoff::Exponential => {
+            let exponent = u32::from(attempt_number.saturating_sub(1)).min(6);
+            base.saturating_mul(1_i64 << exponent).min(60_000)
+        }
+    }
+}
+
 fn background_run_summary(
     run: &HookQueuedBackgroundRun,
     outcome: &HookNodeOutcome,
+    status: HookRunStatus,
 ) -> HookBackgroundRunSummary {
-    let (status, contribution_count, diagnostic_count) = match outcome {
-        HookNodeOutcome::Succeeded(response) => (
-            HookRunStatus::Succeeded,
-            response.contributions.len(),
-            response.diagnostics.len(),
-        ),
-        HookNodeOutcome::Failed(_) => (HookRunStatus::Failed, 0, 1),
-        HookNodeOutcome::TimedOut { .. } => (HookRunStatus::TimedOut, 0, 1),
-        HookNodeOutcome::Skipped => (HookRunStatus::Skipped, 0, 0),
-        HookNodeOutcome::Queued => (HookRunStatus::Queued, 0, 0),
+    let (contribution_count, diagnostic_count) = match outcome {
+        HookNodeOutcome::Succeeded(response) => {
+            (response.contributions.len(), response.diagnostics.len())
+        }
+        HookNodeOutcome::Failed(_) | HookNodeOutcome::TimedOut { .. } => (0, 1),
+        HookNodeOutcome::Skipped | HookNodeOutcome::Queued => (0, 0),
     };
     HookBackgroundRunSummary {
         subscription_id: run.node.subscription.subscription_id.clone(),
@@ -1919,10 +2606,10 @@ mod tests {
     use super::*;
     use crate::{
         HookAuditEventStoreRecord, HookCapabilities, HookCapability, HookDiagnosticMessage,
-        HookDomain, HookError, HookFilterKey, HookHandler, HookKind, HookPromptContent,
-        HookPromptSectionTitle, HookResult, HookRunAttemptId, HookRunId, HookRunStoreResult,
-        HookSectionId, HookSubscription, HookSubscriptionDependencies, HookValue,
-        NewHookAuditEventStoreRecord,
+        HookDomain, HookError, HookExecutionPolicy, HookFilterKey, HookHandler, HookKind,
+        HookPromptContent, HookPromptSectionTitle, HookResult, HookRunAttemptId, HookRunId,
+        HookRunStoreResult, HookSectionId, HookSubscription, HookSubscriptionDependencies,
+        HookValue, NewHookAuditEventStoreRecord,
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -4208,7 +4895,10 @@ mod tests {
                     | StoreEvent::AppendAttempt { status, .. }
                     | StoreEvent::CompleteAttempt { status, .. }
                     | StoreEvent::CompleteRun { status, .. } => Some(*status),
-                    StoreEvent::MarkRunRunning | StoreEvent::AppendAudit { .. } => None,
+                    StoreEvent::MarkRunRunning
+                    | StoreEvent::AppendAudit { .. }
+                    | StoreEvent::ScheduleRetry { .. }
+                    | StoreEvent::MarkUnrecoverable { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             vec![
@@ -4701,6 +5391,7 @@ mod tests {
         );
         let store = Arc::new(RecordingHookRunStore {
             events: Mutex::new(Vec::new()),
+            recoverable_runs: Mutex::new(Vec::new()),
             fail_all: true,
             append_attempt_conflicts_remaining: AtomicUsize::new(0),
         });
@@ -5116,6 +5807,12 @@ mod tests {
             status: HookRunStatus,
             contribution_hashes: Vec<HookContributionHash>,
         },
+        ScheduleRetry {
+            queued_at_unix_ms: i64,
+        },
+        MarkUnrecoverable {
+            status: HookRunStatus,
+        },
         AppendAudit {
             event_kinds: Vec<String>,
             contribution_hashes: Vec<Option<HookContributionHash>>,
@@ -5125,6 +5822,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingHookRunStore {
         events: Mutex<Vec<StoreEvent>>,
+        recoverable_runs: Mutex<Vec<crate::HookRecoverableRunRecord>>,
         fail_all: bool,
         append_attempt_conflicts_remaining: AtomicUsize,
     }
@@ -5137,8 +5835,18 @@ mod tests {
         fn with_append_attempt_conflicts(count: usize) -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
+                recoverable_runs: Mutex::new(Vec::new()),
                 fail_all: false,
                 append_attempt_conflicts_remaining: AtomicUsize::new(count),
+            }
+        }
+
+        fn with_recoverable_runs(records: Vec<crate::HookRecoverableRunRecord>) -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                recoverable_runs: Mutex::new(records),
+                fail_all: false,
+                append_attempt_conflicts_remaining: AtomicUsize::new(0),
             }
         }
     }
@@ -5178,6 +5886,7 @@ mod tests {
                 started_at_unix_ms: run.started_at_unix_ms,
                 completed_at_unix_ms: run.completed_at_unix_ms,
                 deadline_at_unix_ms: run.deadline_at_unix_ms,
+                resume_state: run.resume_state,
             })
         }
 
@@ -5212,6 +5921,7 @@ mod tests {
                 started_at_unix_ms: Some(started_at_unix_ms),
                 completed_at_unix_ms: None,
                 deadline_at_unix_ms: None,
+                resume_state: None,
             })
         }
 
@@ -5250,6 +5960,7 @@ mod tests {
                 started_at_unix_ms: None,
                 completed_at_unix_ms: Some(completion.completed_at_unix_ms),
                 deadline_at_unix_ms: None,
+                resume_state: None,
             })
         }
 
@@ -5365,6 +6076,103 @@ mod tests {
                 })
                 .collect())
         }
+
+        async fn list_recoverable_runs(
+            &self,
+            _scan: crate::HookRecoveryScan,
+        ) -> HookRunStoreResult<Vec<crate::HookRecoverableRunRecord>> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            Ok(self
+                .recoverable_runs
+                .lock()
+                .expect("recoverable runs lock")
+                .clone())
+        }
+
+        async fn schedule_run_retry(
+            &self,
+            run_id: &HookRunId,
+            schedule: crate::HookRetrySchedule,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::ScheduleRetry {
+                    queued_at_unix_ms: schedule.queued_at_unix_ms,
+                });
+            Ok(HookRunStoreRecord {
+                id: run_id.clone(),
+                idempotency_key: HookRunIdempotencyKey::new("phase21.retry").expect("valid key"),
+                subscription_id: subscription_id("sub.persistence"),
+                hook_id: hook_id("test.persistence"),
+                phase: HookPhase::TurnPrePromptCompile,
+                status: HookRunStatus::Queued,
+                scope: None,
+                context: HookContext::default(),
+                attempt_count: 1,
+                contribution_count: 0,
+                diagnostic_count: schedule.diagnostic_previews.len(),
+                contribution_hashes: Vec::new(),
+                diagnostic_previews: schedule.diagnostic_previews,
+                error: None,
+                queued_at_unix_ms: Some(schedule.queued_at_unix_ms),
+                started_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                deadline_at_unix_ms: schedule.deadline_at_unix_ms,
+                resume_state: None,
+            })
+        }
+
+        async fn mark_stale_run_timed_out(
+            &self,
+            run_id: &HookRunId,
+            completion: HookRunStoreCompletion,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            self.mark_run_unrecoverable(run_id, completion).await
+        }
+
+        async fn mark_run_unrecoverable(
+            &self,
+            run_id: &HookRunId,
+            completion: HookRunStoreCompletion,
+        ) -> HookRunStoreResult<HookRunStoreRecord> {
+            if self.fail_all {
+                return Err(crate::HookRunStoreError::internal("store unavailable"));
+            }
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(StoreEvent::MarkUnrecoverable {
+                    status: completion.status,
+                });
+            Ok(HookRunStoreRecord {
+                id: run_id.clone(),
+                idempotency_key: HookRunIdempotencyKey::new("phase21.unrecoverable")
+                    .expect("valid key"),
+                subscription_id: subscription_id("sub.persistence"),
+                hook_id: hook_id("test.persistence"),
+                phase: HookPhase::TurnPrePromptCompile,
+                status: completion.status,
+                scope: None,
+                context: HookContext::default(),
+                attempt_count: 1,
+                contribution_count: completion.contribution_hashes.len(),
+                diagnostic_count: completion.diagnostic_previews.len(),
+                contribution_hashes: completion.contribution_hashes,
+                diagnostic_previews: completion.diagnostic_previews,
+                error: completion.error,
+                queued_at_unix_ms: None,
+                started_at_unix_ms: None,
+                completed_at_unix_ms: Some(completion.completed_at_unix_ms),
+                deadline_at_unix_ms: None,
+                resume_state: None,
+            })
+        }
     }
 
     fn runtime_with_recording_store(
@@ -5373,6 +6181,436 @@ mod tests {
         store: Arc<RecordingHookRunStore>,
     ) -> HookRuntime {
         HookRuntime::with_run_store(handlers, subscriptions, store)
+    }
+
+    fn phase_21_background_policy() -> HookExecutionPolicy {
+        HookExecutionPolicy {
+            await_policy: HookAwaitPolicy::Background,
+            timeout_ms: Some(10_000),
+            max_parallelism: None,
+        }
+    }
+
+    fn phase_21_retry_policy(
+        max_attempts: u16,
+        idempotency_required: bool,
+    ) -> crate::HookRetryPolicy {
+        crate::HookRetryPolicy {
+            max_attempts,
+            backoff: HookRetryBackoff::Fixed,
+            initial_delay_ms: Some(250),
+            idempotency_required,
+        }
+    }
+
+    fn phase_21_resume_state(retry_policy: crate::HookRetryPolicy) -> HookRunResumeState {
+        HookRunResumeState::input_snapshot(
+            phase_21_background_policy(),
+            HookFailurePolicy::BestEffort,
+            retry_policy,
+            1,
+            1,
+            1,
+            HookRunInputSnapshot::new(
+                HookPhase::TurnPrePromptCompile,
+                HookContext::default(),
+                HookInput::empty(crate::HookInputKind::TurnPrePromptCompile),
+                HookPolicySet::empty(),
+                HookPromptContextSet::empty(),
+            ),
+        )
+    }
+
+    fn phase_21_recoverable_record(
+        subscription_id: &str,
+        hook_id: &str,
+        status: HookRunStatus,
+        attempt_count: u16,
+        resume_state: HookRunResumeState,
+        attempts: Vec<HookRunAttemptStoreRecord>,
+    ) -> HookRecoverableRunRecord {
+        HookRecoverableRunRecord {
+            run: HookRunStoreRecord {
+                id: HookRunId::new("run.phase21").expect("valid run id"),
+                idempotency_key: HookRunIdempotencyKey::new("phase21.recovery")
+                    .expect("valid idempotency key"),
+                subscription_id: self::subscription_id(subscription_id),
+                hook_id: self::hook_id(hook_id),
+                phase: HookPhase::TurnPrePromptCompile,
+                status,
+                scope: None,
+                context: HookContext::default(),
+                attempt_count,
+                contribution_count: 0,
+                diagnostic_count: 0,
+                contribution_hashes: Vec::new(),
+                diagnostic_previews: Vec::new(),
+                error: None,
+                queued_at_unix_ms: Some(1_000),
+                started_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                deadline_at_unix_ms: None,
+                resume_state: Some(resume_state.clone()),
+            },
+            resume_state: Some(resume_state),
+            attempts,
+        }
+    }
+
+    fn register_phase_21_background_subscription(
+        handlers: &HookRegistry,
+        subscriptions: &HookSubscriptionRegistry,
+        subscription_id: &str,
+        hook_id: &str,
+        retry_policy: crate::HookRetryPolicy,
+    ) {
+        subscriptions
+            .register_subscription(
+                handlers,
+                HookSubscription::new(
+                    self::subscription_id(subscription_id),
+                    self::hook_id(hook_id),
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_execution_policy(phase_21_background_policy())
+                .with_failure_policy(HookFailurePolicy::BestEffort)
+                .with_retry_policy(retry_policy),
+            )
+            .expect("subscription registers");
+    }
+
+    #[tokio::test]
+    async fn phase_21_recover_background_runs_once_executes_due_queued_run() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase21.recover",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        let retry_policy = phase_21_retry_policy(1, true);
+        register_phase_21_background_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase21.recover",
+            "test.phase21.recover",
+            retry_policy.clone(),
+        );
+        let record = phase_21_recoverable_record(
+            "sub.phase21.recover",
+            "test.phase21.recover",
+            HookRunStatus::Queued,
+            0,
+            phase_21_resume_state(retry_policy),
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions {
+                now_unix_ms: 2_000,
+                batch_size: 10,
+                max_concurrent: 2,
+                stale_running_after_ms: 1_000,
+                strict_debug: true,
+            })
+            .await
+            .expect("recovery succeeds");
+
+        assert_eq!(summary.scanned_count, 1);
+        assert_eq!(summary.recovered_count, 1);
+        assert_eq!(summary.executed_count, 1);
+        assert_eq!(calls.lock().expect("calls lock").len(), 1);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::CompleteRun {
+                    status: HookRunStatus::Succeeded,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_21_recovery_marks_missing_subscription_unrecoverable() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let retry_policy = phase_21_retry_policy(1, true);
+        let record = phase_21_recoverable_record(
+            "sub.phase21.missing_subscription",
+            "test.phase21.missing_subscription",
+            HookRunStatus::Queued,
+            0,
+            phase_21_resume_state(retry_policy),
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions::default())
+            .await
+            .expect("recovery handles unrecoverable run");
+
+        assert_eq!(summary.unrecoverable_count, 1);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::MarkUnrecoverable {
+                    status: HookRunStatus::Failed
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_21_retryable_failure_schedules_retry_with_idempotency_proof() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        handlers
+            .register_handler(Arc::new(RecordingHookHandler {
+                id: hook_id("test.phase21.retry"),
+                phases: vec![HookPhase::TurnPrePromptCompile],
+                calls: calls.clone(),
+                responses: Mutex::new(VecDeque::from([Err(HookError::new(
+                    HookDiagnosticCode::new("test.retryable").expect("valid code"),
+                    HookDiagnosticMessage::new("retryable failure").expect("valid message"),
+                )
+                .with_retryable(true))])),
+                capabilities: HookCapabilities::new([HookCapability::new(
+                    "idempotent_side_effect",
+                )
+                .expect("valid capability")]),
+            }))
+            .expect("handler registers");
+        let retry_policy = phase_21_retry_policy(2, true);
+        register_phase_21_background_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase21.retry",
+            "test.phase21.retry",
+            retry_policy.clone(),
+        );
+        let record = phase_21_recoverable_record(
+            "sub.phase21.retry",
+            "test.phase21.retry",
+            HookRunStatus::Queued,
+            0,
+            phase_21_resume_state(retry_policy),
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions {
+                now_unix_ms: 2_000,
+                batch_size: 10,
+                max_concurrent: 1,
+                stale_running_after_ms: 1_000,
+                strict_debug: true,
+            })
+            .await
+            .expect("recovery succeeds");
+
+        assert_eq!(summary.retried_count, 1);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::ScheduleRetry {
+                    queued_at_unix_ms
+                } if *queued_at_unix_ms > 0
+            )
+        }));
+        assert!(!store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::CompleteRun {
+                    status: HookRunStatus::Failed,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_21_retryable_failure_without_idempotency_proof_is_terminal() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase21.no_idempotency",
+            calls,
+            vec![Err(HookError::new(
+                HookDiagnosticCode::new("test.retryable").expect("valid code"),
+                HookDiagnosticMessage::new("retryable failure").expect("valid message"),
+            )
+            .with_retryable(true))],
+        );
+        let retry_policy = phase_21_retry_policy(2, true);
+        register_phase_21_background_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase21.no_idempotency",
+            "test.phase21.no_idempotency",
+            retry_policy.clone(),
+        );
+        let record = phase_21_recoverable_record(
+            "sub.phase21.no_idempotency",
+            "test.phase21.no_idempotency",
+            HookRunStatus::Queued,
+            0,
+            phase_21_resume_state(retry_policy),
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions::default())
+            .await
+            .expect("recovery succeeds");
+
+        assert_eq!(summary.retried_count, 0);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::CompleteRun {
+                    status: HookRunStatus::Failed,
+                    ..
+                }
+            )
+        }));
+        assert!(
+            !store
+                .events()
+                .iter()
+                .any(|event| matches!(event, StoreEvent::ScheduleRetry { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_21_stale_running_recovery_marks_timed_out_without_retry_budget() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase21.stale",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        let retry_policy = phase_21_retry_policy(1, true);
+        register_phase_21_background_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase21.stale",
+            "test.phase21.stale",
+            retry_policy.clone(),
+        );
+        let attempt = HookRunAttemptStoreRecord {
+            id: HookRunAttemptId::new("attempt.phase21.stale").expect("valid attempt id"),
+            hook_run_id: HookRunId::new("run.phase21").expect("valid run id"),
+            attempt_number: 1,
+            status: HookRunStatus::Running,
+            contribution_count: 0,
+            diagnostic_count: 0,
+            contribution_hashes: Vec::new(),
+            diagnostic_previews: Vec::new(),
+            error: None,
+            started_at_unix_ms: Some(1_000),
+            completed_at_unix_ms: None,
+            duration_ms: None,
+        };
+        let record = phase_21_recoverable_record(
+            "sub.phase21.stale",
+            "test.phase21.stale",
+            HookRunStatus::Running,
+            1,
+            phase_21_resume_state(retry_policy),
+            vec![attempt],
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions {
+                now_unix_ms: 3_000,
+                batch_size: 10,
+                max_concurrent: 1,
+                stale_running_after_ms: 1_000,
+                strict_debug: true,
+            })
+            .await
+            .expect("recovery succeeds");
+
+        assert_eq!(summary.timed_out_count, 1);
+        assert!(calls.lock().expect("calls lock").is_empty());
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::MarkUnrecoverable {
+                    status: HookRunStatus::TimedOut
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_21_recovered_forbidden_background_contribution_fails_terminal() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase21.forbidden",
+            calls,
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.phase21.forbidden", "forbidden")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        let retry_policy = phase_21_retry_policy(1, true);
+        register_phase_21_background_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase21.forbidden",
+            "test.phase21.forbidden",
+            retry_policy.clone(),
+        );
+        let record = phase_21_recoverable_record(
+            "sub.phase21.forbidden",
+            "test.phase21.forbidden",
+            HookRunStatus::Queued,
+            0,
+            phase_21_resume_state(retry_policy),
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::with_recoverable_runs(vec![record]));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let summary = runtime
+            .recover_background_runs_once(HookRecoveryOptions::default())
+            .await
+            .expect("recovery succeeds");
+
+        assert_eq!(summary.executed_count, 1);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event,
+                StoreEvent::CompleteRun {
+                    status: HookRunStatus::Failed,
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
@@ -5736,6 +6974,7 @@ mod tests {
         );
         let store = Arc::new(RecordingHookRunStore {
             events: Mutex::new(Vec::new()),
+            recoverable_runs: Mutex::new(Vec::new()),
             fail_all: true,
             append_attempt_conflicts_remaining: AtomicUsize::new(0),
         });

@@ -1356,6 +1356,7 @@ fn build_agent_hook_runtime(
     memory_post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     memory_turn_policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     memory_config: MemoryLoopConfig,
+    tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
 ) -> Result<
     (
         Option<Arc<HookRuntime>>,
@@ -1373,7 +1374,6 @@ fn build_agent_hook_runtime(
             Arc::new(HookSubscriptionRegistry::new()),
         ))
     });
-    let tool_bundle_artifacts = Arc::new(AgentToolBundleArtifactStore::new());
     install_memory_hooks(
         &runtime,
         memory_provider,
@@ -1402,6 +1402,7 @@ pub struct AgentManager {
         RwLock<Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>>,
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
+    tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
 }
 
@@ -1435,6 +1436,7 @@ impl AgentManager {
             memory_post_turn_extractor_provider: RwLock::new(None),
             memory_turn_policy_provider: RwLock::new(None),
             hook_runtime: RwLock::new(None),
+            tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
         }
     }
@@ -1471,6 +1473,31 @@ impl AgentManager {
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
         // Existing loops keep the runtime snapshot captured by ensure_thread.
         *self.hook_runtime.write().await = runtime;
+    }
+
+    pub async fn ensure_hook_runtime_with_current_providers(
+        &self,
+    ) -> Result<Option<Arc<HookRuntime>>, AgentStartError> {
+        let runtime = self.hook_runtime.read().await.clone();
+        let memory_provider = self.memory_provider.read().await.clone();
+        let memory_write_provider = self.memory_write_provider.read().await.clone();
+        let memory_post_turn_extractor_provider = self
+            .memory_post_turn_extractor_provider
+            .read()
+            .await
+            .clone();
+        let memory_turn_policy_provider = self.memory_turn_policy_provider.read().await.clone();
+        let (hook_runtime, _) = build_agent_hook_runtime(
+            runtime,
+            memory_provider,
+            memory_write_provider,
+            memory_post_turn_extractor_provider,
+            memory_turn_policy_provider,
+            self.tool_loop_config.memory.clone(),
+            self.tool_bundle_artifacts.clone(),
+        )?;
+        *self.hook_runtime.write().await = hook_runtime.clone();
+        Ok(hook_runtime)
     }
 
     pub async fn set_post_turn_hook_dispatch_policy(
@@ -1532,6 +1559,7 @@ impl AgentManager {
             memory_post_turn_extractor_provider,
             memory_turn_policy_provider,
             self.tool_loop_config.memory.clone(),
+            self.tool_bundle_artifacts.clone(),
         )?;
 
         let loop_handle = tokio::spawn(agent_loop::run_agent_loop(

@@ -2443,3 +2443,117 @@ fn workspace_visible(row: &AgentMemoryControlRecord, context: &MemoryOperationCo
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryMemoryBackend;
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_crud::AgentMemoryListFilter;
+    use pioneer_protocol::{
+        MemoryAttribute, MemoryDurability, MemoryExtractorCertainty, MemorySubject,
+    };
+    use sea_orm::Database;
+
+    async fn test_service() -> (MemoryService, Arc<CrudStore>) {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory connects");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations apply");
+        let store = Arc::new(CrudStore::new(connection));
+        let service = MemoryService::new(
+            store.clone(),
+            Arc::new(InMemoryMemoryBackend::default()),
+            MemoryServiceConfig::default(),
+        );
+        (service, store)
+    }
+
+    fn duplicate_safe_context() -> MemoryOperationContext {
+        MemoryOperationContext {
+            allow_global_user: true,
+            now_unix: Some(1_771_000_000),
+            ..MemoryOperationContext::default()
+        }
+    }
+
+    fn user_name_semantic_params() -> MemorySemanticWriteParams {
+        MemorySemanticWriteParams {
+            scope: MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".to_owned(),
+            },
+            semantic: MemorySemanticFields {
+                intent: MemoryIntent::ExplicitStore,
+                explicitness: MemoryExplicitness::Explicit,
+                category: MemoryCategory::Identity,
+                subject: MemorySubject::CurrentUser,
+                attribute: MemoryAttribute::Name,
+                subject_key: None,
+                custom_subject: None,
+                custom_attribute: None,
+                scope_hint: MemoryScopeHint::UserGlobal,
+                durability: MemoryDurability::LongLived,
+                sensitivity: MemorySensitivityHint::Personal,
+                certainty: MemoryExtractorCertainty::High,
+            },
+            content: "Имя пользователя: Александр".to_owned(),
+            value: Some("Александр".to_owned()),
+            evidence: Some(MemoryWriteEvidence {
+                source_thread_id: Some("thread_phase21".to_owned()),
+                source_turn_id: Some("turn_phase21".to_owned()),
+                source_item_id: Some("user_turn_phase21".to_owned()),
+                source_ref: Some("hook:memory.post_turn_extractor".to_owned()),
+                quote_or_span: Some("Меня зовут Александр".to_owned()),
+                extractor_reason: Some("explicit self-identification".to_owned()),
+            }),
+            provenance: None,
+            disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
+            client_provided_key: None,
+            confidence: Some(0.99),
+            importance: Some(0.7),
+            metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_21_duplicate_semantic_retry_merges_active_memory_instead_of_creating_duplicate()
+    {
+        let (service, store) = test_service().await;
+        let context = duplicate_safe_context();
+        let params = user_name_semantic_params();
+
+        let first = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .expect("first semantic write succeeds");
+        let second = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .expect("retry semantic write succeeds");
+
+        assert_eq!(first.relation, MemoryWriteRelation::Novel);
+        assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
+        assert!(second.evidence_merged);
+        assert_eq!(
+            first.record.as_ref().map(|record| record.id.as_str()),
+            second.record.as_ref().map(|record| record.id.as_str())
+        );
+
+        let records = store
+            .list_agent_memory_records(AgentMemoryListFilter {
+                scopes: vec![params.scope],
+                statuses: vec![MemoryStatus::Active],
+                ..AgentMemoryListFilter::default()
+            })
+            .await
+            .expect("memory records list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            metadata_evidence_count(records[0].metadata_json.as_deref().unwrap_or("{}")),
+            2
+        );
+    }
+}

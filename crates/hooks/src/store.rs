@@ -1,9 +1,13 @@
 use crate::{
-    HookAuditEventKind, HookContext, HookContributionHash, HookDiagnosticPreview, HookId,
-    HookPhase, HookRunAttemptId, HookRunErrorSummary, HookRunId, HookRunIdempotencyKey,
-    HookRunScopeId, HookRunStatus, HookSubscriptionId, HookValue,
+    HookAgentId, HookAuditEventKind, HookContext, HookContributionHash, HookDiagnosticPreview,
+    HookExecutionPolicy, HookFailurePolicy, HookId, HookInput, HookInputKind, HookPhase,
+    HookPolicySet, HookPromptContextSet, HookRetryPolicy, HookRunAttemptId, HookRunErrorSummary,
+    HookRunId, HookRunIdempotencyKey, HookRunScopeId, HookRunStatus, HookSubscriptionId,
+    HookTaskId, HookThreadId, HookTurnId, HookValue, HookWorkspaceId,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 pub type HookRunStoreResult<T> = Result<T, HookRunStoreError>;
@@ -151,6 +155,7 @@ pub struct NewHookRunStoreRecord {
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
     pub deadline_at_unix_ms: Option<i64>,
+    pub resume_state: Option<HookRunResumeState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +178,7 @@ pub struct HookRunStoreRecord {
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
     pub deadline_at_unix_ms: Option<i64>,
+    pub resume_state: Option<HookRunResumeState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,6 +260,153 @@ pub struct HookAuditEventStoreRecord {
     pub created_at_unix_ms: i64,
 }
 
+pub const HOOK_RUN_RESUME_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookRunResumeState {
+    pub schema_version: u16,
+    pub execution_policy: HookExecutionPolicy,
+    pub failure_policy: HookFailurePolicy,
+    pub retry_policy: HookRetryPolicy,
+    pub handler_version: u32,
+    pub input_contract_version: u32,
+    pub output_contract_version: u32,
+    pub payload: HookRunResumePayload,
+}
+
+impl HookRunResumeState {
+    pub fn input_snapshot(
+        execution_policy: HookExecutionPolicy,
+        failure_policy: HookFailurePolicy,
+        retry_policy: HookRetryPolicy,
+        handler_version: u32,
+        input_contract_version: u32,
+        output_contract_version: u32,
+        snapshot: HookRunInputSnapshot,
+    ) -> Self {
+        Self {
+            schema_version: HOOK_RUN_RESUME_SCHEMA_VERSION,
+            execution_policy,
+            failure_policy,
+            retry_policy,
+            handler_version,
+            input_contract_version,
+            output_contract_version,
+            payload: HookRunResumePayload::InputSnapshot(snapshot),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum HookRunResumePayload {
+    Reference(HookRunResumeReference),
+    InputSnapshot(HookRunInputSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRunResumeReference {
+    pub phase: HookPhase,
+    pub input_kind: HookInputKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<HookWorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<HookThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<HookTurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<HookTaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<HookAgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_hash: Option<String>,
+    pub input_hash: HookContributionHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookRunInputSnapshot {
+    pub phase: HookPhase,
+    pub context: HookContext,
+    pub input: HookInput,
+    #[serde(default, skip_serializing_if = "HookPolicySet::is_empty")]
+    pub policy_set: HookPolicySet,
+    #[serde(default, skip_serializing_if = "HookPromptContextSet::is_empty")]
+    pub prompt_context_set: HookPromptContextSet,
+    pub snapshot_hash: HookContributionHash,
+}
+
+impl HookRunInputSnapshot {
+    pub fn new(
+        phase: HookPhase,
+        context: HookContext,
+        input: HookInput,
+        policy_set: HookPolicySet,
+        prompt_context_set: HookPromptContextSet,
+    ) -> Self {
+        let snapshot_hash =
+            Self::hash_parts(phase, &context, &input, &policy_set, &prompt_context_set);
+        Self {
+            phase,
+            context,
+            input,
+            policy_set,
+            prompt_context_set,
+            snapshot_hash,
+        }
+    }
+
+    pub fn hash_parts(
+        phase: HookPhase,
+        context: &HookContext,
+        input: &HookInput,
+        policy_set: &HookPolicySet,
+        prompt_context_set: &HookPromptContextSet,
+    ) -> HookContributionHash {
+        #[derive(Serialize)]
+        struct SnapshotHashInput<'a> {
+            phase: HookPhase,
+            context: &'a HookContext,
+            input: &'a HookInput,
+            policy_set: &'a HookPolicySet,
+            prompt_context_set: &'a HookPromptContextSet,
+        }
+
+        let bytes = serde_json::to_vec(&SnapshotHashInput {
+            phase,
+            context,
+            input,
+            policy_set,
+            prompt_context_set,
+        })
+        .unwrap_or_default();
+        let digest = Sha256::digest(bytes);
+        HookContributionHash::new(format!("sha256:{}", hex::encode(digest)))
+            .expect("sha256 hook input snapshot hash is valid")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookRecoverableRunRecord {
+    pub run: HookRunStoreRecord,
+    pub resume_state: Option<HookRunResumeState>,
+    pub attempts: Vec<HookRunAttemptStoreRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRecoveryScan {
+    pub now_unix_ms: i64,
+    pub batch_size: usize,
+    pub stale_running_after_ms: u64,
+    pub phases: Option<Vec<HookPhase>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookRetrySchedule {
+    pub queued_at_unix_ms: i64,
+    pub deadline_at_unix_ms: Option<i64>,
+    pub diagnostic_previews: Vec<HookDiagnosticPreview>,
+}
+
 #[async_trait]
 pub trait HookRunStore: Send + Sync {
     async fn create_or_load_run(
@@ -289,5 +442,95 @@ pub trait HookRunStore: Send + Sync {
         _events: Vec<NewHookAuditEventStoreRecord>,
     ) -> HookRunStoreResult<Vec<HookAuditEventStoreRecord>> {
         Ok(Vec::new())
+    }
+
+    async fn list_recoverable_runs(
+        &self,
+        _scan: HookRecoveryScan,
+    ) -> HookRunStoreResult<Vec<HookRecoverableRunRecord>>;
+
+    async fn schedule_run_retry(
+        &self,
+        run_id: &HookRunId,
+        schedule: HookRetrySchedule,
+    ) -> HookRunStoreResult<HookRunStoreRecord>;
+
+    async fn mark_stale_run_timed_out(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord>;
+
+    async fn mark_run_unrecoverable(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HookInputPayload, HookPolicySet, HookPromptContextSet};
+
+    #[test]
+    fn phase_21_resume_state_roundtrips_as_typed_snapshot() {
+        let input = HookInput {
+            kind: HookInputKind::TurnPostTurn,
+            payload: HookInputPayload::Empty,
+        };
+        let snapshot = HookRunInputSnapshot::new(
+            HookPhase::TurnPostTurn,
+            HookContext::default(),
+            input,
+            HookPolicySet::empty(),
+            HookPromptContextSet::empty(),
+        );
+        let state = HookRunResumeState::input_snapshot(
+            HookExecutionPolicy::default(),
+            HookFailurePolicy::BestEffort,
+            HookRetryPolicy::default(),
+            1,
+            1,
+            1,
+            snapshot.clone(),
+        );
+
+        let encoded = serde_json::to_string(&state).expect("resume state serializes");
+        let decoded: HookRunResumeState =
+            serde_json::from_str(encoded.as_str()).expect("resume state deserializes");
+
+        assert_eq!(decoded, state);
+        let HookRunResumePayload::InputSnapshot(decoded_snapshot) = decoded.payload else {
+            panic!("expected input snapshot payload");
+        };
+        assert_eq!(decoded_snapshot.snapshot_hash, snapshot.snapshot_hash);
+        assert!(
+            decoded_snapshot
+                .snapshot_hash
+                .as_str()
+                .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn phase_21_input_snapshot_hash_is_stable() {
+        let input = HookInput::empty(HookInputKind::TurnPostTurn);
+        let first = HookRunInputSnapshot::new(
+            HookPhase::TurnPostTurn,
+            HookContext::default(),
+            input.clone(),
+            HookPolicySet::empty(),
+            HookPromptContextSet::empty(),
+        );
+        let second = HookRunInputSnapshot::new(
+            HookPhase::TurnPostTurn,
+            HookContext::default(),
+            input,
+            HookPolicySet::empty(),
+            HookPromptContextSet::empty(),
+        );
+
+        assert_eq!(first.snapshot_hash, second.snapshot_hash);
     }
 }

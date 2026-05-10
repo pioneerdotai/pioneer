@@ -12,7 +12,7 @@ use pioneer_agent::{
     AgentManager, AgentMcpToolProvider, AgentMemoryProvider, MemoryRecallRequest,
     MemoryTurnContext, SkillsLoopConfig, ToolLoopConfig,
 };
-use pioneer_config::{GatewayMemoryConfig, GatewayWebToolsConfig};
+use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
     global_agent_memory_scope_key,
@@ -734,6 +734,59 @@ async fn phase_15_message_processor_set_hook_runtime_attaches_crud_store() {
     assert!(stored.has_run_store());
     assert!(!Arc::ptr_eq(&stored, &runtime));
     assert!(harness.processor.agent_manager.has_hook_runtime().await);
+}
+
+#[tokio::test]
+async fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
+    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    harness
+        .processor
+        .set_hook_recovery_config(GatewayHookRecoveryConfig {
+            enabled: true,
+            startup_scan: false,
+            poll_interval_ms: 60_000,
+            batch_size: 4,
+            max_concurrent: 1,
+            stale_running_after_ms: 1_000,
+            strict_debug: true,
+        })
+        .await;
+    harness
+        .processor
+        .set_hook_runtime(Some(phase_13_empty_hook_runtime()))
+        .await;
+
+    harness.processor.start_hook_recovery_worker().await;
+
+    let mut guard = harness.processor.hook_recovery_worker.lock().await;
+    let handle = guard
+        .take()
+        .expect("hook recovery worker should be started");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn phase_21_memory_bridge_installs_recoverable_hook_runtime() {
+    let harness = setup_memory_gateway_harness("phase21_recoverable_runtime", true).await;
+    harness.processor.bind_memory_bridge_if_enabled().await;
+
+    let runtime = harness
+        .processor
+        .hook_runtime
+        .read()
+        .await
+        .clone()
+        .expect("memory bridge should install hook runtime");
+    assert!(runtime.has_run_store());
+    let post_turn_subscription = runtime
+        .subscriptions()
+        .get_subscription(
+            &HookSubscriptionId::new("memory.post_turn_extractor.default")
+                .expect("static subscription id is valid"),
+        )
+        .expect("subscription lookup succeeds");
+    assert!(post_turn_subscription.is_some());
 }
 
 impl SequencedToolProvider {

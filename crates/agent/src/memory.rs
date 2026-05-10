@@ -6,12 +6,12 @@ use pioneer_hooks::{
     HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain,
     HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
     HookId, HookInputPayload, HookKind, HookMetadata, HookMetadataKey, HookPhase, HookPolicyKey,
-    HookPolicySet, HookPromptContent, HookRegistryError, HookResult, HookRuntime, HookSectionId,
-    HookSourceId, HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionDependencies,
-    HookSubscriptionId, HookSubscriptionVisibility, HookToolBundleId, HookToolName, HookValue,
-    PolicyContribution, PromptContextContribution, PromptSectionContribution,
-    ToolBundleContribution, TurnPostTurnHookInput, TurnPostTurnStatus, TurnPrePolicyHookInput,
-    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    HookPolicySet, HookPromptContent, HookRegistryError, HookResult, HookRetryBackoff,
+    HookRetryPolicy, HookRuntime, HookSectionId, HookSourceId, HookSourceKind, HookSourceRef,
+    HookSubscription, HookSubscriptionDependencies, HookSubscriptionId, HookSubscriptionVisibility,
+    HookToolBundleId, HookToolName, HookValue, PolicyContribution, PromptContextContribution,
+    PromptSectionContribution, ToolBundleContribution, TurnPostTurnHookInput, TurnPostTurnStatus,
+    TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
     MemoryPostTurnExtractorPromptInput, MemoryRecallPromptInput, MemoryRecallPromptItem,
@@ -1088,7 +1088,7 @@ pub(crate) fn install_memory_hooks(
         HookPhase::TurnPrePromptCompile,
         0,
     )?;
-    register_memory_hook_handler_with_options(
+    register_memory_hook_handler_with_options_and_retry(
         runtime,
         Arc::new(MemoryPostTurnExtractorHook {
             write_provider: memory_write_provider,
@@ -1105,6 +1105,12 @@ pub(crate) fn install_memory_hooks(
         },
         HookSubscriptionDependencies::default(),
         HookSubscriptionVisibility::Internal,
+        HookRetryPolicy {
+            max_attempts: 2,
+            backoff: HookRetryBackoff::Fixed,
+            initial_delay_ms: Some(1_000),
+            idempotency_required: true,
+        },
     )?;
     Ok(())
 }
@@ -1142,6 +1148,30 @@ fn register_memory_hook_handler_with_options(
     dependencies: HookSubscriptionDependencies,
     visibility: HookSubscriptionVisibility,
 ) -> Result<(), HookRegistryError> {
+    register_memory_hook_handler_with_options_and_retry(
+        runtime,
+        handler,
+        subscription_id,
+        phase,
+        priority,
+        execution_policy,
+        dependencies,
+        visibility,
+        HookRetryPolicy::default(),
+    )
+}
+
+fn register_memory_hook_handler_with_options_and_retry(
+    runtime: &Arc<HookRuntime>,
+    handler: Arc<dyn HookHandler>,
+    subscription_id: &'static str,
+    phase: HookPhase,
+    priority: i32,
+    execution_policy: HookExecutionPolicy,
+    dependencies: HookSubscriptionDependencies,
+    visibility: HookSubscriptionVisibility,
+    retry_policy: HookRetryPolicy,
+) -> Result<(), HookRegistryError> {
     let hook_id = handler.id();
     if !runtime.handlers().contains_handler(&hook_id)? {
         runtime.handlers().register_handler(handler)?;
@@ -1161,6 +1191,7 @@ fn register_memory_hook_handler_with_options(
                 .with_dependencies(dependencies)
                 .with_execution_policy(execution_policy)
                 .with_failure_policy(HookFailurePolicy::BestEffort)
+                .with_retry_policy(retry_policy)
                 .with_visibility(visibility),
         )?;
     }
@@ -1972,6 +2003,7 @@ fn memory_post_turn_extractor_capabilities(provider_enabled: bool) -> HookCapabi
         HookCapability::new("memory").expect("static capability is valid"),
         HookCapability::new("read_domain_context").expect("static capability is valid"),
         HookCapability::new("write_domain_context").expect("static capability is valid"),
+        HookCapability::new("idempotent_side_effect").expect("static capability is valid"),
     ];
     if provider_enabled {
         capabilities
@@ -4636,6 +4668,9 @@ mod tests {
         assert!(capabilities.contains(
             &HookCapability::new("write_domain_context").expect("static capability is valid")
         ));
+        assert!(capabilities.contains(
+            &HookCapability::new("idempotent_side_effect").expect("static capability is valid")
+        ));
         assert!(
             capabilities.contains(
                 &HookCapability::new("call_provider").expect("static capability is valid")
@@ -4653,6 +4688,50 @@ mod tests {
         ));
         assert!(!capabilities.contains(
             &HookCapability::new("contribute_prompt_context").expect("static capability is valid")
+        ));
+    }
+
+    #[test]
+    fn phase_21_post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
+        let runtime = Arc::new(HookRuntime::new(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        ));
+        install_memory_hooks(
+            &runtime,
+            Arc::new(TestMemoryProvider::with_materialization(
+                empty_tool_materialization(),
+            )),
+            Some(Arc::new(TestMemoryWriteProvider::default())),
+            Some(Arc::new(TestPostTurnExtractorProvider::json(
+                r#"{"facts":[]}"#,
+            ))),
+            None,
+            Arc::new(AgentToolBundleArtifactStore::new()),
+            MemoryLoopConfig::default(),
+        )
+        .expect("memory hooks install");
+
+        let subscription = runtime
+            .subscriptions()
+            .get_subscription(
+                &HookSubscriptionId::new(MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID)
+                    .expect("static subscription id is valid"),
+            )
+            .expect("subscription lookup succeeds")
+            .expect("post-turn extractor subscription exists");
+        assert_eq!(subscription.retry_policy.max_attempts, 2);
+        assert_eq!(subscription.retry_policy.backoff, HookRetryBackoff::Fixed);
+        assert_eq!(subscription.retry_policy.initial_delay_ms, Some(1_000));
+        assert!(subscription.retry_policy.idempotency_required);
+
+        let handler = runtime
+            .handlers()
+            .get_handler(&subscription.hook_id)
+            .expect("handler lookup succeeds")
+            .expect("post-turn extractor handler exists");
+        assert!(handler.capabilities().contains(
+            &HookCapability::new("idempotent_side_effect").expect("static capability is valid")
         ));
     }
 

@@ -45,6 +45,8 @@ pub struct Model {
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub deadline_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub resume_state_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
