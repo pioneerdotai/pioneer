@@ -1881,11 +1881,10 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         {
             Ok(json) => json,
             Err(_) => {
-                response.diagnostics.push(memory_safe_warning_diagnostic(
+                return Err(memory_retryable_safe_hook_error(
                     "memory.post_turn_extractor.provider_failed",
                     "memory post-turn extractor provider failed",
                 ));
-                return Ok(response);
             }
         };
 
@@ -3744,6 +3743,12 @@ fn memory_hook_error(code: &'static str, message: impl Into<String>) -> HookErro
     )
 }
 
+fn memory_retryable_safe_hook_error(code: &'static str, message: impl Into<String>) -> HookError {
+    memory_hook_error(code, safe_memory_policy_diagnostic(message.into().as_str()))
+        .with_retryable(true)
+        .with_safe_for_user(true)
+}
+
 fn memory_turn_policy_request_from_metadata(
     metadata: &HookMetadata,
 ) -> (MemoryTurnPolicyRequest, Vec<String>) {
@@ -4868,6 +4873,35 @@ mod tests {
             diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
                 && diagnostic.message.as_str().contains("write_successes=1")
         }));
+    }
+
+    #[tokio::test]
+    async fn phase_21_post_turn_extractor_provider_failure_is_retryable_hook_failure() {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestFailingPostTurnExtractorProvider::default());
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let error = hook
+            .execute(test_post_turn_hook_request(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                "Меня зовут Александр",
+                "Понял.",
+            ))
+            .await
+            .expect_err("provider failure should be visible to hook runtime");
+
+        assert_eq!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.provider_failed"
+        );
+        assert!(error.retryable);
+        assert!(error.safe_for_user);
+        assert_eq!(extractor_provider.call_count(), 1);
+        assert_eq!(write_provider.write_call_count(), 0);
     }
 
     #[tokio::test]
@@ -6855,6 +6889,29 @@ mod tests {
                 .expect("prompt lock poisoned")
                 .push(request.render_prompt());
             Ok(self.json.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestFailingPostTurnExtractorProvider {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestFailingPostTurnExtractorProvider {
+        fn call_count(&self) -> usize {
+            *self.calls.lock().expect("extractor call lock poisoned")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentMemoryPostTurnExtractorProvider for TestFailingPostTurnExtractorProvider {
+        async fn extract_post_turn_memory_json(
+            &self,
+            _context: MemoryPostTurnExtractorContext,
+            _request: MemoryPostTurnExtractorRequest,
+        ) -> Result<String, String> {
+            *self.calls.lock().expect("extractor call lock poisoned") += 1;
+            Err("provider unavailable".to_owned())
         }
     }
 

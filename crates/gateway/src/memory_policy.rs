@@ -56,7 +56,7 @@ impl GatewayMemoryTurnPolicyProvider {
                 model: model.to_owned(),
                 messages: vec![ChatMessage::user(prompt)],
                 temperature: Some(0.0),
-                max_tokens: Some(420),
+                max_tokens: None,
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,

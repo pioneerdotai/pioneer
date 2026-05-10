@@ -16,7 +16,7 @@ use pioneer_protocol::{
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
     MemorySensitivity, MemorySourceKind, MemoryStatus,
 };
-use pioneer_provider::{ChatMessage, ChatRequest};
+use pioneer_provider::{ChatMessage, ChatRequest, Provider};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -35,7 +35,6 @@ const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
 const SNIPPET_MAX_CHARS: usize = 280;
-const POST_TURN_EXTRACTOR_MAX_TOKENS: u32 = 1_200;
 
 #[derive(Clone)]
 pub(crate) struct GatewayMemoryProvider {
@@ -155,22 +154,71 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             .map_err(|error| {
                 format!("failed to create memory post-turn extractor provider: {error}")
             })?;
-        let prompt = request.render_prompt();
-        let response = provider
-            .chat(ChatRequest {
-                model: model.to_owned(),
-                messages: vec![ChatMessage::user(prompt)],
-                temperature: Some(0.0),
-                max_tokens: Some(POST_TURN_EXTRACTOR_MAX_TOKENS),
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                compiled_prompt: None,
-            })
-            .await
-            .map_err(|error| format!("memory post-turn extractor request failed: {error:#}"))?;
-        Ok(response.text)
+        request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt()).await
     }
+}
+
+async fn request_post_turn_extractor_json(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+) -> Result<String, String> {
+    match provider
+        .chat(post_turn_extractor_chat_request(
+            model,
+            prompt.clone(),
+            Some(0.0),
+        ))
+        .await
+    {
+        Ok(response) => Ok(response.text),
+        Err(primary_error) => {
+            let primary_error = format!("{primary_error:#}");
+            if !should_retry_post_turn_extractor_without_optional_params(primary_error.as_str()) {
+                return Err(format!(
+                    "memory post-turn extractor request failed: {primary_error}"
+                ));
+            }
+
+            let fallback = provider
+                .chat(post_turn_extractor_chat_request(model, prompt, None))
+                .await
+                .map_err(|fallback_error| {
+                    format!(
+                        "memory post-turn extractor request failed: {primary_error}; compatibility fallback failed: {fallback_error:#}"
+                    )
+                })?;
+            Ok(fallback.text)
+        }
+    }
+}
+
+fn post_turn_extractor_chat_request(
+    model: &str,
+    prompt: String,
+    temperature: Option<f32>,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_owned(),
+        messages: vec![ChatMessage::user(prompt)],
+        temperature,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        compiled_prompt: None,
+    }
+}
+
+fn should_retry_post_turn_extractor_without_optional_params(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("400")
+        || error.contains("bad request")
+        || error.contains("invalid request")
+        || error.contains("invalid parameter")
+        || error.contains("unsupported")
+        || error.contains("temperature")
+        || error.contains("reasoning")
 }
 
 #[async_trait]
@@ -1014,4 +1062,123 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Result, anyhow};
+    use async_trait::async_trait;
+    use futures_util::stream::{self, BoxStream};
+    use pioneer_provider::{ChatResponse, StreamChunk};
+    use std::sync::{Arc, Mutex};
+
+    struct CompatibilityFallbackProvider {
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    impl CompatibilityFallbackProvider {
+        fn new() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().expect("request lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CompatibilityFallbackProvider {
+        fn name(&self) -> &str {
+            "compatibility-fallback"
+        }
+
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("request lock poisoned")
+                .push(request.clone());
+
+            if request.temperature.is_some() || request.max_tokens.is_some() {
+                return Err(anyhow!(
+                    "OpenRouter API error (400 Bad Request): unsupported temperature"
+                ));
+            }
+
+            Ok(ChatResponse {
+                text: r#"{"facts":[]}"#.to_owned(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn post_turn_extractor_retries_without_optional_params_on_compatibility_error() {
+        let provider = CompatibilityFallbackProvider::new();
+
+        let json = request_post_turn_extractor_json(
+            &provider,
+            "openrouter/owl-alpha",
+            "extract memory".to_owned(),
+        )
+        .await
+        .expect("fallback request should succeed");
+
+        assert_eq!(json, r#"{"facts":[]}"#);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].temperature, Some(0.0));
+        assert_eq!(requests[0].max_tokens, None);
+        assert_eq!(requests[1].temperature, None);
+        assert_eq!(requests[1].max_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn post_turn_extractor_does_not_retry_non_compatibility_errors() {
+        struct FailingProvider {
+            requests: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl Provider for FailingProvider {
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+                *self.requests.lock().expect("request lock poisoned") += 1;
+                Err(anyhow!("network unavailable"))
+            }
+
+            async fn stream_chat(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+                Ok(Box::pin(stream::empty()))
+            }
+        }
+
+        let provider = FailingProvider {
+            requests: Arc::new(Mutex::new(0)),
+        };
+
+        let error =
+            request_post_turn_extractor_json(&provider, "model", "extract memory".to_owned())
+                .await
+                .expect_err("network errors should be returned to hook runtime");
+
+        assert!(error.contains("network unavailable"));
+        assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
+    }
 }

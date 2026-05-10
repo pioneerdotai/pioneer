@@ -606,9 +606,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Some(ApiReasoningOptions {
-            effort: "medium".to_owned(),
-        });
+        let reasoning = None;
 
         let api_request = ApiChatRequest {
             model: request.model,
