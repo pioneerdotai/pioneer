@@ -156,6 +156,28 @@
     {
       "type": "object",
       "properties": {
+        "artifactId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "artifact"
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "artifactId"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "name": {
           "type": "string"
         },

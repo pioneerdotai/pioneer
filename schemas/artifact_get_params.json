@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactGetParams",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "version_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "artifact_id"
+  ]
+}

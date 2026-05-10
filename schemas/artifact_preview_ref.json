@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactPreviewRef",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "mime_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "projection_kind": {
+      "$ref": "#/$defs/ArtifactProjectionKind"
+    },
+    "size_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/ArtifactProjectionStatus"
+    },
+    "version_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "projection_kind",
+    "status",
+    "artifact_id",
+    "version_id"
+  ],
+  "$defs": {
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    }
+  }
+}

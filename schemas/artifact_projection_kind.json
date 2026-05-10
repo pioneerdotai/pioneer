@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactProjectionKind",
+  "type": "string",
+  "enum": [
+    "plain_text",
+    "thumbnail",
+    "json_summary",
+    "pdf_text"
+  ]
+}

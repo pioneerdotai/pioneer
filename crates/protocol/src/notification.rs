@@ -1,13 +1,15 @@
 use crate::constants::events;
 use crate::{
-    ContextCompressedNotification, ContextCompressingNotification, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
-    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
-    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
-    McpChangedNotification, McpServerCatalogChangedNotification,
+    ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactDownloadProgressNotification,
+    ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
+    ArtifactUploadProgressNotification, ContextCompressedNotification,
+    ContextCompressingNotification, ItemCompletedNotification, ItemDeltaNotification,
+    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
+    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
+    JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
     McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
     MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
@@ -18,10 +20,11 @@ use crate::{
     TaskRecoveredNotification, TaskRescheduledNotification, TaskResumedNotification,
     TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunFailedNotification,
     TaskRunStartedNotification, TaskScheduledNotification,
-    TaskTreeChangedNotification as TaskTreeChangedTaskNotification, ThreadClosedNotification,
-    ThreadStartedNotification, ThreadTreeChangedNotification, ThreadUpdatedNotification,
-    TurnCompletedNotification, TurnFailedNotification, TurnStartedNotification,
-    TurnTimelineChangedNotification, TurnToolLoopBudgetExceededNotification,
+    TaskTreeChangedNotification as TaskTreeChangedTaskNotification,
+    ThreadArtifactsChangedNotification, ThreadClosedNotification, ThreadStartedNotification,
+    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnCompletedNotification,
+    TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
+    TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,6 +77,13 @@ pub enum GatewayNotification {
     McpChanged(McpChangedNotification),
     McpServerStatusChanged(McpServerStatusChangedNotification),
     McpServerCatalogChanged(McpServerCatalogChangedNotification),
+    ArtifactCreated(ArtifactCreatedNotification),
+    ArtifactUpdated(ArtifactUpdatedNotification),
+    ArtifactDeleted(ArtifactDeletedNotification),
+    ThreadArtifactsChanged(ThreadArtifactsChangedNotification),
+    ArtifactProjectionUpdated(ArtifactProjectionUpdatedNotification),
+    ArtifactUploadProgress(ArtifactUploadProgressNotification),
+    ArtifactDownloadProgress(ArtifactDownloadProgressNotification),
     TaskCreated(TaskCreatedNotification),
     TaskScheduled(TaskScheduledNotification),
     TaskQueued(TaskQueuedNotification),
@@ -268,6 +278,41 @@ impl GatewayNotification {
                     .ok()
                     .map(Self::McpServerCatalogChanged)
             }
+            events::ARTIFACT_CREATED => {
+                serde_json::from_value::<ArtifactCreatedNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactCreated)
+            }
+            events::ARTIFACT_UPDATED => {
+                serde_json::from_value::<ArtifactUpdatedNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactUpdated)
+            }
+            events::ARTIFACT_DELETED => {
+                serde_json::from_value::<ArtifactDeletedNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactDeleted)
+            }
+            events::THREAD_ARTIFACTS_CHANGED => {
+                serde_json::from_value::<ThreadArtifactsChangedNotification>(params)
+                    .ok()
+                    .map(Self::ThreadArtifactsChanged)
+            }
+            events::ARTIFACT_PROJECTION_UPDATED => {
+                serde_json::from_value::<ArtifactProjectionUpdatedNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactProjectionUpdated)
+            }
+            events::ARTIFACT_UPLOAD_PROGRESS => {
+                serde_json::from_value::<ArtifactUploadProgressNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactUploadProgress)
+            }
+            events::ARTIFACT_DOWNLOAD_PROGRESS => {
+                serde_json::from_value::<ArtifactDownloadProgressNotification>(params)
+                    .ok()
+                    .map(Self::ArtifactDownloadProgress)
+            }
             events::TASK_CREATED => serde_json::from_value::<TaskCreatedNotification>(params)
                 .ok()
                 .map(Self::TaskCreated),
@@ -381,7 +426,9 @@ impl GatewayNotification {
                 || method.starts_with("turn/")
                 || method.starts_with("context/")
                 || method.starts_with("task/")
-                || method.starts_with("memory/") =>
+                || method.starts_with("memory/")
+                || method.starts_with("artifact/")
+                || method.starts_with("thread/artifacts_") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
             }

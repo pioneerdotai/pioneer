@@ -1,4 +1,4 @@
-use crate::{MarkdownDocument, SandboxPolicy, TaskEvent, TaskTurnItem, ThreadMode};
+use crate::{ArtifactRef, MarkdownDocument, SandboxPolicy, TaskEvent, TaskTurnItem, ThreadMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -1499,6 +1499,12 @@ pub enum UserInput {
     LocalVideo {
         path: String,
     },
+    Artifact {
+        #[serde(rename = "artifactId")]
+        artifact_id: String,
+        #[serde(rename = "versionId", default, skip_serializing_if = "Option::is_none")]
+        version_id: Option<String>,
+    },
     Skill {
         name: String,
         path: String,
@@ -1520,6 +1526,7 @@ pub enum UserMessageAttachment {
     LocalAudio { path: String },
     Video { url: String },
     LocalVideo { path: String },
+    Artifact { artifact: ArtifactRef },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -2166,6 +2173,10 @@ mod tests {
                 UserInput::LocalVideo {
                     path: "/tmp/clip.mp4".to_owned(),
                 },
+                UserInput::Artifact {
+                    artifact_id: "art_123".to_owned(),
+                    version_id: Some("av_123".to_owned()),
+                },
             ],
             model: None,
             model_provider: None,
@@ -2185,10 +2196,69 @@ mod tests {
                     { "type": "audio", "url": "https://example.com/sample.mp3" },
                     { "type": "localAudio", "path": "/tmp/sample.wav" },
                     { "type": "video", "url": "https://example.com/clip.mp4" },
-                    { "type": "localVideo", "path": "/tmp/clip.mp4" }
+                    { "type": "localVideo", "path": "/tmp/clip.mp4" },
+                    { "type": "artifact", "artifactId": "art_123", "versionId": "av_123" }
                 ]
             })
         );
+    }
+
+    #[test]
+    fn user_input_artifact_round_trips_with_optional_version() {
+        let input: UserInput = serde_json::from_value(json!({
+            "type": "artifact",
+            "artifactId": "art_123",
+            "versionId": "av_123"
+        }))
+        .expect("artifact input should decode");
+
+        assert_eq!(
+            input,
+            UserInput::Artifact {
+                artifact_id: "art_123".to_owned(),
+                version_id: Some("av_123".to_owned())
+            }
+        );
+
+        let encoded = serde_json::to_value(UserInput::Artifact {
+            artifact_id: "art_123".to_owned(),
+            version_id: None,
+        })
+        .expect("artifact input should encode");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "artifact",
+                "artifactId": "art_123"
+            })
+        );
+    }
+
+    #[test]
+    fn user_message_attachment_artifact_round_trips() {
+        let attachment = UserMessageAttachment::Artifact {
+            artifact: ArtifactRef {
+                artifact_id: "art_123".to_owned(),
+                version_id: Some("av_123".to_owned()),
+                display_name: "report.pdf".to_owned(),
+                kind: crate::ArtifactKind::Pdf,
+                mime_type: Some("application/pdf".to_owned()),
+                size_bytes: Some(42),
+                sha256: Some("a".repeat(64)),
+                status: crate::ArtifactStatus::Ready,
+                preview: None,
+            },
+        };
+
+        let encoded = serde_json::to_value(&attachment).expect("attachment should encode");
+        assert_eq!(encoded["type"], json!("artifact"));
+        assert_eq!(encoded["artifact"]["artifact_id"], json!("art_123"));
+        assert_eq!(encoded["artifact"]["version_id"], json!("av_123"));
+
+        let decoded: UserMessageAttachment =
+            serde_json::from_value(encoded).expect("attachment should decode");
+        assert_eq!(decoded, attachment);
     }
 
     #[test]

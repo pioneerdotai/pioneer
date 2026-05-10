@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadStartResponse",
+  "type": "object",
+  "properties": {
+    "expires_at_unix": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "max_chunk_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "recommended_chunk_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "upload_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "upload_id",
+    "recommended_chunk_size_bytes",
+    "max_chunk_size_bytes",
+    "max_size_bytes",
+    "expires_at_unix"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadArtifactsChangedNotification",
+  "type": "object",
+  "properties": {
+    "artifact_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "reason",
+    "generated_at"
+  ]
+}

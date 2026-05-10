@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadStartParams",
+  "type": "object",
+  "properties": {
+    "client_attachment_id": {
+      "type": "string"
+    },
+    "file_name": {
+      "type": "string"
+    },
+    "mime_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "planned_turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sha256": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "source_kind": {
+      "$ref": "#/$defs/ArtifactUploadSourceKind"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "client_attachment_id",
+    "file_name",
+    "size_bytes",
+    "sha256",
+    "source_kind"
+  ],
+  "$defs": {
+    "ArtifactUploadSourceKind": {
+      "type": "string",
+      "enum": [
+        "user_composer",
+        "drag_drop",
+        "paste",
+        "api"
+      ]
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadChunkAckNotification",
+  "type": "object",
+  "properties": {
+    "len": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "next_offset": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "offset": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "received_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "upload_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "upload_id",
+    "offset",
+    "len",
+    "received_bytes",
+    "next_offset"
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactDownloadChunkParams",
+  "type": "object",
+  "properties": {
+    "download_id": {
+      "type": "string"
+    },
+    "len": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "offset": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "download_id",
+    "offset",
+    "len"
+  ]
+}

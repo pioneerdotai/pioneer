@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactStatus",
+  "type": "string",
+  "enum": [
+    "ready",
+    "pending",
+    "quarantined",
+    "deleted",
+    "missing_external_source",
+    "failed"
+  ]
+}

@@ -487,6 +487,118 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "artifact_created"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactCreatedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "artifact_updated"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactUpdatedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "artifact_deleted"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactDeletedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "thread_artifacts_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/ThreadArtifactsChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "artifact_projection_updated"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactProjectionUpdatedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "artifact_upload_progress"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactUploadProgressNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "artifact_download_progress"
+        },
+        "params": {
+          "$ref": "#/$defs/ArtifactDownloadProgressNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "task_created"
         },
         "params": {
@@ -916,6 +1028,484 @@
     }
   ],
   "$defs": {
+    "ArtifactBindingDirection": {
+      "type": "string",
+      "enum": [
+        "input",
+        "output",
+        "context",
+        "derived"
+      ]
+    },
+    "ArtifactBindingKind": {
+      "type": "string",
+      "enum": [
+        "user_input",
+        "agent_output",
+        "tool_output",
+        "task_result",
+        "context_attachment",
+        "derived_from",
+        "preview",
+        "system_capture",
+        "manual_attach",
+        "draft_upload"
+      ]
+    },
+    "ArtifactBindingSummary": {
+      "type": "object",
+      "properties": {
+        "binding_id": {
+          "type": "string"
+        },
+        "binding_kind": {
+          "$ref": "#/$defs/ArtifactBindingKind"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "direction": {
+          "$ref": "#/$defs/ArtifactBindingDirection"
+        },
+        "item_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding_id",
+        "workspace_id",
+        "binding_kind",
+        "direction",
+        "created_at"
+      ]
+    },
+    "ArtifactCreatedByKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "agent",
+        "tool",
+        "task",
+        "system",
+        "import",
+        "external_agent"
+      ]
+    },
+    "ArtifactCreatedNotification": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactSummary"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "artifact"
+      ]
+    },
+    "ArtifactDeletedNotification": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "deleted_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "artifact_id",
+        "status",
+        "deleted_at"
+      ]
+    },
+    "ArtifactDownloadProgressNotification": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "download_id": {
+          "type": "string"
+        },
+        "received_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "download_id",
+        "artifact_id",
+        "received_bytes",
+        "total_size_bytes"
+      ]
+    },
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactProjectionUpdatedNotification": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "artifact_id",
+        "version_id",
+        "projection_kind",
+        "status",
+        "updated_at"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "tool",
+        "system",
+        "task"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
+    "ArtifactSummary": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactBindingSummary"
+          }
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "created_by_actor_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_by_kind": {
+          "$ref": "#/$defs/ArtifactCreatedByKind"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "primary_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "workspace_id",
+        "created_by_kind",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ArtifactUpdatedNotification": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactSummary"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "artifact"
+      ]
+    },
+    "ArtifactUploadProgressNotification": {
+      "type": "object",
+      "properties": {
+        "next_offset": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "received_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "upload_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "upload_id",
+        "received_bytes",
+        "total_size_bytes",
+        "next_offset"
+      ]
+    },
     "ContextCompressedNotification": {
       "type": "object",
       "properties": {
@@ -3362,6 +3952,12 @@
             "string",
             "null"
           ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -5012,6 +5608,36 @@
         "updated_at",
         "status",
         "turns"
+      ]
+    },
+    "ThreadArtifactsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "artifact_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "generated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "reason",
+        "generated_at"
       ]
     },
     "ThreadClosedNotification": {
@@ -7238,6 +7864,22 @@
           "required": [
             "type",
             "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            }
+          },
+          "required": [
+            "type",
+            "artifact"
           ]
         }
       ]

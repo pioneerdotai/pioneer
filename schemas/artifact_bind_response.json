@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactBindResponse",
+  "type": "object",
+  "properties": {
+    "binding": {
+      "$ref": "#/$defs/ArtifactBindingSummary"
+    }
+  },
+  "required": [
+    "binding"
+  ],
+  "$defs": {
+    "ArtifactBindingDirection": {
+      "type": "string",
+      "enum": [
+        "input",
+        "output",
+        "context",
+        "derived"
+      ]
+    },
+    "ArtifactBindingKind": {
+      "type": "string",
+      "enum": [
+        "user_input",
+        "agent_output",
+        "tool_output",
+        "task_result",
+        "context_attachment",
+        "derived_from",
+        "preview",
+        "system_capture",
+        "manual_attach",
+        "draft_upload"
+      ]
+    },
+    "ArtifactBindingSummary": {
+      "type": "object",
+      "properties": {
+        "binding_id": {
+          "type": "string"
+        },
+        "binding_kind": {
+          "$ref": "#/$defs/ArtifactBindingKind"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "direction": {
+          "$ref": "#/$defs/ArtifactBindingDirection"
+        },
+        "item_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding_id",
+        "workspace_id",
+        "binding_kind",
+        "direction",
+        "created_at"
+      ]
+    },
+    "ArtifactRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "tool",
+        "system",
+        "task"
+      ]
+    }
+  }
+}

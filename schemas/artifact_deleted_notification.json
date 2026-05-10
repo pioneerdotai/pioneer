@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactDeletedNotification",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "deleted_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "status": {
+      "$ref": "#/$defs/ArtifactStatus"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "artifact_id",
+    "status",
+    "deleted_at"
+  ],
+  "$defs": {
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    }
+  }
+}

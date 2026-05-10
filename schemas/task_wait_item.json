@@ -241,6 +241,12 @@
             "string",
             "null"
           ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

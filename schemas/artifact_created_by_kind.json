@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactCreatedByKind",
+  "type": "string",
+  "enum": [
+    "user",
+    "agent",
+    "tool",
+    "task",
+    "system",
+    "import",
+    "external_agent"
+  ]
+}

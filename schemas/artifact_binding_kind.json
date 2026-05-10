@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactBindingKind",
+  "type": "string",
+  "enum": [
+    "user_input",
+    "agent_output",
+    "tool_output",
+    "task_result",
+    "context_attachment",
+    "derived_from",
+    "preview",
+    "system_capture",
+    "manual_attach",
+    "draft_upload"
+  ]
+}

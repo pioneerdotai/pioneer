@@ -2,6 +2,27 @@ use schemars::{Schema, schema_for};
 use std::fs;
 use std::path::Path;
 
+use crate::artifact::{
+    ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
+    ArtifactBindingSummary, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse,
+    ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactDeleteParams,
+    ArtifactDeleteResponse, ArtifactDeletedNotification, ArtifactDownloadAbortParams,
+    ArtifactDownloadAbortResponse, ArtifactDownloadCapabilities, ArtifactDownloadChunkHeader,
+    ArtifactDownloadChunkParams, ArtifactDownloadChunkResponse, ArtifactDownloadFinishParams,
+    ArtifactDownloadFinishResponse, ArtifactDownloadProgressNotification,
+    ArtifactDownloadStartParams, ArtifactDownloadStartResponse, ArtifactGetParams,
+    ArtifactGetResponse, ArtifactKind, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactPreviewRef,
+    ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactProjectionUpdatedNotification,
+    ArtifactReadParams, ArtifactReadResponse, ArtifactRef, ArtifactRestoreParams,
+    ArtifactRestoreResponse, ArtifactRole, ArtifactStatus, ArtifactSummary,
+    ArtifactUpdatedNotification, ArtifactUploadAbortParams, ArtifactUploadAbortResponse,
+    ArtifactUploadCapabilities, ArtifactUploadChunkAckNotification, ArtifactUploadChunkHeader,
+    ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadProgressNotification,
+    ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    ThreadArtifactsChangedNotification,
+};
+
 use crate::{
     AgentDurableEvent, AgentProgressEvent, ByteRange, ContextCompressedNotification,
     ContextCompressingNotification, DurableEventCausalityKey, GatewayNotification,
@@ -139,6 +160,155 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("workspace_create_response.json", WorkspaceCreateResponse),
         schema_doc!("workspace_default_params.json", WorkspaceDefaultParams),
         schema_doc!("workspace_default_response.json", WorkspaceDefaultResponse),
+        schema_doc!("artifact_kind.json", ArtifactKind),
+        schema_doc!("artifact_status.json", ArtifactStatus),
+        schema_doc!("artifact_created_by_kind.json", ArtifactCreatedByKind),
+        schema_doc!("artifact_binding_kind.json", ArtifactBindingKind),
+        schema_doc!("artifact_binding_direction.json", ArtifactBindingDirection),
+        schema_doc!("artifact_role.json", ArtifactRole),
+        schema_doc!("artifact_projection_kind.json", ArtifactProjectionKind),
+        schema_doc!("artifact_projection_status.json", ArtifactProjectionStatus),
+        schema_doc!("artifact_upload_source_kind.json", ArtifactUploadSourceKind),
+        schema_doc!("artifact_preview_ref.json", ArtifactPreviewRef),
+        schema_doc!("artifact_ref.json", ArtifactRef),
+        schema_doc!("artifact_binding_summary.json", ArtifactBindingSummary),
+        schema_doc!("artifact_summary.json", ArtifactSummary),
+        schema_doc!(
+            "artifact_capabilities_params.json",
+            ArtifactCapabilitiesParams
+        ),
+        schema_doc!(
+            "artifact_capabilities_response.json",
+            ArtifactCapabilitiesResponse
+        ),
+        schema_doc!(
+            "artifact_upload_capabilities.json",
+            ArtifactUploadCapabilities
+        ),
+        schema_doc!(
+            "artifact_download_capabilities.json",
+            ArtifactDownloadCapabilities
+        ),
+        schema_doc!("artifact_list_params.json", ArtifactListParams),
+        schema_doc!(
+            "artifact_list_for_thread_params.json",
+            ArtifactListForThreadParams
+        ),
+        schema_doc!(
+            "artifact_list_for_turn_params.json",
+            ArtifactListForTurnParams
+        ),
+        schema_doc!(
+            "artifact_list_for_message_params.json",
+            ArtifactListForMessageParams
+        ),
+        schema_doc!("artifact_list_response.json", ArtifactListResponse),
+        schema_doc!("artifact_get_params.json", ArtifactGetParams),
+        schema_doc!("artifact_get_response.json", ArtifactGetResponse),
+        schema_doc!("artifact_read_params.json", ArtifactReadParams),
+        schema_doc!("artifact_read_response.json", ArtifactReadResponse),
+        schema_doc!(
+            "artifact_upload_start_params.json",
+            ArtifactUploadStartParams
+        ),
+        schema_doc!(
+            "artifact_upload_start_response.json",
+            ArtifactUploadStartResponse
+        ),
+        schema_doc!(
+            "artifact_upload_chunk_header.json",
+            ArtifactUploadChunkHeader
+        ),
+        schema_doc!(
+            "artifact_upload_chunk_ack_notification.json",
+            ArtifactUploadChunkAckNotification
+        ),
+        schema_doc!(
+            "artifact_upload_finish_params.json",
+            ArtifactUploadFinishParams
+        ),
+        schema_doc!(
+            "artifact_upload_finish_response.json",
+            ArtifactUploadFinishResponse
+        ),
+        schema_doc!(
+            "artifact_upload_abort_params.json",
+            ArtifactUploadAbortParams
+        ),
+        schema_doc!(
+            "artifact_upload_abort_response.json",
+            ArtifactUploadAbortResponse
+        ),
+        schema_doc!(
+            "artifact_download_start_params.json",
+            ArtifactDownloadStartParams
+        ),
+        schema_doc!(
+            "artifact_download_start_response.json",
+            ArtifactDownloadStartResponse
+        ),
+        schema_doc!(
+            "artifact_download_chunk_params.json",
+            ArtifactDownloadChunkParams
+        ),
+        schema_doc!(
+            "artifact_download_chunk_header.json",
+            ArtifactDownloadChunkHeader
+        ),
+        schema_doc!(
+            "artifact_download_chunk_response.json",
+            ArtifactDownloadChunkResponse
+        ),
+        schema_doc!(
+            "artifact_download_finish_params.json",
+            ArtifactDownloadFinishParams
+        ),
+        schema_doc!(
+            "artifact_download_finish_response.json",
+            ArtifactDownloadFinishResponse
+        ),
+        schema_doc!(
+            "artifact_download_abort_params.json",
+            ArtifactDownloadAbortParams
+        ),
+        schema_doc!(
+            "artifact_download_abort_response.json",
+            ArtifactDownloadAbortResponse
+        ),
+        schema_doc!("artifact_bind_params.json", ArtifactBindParams),
+        schema_doc!("artifact_bind_response.json", ArtifactBindResponse),
+        schema_doc!("artifact_delete_params.json", ArtifactDeleteParams),
+        schema_doc!("artifact_delete_response.json", ArtifactDeleteResponse),
+        schema_doc!("artifact_restore_params.json", ArtifactRestoreParams),
+        schema_doc!("artifact_restore_response.json", ArtifactRestoreResponse),
+        schema_doc!(
+            "artifact_created_notification.json",
+            ArtifactCreatedNotification
+        ),
+        schema_doc!(
+            "artifact_updated_notification.json",
+            ArtifactUpdatedNotification
+        ),
+        schema_doc!(
+            "artifact_deleted_notification.json",
+            ArtifactDeletedNotification
+        ),
+        schema_doc!(
+            "thread_artifacts_changed_notification.json",
+            ThreadArtifactsChangedNotification
+        ),
+        schema_doc!(
+            "artifact_projection_updated_notification.json",
+            ArtifactProjectionUpdatedNotification
+        ),
+        schema_doc!(
+            "artifact_upload_progress_notification.json",
+            ArtifactUploadProgressNotification
+        ),
+        schema_doc!(
+            "artifact_download_progress_notification.json",
+            ArtifactDownloadProgressNotification
+        ),
         schema_doc!("memory_scope_kind.json", MemoryScopeKind),
         schema_doc!("memory_scope.json", MemoryScope),
         schema_doc!("memory_category.json", MemoryCategory),

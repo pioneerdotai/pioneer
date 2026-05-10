@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadCapabilities",
+  "type": "object",
+  "properties": {
+    "max_chunk_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_file_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_files_per_turn": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "recommended_chunk_size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "required_for_local_paths": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "required_for_local_paths",
+    "recommended_chunk_size_bytes",
+    "max_chunk_size_bytes",
+    "max_file_size_bytes",
+    "max_files_per_turn"
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactProjectionUpdatedNotification",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "projection_kind": {
+      "$ref": "#/$defs/ArtifactProjectionKind"
+    },
+    "status": {
+      "$ref": "#/$defs/ArtifactProjectionStatus"
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "version_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "artifact_id",
+    "version_id",
+    "projection_kind",
+    "status",
+    "updated_at"
+  ],
+  "$defs": {
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    }
+  }
+}

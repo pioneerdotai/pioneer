@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactKind",
+  "type": "string",
+  "enum": [
+    "file",
+    "text",
+    "image",
+    "audio",
+    "video",
+    "pdf",
+    "spreadsheet",
+    "archive",
+    "json",
+    "generated_image",
+    "screenshot",
+    "workspace_file",
+    "directory_manifest",
+    "unknown"
+  ]
+}

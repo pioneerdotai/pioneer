@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactListParams",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "include_deleted": {
+      "type": "boolean",
+      "default": false
+    },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactKind"
+      }
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "message_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id"
+  ],
+  "$defs": {
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    }
+  }
+}

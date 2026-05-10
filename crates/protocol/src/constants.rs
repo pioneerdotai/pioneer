@@ -62,6 +62,23 @@ pub mod methods {
     pub const MEMORY_CANDIDATES_EDIT_AND_APPROVE: &str = "memory/candidates/edit_and_approve";
     pub const MEMORY_CANDIDATES_MERGE: &str = "memory/candidates/merge";
     pub const MEMORY_CANDIDATES_SUPPRESS_SIMILAR: &str = "memory/candidates/suppress_similar";
+    pub const ARTIFACT_CAPABILITIES: &str = "artifact/capabilities";
+    pub const ARTIFACT_LIST: &str = "artifact/list";
+    pub const ARTIFACT_LIST_FOR_THREAD: &str = "artifact/list/thread";
+    pub const ARTIFACT_LIST_FOR_TURN: &str = "artifact/list/turn";
+    pub const ARTIFACT_LIST_FOR_MESSAGE: &str = "artifact/list/message";
+    pub const ARTIFACT_GET: &str = "artifact/get";
+    pub const ARTIFACT_READ: &str = "artifact/read";
+    pub const ARTIFACT_DELETE: &str = "artifact/delete";
+    pub const ARTIFACT_RESTORE: &str = "artifact/restore";
+    pub const ARTIFACT_BIND: &str = "artifact/bind";
+    pub const ARTIFACT_UPLOAD_START: &str = "artifact/upload/start";
+    pub const ARTIFACT_UPLOAD_FINISH: &str = "artifact/upload/finish";
+    pub const ARTIFACT_UPLOAD_ABORT: &str = "artifact/upload/abort";
+    pub const ARTIFACT_DOWNLOAD_START: &str = "artifact/download/start";
+    pub const ARTIFACT_DOWNLOAD_CHUNK: &str = "artifact/download/chunk";
+    pub const ARTIFACT_DOWNLOAD_FINISH: &str = "artifact/download/finish";
+    pub const ARTIFACT_DOWNLOAD_ABORT: &str = "artifact/download/abort";
 }
 
 pub mod events {
@@ -130,4 +147,12 @@ pub mod events {
     pub const MEMORY_CHANGED: &str = "memory/changed";
     pub const MEMORY_CANDIDATE_CREATED: &str = "memory/candidate_created";
     pub const MEMORY_FORGOTTEN: &str = "memory/forgotten";
+    pub const ARTIFACT_CREATED: &str = "artifact/created";
+    pub const ARTIFACT_UPDATED: &str = "artifact/updated";
+    pub const ARTIFACT_DELETED: &str = "artifact/deleted";
+    pub const THREAD_ARTIFACTS_CHANGED: &str = "thread/artifacts/changed";
+    pub const ARTIFACT_PROJECTION_UPDATED: &str = "artifact/projection/updated";
+    pub const ARTIFACT_UPLOAD_CHUNK_ACK: &str = "artifact/upload/chunk_ack";
+    pub const ARTIFACT_UPLOAD_PROGRESS: &str = "artifact/upload/progress";
+    pub const ARTIFACT_DOWNLOAD_PROGRESS: &str = "artifact/download/progress";
 }

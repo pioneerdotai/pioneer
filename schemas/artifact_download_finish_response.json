@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactDownloadFinishResponse",
+  "type": "object",
+  "properties": {
+    "download_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "download_id",
+    "status"
+  ]
+}

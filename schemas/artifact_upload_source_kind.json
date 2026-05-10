@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadSourceKind",
+  "type": "string",
+  "enum": [
+    "user_composer",
+    "drag_drop",
+    "paste",
+    "api"
+  ]
+}

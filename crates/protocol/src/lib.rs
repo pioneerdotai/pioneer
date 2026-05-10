@@ -1,6 +1,7 @@
 pub mod constants;
 
 mod agent_event;
+mod artifact;
 mod id;
 mod jsonrpc;
 mod markdown;
@@ -18,6 +19,26 @@ mod workspace;
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView, TurnSkillBinding,
+};
+pub use artifact::{
+    ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
+    ArtifactBindingSummary, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse,
+    ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactDeleteParams,
+    ArtifactDeleteResponse, ArtifactDeletedNotification, ArtifactDownloadAbortParams,
+    ArtifactDownloadAbortResponse, ArtifactDownloadCapabilities, ArtifactDownloadChunkHeader,
+    ArtifactDownloadChunkParams, ArtifactDownloadChunkResponse, ArtifactDownloadFinishParams,
+    ArtifactDownloadFinishResponse, ArtifactDownloadProgressNotification,
+    ArtifactDownloadStartParams, ArtifactDownloadStartResponse, ArtifactGetParams,
+    ArtifactGetResponse, ArtifactKind, ArtifactListForMessageParams, ArtifactListForThreadParams,
+    ArtifactListForTurnParams, ArtifactListParams, ArtifactListResponse, ArtifactPreviewRef,
+    ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactProjectionUpdatedNotification,
+    ArtifactReadParams, ArtifactReadResponse, ArtifactRef, ArtifactRestoreParams,
+    ArtifactRestoreResponse, ArtifactRole, ArtifactStatus, ArtifactSummary,
+    ArtifactUpdatedNotification, ArtifactUploadAbortParams, ArtifactUploadAbortResponse,
+    ArtifactUploadCapabilities, ArtifactUploadChunkAckNotification, ArtifactUploadChunkHeader,
+    ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadProgressNotification,
+    ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    ThreadArtifactsChangedNotification,
 };
 pub use id::generate_id;
 pub use jsonrpc::{

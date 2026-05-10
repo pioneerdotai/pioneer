@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactDeleteResponse",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ArtifactStatus"
+    }
+  },
+  "required": [
+    "artifact_id",
+    "status"
+  ],
+  "$defs": {
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    }
+  }
+}

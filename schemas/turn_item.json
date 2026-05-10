@@ -957,6 +957,150 @@
     }
   ],
   "$defs": {
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
     "DeltaOutputPolicy": {
       "oneOf": [
         {
@@ -2445,6 +2589,22 @@
           "required": [
             "type",
             "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            }
+          },
+          "required": [
+            "type",
+            "artifact"
           ]
         }
       ]
