@@ -27,6 +27,22 @@ max_concurrent = 4
 stale_running_after_ms = 120000
 strict_debug = false
 
+[gateway.artifacts]
+capture_new_workspace_files = true
+capture_modified_workspace_files = false
+output_roots = []
+ignored_globs = [".git", "target", "node_modules", "dist", "build", ".next", ".cache", ".DS_Store", "*.tmp", "*.swp", "*~"]
+max_files_per_turn = 32
+max_bytes_per_file = 52428800
+max_total_bytes_per_turn = 134217728
+max_file_bytes = 536870912
+max_workspace_bytes = 10737418240
+max_files_per_workspace = 100000
+upload_session_ttl_secs = 3600
+download_session_ttl_secs = 900
+gc_grace_secs = 86400
+quota_warn_at_percent = 80
+
 [gateway.thread]
 default_model = "google/gemini-3-flash-preview"
 default_model_provider = "openrouter"
