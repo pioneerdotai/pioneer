@@ -1094,6 +1094,9 @@ pub(super) async fn run_agent_turn_post_turn_hook_phase(
             for diagnostic in response.diagnostics {
                 warn_hook_diagnostic(phase, &diagnostic);
             }
+            if let Err(error) = runtime.drain_queued_background().await {
+                warn_hook_runtime_error(phase, &error);
+            }
         }
         Err(error) => warn_hook_runtime_error(phase, &error),
     }
@@ -1807,5 +1810,93 @@ fn warn_hook_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 "agent turn hook phase failed; continuing"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_hooks::{
+        HookAwaitPolicy, HookCapabilities, HookExecutionPolicy, HookFailurePolicy, HookHandler,
+        HookHandlerRequest, HookHandlerResponse, HookKind, HookRegistry, HookResult,
+        HookSubscription, HookSubscriptionRegistry,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestPostTurnBackgroundHook {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl HookHandler for TestPostTurnBackgroundHook {
+        fn id(&self) -> HookId {
+            HookId::new("test.post_turn_background").expect("valid hook id")
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPostTurn]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([])
+        }
+
+        async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            assert_eq!(request.phase, HookPhase::TurnPostTurn);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(HookHandlerResponse::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_20_post_turn_dispatch_drains_queued_background_hooks_generically() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(TestPostTurnBackgroundHook {
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    HookSubscriptionId::new("sub.post_turn_background")
+                        .expect("valid subscription id"),
+                    HookId::new("test.post_turn_background").expect("valid hook id"),
+                    HookPhase::TurnPostTurn,
+                )
+                .with_execution_policy(HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::FireAndRecord,
+                    timeout_ms: Some(1_000),
+                    max_parallelism: None,
+                })
+                .with_failure_policy(HookFailurePolicy::BestEffort),
+            )
+            .expect("subscription registers");
+        let runtime = Arc::new(HookRuntime::new(handlers, subscriptions));
+        let dispatch = AgentTurnPostTurnHookDispatch::new(
+            AgentTurnHookContext::new("workspace", "thread", "turn"),
+            EffectiveTurnPolicySet::empty(),
+            EffectiveTurnPromptContextSet::empty(),
+            AgentTurnPostTurnSummary::succeeded_with_model(
+                Some("model".to_owned()),
+                Some("provider".to_owned()),
+                "user".to_owned(),
+                "assistant".to_owned(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        run_agent_turn_post_turn_hook_phase(Some(&runtime), dispatch).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
     }
 }

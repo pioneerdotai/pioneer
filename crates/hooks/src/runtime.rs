@@ -292,6 +292,39 @@ pub struct HookPhaseResponse {
     pub runs: Vec<HookRunSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookBackgroundRunSummary {
+    pub subscription_id: HookSubscriptionId,
+    pub hook_id: HookId,
+    pub phase: HookPhase,
+    pub await_policy: HookAwaitPolicy,
+    pub status: HookRunStatus,
+    pub contribution_count: usize,
+    pub diagnostic_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HookBackgroundDrainSummary {
+    pub executed_count: usize,
+    pub succeeded_count: usize,
+    pub failed_count: usize,
+    pub timed_out_count: usize,
+    pub skipped_count: usize,
+}
+
+impl HookBackgroundDrainSummary {
+    fn record(&mut self, run: &HookBackgroundRunSummary) {
+        self.executed_count += 1;
+        match run.status {
+            HookRunStatus::Succeeded => self.succeeded_count += 1,
+            HookRunStatus::Failed => self.failed_count += 1,
+            HookRunStatus::TimedOut => self.timed_out_count += 1,
+            HookRunStatus::Skipped => self.skipped_count += 1,
+            HookRunStatus::Queued | HookRunStatus::Running => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRuntimeOptions {
     pub default_deadline_timeout_ms: u64,
@@ -323,8 +356,80 @@ pub struct HookRuntime {
     handlers: Arc<HookRegistry>,
     subscriptions: Arc<HookSubscriptionRegistry>,
     options: HookRuntimeOptions,
-    queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    queued_background: HookBackgroundQueue,
     run_store: Option<Arc<dyn HookRunStore>>,
+}
+
+#[derive(Clone)]
+struct HookBackgroundQueue {
+    inner: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    drain_state: Arc<Mutex<HookBackgroundDrainState>>,
+}
+
+#[derive(Default)]
+struct HookBackgroundDrainState {
+    draining: bool,
+}
+
+struct HookBackgroundDrainGuard {
+    queue: HookBackgroundQueue,
+}
+
+impl HookBackgroundQueue {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+            drain_state: Arc::new(Mutex::new(HookBackgroundDrainState::default())),
+        }
+    }
+
+    fn len(&self) -> HookRuntimeResult<usize> {
+        self.inner
+            .lock()
+            .map(|queue| queue.len())
+            .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background queue").into())
+    }
+
+    fn push(&self, run: HookQueuedBackgroundRun) -> HookRuntimeResult<()> {
+        self.inner
+            .lock()
+            .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background queue"))?
+            .push_back(run);
+        Ok(())
+    }
+
+    fn pop_front(&self) -> HookRuntimeResult<Option<HookQueuedBackgroundRun>> {
+        self.inner
+            .lock()
+            .map(|mut queue| queue.pop_front())
+            .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background queue").into())
+    }
+
+    fn try_acquire_drain(&self) -> HookRuntimeResult<Option<HookBackgroundDrainGuard>> {
+        let mut state = self
+            .drain_state
+            .lock()
+            .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background drain state"))?;
+        if state.draining {
+            return Ok(None);
+        }
+        state.draining = true;
+        Ok(Some(HookBackgroundDrainGuard {
+            queue: self.clone(),
+        }))
+    }
+
+    fn release_drain(&self) {
+        if let Ok(mut state) = self.drain_state.lock() {
+            state.draining = false;
+        }
+    }
+}
+
+impl Drop for HookBackgroundDrainGuard {
+    fn drop(&mut self) {
+        self.queue.release_drain();
+    }
 }
 
 impl HookRuntime {
@@ -372,7 +477,7 @@ impl HookRuntime {
             handlers,
             subscriptions,
             options: options.normalized(),
-            queued_background: Arc::new(Mutex::new(VecDeque::new())),
+            queued_background: HookBackgroundQueue::new(),
             run_store,
         }
     }
@@ -412,10 +517,7 @@ impl HookRuntime {
     }
 
     pub fn queued_background_len(&self) -> HookRuntimeResult<usize> {
-        self.queued_background
-            .lock()
-            .map(|queue| queue.len())
-            .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background queue").into())
+        self.queued_background.len()
     }
 
     pub async fn run_phase(
@@ -449,6 +551,32 @@ impl HookRuntime {
 
         Ok(response)
     }
+
+    pub async fn run_queued_background_once(
+        &self,
+    ) -> HookRuntimeResult<Option<HookBackgroundRunSummary>> {
+        let Some(_guard) = self.queued_background.try_acquire_drain()? else {
+            return Ok(None);
+        };
+        let Some(run) = self.queued_background.pop_front()? else {
+            return Ok(None);
+        };
+        execute_queued_background_run(run, &self.options)
+            .await
+            .map(Some)
+    }
+
+    pub async fn drain_queued_background(&self) -> HookRuntimeResult<HookBackgroundDrainSummary> {
+        let Some(_guard) = self.queued_background.try_acquire_drain()? else {
+            return Ok(HookBackgroundDrainSummary::default());
+        };
+        let mut summary = HookBackgroundDrainSummary::default();
+        while let Some(run) = self.queued_background.pop_front()? {
+            let run_summary = execute_queued_background_run(run, &self.options).await?;
+            summary.record(&run_summary);
+        }
+        Ok(summary)
+    }
 }
 
 #[derive(Clone)]
@@ -477,18 +605,32 @@ enum HookNodeOutcome {
     Queued,
 }
 
-#[derive(Clone)]
-enum HookQueuedBackgroundRun {
+struct HookQueuedBackgroundRun {
+    await_policy: HookQueuedBackgroundPolicy,
+    node: HookExecutionNode,
+    request: HookPhaseRequest,
+    persistence: HookRunPersistence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookQueuedBackgroundPolicy {
     Background,
     FireAndRecord,
 }
 
-impl HookQueuedBackgroundRun {
+impl HookQueuedBackgroundPolicy {
     fn from_await_policy(await_policy: HookAwaitPolicy) -> Option<Self> {
         match await_policy {
             HookAwaitPolicy::Background => Some(Self::Background),
             HookAwaitPolicy::FireAndRecord => Some(Self::FireAndRecord),
             HookAwaitPolicy::Blocking | HookAwaitPolicy::Deadline => None,
+        }
+    }
+
+    fn as_await_policy(self) -> HookAwaitPolicy {
+        match self {
+            Self::Background => HookAwaitPolicy::Background,
+            Self::FireAndRecord => HookAwaitPolicy::FireAndRecord,
         }
     }
 }
@@ -549,6 +691,8 @@ fn validate_dependencies(
                     phase,
                 });
             }
+            let dependency = &subscriptions[subscription_indexes[dependency_id]];
+            validate_dependency_execution_policy(phase, subscription, dependency)?;
         }
         for dependency_id in &subscription.dependencies.before {
             if !subscription_indexes.contains_key(dependency_id) {
@@ -558,7 +702,41 @@ fn validate_dependencies(
                     phase,
                 });
             }
+            let target = &subscriptions[subscription_indexes[dependency_id]];
+            validate_dependency_execution_policy(phase, target, subscription)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_dependency_execution_policy(
+    phase: HookPhase,
+    subscription: &HookSubscription,
+    dependency: &HookSubscription,
+) -> HookRuntimeResult<()> {
+    let subscription_background = is_background_like(subscription.execution_policy.await_policy);
+    let dependency_background = is_background_like(dependency.execution_policy.await_policy);
+    if !subscription_background && dependency_background {
+        return Err(HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id: subscription.subscription_id.clone(),
+            hook_id: subscription.hook_id.clone(),
+            phase,
+            reason: format!(
+                "inline hook cannot depend on background-like subscription `{}` in the same phase",
+                dependency.subscription_id
+            ),
+        });
+    }
+    if subscription_background && dependency_background {
+        return Err(HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id: subscription.subscription_id.clone(),
+            hook_id: subscription.hook_id.clone(),
+            phase,
+            reason: format!(
+                "background-like hook cannot depend on background-like subscription `{}` in phase 20",
+                dependency.subscription_id
+            ),
+        });
     }
     Ok(())
 }
@@ -585,8 +763,47 @@ fn validate_policy_configuration(
                 reason: "max_parallelism must be greater than zero".to_owned(),
             });
         }
+        if is_background_like(subscription.execution_policy.await_policy) {
+            match subscription.failure_policy {
+                HookFailurePolicy::Required | HookFailurePolicy::FailClosed => {
+                    return Err(HookRuntimeError::InvalidExecutionPolicy {
+                        subscription_id: subscription.subscription_id.clone(),
+                        hook_id: subscription.hook_id.clone(),
+                        phase,
+                        reason: format!(
+                            "{:?} failure policy cannot be used with background-like await policy",
+                            subscription.failure_policy
+                        ),
+                    });
+                }
+                HookFailurePolicy::Fallback => {
+                    if subscription
+                        .fallback_contributions
+                        .iter()
+                        .any(|contribution| !background_contribution_allowed(contribution))
+                    {
+                        return Err(HookRuntimeError::InvalidExecutionPolicy {
+                            subscription_id: subscription.subscription_id.clone(),
+                            hook_id: subscription.hook_id.clone(),
+                            phase,
+                            reason:
+                                "background-like fallback contributions must be side-effect-only"
+                                    .to_owned(),
+                        });
+                    }
+                }
+                HookFailurePolicy::BestEffort | HookFailurePolicy::Skip => {}
+            }
+        }
     }
     Ok(())
+}
+
+fn is_background_like(await_policy: HookAwaitPolicy) -> bool {
+    matches!(
+        await_policy,
+        HookAwaitPolicy::Background | HookAwaitPolicy::FireAndRecord
+    )
 }
 
 fn build_topological_batches(
@@ -806,7 +1023,7 @@ fn append_node_result(
 async fn execute_node(
     node: HookExecutionNode,
     request: HookPhaseRequest,
-    queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    queued_background: HookBackgroundQueue,
     options: HookRuntimeOptions,
     run_store: Option<Arc<dyn HookRunStore>>,
 ) -> NodeExecutionResult {
@@ -822,7 +1039,7 @@ async fn execute_node(
 async fn execute_node_with_persistence(
     node: &HookExecutionNode,
     request: HookPhaseRequest,
-    queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
+    queued_background: HookBackgroundQueue,
     options: &HookRuntimeOptions,
     run_store: Option<Arc<dyn HookRunStore>>,
 ) -> HookRuntimeResult<HookNodeOutcome> {
@@ -841,21 +1058,44 @@ async fn execute_node_with_persistence(
         return Ok(HookNodeOutcome::Skipped);
     }
 
-    let executes_inline = matches!(
-        node.subscription.execution_policy.await_policy,
-        HookAwaitPolicy::Blocking | HookAwaitPolicy::Deadline
-    );
-    if executes_inline {
-        persistence.start_attempt().await;
+    let await_policy = node.subscription.execution_policy.await_policy;
+    if let Some(background_policy) = HookQueuedBackgroundPolicy::from_await_policy(await_policy) {
+        queued_background.push(HookQueuedBackgroundRun {
+            await_policy: background_policy,
+            node: node.clone(),
+            request,
+            persistence,
+        })?;
+        return Ok(HookNodeOutcome::Queued);
     }
 
-    let outcome = execute_node_with_policy(node, request.clone(), queued_background, options).await;
+    persistence.start_attempt().await;
+    let outcome = execute_node_with_policy(node, request.clone(), options).await;
     if let Ok(outcome) = &outcome {
         persistence
             .complete_for_outcome(&node.subscription, request.phase, outcome, options)
             .await;
     }
     outcome
+}
+
+async fn execute_queued_background_run(
+    mut run: HookQueuedBackgroundRun,
+    options: &HookRuntimeOptions,
+) -> HookRuntimeResult<HookBackgroundRunSummary> {
+    run.persistence.start_attempt().await;
+    let mut outcome = execute_node_with_policy(&run.node, run.request.clone(), options).await?;
+    if let HookNodeOutcome::Succeeded(response) = outcome {
+        outcome = match validate_background_response(response) {
+            Ok(response) => HookNodeOutcome::Succeeded(response),
+            Err(error) => HookNodeOutcome::Failed(error),
+        };
+    }
+    let summary = background_run_summary(&run, &outcome);
+    run.persistence
+        .complete_for_outcome(&run.node.subscription, run.request.phase, &outcome, options)
+        .await;
+    Ok(summary)
 }
 
 struct HookRunPersistence {
@@ -1306,7 +1546,6 @@ fn u128_to_i64_saturating(value: u128) -> i64 {
 async fn execute_node_with_policy(
     node: &HookExecutionNode,
     request: HookPhaseRequest,
-    queued_background: Arc<Mutex<VecDeque<HookQueuedBackgroundRun>>>,
     options: &HookRuntimeOptions,
 ) -> HookRuntimeResult<HookNodeOutcome> {
     match node.subscription.failure_policy {
@@ -1325,7 +1564,9 @@ async fn execute_node_with_policy(
                 Err(error) => HookNodeOutcome::Failed(error),
             })
         }
-        HookAwaitPolicy::Deadline => {
+        HookAwaitPolicy::Deadline
+        | HookAwaitPolicy::Background
+        | HookAwaitPolicy::FireAndRecord => {
             let timeout_ms = node
                 .subscription
                 .execution_policy
@@ -1344,17 +1585,6 @@ async fn execute_node_with_policy(
                 }
             }
         }
-        HookAwaitPolicy::Background | HookAwaitPolicy::FireAndRecord => {
-            let await_policy = node.subscription.execution_policy.await_policy;
-            queued_background
-                .lock()
-                .map_err(|_| HookRegistryError::LockPoisoned("hook runtime background queue"))?
-                .push_back(
-                    HookQueuedBackgroundRun::from_await_policy(await_policy)
-                        .expect("queued await policy is background-like"),
-                );
-            Ok(HookNodeOutcome::Queued)
-        }
     }
 }
 
@@ -1362,6 +1592,61 @@ fn validated_success(handler: &dyn HookHandler, response: HookHandlerResponse) -
     match missing_contribution_capability(handler, response.contributions.as_slice()) {
         Some(error) => HookNodeOutcome::Failed(error),
         None => HookNodeOutcome::Succeeded(response),
+    }
+}
+
+fn validate_background_response(
+    response: HookHandlerResponse,
+) -> Result<HookHandlerResponse, HookError> {
+    if let Some(contribution) = response
+        .contributions
+        .iter()
+        .find(|contribution| !background_contribution_allowed(contribution))
+    {
+        return Err(HookError::new(
+            HookDiagnosticCode::new("hook.background_contribution_not_allowed")
+                .expect("static diagnostic code is valid"),
+            HookDiagnosticMessage::new(format!(
+                "background hook returned `{}` contribution that cannot mutate a completed phase",
+                contribution.kind_name()
+            ))
+            .expect("static diagnostic message is valid"),
+        )
+        .with_safe_for_user(true));
+    }
+    Ok(response)
+}
+
+fn background_contribution_allowed(contribution: &HookContribution) -> bool {
+    matches!(
+        contribution,
+        HookContribution::Audit(_) | HookContribution::BackgroundJob(_) | HookContribution::Noop
+    )
+}
+
+fn background_run_summary(
+    run: &HookQueuedBackgroundRun,
+    outcome: &HookNodeOutcome,
+) -> HookBackgroundRunSummary {
+    let (status, contribution_count, diagnostic_count) = match outcome {
+        HookNodeOutcome::Succeeded(response) => (
+            HookRunStatus::Succeeded,
+            response.contributions.len(),
+            response.diagnostics.len(),
+        ),
+        HookNodeOutcome::Failed(_) => (HookRunStatus::Failed, 0, 1),
+        HookNodeOutcome::TimedOut { .. } => (HookRunStatus::TimedOut, 0, 1),
+        HookNodeOutcome::Skipped => (HookRunStatus::Skipped, 0, 0),
+        HookNodeOutcome::Queued => (HookRunStatus::Queued, 0, 0),
+    };
+    HookBackgroundRunSummary {
+        subscription_id: run.node.subscription.subscription_id.clone(),
+        hook_id: run.node.subscription.hook_id.clone(),
+        phase: run.request.phase,
+        await_policy: run.await_policy.as_await_policy(),
+        status,
+        contribution_count,
+        diagnostic_count,
     }
 }
 
@@ -1887,6 +2172,60 @@ mod tests {
             max_chars: None,
             diagnostics: Vec::new(),
             truncated: false,
+        })
+    }
+
+    fn audit_contribution(event_kind: &str) -> HookContribution {
+        HookContribution::Audit(crate::AuditContribution {
+            event_kind: crate::HookAuditEventKind::new(event_kind).expect("valid event kind"),
+            details: HookValue::Text("audit details".to_owned()),
+            safe_for_user: false,
+        })
+    }
+
+    fn policy_contribution(key: &str) -> HookContribution {
+        HookContribution::Policy(crate::PolicyContribution {
+            domain: HookDomain::new("test").expect("valid domain"),
+            key: crate::HookPolicyKey::new(key).expect("valid policy key"),
+            value: HookValue::Bool(true),
+            priority: 0,
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn prompt_context_contribution(id: &str) -> HookContribution {
+        HookContribution::PromptContext(crate::PromptContextContribution {
+            contribution_id: crate::HookContributionId::new(id).expect("valid contribution id"),
+            domain: HookDomain::new("test").expect("valid domain"),
+            priority: 0,
+            content: HookPromptContent::new("context").expect("valid content"),
+            max_chars: None,
+            source_refs: Vec::new(),
+            diagnostics: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    fn tool_bundle_contribution(id: &str) -> HookContribution {
+        HookContribution::ToolBundle(crate::ToolBundleContribution {
+            contribution_id: crate::HookContributionId::new(id).expect("valid contribution id"),
+            bundle_id: crate::HookToolBundleId::new(format!("{id}.bundle"))
+                .expect("valid bundle id"),
+            domain: HookDomain::new("test").expect("valid domain"),
+            priority: 0,
+            tool_names: vec![crate::HookToolName::new("test_tool").expect("valid tool name")],
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn prompt_manifest_diagnostic_contribution(code: &str) -> HookContribution {
+        HookContribution::PromptManifestDiagnostic(crate::PromptManifestDiagnosticContribution {
+            code: HookDiagnosticCode::new(code).expect("valid diagnostic code"),
+            message: HookDiagnosticMessage::new("manifest diagnostic").expect("valid message"),
+            severity: HookDiagnosticSeverity::Info,
+            safe_for_user: true,
+            hook_id: None,
+            subscription_id: None,
         })
     }
 
@@ -3724,6 +4063,664 @@ mod tests {
         assert_eq!(response.runs[0].status, HookRunStatus::Queued);
         assert!(response.runs[0].attempts.is_empty());
         assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
+    }
+
+    #[tokio::test]
+    async fn phase_20_fire_and_record_executes_through_runtime_drain() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase20.fire",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::Noop],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.fire",
+            "test.phase20.fire",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+
+        assert!(response.contributions.is_empty());
+        assert!(calls.lock().expect("calls lock").is_empty());
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 1);
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.executed_count, 1);
+        assert_eq!(drain.succeeded_count, 1);
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![hook_id("test.phase20.fire")]
+        );
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase_20_caller_receives_queued_before_slow_handler_completion() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active_count = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(ConcurrencyTrackingHookHandler {
+                id: hook_id("test.phase20.slow"),
+                active_count: active_count.clone(),
+                max_active_count: max_active_count.clone(),
+                delay: Duration::from_millis(25),
+            }))
+            .expect("handler registers");
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.slow",
+            "test.phase20.slow",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert_eq!(max_active_count.load(Ordering::SeqCst), 0);
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+        assert_eq!(drain.succeeded_count, 1);
+        assert_eq!(max_active_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn phase_20_fire_and_record_persists_success_lifecycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase20.persist.success",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::Noop],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.persist.success",
+            "test.phase20.persist.success",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.succeeded_count, 1);
+        let events = store.events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| match event {
+                    StoreEvent::CreateRun { status, .. }
+                    | StoreEvent::AppendAttempt { status, .. }
+                    | StoreEvent::CompleteAttempt { status, .. }
+                    | StoreEvent::CompleteRun { status, .. } => Some(*status),
+                    StoreEvent::MarkRunRunning | StoreEvent::AppendAudit { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                Some(HookRunStatus::Queued),
+                None,
+                Some(HookRunStatus::Running),
+                Some(HookRunStatus::Succeeded),
+                Some(HookRunStatus::Succeeded),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_20_background_failure_persists_failed_lifecycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase20.failure",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error("hook.failed", "failure"))],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.failure",
+            "test.phase20.failure",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.failed_count, 1);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteAttempt {
+                status: HookRunStatus::Failed,
+                ..
+            }
+        )));
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::Failed,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase_20_background_timeout_persists_timed_out_lifecycle() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        handlers
+            .register_handler(Arc::new(DelayedHookHandler {
+                id: hook_id("test.phase20.timeout"),
+                delay: Duration::from_millis(50),
+                contribution: HookContribution::Noop,
+            }))
+            .expect("handler registers");
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.timeout",
+            "test.phase20.timeout",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.timed_out_count, 1);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteRun {
+                status: HookRunStatus::TimedOut,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn phase_20_background_prompt_contributions_do_not_mutate_returned_phase_output() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase20.forbidden",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![contribution("section.phase20.forbidden", "forbidden")],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.forbidden",
+            "test.phase20.forbidden",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+        assert!(response.contributions.is_empty());
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.failed_count, 1);
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
+    }
+
+    #[tokio::test]
+    async fn phase_20_all_prompt_mutating_background_contributions_are_rejected() {
+        let forbidden = vec![
+            policy_contribution("phase20.policy"),
+            prompt_context_contribution("phase20.prompt_context"),
+            contribution("phase20.prompt_section", "forbidden"),
+            tool_bundle_contribution("phase20.tool_bundle"),
+            prompt_manifest_diagnostic_contribution("phase20.manifest"),
+        ];
+
+        for (index, forbidden_contribution) in forbidden.into_iter().enumerate() {
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            let hook_id_value = format!("test.phase20.forbidden.{index}");
+            let subscription_id_value = format!("sub.phase20.forbidden.{index}");
+            register_handler(
+                &handlers,
+                hook_id_value.as_str(),
+                Arc::new(Mutex::new(Vec::new())),
+                vec![Ok(HookHandlerResponse {
+                    contributions: vec![forbidden_contribution],
+                    diagnostics: Vec::new(),
+                    metadata: HookMetadata::default(),
+                })],
+            );
+            register_subscription_with_policy(
+                &handlers,
+                &subscriptions,
+                subscription_id_value.as_str(),
+                hook_id_value.as_str(),
+                0,
+                HookAwaitPolicy::FireAndRecord,
+                Some(1_000),
+                HookFailurePolicy::BestEffort,
+                Vec::new(),
+            );
+            let runtime = runtime(handlers, subscriptions);
+
+            let response = runtime
+                .run_phase(phase_request())
+                .await
+                .expect("phase execution succeeds");
+            assert!(response.contributions.is_empty());
+
+            let drain = runtime
+                .drain_queued_background()
+                .await
+                .expect("background drain succeeds");
+
+            assert_eq!(drain.failed_count, 1, "index {index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_20_background_audit_contribution_persists() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let audit = audit_contribution("test.phase20.audit");
+        register_handler(
+            &handlers,
+            "test.phase20.audit",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![audit],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.audit",
+            "test.phase20.audit",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+        assert!(response.contributions.is_empty());
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.succeeded_count, 1);
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::AppendAudit { event_kinds, .. }
+                if event_kinds == &vec!["test.phase20.audit".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn phase_20_inline_dependency_on_background_hook_is_rejected() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.phase20.background.dep",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_handler(
+            &handlers,
+            "test.phase20.inline.dep",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.background.dep",
+            "test.phase20.background.dep",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        register_subscription_with_dependencies(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.inline.dep",
+            "test.phase20.inline.dep",
+            1,
+            HookSubscriptionDependencies::new([subscription_id("sub.phase20.background.dep")], []),
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = block_on_ready(runtime.run_phase(phase_request()))
+            .expect_err("inline dependency on background should be rejected");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::InvalidExecutionPolicy {
+                subscription_id: invalid_subscription_id,
+                ..
+            } if invalid_subscription_id == subscription_id("sub.phase20.inline.dep")
+        ));
+    }
+
+    #[tokio::test]
+    async fn phase_20_background_after_inline_dependency_is_allowed() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase20.inline.first",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_handler(
+            &handlers,
+            "test.phase20.background.after",
+            calls.clone(),
+            vec![
+                Ok(HookHandlerResponse {
+                    contributions: vec![HookContribution::Noop],
+                    diagnostics: Vec::new(),
+                    metadata: HookMetadata::default(),
+                }),
+                Ok(HookHandlerResponse {
+                    contributions: vec![HookContribution::Noop],
+                    diagnostics: Vec::new(),
+                    metadata: HookMetadata::default(),
+                }),
+            ],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.inline.first",
+            "test.phase20.inline.first",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.background.after",
+            "test.phase20.background.after",
+            1,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    subscription_id("sub.phase20.background.after.dep"),
+                    hook_id("test.phase20.background.after"),
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_priority(2)
+                .with_execution_policy(crate::HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::FireAndRecord,
+                    timeout_ms: Some(1_000),
+                    max_parallelism: None,
+                })
+                .with_dependencies(HookSubscriptionDependencies::new(
+                    [subscription_id("sub.phase20.inline.first")],
+                    [],
+                )),
+            )
+            .expect("subscription registers");
+        let runtime = runtime(handlers, subscriptions);
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds");
+
+        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+        assert_eq!(response.runs[1].status, HookRunStatus::Queued);
+        assert_eq!(response.runs[2].status, HookRunStatus::Queued);
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+        assert_eq!(drain.executed_count, 2);
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![
+                hook_id("test.phase20.inline.first"),
+                hook_id("test.phase20.background.after"),
+                hook_id("test.phase20.background.after"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase_20_background_drain_respects_max_parallelism_upper_bound() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active_count = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(ConcurrencyTrackingHookHandler {
+                id: hook_id("test.phase20.max.parallel"),
+                active_count: active_count.clone(),
+                max_active_count: max_active_count.clone(),
+                delay: Duration::from_millis(10),
+            }))
+            .expect("handler registers");
+        subscriptions
+            .register_subscription(
+                handlers.as_ref(),
+                HookSubscription::new(
+                    subscription_id("sub.phase20.max.parallel"),
+                    hook_id("test.phase20.max.parallel"),
+                    HookPhase::TurnPrePromptCompile,
+                )
+                .with_execution_policy(crate::HookExecutionPolicy {
+                    await_policy: HookAwaitPolicy::FireAndRecord,
+                    timeout_ms: Some(1_000),
+                    max_parallelism: Some(1),
+                }),
+            )
+            .expect("subscription registers");
+        let runtime = runtime(handlers, subscriptions);
+
+        runtime
+            .run_phase(phase_request())
+            .await
+            .expect("first phase execution succeeds");
+        runtime
+            .run_phase(phase_request())
+            .await
+            .expect("second phase execution succeeds");
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 2);
+
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds");
+
+        assert_eq!(drain.executed_count, 2);
+        assert_eq!(max_active_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn phase_20_empty_background_drain_is_idempotent() {
+        let runtime = runtime(
+            Arc::new(HookRegistry::new()),
+            Arc::new(HookSubscriptionRegistry::new()),
+        );
+
+        let first = runtime
+            .drain_queued_background()
+            .await
+            .expect("empty drain succeeds");
+        let second = runtime
+            .drain_queued_background()
+            .await
+            .expect("empty drain succeeds again");
+
+        assert_eq!(first.executed_count, 0);
+        assert_eq!(second.executed_count, 0);
+        assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
+    }
+
+    #[tokio::test]
+    async fn phase_20_store_failure_does_not_prevent_best_effort_background_execution() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.phase20.store.failure",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::Noop],
+                diagnostics: Vec::new(),
+                metadata: HookMetadata::default(),
+            })],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.phase20.store.failure",
+            "test.phase20.store.failure",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore {
+            events: Mutex::new(Vec::new()),
+            fail_all: true,
+            append_attempt_conflicts_remaining: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store);
+
+        let response = runtime
+            .run_phase(phase_request())
+            .await
+            .expect("phase execution succeeds despite store failure");
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("background drain succeeds despite store failure");
+
+        assert_eq!(drain.succeeded_count, 1);
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![hook_id("test.phase20.store.failure")]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

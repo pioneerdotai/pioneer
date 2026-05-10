@@ -75,8 +75,9 @@ pub use request::{
     TurnPreToolMaterializationHookInput,
 };
 pub use runtime::{
-    HookAttemptSummary, HookPhaseRequest, HookPhaseResponse, HookRunErrorSummary, HookRunStatus,
-    HookRunSummary, HookRuntime, HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
+    HookAttemptSummary, HookBackgroundDrainSummary, HookBackgroundRunSummary, HookPhaseRequest,
+    HookPhaseResponse, HookRunErrorSummary, HookRunStatus, HookRunSummary, HookRuntime,
+    HookRuntimeError, HookRuntimeOptions, HookRuntimeResult,
 };
 pub use store::{
     HookAuditEventStoreRecord, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
