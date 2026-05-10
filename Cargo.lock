@@ -7083,6 +7083,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-artifacts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "hex",
+ "mime_guess",
+ "pioneer-crud",
+ "pioneer-migration",
+ "pioneer-protocol",
+ "pioneer-provider",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pioneer-cli"
 version = "0.1.0"
 dependencies = [
@@ -7147,6 +7169,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui-terminal",
  "hex",
+ "mime_guess",
  "pioneer-config",
  "pioneer-gateway",
  "pioneer-keystore",
@@ -7161,6 +7184,7 @@ dependencies = [
  "sha2 0.11.0",
  "sys-locale",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
@@ -7192,6 +7216,7 @@ dependencies = [
  "jsonwebtoken",
  "markdown",
  "pioneer-agent",
+ "pioneer-artifacts",
  "pioneer-config",
  "pioneer-crud",
  "pioneer-entity",
@@ -7214,6 +7239,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tar",
+ "tempfile",
  "tiktoken-rs",
  "tokio",
  "tokio-tungstenite",

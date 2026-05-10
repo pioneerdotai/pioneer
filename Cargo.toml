@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/agent",
+  "crates/artifacts",
   "crates/promt",
   "crates/config",
   "crates/keystore",
@@ -31,6 +32,7 @@ authors = ["Pioneer Contributors"]
 [workspace.dependencies]
 # Local
 pioneer-agent = { path = "crates/agent" }
+pioneer-artifacts = { path = "crates/artifacts" }
 pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
 pioneer-hooks = { path = "crates/hooks" }
