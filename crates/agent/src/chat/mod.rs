@@ -21,8 +21,9 @@ use crate::hooks::{
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider,
-    TaskTurnContext, TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl,
+    AgentMcpToolProvider, ResolvedArtifactInput, RetainedToolLlmContext, TaskToolMaterialization,
+    TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
+    TurnExecutionControl,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -795,6 +796,7 @@ pub(super) async fn execute_chat_turn_flow(
     model: String,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
+    resolved_artifacts: Vec<ResolvedArtifactInput>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     force_non_stream: bool,
@@ -808,7 +810,7 @@ pub(super) async fn execute_chat_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
-    let user_message = build_user_message(input.as_slice());
+    let user_message = build_user_message(input.as_slice(), resolved_artifacts.as_slice());
 
     let thinking_item_id = generate_id(TURN_ITEM_ID_LEN);
     let message_item_id = generate_id(TURN_ITEM_ID_LEN);
@@ -2798,7 +2800,10 @@ fn extract_user_text(input: &[UserInput]) -> String {
     parts.join("\n")
 }
 
-fn build_user_message(input: &[UserInput]) -> ChatMessage {
+fn build_user_message(
+    input: &[UserInput],
+    resolved_artifacts: &[ResolvedArtifactInput],
+) -> ChatMessage {
     let mut message = ChatMessage::user(extract_user_text(input));
 
     for item in input {
@@ -2867,11 +2872,44 @@ fn build_user_message(input: &[UserInput]) -> ChatMessage {
                     ),
                 ));
             }
+            UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } => {
+                if let Some(resolved) =
+                    find_resolved_artifact(resolved_artifacts, artifact_id, version_id.as_deref())
+                {
+                    message
+                        .content_parts
+                        .push(content_part_for_resolved_artifact(resolved));
+                }
+            }
             UserInput::Text { .. } | UserInput::Skill { .. } | UserInput::Mention { .. } => {}
         }
     }
 
     message
+}
+
+fn find_resolved_artifact<'a>(
+    resolved_artifacts: &'a [ResolvedArtifactInput],
+    artifact_id: &str,
+    version_id: Option<&str>,
+) -> Option<&'a ResolvedArtifactInput> {
+    resolved_artifacts.iter().find(|artifact| {
+        artifact.artifact_id == artifact_id && artifact.version_id.as_deref() == version_id
+    })
+}
+
+fn content_part_for_resolved_artifact(resolved: &ResolvedArtifactInput) -> MessageContentPart {
+    match resolved.content_type {
+        InputContentType::Image => MessageContentPart::image(resolved.attachment.clone()),
+        InputContentType::Audio => MessageContentPart::audio(resolved.attachment.clone()),
+        InputContentType::Video => MessageContentPart::video(resolved.attachment.clone()),
+        InputContentType::Text | InputContentType::File => {
+            MessageContentPart::file(resolved.attachment.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3034,10 +3072,11 @@ mod tests {
         compile_agent_prompt_bundle_with_prompt_root, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
     };
-    use crate::RetainedToolLlmContext;
+    use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
     use pioneer_protocol::UserInput;
     use pioneer_provider::{
-        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Role,
+        AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
+        Role,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3065,6 +3104,7 @@ mod tests {
             source: AttachmentDataSource::Path {
                 path: path.to_owned(),
             },
+            artifact: None,
         })
     }
 
@@ -3077,6 +3117,7 @@ mod tests {
             source: AttachmentDataSource::Path {
                 path: path.to_owned(),
             },
+            artifact: None,
         })
     }
 
@@ -3312,7 +3353,7 @@ mod tests {
             },
         ];
 
-        let message = build_user_message(input.as_slice());
+        let message = build_user_message(input.as_slice(), &[]);
 
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content, "describe screenshot");
@@ -3424,6 +3465,48 @@ mod tests {
     }
 
     #[test]
+    fn build_user_message_adds_resolved_artifact_attachment() {
+        let input = vec![
+            UserInput::Text {
+                text: "summarize".to_owned(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Artifact {
+                artifact_id: "art_1".to_owned(),
+                version_id: Some("av_1".to_owned()),
+            },
+        ];
+        let resolved = vec![ResolvedArtifactInput {
+            artifact_id: "art_1".to_owned(),
+            version_id: Some("av_1".to_owned()),
+            content_type: InputContentType::File,
+            attachment: MessageAttachment {
+                mime_type: "text/plain".to_owned(),
+                name: Some("report.txt".to_owned()),
+                size_bytes: Some(13),
+                sha256: Some("a".repeat(64)),
+                source: AttachmentDataSource::Path {
+                    path: "/tmp/materialized/report.txt".to_owned(),
+                },
+                artifact: None,
+            },
+        }];
+
+        let message = build_user_message(input.as_slice(), resolved.as_slice());
+
+        assert_eq!(message.content, "summarize");
+        assert_eq!(message.content_parts.len(), 1);
+        match &message.content_parts[0] {
+            MessageContentPart::File { file } => {
+                assert_eq!(file.name.as_deref(), Some("report.txt"));
+                assert_eq!(file.size_bytes, Some(13));
+                assert!(matches!(file.source, AttachmentDataSource::Path { .. }));
+            }
+            other => panic!("expected file artifact part, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_user_message_text_only_remains_plain_user_message() {
         let input = vec![
             UserInput::Text {
@@ -3436,7 +3519,7 @@ mod tests {
             },
         ];
 
-        let message = build_user_message(input.as_slice());
+        let message = build_user_message(input.as_slice(), &[]);
 
         assert_eq!(message.content, "first\nsecond");
         assert!(message.content_parts.is_empty());

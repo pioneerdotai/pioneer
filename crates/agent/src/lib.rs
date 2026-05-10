@@ -17,7 +17,7 @@ use pioneer_protocol::{
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, PromptManifest,
     ToolOutputPolicySnapshot, TurnToolLoopBudgetExceededNotification,
 };
-use pioneer_provider::{ChatMessage, ProviderRegistry};
+use pioneer_provider::{ChatMessage, InputContentType, MessageAttachment, ProviderRegistry};
 #[cfg(test)]
 use pioneer_skills::SkillAuditEvent;
 use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
@@ -51,6 +51,14 @@ pub use memory::{
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtifactInput {
+    pub artifact_id: String,
+    pub version_id: Option<String>,
+    pub content_type: InputContentType,
+    pub attachment: MessageAttachment,
+}
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const DURABLE_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -1167,6 +1175,7 @@ struct ActiveTurnRequest {
     provider_name: String,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
+    resolved_artifacts: Vec<ResolvedArtifactInput>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_options: TurnExecutionOptions,
@@ -1197,6 +1206,7 @@ enum AgentCommand {
         provider_name: String,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
         history: Vec<ChatMessage>,
         ack: oneshot::Sender<Result<(), AgentStartError>>,
     },
@@ -1601,6 +1611,33 @@ impl AgentManager {
         input: Vec<UserInput>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            Vec::new(),
+            history,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_resolved_artifacts(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
@@ -1619,6 +1656,7 @@ impl AgentManager {
                 provider_name: provider_name.to_owned(),
                 workspace_skill_policies,
                 input,
+                resolved_artifacts,
                 history,
                 ack: ack_tx,
             })

@@ -114,7 +114,8 @@ fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
             UserInput::Image { .. }
             | UserInput::File { .. }
             | UserInput::Audio { .. }
-            | UserInput::Video { .. } => {}
+            | UserInput::Video { .. }
+            | UserInput::Artifact { .. } => {}
         }
     }
 
