@@ -985,6 +985,7 @@ mod tests {
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+VrWQAAAAASUVORK5CYII="
                         .to_owned(),
             },
+            artifact: None,
         }));
 
         let messages = vec![ChatMessage::user("hello"), tool_message];

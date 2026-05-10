@@ -1,4 +1,4 @@
-use crate::types::{ChatMessage, InputContentType};
+use crate::types::{AttachmentArtifactContext, ChatMessage, InputContentType};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -7,14 +7,14 @@ pub struct AttachmentPipelineConfig {
     pub max_total_bytes_per_request: usize,
     pub max_attachments_per_request: usize,
     pub upload_preferred_min_bytes: usize,
-    pub upload_registry: AttachmentUploadRegistryPolicy,
+    pub upload_registry: ArtifactExternalRefCachePolicy,
     pub security: AttachmentSecurityPolicy,
     pub normalization: AttachmentNormalizationPolicy,
     pub runtime: AttachmentRuntimePolicy,
 }
 
 #[derive(Debug, Clone)]
-pub struct AttachmentUploadRegistryPolicy {
+pub struct ArtifactExternalRefCachePolicy {
     pub enabled: bool,
     pub ttl_secs: u64,
 }
@@ -68,7 +68,7 @@ impl Default for AttachmentPipelineConfig {
             max_total_bytes_per_request: 200 * 1024 * 1024,
             max_attachments_per_request: 64,
             upload_preferred_min_bytes: 512 * 1024,
-            upload_registry: AttachmentUploadRegistryPolicy::default(),
+            upload_registry: ArtifactExternalRefCachePolicy::default(),
             security: AttachmentSecurityPolicy::default(),
             normalization: AttachmentNormalizationPolicy::default(),
             runtime: AttachmentRuntimePolicy::default(),
@@ -76,7 +76,7 @@ impl Default for AttachmentPipelineConfig {
     }
 }
 
-impl Default for AttachmentUploadRegistryPolicy {
+impl Default for ArtifactExternalRefCachePolicy {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -187,6 +187,7 @@ pub struct PreparedAttachment {
     pub source: PreparedAttachmentSource,
     pub bytes: Option<Vec<u8>>,
     pub transport_plan: AttachmentTransportPlan,
+    pub artifact: Option<AttachmentArtifactContext>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

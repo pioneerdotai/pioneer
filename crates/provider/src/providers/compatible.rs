@@ -1272,6 +1272,7 @@ mod tests {
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+VrWQAAAAASUVORK5CYII="
                         .to_owned(),
             },
+            artifact: None,
         }));
 
         let prepared = prepared_for(&provider, &[ChatMessage::user("hello"), tool_message]);
@@ -1315,6 +1316,7 @@ mod tests {
                 source: AttachmentDataSource::Bytes {
                     base64_data: expected_base64.clone(),
                 },
+                artifact: None,
             },
         )])];
 

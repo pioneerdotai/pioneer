@@ -472,6 +472,7 @@ mod tests {
                         base64_data: base64::engine::general_purpose::STANDARD
                             .encode([1u8, 2, 3, 4]),
                     },
+                    artifact: None,
                 }),
                 "image" => MessageContentPart::image(MessageAttachment {
                     mime_type: "image/png".to_owned(),
@@ -482,6 +483,7 @@ mod tests {
                         base64_data: base64::engine::general_purpose::STANDARD
                             .encode([1u8, 2, 3, 4]),
                     },
+                    artifact: None,
                 }),
                 "audio" => MessageContentPart::audio(MessageAttachment {
                     mime_type: "audio/wav".to_owned(),
@@ -492,6 +494,7 @@ mod tests {
                         base64_data: base64::engine::general_purpose::STANDARD
                             .encode([1u8, 2, 3, 4]),
                     },
+                    artifact: None,
                 }),
                 "video" => MessageContentPart::video(MessageAttachment {
                     mime_type: "video/mp4".to_owned(),
@@ -502,6 +505,7 @@ mod tests {
                         base64_data: base64::engine::general_purpose::STANDARD
                             .encode([1u8, 2, 3, 4]),
                     },
+                    artifact: None,
                 }),
                 other => panic!("unknown part type: {other}"),
             }

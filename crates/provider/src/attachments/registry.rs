@@ -2,22 +2,24 @@ use crate::attachments::observability;
 use crate::attachments::types::{
     AttachmentPipelineConfig, AttachmentTransportKind, PreparedAttachment,
 };
+use crate::types::AttachmentArtifactContext;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::{Arc, OnceLock, RwLock};
 
 #[derive(Debug, Clone)]
-pub struct UploadRegistryLookupRequest {
+pub struct ArtifactExternalRefLookupRequest {
     pub provider: String,
     pub model_family: String,
     pub transport_kind: AttachmentTransportKind,
     pub sha256: String,
     pub registry_key: String,
     pub now_unix_ms: i64,
+    pub artifact: Option<AttachmentArtifactContext>,
 }
 
 #[derive(Debug, Clone)]
-pub struct UploadRegistryStoreRequest {
+pub struct ArtifactExternalRefStoreRequest {
     pub provider: String,
     pub model_family: String,
     pub transport_kind: AttachmentTransportKind,
@@ -30,41 +32,46 @@ pub struct UploadRegistryStoreRequest {
     pub mime_type: String,
     pub size_bytes: usize,
     pub file_name: String,
+    pub artifact: Option<AttachmentArtifactContext>,
 }
 
 #[async_trait]
-pub trait AttachmentUploadRegistryBackend: Send + Sync {
+pub trait ArtifactExternalRefCacheBackend: Send + Sync {
     async fn lookup_uploaded_reference(
         &self,
-        request: UploadRegistryLookupRequest,
+        request: ArtifactExternalRefLookupRequest,
     ) -> Result<Option<String>>;
 
-    async fn store_uploaded_reference(&self, request: UploadRegistryStoreRequest) -> Result<()>;
+    async fn store_uploaded_reference(
+        &self,
+        request: ArtifactExternalRefStoreRequest,
+    ) -> Result<()>;
 }
 
-static UPLOAD_REGISTRY_BACKEND: OnceLock<RwLock<Option<Arc<dyn AttachmentUploadRegistryBackend>>>> =
-    OnceLock::new();
+static ARTIFACT_EXTERNAL_REF_CACHE_BACKEND: OnceLock<
+    RwLock<Option<Arc<dyn ArtifactExternalRefCacheBackend>>>,
+> = OnceLock::new();
 
-fn backend_store() -> &'static RwLock<Option<Arc<dyn AttachmentUploadRegistryBackend>>> {
-    UPLOAD_REGISTRY_BACKEND.get_or_init(|| RwLock::new(None))
+fn backend_store() -> &'static RwLock<Option<Arc<dyn ArtifactExternalRefCacheBackend>>> {
+    ARTIFACT_EXTERNAL_REF_CACHE_BACKEND.get_or_init(|| RwLock::new(None))
 }
 
-fn upload_registry_backend() -> Result<Arc<dyn AttachmentUploadRegistryBackend>> {
+fn artifact_external_ref_cache_backend() -> Result<Arc<dyn ArtifactExternalRefCacheBackend>> {
     backend_store()
         .read()
-        .expect("attachment upload registry backend lock poisoned")
+        .expect("artifact external ref cache backend lock poisoned")
         .clone()
         .ok_or_else(|| {
             anyhow!(
-                "attachment upload registry backend is not initialized; call set_attachment_upload_registry_backend(...) during gateway startup or disable upload_registry in provider attachments config"
+                "artifact external ref cache backend is not initialized; call set_artifact_external_ref_cache_backend(...) during gateway startup or disable upload_registry in provider attachments config"
             )
         })
 }
 
-pub fn set_attachment_upload_registry_backend(backend: Arc<dyn AttachmentUploadRegistryBackend>) {
+pub fn set_artifact_external_ref_cache_backend(backend: Arc<dyn ArtifactExternalRefCacheBackend>) {
     let mut guard = backend_store()
         .write()
-        .expect("attachment upload registry backend lock poisoned");
+        .expect("artifact external ref cache backend lock poisoned");
     *guard = Some(backend);
 }
 
@@ -112,26 +119,31 @@ pub fn upload_registry_key(
     )
 }
 
-pub async fn lookup_uploaded_reference(
+pub async fn lookup_uploaded_reference_with_artifact(
     config: &AttachmentPipelineConfig,
     provider: &str,
     model_family: &str,
     transport_kind: AttachmentTransportKind,
     sha256: &str,
+    artifact: Option<&AttachmentArtifactContext>,
 ) -> Result<Option<String>> {
     if !config.upload_registry.enabled {
         return Ok(None);
     }
+    let Some(artifact) = artifact else {
+        return Ok(None);
+    };
 
     let key = upload_registry_key(provider, model_family, transport_kind, sha256);
-    let result = upload_registry_backend()?
-        .lookup_uploaded_reference(UploadRegistryLookupRequest {
+    let result = artifact_external_ref_cache_backend()?
+        .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
             provider: provider.trim().to_ascii_lowercase(),
             model_family: model_family.trim().to_ascii_lowercase(),
             transport_kind,
             sha256: sha256.trim().to_ascii_lowercase(),
             registry_key: key.clone(),
             now_unix_ms: now_unix_ms(),
+            artifact: Some(artifact.clone()),
         })
         .await?;
 
@@ -155,6 +167,9 @@ pub async fn store_uploaded_reference(
     if !config.upload_registry.enabled {
         return Ok(());
     }
+    if attachment.artifact.is_none() {
+        return Ok(());
+    }
 
     let trimmed_id = provider_file_id.trim();
     if trimmed_id.is_empty() {
@@ -171,8 +186,8 @@ pub async fn store_uploaded_reference(
         attachment.sha256.as_str(),
     );
 
-    upload_registry_backend()?
-        .store_uploaded_reference(UploadRegistryStoreRequest {
+    artifact_external_ref_cache_backend()?
+        .store_uploaded_reference(ArtifactExternalRefStoreRequest {
             provider: provider.trim().to_ascii_lowercase(),
             model_family: model_family.trim().to_ascii_lowercase(),
             transport_kind,
@@ -185,6 +200,7 @@ pub async fn store_uploaded_reference(
             mime_type: attachment.mime_type.clone(),
             size_bytes: attachment.size_bytes,
             file_name: attachment.name.clone(),
+            artifact: attachment.artifact.clone(),
         })
         .await?;
     observability::emit_upload_registry_write(provider, key.as_str());
@@ -200,14 +216,14 @@ mod tests {
 
     #[derive(Default)]
     struct InMemoryRegistryBackend {
-        entries: Mutex<HashMap<String, UploadRegistryStoreRequest>>,
+        entries: Mutex<HashMap<String, ArtifactExternalRefStoreRequest>>,
     }
 
     #[async_trait]
-    impl AttachmentUploadRegistryBackend for InMemoryRegistryBackend {
+    impl ArtifactExternalRefCacheBackend for InMemoryRegistryBackend {
         async fn lookup_uploaded_reference(
             &self,
-            request: UploadRegistryLookupRequest,
+            request: ArtifactExternalRefLookupRequest,
         ) -> Result<Option<String>> {
             let mut guard = self.entries.lock().expect("entries lock poisoned");
             guard.retain(|_, entry| entry.expires_at_unix_ms > request.now_unix_ms);
@@ -218,7 +234,7 @@ mod tests {
 
         async fn store_uploaded_reference(
             &self,
-            request: UploadRegistryStoreRequest,
+            request: ArtifactExternalRefStoreRequest,
         ) -> Result<()> {
             self.entries
                 .lock()
@@ -243,23 +259,31 @@ mod tests {
                 kind: AttachmentTransportKind::Upload,
                 reason: "test".to_owned(),
             },
+            artifact: None,
         }
     }
 
     #[tokio::test]
-    async fn registry_roundtrip_store_and_lookup() {
-        set_attachment_upload_registry_backend(Arc::new(InMemoryRegistryBackend::default()));
+    async fn registry_roundtrip_store_and_lookup_for_artifact_attachment() {
+        set_artifact_external_ref_cache_backend(Arc::new(InMemoryRegistryBackend::default()));
 
         let config = AttachmentPipelineConfig::default();
-        let attachment = test_attachment();
+        let artifact = AttachmentArtifactContext {
+            workspace_id: "ws_a".to_owned(),
+            artifact_id: "artifact_a".to_owned(),
+            artifact_version_id: Some("version_a".to_owned()),
+        };
+        let mut attachment = test_attachment();
+        attachment.artifact = Some(artifact.clone());
         let model_family = model_family_for_model("gpt-4.1-mini");
 
-        let miss = lookup_uploaded_reference(
+        let miss = lookup_uploaded_reference_with_artifact(
             &config,
             "openai",
             model_family.as_str(),
             AttachmentTransportKind::Upload,
             attachment.sha256.as_str(),
+            Some(&artifact),
         )
         .await
         .expect("lookup should succeed");
@@ -276,16 +300,49 @@ mod tests {
         .await
         .expect("store should succeed");
 
-        let hit = lookup_uploaded_reference(
+        let hit = lookup_uploaded_reference_with_artifact(
             &config,
             "openai",
             model_family.as_str(),
             AttachmentTransportKind::Upload,
             attachment.sha256.as_str(),
+            Some(&artifact),
         )
         .await
         .expect("lookup should succeed");
         assert_eq!(hit.as_deref(), Some("file-123"));
+    }
+
+    #[tokio::test]
+    async fn registry_ignores_non_artifact_attachments() {
+        set_artifact_external_ref_cache_backend(Arc::new(InMemoryRegistryBackend::default()));
+
+        let config = AttachmentPipelineConfig::default();
+        let attachment = test_attachment();
+        let model_family = model_family_for_model("gpt-4.1-mini");
+
+        store_uploaded_reference(
+            &config,
+            "openai",
+            model_family.as_str(),
+            AttachmentTransportKind::Upload,
+            &attachment,
+            "file-legacy",
+        )
+        .await
+        .expect("store should be a no-op");
+
+        let hit = lookup_uploaded_reference_with_artifact(
+            &config,
+            "openai",
+            model_family.as_str(),
+            AttachmentTransportKind::Upload,
+            attachment.sha256.as_str(),
+            None,
+        )
+        .await
+        .expect("lookup should be a no-op");
+        assert!(hit.is_none());
     }
 
     #[test]

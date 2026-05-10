@@ -22,16 +22,17 @@ use std::sync::{OnceLock, RwLock};
 
 pub use normalize::infer_mime_from_reference;
 pub use registry::{
-    AttachmentUploadRegistryBackend, UploadRegistryLookupRequest, UploadRegistryStoreRequest,
-    lookup_uploaded_reference, model_family_for_model, set_attachment_upload_registry_backend,
-    store_uploaded_reference, upload_registry_key,
+    ArtifactExternalRefCacheBackend, ArtifactExternalRefLookupRequest,
+    ArtifactExternalRefStoreRequest, lookup_uploaded_reference_with_artifact,
+    model_family_for_model, set_artifact_external_ref_cache_backend, store_uploaded_reference,
+    upload_registry_key,
 };
 pub use runtime::AttachmentOperationError;
 pub use types::{
-    AttachmentBudgetReport, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
-    AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
-    AttachmentSecurityPolicy, AttachmentTransportKind, AttachmentTransportPlan,
-    AttachmentUploadRegistryPolicy, PreparedAttachment, PreparedAttachmentSource,
+    ArtifactExternalRefCachePolicy, AttachmentBudgetReport, AttachmentCircuitBreakerPolicy,
+    AttachmentNormalizationPolicy, AttachmentPipelineConfig, AttachmentRetryPolicy,
+    AttachmentRuntimePolicy, AttachmentSecurityPolicy, AttachmentTransportKind,
+    AttachmentTransportPlan, PreparedAttachment, PreparedAttachmentSource,
     PreparedProviderMessages,
 };
 
@@ -282,6 +283,7 @@ fn resolve_attachment(
             kind: AttachmentTransportKind::Unsupported,
             reason: String::new(),
         },
+        artifact: attachment.artifact.clone(),
     })
 }
 
@@ -340,6 +342,7 @@ mod tests {
                     source: AttachmentDataSource::Bytes {
                         base64_data: BASE64.encode([1u8, 2, 3, 4]),
                     },
+                    artifact: None,
                 }),
             ],
             tool_call_id: None,
@@ -382,6 +385,7 @@ mod tests {
             source: AttachmentDataSource::Reference {
                 reference: "file://artifact/1".to_owned(),
             },
+            artifact: None,
         })]);
 
         let err = prepare_messages_for_provider("mock", &caps, &[message])
@@ -402,6 +406,7 @@ mod tests {
             source: AttachmentDataSource::Bytes {
                 base64_data: BASE64.encode([1u8, 2, 3]),
             },
+            artifact: None,
         })]);
 
         let prepared =
@@ -430,6 +435,7 @@ mod tests {
             source: AttachmentDataSource::Bytes {
                 base64_data: BASE64.encode([1u8, 2, 3, 4]),
             },
+            artifact: None,
         });
         let second = MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
@@ -439,6 +445,7 @@ mod tests {
             source: AttachmentDataSource::Bytes {
                 base64_data: BASE64.encode([5u8, 6, 7]),
             },
+            artifact: None,
         });
 
         let message = ChatMessage::user_parts(vec![first, second]);
@@ -490,6 +497,7 @@ mod tests {
             source: AttachmentDataSource::Bytes {
                 base64_data: BASE64.encode(vec![7u8; 32]),
             },
+            artifact: None,
         })]);
 
         let prepared =
@@ -515,6 +523,7 @@ mod tests {
             source: AttachmentDataSource::Url {
                 url: "http://127.0.0.1/screen.png".to_owned(),
             },
+            artifact: None,
         })]);
 
         let err = prepare_messages_for_provider_with_config(
@@ -546,6 +555,7 @@ mod tests {
             source: AttachmentDataSource::Path {
                 path: target.display().to_string(),
             },
+            artifact: None,
         })]);
 
         let err = prepare_messages_for_provider_with_config(

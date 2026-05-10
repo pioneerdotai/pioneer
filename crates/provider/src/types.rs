@@ -160,6 +160,14 @@ pub enum AttachmentDataSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentArtifactContext {
+    pub workspace_id: String,
+    pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachment {
     pub mime_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +177,8 @@ pub struct MessageAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     pub source: AttachmentDataSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<AttachmentArtifactContext>,
 }
 
 impl MessageAttachment {
@@ -179,6 +189,7 @@ impl MessageAttachment {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Path { path: path.into() },
+            artifact: None,
         }
     }
 
@@ -189,6 +200,7 @@ impl MessageAttachment {
             size_bytes: None,
             sha256: None,
             source: AttachmentDataSource::Url { url: url.into() },
+            artifact: None,
         }
     }
 }

@@ -3,8 +3,8 @@ use crate::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
         default_attachment_pipeline_config, ensure_no_unrendered_attachments,
-        lookup_uploaded_reference, model_family_for_model, prepare_messages_for_provider, runtime,
-        store_uploaded_reference,
+        lookup_uploaded_reference_with_artifact, model_family_for_model,
+        prepare_messages_for_provider, runtime, store_uploaded_reference,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
@@ -338,12 +338,13 @@ impl OpenAiProvider {
         config: &AttachmentPipelineConfig,
     ) -> Result<String> {
         let model_family = model_family_for_model(model);
-        if let Some(file_id) = lookup_uploaded_reference(
+        if let Some(file_id) = lookup_uploaded_reference_with_artifact(
             config,
             "openai",
             model_family.as_str(),
             AttachmentTransportKind::Upload,
             attachment.sha256.as_str(),
+            attachment.artifact.as_ref(),
         )
         .await?
         {
@@ -1036,6 +1037,7 @@ mod tests {
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+VrWQAAAAASUVORK5CYII="
                         .to_owned(),
             },
+            artifact: None,
         }));
 
         let messages = vec![ChatMessage::user("hello"), tool_message];
