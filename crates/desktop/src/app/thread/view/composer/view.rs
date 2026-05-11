@@ -84,7 +84,8 @@ impl PioneerDesktop {
                         )
                         .child(
                             h_flex()
-                                .p_2()
+                                .px_2()
+                                .pb_2()
                                 .justify_between()
                                 .items_center()
                                 .bg(cx.theme().background)
