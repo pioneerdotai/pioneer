@@ -98,7 +98,10 @@ impl PioneerDesktop {
                                             Button::new("composer-add-attachment")
                                                 .small()
                                                 .ghost()
-                                                .icon(IconName::Plus)
+                                                .compact()
+                                                .child(
+                                                    Icon::new(IconName::Plus).size_5().opacity(0.6),
+                                                )
                                                 .disabled(self.composer_upload_in_progress)
                                                 .on_click(cx.listener(|view, _, window, cx| {
                                                     view.open_composer_file_picker(window, cx);

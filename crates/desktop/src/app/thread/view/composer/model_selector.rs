@@ -138,7 +138,7 @@ impl PioneerDesktop {
             &self.composer_selected_provider,
             &self.composer_selected_model,
         ) {
-            format!("{} / {}", provider, model)
+            format!("{}/{}", provider, model)
         } else {
             t!("chat.composer.model.select_label").to_string()
         };
@@ -155,7 +155,7 @@ impl PioneerDesktop {
                     .child(
                         div()
                             .text_ellipsis()
-                            .max_w(px(180.))
+                            .max_w(px(350.))
                             .overflow_hidden()
                             .child(display_label),
                     )
