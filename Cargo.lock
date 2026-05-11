@@ -7091,6 +7091,7 @@ dependencies = [
  "base64",
  "chrono",
  "hex",
+ "image",
  "mime_guess",
  "pioneer-crud",
  "pioneer-migration",
@@ -7161,6 +7162,7 @@ name = "pioneer-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "flate2",
  "futures-util",

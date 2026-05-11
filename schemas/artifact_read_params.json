@@ -22,6 +22,16 @@
       "format": "uint64",
       "minimum": 0
     },
+    "projection_kind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "version_id": {
       "type": [
         "string",
@@ -35,5 +45,16 @@
   "required": [
     "workspace_id",
     "artifact_id"
-  ]
+  ],
+  "$defs": {
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    }
+  }
 }

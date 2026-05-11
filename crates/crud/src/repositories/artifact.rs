@@ -432,6 +432,83 @@ impl ArtifactRepository {
         })
     }
 
+    pub async fn get_artifact_projection_blob<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+        projection_kind: ArtifactProjectionKind,
+    ) -> ArtifactCrudResult<ArtifactProjectionBlobRecord> {
+        let version_blob = self
+            .get_artifact_version_blob(db, workspace_id, artifact_id, version_id)
+            .await?;
+
+        let projection = artifact_projection::Entity::find()
+            .filter(artifact_projection::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_projection::Column::ArtifactId.eq(artifact_id.to_owned()))
+            .filter(
+                artifact_projection::Column::ArtifactVersionId
+                    .eq(version_blob.artifact_version_id.clone()),
+            )
+            .filter(
+                artifact_projection::Column::ProjectionKind
+                    .eq(projection_kind_to_db(projection_kind).to_owned()),
+            )
+            .filter(artifact_projection::Column::Status.eq("ready"))
+            .filter(artifact_projection::Column::BlobId.is_not_null())
+            .order_by_desc(artifact_projection::Column::UpdatedAt)
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query artifact projection blob".to_owned(),
+                source,
+            })?
+            .ok_or_else(|| ArtifactCrudError::NotFound {
+                message: format!(
+                    "workspace={workspace_id} artifact={artifact_id} version={} projection={:?}",
+                    version_blob.artifact_version_id, projection_kind
+                ),
+            })?;
+
+        let projection_blob_id =
+            projection
+                .blob_id
+                .clone()
+                .ok_or_else(|| ArtifactCrudError::NotFound {
+                    message: format!(
+                        "workspace={workspace_id} artifact={artifact_id} projection={} has no blob",
+                        projection.id
+                    ),
+                })?;
+
+        let blob = artifact_blob::Entity::find()
+            .filter(artifact_blob::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_blob::Column::Id.eq(projection_blob_id.clone()))
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query artifact projection blob".to_owned(),
+                source,
+            })?
+            .ok_or_else(|| ArtifactCrudError::NotFound {
+                message: format!("workspace={workspace_id} blob={projection_blob_id}"),
+            })?;
+
+        Ok(ArtifactProjectionBlobRecord {
+            artifact_id: version_blob.artifact_id,
+            workspace_id: version_blob.workspace_id,
+            artifact_version_id: version_blob.artifact_version_id,
+            projection_id: projection.id,
+            projection_kind: projection_kind_from_db(projection.projection_kind.as_str()),
+            blob_id: blob.id,
+            storage_key: blob.storage_key,
+            size_bytes: blob.size_bytes.max(0) as u64,
+            sha256: blob.sha256,
+            mime_type: blob.mime_type,
+        })
+    }
+
     pub async fn list_thread_artifacts<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -697,6 +774,20 @@ pub struct ArtifactVersionBlobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactProjectionBlobRecord {
+    pub artifact_id: String,
+    pub workspace_id: String,
+    pub artifact_version_id: String,
+    pub projection_id: String,
+    pub projection_kind: ArtifactProjectionKind,
+    pub blob_id: String,
+    pub storage_key: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactProjectionRecord {
     pub id: String,
     pub workspace_id: String,
@@ -704,6 +795,7 @@ pub struct ArtifactProjectionRecord {
     pub artifact_version_id: String,
     pub projection_kind: ArtifactProjectionKind,
     pub status: ArtifactProjectionStatus,
+    pub blob_id: Option<String>,
     pub text_content: Option<String>,
 }
 
@@ -771,6 +863,7 @@ pub async fn replace_projection<C: ConnectionTrait>(
     projection_kind: ArtifactProjectionKind,
     status: ArtifactProjectionStatus,
     text_content: Option<String>,
+    blob_id: Option<String>,
     metadata: BTreeMap<String, serde_json::Value>,
 ) -> ArtifactCrudResult<ArtifactProjectionRecord> {
     let now = now();
@@ -796,7 +889,7 @@ pub async fn replace_projection<C: ConnectionTrait>(
         projection_kind: Set(projection_kind_to_db(projection_kind).to_owned()),
         status: Set(projection_status_to_db(status).to_owned()),
         text_content: Set(text_content),
-        blob_id: Set(None),
+        blob_id: Set(blob_id),
         metadata_json: Set(metadata_to_db(&metadata)?),
         created_at: Set(now),
         updated_at: Set(now),
@@ -948,7 +1041,7 @@ pub async fn workspace_usage<C: ConnectionTrait>(
         .map(|artifact| artifact.id)
         .collect::<HashSet<_>>();
 
-    let referenced_blob_ids = artifact_version::Entity::find()
+    let mut referenced_blob_ids = artifact_version::Entity::find()
         .filter(artifact_version::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .all(db)
         .await
@@ -960,6 +1053,19 @@ pub async fn workspace_usage<C: ConnectionTrait>(
         .filter(|version| active_artifact_ids.contains(&version.artifact_id))
         .map(|version| version.blob_id)
         .collect::<HashSet<_>>();
+    referenced_blob_ids.extend(
+        artifact_projection::Entity::find()
+            .filter(artifact_projection::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query artifact projections for workspace usage".to_owned(),
+                source,
+            })?
+            .into_iter()
+            .filter(|projection| active_artifact_ids.contains(&projection.artifact_id))
+            .filter_map(|projection| projection.blob_id),
+    );
 
     let active_blobs = blobs
         .iter()
@@ -1003,7 +1109,19 @@ pub async fn plan_gc_with_grace<C: ConnectionTrait>(
                 message: "failed to query artifact blob references for gc".to_owned(),
                 source,
             })?;
-        if refs.is_empty() && blob.created_at.timestamp_millis() <= cutoff_ms {
+        let projection_refs = artifact_projection::Entity::find()
+            .filter(artifact_projection::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_projection::Column::BlobId.eq(blob.id.clone()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query artifact projection blob references for gc".to_owned(),
+                source,
+            })?;
+        if refs.is_empty()
+            && projection_refs.is_empty()
+            && blob.created_at.timestamp_millis() <= cutoff_ms
+        {
             orphan_blobs.push(ArtifactGcBlobCandidateRecord {
                 blob_id: blob.id,
                 storage_key: blob.storage_key,
@@ -1240,6 +1358,7 @@ async fn projection_preview<C: ConnectionTrait>(
         .filter(artifact_projection::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(artifact_projection::Column::ArtifactId.eq(artifact_id.to_owned()))
         .filter(artifact_projection::Column::ArtifactVersionId.eq(version_id.to_owned()))
+        .filter(artifact_projection::Column::Status.eq("ready"))
         .order_by_desc(artifact_projection::Column::UpdatedAt)
         .one(db)
         .await
@@ -1248,13 +1367,38 @@ async fn projection_preview<C: ConnectionTrait>(
             source,
         })?;
 
-    Ok(projection.map(|projection| ArtifactPreviewRef {
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+
+    let projection_blob = match projection.blob_id.as_deref() {
+        Some(blob_id) => artifact_blob::Entity::find()
+            .filter(artifact_blob::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_blob::Column::Id.eq(blob_id.to_owned()))
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query artifact preview blob".to_owned(),
+                source,
+            })?,
+        None => None,
+    };
+
+    Ok(Some(ArtifactPreviewRef {
         projection_kind: projection_kind_from_db(projection.projection_kind.as_str()),
         status: projection_status_from_db(projection.status.as_str()),
         artifact_id: artifact_id.to_owned(),
         version_id: version_id.to_owned(),
-        mime_type,
-        size_bytes,
+        blob_id: projection.blob_id,
+        mime_type: projection_blob
+            .as_ref()
+            .and_then(|blob| blob.mime_type.clone())
+            .or(mime_type),
+        size_bytes: projection_blob
+            .as_ref()
+            .map(|blob| blob.size_bytes.max(0) as u64)
+            .or(size_bytes),
+        sha256: projection_blob.map(|blob| blob.sha256),
     }))
 }
 
@@ -1371,6 +1515,7 @@ fn projection_record_from_model(
         artifact_version_id: model.artifact_version_id,
         projection_kind: projection_kind_from_db(model.projection_kind.as_str()),
         status: projection_status_from_db(model.status.as_str()),
+        blob_id: model.blob_id,
         text_content: model.text_content,
     })
 }

@@ -9,8 +9,8 @@ use pioneer_crud::{
     NewArtifactBlobRecord,
 };
 use pioneer_protocol::{
-    ArtifactBindingSummary, ArtifactReadParams, ArtifactReadResponse, ArtifactRef, ArtifactStatus,
-    ArtifactSummary,
+    ArtifactBindingSummary, ArtifactProjectionKind, ArtifactReadParams, ArtifactReadResponse,
+    ArtifactRef, ArtifactStatus, ArtifactSummary,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -26,8 +26,8 @@ use crate::models::{
     IngestArtifactTempFileRequest,
 };
 use crate::projection::{
-    ArtifactProjectionRecord, create_inline_projections, list_projections,
-    supports_inline_plain_text_projection, supports_thumbnail_projection,
+    ArtifactProjectionRecord, MAX_THUMBNAIL_SOURCE_BYTES, create_inline_projections,
+    list_projections, supports_inline_plain_text_projection, supports_thumbnail_projection,
 };
 use crate::quota::{ArtifactQuotaPolicy, ArtifactWorkspaceUsage};
 use crate::security::read_validated_local_file;
@@ -53,6 +53,12 @@ pub struct ArtifactDownloadSnapshot {
     pub mime_type: Option<String>,
     pub size_bytes: u64,
     pub sha256: String,
+}
+
+struct ArtifactReadBlobDescriptor {
+    storage_key: String,
+    size_bytes: u64,
+    sha256: String,
 }
 
 impl ArtifactService {
@@ -99,7 +105,17 @@ impl ArtifactService {
         validate_ingest_request(&request)?;
         self.enforce_quota(&request.workspace_id, request.bytes.len() as u64)
             .await?;
-        let projection_bytes = (!request.bytes.is_empty()).then(|| request.bytes.clone());
+        let needs_plain_text_projection = supports_inline_plain_text_projection(
+            request.kind,
+            request.mime_type.as_deref(),
+            request.bytes.len(),
+        );
+        let needs_thumbnail_projection =
+            supports_thumbnail_projection(request.kind, request.mime_type.as_deref())
+                && (request.bytes.len() as u64) <= MAX_THUMBNAIL_SOURCE_BYTES;
+        let projection_bytes = (!request.bytes.is_empty()
+            && (needs_plain_text_projection || needs_thumbnail_projection))
+            .then(|| request.bytes.clone());
         self.ingest_blob_input(
             request.clone(),
             ArtifactBlobInput::Bytes(request.bytes.clone()),
@@ -130,25 +146,28 @@ impl ArtifactService {
             });
         }
         self.enforce_quota(&request.workspace_id, file_size).await?;
-        let projection_bytes = usize::try_from(file_size).ok().and_then(|size| {
+        let needs_plain_text_projection = usize::try_from(file_size).ok().is_some_and(|size| {
             supports_inline_plain_text_projection(request.kind, request.mime_type.as_deref(), size)
-                .then_some(size)
         });
-        let projection_bytes = if projection_bytes.is_some() && file_size > 0 {
-            Some(
-                tokio::fs::read(&request.temp_path)
-                    .await
-                    .map_err(|source| ArtifactError::Io {
-                        message: format!(
-                            "failed to read temp artifact input {} for projection",
-                            request.temp_path.display()
-                        ),
-                        source,
-                    })?,
-            )
-        } else {
-            None
-        };
+        let needs_thumbnail_projection =
+            supports_thumbnail_projection(request.kind, request.mime_type.as_deref())
+                && file_size <= MAX_THUMBNAIL_SOURCE_BYTES;
+        let projection_bytes =
+            if file_size > 0 && (needs_plain_text_projection || needs_thumbnail_projection) {
+                Some(
+                    tokio::fs::read(&request.temp_path)
+                        .await
+                        .map_err(|source| ArtifactError::Io {
+                            message: format!(
+                                "failed to read temp artifact input {} for projection",
+                                request.temp_path.display()
+                            ),
+                            source,
+                        })?,
+                )
+            } else {
+                None
+            };
         let metadata_request = IngestArtifactBytesRequest {
             workspace_id: request.workspace_id,
             primary_thread_id: request.primary_thread_id,
@@ -203,12 +222,11 @@ impl ArtifactService {
             )
             .await?;
 
-        if projection_bytes.is_some()
-            || supports_thumbnail_projection(request.kind, request.mime_type.as_deref())
-        {
+        if projection_bytes.is_some() {
             let bytes = projection_bytes.as_deref().unwrap_or(&[]);
             let _ = create_inline_projections(
                 self.store.as_ref(),
+                self.blob_store.as_ref(),
                 &request.workspace_id,
                 &ingested.artifact.id,
                 &ingested.version.id,
@@ -442,11 +460,11 @@ impl ArtifactService {
         }
 
         let blob = self
-            .store
-            .get_artifact_version_blob(
+            .read_blob_descriptor(
                 params.workspace_id.as_str(),
                 params.artifact_id.as_str(),
                 params.version_id.as_deref(),
+                params.projection_kind,
             )
             .await?;
         let total_size_bytes = blob.size_bytes;
@@ -484,6 +502,41 @@ impl ArtifactService {
             sha256: blob.sha256,
             content_base64: BASE64.encode(bytes),
             truncated: offset.saturating_add(len) < total_size_bytes,
+        })
+    }
+
+    async fn read_blob_descriptor(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+        projection_kind: Option<ArtifactProjectionKind>,
+    ) -> ArtifactResult<ArtifactReadBlobDescriptor> {
+        if let Some(projection_kind) = projection_kind {
+            let blob = self
+                .store
+                .get_artifact_projection_blob(
+                    workspace_id,
+                    artifact_id,
+                    version_id,
+                    projection_kind,
+                )
+                .await?;
+            return Ok(ArtifactReadBlobDescriptor {
+                storage_key: blob.storage_key,
+                size_bytes: blob.size_bytes,
+                sha256: blob.sha256,
+            });
+        }
+
+        let blob = self
+            .store
+            .get_artifact_version_blob(workspace_id, artifact_id, version_id)
+            .await?;
+        Ok(ArtifactReadBlobDescriptor {
+            storage_key: blob.storage_key,
+            size_bytes: blob.size_bytes,
+            sha256: blob.sha256,
         })
     }
 
@@ -697,8 +750,10 @@ fn list_filter_record(filter: ArtifactListFilter) -> ArtifactListFilterRecord {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::Arc;
 
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         ArtifactExternalRefKey, CrudStore, NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
@@ -949,6 +1004,7 @@ mod tests {
 
         crate::projection::create_inline_projections(
             harness.store.as_ref(),
+            harness.service.blob_store.as_ref(),
             "ws_a",
             artifact_id,
             version_id,
@@ -969,9 +1025,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thumbnail_projection_is_created_for_image_artifact() {
+    async fn thumbnail_projection_is_generated_for_image_artifact() {
         let harness = setup().await;
-        let mut request = ingest_request("ws_a", "thr_a", "turn_a", b"not-a-real-png", "image.png");
+        let image_bytes = test_png_bytes(800, 600);
+        let mut request = ingest_request(
+            "ws_a",
+            "thr_a",
+            "turn_a",
+            image_bytes.as_slice(),
+            "image.png",
+        );
         request.kind = ArtifactKind::Image;
         request.mime_type = Some("image/png".to_owned());
 
@@ -995,7 +1058,118 @@ mod tests {
             projections[0].projection_kind,
             ArtifactProjectionKind::Thumbnail
         );
-        assert_eq!(projections[0].status, ArtifactProjectionStatus::Pending);
+        assert_eq!(projections[0].status, ArtifactProjectionStatus::Ready);
+        assert!(projections[0].blob_id.is_some());
+        assert_eq!(projections[0].text_content, None);
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
+
+        let preview = summary.artifact.preview.expect("thumbnail preview");
+        assert_eq!(preview.projection_kind, ArtifactProjectionKind::Thumbnail);
+        assert_eq!(preview.status, ArtifactProjectionStatus::Ready);
+        assert!(preview.blob_id.is_some());
+        assert_eq!(preview.mime_type.as_deref(), Some("image/png"));
+        assert!(preview.size_bytes.is_some_and(|size| size > 0));
+        assert!(preview.sha256.is_some());
+
+        let thumbnail_read = harness
+            .service
+            .read_artifact(
+                ArtifactReadParams {
+                    workspace_id: "ws_a".to_owned(),
+                    artifact_id: summary.artifact.artifact_id.clone(),
+                    version_id: summary.artifact.version_id.clone(),
+                    projection_kind: Some(ArtifactProjectionKind::Thumbnail),
+                    offset: Some(0),
+                    max_bytes: Some(512 * 1024),
+                },
+                512 * 1024,
+            )
+            .await
+            .expect("read thumbnail projection");
+        assert_eq!(
+            thumbnail_read.total_size_bytes,
+            preview.size_bytes.expect("preview size")
+        );
+        assert_eq!(thumbnail_read.sha256, preview.sha256.expect("preview sha"));
+        assert!(!thumbnail_read.content_base64.is_empty());
+        assert!(!thumbnail_read.truncated);
+
+        let usage = harness
+            .service
+            .workspace_usage("ws_a")
+            .await
+            .expect("workspace usage");
+        assert_eq!(usage.files, 2);
+
+        let gc_plan = harness
+            .service
+            .gc_dry_run("ws_a", i64::MAX)
+            .await
+            .expect("gc dry run");
+        assert!(gc_plan.orphan_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_and_pending_thumbnail_projections_are_not_exposed_as_preview() {
+        let harness = setup().await;
+        let mut request = ingest_request("ws_a", "thr_a", "turn_a", b"not-a-real-png", "image.png");
+        request.kind = ArtifactKind::Image;
+        request.mime_type = Some("image/png".to_owned());
+
+        let summary = harness
+            .service
+            .ingest_bytes(request)
+            .await
+            .expect("ingest image");
+        let projections = harness
+            .service
+            .list_projections(
+                "ws_a",
+                summary.artifact.artifact_id.as_str(),
+                summary.artifact.version_id.as_deref(),
+            )
+            .await
+            .expect("list projections");
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].status, ArtifactProjectionStatus::Failed);
+        assert!(summary.artifact.preview.is_none());
+
+        harness
+            .store
+            .replace_artifact_projection(
+                "ws_a",
+                summary.artifact.artifact_id.as_str(),
+                summary.artifact.version_id.as_deref().expect("version id"),
+                ArtifactProjectionKind::Thumbnail,
+                ArtifactProjectionStatus::Pending,
+                None,
+                std::collections::BTreeMap::new(),
+            )
+            .await
+            .expect("insert pending projection");
+
+        let refreshed = harness
+            .service
+            .get_artifact(
+                "ws_a",
+                summary.artifact.artifact_id.as_str(),
+                summary.artifact.version_id.as_deref(),
+            )
+            .await
+            .expect("get refreshed artifact");
+        assert!(refreshed.artifact.preview.is_none());
+    }
+
+    fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8, 255])
+        });
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode test png");
+        cursor.into_inner()
     }
 
     #[tokio::test]

@@ -112,9 +112,13 @@ pub struct ArtifactPreviewRef {
     pub artifact_id: String,
     pub version_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -260,6 +264,8 @@ pub struct ArtifactReadParams {
     pub artifact_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_kind: Option<ArtifactProjectionKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

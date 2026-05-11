@@ -71,6 +71,12 @@
         "artifact_id": {
           "type": "string"
         },
+        "blob_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mime_type": {
           "type": [
             "string",
@@ -79,6 +85,12 @@
         },
         "projection_kind": {
           "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "size_bytes": {
           "type": [

@@ -53,10 +53,10 @@ use crate::projector::TurnProjector;
 pub use crate::repositories::artifact::{
     ArtifactBindingTargetRecord, ArtifactBlobRecord, ArtifactCrudError, ArtifactExternalRefKey,
     ArtifactExternalRefRecord, ArtifactGcBlobCandidateRecord, ArtifactGcPlanRecord,
-    ArtifactListFilterRecord, ArtifactListPageRecord, ArtifactProjectionRecord, ArtifactRecord,
-    ArtifactVersionBlobRecord, ArtifactVersionRecord, ArtifactWorkspaceUsageRecord,
-    IngestArtifactMetadataRecord, IngestedArtifactRecord, NewArtifactBlobRecord,
-    UpsertArtifactExternalRefRequest,
+    ArtifactListFilterRecord, ArtifactListPageRecord, ArtifactProjectionBlobRecord,
+    ArtifactProjectionRecord, ArtifactRecord, ArtifactVersionBlobRecord, ArtifactVersionRecord,
+    ArtifactWorkspaceUsageRecord, IngestArtifactMetadataRecord, IngestedArtifactRecord,
+    NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
@@ -458,6 +458,22 @@ impl CrudStore {
         .await
     }
 
+    pub async fn find_or_create_artifact_blob(
+        &self,
+        blob: NewArtifactBlobRecord,
+    ) -> Result<ArtifactBlobRecord> {
+        self.run_serialized_write(|| {
+            let blob = blob.clone();
+            async move {
+                artifact_repository::ArtifactRepository::new()
+                    .find_or_create_blob(&self.connection, blob)
+                    .await
+                    .map_err(Into::into)
+            }
+        })
+        .await
+    }
+
     pub async fn bind_artifact(
         &self,
         workspace_id: &str,
@@ -547,6 +563,25 @@ impl CrudStore {
             .map_err(Into::into)
     }
 
+    pub async fn get_artifact_projection_blob(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+        projection_kind: ArtifactProjectionKind,
+    ) -> Result<ArtifactProjectionBlobRecord> {
+        artifact_repository::ArtifactRepository::new()
+            .get_artifact_projection_blob(
+                &self.connection,
+                workspace_id,
+                artifact_id,
+                version_id,
+                projection_kind,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn list_thread_artifacts(
         &self,
         workspace_id: &str,
@@ -607,11 +642,36 @@ impl CrudStore {
         text_content: Option<String>,
         metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<ArtifactProjectionRecord> {
+        self.replace_artifact_projection_with_blob(
+            workspace_id,
+            artifact_id,
+            artifact_version_id,
+            projection_kind,
+            status,
+            text_content,
+            None,
+            metadata,
+        )
+        .await
+    }
+
+    pub async fn replace_artifact_projection_with_blob(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        artifact_version_id: &str,
+        projection_kind: ArtifactProjectionKind,
+        status: ArtifactProjectionStatus,
+        text_content: Option<String>,
+        blob_id: Option<String>,
+        metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<ArtifactProjectionRecord> {
         self.run_serialized_write(|| {
             let workspace_id = workspace_id.to_owned();
             let artifact_id = artifact_id.to_owned();
             let artifact_version_id = artifact_version_id.to_owned();
             let text_content = text_content.clone();
+            let blob_id = blob_id.clone();
             let metadata = metadata.clone();
             async move {
                 artifact_repository::replace_projection(
@@ -622,6 +682,7 @@ impl CrudStore {
                     projection_kind,
                     status,
                     text_content,
+                    blob_id,
                     metadata,
                 )
                 .await
