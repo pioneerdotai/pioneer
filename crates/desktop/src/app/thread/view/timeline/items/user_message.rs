@@ -173,7 +173,10 @@ impl PioneerDesktop {
                             .when_some(artifact_id, |this, artifact_id| {
                                 this.hover(|this| this.opacity(0.8)).on_click(cx.listener(
                                     move |view, _, _, cx| {
-                                        view.select_thread_artifact(artifact_id.clone(), cx);
+                                        view.open_thread_artifact_in_sidebar(
+                                            artifact_id.clone(),
+                                            cx,
+                                        );
                                     },
                                 ))
                             })

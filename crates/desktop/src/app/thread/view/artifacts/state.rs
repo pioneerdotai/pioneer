@@ -537,6 +537,16 @@ impl PioneerDesktop {
         cx.notify();
     }
 
+    pub(in crate::app) fn open_thread_artifact_in_sidebar(
+        &mut self,
+        artifact_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_thread_artifacts_sidebar = true;
+        self.thread_artifacts.select_artifact(artifact_id);
+        cx.notify();
+    }
+
     pub(in crate::app) fn set_thread_artifact_filter(
         &mut self,
         filter: ThreadArtifactFilter,
