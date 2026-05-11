@@ -138,35 +138,16 @@ impl PioneerDesktop {
     }
 
     fn render_composer_attachment_badges(&self, cx: &mut Context<Self>) -> AnyElement {
-        let rows = self
-            .composer_attachments
-            .chunks(4)
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-
-        v_flex()
+        h_flex()
             .w_full()
+            .min_w_0()
             .pt_2()
             .px_2()
             .gap_1p5()
-            .children(rows.into_iter().enumerate().map(|(row_index, row)| {
-                h_flex()
-                    .id(("composer-attachment-row", row_index))
-                    .w_full()
-                    .gap_2()
-                    .children(
-                        row.into_iter()
-                            .enumerate()
-                            .map(|(column_index, attachment)| {
-                                let absolute_index = row_index * 4 + column_index;
-                                self.render_composer_attachment_badge(
-                                    attachment,
-                                    absolute_index,
-                                    cx,
-                                )
-                            }),
-                    )
-            }))
+            .flex_wrap()
+            .children(self.composer_attachments.iter().cloned().enumerate().map(
+                |(index, attachment)| self.render_composer_attachment_badge(attachment, index, cx),
+            ))
             .into_any_element()
     }
 
@@ -205,12 +186,14 @@ impl PioneerDesktop {
 
         h_flex()
             .id(("composer-attachment-chip", index))
-            .flex_1()
             .max_w(px(196.))
+            .min_w_0()
+            .flex_initial()
             .h(px(32.))
-            .px_2()
+            .pl_2()
+            .pr_1p5()
             .items_center()
-            .gap_2()
+            .gap_1()
             .rounded_full()
             .border_1()
             .border_color(cx.theme().border)
@@ -223,7 +206,6 @@ impl PioneerDesktop {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(cx.theme().muted)
                     .child(
                         Icon::new(status_icon)
                             .size_3()
@@ -234,19 +216,22 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .gap_1()
                     .child(
                         div()
+                            .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_sm()
+                            .text_xs()
                             .child(file_name),
                     )
                     .when_some(status_text, |this, status_text| {
                         this.child(
                             div()
+                                .flex_none()
                                 .text_xs()
                                 .text_color(status_color)
                                 .whitespace_nowrap()
@@ -261,8 +246,7 @@ impl PioneerDesktop {
                     .compact()
                     .icon(IconName::Close)
                     .disabled(self.composer_upload_in_progress)
-                    .opacity(0.0)
-                    .group_hover(group_id, |this| this.opacity(0.85))
+                    .rounded_full()
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.remove_composer_attachment_at(index);
                         cx.notify();
