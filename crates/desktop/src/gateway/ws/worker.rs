@@ -12,6 +12,18 @@ enum ConnectionRpcCommand {
         payload: Vec<u8>,
         response_tx: Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     },
+    ArtifactBinaryUploadChunk {
+        upload_id: String,
+        offset: u64,
+        payload: Vec<u8>,
+        response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+    },
+    ArtifactDownloadRegisterChunk {
+        download_id: String,
+        offset: u64,
+        response_tx: Sender<std::result::Result<ArtifactDownloadChunkPayload, String>>,
+        registered_tx: Sender<std::result::Result<(), String>>,
+    },
 }
 
 struct ActiveConnectionTask {
@@ -102,6 +114,58 @@ async fn run_worker(
                         offset,
                         payload,
                         response_tx,
+                    })
+                    .is_err()
+                {
+                    let _ = fallback_tx
+                        .send(Err("websocket connection task is unavailable".to_owned()));
+                }
+            }
+            GatewayWsCommand::ArtifactBinaryUploadChunk {
+                upload_id,
+                offset,
+                payload,
+                response_tx,
+            } => {
+                let Some(connection_task) = connection_task.as_mut() else {
+                    let _ = response_tx.send(Err("websocket is not connected".to_owned()));
+                    continue;
+                };
+
+                let fallback_tx = response_tx.clone();
+                if connection_task
+                    .rpc_tx
+                    .send(ConnectionRpcCommand::ArtifactBinaryUploadChunk {
+                        upload_id,
+                        offset,
+                        payload,
+                        response_tx,
+                    })
+                    .is_err()
+                {
+                    let _ = fallback_tx
+                        .send(Err("websocket connection task is unavailable".to_owned()));
+                }
+            }
+            GatewayWsCommand::ArtifactDownloadRegisterChunk {
+                download_id,
+                offset,
+                response_tx,
+                registered_tx,
+            } => {
+                let Some(connection_task) = connection_task.as_mut() else {
+                    let _ = registered_tx.send(Err("websocket is not connected".to_owned()));
+                    continue;
+                };
+
+                let fallback_tx = registered_tx.clone();
+                if connection_task
+                    .rpc_tx
+                    .send(ConnectionRpcCommand::ArtifactDownloadRegisterChunk {
+                        download_id,
+                        offset,
+                        response_tx,
+                        registered_tx,
                     })
                     .is_err()
                 {
@@ -264,6 +328,8 @@ async fn monitor_connection(
     let mut last_pong = Instant::now();
     let mut pending_requests = HashMap::new();
     let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
+    let mut pending_artifact_download_chunks = HashMap::new();
 
     let disconnect_reason = loop {
         tokio::select! {
@@ -297,6 +363,21 @@ async fn monitor_connection(
                             break format!("websocket binary write failed: {error}");
                         }
                     }
+                    Some(ConnectionRpcCommand::ArtifactBinaryUploadChunk { upload_id, offset, payload, response_tx }) => {
+                        let ack_key = upload_ack_key(upload_id.as_str(), offset);
+                        pending_artifact_upload_chunks.insert(ack_key.clone(), response_tx);
+                        if let Err(error) = writer.send(Message::Binary(payload.into())).await {
+                            if let Some(response_tx) = pending_artifact_upload_chunks.remove(&ack_key) {
+                                let _ = response_tx.send(Err(format!("websocket binary write failed: {error}")));
+                            }
+                            break format!("websocket binary write failed: {error}");
+                        }
+                    }
+                    Some(ConnectionRpcCommand::ArtifactDownloadRegisterChunk { download_id, offset, response_tx, registered_tx }) => {
+                        let key = artifact_download_chunk_key(download_id.as_str(), offset);
+                        pending_artifact_download_chunks.insert(key, response_tx);
+                        let _ = registered_tx.send(Ok(()));
+                    }
                     None => {
                         break "websocket command channel closed".to_owned();
                     }
@@ -324,11 +405,17 @@ async fn monitor_connection(
                             connection_id,
                             &mut pending_requests,
                             &mut pending_upload_chunks,
+                            &mut pending_artifact_upload_chunks,
                             event_tx,
                         );
                     }
-                    Some(Ok(Message::Binary(_)))
-                    | Some(Ok(Message::Frame(_))) => {}
+                    Some(Ok(Message::Binary(payload))) => {
+                        let _ = process_artifact_download_binary_frame(
+                            payload.as_ref(),
+                            &mut pending_artifact_download_chunks,
+                        );
+                    }
+                    Some(Ok(Message::Frame(_))) => {}
                     Some(Err(error)) => {
                         break format!("websocket read failed: {error}");
                     }
@@ -342,5 +429,13 @@ async fn monitor_connection(
 
     fail_pending_requests(&mut pending_requests, disconnect_reason.as_str());
     fail_pending_upload_chunks(&mut pending_upload_chunks, disconnect_reason.as_str());
+    fail_pending_artifact_upload_chunks(
+        &mut pending_artifact_upload_chunks,
+        disconnect_reason.as_str(),
+    );
+    fail_pending_artifact_download_chunks(
+        &mut pending_artifact_download_chunks,
+        disconnect_reason.as_str(),
+    );
     disconnect_reason
 }

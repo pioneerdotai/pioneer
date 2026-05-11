@@ -8,6 +8,10 @@ pub(super) fn process_text_payload(
         String,
         Sender<std::result::Result<SkillsUploadChunkAckNotification, String>>,
     >,
+    pending_artifact_upload_chunks: &mut HashMap<
+        String,
+        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+    >,
     event_tx: &Sender<GatewayWsEvent>,
 ) {
     let value = match serde_json::from_str::<JsonValue>(payload) {
@@ -57,6 +61,16 @@ pub(super) fn process_text_payload(
         }
     }
 
+    if notification.method == events::ARTIFACT_UPLOAD_CHUNK_ACK
+        && let Some(params) = notification.params.clone()
+        && let Ok(ack) = serde_json::from_value::<ArtifactUploadChunkAckNotification>(params)
+    {
+        let key = upload_ack_key(ack.upload_id.as_str(), ack.offset);
+        if let Some(response_tx) = pending_artifact_upload_chunks.remove(&key) {
+            let _ = response_tx.send(Ok(ack.clone()));
+        }
+    }
+
     if let Some(notification) = GatewayNotification::from_jsonrpc(notification) {
         let _ = event_tx.send(GatewayWsEvent::Notification {
             connection_id,
@@ -86,6 +100,30 @@ pub(super) fn fail_pending_upload_chunks(
     error: &str,
 ) {
     for (_, response_tx) in pending_upload_chunks.drain() {
+        let _ = response_tx.send(Err(error.to_owned()));
+    }
+}
+
+pub(super) fn fail_pending_artifact_upload_chunks(
+    pending_upload_chunks: &mut HashMap<
+        String,
+        Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+    >,
+    error: &str,
+) {
+    for (_, response_tx) in pending_upload_chunks.drain() {
+        let _ = response_tx.send(Err(error.to_owned()));
+    }
+}
+
+pub(super) fn fail_pending_artifact_download_chunks(
+    pending_download_chunks: &mut HashMap<
+        String,
+        Sender<std::result::Result<ArtifactDownloadChunkPayload, String>>,
+    >,
+    error: &str,
+) {
+    for (_, response_tx) in pending_download_chunks.drain() {
         let _ = response_tx.send(Err(error.to_owned()));
     }
 }

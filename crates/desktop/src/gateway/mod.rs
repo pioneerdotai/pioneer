@@ -13,7 +13,10 @@ pub(crate) use timings::GatewayWsTimings;
 
 pub use runtime::{ActiveGatewayState, GatewayRuntime, ensure_runtime_home_dir};
 pub use types::{GatewayEndpoint, GatewayEndpointKind};
-pub use ws::{GatewayWsClient, GatewayWsCommandSender, GatewayWsConnectSpec, GatewayWsEvent};
+pub use ws::{
+    DesktopArtifactDownloadRequest, DesktopArtifactDownloadResult, DesktopArtifactUploadRequest,
+    GatewayWsClient, GatewayWsCommandSender, GatewayWsConnectSpec, GatewayWsEvent,
+};
 
 #[cfg(test)]
 mod tests;

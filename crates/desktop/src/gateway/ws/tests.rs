@@ -1,6 +1,7 @@
 use super::{
-    GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent, duration_to_millis_u64, next_backoff,
-    normalize_ws_url, process_text_payload,
+    DesktopArtifactDownloadRequest, DesktopArtifactUploadRequest, GatewayWsClient,
+    GatewayWsConnectSpec, GatewayWsEvent, duration_to_millis_u64,
+    encode_artifact_upload_chunk_frame, next_backoff, normalize_ws_url, process_text_payload,
 };
 use crate::gateway::timings::GatewayWsTimings;
 use crate::gateway::types::GatewayEndpointKind;
@@ -10,6 +11,7 @@ use pioneer_protocol::{
     UserInput, constants::events, generate_id,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,6 +65,7 @@ fn process_text_payload_maps_unknown_agent_notifications() {
     let (event_tx, event_rx) = mpsc::channel();
     let mut pending_requests = HashMap::new();
     let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
         "jsonrpc": "2.0",
         "method": "item/tool.started",
@@ -79,6 +82,7 @@ fn process_text_payload_maps_unknown_agent_notifications() {
         17,
         &mut pending_requests,
         &mut pending_upload_chunks,
+        &mut pending_artifact_upload_chunks,
         &event_tx,
     );
 
@@ -110,6 +114,7 @@ fn process_text_payload_maps_thread_updated_notifications() {
     let (event_tx, event_rx) = mpsc::channel();
     let mut pending_requests = HashMap::new();
     let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
         "jsonrpc": "2.0",
         "method": "thread/updated",
@@ -136,6 +141,7 @@ fn process_text_payload_maps_thread_updated_notifications() {
         17,
         &mut pending_requests,
         &mut pending_upload_chunks,
+        &mut pending_artifact_upload_chunks,
         &event_tx,
     );
 
@@ -180,6 +186,260 @@ fn skill_upload_chunk_sends_binary_frame_and_receives_ack() {
     assert_eq!(ack.len, 5);
     assert_eq!(ack.received_bytes, 5);
     assert_eq!(ack.next_offset, 5);
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn artifact_upload_frame_is_encoded_with_artu_magic() {
+    let frame = encode_artifact_upload_chunk_frame(
+        TEST_WORKSPACE_ID.to_owned(),
+        "artifact_upload_1".to_owned(),
+        0,
+        b"hello",
+    )
+    .expect("encode artifact frame");
+
+    assert_eq!(&frame[0..4], b"ARTU");
+}
+
+#[test]
+fn artifact_capabilities_request_receives_response() {
+    let mut server = TestWsServer::spawn("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+    let spec = connect_spec(
+        "artifact-capabilities",
+        "Artifact Capabilities",
+        server.address.as_str(),
+    );
+
+    let _connection_id = sender
+        .connect_and_wait(spec)
+        .expect("expected connect_and_wait to succeed");
+    let response = sender
+        .artifact_capabilities(pioneer_protocol::ArtifactCapabilitiesParams {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+        })
+        .expect("artifact capabilities");
+
+    assert!(response.upload.required_for_local_paths);
+    assert_eq!(response.upload.recommended_chunk_size_bytes, 3);
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn artifact_capabilities_rejects_missing_workspace_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let error = sender
+        .artifact_capabilities(pioneer_protocol::ArtifactCapabilitiesParams {
+            workspace_id: String::new(),
+        })
+        .expect_err("missing workspace should be rejected");
+
+    assert!(error.to_string().contains("workspace_id is required"));
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn artifact_upload_chunk_sends_binary_frame_and_receives_ack() {
+    let mut server = TestWsServer::spawn("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+    let spec = connect_spec(
+        "artifact-upload-chunk",
+        "Artifact Upload Chunk",
+        server.address.as_str(),
+    );
+
+    let _connection_id = sender
+        .connect_and_wait(spec)
+        .expect("expected connect_and_wait to succeed");
+    let ack = sender
+        .send_artifact_upload_chunk(
+            TEST_WORKSPACE_ID.to_owned(),
+            "artifact_upload_1".to_owned(),
+            0,
+            b"hello".to_vec(),
+        )
+        .expect("artifact upload chunk should be acked");
+
+    assert_eq!(ack.workspace_id, TEST_WORKSPACE_ID);
+    assert_eq!(ack.upload_id, "artifact_upload_1");
+    assert_eq!(ack.offset, 0);
+    assert_eq!(ack.len, 5);
+    assert_eq!(ack.received_bytes, 5);
+    assert_eq!(ack.next_offset, 5);
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn artifact_upload_ack_routes_to_pending_sender() {
+    let (event_tx, _event_rx) = mpsc::channel();
+    let mut pending_requests = HashMap::new();
+    let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
+    let (ack_tx, ack_rx) = mpsc::channel();
+    pending_artifact_upload_chunks.insert("artifact_upload_1:0".to_owned(), ack_tx);
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": events::ARTIFACT_UPLOAD_CHUNK_ACK,
+        "params": {
+            "workspace_id": TEST_WORKSPACE_ID,
+            "upload_id": "artifact_upload_1",
+            "offset": 0,
+            "len": 5,
+            "received_bytes": 5,
+            "next_offset": 5
+        }
+    })
+    .to_string();
+
+    process_text_payload(
+        &payload,
+        17,
+        &mut pending_requests,
+        &mut pending_upload_chunks,
+        &mut pending_artifact_upload_chunks,
+        &event_tx,
+    );
+
+    let ack = ack_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected artifact ack")
+        .expect("ack should be ok");
+    assert_eq!(ack.upload_id, "artifact_upload_1");
+    assert!(pending_artifact_upload_chunks.is_empty());
+}
+
+#[test]
+fn upload_artifact_file_uploads_small_fixture_and_returns_ref() {
+    let mut server = TestWsServer::spawn("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+    let spec = connect_spec(
+        "artifact-upload-file",
+        "Artifact Upload File",
+        server.address.as_str(),
+    );
+    let temp = tempfile::tempdir().expect("temp dir");
+    let file_path = temp.path().join("fixture.txt");
+    std::fs::write(file_path.as_path(), b"hello").expect("write fixture");
+
+    let _connection_id = sender
+        .connect_and_wait(spec)
+        .expect("expected connect_and_wait to succeed");
+    let artifact = sender
+        .upload_artifact_file(DesktopArtifactUploadRequest {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            thread_id: Some("thr_a".to_owned()),
+            planned_turn_id: Some("turn_a".to_owned()),
+            client_attachment_id: "client_attachment_1".to_owned(),
+            path: file_path,
+            mime_type: None,
+        })
+        .expect("artifact file upload");
+
+    assert_eq!(artifact.artifact_id, "artifact_upload_result");
+    assert_eq!(artifact.display_name, "fixture.txt");
+    assert_eq!(artifact.size_bytes, Some(5));
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn artifact_download_writes_verified_cache_file() {
+    let mut server = TestWsServer::spawn("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+    let spec = connect_spec(
+        "artifact-download-file",
+        "Artifact Download File",
+        server.address.as_str(),
+    );
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let _connection_id = sender
+        .connect_and_wait(spec)
+        .expect("expected connect_and_wait to succeed");
+    let result = sender
+        .download_artifact_to_cache_with_runtime_home(
+            DesktopArtifactDownloadRequest {
+                gateway_profile_id: "remote/test".to_owned(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                artifact_id: "artifact_download_result".to_owned(),
+                version_id: Some("artifact_download_version_1".to_owned()),
+            },
+            temp.path().to_path_buf(),
+        )
+        .expect("artifact download");
+
+    assert_eq!(result.artifact.artifact_id, "artifact_download_result");
+    assert_eq!(result.size_bytes, artifact_download_fixture().len() as u64);
+    assert_eq!(
+        std::fs::read(result.local_path.as_path()).expect("read downloaded file"),
+        artifact_download_fixture()
+    );
+    assert_eq!(result.sha256, sha256_hex(artifact_download_fixture()));
+    assert!(
+        !result
+            .local_path
+            .with_file_name("download.txt.part")
+            .exists()
+    );
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn artifact_download_interrupted_download_removes_part_file() {
+    let mut server = TestWsServer::spawn("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+    let spec = connect_spec(
+        "artifact-download-corrupt",
+        "Artifact Download Corrupt",
+        server.address.as_str(),
+    );
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    let _connection_id = sender
+        .connect_and_wait(spec)
+        .expect("expected connect_and_wait to succeed");
+    let error = sender
+        .download_artifact_to_cache_with_runtime_home(
+            DesktopArtifactDownloadRequest {
+                gateway_profile_id: "remote/test".to_owned(),
+                workspace_id: TEST_WORKSPACE_ID.to_owned(),
+                artifact_id: "artifact_download_corrupt".to_owned(),
+                version_id: Some("artifact_download_version_1".to_owned()),
+            },
+            temp.path().to_path_buf(),
+        )
+        .expect_err("corrupt download should fail");
+
+    assert!(error.to_string().contains("identity mismatch"));
+    let part_path = temp
+        .path()
+        .join("downloads")
+        .join("gateways")
+        .join("remote_test")
+        .join("workspaces")
+        .join(TEST_WORKSPACE_ID)
+        .join("artifacts")
+        .join("artifact_download_corrupt")
+        .join("artifact_download_version_1")
+        .join("download.txt.part");
+    assert!(!part_path.exists());
 
     let _ = sender.shutdown();
     server.stop();
@@ -779,6 +1039,35 @@ fn event_connection_id(event: &GatewayWsEvent) -> u64 {
     }
 }
 
+fn artifact_download_fixture() -> &'static [u8] {
+    b"hello artifact download"
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn artifact_download_frame(offset: u64, chunk: &[u8], final_chunk: bool) -> Vec<u8> {
+    let header = json!({
+        "workspace_id": TEST_WORKSPACE_ID,
+        "download_id": "artifact_download_1",
+        "artifact_id": "artifact_download_result",
+        "version_id": "artifact_download_version_1",
+        "offset": offset,
+        "len": chunk.len() as u64,
+        "total_size_bytes": artifact_download_fixture().len() as u64,
+        "chunk_sha256": sha256_hex(chunk),
+        "final_chunk": final_chunk
+    });
+    let header_bytes = serde_json::to_vec(&header).expect("encode download header");
+    let mut frame = Vec::new();
+    frame.extend_from_slice(b"ARTD");
+    frame.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(header_bytes.as_slice());
+    frame.extend_from_slice(chunk);
+    frame
+}
+
 struct TestWsServer {
     address: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -827,9 +1116,13 @@ impl TestWsServer {
                                                 let _ = writer.send(Message::Pong(payload)).await;
                                             }
                                             Message::Binary(payload) => {
-                                                if payload.len() < 8 || &payload[0..4] != b"PSU1" {
+                                                if payload.len() < 8
+                                                    || (&payload[0..4] != b"PSU1"
+                                                        && &payload[0..4] != b"ARTU")
+                                                {
                                                     continue;
                                                 }
+                                                let is_artifact = &payload[0..4] == b"ARTU";
                                                 let header_len = u32::from_be_bytes([
                                                     payload[4], payload[5], payload[6], payload[7],
                                                 ]) as usize;
@@ -852,19 +1145,38 @@ impl TestWsServer {
                                                     .get("offset")
                                                     .and_then(serde_json::Value::as_u64)
                                                     .unwrap_or(0);
+                                                let workspace_id = header
+                                                    .get("workspace_id")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or(TEST_WORKSPACE_ID);
                                                 let chunk_len = u64::try_from(payload.len().saturating_sub(header_end))
                                                     .unwrap_or(u64::MAX);
-                                                let ack = json!({
-                                                    "jsonrpc": "2.0",
-                                                    "method": events::SKILLS_UPLOAD_CHUNK_ACK,
-                                                    "params": {
-                                                        "upload_id": upload_id,
-                                                        "offset": offset,
-                                                        "len": chunk_len,
-                                                        "received_bytes": offset.saturating_add(chunk_len),
-                                                        "next_offset": offset.saturating_add(chunk_len)
-                                                    }
-                                                });
+                                                let ack = if is_artifact {
+                                                    json!({
+                                                        "jsonrpc": "2.0",
+                                                        "method": events::ARTIFACT_UPLOAD_CHUNK_ACK,
+                                                        "params": {
+                                                            "workspace_id": workspace_id,
+                                                            "upload_id": upload_id,
+                                                            "offset": offset,
+                                                            "len": chunk_len,
+                                                            "received_bytes": offset.saturating_add(chunk_len),
+                                                            "next_offset": offset.saturating_add(chunk_len)
+                                                        }
+                                                    })
+                                                } else {
+                                                    json!({
+                                                        "jsonrpc": "2.0",
+                                                        "method": events::SKILLS_UPLOAD_CHUNK_ACK,
+                                                        "params": {
+                                                            "upload_id": upload_id,
+                                                            "offset": offset,
+                                                            "len": chunk_len,
+                                                            "received_bytes": offset.saturating_add(chunk_len),
+                                                            "next_offset": offset.saturating_add(chunk_len)
+                                                        }
+                                                    })
+                                                };
                                                 let _ = writer
                                                     .send(Message::Text(ack.to_string().into()))
                                                     .await;
@@ -889,6 +1201,192 @@ impl TestWsServer {
                                                 };
 
                                                 match method {
+                                                    "artifact/capabilities" => {
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "upload": {
+                                                                    "required_for_local_paths": true,
+                                                                    "recommended_chunk_size_bytes": 3,
+                                                                    "max_chunk_size_bytes": 1024,
+                                                                    "max_file_size_bytes": 1048576,
+                                                                    "max_files_per_turn": 32
+                                                                },
+                                                                "download": {
+                                                                    "recommended_chunk_size_bytes": 3,
+                                                                    "max_chunk_size_bytes": 1024,
+                                                                    "max_concurrent_downloads": 2
+                                                                }
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/upload/start" => {
+                                                        let params = request
+                                                            .get("params")
+                                                            .cloned()
+                                                            .unwrap_or_else(|| json!({}));
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "upload_id": "artifact_upload_1",
+                                                                "recommended_chunk_size_bytes": 3,
+                                                                "max_chunk_size_bytes": 1024,
+                                                                "max_size_bytes": 1048576,
+                                                                "expires_at_unix": 1_700_000_000i64
+                                                            }
+                                                        });
+                                                        let _ = params;
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/upload/finish" => {
+                                                        let upload_id = request
+                                                            .get("params")
+                                                            .and_then(|value| value.get("upload_id"))
+                                                            .and_then(serde_json::Value::as_str)
+                                                            .unwrap_or("artifact_upload_1");
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "upload_id": upload_id,
+                                                                "artifact": {
+                                                                    "artifact_id": "artifact_upload_result",
+                                                                    "version_id": "artifact_version_1",
+                                                                    "display_name": "fixture.txt",
+                                                                    "kind": "text",
+                                                                    "mime_type": "text/plain",
+                                                                    "size_bytes": 5,
+                                                                    "sha256": "00",
+                                                                    "status": "ready",
+                                                                    "preview": null
+                                                                }
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/upload/abort" => {
+                                                        let upload_id = request
+                                                            .get("params")
+                                                            .and_then(|value| value.get("upload_id"))
+                                                            .and_then(serde_json::Value::as_str)
+                                                            .unwrap_or("artifact_upload_1");
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "upload_id": upload_id,
+                                                                "status": "aborted"
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/download/start" => {
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "download_id": "artifact_download_1",
+                                                                "artifact": {
+                                                                    "artifact_id": "artifact_download_result",
+                                                                    "version_id": "artifact_download_version_1",
+                                                                    "display_name": "download.txt",
+                                                                    "kind": "text",
+                                                                    "mime_type": "text/plain",
+                                                                    "size_bytes": artifact_download_fixture().len(),
+                                                                    "sha256": sha256_hex(artifact_download_fixture()),
+                                                                    "status": "ready",
+                                                                    "preview": null
+                                                                },
+                                                                "file_name": "download.txt",
+                                                                "size_bytes": artifact_download_fixture().len(),
+                                                                "sha256": sha256_hex(artifact_download_fixture()),
+                                                                "recommended_chunk_size_bytes": 5,
+                                                                "max_chunk_size_bytes": 8,
+                                                                "expires_at_unix": 1_700_000_000i64
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/download/chunk" => {
+                                                        let params = request
+                                                            .get("params")
+                                                            .cloned()
+                                                            .unwrap_or_else(|| json!({}));
+                                                        let offset = params
+                                                            .get("offset")
+                                                            .and_then(serde_json::Value::as_u64)
+                                                            .unwrap_or(0);
+                                                        let len = params
+                                                            .get("len")
+                                                            .and_then(serde_json::Value::as_u64)
+                                                            .unwrap_or(0);
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "download_id": "artifact_download_1",
+                                                                "offset": offset,
+                                                                "len": len,
+                                                                "queued": true
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+
+                                                        let fixture = artifact_download_fixture();
+                                                        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                                                        let end = start.saturating_add(usize::try_from(len).unwrap_or(0));
+                                                        if end <= fixture.len() {
+                                                            let frame = artifact_download_frame(
+                                                                offset,
+                                                                &fixture[start..end],
+                                                                end == fixture.len(),
+                                                            );
+                                                            let _ = writer
+                                                                .send(Message::Binary(frame.into()))
+                                                                .await;
+                                                        }
+                                                    }
+                                                    "artifact/download/finish" => {
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "download_id": "artifact_download_1",
+                                                                "status": "finished"
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
+                                                    "artifact/download/abort" => {
+                                                        let response = json!({
+                                                            "jsonrpc": "2.0",
+                                                            "id": request_id,
+                                                            "result": {
+                                                                "download_id": "artifact_download_1",
+                                                                "status": "aborted"
+                                                            }
+                                                        });
+                                                        let _ = writer
+                                                            .send(Message::Text(response.to_string().into()))
+                                                            .await;
+                                                    }
                                                     "thread/start" => {
                                                         let Some(thread_id) = request
                                                             .get("params")

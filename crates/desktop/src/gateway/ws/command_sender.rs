@@ -373,6 +373,513 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::SKILLS_UPLOAD_ABORT, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn artifact_capabilities(
+        &self,
+        params: ArtifactCapabilitiesParams,
+    ) -> Result<ArtifactCapabilitiesResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/capabilities"
+            ));
+        }
+        self.send_request_typed(methods::ARTIFACT_CAPABILITIES, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn artifact_list_for_thread(
+        &self,
+        params: ArtifactListForThreadParams,
+    ) -> Result<ArtifactListResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for artifact/list/thread"));
+        }
+        if params
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(anyhow!("thread_id is required for artifact/list/thread"));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_LIST_FOR_THREAD,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn artifact_download_start(
+        &self,
+        params: ArtifactDownloadStartParams,
+    ) -> Result<ArtifactDownloadStartResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/download/start"
+            ));
+        }
+        if params.artifact_id.trim().is_empty() {
+            return Err(anyhow!(
+                "artifact_id is required for artifact/download/start"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_DOWNLOAD_START,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn artifact_download_chunk(
+        &self,
+        params: ArtifactDownloadChunkParams,
+    ) -> Result<ArtifactDownloadChunkResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/download/chunk"
+            ));
+        }
+        if params.download_id.trim().is_empty() {
+            return Err(anyhow!(
+                "download_id is required for artifact/download/chunk"
+            ));
+        }
+        if params.len == 0 {
+            return Err(anyhow!("len must be positive for artifact/download/chunk"));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_DOWNLOAD_CHUNK,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn artifact_download_finish(
+        &self,
+        params: ArtifactDownloadFinishParams,
+    ) -> Result<ArtifactDownloadFinishResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/download/finish"
+            ));
+        }
+        if params.download_id.trim().is_empty() {
+            return Err(anyhow!(
+                "download_id is required for artifact/download/finish"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_DOWNLOAD_FINISH,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn artifact_download_abort(
+        &self,
+        params: ArtifactDownloadAbortParams,
+    ) -> Result<ArtifactDownloadAbortResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/download/abort"
+            ));
+        }
+        if params.download_id.trim().is_empty() {
+            return Err(anyhow!(
+                "download_id is required for artifact/download/abort"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_DOWNLOAD_ABORT,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn download_artifact_to_cache(
+        &self,
+        request: DesktopArtifactDownloadRequest,
+    ) -> Result<DesktopArtifactDownloadResult> {
+        let runtime_home = state::runtime_home_dir()?;
+        self.download_artifact_to_cache_with_runtime_home(request, runtime_home)
+    }
+
+    pub(super) fn download_artifact_to_cache_with_runtime_home(
+        &self,
+        request: DesktopArtifactDownloadRequest,
+        runtime_home: PathBuf,
+    ) -> Result<DesktopArtifactDownloadResult> {
+        validate_artifact_download_request(&request)?;
+        let _ =
+            prune_artifact_download_cache(runtime_home.as_path(), ARTIFACT_DOWNLOAD_CACHE_MAX_AGE);
+        let start = self.artifact_download_start(ArtifactDownloadStartParams {
+            workspace_id: request.workspace_id.clone(),
+            artifact_id: request.artifact_id.clone(),
+            version_id: request.version_id.clone(),
+            preferred_chunk_size_bytes: None,
+        })?;
+        let version_id = start
+            .artifact
+            .version_id
+            .clone()
+            .or(request.version_id.clone())
+            .unwrap_or_else(|| "latest".to_owned());
+        let cache_paths = build_artifact_download_cache_path(
+            runtime_home.as_path(),
+            request.gateway_profile_id.as_str(),
+            request.workspace_id.as_str(),
+            request.artifact_id.as_str(),
+            version_id.as_str(),
+            start.file_name.as_str(),
+        )?;
+        let result = self.download_artifact_to_cache_inner(&request, &start, &cache_paths);
+        if result.is_err() {
+            let _ = self.artifact_download_abort(ArtifactDownloadAbortParams {
+                workspace_id: request.workspace_id,
+                download_id: start.download_id,
+            });
+            let _ = fs::remove_file(cache_paths.part_path.as_path());
+        }
+        result
+    }
+
+    fn download_artifact_to_cache_inner(
+        &self,
+        request: &DesktopArtifactDownloadRequest,
+        start: &ArtifactDownloadStartResponse,
+        cache_paths: &ArtifactDownloadCachePaths,
+    ) -> Result<DesktopArtifactDownloadResult> {
+        if let Some(parent) = cache_paths.part_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create artifact download cache {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let _ = fs::remove_file(cache_paths.part_path.as_path());
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(cache_paths.part_path.as_path())
+            .with_context(|| {
+                format!(
+                    "failed to create artifact download part file {}",
+                    cache_paths.part_path.display()
+                )
+            })?;
+
+        let mut offset = 0_u64;
+        let chunk_size = start
+            .recommended_chunk_size_bytes
+            .min(start.max_chunk_size_bytes)
+            .max(1);
+        let version_id = start
+            .artifact
+            .version_id
+            .as_deref()
+            .or(request.version_id.as_deref())
+            .unwrap_or("latest");
+        while offset < start.size_bytes {
+            let len = (start.size_bytes - offset).min(chunk_size);
+            let frame_rx =
+                self.register_artifact_download_chunk(start.download_id.as_str(), offset)?;
+            let response = self.artifact_download_chunk(ArtifactDownloadChunkParams {
+                workspace_id: request.workspace_id.clone(),
+                download_id: start.download_id.clone(),
+                offset,
+                len,
+            })?;
+            if !response.queued || response.offset != offset || response.len != len {
+                return Err(anyhow!("artifact/download/chunk returned an invalid range"));
+            }
+            let payload = frame_rx
+                .recv_timeout(DOWNLOAD_CHUNK_TIMEOUT)
+                .map_err(|_| anyhow!("timed out waiting for artifact download chunk"))?
+                .map_err(anyhow::Error::msg)?;
+            validate_artifact_download_chunk_payload(
+                &payload,
+                request.workspace_id.as_str(),
+                start.download_id.as_str(),
+                request.artifact_id.as_str(),
+                version_id,
+                offset,
+                len,
+                start.size_bytes,
+            )?;
+            write_chunk_at(&mut file, offset, payload.bytes.as_slice())?;
+            offset = offset.saturating_add(len);
+        }
+        file.sync_data()
+            .context("failed to sync artifact download")?;
+        drop(file);
+
+        let actual_size = fs::metadata(cache_paths.part_path.as_path())
+            .with_context(|| {
+                format!(
+                    "failed to stat artifact download part file {}",
+                    cache_paths.part_path.display()
+                )
+            })?
+            .len();
+        if actual_size != start.size_bytes {
+            return Err(anyhow!(
+                "artifact download size mismatch: expected {}, got {}",
+                start.size_bytes,
+                actual_size
+            ));
+        }
+        let actual_sha256 = sha256_file(cache_paths.part_path.as_path())?;
+        if actual_sha256 != start.sha256 {
+            return Err(anyhow!("artifact download sha256 mismatch"));
+        }
+
+        let _ = fs::remove_file(cache_paths.final_path.as_path());
+        fs::rename(
+            cache_paths.part_path.as_path(),
+            cache_paths.final_path.as_path(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to finalize artifact download {}",
+                cache_paths.final_path.display()
+            )
+        })?;
+        self.artifact_download_finish(ArtifactDownloadFinishParams {
+            workspace_id: request.workspace_id.clone(),
+            download_id: start.download_id.clone(),
+        })?;
+        Ok(DesktopArtifactDownloadResult {
+            local_path: cache_paths.final_path.clone(),
+            artifact: start.artifact.clone(),
+            size_bytes: start.size_bytes,
+            sha256: start.sha256.clone(),
+        })
+    }
+
+    fn register_artifact_download_chunk(
+        &self,
+        download_id: &str,
+        offset: u64,
+    ) -> Result<Receiver<std::result::Result<ArtifactDownloadChunkPayload, String>>> {
+        let (response_tx, response_rx) = mpsc::channel();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        self.command_tx
+            .send(GatewayWsCommand::ArtifactDownloadRegisterChunk {
+                download_id: download_id.to_owned(),
+                offset,
+                response_tx,
+                registered_tx,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+        registered_rx
+            .recv_timeout(RPC_REQUEST_TIMEOUT)
+            .map_err(|_| anyhow!("timed out registering artifact download chunk waiter"))?
+            .map_err(anyhow::Error::msg)?;
+        Ok(response_rx)
+    }
+
+    pub fn artifact_upload_start(
+        &self,
+        params: ArtifactUploadStartParams,
+    ) -> Result<ArtifactUploadStartResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/upload/start"
+            ));
+        }
+        if params.file_name.trim().is_empty() {
+            return Err(anyhow!("file_name is required for artifact/upload/start"));
+        }
+        if params.client_attachment_id.trim().is_empty() {
+            return Err(anyhow!(
+                "client_attachment_id is required for artifact/upload/start"
+            ));
+        }
+        if params.sha256.trim().is_empty() {
+            return Err(anyhow!("sha256 is required for artifact/upload/start"));
+        }
+
+        self.send_request_typed(methods::ARTIFACT_UPLOAD_START, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn artifact_upload_finish(
+        &self,
+        params: ArtifactUploadFinishParams,
+    ) -> Result<ArtifactUploadFinishResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/upload/finish"
+            ));
+        }
+        if params.upload_id.trim().is_empty() {
+            return Err(anyhow!("upload_id is required for artifact/upload/finish"));
+        }
+
+        self.send_request_typed(
+            methods::ARTIFACT_UPLOAD_FINISH,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn artifact_upload_abort(
+        &self,
+        params: ArtifactUploadAbortParams,
+    ) -> Result<ArtifactUploadAbortResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact/upload/abort"
+            ));
+        }
+        if params.upload_id.trim().is_empty() {
+            return Err(anyhow!("upload_id is required for artifact/upload/abort"));
+        }
+
+        self.send_request_typed(methods::ARTIFACT_UPLOAD_ABORT, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn send_artifact_upload_chunk(
+        &self,
+        workspace_id: String,
+        upload_id: String,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> Result<ArtifactUploadChunkAckNotification> {
+        if workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for artifact upload chunk"
+            ));
+        }
+        if upload_id.trim().is_empty() {
+            return Err(anyhow!("upload_id is required for artifact upload chunk"));
+        }
+        if chunk.is_empty() {
+            return Err(anyhow!("artifact upload chunk cannot be empty"));
+        }
+
+        let payload =
+            encode_artifact_upload_chunk_frame(workspace_id, upload_id.clone(), offset, &chunk)?;
+
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(GatewayWsCommand::ArtifactBinaryUploadChunk {
+                upload_id,
+                offset,
+                payload,
+                response_tx,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+
+        let response = response_rx
+            .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
+            .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))?;
+
+        response.map_err(anyhow::Error::msg)
+    }
+
+    pub fn upload_artifact_file(
+        &self,
+        request: DesktopArtifactUploadRequest,
+    ) -> Result<ArtifactRef> {
+        if request.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for artifact file upload"));
+        }
+        if request.client_attachment_id.trim().is_empty() {
+            return Err(anyhow!(
+                "client_attachment_id is required for artifact file upload"
+            ));
+        }
+        let metadata = fs::metadata(request.path.as_path())
+            .with_context(|| format!("failed to stat `{}`", request.path.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("artifact upload path is not a regular file"));
+        }
+        let file_name = request
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("artifact upload path has no file name"))?;
+        let size_bytes = metadata.len();
+        let sha256 = sha256_file(request.path.as_path())?;
+        let mime_type = request.mime_type.clone().or_else(|| {
+            mime_guess::from_path(request.path.as_path())
+                .first()
+                .map(|mime| mime.essence_str().to_owned())
+        });
+
+        let start = self.artifact_upload_start(ArtifactUploadStartParams {
+            workspace_id: request.workspace_id.clone(),
+            thread_id: request.thread_id.clone(),
+            planned_turn_id: request.planned_turn_id.clone(),
+            client_attachment_id: request.client_attachment_id.clone(),
+            file_name,
+            mime_type,
+            size_bytes,
+            sha256,
+            source_kind: ArtifactUploadSourceKind::UserComposer,
+        })?;
+
+        let result = self.upload_artifact_file_chunks_and_finish(&request, &start);
+        if result.is_err() {
+            let _ = self.artifact_upload_abort(ArtifactUploadAbortParams {
+                workspace_id: request.workspace_id,
+                upload_id: start.upload_id,
+            });
+        }
+        result
+    }
+
+    fn upload_artifact_file_chunks_and_finish(
+        &self,
+        request: &DesktopArtifactUploadRequest,
+        start: &ArtifactUploadStartResponse,
+    ) -> Result<ArtifactRef> {
+        let chunk_size = usize::try_from(
+            start
+                .recommended_chunk_size_bytes
+                .min(start.max_chunk_size_bytes)
+                .max(1),
+        )
+        .unwrap_or(256 * 1024);
+        let mut file = fs::File::open(request.path.as_path())
+            .with_context(|| format!("failed to open `{}`", request.path.display()))?;
+        let mut offset = 0_u64;
+        let mut buffer = vec![0_u8; chunk_size];
+        loop {
+            let read = file
+                .read(buffer.as_mut_slice())
+                .with_context(|| format!("failed to read `{}`", request.path.display()))?;
+            if read == 0 {
+                break;
+            }
+            let chunk = buffer[..read].to_vec();
+            let ack = self.send_artifact_upload_chunk(
+                request.workspace_id.clone(),
+                start.upload_id.clone(),
+                offset,
+                chunk,
+            )?;
+            offset = ack.next_offset;
+        }
+
+        let finish = self.artifact_upload_finish(ArtifactUploadFinishParams {
+            workspace_id: request.workspace_id.clone(),
+            upload_id: start.upload_id.clone(),
+        })?;
+        Ok(finish.artifact)
+    }
+
     pub fn send_skill_upload_chunk(
         &self,
         workspace_id: String,
@@ -546,4 +1053,74 @@ impl GatewayWsCommandSender {
             serde_json::to_string(&request).context("failed to serialize JSON-RPC request")?;
         Ok((request_id, payload))
     }
+}
+
+pub(crate) fn encode_artifact_upload_chunk_frame(
+    workspace_id: String,
+    upload_id: String,
+    offset: u64,
+    chunk: &[u8],
+) -> Result<Vec<u8>> {
+    let header = ArtifactUploadChunkHeader {
+        workspace_id,
+        upload_id,
+        offset,
+        len: u64::try_from(chunk.len()).context("artifact upload chunk length overflow")?,
+        chunk_sha256: Some(hex::encode(Sha256::digest(chunk))),
+    };
+    let header_bytes =
+        serde_json::to_vec(&header).context("failed to encode artifact upload chunk header")?;
+    let header_len =
+        u32::try_from(header_bytes.len()).context("artifact upload chunk header is too large")?;
+
+    let mut payload = Vec::with_capacity(
+        ARTIFACT_UPLOAD_FRAME_MAGIC.len() + 4 + header_bytes.len() + chunk.len(),
+    );
+    payload.extend_from_slice(ARTIFACT_UPLOAD_FRAME_MAGIC);
+    payload.extend_from_slice(&header_len.to_be_bytes());
+    payload.extend_from_slice(header_bytes.as_slice());
+    payload.extend_from_slice(chunk);
+    Ok(payload)
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open `{}`", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read `{}`", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn validate_artifact_download_request(request: &DesktopArtifactDownloadRequest) -> Result<()> {
+    if request.gateway_profile_id.trim().is_empty() {
+        return Err(anyhow!(
+            "gateway_profile_id is required for artifact download"
+        ));
+    }
+    if request.workspace_id.trim().is_empty() {
+        return Err(anyhow!("workspace_id is required for artifact download"));
+    }
+    if request.artifact_id.trim().is_empty() {
+        return Err(anyhow!("artifact_id is required for artifact download"));
+    }
+    Ok(())
+}
+
+fn write_chunk_at(file: &mut fs::File, offset: u64, bytes: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    file.seek(SeekFrom::Start(offset))
+        .context("failed to seek artifact download part file")?;
+    file.write_all(bytes)
+        .context("failed to write artifact download chunk")?;
+    Ok(())
 }
