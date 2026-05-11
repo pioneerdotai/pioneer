@@ -139,16 +139,37 @@ impl PioneerDesktop {
     }
 
     fn render_composer_attachment_badges(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
+        let rows = self
+            .composer_attachments
+            .chunks(3)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+
+        v_flex()
             .w_full()
             .min_w_0()
             .pt_2()
             .px_2()
             .gap_1p5()
-            .flex_wrap()
-            .children(self.composer_attachments.iter().cloned().enumerate().map(
-                |(index, attachment)| self.render_composer_attachment_badge(attachment, index, cx),
-            ))
+            .children(rows.into_iter().enumerate().map(|(row_index, row)| {
+                h_flex()
+                    .id(("composer-attachment-row", row_index))
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .children(
+                        row.into_iter()
+                            .enumerate()
+                            .map(|(column_index, attachment)| {
+                                let absolute_index = row_index * 3 + column_index;
+                                self.render_composer_attachment_badge(
+                                    attachment,
+                                    absolute_index,
+                                    cx,
+                                )
+                            }),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -187,9 +208,9 @@ impl PioneerDesktop {
 
         h_flex()
             .id(("composer-attachment-chip", index))
+            .flex_1()
             .max_w(px(196.))
             .min_w_0()
-            .flex_initial()
             .h(px(32.))
             .pl_2()
             .pr_1p5()
