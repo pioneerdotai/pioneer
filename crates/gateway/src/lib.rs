@@ -23,14 +23,14 @@ mod transport;
 mod workspace;
 
 use anyhow::{Context, Result};
-use attachment::CrudAttachmentUploadRegistryBackend;
+use attachment::CrudArtifactExternalRefCacheBackend;
 use pioneer_agent::{MemoryLoopConfig, ToolLoopConfig};
 use pioneer_config::AppConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::{
-    AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy, AttachmentPipelineConfig,
-    AttachmentRetryPolicy, AttachmentRuntimePolicy, AttachmentSecurityPolicy,
-    AttachmentUploadRegistryPolicy, ProviderRegistry, set_attachment_upload_registry_backend,
+    ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
+    AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
+    AttachmentSecurityPolicy, ProviderRegistry, set_artifact_external_ref_cache_backend,
     set_default_attachment_pipeline_config,
 };
 use pioneer_skills::SkillTrustLevel;
@@ -63,7 +63,8 @@ pub use crate::operations::{
     KeystoreEncryptionReport, McpSecretGarbageCollectionFailure, McpSecretGarbageCollectionReport,
     McpSecretOrphanStatusReport, SecretKindCounts, SecretPermissionHealthReport,
     SecretPermissionHealthStatus, SecretsStatusReport, SuperuserJwtRotationReport,
-    rotate_superuser_jwt_token, secrets_garbage_collection, secrets_status,
+    artifact_gc_dry_run, artifact_gc_execute, artifact_storage_usage, rotate_superuser_jwt_token,
+    secrets_garbage_collection, secrets_status,
 };
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
@@ -131,7 +132,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         }
     }
 
-    set_attachment_upload_registry_backend(Arc::new(CrudAttachmentUploadRegistryBackend::new(
+    set_artifact_external_ref_cache_backend(Arc::new(CrudArtifactExternalRefCacheBackend::new(
         crud_store.clone(),
     )));
 
@@ -173,7 +174,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         max_total_bytes_per_request: provider_attachments_cfg.max_total_bytes_per_request,
         max_attachments_per_request: provider_attachments_cfg.max_attachments_per_request,
         upload_preferred_min_bytes: provider_attachments_cfg.upload_preferred_min_bytes,
-        upload_registry: AttachmentUploadRegistryPolicy {
+        upload_registry: ArtifactExternalRefCachePolicy {
             enabled: provider_attachments_cfg.upload_registry_enabled,
             ttl_secs: provider_attachments_cfg.upload_registry_ttl_secs,
         },
@@ -353,6 +354,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         context_budget,
         tool_loop_config,
         memory_runtime,
+        runtime_home.clone(),
+        config.gateway.artifacts.clone(),
     ));
 
     message_processor

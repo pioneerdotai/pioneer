@@ -56,6 +56,28 @@ impl MessageProcessor {
         };
 
         if let Err(error) = self
+            .validate_artifact_user_inputs(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to validate artifact input: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if let Err(error) = self
             .crud_store
             .materialize_turn_start(
                 &outcome.materialization.thread,
@@ -80,6 +102,13 @@ impl MessageProcessor {
             .await;
             return;
         }
+
+        self.start_file_capture_session(
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+        )
+        .await;
 
         if let Err(error) = self
             .agent_manager
@@ -144,9 +173,37 @@ impl MessageProcessor {
             }
         };
 
+        let resolved_artifacts = match self
+            .resolve_provider_artifact_inputs(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            Ok(resolved_artifacts) => resolved_artifacts,
+            Err(error) => {
+                self.mark_turn_failed(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to resolve artifact input for provider: {error:#}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resolve artifact input for provider: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
         if let Err(error) = self
             .agent_manager
-            .start_turn(
+            .start_turn_with_resolved_artifacts(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.thread.mode,
@@ -154,6 +211,7 @@ impl MessageProcessor {
                 &outcome.materialization.thread.model_provider,
                 workspace_skill_policies,
                 outcome.materialization.input.clone(),
+                resolved_artifacts,
                 history,
             )
             .await

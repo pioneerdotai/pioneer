@@ -1,8 +1,14 @@
 use super::*;
 use pioneer_protocol::{
-    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
-    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
-    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams,
+    ArtifactDownloadAbortParams, ArtifactDownloadChunkParams, ArtifactDownloadFinishParams,
+    ArtifactDownloadStartParams, ArtifactGetParams, ArtifactListForMessageParams,
+    ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
+    ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
+    ArtifactUploadStartParams, McpInstallParams, McpListParams, McpPolicySetParams,
+    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
+    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
+    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
@@ -913,6 +919,396 @@ impl MessageProcessor {
                     }
                 }
             }
+            methods::ARTIFACT_CAPABILITIES => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactCapabilitiesParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_capabilities(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_CAPABILITIES
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactListParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_list(
+                            connection_id,
+                            request.id,
+                            params,
+                            methods::ARTIFACT_LIST,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::ARTIFACT_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_LIST_FOR_THREAD => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactListForThreadParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_list(
+                            connection_id,
+                            request.id,
+                            params,
+                            methods::ARTIFACT_LIST_FOR_THREAD,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_LIST_FOR_THREAD
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_LIST_FOR_TURN => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactListForTurnParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_list(
+                            connection_id,
+                            request.id,
+                            params,
+                            methods::ARTIFACT_LIST_FOR_TURN,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_LIST_FOR_TURN
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_LIST_FOR_MESSAGE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactListForMessageParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_list(
+                            connection_id,
+                            request.id,
+                            params,
+                            methods::ARTIFACT_LIST_FOR_MESSAGE,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_LIST_FOR_MESSAGE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactGetParams>(params_value) {
+                    Ok(params) => self.artifact_get(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::ARTIFACT_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_READ => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactReadParams>(params_value) {
+                    Ok(params) => self.artifact_read(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::ARTIFACT_READ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_DELETE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactDeleteParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_delete(connection_id, request.id, params)
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_DELETE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_RESTORE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactRestoreParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_restore(connection_id, request.id, params)
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_RESTORE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_BIND => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactBindParams>(params_value) {
+                    Ok(params) => self.artifact_bind(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::ARTIFACT_BIND),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_UPLOAD_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactUploadStartParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_upload_start(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_UPLOAD_START
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_UPLOAD_FINISH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactUploadFinishParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_upload_finish(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_UPLOAD_FINISH
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_UPLOAD_ABORT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactUploadAbortParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_upload_abort(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_UPLOAD_ABORT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_DOWNLOAD_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactDownloadStartParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_download_start(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_DOWNLOAD_START
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_DOWNLOAD_CHUNK => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactDownloadChunkParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_download_chunk(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_DOWNLOAD_CHUNK
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_DOWNLOAD_FINISH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactDownloadFinishParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_download_finish(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_DOWNLOAD_FINISH
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::ARTIFACT_DOWNLOAD_ABORT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ArtifactDownloadAbortParams>(params_value) {
+                    Ok(params) => {
+                        self.artifact_download_abort(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::ARTIFACT_DOWNLOAD_ABORT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
             methods::SKILLS_HEALTH => {
                 let params_value = request.params.unwrap_or_else(empty_object_value);
                 match serde_json::from_value::<SkillsHealthParams>(params_value) {
@@ -1436,6 +1832,10 @@ impl MessageProcessor {
     }
 
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.artifact_uploads.abort_connection(connection_id).await;
+        self.artifact_downloads
+            .abort_connection(connection_id)
+            .await;
         let removed_thread_ids = self.thread_manager.connection_closed(connection_id).await;
         if removed_thread_ids.is_empty() {
             return;

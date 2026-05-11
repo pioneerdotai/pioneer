@@ -1,8 +1,10 @@
 use super::*;
+use crate::message::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC;
 use crate::message::skills::SKILL_UPLOAD_CHUNK_FRAME_MAGIC;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayBinaryFrameKind {
+    ArtifactUploadChunk,
     SkillUploadChunk,
 }
 
@@ -11,12 +13,16 @@ impl GatewayBinaryFrameKind {
         if payload.starts_with(SKILL_UPLOAD_CHUNK_FRAME_MAGIC) {
             return Some(Self::SkillUploadChunk);
         }
+        if payload.starts_with(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC) {
+            return Some(Self::ArtifactUploadChunk);
+        }
 
         None
     }
 
     fn name(self) -> &'static str {
         match self {
+            Self::ArtifactUploadChunk => "artifact/upload/chunk",
             Self::SkillUploadChunk => "skills/upload/chunk",
         }
     }
@@ -41,6 +47,10 @@ impl MessageProcessor {
         );
 
         match kind {
+            GatewayBinaryFrameKind::ArtifactUploadChunk => {
+                self.process_artifact_upload_chunk_frame(connection_id, payload)
+                    .await;
+            }
             GatewayBinaryFrameKind::SkillUploadChunk => {
                 self.process_skill_upload_chunk_frame(connection_id, payload)
                     .await;
@@ -63,6 +73,18 @@ mod tests {
 
         assert_eq!(kind, Some(GatewayBinaryFrameKind::SkillUploadChunk));
         assert_eq!(kind.expect("kind").name(), "skills/upload/chunk");
+    }
+
+    #[test]
+    fn binary_frame_kind_detects_artifact_upload_magic() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+
+        let kind = GatewayBinaryFrameKind::from_payload(payload.as_slice());
+
+        assert_eq!(kind, Some(GatewayBinaryFrameKind::ArtifactUploadChunk));
+        assert_eq!(kind.expect("kind").name(), "artifact/upload/chunk");
     }
 
     #[test]

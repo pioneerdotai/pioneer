@@ -13,6 +13,7 @@ computer-use = ["pioneer-tools/computer-use"]
 anyhow.workspace = true
 async-trait.workspace = true
 pioneer-agent.workspace = true
+pioneer-artifacts.workspace = true
 pioneer-config.workspace = true
 pioneer-crud.workspace = true
 pioneer-hooks.workspace = true
@@ -47,3 +48,6 @@ flate2.workspace = true
 tar.workspace = true
 sha2.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

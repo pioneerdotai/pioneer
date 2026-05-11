@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use pioneer_artifacts::{
+    ArtifactGcPlan, ArtifactGcReport, ArtifactQuotaPolicy, ArtifactService, ArtifactWorkspaceUsage,
+    LocalArtifactBlobStore,
+};
 use pioneer_config::AppConfig;
 use pioneer_crud::CrudStore;
 use pioneer_keystore::{
@@ -166,6 +171,74 @@ pub async fn secrets_garbage_collection(
     })
 }
 
+pub async fn artifact_storage_usage(
+    config: &AppConfig,
+    runtime_home: &Path,
+    workspace_id: &str,
+) -> Result<ArtifactWorkspaceUsage> {
+    let service = open_artifact_service_for_operations(config, runtime_home).await?;
+    service
+        .workspace_usage(workspace_id)
+        .await
+        .with_context(|| format!("failed to compute artifact storage usage for `{workspace_id}`"))
+}
+
+pub async fn artifact_gc_dry_run(
+    config: &AppConfig,
+    runtime_home: &Path,
+    workspace_id: &str,
+    now_unix_ms: i64,
+) -> Result<ArtifactGcPlan> {
+    let service = open_artifact_service_for_operations(config, runtime_home).await?;
+    service
+        .gc_dry_run(workspace_id, now_unix_ms)
+        .await
+        .with_context(|| format!("failed to plan artifact GC for `{workspace_id}`"))
+}
+
+pub async fn artifact_gc_execute(
+    config: &AppConfig,
+    runtime_home: &Path,
+    workspace_id: &str,
+    now_unix_ms: i64,
+    execute: bool,
+) -> Result<ArtifactGcReport> {
+    if !execute {
+        bail!("artifact GC execute requires execute=true; call dry-run first for visibility");
+    }
+    let service = open_artifact_service_for_operations(config, runtime_home).await?;
+    service
+        .gc_execute(workspace_id, now_unix_ms)
+        .await
+        .with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
+}
+
+async fn open_artifact_service_for_operations(
+    config: &AppConfig,
+    runtime_home: &Path,
+) -> Result<ArtifactService> {
+    let gateway_db_path = gateway_database_path(runtime_home, config)?;
+    let Some(database) = initialize_existing_for_operations(runtime_home, config).await? else {
+        bail!(
+            "gateway database `{}` is missing; refusing artifact operations",
+            gateway_db_path.display()
+        );
+    };
+    Ok(ArtifactService::new_with_policies(
+        Arc::new(CrudStore::new(database)),
+        Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
+        ArtifactQuotaPolicy {
+            max_file_bytes: config.gateway.artifacts.max_file_bytes,
+            max_workspace_bytes: config.gateway.artifacts.max_workspace_bytes,
+            max_files_per_workspace: config.gateway.artifacts.max_files_per_workspace,
+            warn_at_percent: config.gateway.artifacts.quota_warn_at_percent,
+        },
+        pioneer_artifacts::ArtifactGcPolicy {
+            grace_secs: config.gateway.artifacts.gc_grace_secs,
+        },
+    ))
+}
+
 pub fn rotate_superuser_jwt_token(
     config: &AppConfig,
     runtime_home: &Path,
@@ -218,14 +291,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use pioneer_config::{
-        AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
-        GatewayDatabaseConfig, GatewayMemoryConfig, GatewayProviderConfig, GatewayRuntimeConfig,
-        GatewaySkillsConfig, GatewayThreadConfig, GatewayToolLoopBudgetConfig,
-        GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
+        AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
+        GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,
+        GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
+        GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
+        GatewayWebToolsConfig, InstallConfig,
     };
-    use pioneer_crud::{McpAuditEventRecord, McpServerInstallationRecord};
+    use pioneer_crud::{
+        CrudStore, McpAuditEventRecord, McpServerInstallationRecord, NewArtifactBlobRecord,
+    };
     use pioneer_keystore::{DbKeyStore, SecretFilter, SecretKind, SecretMeta, SecretStore};
     use pioneer_mcp::McpSecretRef;
+    use sea_orm::ConnectionTrait;
     use tokio_tungstenite::tungstenite::handshake::server::Request;
 
     use super::*;
@@ -359,6 +436,68 @@ mod tests {
         assert!(
             format!("{error:#}").contains("refusing to garbage collect MCP secrets"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_gc_dry_run_and_execute_requires_explicit_apply() {
+        let runtime_home = unique_temp_dir("artifact-gc");
+        std::fs::create_dir_all(&runtime_home).expect("create runtime home");
+        let config = test_app_config();
+        let database = initialize_database(&runtime_home, &config)
+            .await
+            .expect("initialize gateway db");
+        database
+            .execute_unprepared(
+                "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_ops', 'Ops', 1, 1)",
+            )
+            .await
+            .expect("insert workspace");
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let crud_store = CrudStore::new(database.clone());
+        crud_store
+            .insert_test_artifact_blob(
+                NewArtifactBlobRecord {
+                    workspace_id: "ws_ops".to_owned(),
+                    sha256: sha256.to_owned(),
+                    size_bytes: 7,
+                    mime_type: Some("text/plain".to_owned()),
+                    storage_backend: "local".to_owned(),
+                    storage_key: format!("sha256/01/23/{sha256}"),
+                    metadata: Default::default(),
+                },
+                0,
+                "orphan_blob".to_owned(),
+            )
+            .await
+            .expect("insert orphan blob");
+
+        let usage = artifact_storage_usage(&config, &runtime_home, "ws_ops")
+            .await
+            .expect("usage");
+        assert_eq!(usage.bytes, 0);
+
+        let plan = artifact_gc_dry_run(&config, &runtime_home, "ws_ops", 200_000_000)
+            .await
+            .expect("dry-run artifact gc");
+        assert_eq!(plan.orphan_blobs.len(), 1);
+
+        let explicit_error =
+            artifact_gc_execute(&config, &runtime_home, "ws_ops", 200_000_000, false)
+                .await
+                .expect_err("execute flag should be required");
+        assert!(format!("{explicit_error:#}").contains("execute=true"));
+
+        let report = artifact_gc_execute(&config, &runtime_home, "ws_ops", 200_000_000, true)
+            .await
+            .expect("execute artifact gc");
+        assert_eq!(report.deleted_blobs, 1);
+        assert_eq!(
+            crud_store
+                .count_artifact_blobs_by_workspace("ws_ops")
+                .await
+                .expect("query blobs"),
+            0
         );
     }
 
@@ -583,6 +722,7 @@ mod tests {
                 },
                 memory: GatewayMemoryConfig::default(),
                 hooks: Default::default(),
+                artifacts: GatewayArtifactsConfig::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),

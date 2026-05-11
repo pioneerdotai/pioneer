@@ -2506,6 +2506,671 @@ fn user_message_payload_from_input_keeps_attachment_only_message() {
     );
 }
 
+async fn start_thread_for_artifact_test(
+    processor: &MessageProcessor,
+    connection_id: u64,
+    _rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+) -> ThreadStartResponse {
+    processor
+        .thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.to_owned(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: None,
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("thread/start should succeed")
+        .response
+}
+
+async fn ingest_user_test_artifact(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    display_name: &str,
+) -> pioneer_protocol::ArtifactRef {
+    processor
+        .artifact_service
+        .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
+            workspace_id: workspace_id.to_owned(),
+            primary_thread_id: None,
+            bytes: b"hello artifact".to_vec(),
+            display_name: display_name.to_owned(),
+            kind: pioneer_protocol::ArtifactKind::File,
+            mime_type: Some("text/plain".to_owned()),
+            created_by_kind: pioneer_protocol::ArtifactCreatedByKind::User,
+            created_by_actor_id: Some("test-user".to_owned()),
+            binding: None,
+            metadata: Default::default(),
+        })
+        .await
+        .expect("artifact ingest should succeed")
+        .artifact
+}
+
+async fn materialize_artifact_api_thread(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let thread = pioneer_protocol::Thread {
+        workspace_id: workspace_id.to_owned(),
+        id: thread_id.to_owned(),
+        name: None,
+        preview: String::new(),
+        mode: pioneer_protocol::ThreadMode::Agent,
+        model: "test-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        created_at: 1,
+        updated_at: 1,
+        status: pioneer_protocol::ThreadStatus::Active,
+        origin_kind: pioneer_protocol::ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        error: None,
+        prompt_manifest: None,
+    };
+    crud_store
+        .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+        .await
+        .expect("artifact API test thread should materialize");
+}
+
+async fn ingest_bound_test_artifact(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    message_id: &str,
+    display_name: &str,
+    bytes: Vec<u8>,
+) -> pioneer_protocol::ArtifactRef {
+    processor
+        .artifact_service
+        .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
+            workspace_id: workspace_id.to_owned(),
+            primary_thread_id: Some(thread_id.to_owned()),
+            bytes,
+            display_name: display_name.to_owned(),
+            kind: pioneer_protocol::ArtifactKind::File,
+            mime_type: Some("text/plain".to_owned()),
+            created_by_kind: pioneer_protocol::ArtifactCreatedByKind::User,
+            created_by_actor_id: Some("test-user".to_owned()),
+            binding: Some(pioneer_artifacts::ArtifactBindingTarget {
+                thread_id: Some(thread_id.to_owned()),
+                turn_id: Some(turn_id.to_owned()),
+                message_id: Some(message_id.to_owned()),
+                turn_item_id: None,
+                tool_call_id: None,
+                task_id: None,
+                task_run_id: None,
+                binding_kind: pioneer_protocol::ArtifactBindingKind::UserInput,
+                direction: pioneer_protocol::ArtifactBindingDirection::Input,
+                role: Some(pioneer_protocol::ArtifactRole::User),
+                item_index: Some(0),
+            }),
+            metadata: Default::default(),
+        })
+        .await
+        .expect("bound artifact ingest should succeed")
+        .artifact
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_with_artifact_input_materializes_user_message_attachment_and_binding() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("artifact answer"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let artifact = ingest_user_test_artifact(&processor, workspace_id.as_str(), "report.txt").await;
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_artifact_user_msg",
+    )
+    .await;
+
+    let turn_id = "turn_artifact_user_01";
+    let request_id = generate_test_request_id("turnartifact", "input");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id.clone(),
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread.thread.id,
+            "turn_id": turn_id,
+            "input": [
+                { "type": "text", "text": "summarize" },
+                {
+                    "type": "artifact",
+                    "artifactId": artifact.artifact_id.clone(),
+                    "versionId": artifact.version_id.clone()
+                }
+            ]
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let _response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let mut user_message = None;
+    for _ in 0..10 {
+        let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
+        let completed_payload: pioneer_protocol::ItemCompletedNotification =
+            serde_json::from_value(completed.params.expect("item/completed params"))
+                .expect("item/completed payload should decode");
+        if let TurnItem::UserMessage {
+            text, attachments, ..
+        } = completed_payload.item
+        {
+            user_message = Some((text, attachments));
+            break;
+        }
+    }
+    let (text, attachments) = user_message.expect("expected user message item/completed");
+    let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    assert_eq!(text, "summarize");
+    assert!(matches!(
+        attachments.as_slice(),
+        [UserMessageAttachment::Artifact { artifact: resolved }]
+            if resolved.artifact_id == artifact.artifact_id
+                && resolved.display_name == "report.txt"
+    ));
+
+    let summary = crud_store
+        .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
+        .await
+        .expect("artifact summary query should succeed");
+    let bindings = summary
+        .bindings
+        .iter()
+        .filter(|binding| binding.binding_kind == pioneer_protocol::ArtifactBindingKind::UserInput)
+        .collect::<Vec<_>>();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(
+        bindings[0].thread_id.as_deref(),
+        Some(thread.thread.id.as_str())
+    );
+    assert_eq!(bindings[0].turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        bindings[0].message_id.as_deref(),
+        Some(format!("user_{turn_id}").as_str())
+    );
+    assert_eq!(bindings[0].item_index, Some(1));
+
+    let requests = capture_provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let user_message = requests[0]
+        .messages
+        .last()
+        .expect("provider request should include user message");
+    assert_eq!(user_message.content, "summarize");
+    assert!(matches!(
+        user_message.content_parts.as_slice(),
+        [pioneer_provider::MessageContentPart::File { file }]
+            if file.name.as_deref() == Some("report.txt")
+                && file.mime_type == "text/plain"
+                && file.size_bytes == Some(14)
+                && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_rejects_artifact_from_another_workspace() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let other_workspace = workspace_manager
+        .create_workspace("ws_artifact_other", Some("Artifact Other"))
+        .await
+        .expect("other workspace should be created");
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let artifact =
+        ingest_user_test_artifact(&processor, other_workspace.id.as_str(), "foreign.txt").await;
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_artifact_foreign",
+    )
+    .await;
+
+    let request_id = generate_test_request_id("turnartifact", "foreign");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id.clone(),
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread.thread.id,
+            "turn_id": "turn_artifact_foreign",
+            "input": [
+                {
+                    "type": "artifact",
+                    "artifactId": artifact.artifact_id.clone(),
+                    "versionId": artifact.version_id.clone()
+                }
+            ]
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("failed to validate artifact input"),
+        "unexpected error: {}",
+        error.error.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let other_workspace = workspace_manager
+        .create_workspace("ws_artifact_api_other", Some("Artifact API Other"))
+        .await
+        .expect("other workspace should be created");
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_api",
+        "turn_artifact_api_01",
+    )
+    .await;
+    let artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        "thr_artifact_api",
+        "turn_artifact_api_01",
+        "msg_artifact_api_01",
+        "api.txt",
+        b"hello artifact".to_vec(),
+    )
+    .await;
+    ingest_bound_test_artifact(
+        &processor,
+        other_workspace.id.as_str(),
+        "thr_artifact_api",
+        "turn_artifact_api_other",
+        "msg_artifact_api_other",
+        "other.txt",
+        b"other artifact".to_vec(),
+    )
+    .await;
+
+    let list_id = generate_test_request_id("artifactlist", "thread");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": list_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_LIST_FOR_THREAD,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thr_artifact_api"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let list_response = recv_response_by_id(&mut rx, list_id.as_str()).await;
+    let list: pioneer_protocol::ArtifactListResponse =
+        serde_json::from_value(list_response.result).expect("artifact/list response should decode");
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].artifact.artifact_id, artifact.artifact_id);
+    assert_eq!(list.items[0].bindings.len(), 1);
+    assert_eq!(list.next_cursor, None);
+
+    let get_id = generate_test_request_id("artifactget", "summary");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": get_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_GET,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let get_response = recv_response_by_id(&mut rx, get_id.as_str()).await;
+    let get: pioneer_protocol::ArtifactGetResponse =
+        serde_json::from_value(get_response.result).expect("artifact/get response should decode");
+    assert_eq!(get.artifact.bindings.len(), 1);
+
+    let read_id = generate_test_request_id("artifactread", "range");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": read_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id,
+                    "offset": 6,
+                    "max_bytes": 4
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let read_response = recv_response_by_id(&mut rx, read_id.as_str()).await;
+    let read: pioneer_protocol::ArtifactReadResponse =
+        serde_json::from_value(read_response.result).expect("artifact/read response should decode");
+    assert_eq!(read.offset, 6);
+    assert_eq!(read.len, 4);
+    assert_eq!(read.content_base64, "YXJ0aQ==");
+    assert!(read.truncated);
+
+    let bind_id = generate_test_request_id("artifactbind", "second");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": bind_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_BIND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id,
+                    "thread_id": "thr_artifact_api",
+                    "turn_id": "turn_artifact_api_02",
+                    "message_id": "msg_artifact_api_02",
+                    "binding_kind": "manual_attach",
+                    "direction": "context",
+                    "role": "user",
+                    "item_index": 1
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _bind_response = recv_response_by_id(&mut rx, bind_id.as_str()).await;
+    let summary = crud_store
+        .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
+        .await
+        .expect("artifact summary query should succeed");
+    assert_eq!(summary.bindings.len(), 2);
+    assert_eq!(
+        crud_store
+            .count_artifact_blobs_by_workspace(&workspace_id)
+            .await
+            .expect("artifact blob count should succeed"),
+        1
+    );
+
+    let delete_id = generate_test_request_id("artifactdelete", "soft");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": delete_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_DELETE,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let delete_response = recv_response_by_id(&mut rx, delete_id.as_str()).await;
+    let delete: pioneer_protocol::ArtifactDeleteResponse =
+        serde_json::from_value(delete_response.result)
+            .expect("artifact/delete response should decode");
+    assert_eq!(delete.status, pioneer_protocol::ArtifactStatus::Deleted);
+
+    let list_deleted_id = generate_test_request_id("artifactlist", "deleted");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": list_deleted_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_LIST_FOR_THREAD,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thr_artifact_api"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let list_after_delete_response = recv_response_by_id(&mut rx, list_deleted_id.as_str()).await;
+    let list_after_delete: pioneer_protocol::ArtifactListResponse =
+        serde_json::from_value(list_after_delete_response.result)
+            .expect("artifact/list response should decode");
+    assert!(list_after_delete.items.is_empty());
+
+    let restore_id = generate_test_request_id("artifactrestore", "ready");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": restore_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_RESTORE,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let restore_response = recv_response_by_id(&mut rx, restore_id.as_str()).await;
+    let restore: pioneer_protocol::ArtifactRestoreResponse =
+        serde_json::from_value(restore_response.result)
+            .expect("artifact/restore response should decode");
+    assert_eq!(restore.status, pioneer_protocol::ArtifactStatus::Ready);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_read_caps_oversized_json_request() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        "thr_artifact_read_cap",
+        "turn_artifact_read_cap",
+        "msg_artifact_read_cap",
+        "large.txt",
+        vec![b'a'; 1024 * 1024 + 16],
+    )
+    .await;
+
+    let read_id = generate_test_request_id("artifactread", "capped");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": read_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id,
+                    "max_bytes": 2 * 1024 * 1024
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, read_id.as_str()).await;
+    let read: pioneer_protocol::ArtifactReadResponse =
+        serde_json::from_value(response.result).expect("artifact/read response should decode");
+    assert_eq!(read.len, 1024 * 1024);
+    assert!(read.truncated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_get_and_read_reject_cross_workspace_artifact() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let other_workspace = workspace_manager
+        .create_workspace("ws_artifact_api_foreign", Some("Artifact API Foreign"))
+        .await
+        .expect("other workspace should be created");
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let artifact = ingest_bound_test_artifact(
+        &processor,
+        other_workspace.id.as_str(),
+        "thr_foreign_artifact_api",
+        "turn_foreign_artifact_api",
+        "msg_foreign_artifact_api",
+        "foreign.txt",
+        b"foreign".to_vec(),
+    )
+    .await;
+
+    let get_id = generate_test_request_id("artifactget", "foreign");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": get_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_GET,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let get_error = recv_error_by_id(&mut rx, get_id.as_str()).await;
+    assert!(get_error.error.message.contains("failed to get artifact"));
+
+    let read_id = generate_test_request_id("artifactread", "foreign");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": read_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_READ,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "artifact_id": artifact.artifact_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let read_error = recv_error_by_id(&mut rx, read_id.as_str()).await;
+    assert!(read_error.error.message.contains("failed to read artifact"));
+}
+
 #[test]
 fn force_fail_tool_item_marks_in_progress_tool_as_failed() {
     let item = pioneer_protocol::TurnItem::CommandExecution {
@@ -10085,6 +10750,8 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         test_context_budget(),
         test_tool_loop_config(),
         memory_runtime,
+        runtime_home.clone(),
+        pioneer_config::GatewayArtifactsConfig::default(),
     ));
 
     MemoryGatewayHarness {
@@ -10139,6 +10806,8 @@ async fn setup_memory_agent_e2e_harness(
         test_context_budget(),
         test_tool_loop_config(),
         memory_runtime,
+        runtime_home.clone(),
+        pioneer_config::GatewayArtifactsConfig::default(),
     ));
     processor.bind_memory_bridge_if_enabled().await;
 

@@ -1,6 +1,9 @@
 mod agent_runtime;
+mod artifact_capture;
+mod artifacts;
 mod binary;
 mod dispatch;
+mod file_capture_session;
 mod hooks;
 mod markdown;
 mod mcp;
@@ -23,12 +26,19 @@ pub use summary::SummaryConfig;
 
 use crate::hook_run_store::CrudHookRunStore;
 use crate::tokenizer::count_tokens;
-use pioneer_agent::{AgentManager, ToolLoopConfig};
-use pioneer_config::GatewayHookRecoveryConfig;
+use anyhow::Context as AnyhowContext;
+use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
+use pioneer_artifacts::{
+    ArtifactBindingTarget, ArtifactCaptureCandidate, ArtifactCaptureContext, ArtifactCapturePolicy,
+    ArtifactCaptureSource, ArtifactGcPolicy, ArtifactQuotaPolicy, ArtifactService,
+    BindArtifactRequest, LocalArtifactBlobStore,
+};
+use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
 use pioneer_hooks::{HookRecoveryOptions, HookRegistry, HookRuntime, HookSubscriptionRegistry};
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ContextCompressedNotification,
+    AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
+    ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ContextCompressedNotification,
     ContextCompressingNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, ItemDeltaStream,
     ItemTimeoutDetectedNotification, JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE,
@@ -51,18 +61,18 @@ use pioneer_protocol::{
     TaskDeliveryMode, TaskDetachParams, TaskDetachResponse, TaskEventsParams, TaskGetParams,
     TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
     TaskTreeParams as TaskTreeTaskParams, TaskTrigger, TaskTurnItem, TaskWaitParams,
-    TaskWaitResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
-    ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
-    ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadHistoryParams,
-    ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse, ThreadStartParams,
-    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
-    ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin, TimelineOriginKind,
-    TimelinePayload, ToolCallStatus, TurnCancelParams, TurnCancelResponse,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem,
-    TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnStartParams,
-    TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
-    TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    TaskWaitResponse, ThreadArtifactsChangedNotification, ThreadFolderCreateParams,
+    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
+    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
+    ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
+    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
+    ThreadUnsubscribeParams, ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin,
+    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload, TurnCancelParams,
+    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
+    TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
+    TurnStartParams, TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason,
+    TurnTimelineParams, TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
     constants::{events, methods},
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
@@ -70,6 +80,7 @@ use pioneer_tasks::TaskRuntime;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -148,6 +159,12 @@ pub struct MessageProcessor {
     memory_runtime: Arc<GatewayMemoryRuntime>,
     hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
+    artifact_service: Arc<ArtifactService>,
+    artifact_capture_policy: Arc<ArtifactCapturePolicy>,
+    artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
+    artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
+    file_capture_sessions:
+        Arc<Mutex<HashMap<String, file_capture_session::TurnFileCaptureSession>>>,
 }
 
 impl MessageProcessor {
@@ -162,6 +179,8 @@ impl MessageProcessor {
         context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
+        runtime_home: PathBuf,
+        artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
@@ -192,6 +211,21 @@ impl MessageProcessor {
             provider_registry.clone(),
             RecoveryPolicyRegistry::default(),
         ));
+        let artifact_service = Arc::new(ArtifactService::new_with_policies(
+            crud_store.clone(),
+            Arc::new(LocalArtifactBlobStore::new(runtime_home.clone())),
+            artifact_quota_policy_from_config(&artifacts_config),
+            ArtifactGcPolicy {
+                grace_secs: artifacts_config.gc_grace_secs,
+            },
+        ));
+        let artifact_capture_policy =
+            Arc::new(artifact_capture_policy_from_config(&artifacts_config));
+        let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
+            runtime_home.join("artifacts").join("upload_sessions"),
+        ));
+        let artifact_downloads =
+            Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
 
         Self {
             thread_manager,
@@ -224,6 +258,11 @@ impl MessageProcessor {
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            artifact_service,
+            artifact_capture_policy,
+            artifact_uploads,
+            artifact_downloads,
+            file_capture_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -572,6 +611,7 @@ fn first_user_text(input: &[pioneer_protocol::UserInput]) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn user_message_payload_from_input(
     input: &[pioneer_protocol::UserInput],
 ) -> Option<(String, Vec<pioneer_protocol::UserMessageAttachment>)> {
@@ -628,6 +668,9 @@ fn user_message_payload_from_input(
             pioneer_protocol::UserInput::Mention { name, .. } => {
                 text_parts.push(format!("mention: {name}"));
             }
+            pioneer_protocol::UserInput::Artifact { artifact_id, .. } => {
+                text_parts.push(format!("artifact: {artifact_id}"));
+            }
         }
     }
 
@@ -636,6 +679,178 @@ fn user_message_payload_from_input(
         None
     } else {
         Some((text, attachments))
+    }
+}
+
+impl MessageProcessor {
+    async fn validate_artifact_user_inputs(
+        &self,
+        workspace_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<()> {
+        for value in input {
+            if let pioneer_protocol::UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } = value
+            {
+                self.artifact_service
+                    .get_artifact(workspace_id, artifact_id, version_id.as_deref())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "artifact `{artifact_id}` is not available in workspace `{workspace_id}`"
+                        )
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_provider_artifact_inputs(
+        &self,
+        workspace_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<Vec<ResolvedArtifactInput>> {
+        let mut resolved = Vec::new();
+        for value in input {
+            let pioneer_protocol::UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } = value
+            else {
+                continue;
+            };
+
+            let provider_artifact = self
+                .artifact_service
+                .resolve_provider_attachment(workspace_id, artifact_id, version_id.as_deref())
+                .await
+                .with_context(|| {
+                    format!("failed to resolve artifact `{artifact_id}` for provider input")
+                })?;
+            resolved.push(ResolvedArtifactInput {
+                artifact_id: provider_artifact.artifact_id,
+                version_id: provider_artifact.version_id,
+                content_type: provider_artifact.content_type,
+                attachment: provider_artifact.attachment,
+            });
+        }
+
+        Ok(resolved)
+    }
+
+    async fn user_message_payload_from_input_resolved(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<Option<(String, Vec<pioneer_protocol::UserMessageAttachment>)>> {
+        let mut text_parts = Vec::new();
+        let mut attachments = Vec::new();
+
+        for (index, value) in input.iter().enumerate() {
+            match value {
+                pioneer_protocol::UserInput::Text { text, .. } => {
+                    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !normalized.is_empty() {
+                        text_parts.push(normalized);
+                    }
+                }
+                pioneer_protocol::UserInput::Image { url } => {
+                    attachments
+                        .push(pioneer_protocol::UserMessageAttachment::Image { url: url.clone() });
+                }
+                pioneer_protocol::UserInput::LocalImage { path } => {
+                    attachments.push(pioneer_protocol::UserMessageAttachment::LocalImage {
+                        path: path.clone(),
+                    });
+                }
+                pioneer_protocol::UserInput::File { url } => {
+                    attachments
+                        .push(pioneer_protocol::UserMessageAttachment::File { url: url.clone() });
+                }
+                pioneer_protocol::UserInput::LocalFile { path } => {
+                    attachments.push(pioneer_protocol::UserMessageAttachment::LocalFile {
+                        path: path.clone(),
+                    });
+                }
+                pioneer_protocol::UserInput::Audio { url } => {
+                    attachments
+                        .push(pioneer_protocol::UserMessageAttachment::Audio { url: url.clone() });
+                }
+                pioneer_protocol::UserInput::LocalAudio { path } => {
+                    attachments.push(pioneer_protocol::UserMessageAttachment::LocalAudio {
+                        path: path.clone(),
+                    });
+                }
+                pioneer_protocol::UserInput::Video { url } => {
+                    attachments
+                        .push(pioneer_protocol::UserMessageAttachment::Video { url: url.clone() });
+                }
+                pioneer_protocol::UserInput::LocalVideo { path } => {
+                    attachments.push(pioneer_protocol::UserMessageAttachment::LocalVideo {
+                        path: path.clone(),
+                    });
+                }
+                pioneer_protocol::UserInput::Skill { name, .. } => {
+                    text_parts.push(format!("skill: {name}"));
+                }
+                pioneer_protocol::UserInput::Mention { name, .. } => {
+                    text_parts.push(format!("mention: {name}"));
+                }
+                pioneer_protocol::UserInput::Artifact {
+                    artifact_id,
+                    version_id,
+                } => {
+                    let summary = self
+                        .artifact_service
+                        .get_artifact(workspace_id, artifact_id, version_id.as_deref())
+                        .await
+                        .with_context(|| {
+                            format!("failed to resolve artifact `{artifact_id}` for user message")
+                        })?;
+                    let resolved_version_id = summary.artifact.version_id.clone();
+                    attachments.push(pioneer_protocol::UserMessageAttachment::Artifact {
+                        artifact: summary.artifact,
+                    });
+                    self.artifact_service
+                        .bind_artifact(BindArtifactRequest {
+                            workspace_id: workspace_id.to_owned(),
+                            artifact_id: artifact_id.clone(),
+                            version_id: resolved_version_id,
+                            target: ArtifactBindingTarget {
+                                thread_id: Some(thread_id.to_owned()),
+                                turn_id: Some(turn_id.to_owned()),
+                                message_id: Some(item_id.to_owned()),
+                                turn_item_id: Some(item_id.to_owned()),
+                                tool_call_id: None,
+                                task_id: None,
+                                task_run_id: None,
+                                binding_kind: ArtifactBindingKind::UserInput,
+                                direction: ArtifactBindingDirection::Input,
+                                role: Some(ArtifactRole::User),
+                                item_index: Some(index as i64),
+                            },
+                            metadata: Default::default(),
+                        })
+                        .await
+                        .with_context(|| {
+                            format!("failed to bind artifact `{artifact_id}` to user message")
+                        })?;
+                }
+            }
+        }
+
+        let text = text_parts.join("\n");
+        if text.is_empty() && attachments.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((text, attachments)))
+        }
     }
 }
 
@@ -654,6 +869,31 @@ fn fallback_title_from_first_user_text(user_text: &str) -> Option<String> {
     }
 
     Some(words.join(" "))
+}
+
+fn artifact_quota_policy_from_config(config: &GatewayArtifactsConfig) -> ArtifactQuotaPolicy {
+    ArtifactQuotaPolicy {
+        max_file_bytes: config.max_file_bytes,
+        max_workspace_bytes: config.max_workspace_bytes,
+        max_files_per_workspace: config.max_files_per_workspace,
+        warn_at_percent: config.quota_warn_at_percent,
+    }
+}
+
+fn artifact_capture_policy_from_config(config: &GatewayArtifactsConfig) -> ArtifactCapturePolicy {
+    ArtifactCapturePolicy {
+        capture_user_uploads: config.capture_user_uploads,
+        capture_new_workspace_files: config.capture_new_workspace_files,
+        capture_modified_workspace_files: config.capture_modified_workspace_files,
+        capture_generated_media: config.capture_generated_media,
+        capture_tool_outputs: config.capture_tool_outputs,
+        capture_task_results: config.capture_task_results,
+        output_roots: config.output_roots.iter().map(PathBuf::from).collect(),
+        ignored_globs: config.ignored_globs.clone(),
+        max_files_per_turn: config.max_files_per_turn,
+        max_bytes_per_file: config.max_bytes_per_file,
+        max_total_bytes_per_turn: config.max_total_bytes_per_turn,
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +921,8 @@ impl MessageProcessor {
             context_budget,
             tool_loop_config,
             memory_runtime,
+            std::env::temp_dir().join("pioneer-message-tests"),
+            GatewayArtifactsConfig::default(),
         )
     }
 
@@ -731,6 +973,19 @@ impl MessageProcessor {
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new(crud_store.clone()));
         let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
+        let artifact_runtime_home = std::env::temp_dir().join("pioneer-message-tests");
+        let artifact_service = Arc::new(ArtifactService::new(
+            crud_store.clone(),
+            Arc::new(LocalArtifactBlobStore::new(artifact_runtime_home.clone())),
+        ));
+        let artifact_capture_policy = Arc::new(ArtifactCapturePolicy::default());
+        let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
+            artifact_runtime_home
+                .join("artifacts")
+                .join("upload_sessions"),
+        ));
+        let artifact_downloads =
+            Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         Self {
             thread_manager,
             agent_manager,
@@ -851,6 +1106,11 @@ impl MessageProcessor {
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            artifact_service,
+            artifact_capture_policy,
+            artifact_uploads,
+            artifact_downloads,
+            file_capture_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

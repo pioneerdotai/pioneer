@@ -177,10 +177,11 @@ mod tests {
     use super::{JwtAuth, extract_bearer_token, initialize, issue_superuser_token};
     use crate::secrets::GatewaySecrets;
     use pioneer_config::{
-        AppConfig, DesktopConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
-        GatewayDatabaseConfig, GatewayMemoryConfig, GatewayProviderConfig, GatewayRuntimeConfig,
-        GatewaySkillsConfig, GatewayThreadConfig, GatewayToolLoopBudgetConfig,
-        GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig, InstallConfig,
+        AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
+        GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,
+        GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
+        GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
+        GatewayWebToolsConfig, InstallConfig,
     };
     use pioneer_keystore::{
         MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretMeta, SecretStore,
@@ -425,6 +426,7 @@ mod tests {
                 },
                 memory: GatewayMemoryConfig::default(),
                 hooks: Default::default(),
+                artifacts: GatewayArtifactsConfig::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),

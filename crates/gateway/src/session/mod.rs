@@ -104,6 +104,24 @@ impl SessionManager {
 
         Ok(())
     }
+
+    pub async fn send_binary(&self, connection_id: ConnectionId, payload: Vec<u8>) -> Result<()> {
+        let sender = {
+            self.connections
+                .read()
+                .await
+                .get(&connection_id)
+                .map(|connection| connection.sender.clone())
+                .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))?
+        };
+
+        if sender.send(Message::Binary(payload.into())).await.is_err() {
+            self.unregister_connection(connection_id).await;
+            return Err(anyhow!("connection `{connection_id}` channel is closed"));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +143,24 @@ mod tests {
             .expect("send_text should succeed");
 
         assert_eq!(rx.recv().await, Some(Message::Text("ping".into())));
+    }
+
+    #[tokio::test]
+    async fn send_binary_reaches_registered_connection() {
+        let manager = SessionManager::new();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let connection_id = manager.register_connection(tx).await;
+
+        manager
+            .send_binary(connection_id, b"payload".to_vec())
+            .await
+            .expect("send_binary should succeed");
+
+        assert_eq!(
+            rx.recv().await,
+            Some(Message::Binary(b"payload".to_vec().into()))
+        );
     }
 
     #[tokio::test]

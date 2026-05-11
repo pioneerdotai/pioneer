@@ -1,18 +1,24 @@
 use super::*;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use pioneer_artifacts::{
+    ArtifactListFilter, ArtifactLocalPathPolicy, ArtifactSource, IngestArtifactSourceRequest,
+};
 use pioneer_protocol::{
-    SandboxMode, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskArtifact, TaskError,
-    TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskResult, TaskRun, TaskRunStatus,
-    TaskValue, ThreadLineage, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-    TurnStartParams, TurnStatus, UserInput, generate_id,
+    ArtifactCreatedByKind, ArtifactKind, ArtifactSummary, SandboxMode, Task, TaskAgentContext,
+    TaskAgentContextMode, TaskAgentInput, TaskAgentInputAttachmentKind,
+    TaskAgentInputReferenceKind, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat,
+    TaskAgentSpec, TaskArtifact, TaskError, TaskErrorClass, TaskExecutorKind, TaskGetResponse,
+    TaskResult, TaskRun, TaskRunStatus, TaskValue, ThreadLineage, ThreadMode, ThreadOriginKind,
+    ThreadSidebarVisibility, TurnStartParams, TurnStatus, UserInput, generate_id,
 };
 use pioneer_tasks::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRecoveryOutcome,
     TaskExecutorStartOutcome, WriteLockDecision,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{RwLock as StdRwLock, Weak};
 
 const ID_LEN: usize = 21;
@@ -133,10 +139,7 @@ impl TaskAgentExecutor {
 
         let prompt =
             materialize_child_task_prompt(processor, task, run, agent_spec, parent).await?;
-        let child_input = vec![UserInput::Text {
-            text: prompt,
-            text_elements: Vec::new(),
-        }];
+        let child_input = materialize_child_task_input(prompt, agent_spec);
         let turn_outcome = processor
             .thread_manager
             .system_turn_start(TurnStartParams {
@@ -150,6 +153,20 @@ impl TaskAgentExecutor {
             })
             .await
             .context("failed to create hidden task turn")?;
+
+        if let Err(error) = processor
+            .validate_artifact_user_inputs(
+                context.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to validate hidden task artifact input");
+        }
 
         if let Err(error) = processor
             .crud_store
@@ -167,6 +184,13 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden task turn");
         }
+        processor
+            .start_file_capture_session(
+                context.workspace_id.as_str(),
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await;
 
         let now = now_timestamp_secs();
         handle
@@ -198,9 +222,16 @@ impl TaskAgentExecutor {
         handle.mark_started(now_timestamp_secs()).await?;
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let resolved_artifacts = processor
+            .resolve_provider_artifact_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+            .context("failed to resolve hidden task artifact input for provider")?;
         if let Err(error) = processor
             .agent_manager
-            .start_turn(
+            .start_turn_with_resolved_artifacts(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -208,6 +239,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 turn_outcome.materialization.input,
+                resolved_artifacts,
                 Vec::new(),
             )
             .await
@@ -346,10 +378,10 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore hidden task thread")?;
-        let input = vec![UserInput::Text {
-            text: materialize_child_task_prompt(processor, task, run, agent_spec, &parent).await?,
-            text_elements: Vec::new(),
-        }];
+        let input = materialize_child_task_input(
+            materialize_child_task_prompt(processor, task, run, agent_spec, &parent).await?,
+            agent_spec,
+        );
         let turn_outcome = match processor
             .thread_manager
             .system_turn_start(TurnStartParams {
@@ -373,6 +405,20 @@ impl TaskAgentExecutor {
             Err(error) => return Err(error).context("failed to restore hidden task turn"),
         };
 
+        if let Err(error) = processor
+            .validate_artifact_user_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to validate restored task artifact input");
+        }
+
         processor
             .agent_manager
             .ensure_thread(lineage.child_thread_id.as_str(), task.workspace_id.as_str())
@@ -387,9 +433,16 @@ impl TaskAgentExecutor {
         }
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let resolved_artifacts = processor
+            .resolve_provider_artifact_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+            .context("failed to resolve restored task artifact input for provider")?;
         processor
             .agent_manager
-            .start_turn(
+            .start_turn_with_resolved_artifacts(
                 lineage.child_thread_id.as_str(),
                 lineage.child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -397,6 +450,7 @@ impl TaskAgentExecutor {
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
                 turn_outcome.materialization.input,
+                resolved_artifacts,
                 Vec::new(),
             )
             .await
@@ -706,7 +760,9 @@ async fn materialize_child_task_prompt(
     ));
     sections.push(render_agent_prompt(&agent_spec.prompt));
 
-    if let Some(context) = render_context_policy(processor, agent_spec, parent).await? {
+    if let Some(context) =
+        render_context_policy(processor, task.workspace_id.as_str(), agent_spec, parent).await?
+    {
         sections.push(context);
     }
     if let Some(tool_policy) = agent_spec.tool_policy.as_ref() {
@@ -732,6 +788,71 @@ async fn materialize_child_task_prompt(
     }
 
     Ok(sections.join("\n\n"))
+}
+
+fn materialize_child_task_input(prompt: String, agent_spec: &TaskAgentSpec) -> Vec<UserInput> {
+    let mut input = vec![UserInput::Text {
+        text: prompt,
+        text_elements: Vec::new(),
+    }];
+    input.extend(task_agent_artifact_user_inputs(agent_spec));
+    input
+}
+
+fn task_agent_artifact_user_inputs(agent_spec: &TaskAgentSpec) -> Vec<UserInput> {
+    let mut artifacts = Vec::new();
+    collect_task_agent_input_artifacts(agent_spec.prompt.input.as_ref(), &mut artifacts);
+    if let Some(context) = agent_spec
+        .context_policy
+        .as_ref()
+        .and_then(|policy| policy.custom_context.as_ref())
+    {
+        collect_task_agent_context_artifacts(context, &mut artifacts);
+    }
+    artifacts
+}
+
+fn collect_task_agent_context_artifacts(
+    context: &TaskAgentContext,
+    artifacts: &mut Vec<UserInput>,
+) {
+    let input = TaskAgentInput {
+        text: None,
+        variables: Vec::new(),
+        attachments: context.attachments.clone(),
+        references: context.references.clone(),
+    };
+    collect_task_agent_input_artifacts(Some(&input), artifacts);
+}
+
+fn collect_task_agent_input_artifacts(
+    input: Option<&TaskAgentInput>,
+    artifacts: &mut Vec<UserInput>,
+) {
+    let Some(input) = input else {
+        return;
+    };
+    for attachment in &input.attachments {
+        if attachment.kind == TaskAgentInputAttachmentKind::Artifact
+            && let Some(artifact_id) = attachment.artifact_id.as_deref()
+            && !artifact_id.trim().is_empty()
+        {
+            artifacts.push(UserInput::Artifact {
+                artifact_id: artifact_id.to_owned(),
+                version_id: None,
+            });
+        }
+    }
+    for reference in &input.references {
+        if reference.kind == TaskAgentInputReferenceKind::Artifact
+            && !reference.id.trim().is_empty()
+        {
+            artifacts.push(UserInput::Artifact {
+                artifact_id: reference.id.clone(),
+                version_id: None,
+            });
+        }
+    }
 }
 
 fn render_agent_prompt(prompt: &TaskAgentPrompt) -> String {
@@ -771,6 +892,7 @@ fn thread_name_from_task(task: &Task) -> Option<String> {
 
 async fn render_context_policy(
     processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
     agent_spec: &TaskAgentSpec,
     parent: &TaskParentRuntimeContext,
 ) -> Result<Option<String>> {
@@ -778,7 +900,8 @@ async fn render_context_policy(
         return render_parent_history(processor, parent, Some(6), true).await;
     };
 
-    match policy.mode {
+    let mut sections = Vec::new();
+    if let Some(rendered) = match policy.mode {
         TaskAgentContextMode::Empty => Ok(None),
         TaskAgentContextMode::Custom => Ok(policy
             .custom_context
@@ -806,7 +929,67 @@ async fn render_context_policy(
             )
             .await
         }
+    }? {
+        sections.push(rendered);
     }
+
+    if policy.include_artifacts
+        && let Some(rendered) = render_parent_artifact_refs(processor, workspace_id, parent).await?
+    {
+        sections.push(rendered);
+    }
+
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sections.join("\n\n")))
+    }
+}
+
+async fn render_parent_artifact_refs(
+    processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
+    parent: &TaskParentRuntimeContext,
+) -> Result<Option<String>> {
+    let page = processor
+        .artifact_service
+        .list_thread_artifacts(
+            workspace_id,
+            parent.parent_thread_id.as_str(),
+            ArtifactListFilter {
+                limit: Some(20),
+                ..ArtifactListFilter::default()
+            },
+        )
+        .await
+        .context("failed to list parent thread artifacts for task context")?;
+    if page.items.is_empty() {
+        return Ok(None);
+    }
+
+    let lines = page
+        .items
+        .into_iter()
+        .map(|summary| {
+            let artifact = summary.artifact;
+            format!(
+                "- {} (artifact_id: {}, version_id: {}, kind: {:?}, mime: {}, size_bytes: {})",
+                artifact.display_name,
+                artifact.artifact_id,
+                artifact.version_id.unwrap_or_else(|| "current".to_owned()),
+                artifact.kind,
+                artifact.mime_type.unwrap_or_else(|| "unknown".to_owned()),
+                artifact
+                    .size_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(format!(
+        "Parent thread artifacts:\n{}",
+        lines.join("\n")
+    )))
 }
 
 async fn render_parent_summary(
@@ -932,15 +1115,26 @@ impl TaskAgentResultExtractor {
         processor: &Arc<MessageProcessor>,
         lineage: &ThreadLineage,
     ) -> Result<TaskAgentResultExtraction> {
-        let contract = match processor
+        let task_response = match processor
             .crud_store
             .get_task(lineage.task_id.as_str())
             .await?
         {
-            Some(response) => select_agent_spec(&response, lineage.task_run_id.as_str())
-                .and_then(|spec| spec.result_contract),
-            None => None,
+            Some(response) => response,
+            None => {
+                return Ok(Err(task_error(
+                    "task_missing",
+                    format!(
+                        "task `{}` was not found for result extraction",
+                        lineage.task_id
+                    ),
+                    TaskErrorClass::Internal,
+                    Some(lineage.task_run_id.clone()),
+                )));
+            }
         };
+        let contract = select_agent_spec(&task_response, lineage.task_run_id.as_str())
+            .and_then(|spec| spec.result_contract);
 
         let messages = processor
             .crud_store
@@ -959,12 +1153,13 @@ impl TaskAgentResultExtractor {
             )));
         };
 
-        Ok(Self::normalize_final_message(
-            raw_text,
-            source_item_id,
-            lineage,
-            contract.as_ref(),
-        ))
+        match Self::normalize_final_message(raw_text, source_item_id, lineage, contract.as_ref()) {
+            Ok(result) => {
+                normalize_task_result_artifacts(processor, &task_response.task, lineage, result)
+                    .await
+            }
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     fn normalize_final_message(
@@ -1081,6 +1276,255 @@ fn fallback_text_task_result(
         artifacts: Vec::new(),
         completed_by_run_id: Some(lineage.task_run_id.clone()),
     }
+}
+
+async fn normalize_task_result_artifacts(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    lineage: &ThreadLineage,
+    mut result: TaskResult,
+) -> Result<TaskAgentResultExtraction> {
+    let mut changed_artifact_ids = Vec::new();
+    for (index, artifact) in result.artifacts.iter_mut().enumerate() {
+        match normalize_task_result_artifact(processor, task, lineage, artifact, index).await {
+            Ok(Some(artifact_id)) => changed_artifact_ids.push(artifact_id),
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Err(task_error(
+                    "task_artifact_invalid",
+                    format!("task result artifact {index} is invalid: {error:#}"),
+                    TaskErrorClass::Validation,
+                    Some(lineage.task_run_id.clone()),
+                )));
+            }
+        }
+    }
+
+    notify_task_artifacts_changed(processor, task, lineage, changed_artifact_ids).await;
+    Ok(Ok(result))
+}
+
+async fn normalize_task_result_artifact(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    lineage: &ThreadLineage,
+    artifact: &mut TaskArtifact,
+    index: usize,
+) -> Result<Option<String>> {
+    if let Some(artifact_id) = artifact
+        .artifact_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let summary = processor
+            .artifact_service
+            .get_artifact(
+                task.workspace_id.as_str(),
+                artifact_id,
+                artifact.version_id.as_deref(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "artifact `{artifact_id}` is not available in workspace `{}`",
+                    task.workspace_id
+                )
+            })?;
+        artifact.artifact_id = Some(summary.artifact.artifact_id.clone());
+        artifact.version_id = summary.artifact.version_id.clone();
+        if artifact.mime_type.is_none() {
+            artifact.mime_type = summary.artifact.mime_type.clone();
+        }
+        bind_task_result_artifact(processor, task, lineage, artifact, index).await?;
+        return Ok(Some(summary.artifact.artifact_id));
+    }
+
+    let Some(path) = artifact
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    let summary =
+        ingest_task_result_path(processor, task, lineage, artifact, path.as_str(), index).await?;
+    artifact.artifact_id = Some(summary.artifact.artifact_id.clone());
+    artifact.version_id = summary.artifact.version_id.clone();
+    if artifact.mime_type.is_none() {
+        artifact.mime_type = summary.artifact.mime_type.clone();
+    }
+    Ok(Some(summary.artifact.artifact_id))
+}
+
+async fn ingest_task_result_path(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    lineage: &ThreadLineage,
+    artifact: &TaskArtifact,
+    path: &str,
+    index: usize,
+) -> Result<ArtifactSummary> {
+    let allowed_root = std::env::current_dir().context("failed to resolve task artifact root")?;
+    let mut metadata = task_result_artifact_metadata(artifact);
+    metadata.insert("source_path".to_owned(), json!(path));
+    let summary = processor
+        .artifact_service
+        .ingest_source(IngestArtifactSourceRequest {
+            workspace_id: task.workspace_id.clone(),
+            primary_thread_id: task_result_thread_id(task, lineage),
+            source: ArtifactSource::LocalPath(PathBuf::from(path)),
+            display_name: display_name_from_task_artifact_path(path),
+            kind: Some(ArtifactKind::WorkspaceFile),
+            mime_type: artifact.mime_type.clone(),
+            created_by_kind: ArtifactCreatedByKind::Task,
+            created_by_actor_id: Some(task.id.clone()),
+            binding: Some(task_result_binding_target(task, lineage, index)),
+            metadata,
+            local_path_policy: Some(ArtifactLocalPathPolicy::new(vec![allowed_root])),
+        })
+        .await
+        .with_context(|| format!("failed to ingest task result artifact path `{path}`"))?;
+    processor
+        .send_notification_to_thread_subscribers(
+            task_result_thread_id(task, lineage)
+                .as_deref()
+                .unwrap_or(lineage.parent_thread_id.as_str()),
+            events::ARTIFACT_CREATED,
+            &ArtifactCreatedNotification {
+                workspace_id: task.workspace_id.clone(),
+                artifact: summary.clone(),
+            },
+        )
+        .await;
+    Ok(summary)
+}
+
+async fn bind_task_result_artifact(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    lineage: &ThreadLineage,
+    artifact: &TaskArtifact,
+    index: usize,
+) -> Result<()> {
+    let artifact_id = artifact
+        .artifact_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("artifact id is missing"))?;
+    let summary = processor
+        .artifact_service
+        .get_artifact(
+            task.workspace_id.as_str(),
+            artifact_id,
+            artifact.version_id.as_deref(),
+        )
+        .await?;
+    if summary.bindings.iter().any(|binding| {
+        binding.binding_kind == ArtifactBindingKind::TaskResult
+            && binding.task_id.as_deref() == Some(task.id.as_str())
+            && binding.task_run_id.as_deref() == Some(lineage.task_run_id.as_str())
+            && binding.item_index == Some(index as i64)
+    }) {
+        return Ok(());
+    }
+
+    processor
+        .artifact_service
+        .bind_artifact(BindArtifactRequest {
+            workspace_id: task.workspace_id.clone(),
+            artifact_id: artifact_id.to_owned(),
+            version_id: artifact.version_id.clone(),
+            target: task_result_binding_target(task, lineage, index),
+            metadata: task_result_artifact_metadata(artifact),
+        })
+        .await
+        .with_context(|| format!("failed to bind artifact `{artifact_id}` to task result"))?;
+    Ok(())
+}
+
+async fn notify_task_artifacts_changed(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    lineage: &ThreadLineage,
+    artifact_ids: Vec<String>,
+) {
+    if artifact_ids.is_empty() {
+        return;
+    }
+    let Some(thread_id) = task_result_thread_id(task, lineage) else {
+        return;
+    };
+    processor
+        .send_notification_to_thread_subscribers(
+            thread_id.as_str(),
+            events::THREAD_ARTIFACTS_CHANGED,
+            &ThreadArtifactsChangedNotification {
+                workspace_id: task.workspace_id.clone(),
+                thread_id: thread_id.clone(),
+                artifact_ids,
+                reason: "task_result".to_owned(),
+                generated_at: now_timestamp_secs(),
+            },
+        )
+        .await;
+}
+
+fn task_result_binding_target(
+    task: &Task,
+    lineage: &ThreadLineage,
+    index: usize,
+) -> ArtifactBindingTarget {
+    ArtifactBindingTarget {
+        thread_id: task_result_thread_id(task, lineage),
+        turn_id: task
+            .created_by_turn_id
+            .clone()
+            .or(lineage.parent_turn_id.clone()),
+        message_id: None,
+        turn_item_id: None,
+        tool_call_id: None,
+        task_id: Some(task.id.clone()),
+        task_run_id: Some(lineage.task_run_id.clone()),
+        binding_kind: ArtifactBindingKind::TaskResult,
+        direction: ArtifactBindingDirection::Output,
+        role: Some(ArtifactRole::Task),
+        item_index: Some(index as i64),
+    }
+}
+
+fn task_result_thread_id(task: &Task, lineage: &ThreadLineage) -> Option<String> {
+    task.created_by_thread_id.clone().or_else(|| {
+        (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+            .then(|| task.owner_id.clone())
+            .flatten()
+            .or_else(|| Some(lineage.parent_thread_id.clone()))
+    })
+}
+
+fn task_result_artifact_metadata(artifact: &TaskArtifact) -> BTreeMap<String, JsonValue> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("source_kind".to_owned(), json!("task_result"));
+    if let Some(url) = artifact.url.as_deref() {
+        metadata.insert("source_url".to_owned(), json!(url));
+    }
+    if let Some(value) = artifact.metadata.as_ref() {
+        metadata.insert(
+            "task_artifact_metadata".to_owned(),
+            serde_json::to_value(value).unwrap_or(JsonValue::Null),
+        );
+    }
+    metadata
+}
+
+fn display_name_from_task_artifact_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn extract_structured_result_candidate(
@@ -1470,6 +1914,11 @@ fn parse_task_artifacts(values: &[TaskValue]) -> Vec<TaskArtifact> {
                     .or_else(|| object.get("artifact_id"))
                     .and_then(task_value_str)
                     .map(str::to_owned),
+                version_id: object
+                    .get("versionId")
+                    .or_else(|| object.get("version_id"))
+                    .and_then(task_value_str)
+                    .map(str::to_owned),
                 path: object
                     .get("path")
                     .and_then(task_value_str)
@@ -1556,6 +2005,20 @@ fn render_list(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_agent::{
+        MemoryActiveRecallConfig, MemoryActiveRecallMode, MemoryLoopConfig,
+        SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
+        SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
+    };
+    use pioneer_artifacts::IngestArtifactBytesRequest;
+    use pioneer_config::GatewayWebToolsConfig;
+    use pioneer_keystore::MemorySecretStore;
+    use pioneer_provider::providers::EchoProvider;
+    use pioneer_tools::{
+        ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+    };
+    use sea_orm::Database;
 
     fn test_lineage() -> ThreadLineage {
         ThreadLineage {
@@ -1569,6 +2032,202 @@ mod tests {
             depth: 1,
             created_at: 1,
         }
+    }
+
+    async fn task_artifact_harness(name: &str) -> (Arc<MessageProcessor>, Task, ThreadLineage) {
+        let connection = Database::connect("sqlite::memory:").await.expect("sqlite");
+        Migrator::up(&connection, None).await.expect("migrate");
+        crate::bootstrap::bootstrap(&connection)
+            .await
+            .expect("bootstrap");
+        let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
+        let workspace_id = workspace_manager
+            .list_workspaces()
+            .await
+            .expect("workspaces")
+            .into_iter()
+            .find(|workspace| workspace.is_current)
+            .expect("current workspace")
+            .id;
+        let crud_store = Arc::new(CrudStore::new(connection));
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            Arc::new(ProviderRegistry::with_provider(
+                "openai",
+                Arc::new(EchoProvider::new()),
+            )),
+            Arc::new(SessionManager::new()),
+            workspace_manager,
+            crud_store,
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+            summary::SummaryConfig {
+                summary_model: Some("test-model".to_owned()),
+                summary_model_provider: Some("echo".to_owned()),
+                title_model: Some("test-model".to_owned()),
+                title_model_provider: Some("echo".to_owned()),
+            },
+            ContextBudget {
+                max_context_tokens: 128_000,
+                response_reserve_tokens: 16_000,
+            },
+            test_tool_loop_config_for_task_artifacts(),
+        ));
+        let task = Task {
+            id: format!("task_{name}"),
+            workspace_id: workspace_id.clone(),
+            owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
+            owner_id: Some(format!("thread_{name}")),
+            created_by_thread_id: Some(format!("thread_{name}")),
+            created_by_turn_id: Some(format!("turn_{name}")),
+            root_task_id: None,
+            parent_task_id: None,
+            executor_kind: TaskExecutorKind::Agent,
+            status: pioneer_protocol::TaskStatus::Running,
+            title: "Task".to_owned(),
+            goal: "Goal".to_owned(),
+            priority: 0,
+            lifecycle_policy: None,
+            delivery_policy: None,
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: None,
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        let lineage = ThreadLineage {
+            child_thread_id: format!("child_{name}"),
+            child_turn_id: format!("child_turn_{name}"),
+            parent_thread_id: format!("thread_{name}"),
+            parent_turn_id: Some(format!("turn_{name}")),
+            task_id: task.id.clone(),
+            task_run_id: format!("run_{name}"),
+            root_thread_id: format!("thread_{name}"),
+            depth: 1,
+            created_at: 1,
+        };
+        (processor, task, lineage)
+    }
+
+    fn test_tool_loop_config_for_task_artifacts() -> ToolLoopConfig {
+        let web = GatewayWebToolsConfig::default();
+        ToolLoopConfig {
+            web: WebToolsConfig {
+                default_timeout_ms: web.default_timeout_ms,
+                hard_max_timeout_ms: web.hard_max_timeout_ms,
+                default_fetch_max_bytes: web.default_fetch_max_bytes,
+                hard_fetch_max_bytes: web.hard_fetch_max_bytes,
+                default_download_max_bytes: web.default_download_max_bytes,
+                hard_download_max_bytes: web.hard_download_max_bytes,
+                default_max_results: web.default_max_results,
+                hard_max_results: web.hard_max_results,
+                default_snippet_chars: web.default_snippet_chars,
+                hard_max_snippet_chars: web.hard_max_snippet_chars,
+                default_link_count: web.default_link_count,
+                hard_link_count: web.hard_link_count,
+                default_render_max_chars: web.default_render_max_chars,
+                ddg_html_search_url: web.ddg_html_search_url,
+                ddg_instant_api_url: web.ddg_instant_api_url,
+                default_user_agent: web.default_user_agent,
+            },
+            computer_use: ComputerUseToolsConfig {
+                runtime_home_dir: std::env::temp_dir().join("pioneer-task-artifact-tests"),
+                artifacts_subdir: "tools/computer_use".to_owned(),
+                ..ComputerUseToolsConfig::default()
+            },
+            skills: SkillsLoopConfig {
+                enabled: true,
+                max_skills_per_source: 256,
+                max_skill_file_bytes: 1024 * 1024,
+                prompt_max_chars: 24_000,
+                allow_implicit_invocation: false,
+                system_roots: Vec::new(),
+                user_roots: Vec::new(),
+                registry_roots: Vec::new(),
+                validation: SkillsValidationLoopConfig {
+                    strict_agentskills: true,
+                    accept_openclaw_profile: true,
+                },
+                security: SkillsSecurityLoopConfig {
+                    allow_untrusted_install: false,
+                    min_trust_for_shell_tools: pioneer_skills::SkillTrustLevel::Verified,
+                    min_trust_for_http_tools: pioneer_skills::SkillTrustLevel::Community,
+                    min_trust_for_function_proxy_tools: pioneer_skills::SkillTrustLevel::Community,
+                    max_install_archive_bytes: 10 * 1024 * 1024,
+                    max_install_archive_compressed_bytes: 10 * 1024 * 1024,
+                    max_install_archive_uncompressed_bytes: 50 * 1024 * 1024,
+                    max_install_archive_entries: 2048,
+                    max_install_file_bytes: 1024 * 1024,
+                    upload_ttl_secs: 3600,
+                    upload_recommended_chunk_size_bytes: 256 * 1024,
+                    upload_max_chunk_size_bytes: 1024 * 1024,
+                },
+                dependencies: SkillsDependenciesLoopConfig {
+                    preflight_on_resolve: true,
+                    runtime_recheck_on_tool_call: true,
+                },
+                runtime: SkillsRuntimeLoopConfig {
+                    enable_dynamic_tools: true,
+                    enable_read_skill: true,
+                    max_dynamic_tools_per_skill: 64,
+                    read_skill_max_chars: 24_000,
+                    compact_mode_threshold: 6,
+                    allow_shell_tools: true,
+                    allow_http_tools: true,
+                    allow_function_proxy_tools: true,
+                },
+            },
+            memory: MemoryLoopConfig {
+                active_recall: MemoryActiveRecallConfig {
+                    mode: MemoryActiveRecallMode::DeterministicOnly,
+                    ..MemoryActiveRecallConfig::default()
+                },
+                ..MemoryLoopConfig::default()
+            },
+            budget: ToolLoopBudgetConfig::default(),
+            retry: ToolRetryBudgetConfig::default(),
+        }
+        .normalized()
+    }
+
+    async fn ingest_task_test_artifact(
+        processor: &MessageProcessor,
+        workspace_id: &str,
+        thread_id: Option<String>,
+        display_name: &str,
+    ) -> ArtifactSummary {
+        processor
+            .artifact_service
+            .ingest_bytes(IngestArtifactBytesRequest {
+                workspace_id: workspace_id.to_owned(),
+                primary_thread_id: thread_id.clone(),
+                bytes: b"task artifact".to_vec(),
+                display_name: display_name.to_owned(),
+                kind: ArtifactKind::Text,
+                mime_type: Some("text/plain".to_owned()),
+                created_by_kind: ArtifactCreatedByKind::User,
+                created_by_actor_id: None,
+                binding: thread_id.map(|thread_id| ArtifactBindingTarget {
+                    thread_id: Some(thread_id),
+                    turn_id: None,
+                    message_id: None,
+                    turn_item_id: None,
+                    tool_call_id: None,
+                    task_id: None,
+                    task_run_id: None,
+                    binding_kind: ArtifactBindingKind::ManualAttach,
+                    direction: ArtifactBindingDirection::Context,
+                    role: Some(ArtifactRole::User),
+                    item_index: None,
+                }),
+                metadata: Default::default(),
+            })
+            .await
+            .expect("ingest artifact")
     }
 
     fn json_answer_contract() -> TaskAgentResultContract {
@@ -1623,6 +2282,239 @@ mod tests {
             Some(&TaskValue::String("42".to_owned()))
         );
         assert_eq!(result.completed_by_run_id.as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn task_artifact_input_attachments_are_materialized_as_user_inputs() {
+        let agent_spec = TaskAgentSpec {
+            id: "spec".to_owned(),
+            task_id: "task".to_owned(),
+            run_id: None,
+            agent_role: None,
+            agent_nickname: None,
+            model: Some("model".to_owned()),
+            model_provider: Some("provider".to_owned()),
+            prompt: TaskAgentPrompt {
+                goal: "Use artifacts".to_owned(),
+                instructions: Vec::new(),
+                input: Some(TaskAgentInput {
+                    text: None,
+                    variables: Vec::new(),
+                    attachments: vec![pioneer_protocol::TaskAgentInputAttachment {
+                        kind: TaskAgentInputAttachmentKind::Artifact,
+                        name: None,
+                        path: None,
+                        url: None,
+                        artifact_id: Some("art_input".to_owned()),
+                        mime_type: None,
+                    }],
+                    references: vec![pioneer_protocol::TaskAgentInputReference {
+                        kind: TaskAgentInputReferenceKind::Artifact,
+                        id: "art_ref".to_owned(),
+                        label: None,
+                    }],
+                }),
+                output_instructions: None,
+            },
+            context_policy: None,
+            tool_policy: None,
+            result_contract: None,
+            depth: 0,
+            max_depth: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let inputs = materialize_child_task_input("prompt".to_owned(), &agent_spec);
+
+        assert!(matches!(inputs[0], UserInput::Text { .. }));
+        assert!(inputs.iter().any(|input| matches!(
+            input,
+            UserInput::Artifact { artifact_id, .. } if artifact_id == "art_input"
+        )));
+        assert!(inputs.iter().any(|input| matches!(
+            input,
+            UserInput::Artifact { artifact_id, .. } if artifact_id == "art_ref"
+        )));
+    }
+
+    #[test]
+    fn task_artifact_parser_preserves_version_id() {
+        let values = vec![TaskValue::Object(BTreeMap::from([
+            (
+                "artifactId".to_owned(),
+                TaskValue::String("artifact".to_owned()),
+            ),
+            (
+                "versionId".to_owned(),
+                TaskValue::String("version".to_owned()),
+            ),
+        ]))];
+
+        let artifacts = parse_task_artifacts(&values);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id.as_deref(), Some("artifact"));
+        assert_eq!(artifacts[0].version_id.as_deref(), Some("version"));
+    }
+
+    #[tokio::test]
+    async fn task_artifact_existing_id_gets_task_result_binding() {
+        let (processor, task, lineage) = task_artifact_harness("existing").await;
+        let source =
+            ingest_task_test_artifact(&processor, task.workspace_id.as_str(), None, "source.txt")
+                .await;
+        let result = TaskResult {
+            summary: Some("done".to_owned()),
+            data: None,
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some(source.artifact.artifact_id.clone()),
+                version_id: source.artifact.version_id.clone(),
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some(lineage.task_run_id.clone()),
+        };
+
+        let normalized = normalize_task_result_artifacts(&processor, &task, &lineage, result)
+            .await
+            .expect("normalize")
+            .expect("valid result");
+
+        assert_eq!(
+            normalized.artifacts[0].artifact_id.as_deref(),
+            Some(source.artifact.artifact_id.as_str())
+        );
+        let summary = processor
+            .artifact_service
+            .get_artifact(
+                task.workspace_id.as_str(),
+                source.artifact.artifact_id.as_str(),
+                None,
+            )
+            .await
+            .expect("artifact");
+        assert!(summary.bindings.iter().any(|binding| {
+            binding.binding_kind == ArtifactBindingKind::TaskResult
+                && binding.task_id.as_deref() == Some(task.id.as_str())
+                && binding.task_run_id.as_deref() == Some(lineage.task_run_id.as_str())
+                && binding.thread_id.as_deref() == task.created_by_thread_id.as_deref()
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_artifact_path_is_ingested_and_listable_by_task() {
+        let (processor, task, lineage) = task_artifact_harness("path").await;
+        let output_dir = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join("task-artifact-tests")
+            .join(lineage.task_run_id.as_str());
+        tokio::fs::create_dir_all(output_dir.as_path())
+            .await
+            .expect("mkdir");
+        let output_path = output_dir.join("result.txt");
+        tokio::fs::write(output_path.as_path(), b"path artifact")
+            .await
+            .expect("write");
+        let result = TaskResult {
+            summary: Some("done".to_owned()),
+            data: None,
+            artifacts: vec![TaskArtifact {
+                artifact_id: None,
+                version_id: None,
+                path: Some(output_path.display().to_string()),
+                url: None,
+                mime_type: Some("text/plain".to_owned()),
+                metadata: None,
+            }],
+            completed_by_run_id: Some(lineage.task_run_id.clone()),
+        };
+
+        let normalized = normalize_task_result_artifacts(&processor, &task, &lineage, result)
+            .await
+            .expect("normalize")
+            .expect("valid result");
+
+        assert!(normalized.artifacts[0].artifact_id.is_some());
+        let page = processor
+            .artifact_service
+            .list_artifacts(
+                task.workspace_id.as_str(),
+                ArtifactListFilter {
+                    task_id: Some(task.id.clone()),
+                    task_run_id: Some(lineage.task_run_id.clone()),
+                    ..ArtifactListFilter::default()
+                },
+            )
+            .await
+            .expect("list task artifacts");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].artifact.display_name, "result.txt");
+        let _ = tokio::fs::remove_dir_all(output_dir.as_path()).await;
+    }
+
+    #[tokio::test]
+    async fn task_artifact_rejects_cross_workspace_id() {
+        let (processor, task, lineage) = task_artifact_harness("foreign").await;
+        let other_workspace = processor
+            .workspace_manager
+            .create_workspace("task_artifact_other", Some("Task Artifact Other"))
+            .await
+            .expect("other workspace");
+        let source =
+            ingest_task_test_artifact(&processor, other_workspace.id.as_str(), None, "foreign.txt")
+                .await;
+        let result = TaskResult {
+            summary: None,
+            data: None,
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some(source.artifact.artifact_id),
+                version_id: source.artifact.version_id,
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some(lineage.task_run_id.clone()),
+        };
+
+        let error = normalize_task_result_artifacts(&processor, &task, &lineage, result)
+            .await
+            .expect("normalization should return task error")
+            .expect_err("foreign artifact should fail result");
+
+        assert_eq!(error.code, "task_artifact_invalid");
+    }
+
+    #[tokio::test]
+    async fn include_artifacts_context_renders_refs_without_paths() {
+        let (processor, task, lineage) = task_artifact_harness("context").await;
+        let source = ingest_task_test_artifact(
+            &processor,
+            task.workspace_id.as_str(),
+            task.created_by_thread_id.clone(),
+            "context.txt",
+        )
+        .await;
+        let rendered = render_parent_artifact_refs(
+            &processor,
+            task.workspace_id.as_str(),
+            &TaskParentRuntimeContext {
+                parent_thread_id: lineage.parent_thread_id,
+                parent_turn_id: lineage.parent_turn_id,
+                root_thread_id: lineage.root_thread_id,
+            },
+        )
+        .await
+        .expect("render")
+        .expect("artifact context");
+
+        assert!(rendered.contains(source.artifact.artifact_id.as_str()));
+        assert!(rendered.contains("context.txt"));
+        assert!(!rendered.contains("source_path"));
     }
 
     #[test]

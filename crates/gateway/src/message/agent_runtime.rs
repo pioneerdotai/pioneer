@@ -761,6 +761,8 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                self.capture_artifacts_for_completed_item(&notification)
+                    .await;
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     events::ITEM_COMPLETED,
@@ -2065,6 +2067,13 @@ impl MessageProcessor {
             return false;
         }
 
+        self.finish_file_capture_session(
+            turn_completed.workspace_id.as_str(),
+            turn_completed.thread_id.as_str(),
+            turn_completed.turn.id.as_str(),
+        )
+        .await;
+
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_completed(thread_id.as_str(), turn_id.as_str())
@@ -2245,6 +2254,13 @@ impl MessageProcessor {
             return false;
         }
 
+        self.finish_file_capture_session(
+            turn_failed.workspace_id.as_str(),
+            turn_failed.thread_id.as_str(),
+            turn_failed.turn.id.as_str(),
+        )
+        .await;
+
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_failed(
@@ -2414,6 +2430,13 @@ impl MessageProcessor {
             return false;
         }
 
+        self.finish_file_capture_session(
+            turn_failed.workspace_id.as_str(),
+            turn_failed.thread_id.as_str(),
+            turn_failed.turn.id.as_str(),
+        )
+        .await;
+
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_failed(
@@ -2506,12 +2529,36 @@ impl MessageProcessor {
         turn_id: &str,
         input: &[pioneer_protocol::UserInput],
     ) {
-        let Some((text, attachments)) = user_message_payload_from_input(input) else {
+        let item_id = user_message_item_id(turn_id);
+        let payload = match self
+            .user_message_payload_from_input_resolved(
+                workspace_id,
+                thread_id,
+                turn_id,
+                &item_id,
+                input,
+            )
+            .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to materialize artifact-aware user message payload"
+                );
+                return;
+            }
+        };
+
+        let Some((text, attachments)) = payload else {
             return;
         };
 
         let item = TurnItem::UserMessage {
-            id: user_message_item_id(turn_id),
+            id: item_id,
             text,
             attachments,
         };
