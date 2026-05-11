@@ -41,6 +41,74 @@ token = "トークン"
 cancel = "キャンセル"
 save = "保存"
 
+[artifacts]
+created = "作成日時"
+empty = "このスレッドにアーティファクトはありません"
+empty_filter = "このフィルターに一致するアーティファクトはありません"
+failed = "アーティファクトの読み込みに失敗しました"
+kind = "種類"
+loading = "アーティファクトを読み込み中..."
+metadata = "メタデータ"
+preview = "プレビュー"
+provenance = "由来"
+provenance_unknown = "由来なし"
+sha256 = "SHA-256"
+local_copy = "ローカルコピー"
+size = "サイズ"
+size_unknown = "サイズ不明"
+source_label = "ソース"
+title = "アーティファクト"
+version = "バージョン"
+version_latest = "最新"
+
+[artifacts.action]
+attach = "添付"
+attach_tooltip = "このアーティファクトをコンポーザーの入力として使用"
+download = "ダウンロード..."
+download_tooltip = "このアーティファクトをこのコンピューターにダウンロード"
+open = "開く"
+open_tooltip = "検証済みのローカルコピーを開く"
+reveal = "表示"
+reveal_tooltip = "ローカルコピーを表示"
+
+[artifacts.action.error]
+no_gateway = "アクティブなゲートウェイがありません"
+no_workspace = "アーティファクトのワークスペースがありません"
+not_connected = "ゲートウェイが接続されていません"
+
+[artifacts.action.status]
+downloading = "このコンピューターにダウンロード中..."
+failed = "アーティファクト操作に失敗しました"
+opening = "ローカルコピーを開いています..."
+queued = "保存先を待機中..."
+revealing = "ローカルコピーを表示中..."
+verifying = "ローカルコピーを検証中..."
+
+[artifacts.filter]
+all = "すべて"
+documents = "ドキュメント"
+generated = "生成済み"
+images = "画像"
+task_output = "タスク"
+uploaded = "アップロード済み"
+
+[artifacts.source]
+agent = "エージェント"
+external_agent = "外部エージェント"
+import = "インポート"
+system = "システム"
+task = "タスク"
+tool = "ツール"
+user = "ユーザー"
+
+[artifacts.status]
+deleted = "削除済み"
+failed = "失敗"
+missing_external_source = "見つかりません"
+pending = "保留中"
+quarantined = "隔離済み"
+ready = "準備完了"
+
 [conversation.error]
 turn_failed = "ターンが失敗しました"
 

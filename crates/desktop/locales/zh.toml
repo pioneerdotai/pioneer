@@ -41,6 +41,74 @@ token = "令牌"
 cancel = "取消"
 save = "保存"
 
+[artifacts]
+created = "创建时间"
+empty = "此线程中没有工件"
+empty_filter = "没有工件匹配此筛选条件"
+failed = "加载工件失败"
+kind = "类型"
+loading = "正在加载工件..."
+metadata = "元数据"
+preview = "预览"
+provenance = "来源"
+provenance_unknown = "无来源信息"
+sha256 = "SHA-256"
+local_copy = "本地副本"
+size = "大小"
+size_unknown = "未知大小"
+source_label = "来源"
+title = "工件"
+version = "版本"
+version_latest = "最新"
+
+[artifacts.action]
+attach = "附加"
+attach_tooltip = "将此工件作为输入用于编辑器"
+download = "下载..."
+download_tooltip = "将此工件下载到这台电脑"
+open = "打开"
+open_tooltip = "打开已验证的本地副本"
+reveal = "显示"
+reveal_tooltip = "显示本地副本"
+
+[artifacts.action.error]
+no_gateway = "没有活动网关"
+no_workspace = "缺少工件工作区"
+not_connected = "网关未连接"
+
+[artifacts.action.status]
+downloading = "正在下载到这台电脑..."
+failed = "工件操作失败"
+opening = "正在打开本地副本..."
+queued = "正在等待目标位置..."
+revealing = "正在显示本地副本..."
+verifying = "正在验证本地副本..."
+
+[artifacts.filter]
+all = "全部"
+documents = "文档"
+generated = "已生成"
+images = "图片"
+task_output = "任务"
+uploaded = "已上传"
+
+[artifacts.source]
+agent = "智能体"
+external_agent = "外部智能体"
+import = "导入"
+system = "系统"
+task = "任务"
+tool = "工具"
+user = "用户"
+
+[artifacts.status]
+deleted = "已删除"
+failed = "失败"
+missing_external_source = "缺失"
+pending = "待处理"
+quarantined = "已隔离"
+ready = "就绪"
+
 [conversation.error]
 turn_failed = "回合失败"
 

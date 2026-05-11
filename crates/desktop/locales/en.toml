@@ -41,6 +41,74 @@ token = "Token"
 cancel = "Cancel"
 save = "Save"
 
+[artifacts]
+created = "Created"
+empty = "No artifacts in this thread"
+empty_filter = "No artifacts match this filter"
+failed = "Failed to load artifacts"
+kind = "Kind"
+loading = "Loading artifacts..."
+metadata = "Metadata"
+preview = "Preview"
+provenance = "Provenance"
+provenance_unknown = "No provenance"
+sha256 = "SHA-256"
+local_copy = "Local copy"
+size = "Size"
+size_unknown = "Unknown size"
+source_label = "Source"
+title = "Artifacts"
+version = "Version"
+version_latest = "latest"
+
+[artifacts.action]
+attach = "Attach"
+attach_tooltip = "Use this artifact as input in the composer"
+download = "Download..."
+download_tooltip = "Download this artifact to this computer"
+open = "Open"
+open_tooltip = "Open a verified local copy"
+reveal = "Reveal"
+reveal_tooltip = "Reveal the local copy"
+
+[artifacts.action.error]
+no_gateway = "No active gateway"
+no_workspace = "Artifact workspace is missing"
+not_connected = "Gateway is not connected"
+
+[artifacts.action.status]
+downloading = "Downloading to this computer..."
+failed = "Artifact action failed"
+opening = "Opening local copy..."
+queued = "Waiting for destination..."
+revealing = "Revealing local copy..."
+verifying = "Verifying local copy..."
+
+[artifacts.filter]
+all = "All"
+documents = "Docs"
+generated = "Generated"
+images = "Images"
+task_output = "Tasks"
+uploaded = "Uploaded"
+
+[artifacts.source]
+agent = "Agent"
+external_agent = "External agent"
+import = "Import"
+system = "System"
+task = "Task"
+tool = "Tool"
+user = "User"
+
+[artifacts.status]
+deleted = "Deleted"
+failed = "Failed"
+missing_external_source = "Missing"
+pending = "Pending"
+quarantined = "Quarantined"
+ready = "Ready"
+
 [conversation.error]
 turn_failed = "Turn failed"
 

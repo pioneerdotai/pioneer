@@ -41,6 +41,74 @@ token = "Token"
 cancel = "Cancelar"
 save = "Guardar"
 
+[artifacts]
+created = "Creado"
+empty = "No hay artefactos en este hilo"
+empty_filter = "Ningun artefacto coincide con este filtro"
+failed = "No se pudieron cargar los artefactos"
+kind = "Tipo"
+loading = "Cargando artefactos..."
+metadata = "Metadatos"
+preview = "Vista previa"
+provenance = "Procedencia"
+provenance_unknown = "Sin procedencia"
+sha256 = "SHA-256"
+local_copy = "Copia local"
+size = "Tamano"
+size_unknown = "Tamano desconocido"
+source_label = "Origen"
+title = "Artefactos"
+version = "Version"
+version_latest = "actual"
+
+[artifacts.action]
+attach = "Adjuntar"
+attach_tooltip = "Usar este artefacto como entrada en el compositor"
+download = "Descargar..."
+download_tooltip = "Descargar este artefacto a este equipo"
+open = "Abrir"
+open_tooltip = "Abrir una copia local verificada"
+reveal = "Mostrar"
+reveal_tooltip = "Mostrar la copia local"
+
+[artifacts.action.error]
+no_gateway = "No hay una pasarela activa"
+no_workspace = "Falta el workspace del artefacto"
+not_connected = "La pasarela no esta conectada"
+
+[artifacts.action.status]
+downloading = "Descargando a este equipo..."
+failed = "La accion del artefacto fallo"
+opening = "Abriendo copia local..."
+queued = "Esperando destino..."
+revealing = "Mostrando copia local..."
+verifying = "Verificando copia local..."
+
+[artifacts.filter]
+all = "Todos"
+documents = "Docs"
+generated = "Generados"
+images = "Imagenes"
+task_output = "Tareas"
+uploaded = "Subidos"
+
+[artifacts.source]
+agent = "Agente"
+external_agent = "Agente externo"
+import = "Importacion"
+system = "Sistema"
+task = "Tarea"
+tool = "Herramienta"
+user = "Usuario"
+
+[artifacts.status]
+deleted = "Eliminado"
+failed = "Fallido"
+missing_external_source = "Falta"
+pending = "Pendiente"
+quarantined = "En cuarentena"
+ready = "Listo"
+
 [conversation.error]
 turn_failed = "El turno falló"
 

@@ -41,6 +41,74 @@ token = "Jeton"
 cancel = "Annuler"
 save = "Enregistrer"
 
+[artifacts]
+created = "Cree"
+empty = "Aucun artefact dans ce fil"
+empty_filter = "Aucun artefact ne correspond a ce filtre"
+failed = "Impossible de charger les artefacts"
+kind = "Type"
+loading = "Chargement des artefacts..."
+metadata = "Metadonnees"
+preview = "Apercu"
+provenance = "Provenance"
+provenance_unknown = "Aucune provenance"
+sha256 = "SHA-256"
+local_copy = "Copie locale"
+size = "Taille"
+size_unknown = "Taille inconnue"
+source_label = "Source"
+title = "Artefacts"
+version = "Version"
+version_latest = "actuelle"
+
+[artifacts.action]
+attach = "Joindre"
+attach_tooltip = "Utiliser cet artefact comme entree dans le compositeur"
+download = "Telecharger..."
+download_tooltip = "Telecharger cet artefact sur cet ordinateur"
+open = "Ouvrir"
+open_tooltip = "Ouvrir une copie locale verifiee"
+reveal = "Afficher"
+reveal_tooltip = "Afficher la copie locale"
+
+[artifacts.action.error]
+no_gateway = "Aucune passerelle active"
+no_workspace = "L'espace de travail de l'artefact est manquant"
+not_connected = "La passerelle n'est pas connectee"
+
+[artifacts.action.status]
+downloading = "Telechargement sur cet ordinateur..."
+failed = "L'action sur l'artefact a echoue"
+opening = "Ouverture de la copie locale..."
+queued = "En attente de destination..."
+revealing = "Affichage de la copie locale..."
+verifying = "Verification de la copie locale..."
+
+[artifacts.filter]
+all = "Tous"
+documents = "Docs"
+generated = "Generes"
+images = "Images"
+task_output = "Taches"
+uploaded = "Televerses"
+
+[artifacts.source]
+agent = "Agent"
+external_agent = "Agent externe"
+import = "Import"
+system = "Systeme"
+task = "Tache"
+tool = "Outil"
+user = "Utilisateur"
+
+[artifacts.status]
+deleted = "Supprime"
+failed = "Echec"
+missing_external_source = "Manquant"
+pending = "En attente"
+quarantined = "En quarantaine"
+ready = "Pret"
+
 [conversation.error]
 turn_failed = "Le tour a échoué"
 

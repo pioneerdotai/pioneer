@@ -41,6 +41,74 @@ token = "Токен"
 cancel = "Отмена"
 save = "Сохранить"
 
+[artifacts]
+created = "Создан"
+empty = "В этом треде нет артефактов"
+empty_filter = "Нет артефактов для этого фильтра"
+failed = "Не удалось загрузить артефакты"
+kind = "Тип"
+loading = "Загрузка артефактов..."
+metadata = "Метаданные"
+preview = "Превью"
+provenance = "Происхождение"
+provenance_unknown = "Нет данных о происхождении"
+sha256 = "SHA-256"
+local_copy = "Локальная копия"
+size = "Размер"
+size_unknown = "Размер неизвестен"
+source_label = "Источник"
+title = "Артефакты"
+version = "Версия"
+version_latest = "последняя"
+
+[artifacts.action]
+attach = "Приложить"
+attach_tooltip = "Использовать этот артефакт как вход в composer"
+download = "Скачать..."
+download_tooltip = "Скачать этот артефакт на этот компьютер"
+open = "Открыть"
+open_tooltip = "Открыть проверенную локальную копию"
+reveal = "Показать"
+reveal_tooltip = "Показать локальную копию"
+
+[artifacts.action.error]
+no_gateway = "Нет активного gateway"
+no_workspace = "Не указан workspace артефакта"
+not_connected = "Gateway не подключен"
+
+[artifacts.action.status]
+downloading = "Скачивание на этот компьютер..."
+failed = "Действие с артефактом завершилось ошибкой"
+opening = "Открытие локальной копии..."
+queued = "Ожидание папки назначения..."
+revealing = "Показ локальной копии..."
+verifying = "Проверка локальной копии..."
+
+[artifacts.filter]
+all = "Все"
+documents = "Документы"
+generated = "Созданные"
+images = "Изображения"
+task_output = "Задачи"
+uploaded = "Загруженные"
+
+[artifacts.source]
+agent = "Агент"
+external_agent = "Внешний агент"
+import = "Импорт"
+system = "Система"
+task = "Задача"
+tool = "Инструмент"
+user = "Пользователь"
+
+[artifacts.status]
+deleted = "Удалён"
+failed = "Ошибка"
+missing_external_source = "Источник недоступен"
+pending = "Ожидание"
+quarantined = "Карантин"
+ready = "Готов"
+
 [conversation.error]
 turn_failed = "Ход завершился ошибкой"
 

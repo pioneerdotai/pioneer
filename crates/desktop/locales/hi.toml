@@ -41,6 +41,74 @@ token = "टोकन"
 cancel = "रद्द करें"
 save = "सहेजें"
 
+[artifacts]
+created = "बनाया गया"
+empty = "इस थ्रेड में कोई आर्टिफैक्ट नहीं है"
+empty_filter = "इस फ़िल्टर से कोई आर्टिफैक्ट मेल नहीं खाता"
+failed = "आर्टिफैक्ट लोड करने में विफल"
+kind = "प्रकार"
+loading = "आर्टिफैक्ट लोड हो रहे हैं..."
+metadata = "मेटाडेटा"
+preview = "पूर्वावलोकन"
+provenance = "उत्पत्ति"
+provenance_unknown = "कोई उत्पत्ति नहीं"
+sha256 = "SHA-256"
+local_copy = "लोकल कॉपी"
+size = "आकार"
+size_unknown = "अज्ञात आकार"
+source_label = "स्रोत"
+title = "आर्टिफैक्ट"
+version = "संस्करण"
+version_latest = "नवीनतम"
+
+[artifacts.action]
+attach = "अटैच करें"
+attach_tooltip = "इस आर्टिफैक्ट को composer में इनपुट के रूप में उपयोग करें"
+download = "डाउनलोड करें..."
+download_tooltip = "इस आर्टिफैक्ट को इस कंप्यूटर पर डाउनलोड करें"
+open = "खोलें"
+open_tooltip = "सत्यापित लोकल कॉपी खोलें"
+reveal = "दिखाएं"
+reveal_tooltip = "लोकल कॉपी दिखाएं"
+
+[artifacts.action.error]
+no_gateway = "कोई सक्रिय गेटवे नहीं"
+no_workspace = "आर्टिफैक्ट workspace मौजूद नहीं है"
+not_connected = "गेटवे कनेक्ट नहीं है"
+
+[artifacts.action.status]
+downloading = "इस कंप्यूटर पर डाउनलोड हो रहा है..."
+failed = "आर्टिफैक्ट कार्रवाई विफल हुई"
+opening = "लोकल कॉपी खोली जा रही है..."
+queued = "गंतव्य की प्रतीक्षा..."
+revealing = "लोकल कॉपी दिखाई जा रही है..."
+verifying = "लोकल कॉपी सत्यापित हो रही है..."
+
+[artifacts.filter]
+all = "सभी"
+documents = "दस्तावेज"
+generated = "जनरेटेड"
+images = "चित्र"
+task_output = "टास्क"
+uploaded = "अपलोडेड"
+
+[artifacts.source]
+agent = "एजेंट"
+external_agent = "बाहरी एजेंट"
+import = "इम्पोर्ट"
+system = "सिस्टम"
+task = "टास्क"
+tool = "टूल"
+user = "उपयोगकर्ता"
+
+[artifacts.status]
+deleted = "हटाया गया"
+failed = "विफल"
+missing_external_source = "अनुपलब्ध"
+pending = "लंबित"
+quarantined = "क्वारंटीन"
+ready = "तैयार"
+
 [conversation.error]
 turn_failed = "टर्न विफल हुआ"
 

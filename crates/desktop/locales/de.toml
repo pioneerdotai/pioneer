@@ -41,6 +41,74 @@ token = "Token"
 cancel = "Abbrechen"
 save = "Speichern"
 
+[artifacts]
+created = "Erstellt"
+empty = "Keine Artefakte in diesem Thread"
+empty_filter = "Keine Artefakte entsprechen diesem Filter"
+failed = "Artefakte konnten nicht geladen werden"
+kind = "Typ"
+loading = "Artefakte werden geladen..."
+metadata = "Metadaten"
+preview = "Vorschau"
+provenance = "Herkunft"
+provenance_unknown = "Keine Herkunft"
+sha256 = "SHA-256"
+local_copy = "Lokale Kopie"
+size = "Groesse"
+size_unknown = "Unbekannte Groesse"
+source_label = "Quelle"
+title = "Artefakte"
+version = "Version"
+version_latest = "aktuell"
+
+[artifacts.action]
+attach = "Anhaengen"
+attach_tooltip = "Dieses Artefakt als Eingabe im Composer verwenden"
+download = "Herunterladen..."
+download_tooltip = "Dieses Artefakt auf diesen Computer herunterladen"
+open = "Oeffnen"
+open_tooltip = "Eine verifizierte lokale Kopie oeffnen"
+reveal = "Anzeigen"
+reveal_tooltip = "Die lokale Kopie im Dateimanager anzeigen"
+
+[artifacts.action.error]
+no_gateway = "Kein aktives Gateway"
+no_workspace = "Artifact-Workspace fehlt"
+not_connected = "Gateway ist nicht verbunden"
+
+[artifacts.action.status]
+downloading = "Wird auf diesen Computer heruntergeladen..."
+failed = "Artefakt-Aktion fehlgeschlagen"
+opening = "Lokale Kopie wird geoeffnet..."
+queued = "Warte auf Ziel..."
+revealing = "Lokale Kopie wird angezeigt..."
+verifying = "Lokale Kopie wird verifiziert..."
+
+[artifacts.filter]
+all = "Alle"
+documents = "Dokumente"
+generated = "Generiert"
+images = "Bilder"
+task_output = "Tasks"
+uploaded = "Hochgeladen"
+
+[artifacts.source]
+agent = "Agent"
+external_agent = "Externer Agent"
+import = "Import"
+system = "System"
+task = "Task"
+tool = "Tool"
+user = "Benutzer"
+
+[artifacts.status]
+deleted = "Geloescht"
+failed = "Fehlgeschlagen"
+missing_external_source = "Fehlt"
+pending = "Ausstehend"
+quarantined = "Quarantaene"
+ready = "Bereit"
+
 [conversation.error]
 turn_failed = "Durchlauf fehlgeschlagen"
 
