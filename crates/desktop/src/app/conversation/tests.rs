@@ -123,6 +123,39 @@ fn send_stays_blocked_until_terminal_event() {
 }
 
 #[test]
+fn user_message_stays_before_work_items_even_if_it_arrives_late() {
+    let mut conversation = Conversation::new(THREAD_ID);
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: "item_reasoning".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
+        },
+    });
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::UserMessage {
+            id: "item_user".to_owned(),
+            text: "what car is this?".to_owned(),
+            attachments: Vec::new(),
+        },
+    });
+
+    let item_ids = conversation
+        .projection()
+        .timeline
+        .iter()
+        .map(|entry| entry.item_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(item_ids, vec!["item_user", "item_reasoning"]);
+}
+
+#[test]
 fn send_unlocks_only_on_terminal_failed_or_cancelled() {
     let mut conversation = Conversation::new(THREAD_ID);
 

@@ -6,6 +6,7 @@ use pioneer_protocol::{
 };
 use serde_json::Value as JsonValue;
 use std::{
+    cmp::Ordering,
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
 };
@@ -901,12 +902,11 @@ impl ConversationProjector {
     }
 
     fn insert_timeline_entry(&mut self, timeline_entry: TimelineEntry) {
-        let sort_at = self.timeline_entry_sort_at(&timeline_entry);
         let insert_index = self
             .view_state
             .timeline
             .iter()
-            .position(|entry| self.timeline_entry_sort_at(entry) > sort_at)
+            .position(|entry| self.timeline_entry_cmp(&timeline_entry, entry).is_lt())
             .unwrap_or(self.view_state.timeline.len());
 
         self.view_state
@@ -931,6 +931,35 @@ impl ConversationProjector {
             .or_else(|| self.view_state.item_by_id(entry.item_id.as_str()))
             .map(item_sort_at)
             .unwrap_or(i64::MAX)
+    }
+
+    fn timeline_entry_cmp(&self, left: &TimelineEntry, right: &TimelineEntry) -> Ordering {
+        if left.turn_id == right.turn_id {
+            let left_rank = self.timeline_entry_kind_rank(left);
+            let right_rank = self.timeline_entry_kind_rank(right);
+            if left_rank != right_rank {
+                return left_rank.cmp(&right_rank);
+            }
+        }
+
+        self.timeline_entry_sort_at(left)
+            .cmp(&self.timeline_entry_sort_at(right))
+    }
+
+    fn timeline_entry_kind_rank(&self, entry: &TimelineEntry) -> u8 {
+        self.view_state
+            .items
+            .get(entry.item_index)
+            .filter(|item| item.id == entry.item_id)
+            .or_else(|| self.view_state.item_by_id(entry.item_id.as_str()))
+            .map(|item| {
+                if matches!(&item.item, TurnItem::UserMessage { .. }) {
+                    0
+                } else {
+                    1
+                }
+            })
+            .unwrap_or(1)
     }
 
     fn next_synthetic_item_id(&mut self, prefix: &str) -> String {
