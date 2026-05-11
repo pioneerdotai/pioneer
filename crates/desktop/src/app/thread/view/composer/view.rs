@@ -3,7 +3,7 @@ use crate::{
     assets::PioneerIconName,
 };
 use gpui::{prelude::*, *};
-use gpui_component::{IconName, button::*, input::Input, theme::ActiveTheme, *};
+use gpui_component::{IconName, button::*, input::Input, spinner::Spinner, theme::ActiveTheme, *};
 use std::path::Path;
 
 impl PioneerDesktop {
@@ -189,21 +189,29 @@ impl PioneerDesktop {
         } else {
             attachment.file_name.clone()
         };
-        let (status_icon, status_text, status_color) = match &attachment.upload_state {
-            ComposerAttachmentUploadState::Local => (IconName::File, None, cx.theme().foreground),
+        let (status_icon, status_text, status_color, is_uploading) = match &attachment.upload_state
+        {
+            ComposerAttachmentUploadState::Local => {
+                (IconName::File, None, cx.theme().foreground, false)
+            }
             ComposerAttachmentUploadState::Uploading => (
-                IconName::LoaderCircle,
+                IconName::Loader,
                 Some("uploading"),
                 cx.theme().muted_foreground,
+                true,
             ),
             ComposerAttachmentUploadState::Uploaded { .. } => (
                 IconName::Check,
                 Some("uploaded"),
                 cx.theme().muted_foreground,
+                false,
             ),
-            ComposerAttachmentUploadState::Failed { .. } => {
-                (IconName::TriangleAlert, Some("failed"), cx.theme().danger)
-            }
+            ComposerAttachmentUploadState::Failed { .. } => (
+                IconName::TriangleAlert,
+                Some("failed"),
+                cx.theme().danger,
+                false,
+            ),
         };
 
         h_flex()
@@ -228,12 +236,18 @@ impl PioneerDesktop {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
+                    .child(if is_uploading {
+                        Spinner::new()
+                            .with_size(gpui_component::Size::Small)
+                            .color(status_color)
+                            .into_any_element()
+                    } else {
                         Icon::new(status_icon)
                             .size_3()
                             .opacity(0.8)
-                            .text_color(status_color),
-                    ),
+                            .text_color(status_color)
+                            .into_any_element()
+                    }),
             )
             .child(
                 h_flex()

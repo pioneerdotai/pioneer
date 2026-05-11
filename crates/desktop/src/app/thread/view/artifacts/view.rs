@@ -349,7 +349,7 @@ impl PioneerDesktop {
             .when_some(action_status.as_ref(), |this, status| {
                 this.child(render_thread_artifact_action_status(status, cx))
             })
-            .child(h_flex().w_full().gap_1p5().children([
+            .child(h_flex().w_full().gap_1().children([
                 {
                     let summary = summary.clone();
                     artifact_action_button(
@@ -542,7 +542,8 @@ fn artifact_action_button(
                 .h_full()
                 .text()
                 .disabled(!enabled)
-                .text_color(normal_fg),
+                .text_color(normal_fg)
+                .small(),
         )
         .into_any_element()
 }
