@@ -1,4 +1,7 @@
-use crate::{app::root::PioneerDesktop, assets::PioneerIconName};
+use crate::{
+    app::root::{ComposerAttachmentUploadState, PioneerDesktop},
+    assets::PioneerIconName,
+};
 use gpui::{prelude::*, *};
 use gpui_component::{IconName, button::*, input::Input, theme::ActiveTheme, *};
 use std::path::Path;
@@ -7,6 +10,7 @@ impl PioneerDesktop {
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
+        let upload_error = self.composer_upload_error.clone();
         let can_send = self.can_submit_message(cx);
         let in_flight_turn_id = self
             .active_thread_conversation()
@@ -49,6 +53,33 @@ impl PioneerDesktop {
                                 .when(!attachments.is_empty(), |this| {
                                     this.child(self.render_composer_attachment_badges(cx))
                                 })
+                                .when_some(upload_error, |this, error| {
+                                    this.child(
+                                        h_flex()
+                                            .mx_2()
+                                            .mb_2()
+                                            .gap_2()
+                                            .items_start()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(cx.theme().danger.opacity(0.25))
+                                            .bg(cx.theme().danger.opacity(0.08))
+                                            .px_2()
+                                            .py_1p5()
+                                            .child(
+                                                Icon::new(IconName::TriangleAlert)
+                                                    .size_3()
+                                                    .text_color(cx.theme().danger),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .line_height(relative(1.25))
+                                                    .text_color(cx.theme().danger)
+                                                    .child(error),
+                                            ),
+                                    )
+                                })
                                 .child(Input::new(&composer_state).appearance(false)),
                         )
                         .child(
@@ -67,6 +98,7 @@ impl PioneerDesktop {
                                                 .small()
                                                 .ghost()
                                                 .icon(IconName::Plus)
+                                                .disabled(self.composer_upload_in_progress)
                                                 .on_click(cx.listener(|view, _, window, cx| {
                                                     view.open_composer_file_picker(window, cx);
                                                 })),
@@ -80,7 +112,10 @@ impl PioneerDesktop {
                                             .primary()
                                             .rounded_full()
                                             .disabled(composer_action_disabled)
-                                            .loading(has_in_flight_turn && is_cancelling)
+                                            .loading(
+                                                self.composer_upload_in_progress
+                                                    || (has_in_flight_turn && is_cancelling),
+                                            )
                                             .when(has_in_flight_turn, |this| {
                                                 this.icon(PioneerIconName::Square)
                                             })
@@ -151,6 +186,22 @@ impl PioneerDesktop {
         } else {
             attachment.file_name.clone()
         };
+        let (status_icon, status_text, status_color) = match &attachment.upload_state {
+            ComposerAttachmentUploadState::Local => (IconName::File, None, cx.theme().foreground),
+            ComposerAttachmentUploadState::Uploading => (
+                IconName::LoaderCircle,
+                Some("uploading"),
+                cx.theme().muted_foreground,
+            ),
+            ComposerAttachmentUploadState::Uploaded { .. } => (
+                IconName::Check,
+                Some("uploaded"),
+                cx.theme().muted_foreground,
+            ),
+            ComposerAttachmentUploadState::Failed { .. } => {
+                (IconName::TriangleAlert, Some("failed"), cx.theme().danger)
+            }
+        };
 
         h_flex()
             .id(("composer-attachment-chip", index))
@@ -173,16 +224,35 @@ impl PioneerDesktop {
                     .items_center()
                     .justify_center()
                     .bg(cx.theme().muted)
-                    .child(Icon::new(IconName::File).size_3().opacity(0.8)),
+                    .child(
+                        Icon::new(status_icon)
+                            .size_3()
+                            .opacity(0.8)
+                            .text_color(status_color),
+                    ),
             )
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_sm()
-                    .child(file_name),
+                    .gap_1()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .child(file_name),
+                    )
+                    .when_some(status_text, |this, status_text| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(status_color)
+                                .whitespace_nowrap()
+                                .child(status_text),
+                        )
+                    }),
             )
             .child(
                 Button::new(("composer-attachment-remove", index))
@@ -190,6 +260,7 @@ impl PioneerDesktop {
                     .xsmall()
                     .compact()
                     .icon(IconName::Close)
+                    .disabled(self.composer_upload_in_progress)
                     .opacity(0.0)
                     .group_hover(group_id, |this| this.opacity(0.85))
                     .on_click(cx.listener(move |view, _, _, cx| {

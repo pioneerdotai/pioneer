@@ -5,7 +5,7 @@ impl PioneerDesktop {
         normalize_workspace_id(workspace_id.map(str::to_owned))
     }
 
-    pub(in crate::app::flow) fn default_thread_start_scope(&self) -> String {
+    pub(in crate::app) fn default_thread_start_scope(&self) -> String {
         let preferred_workspace_id = self.preferred_workspace_id().map(str::to_owned);
         let runtime_workspace_id = self
             .gateway

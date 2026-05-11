@@ -92,6 +92,18 @@ images = "चित्र"
 task_output = "टास्क"
 uploaded = "अपलोडेड"
 
+[artifacts.preview_kind]
+json_summary = "JSON सारांश"
+pdf_text = "PDF टेक्स्ट"
+plain_text = "टेक्स्ट पूर्वावलोकन"
+thumbnail = "थंबनेल"
+
+[artifacts.preview_status]
+failed = "विफल"
+pending = "तैयार हो रहा है"
+ready = "तैयार"
+stale = "अपडेट हो रहा है"
+
 [artifacts.source]
 agent = "एजेंट"
 external_agent = "बाहरी एजेंट"

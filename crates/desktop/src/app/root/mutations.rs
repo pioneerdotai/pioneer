@@ -116,6 +116,8 @@ impl PioneerDesktop {
         self.composer_state
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.composer_attachments.clear();
+        self.composer_upload_in_progress = false;
+        self.composer_upload_error = None;
     }
 
     pub(in crate::app) fn reset_thread_start_state(&mut self) {
@@ -254,6 +256,8 @@ impl PioneerDesktop {
         self.thread_drafts.clear();
         self.thread_draft_attachments.clear();
         self.composer_attachments.clear();
+        self.composer_upload_in_progress = false;
+        self.composer_upload_error = None;
         self.thread_folders.clear();
         self.thread_placements.clear();
         self.thread_folder_expanded.clear();

@@ -92,6 +92,18 @@ images = "Imagenes"
 task_output = "Tareas"
 uploaded = "Subidos"
 
+[artifacts.preview_kind]
+json_summary = "Resumen JSON"
+pdf_text = "Texto PDF"
+plain_text = "Vista previa de texto"
+thumbnail = "Miniatura"
+
+[artifacts.preview_status]
+failed = "error"
+pending = "preparando"
+ready = "lista"
+stale = "actualizando"
+
 [artifacts.source]
 agent = "Agente"
 external_agent = "Agente externo"

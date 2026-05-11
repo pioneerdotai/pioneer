@@ -18,13 +18,14 @@ use gpui_component::{
 };
 use gpui_terminal::TerminalView;
 use pioneer_protocol::{
-    McpListItem, McpServerDetailsResponse, SkillHealthItem, SkillListItem, Thread, ThreadFolder,
-    ThreadMode, ThreadPlacement,
+    ArtifactRef, ArtifactSummary, McpListItem, McpServerDetailsResponse, SkillHealthItem,
+    SkillListItem, Thread, ThreadFolder, ThreadMode, ThreadPlacement,
 };
 use std::{
     cell::RefCell,
     collections::hash_map::Entry,
     collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
     time::Instant,
@@ -212,6 +213,15 @@ pub(super) struct ComposerAttachment {
     pub(super) path: String,
     pub(super) file_name: String,
     pub(super) kind: ComposerAttachmentKind,
+    pub(super) upload_state: ComposerAttachmentUploadState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ComposerAttachmentUploadState {
+    Local,
+    Uploading,
+    Uploaded { artifact: ArtifactRef },
+    Failed { error: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -220,6 +230,75 @@ pub(super) struct TurnTimelineRefreshState {
     pub(super) dirty: bool,
     pub(super) next_generation: u64,
     pub(super) in_flight_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ThreadArtifactFilter {
+    #[default]
+    All,
+    Uploaded,
+    Generated,
+    TaskOutput,
+    Images,
+    Documents,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ThreadArtifactCacheEntry {
+    pub(super) items: Vec<ArtifactSummary>,
+    pub(super) loaded: bool,
+    pub(super) error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ThreadArtifactVersionKey {
+    pub(super) artifact_id: String,
+    pub(super) version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ThreadArtifactLocalFile {
+    pub(super) path: PathBuf,
+    pub(super) sha256: String,
+    pub(super) size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ThreadArtifactActionStatus {
+    Queued,
+    Downloading,
+    Verifying,
+    Opening,
+    Revealing,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ThreadArtifactPreviewImagePaths {
+    pub(super) square_path: PathBuf,
+    pub(super) detail_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ThreadArtifactsState {
+    pub(super) active_thread_id: Option<String>,
+    pub(super) loading: bool,
+    pub(super) loading_thread_id: Option<String>,
+    pub(super) loading_thread_ids: HashSet<String>,
+    pub(super) refresh_requested_thread_ids: HashSet<String>,
+    pub(super) retry_after_by_thread: HashMap<String, Instant>,
+    pub(super) transient_retry_count_by_thread: HashMap<String, u8>,
+    pub(super) error: Option<String>,
+    pub(super) selected_artifact_id: Option<String>,
+    pub(super) filter: ThreadArtifactFilter,
+    pub(super) cache_by_thread: HashMap<String, ThreadArtifactCacheEntry>,
+    pub(super) local_files_by_artifact: HashMap<ThreadArtifactVersionKey, ThreadArtifactLocalFile>,
+    pub(super) action_status_by_artifact:
+        HashMap<ThreadArtifactVersionKey, ThreadArtifactActionStatus>,
+    pub(super) preview_image_path_by_artifact:
+        HashMap<ThreadArtifactVersionKey, ThreadArtifactPreviewImagePaths>,
+    pub(super) preview_loading_by_artifact: HashSet<ThreadArtifactVersionKey>,
+    pub(super) preview_failed_by_artifact: HashSet<ThreadArtifactVersionKey>,
 }
 
 pub struct PioneerDesktop {
@@ -239,6 +318,8 @@ pub struct PioneerDesktop {
     pub(super) preferred_workspace_id: Option<String>,
     pub(super) composer_state: Entity<InputState>,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
+    pub(super) composer_upload_in_progress: bool,
+    pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
     pub(super) composer_selected_provider: Option<String>,
     pub(super) composer_selected_model: Option<String>,
@@ -282,6 +363,9 @@ pub struct PioneerDesktop {
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
+    pub(super) thread_artifacts: ThreadArtifactsState,
+    pub(super) show_thread_artifacts_sidebar: bool,
+    pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) ready_turn_resume_threads: VecDeque<String>,
     pub(super) ready_turn_resume_thread_set: HashSet<String>,
     pub(super) turn_timeline_refresh: HashMap<(String, String), TurnTimelineRefreshState>,

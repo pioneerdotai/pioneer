@@ -92,6 +92,18 @@ images = "Images"
 task_output = "Tasks"
 uploaded = "Uploaded"
 
+[artifacts.preview_kind]
+json_summary = "JSON summary"
+pdf_text = "PDF text"
+plain_text = "Text preview"
+thumbnail = "Thumbnail"
+
+[artifacts.preview_status]
+failed = "failed"
+pending = "preparing"
+ready = "ready"
+stale = "updating"
+
 [artifacts.source]
 agent = "Agent"
 external_agent = "External agent"

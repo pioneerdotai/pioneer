@@ -11,6 +11,10 @@ impl PioneerDesktop {
             return false;
         }
 
+        if self.composer_upload_in_progress {
+            return false;
+        }
+
         if self.current_active_thread_id().is_none() {
             return false;
         }

@@ -409,6 +409,17 @@ impl GatewayWsCommandSender {
         )
     }
 
+    pub fn artifact_read(&self, params: ArtifactReadParams) -> Result<ArtifactReadResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for artifact/read"));
+        }
+        if params.artifact_id.trim().is_empty() {
+            return Err(anyhow!("artifact_id is required for artifact/read"));
+        }
+
+        self.send_request_typed(methods::ARTIFACT_READ, &params, RPC_REQUEST_TIMEOUT)
+    }
+
     pub fn artifact_download_start(
         &self,
         params: ArtifactDownloadStartParams,

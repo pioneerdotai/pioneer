@@ -5,12 +5,14 @@ use crate::app::{
 use chrono::{Local, TimeZone};
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_protocol::{TurnItem, UserMessageAttachment};
-use std::path::Path;
+use pioneer_protocol::{ArtifactRef, TurnItem, UserMessageAttachment};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 struct ParsedUserAttachment {
     display_name: String,
+    detail: Option<String>,
+    artifact: Option<ArtifactRef>,
 }
 
 impl PioneerDesktop {
@@ -40,6 +42,10 @@ impl PioneerDesktop {
             .unwrap_or_default();
 
         let copy_text = raw_text.to_owned();
+        let active_workspace_id = self
+            .current_active_thread_id()
+            .and_then(|thread_id| self.thread_workspace_id(thread_id))
+            .map(str::to_owned);
 
         let mut row = div().flex().w_full().justify_center();
 
@@ -72,6 +78,7 @@ impl PioneerDesktop {
                                 .when(!attachments.is_empty(), |this| {
                                     this.child(self.render_user_message_attachment_badges(
                                         attachments.clone(),
+                                        active_workspace_id.clone(),
                                         cx,
                                     ))
                                 })
@@ -108,6 +115,7 @@ impl PioneerDesktop {
     fn render_user_message_attachment_badges(
         &self,
         attachments: Vec<ParsedUserAttachment>,
+        workspace_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rows = attachments
@@ -128,9 +136,25 @@ impl PioneerDesktop {
                             .enumerate()
                             .map(|(column_index, attachment)| {
                                 let chip_index = row_index * 4 + column_index;
+                                let artifact = attachment.artifact.clone();
+                                let preview_image_path = artifact.as_ref().and_then(|artifact| {
+                                    if let Some(workspace_id) = workspace_id.as_deref() {
+                                        self.request_thread_artifact_preview_load(
+                                            workspace_id,
+                                            artifact,
+                                            cx,
+                                        );
+                                    }
+                                    self.thread_artifacts
+                                        .preview_square_image_path(artifact)
+                                        .map(PathBuf::from)
+                                });
+                                let artifact_id = artifact
+                                    .as_ref()
+                                    .map(|artifact| artifact.artifact_id.clone());
                                 h_flex()
                                     .id(("timeline-user-attachment-chip", chip_index))
-                                    .h(px(30.))
+                                    .h(px(32.))
                                     .max_w(px(196.))
                                     .px_2()
                                     .rounded_full()
@@ -138,20 +162,10 @@ impl PioneerDesktop {
                                     .border_color(cx.theme().border)
                                     .items_center()
                                     .gap_2()
-                                    .child(
-                                        div()
-                                            .size(px(18.))
-                                            .rounded_full()
-                                            .bg(cx.theme().background.opacity(0.85))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(gpui_component::IconName::File)
-                                                    .size_3()
-                                                    .opacity(0.8),
-                                            ),
-                                    )
+                                    .child(self.render_user_message_attachment_preview(
+                                        preview_image_path,
+                                        cx,
+                                    ))
                                     .child(
                                         div()
                                             .flex_1()
@@ -161,10 +175,84 @@ impl PioneerDesktop {
                                             .text_sm()
                                             .child(attachment.display_name),
                                     )
+                                    .when_some(attachment.detail, |this, detail| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .whitespace_nowrap()
+                                                .child(detail),
+                                        )
+                                    })
+                                    .when_some(artifact_id, |this, artifact_id| {
+                                        this.hover(|this| this.opacity(0.85)).on_click(cx.listener(
+                                            move |view, _, _, cx| {
+                                                view.select_thread_artifact(
+                                                    artifact_id.clone(),
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                    })
                             }),
                     )
             }))
             .into_any_element()
+    }
+
+    fn render_user_message_attachment_preview(
+        &self,
+        preview_image_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(image_path) = preview_image_path {
+            div()
+                .size(px(22.))
+                .flex_none()
+                .relative()
+                .overflow_hidden()
+                .rounded_full()
+                .bg(cx.theme().muted)
+                .child(
+                    img(image_path)
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .w_full()
+                        .h_full()
+                        .rounded_full()
+                        .object_fit(ObjectFit::Fill)
+                        .with_fallback(move || {
+                            div()
+                                .size(px(22.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(gpui_component::IconName::File)
+                                        .size_3()
+                                        .opacity(0.8),
+                                )
+                                .into_any_element()
+                        }),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .size(px(22.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(gpui_component::IconName::File)
+                        .size_3()
+                        .opacity(0.8),
+                )
+                .into_any_element()
+        }
     }
 }
 
@@ -173,6 +261,8 @@ fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<ParsedUs
         .iter()
         .map(|attachment| ParsedUserAttachment {
             display_name: display_name_from_attachment(attachment),
+            detail: detail_from_attachment(attachment),
+            artifact: artifact_from_attachment(attachment),
         })
         .collect()
 }
@@ -187,6 +277,7 @@ fn display_name_from_attachment(attachment: &UserMessageAttachment) -> String {
         | UserMessageAttachment::LocalFile { path }
         | UserMessageAttachment::LocalAudio { path }
         | UserMessageAttachment::LocalVideo { path } => path.as_str(),
+        UserMessageAttachment::Artifact { artifact } => return artifact.display_name.clone(),
     };
 
     if source.contains("://") || source.starts_with("data:") {
@@ -212,10 +303,41 @@ fn display_name_from_attachment(attachment: &UserMessageAttachment) -> String {
     }
 }
 
+fn detail_from_attachment(attachment: &UserMessageAttachment) -> Option<String> {
+    let UserMessageAttachment::Artifact { artifact } = attachment else {
+        return None;
+    };
+
+    let mut parts = vec![format!("{:?}", artifact.kind).to_ascii_lowercase()];
+    if let Some(size_bytes) = artifact.size_bytes {
+        parts.push(format_size(size_bytes));
+    }
+    Some(parts.join(" / "))
+}
+
+fn artifact_from_attachment(attachment: &UserMessageAttachment) -> Option<ArtifactRef> {
+    match attachment {
+        UserMessageAttachment::Artifact { artifact } => Some(artifact.clone()),
+        _ => None,
+    }
+}
+
+fn format_size(size_bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if size_bytes < 1024 {
+        format!("{size_bytes} B")
+    } else if size_bytes < 1024 * 1024 {
+        format!("{:.1} KB", size_bytes as f64 / KB)
+    } else {
+        format!("{:.1} MB", size_bytes as f64 / MB)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::display_name_from_attachment;
-    use pioneer_protocol::UserMessageAttachment;
+    use super::{artifact_from_attachment, detail_from_attachment, display_name_from_attachment};
+    use pioneer_protocol::{ArtifactKind, ArtifactRef, ArtifactStatus, UserMessageAttachment};
 
     #[test]
     fn display_name_uses_local_file_name() {
@@ -234,6 +356,35 @@ mod tests {
                 url: "https://example.com/path/to/file.mov?token=1".to_owned(),
             }),
             "file.mov"
+        );
+    }
+
+    #[test]
+    fn artifact_attachment_uses_artifact_display_name_and_detail() {
+        let attachment = UserMessageAttachment::Artifact {
+            artifact: ArtifactRef {
+                artifact_id: "art_1".to_owned(),
+                version_id: Some("av_1".to_owned()),
+                display_name: "report.pdf".to_owned(),
+                kind: ArtifactKind::Pdf,
+                mime_type: Some("application/pdf".to_owned()),
+                size_bytes: Some(2048),
+                sha256: None,
+                status: ArtifactStatus::Ready,
+                preview: None,
+            },
+        };
+
+        assert_eq!(display_name_from_attachment(&attachment), "report.pdf");
+        assert_eq!(
+            detail_from_attachment(&attachment).as_deref(),
+            Some("pdf / 2.0 KB")
+        );
+        assert_eq!(
+            artifact_from_attachment(&attachment)
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.as_str()),
+            Some("art_1")
         );
     }
 }

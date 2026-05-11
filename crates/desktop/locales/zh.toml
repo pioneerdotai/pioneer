@@ -92,6 +92,18 @@ images = "图片"
 task_output = "任务"
 uploaded = "已上传"
 
+[artifacts.preview_kind]
+json_summary = "JSON 摘要"
+pdf_text = "PDF 文本"
+plain_text = "文本预览"
+thumbnail = "缩略图"
+
+[artifacts.preview_status]
+failed = "失败"
+pending = "准备中"
+ready = "就绪"
+stale = "更新中"
+
 [artifacts.source]
 agent = "智能体"
 external_agent = "外部智能体"

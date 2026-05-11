@@ -75,6 +75,8 @@ impl PioneerDesktop {
             preferred_workspace_id: None,
             composer_state,
             composer_attachments: Vec::new(),
+            composer_upload_in_progress: false,
+            composer_upload_error: None,
             composer_turn_mode: ThreadMode::Agent,
             composer_selected_provider: None,
             composer_selected_model: None,
@@ -118,6 +120,9 @@ impl PioneerDesktop {
             thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
             thread_timeline_item_expanded: RefCell::new(HashSet::new()),
             thread_timeline_terminal_item: RefCell::new(HashMap::new()),
+            thread_artifacts: ThreadArtifactsState::default(),
+            show_thread_artifacts_sidebar: false,
+            thread_artifacts_sidebar_width: px(340.),
             ready_turn_resume_threads: VecDeque::new(),
             ready_turn_resume_thread_set: HashSet::new(),
             turn_timeline_refresh: HashMap::new(),
@@ -154,6 +159,7 @@ impl PioneerDesktop {
         view.sync_provider_sidebar_tree_state(cx);
         view.start_gateway_ws_event_pump(cx);
         view.bootstrap_gateway_runtime(cx);
+        view.prune_thread_artifact_preview_cache(cx);
 
         view
     }

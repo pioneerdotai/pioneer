@@ -144,11 +144,20 @@ impl PioneerDesktop {
                             })),
                     ),
             )
-            .child(if show_status_button {
-                self.render_active_thread_status_button()
-            } else {
-                div().into_any_element()
-            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(if show_status_button {
+                        self.render_active_thread_status_button()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if is_threads_view_active {
+                        self.render_thread_artifacts_sidebar_toggle_button(cx)
+                    } else {
+                        div().into_any_element()
+                    }),
+            )
             .into_any_element()
     }
 
@@ -177,6 +186,33 @@ impl PioneerDesktop {
                         .child(status_text.clone()),
                 )
             })
+            .into_any_element()
+    }
+
+    fn render_thread_artifacts_sidebar_toggle_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let artifacts_sidebar_icon = if self.show_thread_artifacts_sidebar {
+            IconName::PanelRightClose
+        } else {
+            IconName::PanelRightOpen
+        };
+
+        Button::new("bottom-bar-toggle-thread-artifacts-sidebar")
+            .ghost()
+            .small()
+            .compact()
+            .tooltip(t!("artifacts.title").to_string())
+            .child(
+                Icon::new(artifacts_sidebar_icon)
+                    .size_3p5()
+                    .opacity(0.6)
+                    .when(self.show_thread_artifacts_sidebar, |this| {
+                        this.opacity(1.0).text_color(cx.theme().blue)
+                    }),
+            )
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.show_thread_artifacts_sidebar = !view.show_thread_artifacts_sidebar;
+                cx.notify();
+            }))
             .into_any_element()
     }
 }

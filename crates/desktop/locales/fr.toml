@@ -92,6 +92,18 @@ images = "Images"
 task_output = "Taches"
 uploaded = "Televerses"
 
+[artifacts.preview_kind]
+json_summary = "Resume JSON"
+pdf_text = "Texte PDF"
+plain_text = "Apercu texte"
+thumbnail = "Miniature"
+
+[artifacts.preview_status]
+failed = "echec"
+pending = "preparation"
+ready = "pret"
+stale = "mise a jour"
+
 [artifacts.source]
 agent = "Agent"
 external_agent = "Agent externe"

@@ -92,6 +92,18 @@ images = "Изображения"
 task_output = "Задачи"
 uploaded = "Загруженные"
 
+[artifacts.preview_kind]
+json_summary = "JSON-сводка"
+pdf_text = "Текст PDF"
+plain_text = "Текстовое превью"
+thumbnail = "Миниатюра"
+
+[artifacts.preview_status]
+failed = "ошибка"
+pending = "готовится"
+ready = "готово"
+stale = "обновляется"
+
 [artifacts.source]
 agent = "Агент"
 external_agent = "Внешний агент"

@@ -15,7 +15,7 @@ impl PioneerDesktop {
                 self.apply_turn_started_notification(notification);
             }
             GatewayNotification::TurnCompleted(notification) => {
-                self.apply_turn_completed_notification(notification);
+                self.apply_turn_completed_notification(notification, cx);
             }
             GatewayNotification::TurnFailed(notification) => {
                 self.apply_turn_failed_notification(notification);
@@ -300,6 +300,28 @@ impl PioneerDesktop {
             GatewayNotification::McpServerCatalogChanged(notification) => {
                 self.apply_mcp_server_catalog_changed_notification(notification);
             }
+            GatewayNotification::ThreadArtifactsChanged(notification) => {
+                self.apply_thread_artifacts_changed_notification(notification, cx);
+            }
+            GatewayNotification::ArtifactCreated(notification) => {
+                if let Some(thread_id) = notification.artifact.primary_thread_id {
+                    self.refresh_thread_artifacts(thread_id, true, cx);
+                }
+            }
+            GatewayNotification::ArtifactUpdated(notification) => {
+                if let Some(thread_id) = notification.artifact.primary_thread_id {
+                    self.refresh_thread_artifacts(thread_id, true, cx);
+                }
+            }
+            GatewayNotification::ArtifactDeleted(notification) => {
+                self.refresh_current_thread_artifacts_if_contains(
+                    notification.artifact_id.as_str(),
+                    cx,
+                );
+            }
+            GatewayNotification::ArtifactProjectionUpdated(_)
+            | GatewayNotification::ArtifactUploadProgress(_)
+            | GatewayNotification::ArtifactDownloadProgress(_) => {}
             GatewayNotification::TurnTimelineChanged(notification) => {
                 self.refresh_turn_timeline(notification.thread_id, notification.turn_id, cx);
             }
@@ -394,6 +416,7 @@ impl PioneerDesktop {
     fn apply_turn_completed_notification(
         &mut self,
         notification: pioneer_protocol::TurnCompletedNotification,
+        cx: &mut Context<Self>,
     ) {
         let thread_id = notification.thread_id.clone();
         if let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str()) {
@@ -410,6 +433,7 @@ impl PioneerDesktop {
             let _ = conversation.tick();
         }
         self.reset_thread_resume_state(thread_id.as_str());
+        self.refresh_thread_artifacts(thread_id, true, cx);
     }
 
     fn apply_turn_failed_notification(

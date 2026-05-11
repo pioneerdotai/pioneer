@@ -92,6 +92,18 @@ images = "画像"
 task_output = "タスク"
 uploaded = "アップロード済み"
 
+[artifacts.preview_kind]
+json_summary = "JSONサマリー"
+pdf_text = "PDFテキスト"
+plain_text = "テキストプレビュー"
+thumbnail = "サムネイル"
+
+[artifacts.preview_status]
+failed = "失敗"
+pending = "準備中"
+ready = "準備完了"
+stale = "更新中"
+
 [artifacts.source]
 agent = "エージェント"
 external_agent = "外部エージェント"
