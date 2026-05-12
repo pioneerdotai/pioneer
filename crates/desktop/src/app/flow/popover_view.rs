@@ -38,7 +38,9 @@ impl PioneerDesktop {
         let gateway_hover_error = self.gateway.error.clone();
 
         let gateway_selection_locked = self.gateway.connecting;
+
         let active_indicator_color = cx.theme().success;
+        let inactive_indicator_color = cx.theme().yellow;
 
         let desktop_entity = cx.entity();
 
@@ -147,6 +149,7 @@ impl PioneerDesktop {
                 let gateway_option_style = gateway_option_style;
                 let gateway_option_active_style = gateway_option_active_style;
                 let active_indicator_color = active_indicator_color;
+                let inactive_indicator_color = inactive_indicator_color;
 
                 move |_, _window, popover_cx| {
                     let popover_entity = popover_cx.entity();
@@ -165,7 +168,7 @@ impl PioneerDesktop {
                         })
                         .when(!gateway_endpoints.is_empty(), |this| {
                             this.child(
-                                div().w_full().p_2().pb_0().children(
+                                v_flex().w_full().p_2().pb_0().gap_1().children(
                                     gateway_endpoints.iter().enumerate().map(
                                         |(index, endpoint)| {
                                             Self::render_gateways_popover_option(
@@ -176,6 +179,7 @@ impl PioneerDesktop {
                                                 gateway_option_style,
                                                 gateway_option_active_style,
                                                 active_indicator_color,
+                                                inactive_indicator_color,
                                                 desktop_entity.clone(),
                                                 popover_entity.clone(),
                                             )
@@ -237,6 +241,7 @@ impl PioneerDesktop {
         gateway_option_style: ButtonCustomVariant,
         gateway_option_active_style: ButtonCustomVariant,
         active_indicator_color: Hsla,
+        inactive_indicator_color: Hsla,
         desktop_entity: Entity<Self>,
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
@@ -299,6 +304,14 @@ impl PioneerDesktop {
                     .gap_3()
                     .when(is_active, |this| {
                         this.child(div().size(px(8.)).rounded_full().bg(active_indicator_color))
+                    })
+                    .when(!is_active, |this| {
+                        this.child(
+                            div()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(inactive_indicator_color),
+                        )
                     })
                     .child(
                         v_flex()
