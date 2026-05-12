@@ -15,7 +15,7 @@ use pioneer_agent::{
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
-    global_agent_memory_scope_key,
+    ThreadAgentsDocSaveReason, global_agent_memory_scope_key,
 };
 use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
 use pioneer_hooks::{
@@ -57,7 +57,9 @@ use pioneer_protocol::{
     TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
     TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
     TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
-    TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadClosedNotification,
+    TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
     ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
     ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
     ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
@@ -5469,6 +5471,376 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
     assert_eq!(turn_result.turn.status, TurnStatus::InProgress);
 }
 
+async fn start_agents_doc_prompt_test_thread(
+    processor: &MessageProcessor,
+    connection_id: crate::session::ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+) {
+    let request_id = generate_test_request_id("agdocpthrd", thread_id);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "name": "AGENTS.md prompt test"
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let _ = recv_response_by_id(rx, request_id.as_str()).await;
+    let _ = recv_notification_by_method(rx, events::THREAD_STARTED).await;
+}
+
+async fn start_agents_doc_prompt_test_turn(
+    processor: &MessageProcessor,
+    connection_id: crate::session::ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let request_id = generate_test_request_id("agdocpturn", turn_id);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "mode": "Agent",
+            "model": "test-model",
+            "model_provider": "capture-summary",
+            "input": [
+                {
+                    "type": "text",
+                    "text": "Use the prompt context"
+                }
+            ]
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let _ = recv_response_by_id(rx, request_id.as_str()).await;
+    let _ = wait_for_thread_manager_turn_status(
+        &processor.thread_manager,
+        thread_id,
+        turn_id,
+        TurnStatus::Completed,
+    )
+    .await;
+}
+
+#[test]
+fn agents_doc_turn_without_doc_omits_agents_md_prompt_section() {
+    run_thread_agents_doc_rpc_test(|| async {
+        let (tx, mut rx) = mpsc::channel(64);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "capture-summary",
+            capture_provider.clone(),
+        ));
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        );
+
+        let thread_id = "thr_agents_doc_prompt0";
+        let turn_id = "turn_agents_doc_prompt0";
+        start_agents_doc_prompt_test_thread(
+            &processor,
+            connection_id,
+            &mut rx,
+            workspace_id.as_str(),
+            thread_id,
+        )
+        .await;
+        start_agents_doc_prompt_test_turn(&processor, connection_id, &mut rx, thread_id, turn_id)
+            .await;
+
+        let requests = capture_provider.snapshot_requests();
+        let prompt = requests
+            .last()
+            .and_then(|request| request.compiled_prompt.as_ref())
+            .expect("provider request should include compiled prompt");
+        assert!(!prompt.dynamic_system_text.contains("## AGENTS.md"));
+
+        let (_, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn should load")
+            .expect("turn should exist");
+        let manifest = turn
+            .prompt_manifest
+            .expect("prompt manifest should be persisted");
+        assert!(
+            !manifest
+                .section_ids
+                .iter()
+                .any(|section_id| section_id == "agents_md"),
+            "prompt manifest should not include agents_md without an effective doc"
+        );
+        assert!(
+            !manifest
+                .hook_sources
+                .iter()
+                .any(|source| source.section_id.as_deref() == Some("agents_md")),
+            "prompt manifest should not include AGENTS.md hook source without an effective doc"
+        );
+    });
+}
+
+fn agents_doc_prompt_hook_source<'a>(
+    manifest: &'a PromptManifest,
+    doc: &pioneer_crud::ThreadAgentsDocRecord,
+) -> &'a PromptManifestHookSourceEntry {
+    let contribution_id = format!("thread_agents_doc.{}.v{}", doc.id, doc.version);
+    manifest
+        .hook_sources
+        .iter()
+        .find(|source| {
+            source.section_id.as_deref() == Some("agents_md")
+                && source.source.hook_id == "pioneer.thread_agents_doc_prompt"
+                && source.source.subscription_id
+                    == "pioneer.thread_agents_doc_prompt.turn_pre_prompt_compile"
+                && source.source.phase == PromptManifestHookPhase::TurnPrePromptCompile
+                && source.source.contribution_id.as_deref() == Some(contribution_id.as_str())
+                && source.contribution_kind == PromptManifestHookContributionKind::PromptSection
+        })
+        .expect("AGENTS.md prompt hook source should be persisted")
+}
+
+#[test]
+fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
+    run_thread_agents_doc_rpc_test(|| async {
+        let (tx, mut rx) = mpsc::channel(96);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "capture-summary",
+            capture_provider.clone(),
+        ));
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        );
+
+        let thread_id = "thr_agents_doc_prompt1";
+        start_agents_doc_prompt_test_thread(
+            &processor,
+            connection_id,
+            &mut rx,
+            workspace_id.as_str(),
+            thread_id,
+        )
+        .await;
+
+        let root_doc = crud_store
+            .save_thread_agents_doc(
+                workspace_id.as_str(),
+                None,
+                "Root only instruction",
+                None,
+                None,
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("root AGENTS.md should save");
+
+        start_agents_doc_prompt_test_turn(
+            &processor,
+            connection_id,
+            &mut rx,
+            thread_id,
+            "turn_agents_doc_prompt1",
+        )
+        .await;
+        let root_prompt = capture_provider
+            .snapshot_requests()
+            .last()
+            .and_then(|request| request.compiled_prompt.as_ref())
+            .expect("root provider request should include compiled prompt")
+            .dynamic_system_text
+            .clone();
+        assert!(root_prompt.contains("## AGENTS.md"));
+        assert!(root_prompt.contains("Source: thread tree / <root>"));
+        assert!(root_prompt.contains("Root only instruction"));
+
+        let (_, root_turn) = crud_store
+            .get_turn(thread_id, "turn_agents_doc_prompt1")
+            .await
+            .expect("root turn should load")
+            .expect("root turn should exist");
+        let root_manifest = root_turn
+            .prompt_manifest
+            .expect("root prompt manifest should be persisted");
+        let root_source = agents_doc_prompt_hook_source(&root_manifest, &root_doc);
+        assert_eq!(root_source.source_count, Some(1));
+        assert_eq!(root_source.truncation, PromptManifestHookTruncation::None);
+        assert!(root_source.source.contribution_hash.is_some());
+
+        let child_folder = crud_store
+            .create_thread_folder(workspace_id.as_str(), None, "Child")
+            .await
+            .expect("child folder should be created");
+        crud_store
+            .move_thread_to_folder(
+                workspace_id.as_str(),
+                thread_id,
+                Some(child_folder.id.as_str()),
+            )
+            .await
+            .expect("thread should move to child folder");
+
+        start_agents_doc_prompt_test_turn(
+            &processor,
+            connection_id,
+            &mut rx,
+            thread_id,
+            "turn_agents_doc_prompt2",
+        )
+        .await;
+        let inherited_prompt = capture_provider
+            .snapshot_requests()
+            .last()
+            .and_then(|request| request.compiled_prompt.as_ref())
+            .expect("inherited provider request should include compiled prompt")
+            .dynamic_system_text
+            .clone();
+        assert!(inherited_prompt.contains("Root only instruction"));
+        assert!(inherited_prompt.contains("Scope: applies to this thread"));
+
+        let folder_doc = crud_store
+            .save_thread_agents_doc(
+                workspace_id.as_str(),
+                Some(child_folder.id.as_str()),
+                "Folder only instruction",
+                None,
+                None,
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("folder AGENTS.md should save");
+
+        start_agents_doc_prompt_test_turn(
+            &processor,
+            connection_id,
+            &mut rx,
+            thread_id,
+            "turn_agents_doc_prompt3",
+        )
+        .await;
+        let folder_prompt = capture_provider
+            .snapshot_requests()
+            .last()
+            .and_then(|request| request.compiled_prompt.as_ref())
+            .expect("folder provider request should include compiled prompt")
+            .dynamic_system_text
+            .clone();
+        assert!(folder_prompt.contains("Source: thread tree / Child"));
+        assert!(folder_prompt.contains("Folder only instruction"));
+        assert!(!folder_prompt.contains("Root only instruction"));
+
+        let (_, folder_turn) = crud_store
+            .get_turn(thread_id, "turn_agents_doc_prompt3")
+            .await
+            .expect("turn should load")
+            .expect("turn should exist");
+        let manifest = folder_turn
+            .prompt_manifest
+            .expect("prompt manifest should be persisted");
+        assert!(
+            manifest
+                .section_ids
+                .iter()
+                .any(|section_id| section_id == "agents_md"),
+            "prompt manifest should include agents_md when an effective doc exists"
+        );
+        let source = agents_doc_prompt_hook_source(&manifest, &folder_doc);
+        assert_eq!(source.source_count, Some(1));
+        assert_eq!(source.truncation, PromptManifestHookTruncation::None);
+
+        let turn_get_request = json!({
+            "jsonrpc": "2.0",
+            "id": "getagentsdocprompt003",
+            "method": "turn/get",
+            "params": {
+                "thread_id": thread_id,
+                "turn_id": "turn_agents_doc_prompt3"
+            }
+        });
+        processor
+            .process_request(connection_id, &turn_get_request.to_string())
+            .await;
+        let response = recv_response_by_id(&mut rx, "getagentsdocprompt003").await;
+        let turn_get: TurnGetResponse =
+            serde_json::from_value(response.result).expect("turn/get result should decode");
+        let returned_manifest = turn_get
+            .turn
+            .prompt_manifest
+            .expect("turn/get should return prompt manifest");
+        assert_eq!(returned_manifest.hook_sources, manifest.hook_sources);
+
+        let updated_folder_doc = crud_store
+            .save_thread_agents_doc(
+                workspace_id.as_str(),
+                Some(child_folder.id.as_str()),
+                "Folder instruction after turn",
+                Some(folder_doc.version),
+                None,
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("folder AGENTS.md should update");
+        assert_ne!(updated_folder_doc.version, folder_doc.version);
+
+        let (_, folder_turn_after_doc_change) = crud_store
+            .get_turn(thread_id, "turn_agents_doc_prompt3")
+            .await
+            .expect("turn should load after doc change")
+            .expect("turn should exist after doc change");
+        let manifest_after_doc_change = folder_turn_after_doc_change
+            .prompt_manifest
+            .expect("prompt manifest should remain persisted after doc change");
+        let source_after_doc_change =
+            agents_doc_prompt_hook_source(&manifest_after_doc_change, &folder_doc);
+        assert_eq!(source_after_doc_change.source_count, Some(1));
+        let updated_contribution_id = format!(
+            "thread_agents_doc.{}.v{}",
+            updated_folder_doc.id, updated_folder_doc.version
+        );
+        assert_ne!(
+            source_after_doc_change.source.contribution_id.as_deref(),
+            Some(updated_contribution_id.as_str())
+        );
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -5582,139 +5954,141 @@ async fn agent_skill_audit_event_persists_audit_rows() {
     assert!(snapshots[0].diagnostics_json.contains("\"name\":\"node\""));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
-    let (tx, mut rx) = mpsc::channel(8);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = session_manager.register_connection(tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    );
+#[test]
+fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
+    run_gateway_message_test_with_large_stack("prompt-manifest-hook-sources", || async {
+        let (tx, mut rx) = mpsc::channel(8);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let processor = MessageProcessor::new(
+            thread_manager.clone(),
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        );
 
-    let thread_id = "thr_000000000000000090";
-    let turn_id = "turn_000000000000000090";
+        let thread_id = "thr_000000000000000090";
+        let turn_id = "turn_000000000000000090";
 
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": "aaaaaaaaaaaaaaaaaaaaa",
-        "method": "thread/start",
-        "params": {
-            "thread_id": thread_id,
-            "workspace_id": workspace_id
-        }
+        let thread_start_request = json!({
+            "jsonrpc": "2.0",
+            "id": "aaaaaaaaaaaaaaaaaaaaa",
+            "method": "thread/start",
+            "params": {
+                "thread_id": thread_id,
+                "workspace_id": workspace_id
+            }
+        });
+        processor
+            .process_request(connection_id, &thread_start_request.to_string())
+            .await;
+        let _ = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
+        let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+        let turn_start_request = json!({
+            "jsonrpc": "2.0",
+            "id": "bbbbbbbbbbbbbbbbbbbbb",
+            "method": "turn/start",
+            "params": {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "input": [{"type": "text", "text": "manifest me"}]
+            }
+        });
+        processor
+            .process_request(connection_id, &turn_start_request.to_string())
+            .await;
+        let _ = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+        let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+
+        let manifest = PromptManifest {
+            compiler_version: "0.1.0-test".to_owned(),
+            profile: PromptManifestProfile::AssistantFull,
+            section_ids: vec![
+                "identity_base".to_owned(),
+                "assistant_safety".to_owned(),
+                "soul_core".to_owned(),
+                "identity_core".to_owned(),
+                "user_persona".to_owned(),
+            ],
+            fingerprint_stable: "stable-fp".to_owned(),
+            fingerprint_dynamic: "dynamic-fp".to_owned(),
+            fingerprint_full: "full-fp".to_owned(),
+            diagnostics: vec![PromptManifestDiagnostic {
+                code: PromptManifestDiagnosticCode::MissingFile,
+                message: "bootstrap file `SOUL.md` is missing".to_owned(),
+                file: Some("/tmp/SOUL.md".to_owned()),
+                section_id: None,
+                hook_source: Some(PromptManifestHookSource {
+                    hook_id: "test.prompt_manifest_hook".to_owned(),
+                    subscription_id: "test.prompt_manifest_subscription".to_owned(),
+                    phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                    contribution_id: None,
+                    contribution_hash: Some("sha256:gatewaydiagnostic".to_owned()),
+                }),
+            }],
+            hook_sources: vec![PromptManifestHookSourceEntry {
+                source: PromptManifestHookSource {
+                    hook_id: "test.prompt_manifest_hook".to_owned(),
+                    subscription_id: "test.prompt_manifest_subscription".to_owned(),
+                    phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                    contribution_id: None,
+                    contribution_hash: Some("sha256:gatewaysource".to_owned()),
+                },
+                section_id: Some("identity_base".to_owned()),
+                contribution_kind: PromptManifestHookContributionKind::PromptSection,
+                priority: Some(10),
+                source_count: Some(1),
+                truncation: PromptManifestHookTruncation::None,
+            }],
+        };
+
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                manifest: manifest.clone(),
+            })
+            .await;
+
+        let (_, in_memory_turn) = thread_manager
+            .turn_get(thread_id, turn_id)
+            .await
+            .expect("turn should exist in thread manager");
+        assert_eq!(in_memory_turn.prompt_manifest, Some(manifest.clone()));
+
+        let (_, persisted_turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn/get from crud should succeed")
+            .expect("turn must be persisted");
+        assert_eq!(persisted_turn.prompt_manifest, Some(manifest.clone()));
+
+        let turn_get_request = json!({
+            "jsonrpc": "2.0",
+            "id": "ccccccccccccccccccccc",
+            "method": "turn/get",
+            "params": {
+                "thread_id": thread_id,
+                "turn_id": turn_id
+            }
+        });
+        processor
+            .process_request(connection_id, &turn_get_request.to_string())
+            .await;
+        let response = recv_response_by_id(&mut rx, "ccccccccccccccccccccc").await;
+        let turn_get: TurnGetResponse =
+            serde_json::from_value(response.result).expect("turn/get result should decode");
+
+        assert_eq!(turn_get.turn.prompt_manifest, Some(manifest));
     });
-    processor
-        .process_request(connection_id, &thread_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
-    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": "bbbbbbbbbbbbbbbbbbbbb",
-        "method": "turn/start",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "input": [{"type": "text", "text": "manifest me"}]
-        }
-    });
-    processor
-        .process_request(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
-
-    let manifest = PromptManifest {
-        compiler_version: "0.1.0-test".to_owned(),
-        profile: PromptManifestProfile::AssistantFull,
-        section_ids: vec![
-            "identity_base".to_owned(),
-            "assistant_safety".to_owned(),
-            "soul_core".to_owned(),
-            "identity_core".to_owned(),
-            "user_persona".to_owned(),
-        ],
-        fingerprint_stable: "stable-fp".to_owned(),
-        fingerprint_dynamic: "dynamic-fp".to_owned(),
-        fingerprint_full: "full-fp".to_owned(),
-        diagnostics: vec![PromptManifestDiagnostic {
-            code: PromptManifestDiagnosticCode::MissingFile,
-            message: "bootstrap file `SOUL.md` is missing".to_owned(),
-            file: Some("/tmp/SOUL.md".to_owned()),
-            section_id: None,
-            hook_source: Some(PromptManifestHookSource {
-                hook_id: "test.prompt_manifest_hook".to_owned(),
-                subscription_id: "test.prompt_manifest_subscription".to_owned(),
-                phase: PromptManifestHookPhase::TurnPrePromptCompile,
-                contribution_id: None,
-                contribution_hash: Some("sha256:gatewaydiagnostic".to_owned()),
-            }),
-        }],
-        hook_sources: vec![PromptManifestHookSourceEntry {
-            source: PromptManifestHookSource {
-                hook_id: "test.prompt_manifest_hook".to_owned(),
-                subscription_id: "test.prompt_manifest_subscription".to_owned(),
-                phase: PromptManifestHookPhase::TurnPrePromptCompile,
-                contribution_id: None,
-                contribution_hash: Some("sha256:gatewaysource".to_owned()),
-            },
-            section_id: Some("identity_base".to_owned()),
-            contribution_kind: PromptManifestHookContributionKind::PromptSection,
-            priority: Some(10),
-            source_count: Some(1),
-            truncation: PromptManifestHookTruncation::None,
-        }],
-    };
-
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::PromptManifestCompiled {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            manifest: manifest.clone(),
-        })
-        .await;
-
-    let (_, in_memory_turn) = thread_manager
-        .turn_get(thread_id, turn_id)
-        .await
-        .expect("turn should exist in thread manager");
-    assert_eq!(in_memory_turn.prompt_manifest, Some(manifest.clone()));
-
-    let (_, persisted_turn) = crud_store
-        .get_turn(thread_id, turn_id)
-        .await
-        .expect("turn/get from crud should succeed")
-        .expect("turn must be persisted");
-    assert_eq!(persisted_turn.prompt_manifest, Some(manifest.clone()));
-
-    let turn_get_request = json!({
-        "jsonrpc": "2.0",
-        "id": "ccccccccccccccccccccc",
-        "method": "turn/get",
-        "params": {
-            "thread_id": thread_id,
-            "turn_id": turn_id
-        }
-    });
-    processor
-        .process_request(connection_id, &turn_get_request.to_string())
-        .await;
-    let response = recv_response_by_id(&mut rx, "ccccccccccccccccccccc").await;
-    let turn_get: TurnGetResponse =
-        serde_json::from_value(response.result).expect("turn/get result should decode");
-
-    assert_eq!(turn_get.turn.prompt_manifest, Some(manifest));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6770,6 +7144,509 @@ async fn thread_tree_changed_is_broadcast_to_other_connections() {
         .and_then(serde_json::Value::as_str)
         .expect("workspace_id should exist");
     assert_eq!(receiver_workspace, workspace_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_tree_includes_agents_doc_summaries_without_content() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let empty_tree_request = json!({
+        "jsonrpc": "2.0",
+            "id": "aaaaaaaaaaaaaaaaaaaaa",
+        "method": "thread/tree",
+        "params": {
+            "workspace_id": workspace_id
+        }
+    });
+    processor
+        .process_request(connection_id, &empty_tree_request.to_string())
+        .await;
+    let empty_tree_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
+    let empty_tree: ThreadTreeResponse =
+        serde_json::from_value(empty_tree_response.result).expect("empty tree should decode");
+    assert!(empty_tree.agents_docs.is_empty());
+    assert!(empty_tree.threads.is_empty());
+    assert!(empty_tree.placements.is_empty());
+
+    let active_folder = crud_store
+        .create_thread_folder(workspace_id.as_str(), None, "Active")
+        .await
+        .expect("active folder should be created");
+    let draft_folder = crud_store
+        .create_thread_folder(workspace_id.as_str(), None, "Draft")
+        .await
+        .expect("draft folder should be created");
+    let archived_folder = crud_store
+        .create_thread_folder(workspace_id.as_str(), None, "Archived")
+        .await
+        .expect("archived folder should be created");
+
+    let root_content = "# Root AGENTS.md\n";
+    let active_content = "# Folder AGENTS.md\n";
+    let root_doc = crud_store
+        .save_thread_agents_doc(
+            workspace_id.as_str(),
+            None,
+            root_content,
+            None,
+            None,
+            ThreadAgentsDocSaveReason::Manual,
+        )
+        .await
+        .expect("root doc should save");
+    let active_doc = crud_store
+        .save_thread_agents_doc(
+            workspace_id.as_str(),
+            Some(active_folder.id.as_str()),
+            active_content,
+            None,
+            None,
+            ThreadAgentsDocSaveReason::Manual,
+        )
+        .await
+        .expect("active folder doc should save");
+    let draft_doc = crud_store
+        .create_thread_agents_doc_draft(workspace_id.as_str(), Some(draft_folder.id.as_str()), None)
+        .await
+        .expect("draft folder doc should be created");
+    let archived_doc = crud_store
+        .save_thread_agents_doc(
+            workspace_id.as_str(),
+            Some(archived_folder.id.as_str()),
+            "# Archived AGENTS.md\n",
+            None,
+            None,
+            ThreadAgentsDocSaveReason::Manual,
+        )
+        .await
+        .expect("archived folder doc should save");
+    crud_store
+        .archive_thread_agents_doc(
+            workspace_id.as_str(),
+            Some(archived_folder.id.as_str()),
+            Some(archived_doc.version),
+            None,
+        )
+        .await
+        .expect("archived folder doc should archive");
+
+    let tree_request = json!({
+        "jsonrpc": "2.0",
+            "id": "bbbbbbbbbbbbbbbbbbbbb",
+        "method": "thread/tree",
+        "params": {
+            "workspace_id": workspace_id
+        }
+    });
+    processor
+        .process_request(connection_id, &tree_request.to_string())
+        .await;
+    let tree_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let tree_result = tree_response.result.clone();
+    let raw_summaries = tree_result
+        .get("agents_docs")
+        .and_then(serde_json::Value::as_array)
+        .expect("agents_docs should be an array");
+    assert!(
+        raw_summaries
+            .iter()
+            .all(|summary| summary.get("content").is_none()),
+        "thread/tree must not include full AGENTS.md content"
+    );
+
+    let tree: ThreadTreeResponse =
+        serde_json::from_value(tree_response.result).expect("tree should decode");
+    assert_eq!(tree.folders.len(), 3);
+    assert_eq!(tree.agents_docs.len(), 3);
+    assert!(tree.threads.is_empty());
+    assert!(tree.placements.is_empty());
+
+    let root_summary = tree
+        .agents_docs
+        .iter()
+        .find(|summary| summary.folder_id.is_none())
+        .expect("root summary should be present");
+    assert_eq!(root_summary.id, root_doc.id);
+    assert_eq!(root_summary.status, ThreadAgentsDocStatus::Active);
+    assert_eq!(root_summary.char_count, root_content.chars().count());
+
+    let folder_summary = tree
+        .agents_docs
+        .iter()
+        .find(|summary| summary.folder_id.as_deref() == Some(active_folder.id.as_str()))
+        .expect("active folder summary should be present");
+    assert_eq!(folder_summary.id, active_doc.id);
+    assert_eq!(folder_summary.status, ThreadAgentsDocStatus::Active);
+    assert_eq!(folder_summary.char_count, active_content.chars().count());
+
+    let draft_summary = tree
+        .agents_docs
+        .iter()
+        .find(|summary| summary.folder_id.as_deref() == Some(draft_folder.id.as_str()))
+        .expect("draft folder summary should be present");
+    assert_eq!(draft_summary.id, draft_doc.id);
+    assert_eq!(draft_summary.status, ThreadAgentsDocStatus::Draft);
+    assert_eq!(draft_summary.char_count, 0);
+
+    assert!(
+        tree.agents_docs
+            .iter()
+            .all(|summary| { summary.folder_id.as_deref() != Some(archived_folder.id.as_str()) }),
+        "archived AGENTS.md summaries should be hidden from thread/tree"
+    );
+}
+
+fn run_gateway_message_test_with_large_stack<F, Fut>(name: &str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(test());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should finish");
+}
+
+fn run_thread_agents_doc_rpc_test<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    run_gateway_message_test_with_large_stack("thread-agents-doc-rpc-test", test);
+}
+
+#[test]
+fn thread_agents_doc_rpc_saves_inherits_archives_and_resolves_for_thread() {
+    run_thread_agents_doc_rpc_test(|| async {
+        let (tx, mut rx) = mpsc::channel(128);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let processor = MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        );
+
+        let empty_get = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocgetempty0001",
+            "method": "thread/agents_doc/get",
+            "params": {
+                "workspace_id": workspace_id
+            }
+        });
+        processor
+            .process_request(connection_id, &empty_get.to_string())
+            .await;
+        let empty_get_response = recv_response_by_id(&mut rx, "agentsdocgetempty0001").await;
+        let empty_get: ThreadAgentsDocGetResponse =
+            serde_json::from_value(empty_get_response.result).expect("empty get should decode");
+        assert!(empty_get.explicit.is_none());
+        assert!(empty_get.effective.is_none());
+
+        let save_root = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocsaveroot0001",
+            "method": "thread/agents_doc/save",
+            "params": {
+                "workspace_id": workspace_id,
+                "content": "# Root instructions\nUse root context.\n",
+                "save_reason": "manual"
+            }
+        });
+        processor
+            .process_request(connection_id, &save_root.to_string())
+            .await;
+        let (save_root_response, save_root_changed) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            "agentsdocsaveroot0001",
+            events::THREAD_AGENTS_DOC_CHANGED,
+        )
+        .await;
+        let save_root: ThreadAgentsDocSaveResponse =
+            serde_json::from_value(save_root_response.result).expect("root save should decode");
+        assert_eq!(save_root.doc.status, ThreadAgentsDocStatus::Active);
+        assert!(save_root.doc.folder_id.is_none());
+        assert_eq!(save_root.doc.version, 2);
+        let save_root_changed_params = save_root_changed
+            .params
+            .expect("agents doc changed params expected");
+        assert_eq!(
+            save_root_changed_params
+                .get("effective_changed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+
+        let folder_create = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocfolder000001",
+            "method": "thread/folder/create",
+            "params": {
+                "workspace_id": workspace_id,
+                "name": "Child"
+            }
+        });
+        processor
+            .process_request(connection_id, &folder_create.to_string())
+            .await;
+        let folder_response = recv_response_by_id(&mut rx, "agentsdocfolder000001").await;
+        let folder: ThreadFolderCreateResponse =
+            serde_json::from_value(folder_response.result).expect("folder create should decode");
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+
+        let get_child = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocgetchild0001",
+            "method": "thread/agents_doc/get",
+            "params": {
+                "workspace_id": workspace_id,
+                "folder_id": folder.folder.id
+            }
+        });
+        processor
+            .process_request(connection_id, &get_child.to_string())
+            .await;
+        let get_child_response = recv_response_by_id(&mut rx, "agentsdocgetchild0001").await;
+        let child_context: ThreadAgentsDocGetResponse =
+            serde_json::from_value(get_child_response.result).expect("child get should decode");
+        assert!(child_context.explicit.is_none());
+        let child_effective = child_context
+            .effective
+            .expect("child should inherit root AGENTS.md");
+        assert!(child_effective.inherited);
+        assert!(child_effective.source_folder_id.is_none());
+        assert_eq!(child_effective.doc.content, save_root.doc.content);
+
+        let save_child = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocsavechild001",
+            "method": "thread/agents_doc/save",
+            "params": {
+                "workspace_id": workspace_id,
+                "folder_id": folder.folder.id,
+                "content": "# Child instructions\nUse child context.\n"
+            }
+        });
+        processor
+            .process_request(connection_id, &save_child.to_string())
+            .await;
+        let (save_child_response, _) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            "agentsdocsavechild001",
+            events::THREAD_AGENTS_DOC_CHANGED,
+        )
+        .await;
+        let save_child: ThreadAgentsDocSaveResponse =
+            serde_json::from_value(save_child_response.result).expect("child save should decode");
+        assert_eq!(save_child.doc.status, ThreadAgentsDocStatus::Active);
+        assert_eq!(save_child.doc.folder_id, Some(folder.folder.id.clone()));
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+
+        let thread_id = "thr_agents_doc_rpc_001";
+        let start_thread = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocthread000001",
+            "method": "thread/start",
+            "params": {
+                "workspace_id": workspace_id,
+                "thread_id": thread_id
+            }
+        });
+        processor
+            .process_request(connection_id, &start_thread.to_string())
+            .await;
+        let _thread_start = recv_response_by_id(&mut rx, "agentsdocthread000001").await;
+        let _thread_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+        let move_thread = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocmove00000001",
+            "method": "thread/move",
+            "params": {
+                "workspace_id": workspace_id,
+                "thread_id": thread_id,
+                "folder_id": folder.folder.id
+            }
+        });
+        processor
+            .process_request(connection_id, &move_thread.to_string())
+            .await;
+        let move_response = recv_response_by_id(&mut rx, "agentsdocmove00000001").await;
+        let move_result: ThreadMoveResponse =
+            serde_json::from_value(move_response.result).expect("thread move should decode");
+        assert!(move_result.moved);
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+
+        let resolve_thread = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocresolve00001",
+            "method": "thread/agents_doc/resolve_for_thread",
+            "params": {
+                "workspace_id": workspace_id,
+                "thread_id": thread_id
+            }
+        });
+        processor
+            .process_request(connection_id, &resolve_thread.to_string())
+            .await;
+        let resolve_response = recv_response_by_id(&mut rx, "agentsdocresolve00001").await;
+        let resolved: ThreadAgentsDocResolveForThreadResponse =
+            serde_json::from_value(resolve_response.result).expect("thread resolve should decode");
+        let resolved = resolved.effective.expect("thread should resolve child doc");
+        assert!(!resolved.inherited);
+        assert_eq!(resolved.source_folder_id, Some(folder.folder.id.clone()));
+        assert_eq!(resolved.doc.content, save_child.doc.content);
+
+        let archive_child = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocarchive00001",
+            "method": "thread/agents_doc/archive",
+            "params": {
+                "workspace_id": workspace_id,
+                "folder_id": folder.folder.id,
+                "expected_version": save_child.doc.version
+            }
+        });
+        processor
+            .process_request(connection_id, &archive_child.to_string())
+            .await;
+        let (archive_response, _) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            "agentsdocarchive00001",
+            events::THREAD_AGENTS_DOC_CHANGED,
+        )
+        .await;
+        let archive: ThreadAgentsDocArchiveResponse =
+            serde_json::from_value(archive_response.result).expect("archive should decode");
+        assert!(archive.archived);
+        let fallback = archive.effective.expect("child should fall back to root");
+        assert!(fallback.inherited);
+        assert!(fallback.source_folder_id.is_none());
+        assert_eq!(fallback.doc.content, save_root.doc.content);
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    });
+}
+
+#[test]
+fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
+    run_thread_agents_doc_rpc_test(|| async {
+        let (tx, mut rx) = mpsc::channel(32);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let processor = MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        );
+
+        let oversized_content = "x".repeat(64 * 1024 + 1);
+        let oversized_save = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocoversize0001",
+            "method": "thread/agents_doc/save",
+            "params": {
+                "workspace_id": workspace_id,
+                "content": oversized_content
+            }
+        });
+        processor
+            .process_request(connection_id, &oversized_save.to_string())
+            .await;
+        let oversized_error = recv_error_by_id(&mut rx, "agentsdocoversize0001").await;
+        assert_eq!(
+            oversized_error.error.code,
+            pioneer_protocol::INVALID_PARAMS_CODE
+        );
+
+        let save_root = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocversion00001",
+            "method": "thread/agents_doc/save",
+            "params": {
+                "workspace_id": workspace_id,
+                "content": "# Root\n"
+            }
+        });
+        processor
+            .process_request(connection_id, &save_root.to_string())
+            .await;
+        let (save_response, _) = recv_response_and_notification_by_id_method(
+            &mut rx,
+            "agentsdocversion00001",
+            events::THREAD_AGENTS_DOC_CHANGED,
+        )
+        .await;
+        let save: ThreadAgentsDocSaveResponse =
+            serde_json::from_value(save_response.result).expect("save should decode");
+        let _tree_changed = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+
+        let conflict_save = json!({
+            "jsonrpc": "2.0",
+            "id": "agentsdocconflict0001",
+            "method": "thread/agents_doc/save",
+            "params": {
+                "workspace_id": workspace_id,
+                "content": "# Changed\n",
+                "expected_version": save.doc.version + 1
+            }
+        });
+        processor
+            .process_request(connection_id, &conflict_save.to_string())
+            .await;
+        let conflict_error = recv_error_by_id(&mut rx, "agentsdocconflict0001").await;
+        assert_eq!(
+            conflict_error.error.code,
+            pioneer_protocol::INVALID_REQUEST_CODE
+        );
+        assert!(
+            conflict_error.error.message.contains("version conflict"),
+            "version conflict should be explicit in error message"
+        );
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10148,6 +11025,7 @@ fn phase_13_prompt_section_contribution() -> HookContribution {
         content: HookPromptContent::new("this must not enter the summary prompt")
             .expect("valid prompt content"),
         max_chars: None,
+        source_refs: Vec::new(),
         diagnostics: Vec::new(),
         truncated: false,
     })
@@ -12995,7 +13873,7 @@ async fn wait_for_thread_manager_turn_status(
     let last = thread_manager
         .turn_get(thread_id, turn_id)
         .await
-        .map(|(_workspace_id, turn)| turn.status);
+        .map(|(_workspace_id, turn)| (turn.status, turn.error));
     panic!(
         "timed out waiting for turn `{turn_id}` in thread `{thread_id}` status `{expected_status:?}`, last={last:?}"
     );

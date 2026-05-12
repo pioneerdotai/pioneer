@@ -15,7 +15,8 @@ use pioneer_protocol::{
     SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
     TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
     TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
-    TurnCancelParams, TurnTimelineParams,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocSaveParams, TurnCancelParams, TurnTimelineParams,
 };
 
 impl MessageProcessor {
@@ -386,6 +387,103 @@ impl MessageProcessor {
                                 format!(
                                     "invalid params for `{}`: {error}",
                                     methods::THREAD_FOLDER_DELETE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_AGENTS_DOC_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadAgentsDocGetParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_agents_doc_get(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_AGENTS_DOC_GET
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_AGENTS_DOC_SAVE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadAgentsDocSaveParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_agents_doc_save(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_AGENTS_DOC_SAVE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_AGENTS_DOC_ARCHIVE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadAgentsDocArchiveParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_agents_doc_archive(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_AGENTS_DOC_ARCHIVE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadAgentsDocResolveForThreadParams>(params_value)
+                {
+                    Ok(params) => {
+                        self.thread_agents_doc_resolve_for_thread(
+                            connection_id,
+                            request.id,
+                            params,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
                                 ),
                             ),
                         )

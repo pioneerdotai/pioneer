@@ -495,6 +495,7 @@ mod tests {
                     priority: 0,
                     content: HookPromptContent::new(self.secret.clone()).expect("valid content"),
                     max_chars: None,
+                    source_refs: Vec::new(),
                     diagnostics: Vec::new(),
                     truncated: false,
                 })],

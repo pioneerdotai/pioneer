@@ -312,11 +312,35 @@ impl MessageProcessor {
             }
         };
 
+        let agents_docs = match self
+            .crud_store
+            .list_thread_agents_doc_summaries(workspace_id.as_str())
+            .await
+        {
+            Ok(summaries) => summaries
+                .into_iter()
+                .map(Self::thread_tree_agents_doc_summary_from_record)
+                .collect(),
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load thread AGENTS.md summaries: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
         let response_payload = ThreadTreeResponse {
             workspace_id,
             threads,
             folders,
             placements,
+            agents_docs,
         };
 
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
@@ -1142,6 +1166,31 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+    }
+
+    fn thread_tree_agents_doc_summary_from_record(
+        record: pioneer_crud::ThreadAgentsDocSummaryRecord,
+    ) -> ThreadAgentsDocSummary {
+        ThreadAgentsDocSummary {
+            id: record.id,
+            workspace_id: record.workspace_id,
+            folder_id: record.folder_id,
+            status: Self::thread_tree_agents_doc_status_from_record(record.status),
+            content_sha256: record.content_sha256,
+            version: record.version,
+            char_count: record.char_count,
+            updated_at: record.updated_at_unix,
+        }
+    }
+
+    fn thread_tree_agents_doc_status_from_record(
+        status: pioneer_crud::ThreadAgentsDocStatus,
+    ) -> ThreadAgentsDocStatus {
+        match status {
+            pioneer_crud::ThreadAgentsDocStatus::Draft => ThreadAgentsDocStatus::Draft,
+            pioneer_crud::ThreadAgentsDocStatus::Active => ThreadAgentsDocStatus::Active,
+            pioneer_crud::ThreadAgentsDocStatus::Archived => ThreadAgentsDocStatus::Archived,
+        }
     }
 
     pub(super) async fn thread_unsubscribe(

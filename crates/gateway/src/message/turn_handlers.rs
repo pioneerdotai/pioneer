@@ -110,6 +110,8 @@ impl MessageProcessor {
         )
         .await;
 
+        self.ensure_hook_runtime_with_run_store().await;
+
         if let Err(error) = self
             .agent_manager
             .ensure_thread(

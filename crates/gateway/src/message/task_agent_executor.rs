@@ -210,6 +210,7 @@ impl TaskAgentExecutor {
             )
             .await?;
 
+        processor.ensure_hook_runtime_with_run_store().await;
         processor
             .agent_manager
             .ensure_thread(child_thread_id.as_str(), context.workspace_id.as_str())
@@ -419,6 +420,7 @@ impl TaskAgentExecutor {
             return Err(error).context("failed to validate restored task artifact input");
         }
 
+        processor.ensure_hook_runtime_with_run_store().await;
         processor
             .agent_manager
             .ensure_thread(lineage.child_thread_id.as_str(), task.workspace_id.as_str())

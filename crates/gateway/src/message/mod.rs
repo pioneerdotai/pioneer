@@ -18,6 +18,8 @@ mod task_handlers;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod thread_agents_doc_handlers;
+mod thread_agents_doc_prompt_hook;
 mod thread_handlers;
 mod turn_handlers;
 mod workspace_handlers;
@@ -25,6 +27,7 @@ mod workspace_handlers;
 pub use summary::SummaryConfig;
 
 use crate::hook_run_store::CrudHookRunStore;
+use crate::message::thread_agents_doc_prompt_hook::install_thread_agents_doc_prompt_hook;
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
@@ -61,18 +64,24 @@ use pioneer_protocol::{
     TaskDeliveryMode, TaskDetachParams, TaskDetachResponse, TaskEventsParams, TaskGetParams,
     TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
     TaskTreeParams as TaskTreeTaskParams, TaskTrigger, TaskTurnItem, TaskWaitParams,
-    TaskWaitResponse, ThreadArtifactsChangedNotification, ThreadFolderCreateParams,
-    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
-    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
-    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload, TurnCancelParams,
-    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
-    TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
-    TurnStartParams, TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason,
-    TurnTimelineParams, TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    TaskWaitResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadArtifactsChangedNotification,
+    ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
+    ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
+    ThreadGetResponse, ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams,
+    ThreadMoveResponse, ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams,
+    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUpdatedNotification, TimelineItem,
+    TimelineLane, TimelineOrigin, TimelineOriginKind, TimelinePayload, ToolCallStatus,
+    ToolStoragePayload, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent,
+    TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnStartParams, TurnStatus,
+    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
     constants::{events, methods},
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
@@ -270,7 +279,6 @@ impl MessageProcessor {
         *self.hook_recovery_config.write().await = config;
     }
 
-    #[allow(dead_code)]
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
         let runtime =
             runtime.map(|runtime| {
@@ -282,12 +290,24 @@ impl MessageProcessor {
                     ))))
                 }
             });
+        if let Some(runtime) = runtime.as_ref() {
+            if let Err(error) =
+                install_thread_agents_doc_prompt_hook(runtime, self.crud_store.clone())
+            {
+                warn!(error = %error, "failed to install AGENTS.md prompt hook");
+            }
+        }
         *self.hook_runtime.write().await = runtime.clone();
         self.agent_manager.set_hook_runtime(runtime).await;
     }
 
     pub async fn ensure_hook_runtime_with_run_store(&self) {
-        if self.hook_runtime.read().await.is_some() {
+        if let Some(runtime) = self.hook_runtime.read().await.clone() {
+            if let Err(error) =
+                install_thread_agents_doc_prompt_hook(&runtime, self.crud_store.clone())
+            {
+                warn!(error = %error, "failed to install AGENTS.md prompt hook");
+            }
             return;
         }
         self.set_hook_runtime(Some(Arc::new(HookRuntime::new(
