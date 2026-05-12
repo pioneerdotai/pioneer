@@ -147,6 +147,8 @@ pub struct PromptSectionContribution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chars: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<HookSourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<HookDiagnostic>,
     #[serde(default)]
     pub truncated: bool,
@@ -259,6 +261,7 @@ mod tests {
             priority: 10,
             content: HookPromptContent::new("context").expect("valid content"),
             max_chars: Some(200),
+            source_refs: Vec::new(),
             diagnostics: Vec::new(),
             truncated: false,
         });
@@ -281,6 +284,7 @@ mod tests {
             priority: 10,
             content: HookPromptContent::new("context").expect("valid content"),
             max_chars: None,
+            source_refs: Vec::new(),
             diagnostics: Vec::new(),
             truncated: false,
         });

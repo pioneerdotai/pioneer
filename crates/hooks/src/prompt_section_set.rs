@@ -1,14 +1,14 @@
 use crate::{
     HookContribution, HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage,
     HookDiagnosticSeverity, HookDomain, HookMetadata, HookPromptContent, HookPromptSectionTitle,
-    HookSectionId, PromptSectionContribution,
+    HookSectionId, HookSourceRef, PromptSectionContribution,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const DEFAULT_PROMPT_SECTION_MAX_SECTIONS: usize = 16;
-pub const DEFAULT_PROMPT_SECTION_MAX_CHARS_PER_SECTION: usize = 8_000;
-pub const DEFAULT_PROMPT_SECTION_MAX_TOTAL_CHARS: usize = 16_000;
+pub const DEFAULT_PROMPT_SECTION_MAX_CHARS_PER_SECTION: usize = 16_000;
+pub const DEFAULT_PROMPT_SECTION_MAX_TOTAL_CHARS: usize = 32_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookPromptSectionLimits {
@@ -36,6 +36,8 @@ pub struct HookPromptSectionEntry {
     pub domains: Vec<HookDomain>,
     pub priority: i32,
     pub content: HookPromptContent,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<HookSourceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<HookDiagnostic>,
     #[serde(default)]
@@ -253,6 +255,7 @@ fn merge_section_group(
     let mut title = None;
     let mut seen_title: Option<HookPromptSectionTitle> = None;
     let mut content_fragments = Vec::new();
+    let mut source_refs = Vec::new();
     let mut entry_diagnostics = Vec::new();
     let mut set_diagnostics = Vec::new();
     let mut truncated = false;
@@ -281,6 +284,11 @@ fn merge_section_group(
         entry_diagnostics.extend(contribution.diagnostics.iter().cloned());
         set_diagnostics.extend(contribution.diagnostics.iter().cloned());
         truncated |= contribution.truncated;
+        for source_ref in contribution.source_refs {
+            if !source_refs.contains(&source_ref) {
+                source_refs.push(source_ref);
+            }
+        }
 
         let fragment_limit = contribution.max_chars.unwrap_or(usize::MAX);
         if fragment_limit == 0 {
@@ -355,6 +363,7 @@ fn merge_section_group(
                 domains,
                 priority,
                 content,
+                source_refs,
                 diagnostics: entry_diagnostics,
                 truncated,
             },
@@ -458,6 +467,7 @@ mod tests {
             priority,
             content: content(content_value),
             max_chars: None,
+            source_refs: Vec::new(),
             diagnostics: Vec::new(),
             truncated: false,
         }

@@ -448,6 +448,7 @@ mod tests {
                     priority: 100,
                     content: HookPromptContent::new("ignored").expect("valid content"),
                     max_chars: None,
+                    source_refs: Vec::new(),
                     diagnostics: Vec::new(),
                     truncated: false,
                 }),
