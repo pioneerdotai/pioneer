@@ -46,7 +46,6 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Gateway-centered design** - all important work happens in the gateway: workspaces, threads, turns, tools, MCP, skills, tasks, provider settings, auth, and durable storage.
 - **Local or remote deployment** - run a gateway on your personal computer for a local assistant, or host gateways on separate servers for work, study, home, or other isolated environments.
 - **One desktop, many gateways** - connect the desktop app to any number of gateways and switch between them from one native client.
-- **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
 - **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
 - **Durable agent memory** - agent mode can recall and write stable facts, preferences, recurring instructions, project decisions, and communication style through prompt policy, memory tools, proactive post-turn extraction, service-owned dedupe, and memvid-backed search capsules.
 - **Typed hook runtime** - lifecycle hooks attach policy, context, prompt sections, tool bundles, diagnostics, and post-turn work without turning the agent loop into a domain-specific container.
@@ -56,6 +55,8 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **MCP servers** - install and manage servers compatible with [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.
 - **Skills** - compatible with the [Agent Skills specification](https://agentskills.io/home), with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
 - **Tasks** - scheduled and on-demand task execution with dependencies, retries, delivery state, progress events, write locks, and task trees.
+- **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
+- **Thread tree AGENTS.md** - define persistent instructions at the workspace root or any thread folder; child threads inherit the nearest active file and Pioneer injects it into the prompt through the hook runtime.
 - **Protocol-first architecture** - `pioneer-protocol` defines the public JSON-RPC surface and generated schemas under `schemas/`.
 - **Workspace-scoped artifacts** - files uploaded by users or produced by agents are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.
 - **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
