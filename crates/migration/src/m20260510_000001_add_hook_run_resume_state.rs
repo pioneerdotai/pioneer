@@ -1,5 +1,5 @@
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::schema::{big_integer, string, text, timestamp_with_time_zone};
+use sea_orm_migration::schema::{big_integer, integer, string, text, timestamp_with_time_zone};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -143,6 +143,37 @@ enum ArtifactUploadSession {
     MetadataJson,
 }
 
+#[derive(DeriveIden)]
+enum ThreadAgentsDoc {
+    Table,
+    Id,
+    WorkspaceId,
+    FolderId,
+    Status,
+    Title,
+    Content,
+    ContentSha256,
+    Version,
+    CreatedAt,
+    UpdatedAt,
+    ArchivedAt,
+    CreatedBy,
+    UpdatedBy,
+}
+
+#[derive(DeriveIden)]
+enum ThreadAgentsDocRevision {
+    Table,
+    Id,
+    DocId,
+    Version,
+    ContentSha256,
+    Content,
+    SavedAt,
+    SavedBy,
+    SaveReason,
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -165,6 +196,152 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ThreadAgentsDoc::Table)
+                    .if_not_exists()
+                    .col(string(ThreadAgentsDoc::Id).string_len(21).primary_key())
+                    .col(string(ThreadAgentsDoc::WorkspaceId).string_len(21))
+                    .col(string(ThreadAgentsDoc::FolderId).string_len(21).null())
+                    .col(string(ThreadAgentsDoc::Status).string_len(32))
+                    .col(
+                        string(ThreadAgentsDoc::Title)
+                            .string_len(255)
+                            .default("AGENTS.md"),
+                    )
+                    .col(text(ThreadAgentsDoc::Content).default(""))
+                    .col(string(ThreadAgentsDoc::ContentSha256).string_len(64))
+                    .col(integer(ThreadAgentsDoc::Version).default(1))
+                    .col(
+                        timestamp_with_time_zone(ThreadAgentsDoc::CreatedAt)
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        timestamp_with_time_zone(ThreadAgentsDoc::UpdatedAt)
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(timestamp_with_time_zone(ThreadAgentsDoc::ArchivedAt).null())
+                    .col(string(ThreadAgentsDoc::CreatedBy).string_len(64).null())
+                    .col(string(ThreadAgentsDoc::UpdatedBy).string_len(64).null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ThreadAgentsDocRevision::Table)
+                    .if_not_exists()
+                    .col(
+                        string(ThreadAgentsDocRevision::Id)
+                            .string_len(21)
+                            .primary_key(),
+                    )
+                    .col(string(ThreadAgentsDocRevision::DocId).string_len(21))
+                    .col(integer(ThreadAgentsDocRevision::Version))
+                    .col(string(ThreadAgentsDocRevision::ContentSha256).string_len(64))
+                    .col(text(ThreadAgentsDocRevision::Content))
+                    .col(
+                        timestamp_with_time_zone(ThreadAgentsDocRevision::SavedAt)
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        string(ThreadAgentsDocRevision::SavedBy)
+                            .string_len(64)
+                            .null(),
+                    )
+                    .col(string(ThreadAgentsDocRevision::SaveReason).string_len(32))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_thread_agents_doc_root_active")
+                    .table(ThreadAgentsDoc::Table)
+                    .col(ThreadAgentsDoc::WorkspaceId)
+                    .unique()
+                    .cond_where(
+                        Condition::all()
+                            .add(Expr::col(ThreadAgentsDoc::FolderId).is_null())
+                            .add(Expr::col(ThreadAgentsDoc::Status).is_in(["draft", "active"])),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_thread_agents_doc_folder_active")
+                    .table(ThreadAgentsDoc::Table)
+                    .col(ThreadAgentsDoc::WorkspaceId)
+                    .col(ThreadAgentsDoc::FolderId)
+                    .unique()
+                    .cond_where(
+                        Condition::all()
+                            .add(Expr::col(ThreadAgentsDoc::FolderId).is_not_null())
+                            .add(Expr::col(ThreadAgentsDoc::Status).is_in(["draft", "active"])),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        for (name, cols) in [
+            (
+                "idx_thread_agents_doc_workspace_folder_status",
+                vec![
+                    ThreadAgentsDoc::WorkspaceId,
+                    ThreadAgentsDoc::FolderId,
+                    ThreadAgentsDoc::Status,
+                ],
+            ),
+            (
+                "idx_thread_agents_doc_workspace_status_updated",
+                vec![
+                    ThreadAgentsDoc::WorkspaceId,
+                    ThreadAgentsDoc::Status,
+                    ThreadAgentsDoc::UpdatedAt,
+                ],
+            ),
+        ] {
+            let mut index = Index::create();
+            index.name(name).table(ThreadAgentsDoc::Table);
+            for col in cols {
+                index.col(col);
+            }
+            manager.create_index(index.to_owned()).await?;
+        }
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_thread_agents_doc_revision_doc_version")
+                    .table(ThreadAgentsDocRevision::Table)
+                    .col(ThreadAgentsDocRevision::DocId)
+                    .col(ThreadAgentsDocRevision::Version)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        for (name, cols) in [(
+            "idx_thread_agents_doc_revision_doc_version",
+            vec![
+                ThreadAgentsDocRevision::DocId,
+                ThreadAgentsDocRevision::Version,
+            ],
+        )] {
+            let mut index = Index::create();
+            index.name(name).table(ThreadAgentsDocRevision::Table);
+            for col in cols {
+                index.col(col);
+            }
+            manager.create_index(index.to_owned()).await?;
+        }
 
         manager
             .drop_table(
@@ -662,6 +839,16 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .drop_table(Table::drop().table(ArtifactBlob::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ThreadAgentsDocRevision::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ThreadAgentsDoc::Table).to_owned())
             .await?;
 
         manager

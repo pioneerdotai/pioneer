@@ -37,6 +37,8 @@ pub mod task_run;
 pub mod task_trigger;
 pub mod task_write_lock;
 pub mod thread;
+pub mod thread_agents_doc;
+pub mod thread_agents_doc_revision;
 pub mod thread_folder;
 pub mod thread_lineage;
 pub mod thread_placement;

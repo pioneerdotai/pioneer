@@ -35,6 +35,8 @@ pub use super::task_run::Entity as TaskRun;
 pub use super::task_trigger::Entity as TaskTrigger;
 pub use super::task_write_lock::Entity as TaskWriteLock;
 pub use super::thread::Entity as Thread;
+pub use super::thread_agents_doc::Entity as ThreadAgentsDoc;
+pub use super::thread_agents_doc_revision::Entity as ThreadAgentsDocRevision;
 pub use super::thread_folder::Entity as ThreadFolder;
 pub use super::thread_lineage::Entity as ThreadLineage;
 pub use super::thread_placement::Entity as ThreadPlacement;
