@@ -58,6 +58,11 @@ pub use crate::repositories::artifact::{
     ArtifactWorkspaceUsageRecord, IngestArtifactMetadataRecord, IngestedArtifactRecord,
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
+pub use crate::repositories::thread_agents_doc::{
+    ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
+    ThreadAgentsDocRevisionRecord, ThreadAgentsDocSaveReason, ThreadAgentsDocScope,
+    ThreadAgentsDocScopeContext, ThreadAgentsDocStatus, ThreadAgentsDocSummaryRecord,
+};
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
     agent_memory_policy_decision, agent_memory_repair_job, artifact as artifact_repository,
@@ -65,8 +70,8 @@ use crate::repositories::{
     recovery_job, skill_audit_event, skill_dependency_snapshot, skill_installation,
     skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
     task_delivery, task_dependency, task_event, task_run, task_trigger, task_write_lock, thread,
-    thread_lineage, thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context,
-    turn_mcp_binding, turn_skill_binding,
+    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_item_attempt,
+    turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -4094,6 +4099,144 @@ impl CrudStore {
             .collect())
     }
 
+    pub async fn get_thread_agents_doc_explicit(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ThreadAgentsDocRecord>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .find_explicit(&self.connection, workspace_id, folder_id)
+            .await
+    }
+
+    pub async fn create_thread_agents_doc_draft(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        actor_id: Option<&str>,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
+        self.write_coordinator
+            .run_serialized_with_retry(
+                || async {
+                    thread_agents_doc::ThreadAgentsDocRepository::new()
+                        .create_draft(
+                            &self.connection,
+                            workspace_id,
+                            folder_id,
+                            thread_agents_doc::now(),
+                            actor_id,
+                        )
+                        .await
+                },
+                |_| false,
+            )
+            .await
+    }
+
+    pub async fn save_thread_agents_doc(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        content: &str,
+        expected_version: Option<i64>,
+        actor_id: Option<&str>,
+        save_reason: ThreadAgentsDocSaveReason,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
+        self.write_coordinator
+            .run_serialized_with_retry(
+                || async {
+                    thread_agents_doc::ThreadAgentsDocRepository::new()
+                        .save_content(
+                            &self.connection,
+                            workspace_id,
+                            folder_id,
+                            content,
+                            expected_version,
+                            thread_agents_doc::now(),
+                            actor_id,
+                            save_reason,
+                        )
+                        .await
+                },
+                |_| false,
+            )
+            .await
+    }
+
+    pub async fn archive_thread_agents_doc(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        expected_version: Option<i64>,
+        actor_id: Option<&str>,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ThreadAgentsDocRecord>> {
+        self.write_coordinator
+            .run_serialized_with_retry(
+                || async {
+                    thread_agents_doc::ThreadAgentsDocRepository::new()
+                        .archive(
+                            &self.connection,
+                            workspace_id,
+                            folder_id,
+                            expected_version,
+                            thread_agents_doc::now(),
+                            actor_id,
+                        )
+                        .await
+                },
+                |_| false,
+            )
+            .await
+    }
+
+    pub async fn list_thread_agents_doc_revisions(
+        &self,
+        doc_id: &str,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Vec<ThreadAgentsDocRevisionRecord>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .list_revisions(&self.connection, doc_id)
+            .await
+    }
+
+    pub async fn list_thread_agents_doc_summaries(
+        &self,
+        workspace_id: &str,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Vec<ThreadAgentsDocSummaryRecord>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .list_summaries(&self.connection, workspace_id)
+            .await
+    }
+
+    pub async fn resolve_thread_agents_doc_for_folder(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ResolvedThreadAgentsDocRecord>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .resolve_for_folder(&self.connection, workspace_id, folder_id)
+            .await
+    }
+
+    pub async fn resolve_thread_agents_doc_for_thread(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ResolvedThreadAgentsDocRecord>> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .resolve_for_thread(&self.connection, workspace_id, thread_id)
+            .await
+    }
+
+    pub async fn get_thread_agents_doc_scope_context(
+        &self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+    ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocScopeContext> {
+        thread_agents_doc::ThreadAgentsDocRepository::new()
+            .scope_context(&self.connection, workspace_id, folder_id)
+            .await
+    }
+
     pub async fn create_thread_folder(
         &self,
         workspace_id: &str,
@@ -6382,7 +6525,8 @@ mod tests {
     use super::{
         ClaimedRecoveryActivation, CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
         McpServerInstallationRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
-        SkillInstallationRecord, TaskEventPayload, TurnMcpBindingRecord, TurnSkillBindingRecord,
+        SkillInstallationRecord, TaskEventPayload, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, TurnMcpBindingRecord, TurnSkillBindingRecord,
         WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
@@ -6396,13 +6540,14 @@ mod tests {
         ItemToolRetryScheduledNotification, PromptManifest, PromptManifestDiagnostic,
         PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
         PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-        PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-        Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
-        TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskRun, TaskRunStatus,
-        TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus, TaskValue, Thread,
-        ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-        ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
-        ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
+        PromptManifestProfile, PromptManifestRuntimeSourceEntry, PromptManifestRuntimeSourceKind,
+        PromptManifestRuntimeSourceTruncation, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+        SandboxMode, Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat,
+        TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskRun,
+        TaskRunStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus,
+        TaskValue, Thread, ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
+        ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
         ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
         ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
         ToolRetryResolution, ToolStoragePayload, Turn, TurnCompletedNotification, TurnItem,
@@ -6410,10 +6555,34 @@ mod tests {
         TurnToolLoopBudgetExceededNotification, UserInput,
     };
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
+        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter, Set,
         Statement,
     };
     use std::collections::BTreeMap;
+
+    async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Test Workspace".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(timestamp),
+            updated_at: Set(timestamp),
+        })
+        .exec(&connection)
+        .await
+        .expect("workspace insert should succeed");
+
+        CrudStore::new(connection)
+    }
 
     fn sample_tool_recovery_policy() -> ToolRecoveryPolicySnapshot {
         ToolRecoveryPolicySnapshot {
@@ -6446,6 +6615,246 @@ mod tests {
             agent_role: None,
             turns: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn thread_agents_doc_repository_round_trips_draft_save_archive() {
+        let store = test_store_with_workspace("ws_agents_doc_crud").await;
+
+        let draft = store
+            .create_thread_agents_doc_draft("ws_agents_doc_crud", None, Some("user-1"))
+            .await
+            .expect("draft should create");
+        assert_eq!(draft.status, ThreadAgentsDocStatus::Draft);
+        assert_eq!(draft.version, 1);
+        assert!(draft.content.is_empty());
+
+        let duplicate = store
+            .create_thread_agents_doc_draft("ws_agents_doc_crud", None, Some("user-1"))
+            .await
+            .expect("duplicate draft create should return existing draft");
+        assert_eq!(duplicate.id, draft.id);
+
+        let active = store
+            .save_thread_agents_doc(
+                "ws_agents_doc_crud",
+                None,
+                "Use cargo test.\r\nKeep docs short.",
+                Some(draft.version),
+                Some("user-1"),
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("non-empty save should activate doc");
+        assert_eq!(active.status, ThreadAgentsDocStatus::Active);
+        assert_eq!(active.version, 2);
+        assert_eq!(active.content, "Use cargo test.\nKeep docs short.");
+
+        let revisions = store
+            .list_thread_agents_doc_revisions(active.id.as_str())
+            .await
+            .expect("revisions should list");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].version, active.version);
+        assert_eq!(revisions[0].save_reason, ThreadAgentsDocSaveReason::Manual);
+
+        let unchanged = store
+            .save_thread_agents_doc(
+                "ws_agents_doc_crud",
+                None,
+                "Use cargo test.\nKeep docs short.",
+                Some(active.version),
+                Some("user-1"),
+                ThreadAgentsDocSaveReason::Autosave,
+            )
+            .await
+            .expect("unchanged save should no-op");
+        assert_eq!(unchanged.version, active.version);
+        assert_eq!(
+            store
+                .list_thread_agents_doc_revisions(active.id.as_str())
+                .await
+                .expect("revisions should list")
+                .len(),
+            1
+        );
+
+        let conflict = store
+            .save_thread_agents_doc(
+                "ws_agents_doc_crud",
+                None,
+                "Changed",
+                Some(1),
+                Some("user-2"),
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect_err("stale expected version should conflict");
+        assert!(matches!(
+            conflict,
+            ThreadAgentsDocError::VersionConflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
+
+        let archived = store
+            .archive_thread_agents_doc(
+                "ws_agents_doc_crud",
+                None,
+                Some(active.version),
+                Some("user-1"),
+            )
+            .await
+            .expect("archive should succeed")
+            .expect("archive should return archived doc");
+        assert_eq!(archived.status, ThreadAgentsDocStatus::Archived);
+        assert_eq!(archived.version, 3);
+
+        let after_archive = store
+            .get_thread_agents_doc_explicit("ws_agents_doc_crud", None)
+            .await
+            .expect("explicit lookup should succeed");
+        assert!(after_archive.is_none());
+
+        let replacement = store
+            .create_thread_agents_doc_draft("ws_agents_doc_crud", None, Some("user-1"))
+            .await
+            .expect("archived doc should not block replacement draft");
+        assert_eq!(replacement.status, ThreadAgentsDocStatus::Draft);
+        assert_ne!(replacement.id, archived.id);
+    }
+
+    #[tokio::test]
+    async fn thread_agents_doc_resolver_uses_nearest_active_ancestor() {
+        let store = test_store_with_workspace("ws_agents_doc_resolve").await;
+
+        let root = store
+            .save_thread_agents_doc(
+                "ws_agents_doc_resolve",
+                None,
+                "root instructions",
+                None,
+                Some("user-1"),
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("root doc should save");
+
+        let parent = store
+            .create_thread_folder("ws_agents_doc_resolve", None, "Parent")
+            .await
+            .expect("parent folder should create");
+        let child = store
+            .create_thread_folder("ws_agents_doc_resolve", Some(parent.id.as_str()), "Child")
+            .await
+            .expect("child folder should create");
+
+        let root_resolution = store
+            .resolve_thread_agents_doc_for_folder("ws_agents_doc_resolve", None)
+            .await
+            .expect("root resolution should succeed")
+            .expect("root doc should resolve");
+        assert_eq!(root_resolution.doc.id, root.id);
+        assert!(!root_resolution.inherited);
+
+        store
+            .save_thread_agents_doc(
+                "ws_agents_doc_resolve",
+                Some(parent.id.as_str()),
+                "parent instructions",
+                None,
+                Some("user-1"),
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("parent doc should save");
+
+        store
+            .create_thread_agents_doc_draft(
+                "ws_agents_doc_resolve",
+                Some(child.id.as_str()),
+                Some("user-1"),
+            )
+            .await
+            .expect("child blank draft should create");
+
+        let inherited = store
+            .resolve_thread_agents_doc_for_folder("ws_agents_doc_resolve", Some(child.id.as_str()))
+            .await
+            .expect("child resolution should succeed")
+            .expect("parent doc should resolve for child");
+        assert_eq!(inherited.doc.content, "parent instructions");
+        assert_eq!(
+            inherited.source_folder_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(inherited.source_path, vec!["Parent".to_owned()]);
+        assert!(inherited.inherited);
+
+        let child_doc = store
+            .save_thread_agents_doc(
+                "ws_agents_doc_resolve",
+                Some(child.id.as_str()),
+                "child instructions",
+                None,
+                Some("user-1"),
+                ThreadAgentsDocSaveReason::Manual,
+            )
+            .await
+            .expect("child doc should save");
+        let child_resolution = store
+            .resolve_thread_agents_doc_for_folder("ws_agents_doc_resolve", Some(child.id.as_str()))
+            .await
+            .expect("child resolution should succeed")
+            .expect("child doc should resolve");
+        assert_eq!(child_resolution.doc.id, child_doc.id);
+        assert_eq!(
+            child_resolution.source_path,
+            vec!["Parent".to_owned(), "Child".to_owned()]
+        );
+        assert!(!child_resolution.inherited);
+
+        store
+            .archive_thread_agents_doc(
+                "ws_agents_doc_resolve",
+                Some(child.id.as_str()),
+                Some(child_doc.version),
+                Some("user-1"),
+            )
+            .await
+            .expect("child archive should succeed");
+
+        store
+            .move_thread_to_folder(
+                "ws_agents_doc_resolve",
+                "thread_agents_doc_resolve_thread",
+                Some(child.id.as_str()),
+            )
+            .await
+            .expect("thread placement should save");
+        let thread_resolution = store
+            .resolve_thread_agents_doc_for_thread(
+                "ws_agents_doc_resolve",
+                "thread_agents_doc_resolve_thread",
+            )
+            .await
+            .expect("thread resolution should succeed")
+            .expect("parent doc should resolve after child archive");
+        assert_eq!(thread_resolution.doc.content, "parent instructions");
+        assert_eq!(
+            thread_resolution.resolved_for_folder_id,
+            Some(child.id.clone())
+        );
+
+        let mismatch = store
+            .resolve_thread_agents_doc_for_folder("other_workspace", Some(child.id.as_str()))
+            .await
+            .expect_err("folder workspace mismatch should fail");
+        assert!(matches!(
+            mismatch,
+            ThreadAgentsDocError::WorkspaceMismatch { .. }
+        ));
     }
 
     fn sample_turn(turn_id: &str) -> Turn {
@@ -9009,6 +9418,16 @@ mod tests {
                 priority: Some(10),
                 source_count: Some(1),
                 truncation: PromptManifestHookTruncation::None,
+            }],
+            runtime_sources: vec![PromptManifestRuntimeSourceEntry {
+                section_id: "agents_md".to_owned(),
+                source_kind: PromptManifestRuntimeSourceKind::ThreadAgentsDoc,
+                source_id: "agd_000000000000000001".to_owned(),
+                source_version: Some(1),
+                source_hash: Some("sha256:crudagentsdoc".to_owned()),
+                source_scope: Some("root".to_owned()),
+                source_path: Vec::new(),
+                truncation: PromptManifestRuntimeSourceTruncation::None,
             }],
         };
 
