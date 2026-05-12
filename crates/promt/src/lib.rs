@@ -5,6 +5,7 @@ pub mod constants;
 mod content;
 pub mod diagnostics;
 pub mod fingerprint;
+pub mod hooks;
 pub mod profile;
 pub mod render;
 pub mod runtime_files;
@@ -17,6 +18,10 @@ pub use bundle::{
 };
 pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
+pub use hooks::{
+    AGENTS_DOC_PROMPT_HOOK_PACKAGE_ID, AgentsDocPromptResolver, ResolvedAgentsDocPrompt,
+    agents_doc_package,
+};
 pub use profile::PromptProfile;
 pub use render::{
     memory_post_turn_extractor::{

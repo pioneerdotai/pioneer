@@ -1909,12 +1909,12 @@ mod tests {
                     allow_function_proxy_tools: true,
                 },
             },
-            memory: pioneer_agent::MemoryLoopConfig {
-                active_recall: pioneer_agent::MemoryActiveRecallConfig {
-                    mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
-                    ..pioneer_agent::MemoryActiveRecallConfig::default()
+            memory: pioneer_memory::hooks::MemoryLoopConfig {
+                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
+                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
+                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
                 },
-                ..pioneer_agent::MemoryLoopConfig::default()
+                ..pioneer_memory::hooks::MemoryLoopConfig::default()
             },
             budget: ToolLoopBudgetConfig::default(),
             retry: ToolRetryBudgetConfig::default(),

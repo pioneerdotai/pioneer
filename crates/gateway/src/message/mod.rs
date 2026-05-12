@@ -19,15 +19,14 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 mod thread_agents_doc_handlers;
-mod thread_agents_doc_prompt_hook;
 mod thread_handlers;
 mod turn_handlers;
 mod workspace_handlers;
 
 pub use summary::SummaryConfig;
 
-use crate::hook_run_store::CrudHookRunStore;
-use crate::message::thread_agents_doc_prompt_hook::install_thread_agents_doc_prompt_hook;
+use crate::hook_runtime::GatewayHookRuntimeBuilder;
+use crate::prompt_hooks::agents_doc_prompt_hook_package;
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
@@ -38,7 +37,7 @@ use pioneer_artifacts::{
 };
 use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
-use pioneer_hooks::{HookRecoveryOptions, HookRegistry, HookRuntime, HookSubscriptionRegistry};
+use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ContextCompressedNotification,
@@ -59,12 +58,11 @@ use pioneer_protocol::{
     ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
     ProviderModelPricing, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
     RequestId, SkillsUploadAbortParams, SkillsUploadFinishParams, SkillsUploadStartParams,
-    SystemEventLevel, Task, TaskAgendaParams, TaskCancelParams, TaskCancelResponse,
-    TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryMode, TaskDetachParams, TaskDetachResponse, TaskEventsParams, TaskGetParams,
-    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
-    TaskTreeParams as TaskTreeTaskParams, TaskTrigger, TaskTurnItem, TaskWaitParams,
-    TaskWaitResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    SystemEventLevel, Task, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
+    TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams,
+    TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams, TaskRescheduleParams,
+    TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskTrigger, TaskTurnItem,
+    TaskWaitParams, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
     ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
@@ -279,47 +277,39 @@ impl MessageProcessor {
         *self.hook_recovery_config.write().await = config;
     }
 
-    pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {
-        let runtime =
-            runtime.map(|runtime| {
-                if runtime.has_run_store() {
-                    runtime
-                } else {
-                    Arc::new(runtime.clone_with_run_store(Arc::new(CrudHookRunStore::new(
-                        self.crud_store.clone(),
-                    ))))
-                }
-            });
-        if let Some(runtime) = runtime.as_ref() {
-            if let Err(error) =
-                install_thread_agents_doc_prompt_hook(runtime, self.crud_store.clone())
-            {
-                warn!(error = %error, "failed to install AGENTS.md prompt hook");
-            }
-        }
-        *self.hook_runtime.write().await = runtime.clone();
-        self.agent_manager.set_hook_runtime(runtime).await;
-    }
-
     pub async fn ensure_hook_runtime_with_run_store(&self) {
-        if let Some(runtime) = self.hook_runtime.read().await.clone() {
-            if let Err(error) =
-                install_thread_agents_doc_prompt_hook(&runtime, self.crud_store.clone())
+        let existing_runtime = self.hook_runtime.read().await.clone();
+
+        if let Some(runtime) = existing_runtime {
+            match GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), runtime.as_ref())
+                .with_crud_run_store()
+                .install(agents_doc_prompt_hook_package(self.crud_store.clone()))
             {
-                warn!(error = %error, "failed to install AGENTS.md prompt hook");
+                Ok(builder) => {
+                    let runtime = builder.build();
+                    *self.hook_runtime.write().await = Some(runtime.clone());
+                    self.agent_manager.set_hook_runtime(Some(runtime)).await;
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to install AGENTS.md prompt hook package");
+                }
             }
             return;
         }
-        self.set_hook_runtime(Some(Arc::new(HookRuntime::new(
-            Arc::new(HookRegistry::new()),
-            Arc::new(HookSubscriptionRegistry::new()),
-        ))))
-        .await;
-    }
 
-    #[allow(dead_code)]
-    pub async fn has_hook_runtime(&self) -> bool {
-        self.hook_runtime.read().await.is_some()
+        match GatewayHookRuntimeBuilder::new(self.crud_store.clone())
+            .with_crud_run_store()
+            .install(agents_doc_prompt_hook_package(self.crud_store.clone()))
+        {
+            Ok(builder) => {
+                let runtime = builder.build();
+                *self.hook_runtime.write().await = Some(runtime.clone());
+                self.agent_manager.set_hook_runtime(Some(runtime)).await;
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to build hook runtime");
+            }
+        }
     }
 
     pub async fn bind_task_bridge(self: &Arc<Self>) {
@@ -339,6 +329,10 @@ impl MessageProcessor {
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
+        let memory_policy_provider =
+            Arc::new(crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
+                self.provider_registry.clone(),
+            ));
         self.agent_manager
             .set_memory_provider(Some(memory_provider.clone()))
             .await;
@@ -346,26 +340,36 @@ impl MessageProcessor {
             .set_memory_write_provider(Some(memory_provider.clone()))
             .await;
         self.agent_manager
-            .set_memory_post_turn_extractor_provider(Some(memory_provider))
+            .set_memory_post_turn_extractor_provider(Some(memory_provider.clone()))
             .await;
         self.agent_manager
-            .set_memory_turn_policy_provider(Some(Arc::new(
-                crate::memory_policy::GatewayMemoryTurnPolicyProvider::new(
-                    self.provider_registry.clone(),
-                ),
-            )))
+            .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
             .await;
-        match self
-            .agent_manager
-            .ensure_hook_runtime_with_current_providers()
-            .await
-        {
-            Ok(Some(runtime)) => {
-                *self.hook_runtime.write().await = Some(runtime);
+
+        let Some(runtime) = self.hook_runtime.read().await.clone() else {
+            warn!("failed to install memory hook package: hook runtime is not initialized");
+            return;
+        };
+        match GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), runtime.as_ref())
+            .with_crud_run_store()
+            .install(pioneer_memory::hooks::package(
+                memory_provider.clone(),
+                Some(memory_provider.clone()),
+                Some(memory_provider),
+                Some(memory_policy_provider),
+                self.agent_manager.memory_tool_bundle_artifact_store(),
+                self.tool_loop_config.memory.clone(),
+            ))
+            .and_then(|builder| {
+                builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
+            }) {
+            Ok(builder) => {
+                let runtime = builder.build();
+                *self.hook_runtime.write().await = Some(runtime.clone());
+                self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
-            Ok(None) => {}
             Err(error) => {
-                warn!(error = %error, "failed to install memory hooks into hook runtime");
+                warn!(error = %error, "failed to install memory hook package");
             }
         }
     }
@@ -376,7 +380,6 @@ impl MessageProcessor {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn memory_runtime(&self) -> Arc<GatewayMemoryRuntime> {
         self.memory_runtime.clone()
     }
@@ -1105,12 +1108,12 @@ impl MessageProcessor {
                         allow_function_proxy_tools: true,
                     },
                 },
-                memory: pioneer_agent::MemoryLoopConfig {
-                    active_recall: pioneer_agent::MemoryActiveRecallConfig {
-                        mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
-                        ..pioneer_agent::MemoryActiveRecallConfig::default()
+                memory: pioneer_memory::hooks::MemoryLoopConfig {
+                    active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
+                        mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
+                        ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
                     },
-                    ..pioneer_agent::MemoryLoopConfig::default()
+                    ..pioneer_memory::hooks::MemoryLoopConfig::default()
                 },
                 budget: pioneer_tools::ToolLoopBudgetConfig::default(),
                 retry: pioneer_tools::ToolRetryBudgetConfig::default(),

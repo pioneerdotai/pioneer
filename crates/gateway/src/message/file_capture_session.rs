@@ -70,24 +70,6 @@ impl TurnFileCaptureSession {
         })
     }
 
-    #[allow(dead_code)]
-    pub(super) fn record_created(&mut self, path: impl Into<PathBuf>, source: impl Into<String>) {
-        self.explicit_events.push(FileCaptureEvent {
-            path: path.into(),
-            modified: false,
-            source: source.into(),
-        });
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn record_modified(&mut self, path: impl Into<PathBuf>, source: impl Into<String>) {
-        self.explicit_events.push(FileCaptureEvent {
-            path: path.into(),
-            modified: true,
-            source: source.into(),
-        });
-    }
-
     pub(super) async fn finish(
         &self,
         artifact_service: &ArtifactService,

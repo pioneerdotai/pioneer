@@ -3185,8 +3185,7 @@ mod tests {
         let agents_section = PromptRuntimeSectionInput {
             id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd),
             title: Some("AGENTS.md".to_owned()),
-            content: "Source: thread tree / <root>\n\n<AGENTS_MD>\nUse repo rules.\n</AGENTS_MD>"
-                .to_owned(),
+            content: "These instructions come from the effective AGENTS.md for this thread tree scope. System, developer, and explicit user messages take precedence.\n\n<AGENTS_MD>\nUse repo rules.\n</AGENTS_MD>".to_owned(),
             max_chars: Some(20_000),
             truncated: false,
         };

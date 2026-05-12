@@ -3,6 +3,7 @@ mod candidate_policy;
 mod config;
 mod context;
 mod convert;
+pub mod hooks;
 mod memvid;
 mod policy;
 mod ranking;

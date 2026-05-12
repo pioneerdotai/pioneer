@@ -10,6 +10,7 @@ use pioneer_hooks::{
     TurnPostTurnToolEventSummary, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
     TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
 };
+use pioneer_memory::hooks::MemoryToolBundleArtifactStore;
 use pioneer_tools::ToolExtensionBundle;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -394,6 +395,17 @@ impl AgentToolBundleArtifactStore {
         if let Ok(mut bundles) = self.bundles.lock() {
             bundles.retain(|(bundle_turn_id, _), _| bundle_turn_id != turn_id);
         }
+    }
+}
+
+impl MemoryToolBundleArtifactStore for AgentToolBundleArtifactStore {
+    fn insert_tool_bundle_artifact(
+        &self,
+        turn_id: &str,
+        bundle_id: HookToolBundleId,
+        bundle: ToolExtensionBundle,
+    ) {
+        self.insert(turn_id.to_owned(), bundle_id, bundle);
     }
 }
 

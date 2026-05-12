@@ -7,13 +7,13 @@ use pioneer_agent::{
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAgentContextPolicy,
     TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput,
-    TaskAttachmentMode, TaskCancelParams, TaskCompletionBehavior, TaskCreateParams,
-    TaskCreateResponse, TaskDeliveryPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
-    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskMetadata,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus, TaskTimeoutPolicy,
-    TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, ToolCallStatus,
-    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
+    TaskAttachmentMode, TaskCancelParams, TaskCreateParams, TaskCreateResponse, TaskDeliveryPolicy,
+    TaskDetachParams, TaskError, TaskExecutorKind, TaskGetParams, TaskGetResponse,
+    TaskLifecyclePolicy, TaskListParams, TaskMetadata, TaskOwnerKind, TaskPauseParams,
+    TaskRescheduleParams, TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus,
+    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
+    TaskTurnItem, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
+    constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -1435,16 +1435,6 @@ fn owner_kind_label(kind: TaskOwnerKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase())
-}
-
-#[allow(dead_code)]
-fn attached_immediate_lifecycle() -> TaskLifecyclePolicy {
-    TaskLifecyclePolicy {
-        attachment: TaskAttachmentMode::Attached,
-        on_parent_cancel: TaskParentTerminalAction::Cancel,
-        on_parent_failure: TaskParentTerminalAction::Cancel,
-        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
-    }
 }
 
 #[cfg(test)]

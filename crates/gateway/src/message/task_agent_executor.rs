@@ -2009,13 +2009,15 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
-        MemoryActiveRecallConfig, MemoryActiveRecallMode, MemoryLoopConfig,
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
     };
     use pioneer_artifacts::IngestArtifactBytesRequest;
     use pioneer_config::GatewayWebToolsConfig;
     use pioneer_keystore::MemorySecretStore;
+    use pioneer_memory::hooks::{
+        MemoryActiveRecallConfig, MemoryActiveRecallMode, MemoryLoopConfig,
+    };
     use pioneer_provider::providers::EchoProvider;
     use pioneer_tools::{
         ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,

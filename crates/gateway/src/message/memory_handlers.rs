@@ -841,7 +841,6 @@ impl MessageProcessor {
             .await;
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn send_memory_changed_after_tool_remember(
         &self,
         context: &MemoryOperationContext,
@@ -897,7 +896,6 @@ impl MessageProcessor {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn send_memory_forgotten_after_tool_forget(
         &self,
         context: &MemoryOperationContext,

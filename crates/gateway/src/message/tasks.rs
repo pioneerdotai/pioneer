@@ -1,88 +1,10 @@
 use super::*;
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
 use pioneer_protocol::{
-    ItemUpdatedNotification, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskTriggerKind,
+    ItemUpdatedNotification, TaskEventPayload, TaskGetResponse, TaskTriggerKind,
 };
 
 impl MessageProcessor {
-    #[allow(dead_code)]
-    pub(super) async fn task_create_runtime(
-        &self,
-        mut params: TaskCreateParams,
-    ) -> Result<TaskCreateResponse> {
-        validate_immediate_task_agent_params(&params)?;
-        let workspace_id = self
-            .workspace_manager
-            .validate_workspace_id(params.workspace_id.as_str())
-            .await?;
-        params.workspace_id = workspace_id;
-        self.task_runtime
-            .service()
-            .create_task(pioneer_tasks::TaskCreateContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn task_wait_runtime(
-        &self,
-        params: TaskWaitParams,
-    ) -> Result<TaskWaitResponse> {
-        self.task_runtime
-            .service()
-            .wait_tasks(pioneer_tasks::TaskWaitContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn task_cancel_runtime(
-        &self,
-        params: TaskCancelParams,
-    ) -> Result<TaskCancelResponse> {
-        self.task_runtime
-            .service()
-            .cancel_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn task_detach_runtime(
-        &self,
-        params: TaskDetachParams,
-    ) -> Result<TaskDetachResponse> {
-        self.task_runtime
-            .service()
-            .detach_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn task_pause_runtime(
-        &self,
-        params: TaskPauseParams,
-    ) -> Result<pioneer_protocol::TaskPauseResponse> {
-        self.task_runtime
-            .service()
-            .pause_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn task_resume_runtime(
-        &self,
-        params: TaskResumeParams,
-    ) -> Result<pioneer_protocol::TaskResumeResponse> {
-        self.task_runtime
-            .service()
-            .resume_task(pioneer_tasks::TaskMutationContext::default(), params)
-            .await
-            .map_err(|error| anyhow!("{error:#}"))
-    }
-
     pub(super) async fn emit_task_event(
         &self,
         event: pioneer_crud::AppendedTaskEvent,
@@ -674,18 +596,4 @@ async fn task_delivery_child_lineage(
             (None, None)
         }
     }
-}
-
-#[allow(dead_code)]
-fn validate_immediate_task_agent_params(params: &TaskCreateParams) -> Result<()> {
-    if params.executor_kind != TaskExecutorKind::Agent {
-        bail!("Phase 2 only executes agent tasks");
-    }
-    if params.trigger.spec.kind() != TaskTriggerKind::Immediate {
-        bail!("Phase 2 only executes immediate task triggers");
-    }
-    if params.agent_spec.is_none() {
-        bail!("task agent execution requires `agent_spec`");
-    }
-    Ok(())
 }

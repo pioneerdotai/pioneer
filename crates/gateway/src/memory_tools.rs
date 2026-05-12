@@ -1,13 +1,13 @@
 use crate::message::MessageProcessor;
 use async_trait::async_trait;
-use pioneer_agent::{
+use pioneer_crud::workspace_agent_memory_scope_key;
+use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
     MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
     MemoryToolMaterialization, MemoryTurnContext,
 };
-use pioneer_crud::workspace_agent_memory_scope_key;
 use pioneer_memory::{MemoryOperationContext, MemoryRecallParams};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,

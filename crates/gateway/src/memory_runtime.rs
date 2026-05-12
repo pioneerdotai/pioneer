@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
-use pioneer_agent::MemoryTurnContext;
 use pioneer_config::GatewayMemoryConfig;
 use pioneer_crud::CrudStore;
+use pioneer_memory::hooks::MemoryTurnContext;
 use pioneer_memory::{
     MemoryOperationContext, MemoryService, MemoryServiceConfig, MemvidMemoryBackend,
 };
@@ -106,7 +106,6 @@ impl GatewayMemoryRuntime {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn operation_context_for_turn(
         &self,
         turn: &MemoryTurnContext,

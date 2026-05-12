@@ -5,6 +5,7 @@ mod diagnostic;
 mod error;
 mod handler;
 mod id;
+mod package;
 mod phase;
 mod policy;
 mod policy_set;
@@ -42,6 +43,7 @@ pub use id::{
     HookSourceId, HookSubscriptionId, HookTaskId, HookThreadId, HookToolBundleId, HookToolName,
     HookTurnId, HookWorkspaceId,
 };
+pub use package::{HookDefinition, HookPackage, HookRuntimeBuilder};
 pub use phase::{HookPhase, ParseHookPhaseError};
 pub use policy::{
     HookAwaitPolicy, HookExecutionPolicy, HookFailurePolicy, HookRetryBackoff, HookRetryPolicy,

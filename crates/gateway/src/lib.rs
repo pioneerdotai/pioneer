@@ -4,14 +4,15 @@ mod bootstrap;
 mod database;
 mod helpers;
 mod hook_run_store;
+mod hook_runtime;
 mod mcp_secrets;
 mod mcp_service;
 mod memory_policy;
 mod memory_runtime;
-#[allow(dead_code)]
 mod memory_tools;
 mod message;
 mod operations;
+mod prompt_hooks;
 mod resilience;
 mod secrets;
 mod session;
@@ -24,9 +25,10 @@ mod workspace;
 
 use anyhow::{Context, Result};
 use attachment::CrudArtifactExternalRefCacheBackend;
-use pioneer_agent::{MemoryLoopConfig, ToolLoopConfig};
+use pioneer_agent::ToolLoopConfig;
 use pioneer_config::AppConfig;
 use pioneer_crud::CrudStore;
+use pioneer_memory::hooks::MemoryLoopConfig;
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,

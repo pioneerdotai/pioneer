@@ -8,10 +8,7 @@ use crate::workspace::WorkspaceManager;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use migration::{Migrator, MigratorTrait};
-use pioneer_agent::{
-    AgentManager, AgentMcpToolProvider, AgentMemoryProvider, MemoryRecallRequest,
-    MemoryTurnContext, SkillsLoopConfig, ToolLoopConfig,
-};
+use pioneer_agent::{AgentManager, AgentMcpToolProvider, SkillsLoopConfig, ToolLoopConfig};
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
@@ -28,6 +25,7 @@ use pioneer_hooks::{
     TurnPreCompactionSummaryStrategy, TurnPreCompactionTrigger,
 };
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
+use pioneer_memory::hooks::{AgentMemoryProvider, MemoryRecallRequest, MemoryTurnContext};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, INVALID_REQUEST_CODE, ItemCompletedNotification,
     ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
@@ -714,58 +712,73 @@ fn phase_13_hook_runtime_with_fallback(
     ))
 }
 
-#[tokio::test]
-async fn phase_15_message_processor_set_hook_runtime_attaches_crud_store() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
-    let runtime = phase_13_empty_hook_runtime();
-    assert!(!runtime.has_run_store());
-
-    harness
-        .processor
-        .set_hook_runtime(Some(runtime.clone()))
+async fn install_test_hook_runtime(processor: &Arc<MessageProcessor>, runtime: Arc<HookRuntime>) {
+    *processor.hook_runtime.write().await = Some(runtime.clone());
+    processor
+        .agent_manager
+        .set_hook_runtime(Some(runtime))
         .await;
-
-    let stored = harness
-        .processor
-        .hook_runtime
-        .read()
-        .await
-        .clone()
-        .expect("message processor should store hook runtime");
-    assert!(stored.has_run_store());
-    assert!(!Arc::ptr_eq(&stored, &runtime));
-    assert!(harness.processor.agent_manager.has_hook_runtime().await);
 }
 
-#[tokio::test]
-async fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
-    harness
-        .processor
-        .set_hook_recovery_config(GatewayHookRecoveryConfig {
-            enabled: true,
-            startup_scan: false,
-            poll_interval_ms: 60_000,
-            batch_size: 4,
-            max_concurrent: 1,
-            stale_running_after_ms: 1_000,
-            strict_debug: true,
-        })
-        .await;
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_empty_hook_runtime()))
-        .await;
+async fn install_recoverable_test_hook_runtime(
+    processor: &Arc<MessageProcessor>,
+    runtime: Arc<HookRuntime>,
+) {
+    *processor.hook_runtime.write().await = Some(runtime);
+    processor.ensure_hook_runtime_with_run_store().await;
+}
 
-    harness.processor.start_hook_recovery_worker().await;
+#[test]
+fn phase_15_message_processor_ensure_hook_runtime_attaches_crud_store() {
+    run_gateway_message_test_with_large_stack("phase15-hook-runtime", || async {
+        let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+        let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+        let runtime = phase_13_empty_hook_runtime();
+        assert!(!runtime.has_run_store());
 
-    let mut guard = harness.processor.hook_recovery_worker.lock().await;
-    let handle = guard
-        .take()
-        .expect("hook recovery worker should be started");
-    handle.abort();
+        install_recoverable_test_hook_runtime(&harness.processor, runtime.clone()).await;
+
+        let stored = harness
+            .processor
+            .hook_runtime
+            .read()
+            .await
+            .clone()
+            .expect("message processor should store hook runtime");
+        assert!(stored.has_run_store());
+        assert!(!Arc::ptr_eq(&stored, &runtime));
+        assert!(harness.processor.agent_manager.has_hook_runtime().await);
+    });
+}
+
+#[test]
+fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
+    run_gateway_message_test_with_large_stack("phase21-hook-recovery-worker", || async {
+        let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+        let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+        harness
+            .processor
+            .set_hook_recovery_config(GatewayHookRecoveryConfig {
+                enabled: true,
+                startup_scan: false,
+                poll_interval_ms: 60_000,
+                batch_size: 4,
+                max_concurrent: 1,
+                stale_running_after_ms: 1_000,
+                strict_debug: true,
+            })
+            .await;
+        install_recoverable_test_hook_runtime(&harness.processor, phase_13_empty_hook_runtime())
+            .await;
+
+        harness.processor.start_hook_recovery_worker().await;
+
+        let mut guard = harness.processor.hook_recovery_worker.lock().await;
+        let handle = guard
+            .take()
+            .expect("hook recovery worker should be started");
+        handle.abort();
+    });
 }
 
 #[tokio::test]
@@ -1397,6 +1410,60 @@ fn test_task_create_params(
     }
 }
 
+async fn create_task_for_test(
+    processor: &Arc<MessageProcessor>,
+    params: TaskCreateParams,
+) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
+    Box::pin(
+        processor
+            .task_runtime
+            .service()
+            .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn wait_tasks_for_test(
+    processor: &Arc<MessageProcessor>,
+    params: TaskWaitParams,
+) -> anyhow::Result<pioneer_protocol::TaskWaitResponse> {
+    processor
+        .task_runtime
+        .service()
+        .wait_tasks(pioneer_tasks::TaskWaitContext::default(), params)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn cancel_task_for_test(
+    processor: &Arc<MessageProcessor>,
+    params: pioneer_protocol::TaskCancelParams,
+) -> anyhow::Result<pioneer_protocol::TaskCancelResponse> {
+    Box::pin(
+        processor
+            .task_runtime
+            .service()
+            .cancel_task(pioneer_tasks::TaskMutationContext::default(), params),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn detach_task_for_test(
+    processor: &Arc<MessageProcessor>,
+    params: pioneer_protocol::TaskDetachParams,
+) -> anyhow::Result<pioneer_protocol::TaskDetachResponse> {
+    Box::pin(
+        processor
+            .task_runtime
+            .service()
+            .detach_task(pioneer_tasks::TaskMutationContext::default(), params),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
 fn test_summary_config() -> super::summary::SummaryConfig {
     super::summary::SummaryConfig {
         summary_model: Some("test-model".to_owned()),
@@ -1483,12 +1550,12 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 allow_function_proxy_tools: true,
             },
         },
-        memory: pioneer_agent::MemoryLoopConfig {
-            active_recall: pioneer_agent::MemoryActiveRecallConfig {
-                mode: pioneer_agent::MemoryActiveRecallMode::DeterministicOnly,
-                ..pioneer_agent::MemoryActiveRecallConfig::default()
+        memory: pioneer_memory::hooks::MemoryLoopConfig {
+            active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
+                mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
+                ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
             },
-            ..pioneer_agent::MemoryLoopConfig::default()
+            ..pioneer_memory::hooks::MemoryLoopConfig::default()
         },
         budget: ToolLoopBudgetConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
@@ -3250,16 +3317,18 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     processor.bind_task_bridge().await;
 
     let child_title = "Summarize child result";
-    let response = processor
-        .task_create_runtime(test_task_create_params(
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
             workspace_id.as_str(),
             "thr_parent_task_test",
             "turn_parent_task_test",
             child_title,
             3,
-        ))
-        .await
-        .expect("task_create should start immediate child task");
+        ),
+    )
+    .await
+    .expect("task_create should start immediate child task");
     let run = response
         .run
         .clone()
@@ -3289,17 +3358,19 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         "hidden child thread must not appear in sidebar thread tree"
     );
 
-    let wait_response = processor
-        .task_wait_runtime(TaskWaitParams {
+    let wait_response = wait_tasks_for_test(
+        &processor,
+        TaskWaitParams {
             task_ids: vec![response.task.id.clone()],
             run_ids: Vec::new(),
             timeout_ms: Some(5_000),
             return_completed: true,
             return_pending: true,
             ..Default::default()
-        })
-        .await
-        .expect("task_wait should succeed");
+        },
+    )
+    .await
+    .expect("task_wait should succeed");
     assert!(
         !wait_response.completed.is_empty(),
         "child echo turn should complete the task"
@@ -3370,8 +3441,7 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
         .expect("test helper should create agent spec");
     agent_spec.model = None;
 
-    let error = processor
-        .task_create_runtime(missing_model)
+    let error = create_task_for_test(&processor, missing_model)
         .await
         .expect_err("task_create should reject empty agent model");
     assert!(
@@ -3392,8 +3462,7 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
         .expect("test helper should create agent spec");
     agent_spec.model_provider = None;
 
-    let error = processor
-        .task_create_runtime(missing_provider)
+    let error = create_task_for_test(&processor, missing_provider)
         .await
         .expect_err("task_create should reject empty agent model provider");
     assert!(
@@ -3420,16 +3489,18 @@ async fn task_depth_limit_rejects_subtask_creation() {
     ));
     processor.bind_task_bridge().await;
 
-    let root = processor
-        .task_create_runtime(test_task_create_params(
+    let root = create_task_for_test(
+        &processor,
+        test_task_create_params(
             workspace_id.as_str(),
             "thr_depth_parent",
             "turn_depth_parent",
             "Root at max depth one",
             1,
-        ))
-        .await
-        .expect("root task at max depth one should be allowed");
+        ),
+    )
+    .await
+    .expect("root task at max depth one should be allowed");
 
     let mut child_params = test_task_create_params(
         workspace_id.as_str(),
@@ -3439,8 +3510,7 @@ async fn task_depth_limit_rejects_subtask_creation() {
         1,
     );
     child_params.parent_task_id = Some(root.task.id.clone());
-    let error = processor
-        .task_create_runtime(child_params)
+    let error = create_task_for_test(&processor, child_params)
         .await
         .expect_err("child task beyond max depth should fail");
     assert!(format!("{error:#}").contains("exceeds max depth"));
@@ -3471,23 +3541,27 @@ async fn task_detach_updates_lifecycle_policy() {
     ));
     processor.bind_task_bridge().await;
 
-    let response = processor
-        .task_create_runtime(test_task_create_params(
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
             workspace_id.as_str(),
             "thr_guard_parent",
             "turn_guard_parent",
             "Long running child",
             3,
-        ))
-        .await
-        .expect("long-running child task should start");
+        ),
+    )
+    .await
+    .expect("long-running child task should start");
 
-    processor
-        .task_detach_runtime(pioneer_protocol::TaskDetachParams {
+    detach_task_for_test(
+        &processor,
+        pioneer_protocol::TaskDetachParams {
             task_id: response.task.id.clone(),
-        })
-        .await
-        .expect("task_detach should succeed");
+        },
+    )
+    .await
+    .expect("task_detach should succeed");
 
     let detached = processor
         .crud_store
@@ -3505,14 +3579,16 @@ async fn task_detach_updates_lifecycle_policy() {
         TaskAttachmentMode::Detached
     );
 
-    processor
-        .task_cancel_runtime(pioneer_protocol::TaskCancelParams {
+    cancel_task_for_test(
+        &processor,
+        pioneer_protocol::TaskCancelParams {
             task_id: response.task.id,
             reason: Some("test cleanup".to_owned()),
             scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
-        })
-        .await
-        .expect("cleanup cancellation should succeed");
+        },
+    )
+    .await
+    .expect("cleanup cancellation should succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4191,104 +4267,108 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
-    let (tx, mut rx) = mpsc::channel(128);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = session_manager.register_connection(tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(GuardAwareProvider::new());
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
-        provider.clone(),
-    ));
-    provider_registry.insert(
-        "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(10),
-            text: "slow child".to_owned(),
-        }),
-    );
-    let processor = Arc::new(MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    ));
-    processor.bind_task_bridge().await;
+#[test]
+fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
+    run_gateway_message_test_with_large_stack("task-parent-turn-guard", || async {
+        let (tx, mut rx) = mpsc::channel(128);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id = session_manager.register_connection(tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let provider = Arc::new(GuardAwareProvider::new());
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "parent",
+            provider.clone(),
+        ));
+        provider_registry.insert(
+            "delayed",
+            Arc::new(DelayedProvider {
+                delay: Duration::from_secs(10),
+                text: "slow child".to_owned(),
+            }),
+        );
+        let processor = Arc::new(MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        ));
+        processor.bind_task_bridge().await;
 
-    start_thread_and_turn(
-        &processor,
-        connection_id,
-        &mut rx,
-        workspace_id.as_str(),
-        "thr_task_guard_parent",
-        "turn_task_guard_parent",
-        "Agent",
-        "parent",
-    )
-    .await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+        start_thread_and_turn(
+            &processor,
+            connection_id,
+            &mut rx,
+            workspace_id.as_str(),
+            "thr_task_guard_parent",
+            "turn_task_guard_parent",
+            "Agent",
+            "parent",
+        )
+        .await;
+        let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
 
-    let requests = provider.snapshot_requests();
-    assert!(
-        requests.len() >= 4,
-        "parent guard should keep the same turn active for another model round"
-    );
-    assert!(
-        requests.iter().any(|request| {
-            request.messages.iter().any(|message| {
-                message
-                    .content
-                    .contains("Attached tasks created by this turn")
-            })
-        }),
-        "guard observation should be model-visible"
-    );
+        let requests = provider.snapshot_requests();
+        assert!(
+            requests.len() >= 4,
+            "parent guard should keep the same turn active for another model round"
+        );
+        assert!(
+            requests.iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    message
+                        .content
+                        .contains("Attached tasks created by this turn")
+                })
+            }),
+            "guard observation should be model-visible"
+        );
 
-    let turn_items = crud_store
-        .get_turn_item_events("thr_task_guard_parent", "turn_task_guard_parent")
-        .await
-        .expect("turn items should load")
-        .expect("turn should exist");
-    let task_id = turn_items
-        .events
-        .iter()
-        .find_map(|event| match &event.payload {
-            TurnItemEventPayload::ItemCompleted {
-                item: TurnItem::Task { item },
-                ..
-            } => Some(item.task_id.clone()),
-            _ => None,
-        });
-    let task_id = task_id.expect("task anchor should exist");
-    let task = crud_store
-        .get_task(task_id.as_str())
-        .await
-        .expect("task should load")
-        .expect("task should exist");
-    assert_eq!(
-        task.task
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| policy.attachment),
-        Some(TaskAttachmentMode::Detached),
-        "task_detach should unblock parent completion"
-    );
-    processor
-        .task_cancel_runtime(pioneer_protocol::TaskCancelParams {
-            task_id,
-            reason: Some("test cleanup".to_owned()),
-            scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
-        })
+        let turn_items = crud_store
+            .get_turn_item_events("thr_task_guard_parent", "turn_task_guard_parent")
+            .await
+            .expect("turn items should load")
+            .expect("turn should exist");
+        let task_id = turn_items
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::Task { item },
+                    ..
+                } => Some(item.task_id.clone()),
+                _ => None,
+            });
+        let task_id = task_id.expect("task anchor should exist");
+        let task = crud_store
+            .get_task(task_id.as_str())
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(
+            task.task
+                .lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment),
+            Some(TaskAttachmentMode::Detached),
+            "task_detach should unblock parent completion"
+        );
+        cancel_task_for_test(
+            &processor,
+            pioneer_protocol::TaskCancelParams {
+                task_id,
+                reason: Some("test cleanup".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+            },
+        )
         .await
         .expect("detached child cleanup should succeed");
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5688,7 +5768,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .dynamic_system_text
             .clone();
         assert!(root_prompt.contains("## AGENTS.md"));
-        assert!(root_prompt.contains("Source: thread tree / <root>"));
+        assert!(root_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(root_prompt.contains("Root only instruction"));
 
         let (_, root_turn) = crud_store
@@ -5733,7 +5813,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .dynamic_system_text
             .clone();
         assert!(inherited_prompt.contains("Root only instruction"));
-        assert!(inherited_prompt.contains("Scope: applies to this thread"));
+        assert!(inherited_prompt.contains("explicit user messages take precedence"));
 
         let folder_doc = crud_store
             .save_thread_agents_doc(
@@ -5762,7 +5842,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             .expect("folder provider request should include compiled prompt")
             .dynamic_system_text
             .clone();
-        assert!(folder_prompt.contains("Source: thread tree / Child"));
+        assert!(folder_prompt.contains("effective AGENTS.md for this thread tree scope"));
         assert!(folder_prompt.contains("Folder only instruction"));
         assert!(!folder_prompt.contains("Root only instruction"));
 
@@ -11050,9 +11130,9 @@ async fn phase_13_pre_compaction_hook_is_dispatched() {
     .await;
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Succeed {
                 contributions: Vec::new(),
@@ -11060,9 +11140,10 @@ async fn phase_13_pre_compaction_hook_is_dispatched() {
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::BestEffort,
-        )))
-        .await;
-    assert!(harness.processor.has_hook_runtime().await);
+        ),
+    )
+    .await;
+    assert!(harness.processor.agent_manager.has_hook_runtime().await);
 
     let _history = harness
         .processor
@@ -11181,10 +11262,11 @@ async fn phase_13_empty_hook_runtime_preserves_current_compaction_behavior() {
         "PHASE13_EMPTY_RAW",
     )
     .await;
-    empty_runtime_harness
-        .processor
-        .set_hook_runtime(Some(phase_13_empty_hook_runtime()))
-        .await;
+    install_test_hook_runtime(
+        &empty_runtime_harness.processor,
+        phase_13_empty_hook_runtime(),
+    )
+    .await;
     let empty_runtime_history = empty_runtime_harness
         .processor
         .load_conversation_history(empty_runtime_thread_id.as_str(), "turn_empty_runtime")
@@ -11218,16 +11300,17 @@ async fn phase_13_best_effort_hook_failure_keeps_compaction_behavior() {
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Fail,
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::BestEffort,
-        )))
-        .await;
+        ),
+    )
+    .await;
 
     let history = harness
         .processor
@@ -11263,17 +11346,18 @@ async fn phase_13_fallback_hook_failure_keeps_compaction_and_ignores_fallback_co
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime_with_fallback(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime_with_fallback(
             calls.clone(),
             Phase13HookBehavior::Fail,
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::Fallback,
             vec![phase_13_prompt_section_contribution()],
-        )))
-        .await;
+        ),
+    )
+    .await;
 
     let history = harness
         .processor
@@ -11310,16 +11394,17 @@ async fn phase_13_required_hook_failure_skips_summary_update_and_uses_fallback()
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Fail,
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::Required,
-        )))
-        .await;
+        ),
+    )
+    .await;
 
     let history = harness
         .processor
@@ -11356,16 +11441,17 @@ async fn phase_13_fail_closed_hook_failure_skips_summary_update() {
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Fail,
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::FailClosed,
-        )))
-        .await;
+        ),
+    )
+    .await;
 
     let history = harness
         .processor
@@ -11397,16 +11483,17 @@ async fn phase_13_deadline_required_timeout_skips_summary_update() {
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Pending,
             HookAwaitPolicy::Deadline,
             Some(5),
             HookFailurePolicy::Required,
-        )))
-        .await;
+        ),
+    )
+    .await;
 
     let history = harness
         .processor
@@ -11460,9 +11547,9 @@ async fn phase_13_hook_contributions_do_not_mutate_summary() {
     )
     .await;
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    hook_harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &hook_harness.processor,
+        phase_13_hook_runtime(
             calls,
             Phase13HookBehavior::Succeed {
                 contributions: vec![phase_13_prompt_section_contribution()],
@@ -11470,8 +11557,9 @@ async fn phase_13_hook_contributions_do_not_mutate_summary() {
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::BestEffort,
-        )))
-        .await;
+        ),
+    )
+    .await;
     let hook_history = hook_harness
         .processor
         .load_conversation_history(hook_thread_id.as_str(), "turn_hook_contrib")
@@ -11519,9 +11607,9 @@ async fn phase_13_pre_compaction_input_is_bounded() {
         .expect("existing summary should update");
 
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    harness
-        .processor
-        .set_hook_runtime(Some(phase_13_hook_runtime(
+    install_test_hook_runtime(
+        &harness.processor,
+        phase_13_hook_runtime(
             calls.clone(),
             Phase13HookBehavior::Succeed {
                 contributions: Vec::new(),
@@ -11529,8 +11617,9 @@ async fn phase_13_pre_compaction_input_is_bounded() {
             HookAwaitPolicy::Blocking,
             None,
             HookFailurePolicy::BestEffort,
-        )))
-        .await;
+        ),
+    )
+    .await;
     let _history = harness
         .processor
         .load_conversation_history(thread_id.as_str(), "turn_bounded")
@@ -11978,15 +12067,6 @@ fn assert_request_has_tool(request: &ChatRequest, tool_name: &str) {
     );
 }
 
-#[allow(dead_code)]
-fn assert_request_lacks_tool(request: &ChatRequest, tool_name: &str) {
-    let tool_names = request_tool_names(request);
-    assert!(
-        !tool_names.iter().any(|name| name == tool_name),
-        "expected request tools not to include `{tool_name}`, got {tool_names:?}"
-    );
-}
-
 fn compiled_prompt_text(request: &ChatRequest) -> &str {
     request
         .compiled_prompt
@@ -12025,7 +12105,7 @@ fn memory_tool_context(harness: &MemoryGatewayHarness, turn_suffix: &str) -> Mem
 async fn materialize_memory_tools_for_context(
     harness: &MemoryGatewayHarness,
     context: MemoryTurnContext,
-) -> pioneer_agent::MemoryToolMaterialization {
+) -> pioneer_memory::hooks::MemoryToolMaterialization {
     let provider =
         crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
     provider

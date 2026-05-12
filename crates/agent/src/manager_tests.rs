@@ -5,7 +5,6 @@ use super::{
     MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
     ToolLoopConfig, TurnExecutionControl,
 };
-use crate::memory::memory_turn_policy_from_hook_policy_set;
 use futures_util::StreamExt;
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
@@ -18,6 +17,7 @@ use pioneer_hooks::{
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
     TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
+use pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set;
 use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
     MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,

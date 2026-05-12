@@ -1,13 +1,16 @@
-use super::*;
+use crate::PromptRuntimeBuiltInSectionId;
 use async_trait::async_trait;
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookContributionId,
-    HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler, HookHandlerRequest,
-    HookHandlerResponse, HookId, HookKind, HookPhase, HookPromptContent, HookPromptSectionTitle,
-    HookRegistryError, HookSectionId, HookSourceId, HookSourceKind, HookSourceLabel, HookSourceRef,
-    HookSubscription, HookSubscriptionId, HookSubscriptionVisibility, PromptSectionContribution,
+    HookDefinition, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy, HookHandler,
+    HookHandlerRequest, HookHandlerResponse, HookId, HookKind, HookPackage, HookPhase,
+    HookPromptContent, HookRegistryError, HookSectionId, HookSourceId, HookSourceKind,
+    HookSourceLabel, HookSourceRef, HookSubscription, HookSubscriptionId,
+    HookSubscriptionVisibility, PromptSectionContribution,
 };
+use std::sync::Arc;
 
+pub const AGENTS_DOC_PROMPT_HOOK_PACKAGE_ID: &str = "pioneer.prompt.agents_doc";
 const THREAD_AGENTS_DOC_PROMPT_HOOK_ID: &str = "pioneer.thread_agents_doc_prompt";
 const THREAD_AGENTS_DOC_PROMPT_HOOK_KIND: &str = "prompt_section";
 const THREAD_AGENTS_DOC_PROMPT_SUBSCRIPTION_ID: &str =
@@ -16,42 +19,66 @@ const THREAD_AGENTS_DOC_PROMPT_DOMAIN: &str = "pioneer.thread_agents_doc";
 const THREAD_AGENTS_DOC_PROMPT_MAX_CHARS: usize = 16_000;
 const THREAD_AGENTS_DOC_PROMPT_PRIORITY: i32 = 600;
 
-pub(super) fn install_thread_agents_doc_prompt_hook(
-    runtime: &Arc<HookRuntime>,
-    crud_store: Arc<CrudStore>,
-) -> Result<(), HookRegistryError> {
-    let handler = Arc::new(ThreadAgentsDocPromptHook { crud_store });
-    let hook_id = handler.id();
-    if !runtime.handlers().contains_handler(&hook_id)? {
-        runtime.handlers().register_handler(handler)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgentsDocPrompt {
+    pub id: String,
+    pub version: i64,
+    pub content: String,
+    pub source_path: Vec<String>,
+}
+
+#[async_trait]
+pub trait AgentsDocPromptResolver: Send + Sync {
+    async fn resolve_agents_doc_prompt(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<ResolvedAgentsDocPrompt>, String>;
+}
+
+pub fn agents_doc_package(
+    resolver: Arc<dyn AgentsDocPromptResolver>,
+) -> AgentsDocPromptHookPackage {
+    AgentsDocPromptHookPackage { resolver }
+}
+
+pub struct AgentsDocPromptHookPackage {
+    resolver: Arc<dyn AgentsDocPromptResolver>,
+}
+
+impl HookPackage for AgentsDocPromptHookPackage {
+    fn id(&self) -> &'static str {
+        AGENTS_DOC_PROMPT_HOOK_PACKAGE_ID
     }
 
-    let subscription_id = HookSubscriptionId::new(THREAD_AGENTS_DOC_PROMPT_SUBSCRIPTION_ID)
-        .expect("static subscription id is valid");
-    if runtime
-        .subscriptions()
-        .get_subscription(&subscription_id)?
-        .is_none()
-    {
-        runtime.subscriptions().register_subscription(
-            runtime.handlers().as_ref(),
-            HookSubscription::new(subscription_id, hook_id, HookPhase::TurnPrePromptCompile)
-                .with_priority(0)
-                .with_execution_policy(HookExecutionPolicy {
-                    await_policy: HookAwaitPolicy::Blocking,
-                    timeout_ms: None,
-                    max_parallelism: None,
-                })
-                .with_failure_policy(HookFailurePolicy::FailClosed)
-                .with_visibility(HookSubscriptionVisibility::Internal),
-        )?;
-    }
+    fn definitions(&self) -> Result<Vec<HookDefinition>, HookRegistryError> {
+        let handler = Arc::new(ThreadAgentsDocPromptHook {
+            resolver: self.resolver.clone(),
+        });
+        let hook_id = handler.id();
+        let subscription_id = HookSubscriptionId::new(THREAD_AGENTS_DOC_PROMPT_SUBSCRIPTION_ID)
+            .expect("static subscription id is valid");
 
-    Ok(())
+        Ok(vec![HookDefinition::new(
+            handler,
+            [
+                HookSubscription::new(subscription_id, hook_id, HookPhase::TurnPrePromptCompile)
+                    .with_priority(0)
+                    .with_execution_policy(HookExecutionPolicy {
+                        await_policy: HookAwaitPolicy::Blocking,
+                        timeout_ms: None,
+                        max_parallelism: None,
+                    })
+                    .with_failure_policy(HookFailurePolicy::FailClosed)
+                    .with_visibility(HookSubscriptionVisibility::Internal),
+            ],
+            AGENTS_DOC_PROMPT_HOOK_PACKAGE_ID,
+        )])
+    }
 }
 
 struct ThreadAgentsDocPromptHook {
-    crud_store: Arc<CrudStore>,
+    resolver: Arc<dyn AgentsDocPromptResolver>,
 }
 
 #[async_trait]
@@ -119,8 +146,8 @@ impl HookHandler for ThreadAgentsDocPromptHook {
             })?;
 
         let Some(resolved) = self
-            .crud_store
-            .resolve_thread_agents_doc_for_thread(workspace_id, thread_id)
+            .resolver
+            .resolve_agents_doc_prompt(workspace_id, thread_id)
             .await
             .map_err(|error| {
                 agents_doc_hook_error(
@@ -141,12 +168,12 @@ impl HookHandler for ThreadAgentsDocPromptHook {
 }
 
 fn thread_agents_doc_prompt_contribution(
-    resolved: &pioneer_crud::ResolvedThreadAgentsDocRecord,
+    resolved: &ResolvedAgentsDocPrompt,
 ) -> pioneer_hooks::HookResult<PromptSectionContribution> {
     Ok(PromptSectionContribution {
         contribution_id: HookContributionId::new(format!(
             "thread_agents_doc.{}.v{}",
-            resolved.doc.id, resolved.doc.version
+            resolved.id, resolved.version
         ))
         .map_err(|error| {
             agents_doc_hook_error(
@@ -154,12 +181,11 @@ fn thread_agents_doc_prompt_contribution(
                 format!("invalid AGENTS.md prompt contribution id: {error}"),
             )
         })?,
-        section_id: HookSectionId::new(
-            pioneer_promt::PromptRuntimeBuiltInSectionId::AgentsMd.manifest_id(),
-        )
-        .expect("static section id is valid"),
+        section_id: HookSectionId::new(PromptRuntimeBuiltInSectionId::AgentsMd.manifest_id())
+            .expect("static section id is valid"),
         title: Some(
-            HookPromptSectionTitle::new("AGENTS.md").expect("static section title is valid"),
+            pioneer_hooks::HookPromptSectionTitle::new("AGENTS.md")
+                .expect("static section title is valid"),
         ),
         domain: HookDomain::new(THREAD_AGENTS_DOC_PROMPT_DOMAIN).expect("static domain is valid"),
         priority: THREAD_AGENTS_DOC_PROMPT_PRIORITY,
@@ -178,11 +204,11 @@ fn thread_agents_doc_prompt_contribution(
 }
 
 fn thread_agents_doc_source_ref(
-    resolved: &pioneer_crud::ResolvedThreadAgentsDocRecord,
+    resolved: &ResolvedAgentsDocPrompt,
 ) -> pioneer_hooks::HookResult<HookSourceRef> {
     Ok(HookSourceRef {
         kind: HookSourceKind::Document,
-        id: HookSourceId::new(resolved.doc.id.clone()).map_err(|error| {
+        id: HookSourceId::new(resolved.id.clone()).map_err(|error| {
             agents_doc_hook_error(
                 "thread_agents_doc.invalid_source_id",
                 format!("invalid AGENTS.md source id: {error}"),
@@ -195,29 +221,19 @@ fn thread_agents_doc_source_ref(
     })
 }
 
-fn thread_agents_doc_source_label(
-    resolved: &pioneer_crud::ResolvedThreadAgentsDocRecord,
-) -> String {
+fn thread_agents_doc_source_label(resolved: &ResolvedAgentsDocPrompt) -> String {
     match resolved.source_path.as_slice() {
         [] => "AGENTS.md at thread tree root".to_owned(),
         path => format!("AGENTS.md at thread tree / {}", path.join(" / ")),
     }
 }
 
-fn render_thread_agents_doc_prompt_content(
-    resolved: &pioneer_crud::ResolvedThreadAgentsDocRecord,
-) -> String {
-    let source = match resolved.source_path.as_slice() {
-        [] => "thread tree / <root>".to_owned(),
-        path => format!("thread tree / {}", path.join(" / ")),
-    };
-
+fn render_thread_agents_doc_prompt_content(resolved: &ResolvedAgentsDocPrompt) -> String {
     format!(
-        "Source: {source}\n\
-Scope: applies to this thread unless a closer folder AGENTS.md overrides it.\n\
-Precedence: system, developer, and explicit user messages override this section.\n\n\
+        "These instructions come from the effective AGENTS.md for this thread tree scope. \
+System, developer, and explicit user messages take precedence.\n\n\
 <AGENTS_MD>\n{}\n</AGENTS_MD>",
-        resolved.doc.content.trim()
+        resolved.content.trim()
     )
 }
 
