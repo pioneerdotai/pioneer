@@ -515,6 +515,7 @@ fn prompt_section_contribution(
         priority,
         content: HookPromptContent::new(content).expect("valid prompt content"),
         max_chars: None,
+        source_refs: Vec::new(),
         diagnostics: Vec::new(),
         truncated: false,
     })

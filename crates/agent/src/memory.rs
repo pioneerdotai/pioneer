@@ -4047,6 +4047,7 @@ fn memory_recall_prompt_section_contribution_from_input(
         priority: 500,
         content: HookPromptContent::new(prompt).ok()?,
         max_chars: None,
+        source_refs: Vec::new(),
         diagnostics: Vec::new(),
         truncated: false,
     }))

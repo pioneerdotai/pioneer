@@ -756,6 +756,9 @@ fn prompt_manifest_hook_metadata_from_phase_response(
                 let hook_truncated =
                     section.truncated || entry.is_none() || entry.is_some_and(|entry| entry.0);
                 let hook_content_chars = entry.map(|entry| entry.1);
+                let source_count = entry
+                    .map(|entry| entry.2)
+                    .unwrap_or(section.source_refs.len());
                 for run_source in run_sources {
                     metadata
                         .sources
@@ -766,7 +769,7 @@ fn prompt_manifest_hook_metadata_from_phase_response(
                                 EffectiveTurnPromptManifestHookContributionKind::PromptSection,
                             contribution_id: Some(section.contribution_id.clone()),
                             priority: Some(section.priority),
-                            source_count: Some(0),
+                            source_count: Some(source_count),
                             hook_truncated,
                             hook_content_chars,
                         });
@@ -911,13 +914,17 @@ fn run_sources_by_hash(
 
 fn prompt_section_entries_by_id(
     prompt_section_set: &HookPromptSectionSet,
-) -> BTreeMap<HookSectionId, (bool, usize)> {
+) -> BTreeMap<HookSectionId, (bool, usize, usize)> {
     prompt_section_set
         .entries()
         .map(|entry| {
             (
                 entry.section_id.clone(),
-                (entry.truncated, entry.content.as_str().chars().count()),
+                (
+                    entry.truncated,
+                    entry.content.as_str().chars().count(),
+                    entry.source_refs.len(),
+                ),
             )
         })
         .collect()

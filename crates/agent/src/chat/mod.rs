@@ -337,12 +337,15 @@ struct PromptSectionsForCompile {
 fn prompt_sections_for_compile_from_hook_sections(
     section_set: &EffectiveTurnPromptSectionSet,
 ) -> Result<PromptSectionsForCompile, ChatTurnError> {
+    let mut compiled_sections = PromptSectionsForCompile {
+        runtime_sections: Vec::new(),
+    };
+
     if section_set.is_empty() {
-        return Ok(PromptSectionsForCompile::default());
+        return Ok(compiled_sections);
     }
     let sections = section_set.clone_hook_prompt_section_set();
 
-    let mut compiled_sections = PromptSectionsForCompile::default();
     for entry in sections.entries() {
         compiled_sections
             .runtime_sections
@@ -597,15 +600,19 @@ fn prompt_manifest_from_bundle(
     }
 }
 
+fn prompt_manifest_section_content_chars(bundle: &CompiledPromptBundle) -> BTreeMap<String, usize> {
+    bundle
+        .sections
+        .iter()
+        .map(|section| (section.id.manifest_id(), section.content.chars().count()))
+        .collect()
+}
+
 fn prompt_manifest_hook_sources(
     bundle: &CompiledPromptBundle,
     hook_metadata: &EffectiveTurnPromptManifestHookMetadata,
 ) -> Vec<PromptManifestHookSourceEntry> {
-    let section_content_chars = bundle
-        .sections
-        .iter()
-        .map(|section| (section.id.manifest_id(), section.content.chars().count()))
-        .collect::<BTreeMap<_, _>>();
+    let section_content_chars = prompt_manifest_section_content_chars(bundle);
 
     hook_metadata
         .sources
@@ -3073,6 +3080,10 @@ mod tests {
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
     };
     use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
+    use pioneer_promt::{
+        PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
+        PromptSectionId,
+    };
     use pioneer_protocol::UserInput;
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
@@ -3166,6 +3177,40 @@ mod tests {
         assert!(bundle.full_system_text.contains("runtime identity"));
         assert!(!bundle.full_system_text.contains("workspace soul"));
         assert!(!bundle.full_system_text.contains("workspace identity"));
+    }
+
+    #[test]
+    fn agents_md_runtime_section_is_compiled_by_agent_prompt_bundle() {
+        let runtime_home = temp_dir("agents_md_runtime_prompt");
+        let agents_section = PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd),
+            title: Some("AGENTS.md".to_owned()),
+            content: "Source: thread tree / <root>\n\n<AGENTS_MD>\nUse repo rules.\n</AGENTS_MD>"
+                .to_owned(),
+            max_chars: Some(20_000),
+            truncated: false,
+        };
+
+        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+            runtime_home.as_path(),
+            None,
+            None,
+            &[agents_section],
+            false,
+            false,
+            "thread_agents_md",
+            "turn_agents_md",
+        )
+        .expect("compile prompt bundle");
+
+        let agents_section = bundle
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::AgentsMd)
+            .expect("agents_md section should be compiled");
+        assert_eq!(agents_section.title, "AGENTS.md");
+        assert!(bundle.dynamic_system_text.contains("## AGENTS.md"));
+        assert!(bundle.dynamic_system_text.contains("Use repo rules."));
     }
 
     #[test]
