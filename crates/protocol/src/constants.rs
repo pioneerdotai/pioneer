@@ -8,6 +8,10 @@ pub mod methods {
     pub const THREAD_FOLDER_CREATE: &str = "thread/folder/create";
     pub const THREAD_FOLDER_MOVE: &str = "thread/folder/move";
     pub const THREAD_FOLDER_DELETE: &str = "thread/folder/delete";
+    pub const THREAD_AGENTS_DOC_GET: &str = "thread/agents_doc/get";
+    pub const THREAD_AGENTS_DOC_SAVE: &str = "thread/agents_doc/save";
+    pub const THREAD_AGENTS_DOC_ARCHIVE: &str = "thread/agents_doc/archive";
+    pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
     pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_HISTORY: &str = "thread/history";
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
@@ -86,6 +90,7 @@ pub mod events {
     pub const THREAD_UPDATED: &str = "thread/updated";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
+    pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_FAILED: &str = "turn/failed";

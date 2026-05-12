@@ -21,9 +21,10 @@ use crate::{
     TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunFailedNotification,
     TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification,
-    ThreadArtifactsChangedNotification, ThreadClosedNotification, ThreadStartedNotification,
-    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnCompletedNotification,
-    TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
+    ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
+    ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
+    ThreadUpdatedNotification, TurnCompletedNotification, TurnFailedNotification,
+    TurnStartedNotification, TurnTimelineChangedNotification,
     TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
@@ -51,6 +52,7 @@ pub enum GatewayNotification {
     ThreadClosed(ThreadClosedNotification),
     ThreadUpdated(ThreadUpdatedNotification),
     ThreadTreeChanged(ThreadTreeChangedNotification),
+    ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
     TurnStarted(TurnStartedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
@@ -133,6 +135,11 @@ impl GatewayNotification {
                 serde_json::from_value::<ThreadTreeChangedNotification>(params)
                     .ok()
                     .map(Self::ThreadTreeChanged)
+            }
+            events::THREAD_AGENTS_DOC_CHANGED => {
+                serde_json::from_value::<ThreadAgentsDocChangedNotification>(params)
+                    .ok()
+                    .map(Self::ThreadAgentsDocChanged)
             }
             events::TURN_STARTED => serde_json::from_value::<TurnStartedNotification>(params)
                 .ok()

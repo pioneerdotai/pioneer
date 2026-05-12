@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::MarkdownDocument;
+use crate::thread_agents_doc::ThreadAgentsDocSummary;
 use crate::turn::{
     ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
@@ -101,6 +102,8 @@ pub struct ThreadTreeResponse {
     pub folders: Vec<ThreadFolder>,
     #[serde(default)]
     pub placements: Vec<ThreadPlacement>,
+    #[serde(default)]
+    pub agents_docs: Vec<ThreadAgentsDocSummary>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -485,8 +488,10 @@ pub struct ThreadTreeChangedNotification {
 mod tests {
     use super::{
         Thread, ThreadClosedNotification, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-        ThreadStartParams, ThreadStatus, ThreadUnsubscribeParams, ThreadUnsubscribeStatus,
+        ThreadStartParams, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeParams,
+        ThreadUnsubscribeStatus,
     };
+    use crate::{ThreadAgentsDocStatus, ThreadAgentsDocSummary};
     use serde_json::json;
 
     #[test]
@@ -527,6 +532,43 @@ mod tests {
             encoded,
             json!({"thread_id": "thr_123", "workspace_id": "ws_123"})
         );
+    }
+
+    #[test]
+    fn thread_tree_response_defaults_agents_docs_and_omits_content_in_summaries() {
+        let decoded: ThreadTreeResponse = serde_json::from_value(json!({
+            "workspace_id": "ws_123",
+            "threads": [],
+            "folders": [],
+            "placements": []
+        }))
+        .expect("thread tree response should decode without agents_docs");
+        assert!(decoded.agents_docs.is_empty());
+
+        let encoded = serde_json::to_value(ThreadTreeResponse {
+            workspace_id: "ws_123".to_owned(),
+            threads: Vec::new(),
+            folders: Vec::new(),
+            placements: Vec::new(),
+            agents_docs: vec![ThreadAgentsDocSummary {
+                id: "doc_123".to_owned(),
+                workspace_id: "ws_123".to_owned(),
+                folder_id: None,
+                status: ThreadAgentsDocStatus::Active,
+                content_sha256: "hash".to_owned(),
+                version: 2,
+                char_count: 12,
+                updated_at: 10,
+            }],
+        })
+        .expect("thread tree response should encode");
+        let summary = encoded
+            .get("agents_docs")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+            .expect("summary should be present");
+        assert!(summary.get("content").is_none());
+        assert_eq!(summary.get("char_count"), Some(&json!(12)));
     }
 
     #[test]

@@ -3,6 +3,13 @@
   "title": "ThreadTreeResponse",
   "type": "object",
   "properties": {
+    "agents_docs": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ThreadAgentsDocSummary"
+      }
+    },
     "folders": {
       "type": "array",
       "default": [],
@@ -312,6 +319,59 @@
         "updated_at",
         "status",
         "turns"
+      ]
+    },
+    "ThreadAgentsDocStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "archived"
+      ]
+    },
+    "ThreadAgentsDocSummary": {
+      "type": "object",
+      "properties": {
+        "char_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "content_sha256": {
+          "type": "string"
+        },
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadAgentsDocStatus"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "status",
+        "content_sha256",
+        "version",
+        "char_count",
+        "updated_at"
       ]
     },
     "ThreadFolder": {

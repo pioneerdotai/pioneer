@@ -109,14 +109,19 @@ use crate::{
     TaskTreeResponse, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
     TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitItem, TaskWaitParams, TaskWaitResponse,
     TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, TextElement,
-    Thread, ThreadClosedNotification, ThreadFolder, ThreadFolderCreateParams,
-    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
-    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadHistoryParams, ThreadHistoryResponse,
-    ThreadLineage, ThreadMode, ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind,
-    ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams,
-    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+    Thread, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadClosedNotification, ThreadFolder,
+    ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
+    ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
+    ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadHistoryParams,
+    ThreadHistoryResponse, ThreadLineage, ThreadMode, ThreadMoveParams, ThreadMoveResponse,
+    ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
     ThreadUnsubscribeStatus, ThreadUpdatedNotification, ToolDisplayPayload, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolMetadata, ToolMetadataRawKind, ToolMetadataValue,
     ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryIdempotencyMode,
@@ -494,6 +499,53 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "thread_folder_delete_response.json",
             ThreadFolderDeleteResponse
+        ),
+        schema_doc!("thread_agents_doc_status.json", ThreadAgentsDocStatus),
+        schema_doc!(
+            "thread_agents_doc_save_reason.json",
+            ThreadAgentsDocSaveReason
+        ),
+        schema_doc!("thread_agents_doc_payload.json", ThreadAgentsDocPayload),
+        schema_doc!("thread_agents_doc_summary.json", ThreadAgentsDocSummary),
+        schema_doc!(
+            "thread_agents_doc_resolved_payload.json",
+            ThreadAgentsDocResolvedPayload
+        ),
+        schema_doc!(
+            "thread_agents_doc_get_params.json",
+            ThreadAgentsDocGetParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_get_response.json",
+            ThreadAgentsDocGetResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_save_params.json",
+            ThreadAgentsDocSaveParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_save_response.json",
+            ThreadAgentsDocSaveResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_archive_params.json",
+            ThreadAgentsDocArchiveParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_archive_response.json",
+            ThreadAgentsDocArchiveResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_resolve_for_thread_params.json",
+            ThreadAgentsDocResolveForThreadParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_resolve_for_thread_response.json",
+            ThreadAgentsDocResolveForThreadResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_changed_notification.json",
+            ThreadAgentsDocChangedNotification
         ),
         schema_doc!("thread_move_params.json", ThreadMoveParams),
         schema_doc!("thread_move_response.json", ThreadMoveResponse),

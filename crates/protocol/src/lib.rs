@@ -13,6 +13,7 @@ mod schema;
 mod skills;
 mod task;
 mod thread;
+mod thread_agents_doc;
 mod turn;
 mod workspace;
 
@@ -146,6 +147,14 @@ pub use thread::{
     ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams,
     ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
     ThreadUnsubscribeStatus, ThreadUpdatedNotification,
+};
+pub use thread_agents_doc::{
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary,
 };
 pub use turn::{
     ByteRange, ContextCompressedNotification, ContextCompressingNotification, DeltaOutputPolicy,
