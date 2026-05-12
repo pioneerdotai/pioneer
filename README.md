@@ -57,6 +57,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Skills** - compatible with the [Agent Skills specification](https://agentskills.io/home), with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
 - **Tasks** - scheduled and on-demand task execution with dependencies, retries, delivery state, progress events, write locks, and task trees.
 - **Protocol-first architecture** - `pioneer-protocol` defines the public JSON-RPC surface and generated schemas under `schemas/`.
+- **Workspace-scoped artifacts** - files uploaded by users or produced by agents are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.
 - **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
 - **Multi-language desktop** - desktop UI locales are available for English, German, Spanish, French, Hindi, Japanese, Russian, and Chinese.
 
