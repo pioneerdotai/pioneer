@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "アシスタントにメッセージを送信"
-stop = "停止"
-stopping = "停止中..."
 stop_reason = "ユーザーがターンをキャンセルしました"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "このフィルターに一致するアーティファクトは�
 failed = "アーティファクトの読み込みに失敗しました"
 kind = "種類"
 loading = "アーティファクトを読み込み中..."
-metadata = "メタデータ"
-preview = "プレビュー"
-provenance = "由来"
 provenance_unknown = "由来なし"
-sha256 = "SHA-256"
-local_copy = "ローカルコピー"
 size = "サイズ"
 size_unknown = "サイズ不明"
 source_label = "ソース"
@@ -62,13 +55,9 @@ version = "バージョン"
 version_latest = "最新"
 
 [artifacts.action]
-attach = "添付"
 attach_tooltip = "このアーティファクトをコンポーザーの入力として使用"
-download = "ダウンロード..."
 download_tooltip = "このアーティファクトをこのコンピューターにダウンロード"
-open = "開く"
 open_tooltip = "検証済みのローカルコピーを開く"
-reveal = "表示"
 reveal_tooltip = "ローカルコピーを表示"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "生成済み"
 images = "画像"
 task_output = "タスク"
 uploaded = "アップロード済み"
-
-[artifacts.preview_kind]
-json_summary = "JSONサマリー"
-pdf_text = "PDFテキスト"
-plain_text = "テキストプレビュー"
-thumbnail = "サムネイル"
-
-[artifacts.preview_status]
-failed = "失敗"
-pending = "準備中"
-ready = "準備完了"
-stale = "更新中"
 
 [artifacts.source]
 agent = "エージェント"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "新しいスレッド"
-providers = "プロバイダー"
 
 [sidebar.thread]
 untitled = "新しいスレッド"
@@ -251,10 +227,38 @@ new = "新しいフォルダ"
 [sidebar.contextmenu.folder]
 rename = "名前を変更"
 delete = "削除"
+create_agents_doc = "AGENTS.mdを作成"
+edit_agents_doc = "AGENTS.mdを編集"
+remove_agents_doc_override = "AGENTS.mdを削除"
 
 [dialog.folder.rename]
 title = "フォルダ名を変更"
 description = "短く、覚えやすい名前にしてください。"
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "AGENTS.mdを読み込み中..."
+load_error = "AGENTS.mdを読み込めませんでした"
+retry = "再試行"
+retry_save = "保存を再試行"
+save_conflict = "AGENTS.mdが別の場所で変更されました。競合を解消してから再読み込みまたは再試行してください。"
+save_conflict_missing_remote = "AGENTS.mdが別の場所で変更されましたが、リモート文書を読み込めませんでした。"
+
+[editor.agents_doc.conflict]
+title = "AGENTS.mdの競合"
+description = "この編集を保存する前にリモート文書が変更されました。"
+reload_remote = "リモートを再読み込み"
+overwrite_remote = "リモートを上書き"
+local = "ローカル"
+remote = "リモート"
+
+[editor.agents_doc.save_state]
+clean = "未保存の変更はありません"
+dirty = "未保存の変更"
+saving = "保存中..."
+saved = "保存済み"
+error = "保存に失敗しました: %{message}"
+conflict = "保存する前に競合を解消してください"
 
 [providers.screen]
 title = "プロバイダー"
@@ -595,7 +599,6 @@ uninstall = "アンインストール"
 not_selected = "MCP サーバーが選択されていません"
 enabled = "有効"
 implicit = "暗黙"
-refresh = "更新"
 source = "ソース"
 scope = "スコープ"
 transport = "トランスポート"
@@ -702,7 +705,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -723,13 +725,6 @@ preparing = "Preparing skill upload"
 installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
-
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
 
 [skills.diagnostics]
 reason = "Reason:"
@@ -843,8 +838,6 @@ no_details = "詳細はありません"
 truncated = "... [切り詰め]"
 
 [timeline.reasoning]
-summary = "要約:"
-content = "内容:"
 running = "思考中"
 completed = "思考済み"
 
@@ -915,7 +908,6 @@ status_code = "ステータスコード: %{status_code}"
 title = "タイトル: %{title}"
 path = "パス: %{path}"
 bytes = "バイト: %{bytes}"
-stage = "[ステージ] %{value}"
 progress = "[進行状況] %{value}"
 stderr = "[エラー] %{value}"
 

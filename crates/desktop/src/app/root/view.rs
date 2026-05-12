@@ -37,6 +37,7 @@ impl Render for PioneerDesktop {
             let desktop_entity = cx.entity().clone();
             let content = match self.main_content_view {
                 MainContentView::Threads => self.render_thread(window, cx),
+                MainContentView::AgentsDoc => self.render_agents_doc_editor(cx),
                 MainContentView::Providers => self.render_providers(window, cx),
                 MainContentView::Mcp => self.render_mcp(window, cx),
                 MainContentView::McpDetails => self.render_mcp_details(window, cx),

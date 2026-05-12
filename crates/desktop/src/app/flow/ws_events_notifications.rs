@@ -284,6 +284,9 @@ impl PioneerDesktop {
             GatewayNotification::ThreadTreeChanged(notification) => {
                 self.apply_thread_tree_changed_notification(notification);
             }
+            GatewayNotification::ThreadAgentsDocChanged(notification) => {
+                self.apply_thread_agents_doc_changed_notification(notification);
+            }
             GatewayNotification::ThreadUpdated(notification) => {
                 self.apply_thread_updated_notification(notification);
             }
@@ -457,6 +460,19 @@ impl PioneerDesktop {
     fn apply_thread_tree_changed_notification(
         &mut self,
         notification: pioneer_protocol::ThreadTreeChangedNotification,
+    ) {
+        let active_workspace = self.active_workspace_scope_for_notifications();
+        if should_refresh_workspace_bound_data(
+            active_workspace.as_deref(),
+            notification.workspace_id.as_str(),
+        ) {
+            self.queue_thread_list_refresh();
+        }
+    }
+
+    fn apply_thread_agents_doc_changed_notification(
+        &mut self,
+        notification: pioneer_protocol::ThreadAgentsDocChangedNotification,
     ) {
         let active_workspace = self.active_workspace_scope_for_notifications();
         if should_refresh_workspace_bound_data(

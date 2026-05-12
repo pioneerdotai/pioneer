@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "向助手发送消息"
-stop = "停止"
-stopping = "正在停止..."
 stop_reason = "用户取消了回合"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "没有工件匹配此筛选条件"
 failed = "加载工件失败"
 kind = "类型"
 loading = "正在加载工件..."
-metadata = "元数据"
-preview = "预览"
-provenance = "来源"
 provenance_unknown = "无来源信息"
-sha256 = "SHA-256"
-local_copy = "本地副本"
 size = "大小"
 size_unknown = "未知大小"
 source_label = "来源"
@@ -62,13 +55,9 @@ version = "版本"
 version_latest = "最新"
 
 [artifacts.action]
-attach = "附加"
 attach_tooltip = "将此工件作为输入用于编辑器"
-download = "下载..."
 download_tooltip = "将此工件下载到这台电脑"
-open = "打开"
 open_tooltip = "打开已验证的本地副本"
-reveal = "显示"
 reveal_tooltip = "显示本地副本"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "已生成"
 images = "图片"
 task_output = "任务"
 uploaded = "已上传"
-
-[artifacts.preview_kind]
-json_summary = "JSON 摘要"
-pdf_text = "PDF 文本"
-plain_text = "文本预览"
-thumbnail = "缩略图"
-
-[artifacts.preview_status]
-failed = "失败"
-pending = "准备中"
-ready = "就绪"
-stale = "更新中"
 
 [artifacts.source]
 agent = "智能体"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "新建话题"
-providers = "供应商"
 
 [sidebar.thread]
 untitled = "新建话题"
@@ -251,10 +227,38 @@ new = "新建文件夹"
 [sidebar.contextmenu.folder]
 rename = "重命名"
 delete = "删除"
+create_agents_doc = "创建 AGENTS.md"
+edit_agents_doc = "编辑 AGENTS.md"
+remove_agents_doc_override = "移除 AGENTS.md"
 
 [dialog.folder.rename]
 title = "重命名文件夹"
 description = "请保持简短且便于记忆。"
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "正在加载 AGENTS.md..."
+load_error = "无法加载 AGENTS.md"
+retry = "重试"
+retry_save = "重试保存"
+save_conflict = "AGENTS.md 已在其他位置更改。请重新加载或解决冲突后重试。"
+save_conflict_missing_remote = "AGENTS.md 已在其他位置更改，但无法加载远程文档。"
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md 冲突"
+description = "保存此次编辑之前，远程文档已更改。"
+reload_remote = "重新加载远程"
+overwrite_remote = "覆盖远程"
+local = "本地"
+remote = "远程"
+
+[editor.agents_doc.save_state]
+clean = "没有未保存的更改"
+dirty = "有未保存的更改"
+saving = "正在保存..."
+saved = "已保存"
+error = "保存失败：%{message}"
+conflict = "保存前请先解决冲突"
 
 [providers.screen]
 title = "供应商"
@@ -595,7 +599,6 @@ uninstall = "卸载"
 not_selected = "未选择 MCP 服务器"
 enabled = "已启用"
 implicit = "隐式"
-refresh = "刷新"
 source = "来源"
 scope = "范围"
 transport = "传输"
@@ -702,7 +705,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -723,13 +725,6 @@ preparing = "Preparing skill upload"
 installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
-
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
 
 [skills.diagnostics]
 reason = "Reason:"
@@ -843,8 +838,6 @@ no_details = "无详情"
 truncated = "... [已截断]"
 
 [timeline.reasoning]
-summary = "摘要："
-content = "内容："
 running = "正在思考"
 completed = "已思考"
 
@@ -915,7 +908,6 @@ status_code = "状态码：%{status_code}"
 title = "标题：%{title}"
 path = "路径：%{path}"
 bytes = "字节数：%{bytes}"
-stage = "[阶段] %{value}"
 progress = "[进度] %{value}"
 stderr = "[错误] %{value}"
 

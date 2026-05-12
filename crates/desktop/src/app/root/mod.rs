@@ -6,6 +6,7 @@ mod view;
 use crate::{
     app::{
         conversation::Conversation,
+        editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         skills::details::table::SkillDiagnosticsTableDelegate,
         thread::{ThreadCoordinator, view::timeline::model::TimelineRow},
@@ -19,7 +20,7 @@ use gpui_component::{
 use gpui_terminal::TerminalView;
 use pioneer_protocol::{
     ArtifactRef, ArtifactSummary, McpListItem, McpServerDetailsResponse, SkillHealthItem,
-    SkillListItem, Thread, ThreadFolder, ThreadMode, ThreadPlacement,
+    SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement,
 };
 use std::{
     cell::RefCell,
@@ -111,6 +112,7 @@ pub(super) struct SkillUploadProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MainContentView {
     Threads,
+    AgentsDoc,
     Providers,
     Mcp,
     McpDetails,
@@ -301,10 +303,57 @@ pub(super) struct ThreadArtifactsState {
     pub(super) preview_failed_by_artifact: HashSet<ThreadArtifactVersionKey>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ThreadAgentsDocSummaryKey {
+    Root,
+    Folder(String),
+}
+
+impl ThreadAgentsDocSummaryKey {
+    pub(super) fn from_folder_id(folder_id: Option<&str>) -> Self {
+        match folder_id {
+            Some(folder_id) => Self::Folder(folder_id.to_owned()),
+            None => Self::Root,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ThreadAgentsDocEditorScope {
+    Root {
+        workspace_id: String,
+    },
+    Folder {
+        workspace_id: String,
+        folder_id: String,
+    },
+}
+
+impl ThreadAgentsDocEditorScope {
+    pub(super) fn folder_id(&self) -> Option<&str> {
+        match self {
+            Self::Root { .. } => None,
+            Self::Folder { folder_id, .. } => Some(folder_id.as_str()),
+        }
+    }
+
+    pub(super) fn workspace_id(&self) -> &str {
+        match self {
+            Self::Root { workspace_id } | Self::Folder { workspace_id, .. } => {
+                workspace_id.as_str()
+            }
+        }
+    }
+}
+
 pub struct PioneerDesktop {
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
     pub(super) thread_folders: HashMap<String, ThreadFolder>,
     pub(super) thread_placements: HashMap<String, ThreadPlacement>,
+    pub(super) thread_agents_doc_summaries:
+        HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
+    pub(super) active_agents_doc_editor_scope: Option<ThreadAgentsDocEditorScope>,
+    pub(super) agents_doc_editor: Option<Entity<AgentsDocEditor>>,
     pub(super) thread_folder_expanded: HashMap<String, bool>,
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,

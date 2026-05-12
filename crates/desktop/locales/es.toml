@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "Envía un mensaje al asistente"
-stop = "Detener"
-stopping = "Deteniendo..."
 stop_reason = "Turn cancelado por el usuario"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "Ningun artefacto coincide con este filtro"
 failed = "No se pudieron cargar los artefactos"
 kind = "Tipo"
 loading = "Cargando artefactos..."
-metadata = "Metadatos"
-preview = "Vista previa"
-provenance = "Procedencia"
 provenance_unknown = "Sin procedencia"
-sha256 = "SHA-256"
-local_copy = "Copia local"
 size = "Tamano"
 size_unknown = "Tamano desconocido"
 source_label = "Origen"
@@ -62,13 +55,9 @@ version = "Version"
 version_latest = "actual"
 
 [artifacts.action]
-attach = "Adjuntar"
 attach_tooltip = "Usar este artefacto como entrada en el compositor"
-download = "Descargar..."
 download_tooltip = "Descargar este artefacto a este equipo"
-open = "Abrir"
 open_tooltip = "Abrir una copia local verificada"
-reveal = "Mostrar"
 reveal_tooltip = "Mostrar la copia local"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "Generados"
 images = "Imagenes"
 task_output = "Tareas"
 uploaded = "Subidos"
-
-[artifacts.preview_kind]
-json_summary = "Resumen JSON"
-pdf_text = "Texto PDF"
-plain_text = "Vista previa de texto"
-thumbnail = "Miniatura"
-
-[artifacts.preview_status]
-failed = "error"
-pending = "preparando"
-ready = "lista"
-stale = "actualizando"
 
 [artifacts.source]
 agent = "Agente"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "Nuevo hilo"
-providers = "Proveedores"
 
 [sidebar.thread]
 untitled = "Nuevo hilo"
@@ -251,10 +227,38 @@ new = "Nueva carpeta"
 [sidebar.contextmenu.folder]
 rename = "Renombrar"
 delete = "Eliminar"
+create_agents_doc = "Crear AGENTS.md"
+edit_agents_doc = "Editar AGENTS.md"
+remove_agents_doc_override = "Quitar AGENTS.md"
 
 [dialog.folder.rename]
 title = "Renombrar carpeta"
 description = "Hazlo corto y fácil de recordar."
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Cargando AGENTS.md..."
+load_error = "No se pudo cargar AGENTS.md"
+retry = "Reintentar"
+retry_save = "Reintentar guardado"
+save_conflict = "AGENTS.md cambió en otro lugar. Recarga o reintenta después de resolver el conflicto."
+save_conflict_missing_remote = "AGENTS.md cambió en otro lugar, pero no se pudo cargar el documento remoto."
+
+[editor.agents_doc.conflict]
+title = "Conflicto de AGENTS.md"
+description = "El documento remoto cambió antes de que esta edición pudiera guardarse."
+reload_remote = "Recargar remoto"
+overwrite_remote = "Sobrescribir remoto"
+local = "Local"
+remote = "Remoto"
+
+[editor.agents_doc.save_state]
+clean = "Sin cambios sin guardar"
+dirty = "Cambios sin guardar"
+saving = "Guardando..."
+saved = "Guardado"
+error = "Error al guardar: %{message}"
+conflict = "Resuelve el conflicto antes de guardar"
 
 [providers.screen]
 title = "Proveedores"
@@ -595,7 +599,6 @@ uninstall = "Desinstalar"
 not_selected = "No se ha seleccionado ningún servidor MCP"
 enabled = "Activado"
 implicit = "Implícito"
-refresh = "Actualizar"
 source = "Origen"
 scope = "Ámbito"
 transport = "Transporte"
@@ -702,7 +705,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -723,13 +725,6 @@ preparing = "Preparing skill upload"
 installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
-
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
 
 [skills.diagnostics]
 reason = "Reason:"
@@ -843,8 +838,6 @@ no_details = "Sin detalles"
 truncated = "... [truncado]"
 
 [timeline.reasoning]
-summary = "Resumen:"
-content = "Contenido:"
 running = "Pensando"
 completed = "Pensó"
 
@@ -915,7 +908,6 @@ status_code = "Código de estado: %{status_code}"
 title = "Título: %{title}"
 path = "Ruta: %{path}"
 bytes = "Bytes: %{bytes}"
-stage = "[Etapa] %{value}"
 progress = "[Progreso] %{value}"
 stderr = "[Error] %{value}"
 

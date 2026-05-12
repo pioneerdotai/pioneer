@@ -121,6 +121,76 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::THREAD_FOLDER_DELETE, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn thread_agents_doc_get(
+        &self,
+        params: ThreadAgentsDocGetParams,
+    ) -> Result<ThreadAgentsDocGetResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for thread/agents_doc/get"
+            ));
+        }
+
+        self.send_request_typed(methods::THREAD_AGENTS_DOC_GET, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn thread_agents_doc_save(
+        &self,
+        params: ThreadAgentsDocSaveParams,
+    ) -> Result<ThreadAgentsDocSaveResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for thread/agents_doc/save"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::THREAD_AGENTS_DOC_SAVE,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn thread_agents_doc_archive(
+        &self,
+        params: ThreadAgentsDocArchiveParams,
+    ) -> Result<ThreadAgentsDocArchiveResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for thread/agents_doc/archive"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::THREAD_AGENTS_DOC_ARCHIVE,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn thread_agents_doc_resolve_for_thread(
+        &self,
+        params: ThreadAgentsDocResolveForThreadParams,
+    ) -> Result<ThreadAgentsDocResolveForThreadResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for thread/agents_doc/resolve_for_thread"
+            ));
+        }
+        if params.thread_id.trim().is_empty() {
+            return Err(anyhow!(
+                "thread_id is required for thread/agents_doc/resolve_for_thread"
+            ));
+        }
+
+        self.send_request_typed(
+            methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
+            &params,
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
     pub fn thread_history(&self, params: ThreadHistoryParams) -> Result<ThreadHistoryResponse> {
         if params.thread_id.trim().is_empty() {
             return Err(anyhow!("thread_id is required for thread/history"));

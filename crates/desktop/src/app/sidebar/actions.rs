@@ -1,10 +1,14 @@
 use crate::app::{
-    root::{GatewayConnectionState, MainContentView, PioneerDesktop},
+    root::{
+        GatewayConnectionState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope,
+        ThreadAgentsDocSummaryKey,
+    },
     sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
 };
 use gpui::{prelude::*, *};
 use pioneer_protocol::{
-    ThreadFolderCreateParams, ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocSummary, ThreadFolderCreateParams,
+    ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams,
 };
 use tracing::warn;
 
@@ -235,6 +239,142 @@ impl PioneerDesktop {
         .detach();
     }
 
+    pub(super) fn open_root_agents_doc_editor_from_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+
+        self.open_agents_doc_editor(
+            ThreadAgentsDocEditorScope::Root { workspace_id },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn open_folder_agents_doc_editor_from_sidebar(
+        &mut self,
+        folder_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
+            return;
+        };
+
+        self.open_agents_doc_editor(
+            ThreadAgentsDocEditorScope::Folder {
+                workspace_id: folder.workspace_id,
+                folder_id,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn remove_folder_agents_doc_override_from_sidebar(
+        &mut self,
+        folder_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_agents_doc_override_from_sidebar(Some(folder_id), cx);
+    }
+
+    pub(super) fn remove_root_agents_doc_override_from_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.remove_agents_doc_override_from_sidebar(None, cx);
+    }
+
+    fn remove_agents_doc_override_from_sidebar(
+        &mut self,
+        folder_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            return;
+        }
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            return;
+        };
+        let Some(summary) = self
+            .thread_agents_doc_summary(folder_id.as_deref())
+            .cloned()
+        else {
+            return;
+        };
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let params = agents_doc_archive_params_for_summary(&summary, folder_id.as_deref());
+
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.thread_agents_doc_archive(params) })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            if response.archived {
+                                view.remove_agents_doc_from_sidebar_state(
+                                    summary.workspace_id.as_str(),
+                                    folder_id.as_deref(),
+                                    cx,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "failed to remove AGENTS.md override"
+                            );
+                        }
+                    }
+
+                    view.refresh_thread_list(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn remove_agents_doc_from_sidebar_state(
+        &mut self,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.thread_agents_doc_summaries
+            .remove(&ThreadAgentsDocSummaryKey::from_folder_id(folder_id));
+
+        let active_editor_matches =
+            self.active_agents_doc_editor_scope
+                .as_ref()
+                .is_some_and(|scope| {
+                    scope.workspace_id() == workspace_id && scope.folder_id() == folder_id
+                });
+
+        if active_editor_matches {
+            self.active_agents_doc_editor_scope = None;
+            self.agents_doc_editor = None;
+            self.set_thread_tree_selected_node_id(None);
+            if self.main_content_view == MainContentView::AgentsDoc {
+                self.set_main_content_view(MainContentView::Threads, cx);
+                return;
+            }
+        }
+
+        self.rebuild_sidebar_tree_state(cx);
+    }
+
     pub(super) fn handle_sidebar_drop_to_folder(
         &mut self,
         payload: SidebarTreeDragPayload,
@@ -434,5 +574,53 @@ impl PioneerDesktop {
         }
 
         base_name
+    }
+}
+
+fn agents_doc_archive_params_for_summary(
+    summary: &ThreadAgentsDocSummary,
+    folder_id: Option<&str>,
+) -> ThreadAgentsDocArchiveParams {
+    ThreadAgentsDocArchiveParams {
+        workspace_id: summary.workspace_id.clone(),
+        folder_id: folder_id.map(str::to_owned),
+        expected_version: Some(summary.version),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::ThreadAgentsDocStatus;
+
+    fn summary(folder_id: Option<&str>) -> ThreadAgentsDocSummary {
+        ThreadAgentsDocSummary {
+            id: "agd_1".to_owned(),
+            workspace_id: "ws_1".to_owned(),
+            folder_id: folder_id.map(str::to_owned),
+            status: ThreadAgentsDocStatus::Active,
+            content_sha256: "sha".to_owned(),
+            version: 7,
+            char_count: 4,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_conflict_remove_override_targets_selected_folder_id() {
+        let params = agents_doc_archive_params_for_summary(&summary(Some("fld_1")), Some("fld_1"));
+
+        assert_eq!(params.workspace_id, "ws_1");
+        assert_eq!(params.folder_id.as_deref(), Some("fld_1"));
+        assert_eq!(params.expected_version, Some(7));
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_conflict_remove_root_override_has_no_folder_id() {
+        let params = agents_doc_archive_params_for_summary(&summary(None), None);
+
+        assert_eq!(params.workspace_id, "ws_1");
+        assert_eq!(params.folder_id, None);
+        assert_eq!(params.expected_version, Some(7));
     }
 }

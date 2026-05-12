@@ -7,7 +7,11 @@ use gpui_component::{Icon, button::*, popover::Popover, theme::ActiveTheme, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let is_threads_view_active = self.main_content_view == MainContentView::Threads;
+        let is_threads_view_active = matches!(
+            self.main_content_view,
+            MainContentView::Threads | MainContentView::AgentsDoc
+        );
+        let show_thread_artifacts_button = self.main_content_view == MainContentView::Threads;
         let is_providers_view_active = self.main_content_view == MainContentView::Providers;
         let is_settings_view_active = self.main_content_view == MainContentView::Settings;
         let is_mcp_view_active = matches!(
@@ -44,7 +48,10 @@ impl PioneerDesktop {
                                     }),
                             )
                             .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Threads {
+                                if matches!(
+                                    view.main_content_view,
+                                    MainContentView::Threads | MainContentView::AgentsDoc
+                                ) {
                                     view.show_sidebar = !view.show_sidebar;
                                 } else {
                                     view.set_main_content_view(MainContentView::Threads, cx);
@@ -152,7 +159,7 @@ impl PioneerDesktop {
                     } else {
                         div().into_any_element()
                     })
-                    .child(if is_threads_view_active {
+                    .child(if show_thread_artifacts_button {
                         self.render_thread_artifacts_sidebar_toggle_button(cx)
                     } else {
                         div().into_any_element()

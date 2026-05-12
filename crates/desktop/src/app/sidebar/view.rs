@@ -1,5 +1,7 @@
 use crate::app::{
-    root::{MainContentView, PioneerDesktop},
+    root::{
+        MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
+    },
     sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
     thread::{ThreadCoordinator, fallback_title_from_first_user_text},
 };
@@ -13,11 +15,14 @@ use gpui_component::{
     tree::{TreeItem, tree},
     *,
 };
+use pioneer_protocol::{ThreadAgentsDocStatus, ThreadAgentsDocSummary};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 
 const THREAD_NODE_PREFIX: &str = "thread:";
 const FOLDER_NODE_PREFIX: &str = "folder:";
+const AGENTS_DOC_ROOT_NODE_ID: &str = "agents_doc:root";
+const AGENTS_DOC_FOLDER_NODE_PREFIX: &str = "agents_doc:folder:";
 const THREADS_HEADER_NODE_ID: &str = "__threads_header__";
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
 const TREE_ROW_CONTENT_HEIGHT_PX: f32 = 28.0;
@@ -37,6 +42,8 @@ enum SidebarTreeNodeKey<'a> {
     ThreadsHeader,
     Thread(&'a str),
     Folder(&'a str),
+    AgentsDocRoot,
+    AgentsDocFolder(&'a str),
     Unknown,
 }
 
@@ -45,19 +52,61 @@ struct SidebarTreeModel {
     visible_node_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentsDocEditContextMenuLabel {
+    Create,
+    Edit,
+}
+
+fn agents_doc_edit_context_menu_label(
+    summary: Option<&ThreadAgentsDocSummary>,
+) -> AgentsDocEditContextMenuLabel {
+    if summary.is_some() {
+        AgentsDocEditContextMenuLabel::Edit
+    } else {
+        AgentsDocEditContextMenuLabel::Create
+    }
+}
+
+fn agents_doc_has_active_explicit_badge(summary: Option<&ThreadAgentsDocSummary>) -> bool {
+    matches!(
+        summary.map(|summary| summary.status),
+        Some(ThreadAgentsDocStatus::Active)
+    )
+}
+
+fn agents_doc_can_remove_override(summary: Option<&ThreadAgentsDocSummary>) -> bool {
+    summary.is_some()
+}
+
 actions!(
     sidebar_folder_menu,
-    [SidebarFolderRename, SidebarFolderDelete]
+    [
+        SidebarFolderRename,
+        SidebarFolderDelete,
+        SidebarFolderEditAgentsDoc,
+        SidebarFolderRemoveAgentsDoc
+    ]
+);
+actions!(
+    sidebar_root_menu,
+    [SidebarRootEditAgentsDoc, SidebarRootRemoveAgentsDoc]
 );
 
 impl PioneerDesktop {
     pub(in crate::app) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
         let model = self.build_sidebar_tree_model();
-        let selected_ix = if self.main_content_view == MainContentView::Threads {
-            let selected_node_id = self
-                .current_active_thread_id()
-                .map(thread_node_key)
-                .or_else(|| self.selected_thread_tree_node_id().map(str::to_owned));
+        let selected_ix = if matches!(
+            self.main_content_view,
+            MainContentView::Threads | MainContentView::AgentsDoc
+        ) {
+            let selected_node_id = if self.main_content_view == MainContentView::AgentsDoc {
+                self.selected_thread_tree_node_id().map(str::to_owned)
+            } else {
+                self.current_active_thread_id()
+                    .map(thread_node_key)
+                    .or_else(|| self.selected_thread_tree_node_id().map(str::to_owned))
+            };
             selected_node_id.and_then(|node_id| {
                 model
                     .visible_node_ids
@@ -79,9 +128,18 @@ impl PioneerDesktop {
         let desktop_entity = cx.entity().clone();
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
         let folders_by_id = self.thread_folders.clone();
+        let agents_doc_summaries = self.thread_agents_doc_summaries.clone();
+        let active_agents_doc_editor_scope = self.active_agents_doc_editor_scope.clone();
+        let root_agents_doc_summary = agents_doc_summaries.get(&ThreadAgentsDocSummaryKey::Root);
+        let root_agents_doc_active = agents_doc_has_active_explicit_badge(root_agents_doc_summary);
+        let root_agents_doc_edit_menu_label =
+            agents_doc_edit_context_menu_label(root_agents_doc_summary);
+        let root_area_agents_doc_active = root_agents_doc_active;
+        let root_area_agents_doc_edit_menu_label = root_agents_doc_edit_menu_label;
+        let root_context_area_top_px =
+            self.build_sidebar_tree_model().visible_node_ids.len() as f32 * TREE_ROW_HEIGHT_PX;
         let tree_state = self.thread_tree_state().clone();
-        let is_threads_view_active = self.main_content_view == MainContentView::Threads;
-        let is_new_thread_active = is_threads_view_active
+        let is_new_thread_active = self.main_content_view == MainContentView::Threads
             && match (self.current_active_thread_id(), self.draft_thread_id()) {
                 (Some(active_thread_id), Some(draft_thread_id)) => {
                     active_thread_id == draft_thread_id
@@ -101,6 +159,20 @@ impl PioneerDesktop {
                             cx.notify();
                         },
                     );
+                    let root_edit_agents_doc_action_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &SidebarRootEditAgentsDoc, window, cx| {
+                            view.open_root_agents_doc_editor_from_sidebar(window, cx);
+                            cx.notify();
+                        },
+                    );
+                    let root_remove_agents_doc_action_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &SidebarRootRemoveAgentsDoc, _window, cx| {
+                            view.remove_root_agents_doc_override_from_sidebar(cx);
+                            cx.notify();
+                        },
+                    );
 
                     ListItem::new(("thread-tree-row", ix))
                         .separator()
@@ -109,12 +181,38 @@ impl PioneerDesktop {
                         .py_0()
                         .child(
                             h_flex()
+                                .id(("thread-tree-root", ix))
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .justify_between()
                                 .items_center()
+                                .on_action(root_edit_agents_doc_action_listener)
+                                .on_action(root_remove_agents_doc_action_listener)
+                                .context_menu(move |menu, _, _| {
+                                    let menu = menu.menu(
+                                        match root_agents_doc_edit_menu_label {
+                                            AgentsDocEditContextMenuLabel::Create => {
+                                                t!("sidebar.contextmenu.folder.create_agents_doc")
+                                            }
+                                            AgentsDocEditContextMenuLabel::Edit => {
+                                                t!("sidebar.contextmenu.folder.edit_agents_doc")
+                                            }
+                                        },
+                                        Box::new(SidebarRootEditAgentsDoc),
+                                    );
+                                    if root_agents_doc_active {
+                                        menu.menu(
+                                            t!(
+                                                "sidebar.contextmenu.folder.remove_agents_doc_override"
+                                            ),
+                                            Box::new(SidebarRootRemoveAgentsDoc),
+                                        )
+                                    } else {
+                                        menu
+                                    }
+                                })
                                 .child(
-                                    div()
+                                    h_flex()
                                         .pl_4()
                                         .text_xs()
                                         .font_medium()
@@ -213,16 +311,51 @@ impl PioneerDesktop {
                                 ),
                         )
                 }
+                SidebarTreeNodeKey::AgentsDocRoot => {
+                    let workspace_id = agents_doc_summaries
+                        .get(&ThreadAgentsDocSummaryKey::Root)
+                        .map(|summary| summary.workspace_id.clone())
+                        .or_else(|| {
+                            active_agents_doc_editor_scope
+                                .as_ref()
+                                .filter(|scope| scope.folder_id().is_none())
+                                .map(|scope| scope.workspace_id().to_owned())
+                        });
+                    let open_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &ClickEvent, window, cx| {
+                            let Some(workspace_id) = workspace_id.clone() else {
+                                return;
+                            };
+                            view.open_agents_doc_editor(
+                                ThreadAgentsDocEditorScope::Root { workspace_id },
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        },
+                    );
+                    render_agents_doc_file_row(ix, entry.depth(), selected, open_listener, cx)
+                }
                 SidebarTreeNodeKey::Folder(folder_id) => {
                     let folder = folders_by_id.get(folder_id).cloned();
                     let folder_name = folder
                         .as_ref()
                         .map(|folder| folder.name.clone())
                         .unwrap_or_else(|| folder_id.to_owned());
+                    let agents_doc_summary = agents_doc_summaries
+                        .get(&ThreadAgentsDocSummaryKey::Folder(folder_id.to_owned()))
+                        .cloned();
+                    let agents_doc_edit_menu_label =
+                        agents_doc_edit_context_menu_label(agents_doc_summary.as_ref());
+                    let agents_doc_can_remove =
+                        agents_doc_can_remove_override(agents_doc_summary.as_ref());
                     let folder_id_for_move = folder_id.to_owned();
                     let folder_id_for_click = folder_id.to_owned();
                     let folder_id_for_context_menu_rename = folder_id.to_owned();
                     let folder_id_for_context_menu_delete = folder_id.to_owned();
+                    let folder_id_for_context_menu_edit_agents_doc = folder_id.to_owned();
+                    let folder_id_for_context_menu_remove_agents_doc = folder_id.to_owned();
                     let folder_payload = SidebarTreeDragPayload {
                         label: folder_name.clone(),
                         item: SidebarTreeDragItem::Folder {
@@ -271,6 +404,27 @@ impl PioneerDesktop {
                             cx.notify();
                         },
                     );
+                    let folder_edit_agents_doc_action_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &SidebarFolderEditAgentsDoc, window, cx| {
+                            view.open_folder_agents_doc_editor_from_sidebar(
+                                folder_id_for_context_menu_edit_agents_doc.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        },
+                    );
+                    let folder_remove_agents_doc_action_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &SidebarFolderRemoveAgentsDoc, _window, cx| {
+                            view.remove_folder_agents_doc_override_from_sidebar(
+                                folder_id_for_context_menu_remove_agents_doc.clone(),
+                                cx,
+                            );
+                            cx.notify();
+                        },
+                    );
 
                     let folder_icon = if entry.is_expanded() && entry.is_folder() {
                         IconName::FolderOpen
@@ -294,6 +448,8 @@ impl PioneerDesktop {
                                 .on_click(folder_click_listener)
                                 .on_action(folder_rename_action_listener)
                                 .on_action(folder_delete_action_listener)
+                                .on_action(folder_edit_agents_doc_action_listener)
+                                .on_action(folder_remove_agents_doc_action_listener)
                                 .on_drag(folder_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
                                 .can_drop({
                                     let folder_id = folder_id.to_owned();
@@ -305,15 +461,43 @@ impl PioneerDesktop {
                                 .on_drop(drop_listener)
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
-                                .context_menu(|menu, _, _| {
-                                    menu.menu(
-                                        t!("sidebar.contextmenu.folder.rename"),
-                                        Box::new(SidebarFolderRename),
-                                    )
-                                    .menu(
-                                        t!("sidebar.contextmenu.folder.delete"),
-                                        Box::new(SidebarFolderDelete),
-                                    )
+                                .context_menu(move |menu, _, _| {
+                                    let menu = menu
+                                        .menu(
+                                            t!("sidebar.contextmenu.folder.rename"),
+                                            Box::new(SidebarFolderRename),
+                                        )
+                                        .menu(
+                                            t!("sidebar.contextmenu.folder.delete"),
+                                            Box::new(SidebarFolderDelete),
+                                        )
+                                        .separator()
+                                        .menu(
+                                            match agents_doc_edit_menu_label {
+                                                AgentsDocEditContextMenuLabel::Create => {
+                                                    t!(
+                                                        "sidebar.contextmenu.folder.create_agents_doc"
+                                                    )
+                                                }
+                                                AgentsDocEditContextMenuLabel::Edit => {
+                                                    t!(
+                                                        "sidebar.contextmenu.folder.edit_agents_doc"
+                                                    )
+                                                }
+                                            },
+                                            Box::new(SidebarFolderEditAgentsDoc),
+                                        );
+
+                                    if agents_doc_can_remove {
+                                        menu.menu(
+                                            t!(
+                                                "sidebar.contextmenu.folder.remove_agents_doc_override"
+                                            ),
+                                            Box::new(SidebarFolderRemoveAgentsDoc),
+                                        )
+                                    } else {
+                                        menu
+                                    }
                                 })
                                 .child(
                                     h_flex()
@@ -358,6 +542,29 @@ impl PioneerDesktop {
                                         ),
                                 ),
                         )
+                }
+                SidebarTreeNodeKey::AgentsDocFolder(folder_id) => {
+                    let folder = folders_by_id.get(folder_id).cloned();
+                    let workspace_id = folder.as_ref().map(|folder| folder.workspace_id.clone());
+                    let folder_id_for_open = folder_id.to_owned();
+                    let open_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &ClickEvent, window, cx| {
+                            let Some(workspace_id) = workspace_id.clone() else {
+                                return;
+                            };
+                            view.open_agents_doc_editor(
+                                ThreadAgentsDocEditorScope::Folder {
+                                    workspace_id,
+                                    folder_id: folder_id_for_open.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        },
+                    );
+                    render_agents_doc_file_row(ix, entry.depth(), selected, open_listener, cx)
                 }
                 SidebarTreeNodeKey::Unknown => ListItem::new(("thread-tree-row", ix))
                     .separator()
@@ -413,26 +620,69 @@ impl PioneerDesktop {
                         })),
                 ),
             )
-            .when(self.has_known_threads(), |this| {
-                this.child(
-                    v_flex().size_full().child(
-                        div()
-                            .size_full()
-                            .id("thread-tree-root-drop")
-                            .can_drop(can_drop_on_root)
-                            .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
-                                style.bg(cx.theme().sidebar)
-                            })
-                            .on_drop(cx.listener(
-                                |view, payload: &SidebarTreeDragPayload, _, cx| {
-                                    view.handle_sidebar_drop_to_root(payload.clone(), cx);
-                                    cx.notify();
-                                },
-                            ))
-                            .child(tree_view),
-                    ),
-                )
-            })
+            .child(
+                v_flex().size_full().child(
+                    div()
+                        .size_full()
+                        .id("thread-tree-root-drop")
+                        .relative()
+                        .can_drop(can_drop_on_root)
+                        .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
+                            style.bg(cx.theme().sidebar)
+                        })
+                        .on_drop(
+                            cx.listener(|view, payload: &SidebarTreeDragPayload, _, cx| {
+                                view.handle_sidebar_drop_to_root(payload.clone(), cx);
+                                cx.notify();
+                            }),
+                        )
+                        .child(tree_view)
+                        .child(
+                            div()
+                                .id("thread-tree-root-context-area")
+                                .absolute()
+                                .top(px(root_context_area_top_px))
+                                .bottom(px(0.))
+                                .left(px(0.))
+                                .right(px(0.))
+                                .on_action(cx.listener(
+                                    |view, _: &SidebarRootEditAgentsDoc, window, cx| {
+                                        view.open_root_agents_doc_editor_from_sidebar(window, cx);
+                                        cx.notify();
+                                    },
+                                ))
+                                .on_action(cx.listener(
+                                    |view, _: &SidebarRootRemoveAgentsDoc, _, cx| {
+                                        view.remove_root_agents_doc_override_from_sidebar(cx);
+                                        cx.notify();
+                                    },
+                                ))
+                                .context_menu(move |menu, _, _| {
+                                    let menu = menu.menu(
+                                        match root_area_agents_doc_edit_menu_label {
+                                            AgentsDocEditContextMenuLabel::Create => {
+                                                t!("sidebar.contextmenu.folder.create_agents_doc")
+                                            }
+                                            AgentsDocEditContextMenuLabel::Edit => {
+                                                t!("sidebar.contextmenu.folder.edit_agents_doc")
+                                            }
+                                        },
+                                        Box::new(SidebarRootEditAgentsDoc),
+                                    );
+                                    if root_area_agents_doc_active {
+                                        menu.menu(
+                                            t!(
+                                                "sidebar.contextmenu.folder.remove_agents_doc_override"
+                                            ),
+                                            Box::new(SidebarRootRemoveAgentsDoc),
+                                        )
+                                    } else {
+                                        menu
+                                    }
+                                }),
+                        ),
+                ),
+            )
             .into_any_element()
     }
 
@@ -512,6 +762,9 @@ impl PioneerDesktop {
             &threads_by_folder,
             &mut visited_folders,
         );
+        if self.agents_doc_tree_file_visible(None) {
+            items.insert(0, TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"));
+        }
         items.insert(
             0,
             TreeItem::new(THREADS_HEADER_NODE_ID, "threads-header").disabled(true),
@@ -534,12 +787,18 @@ impl PioneerDesktop {
                     continue;
                 }
 
-                let children = self.build_sidebar_tree_branch(
+                let mut children = self.build_sidebar_tree_branch(
                     folder_id.as_str(),
                     folders_by_parent,
                     threads_by_folder,
                     visited_folders,
                 );
+                if self.agents_doc_tree_file_visible(Some(folder_id.as_str())) {
+                    children.insert(
+                        0,
+                        TreeItem::new(agents_doc_folder_node_key(folder_id.as_str()), "AGENTS.md"),
+                    );
+                }
 
                 let folder_name = self
                     .thread_folders
@@ -596,6 +855,84 @@ fn folder_node_key(folder_id: &str) -> String {
     format!("{FOLDER_NODE_PREFIX}{folder_id}")
 }
 
+pub(in crate::app) fn agents_doc_tree_node_key(scope: &ThreadAgentsDocEditorScope) -> String {
+    match scope {
+        ThreadAgentsDocEditorScope::Root { .. } => agents_doc_root_node_key(),
+        ThreadAgentsDocEditorScope::Folder { folder_id, .. } => {
+            agents_doc_folder_node_key(folder_id.as_str())
+        }
+    }
+}
+
+fn agents_doc_root_node_key() -> String {
+    AGENTS_DOC_ROOT_NODE_ID.to_owned()
+}
+
+fn agents_doc_folder_node_key(folder_id: &str) -> String {
+    format!("{AGENTS_DOC_FOLDER_NODE_PREFIX}{folder_id}")
+}
+
+fn render_agents_doc_file_row(
+    ix: usize,
+    depth: usize,
+    selected: bool,
+    open_listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &mut App,
+) -> ListItem {
+    ListItem::new(("thread-tree-row", ix))
+        .separator()
+        .h(px(TREE_ROW_HEIGHT_PX))
+        .px_2()
+        .py_0()
+        .child(
+            div()
+                .id(("thread-tree-agents-doc", ix))
+                .w_full()
+                .h(px(TREE_ROW_HEIGHT_PX))
+                .on_click(open_listener)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .h(px(TREE_ROW_HEIGHT_PX))
+                        .min_w_0()
+                        .items_center()
+                        .child(tree_depth_guides(depth, cx))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
+                                .px(px(TREE_ROW_CONTENT_PADDING_X_PX))
+                                .items_center()
+                                .gap(px(TREE_ROW_GAP_PX))
+                                .rounded_md()
+                                .hover(|this| this.bg(cx.theme().sidebar_accent))
+                                .when(selected, |this| this.bg(cx.theme().sidebar_accent))
+                                .child(
+                                    Icon::new(IconName::File)
+                                        .size_3p5()
+                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                        .text_color(cx.theme().foreground),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_sm()
+                                        .text_color(cx.theme().foreground)
+                                        .line_height(relative(1.0))
+                                        .font_normal()
+                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                        .when(selected, |this| this.opacity(1.0))
+                                        .child("AGENTS.md"),
+                                ),
+                        ),
+                ),
+        )
+}
+
 fn tree_depth_guides(depth: usize, cx: &mut App) -> AnyElement {
     let guide_color = cx.theme().border;
     let mut guides = h_flex().flex_none().items_start();
@@ -643,6 +980,14 @@ fn parse_sidebar_tree_node_key(value: &str) -> SidebarTreeNodeKey<'_> {
         return SidebarTreeNodeKey::Folder(folder_id);
     }
 
+    if value == AGENTS_DOC_ROOT_NODE_ID {
+        return SidebarTreeNodeKey::AgentsDocRoot;
+    }
+
+    if let Some(folder_id) = value.strip_prefix(AGENTS_DOC_FOLDER_NODE_PREFIX) {
+        return SidebarTreeNodeKey::AgentsDocFolder(folder_id);
+    }
+
     SidebarTreeNodeKey::Unknown
 }
 
@@ -665,8 +1010,22 @@ fn can_drop_on_folder(value: &dyn Any, target_folder_id: &str) -> bool {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        Thread, ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus,
     };
+
+    fn agents_doc_summary(status: ThreadAgentsDocStatus) -> ThreadAgentsDocSummary {
+        ThreadAgentsDocSummary {
+            id: "agd_1".to_owned(),
+            workspace_id: "ws_1".to_owned(),
+            folder_id: Some("fld_1".to_owned()),
+            status,
+            content_sha256: "sha256:test".to_owned(),
+            version: 1,
+            char_count: 20,
+            updated_at: 1_700_000_000,
+        }
+    }
 
     #[::core::prelude::v1::test]
     fn parse_sidebar_tree_node_key_roundtrip() {
@@ -674,9 +1033,13 @@ mod tests {
         let folder_id = "fld_123";
         let thread_key = thread_node_key(thread_id);
         let folder_key = folder_node_key(folder_id);
+        let root_agents_key = agents_doc_root_node_key();
+        let folder_agents_key = agents_doc_folder_node_key(folder_id);
 
         let parsed_thread = parse_sidebar_tree_node_key(thread_key.as_str());
         let parsed_folder = parse_sidebar_tree_node_key(folder_key.as_str());
+        let parsed_root_agents = parse_sidebar_tree_node_key(root_agents_key.as_str());
+        let parsed_folder_agents = parse_sidebar_tree_node_key(folder_agents_key.as_str());
 
         assert!(matches!(
             parsed_thread,
@@ -685,6 +1048,14 @@ mod tests {
         assert!(matches!(
             parsed_folder,
             SidebarTreeNodeKey::Folder("fld_123")
+        ));
+        assert!(matches!(
+            parsed_root_agents,
+            SidebarTreeNodeKey::AgentsDocRoot
+        ));
+        assert!(matches!(
+            parsed_folder_agents,
+            SidebarTreeNodeKey::AgentsDocFolder("fld_123")
         ));
         assert!(matches!(
             parse_sidebar_tree_node_key(THREADS_HEADER_NODE_ID),
@@ -719,6 +1090,26 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn collect_visible_node_ids_includes_agents_doc_file_nodes() {
+        let items = vec![
+            TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"),
+            TreeItem::new(folder_node_key("b"), "B")
+                .expanded(true)
+                .child(TreeItem::new(agents_doc_folder_node_key("b"), "AGENTS.md")),
+        ];
+
+        let ids = collect_visible_node_ids(items.as_slice());
+        assert_eq!(
+            ids,
+            vec![
+                agents_doc_root_node_key(),
+                folder_node_key("b"),
+                agents_doc_folder_node_key("b")
+            ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn folder_drop_guard_rejects_self_folder_and_accepts_thread() {
         let thread_payload = SidebarTreeDragPayload {
             label: "t".to_owned(),
@@ -736,6 +1127,38 @@ mod tests {
         assert!(can_drop_on_folder(&thread_payload as &dyn Any, "fld_1"));
         assert!(!can_drop_on_folder(&folder_payload as &dyn Any, "fld_1"));
         assert!(can_drop_on_folder(&folder_payload as &dyn Any, "fld_2"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_menu_label_uses_create_without_summary_and_edit_with_summary() {
+        assert_eq!(
+            agents_doc_edit_context_menu_label(None),
+            AgentsDocEditContextMenuLabel::Create
+        );
+        let draft = agents_doc_summary(ThreadAgentsDocStatus::Draft);
+        assert_eq!(
+            agents_doc_edit_context_menu_label(Some(&draft)),
+            AgentsDocEditContextMenuLabel::Edit
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_badge_only_uses_active_but_remove_accepts_any_explicit_summary() {
+        let draft = agents_doc_summary(ThreadAgentsDocStatus::Draft);
+        let active = agents_doc_summary(ThreadAgentsDocStatus::Active);
+
+        assert!(!agents_doc_has_active_explicit_badge(None));
+        assert!(!agents_doc_has_active_explicit_badge(Some(&draft)));
+        assert!(agents_doc_has_active_explicit_badge(Some(&active)));
+
+        assert!(!agents_doc_can_remove_override(None));
+        assert!(agents_doc_can_remove_override(Some(&draft)));
+        assert!(agents_doc_can_remove_override(Some(&active)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_conflict_inherited_only_folder_does_not_show_remove_action() {
+        assert!(!agents_doc_can_remove_override(None));
     }
 
     #[::core::prelude::v1::test]

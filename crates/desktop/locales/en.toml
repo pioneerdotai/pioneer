@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "Send a message to the assistant"
-stop = "Stop"
-stopping = "Stopping..."
 stop_reason = "Turn cancelled by user"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "No artifacts match this filter"
 failed = "Failed to load artifacts"
 kind = "Kind"
 loading = "Loading artifacts..."
-metadata = "Metadata"
-preview = "Preview"
-provenance = "Provenance"
 provenance_unknown = "No provenance"
-sha256 = "SHA-256"
-local_copy = "Local copy"
 size = "Size"
 size_unknown = "Unknown size"
 source_label = "Source"
@@ -62,13 +55,9 @@ version = "Version"
 version_latest = "latest"
 
 [artifacts.action]
-attach = "Attach"
 attach_tooltip = "Use this artifact as input in the composer"
-download = "Download..."
 download_tooltip = "Download this artifact to this computer"
-open = "Open"
 open_tooltip = "Open a verified local copy"
-reveal = "Reveal"
 reveal_tooltip = "Reveal the local copy"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "Generated"
 images = "Images"
 task_output = "Tasks"
 uploaded = "Uploaded"
-
-[artifacts.preview_kind]
-json_summary = "JSON summary"
-pdf_text = "PDF text"
-plain_text = "Text preview"
-thumbnail = "Thumbnail"
-
-[artifacts.preview_status]
-failed = "failed"
-pending = "preparing"
-ready = "ready"
-stale = "updating"
 
 [artifacts.source]
 agent = "Agent"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "New thread"
-providers = "Providers"
 
 [sidebar.thread]
 untitled = "New thread"
@@ -251,10 +227,38 @@ new = "New folder"
 [sidebar.contextmenu.folder]
 rename = "Rename"
 delete = "Delete"
+create_agents_doc = "Create AGENTS.md"
+edit_agents_doc = "Edit AGENTS.md"
+remove_agents_doc_override = "Remove AGENTS.md"
 
 [dialog.folder.rename]
 title = "Rename folder"
 description = "Make it short and easy to remember."
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Loading AGENTS.md..."
+load_error = "Failed to load AGENTS.md"
+retry = "Retry"
+retry_save = "Retry save"
+save_conflict = "AGENTS.md changed elsewhere. Reload or retry after resolving the conflict."
+save_conflict_missing_remote = "AGENTS.md changed elsewhere, but the remote document could not be loaded."
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md conflict"
+description = "The remote document changed before this edit could be saved."
+reload_remote = "Reload remote"
+overwrite_remote = "Overwrite remote"
+local = "Local"
+remote = "Remote"
+
+[editor.agents_doc.save_state]
+clean = "No unsaved changes"
+dirty = "Unsaved changes"
+saving = "Saving..."
+saved = "Saved"
+error = "Save failed: %{message}"
+conflict = "Resolve conflict before saving"
 
 [providers.screen]
 title = "Providers"
@@ -563,7 +567,6 @@ uninstall = "Uninstall"
 not_selected = "MCP server is not selected"
 enabled = "Enabled"
 implicit = "Implicit"
-refresh = "Refresh"
 source = "Source"
 scope = "Scope"
 transport = "Transport"
@@ -675,13 +678,6 @@ installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
 
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
-
 [skills.diagnostics]
 reason = "Reason:"
 validation = "Validation"
@@ -776,7 +772,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -843,8 +838,6 @@ no_details = "No details"
 truncated = "... [truncated]"
 
 [timeline.reasoning]
-summary = "Summary:"
-content = "Content:"
 running = "Thinking"
 completed = "Thought"
 

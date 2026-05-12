@@ -43,6 +43,22 @@ impl PioneerDesktop {
         self.thread_folders.get(folder_id)
     }
 
+    pub(in crate::app) fn thread_agents_doc_summary(
+        &self,
+        folder_id: Option<&str>,
+    ) -> Option<&ThreadAgentsDocSummary> {
+        self.thread_agents_doc_summaries
+            .get(&ThreadAgentsDocSummaryKey::from_folder_id(folder_id))
+    }
+
+    pub(in crate::app) fn agents_doc_tree_file_visible(&self, folder_id: Option<&str>) -> bool {
+        self.thread_agents_doc_summary(folder_id).is_some()
+            || self
+                .active_agents_doc_editor_scope
+                .as_ref()
+                .is_some_and(|scope| scope.folder_id() == folder_id)
+    }
+
     pub(in crate::app) fn thread_placement_folder_id(&self, thread_id: &str) -> Option<&str> {
         self.thread_placements
             .get(thread_id)

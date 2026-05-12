@@ -4,6 +4,7 @@ mod view;
 
 use gpui::{prelude::*, *};
 use gpui_component::{theme::ActiveTheme, *};
+pub(in crate::app) use view::agents_doc_tree_node_key;
 
 #[derive(Clone)]
 pub(super) enum SidebarTreeDragItem {

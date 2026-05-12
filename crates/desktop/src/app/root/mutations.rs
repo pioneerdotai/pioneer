@@ -260,6 +260,7 @@ impl PioneerDesktop {
         self.composer_upload_error = None;
         self.thread_folders.clear();
         self.thread_placements.clear();
+        self.thread_agents_doc_summaries.clear();
         self.thread_folder_expanded.clear();
         self.thread_tree_selected_node_id = None;
         self.turn_timeline_refresh.clear();
@@ -269,6 +270,7 @@ impl PioneerDesktop {
         &mut self,
         folders: Vec<ThreadFolder>,
         placements: Vec<ThreadPlacement>,
+        agents_docs: Vec<ThreadAgentsDocSummary>,
     ) {
         self.thread_folders = folders
             .into_iter()
@@ -290,6 +292,7 @@ impl PioneerDesktop {
             .into_iter()
             .map(|placement| (placement.thread_id.clone(), placement))
             .collect();
+        self.thread_agents_doc_summaries = thread_agents_doc_summaries_by_scope(agents_docs);
     }
 
     pub(in crate::app) fn toggle_thread_folder_expanded(
@@ -314,6 +317,25 @@ impl PioneerDesktop {
         }
     }
 
+    pub(in crate::app) fn set_thread_folder_expanded(
+        &mut self,
+        folder_id: &str,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.thread_folder_expanded
+            .insert(folder_id.to_owned(), expanded);
+
+        if let Err(error) =
+            state::set_thread_folders_expanded(cx, self.thread_folder_expanded.clone())
+        {
+            warn!(
+                error = %format!("{error:#}"),
+                "failed to save sidebar folder expansion state"
+            );
+        }
+    }
+
     pub(in crate::app) fn set_thread_tree_selected_node_id(&mut self, node_id: Option<String>) {
         self.thread_tree_selected_node_id = node_id;
     }
@@ -324,5 +346,71 @@ impl PioneerDesktop {
             .fold(false, |changed, coordinator| {
                 coordinator.conversation.tick() || changed
             })
+    }
+}
+
+pub(super) fn thread_agents_doc_summaries_by_scope(
+    summaries: Vec<ThreadAgentsDocSummary>,
+) -> HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> {
+    summaries
+        .into_iter()
+        .map(|summary| {
+            (
+                ThreadAgentsDocSummaryKey::from_folder_id(summary.folder_id.as_deref()),
+                summary,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::ThreadAgentsDocStatus;
+
+    fn summary(folder_id: Option<&str>, status: ThreadAgentsDocStatus) -> ThreadAgentsDocSummary {
+        ThreadAgentsDocSummary {
+            id: format!("agd_{}", folder_id.unwrap_or("root")),
+            workspace_id: "ws_1".to_owned(),
+            folder_id: folder_id.map(str::to_owned),
+            status,
+            content_sha256: "sha256:test".to_owned(),
+            version: 1,
+            char_count: 12,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_summary_key_handles_root_and_folder() {
+        assert_eq!(
+            ThreadAgentsDocSummaryKey::from_folder_id(None),
+            ThreadAgentsDocSummaryKey::Root
+        );
+        assert_eq!(
+            ThreadAgentsDocSummaryKey::from_folder_id(Some("fld_1")),
+            ThreadAgentsDocSummaryKey::Folder("fld_1".to_owned())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agents_doc_summaries_by_scope_stores_root_and_folder() {
+        let summaries = thread_agents_doc_summaries_by_scope(vec![
+            summary(None, ThreadAgentsDocStatus::Active),
+            summary(Some("fld_1"), ThreadAgentsDocStatus::Draft),
+        ]);
+
+        assert_eq!(
+            summaries
+                .get(&ThreadAgentsDocSummaryKey::Root)
+                .map(|summary| summary.status),
+            Some(ThreadAgentsDocStatus::Active)
+        );
+        assert_eq!(
+            summaries
+                .get(&ThreadAgentsDocSummaryKey::Folder("fld_1".to_owned()))
+                .map(|summary| summary.status),
+            Some(ThreadAgentsDocStatus::Draft)
+        );
     }
 }

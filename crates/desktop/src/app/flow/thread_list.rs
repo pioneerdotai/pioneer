@@ -95,7 +95,11 @@ impl PioneerDesktop {
                                 );
                             }
 
-                            view.set_thread_tree_snapshot(response.folders, response.placements);
+                            view.set_thread_tree_snapshot(
+                                response.folders,
+                                response.placements,
+                                response.agents_docs,
+                            );
                             view.rebuild_sidebar_tree_state(cx);
 
                             if view.current_active_thread_id().is_none() {

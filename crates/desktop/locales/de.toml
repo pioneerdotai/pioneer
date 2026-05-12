@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "Sende eine Nachricht an den Assistenten"
-stop = "Stoppen"
-stopping = "Wird gestoppt..."
 stop_reason = "Turn vom Benutzer abgebrochen"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "Keine Artefakte entsprechen diesem Filter"
 failed = "Artefakte konnten nicht geladen werden"
 kind = "Typ"
 loading = "Artefakte werden geladen..."
-metadata = "Metadaten"
-preview = "Vorschau"
-provenance = "Herkunft"
 provenance_unknown = "Keine Herkunft"
-sha256 = "SHA-256"
-local_copy = "Lokale Kopie"
 size = "Groesse"
 size_unknown = "Unbekannte Groesse"
 source_label = "Quelle"
@@ -62,13 +55,9 @@ version = "Version"
 version_latest = "aktuell"
 
 [artifacts.action]
-attach = "Anhaengen"
 attach_tooltip = "Dieses Artefakt als Eingabe im Composer verwenden"
-download = "Herunterladen..."
 download_tooltip = "Dieses Artefakt auf diesen Computer herunterladen"
-open = "Oeffnen"
 open_tooltip = "Eine verifizierte lokale Kopie oeffnen"
-reveal = "Anzeigen"
 reveal_tooltip = "Die lokale Kopie im Dateimanager anzeigen"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "Generiert"
 images = "Bilder"
 task_output = "Tasks"
 uploaded = "Hochgeladen"
-
-[artifacts.preview_kind]
-json_summary = "JSON-Zusammenfassung"
-pdf_text = "PDF-Text"
-plain_text = "Textvorschau"
-thumbnail = "Miniatur"
-
-[artifacts.preview_status]
-failed = "fehlgeschlagen"
-pending = "wird vorbereitet"
-ready = "bereit"
-stale = "wird aktualisiert"
 
 [artifacts.source]
 agent = "Agent"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "Neuer Thread"
-providers = "Anbieter"
 
 [sidebar.thread]
 untitled = "Neuer Thread"
@@ -251,10 +227,38 @@ new = "Neuer Ordner"
 [sidebar.contextmenu.folder]
 rename = "Umbenennen"
 delete = "Löschen"
+create_agents_doc = "AGENTS.md erstellen"
+edit_agents_doc = "AGENTS.md bearbeiten"
+remove_agents_doc_override = "AGENTS.md entfernen"
 
 [dialog.folder.rename]
 title = "Ordner umbenennen"
 description = "Machen Sie den Namen kurz und leicht merkbar."
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "AGENTS.md wird geladen..."
+load_error = "AGENTS.md konnte nicht geladen werden"
+retry = "Erneut versuchen"
+retry_save = "Speichern erneut versuchen"
+save_conflict = "AGENTS.md wurde an anderer Stelle geändert. Laden Sie neu oder wiederholen Sie nach dem Konflikt."
+save_conflict_missing_remote = "AGENTS.md wurde an anderer Stelle geändert, aber das Remote-Dokument konnte nicht geladen werden."
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md-Konflikt"
+description = "Das Remote-Dokument wurde geändert, bevor diese Änderung gespeichert werden konnte."
+reload_remote = "Remote laden"
+overwrite_remote = "Remote überschreiben"
+local = "Lokal"
+remote = "Remote"
+
+[editor.agents_doc.save_state]
+clean = "Keine ungespeicherten Änderungen"
+dirty = "Ungespeicherte Änderungen"
+saving = "Speichern..."
+saved = "Gespeichert"
+error = "Speichern fehlgeschlagen: %{message}"
+conflict = "Konflikt vor dem Speichern lösen"
 
 [providers.screen]
 title = "Anbieter"
@@ -595,7 +599,6 @@ uninstall = "Deinstallieren"
 not_selected = "Kein MCP-Server ausgewählt"
 enabled = "Aktiviert"
 implicit = "Implizit"
-refresh = "Aktualisieren"
 source = "Quelle"
 scope = "Bereich"
 transport = "Transport"
@@ -702,7 +705,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -723,13 +725,6 @@ preparing = "Preparing skill upload"
 installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
-
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
 
 [skills.diagnostics]
 reason = "Reason:"
@@ -843,8 +838,6 @@ no_details = "Keine Details"
 truncated = "... [gekürzt]"
 
 [timeline.reasoning]
-summary = "Zusammenfassung:"
-content = "Inhalt:"
 running = "Denkt nach"
 completed = "Nachgedacht"
 
@@ -915,7 +908,6 @@ status_code = "Statuscode: %{status_code}"
 title = "Titel: %{title}"
 path = "Pfad: %{path}"
 bytes = "Bytes: %{bytes}"
-stage = "[Phase] %{value}"
 progress = "[Fortschritt] %{value}"
 stderr = "[Fehler] %{value}"
 

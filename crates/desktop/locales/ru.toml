@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "Отправьте сообщение ассистенту"
-stop = "Стоп"
-stopping = "Остановка..."
 stop_reason = "Ход остановлен пользователем"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "Нет артефактов для этого фильтра"
 failed = "Не удалось загрузить артефакты"
 kind = "Тип"
 loading = "Загрузка артефактов..."
-metadata = "Метаданные"
-preview = "Превью"
-provenance = "Происхождение"
 provenance_unknown = "Нет данных о происхождении"
-sha256 = "SHA-256"
-local_copy = "Локальная копия"
 size = "Размер"
 size_unknown = "Размер неизвестен"
 source_label = "Источник"
@@ -62,13 +55,9 @@ version = "Версия"
 version_latest = "последняя"
 
 [artifacts.action]
-attach = "Приложить"
 attach_tooltip = "Использовать этот артефакт как вход в composer"
-download = "Скачать..."
 download_tooltip = "Скачать этот артефакт на этот компьютер"
-open = "Открыть"
 open_tooltip = "Открыть проверенную локальную копию"
-reveal = "Показать"
 reveal_tooltip = "Показать локальную копию"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "Созданные"
 images = "Изображения"
 task_output = "Задачи"
 uploaded = "Загруженные"
-
-[artifacts.preview_kind]
-json_summary = "JSON-сводка"
-pdf_text = "Текст PDF"
-plain_text = "Текстовое превью"
-thumbnail = "Миниатюра"
-
-[artifacts.preview_status]
-failed = "ошибка"
-pending = "готовится"
-ready = "готово"
-stale = "обновляется"
 
 [artifacts.source]
 agent = "Агент"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "Новый тред"
-providers = "Провайдеры"
 
 [sidebar.thread]
 untitled = "Новый тред"
@@ -251,10 +227,38 @@ new = "Новая папка"
 [sidebar.contextmenu.folder]
 rename = "Переименовать"
 delete = "Удалить"
+create_agents_doc = "Создать AGENTS.md"
+edit_agents_doc = "Редактировать AGENTS.md"
+remove_agents_doc_override = "Удалить AGENTS.md"
 
 [dialog.folder.rename]
 title = "Переименовать папку"
 description = "Сделайте название коротким и легко запоминающимся."
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Загрузка AGENTS.md..."
+load_error = "Не удалось загрузить AGENTS.md"
+retry = "Повторить"
+retry_save = "Повторить сохранение"
+save_conflict = "AGENTS.md изменился в другом месте. Перезагрузите или повторите после разрешения конфликта."
+save_conflict_missing_remote = "AGENTS.md изменился в другом месте, но удаленный документ не удалось загрузить."
+
+[editor.agents_doc.conflict]
+title = "Конфликт AGENTS.md"
+description = "Удаленный документ изменился до сохранения этой правки."
+reload_remote = "Загрузить удаленный"
+overwrite_remote = "Перезаписать удаленный"
+local = "Локально"
+remote = "Удаленно"
+
+[editor.agents_doc.save_state]
+clean = "Несохраненных изменений нет"
+dirty = "Есть несохраненные изменения"
+saving = "Сохранение..."
+saved = "Сохранено"
+error = "Ошибка сохранения: %{message}"
+conflict = "Разрешите конфликт перед сохранением"
 
 [providers.screen]
 title = "Провайдеры"
@@ -563,7 +567,6 @@ uninstall = "Удалить"
 not_selected = "MCP сервер не выбран"
 enabled = "Включён"
 implicit = "Неявный"
-refresh = "Обновить"
 source = "Источник"
 scope = "Область"
 transport = "Транспорт"
@@ -675,13 +678,6 @@ installing = "Загрузка скилла"
 updating = "Загрузка обновления"
 cancelling = "Отмена загрузки"
 
-[skills.dialog]
-install_title = "Установка скилла"
-update_title = "Обновить %{slug}"
-source_kind_description = "Выберите папку со скиллом на диске."
-pick_folder = "Выбрать папку"
-pick_archive = "Выбрать архив"
-
 [skills.diagnostics]
 reason = "Причина:"
 validation = "Валидация"
@@ -776,7 +772,6 @@ disabled = "Выключен"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -843,8 +838,6 @@ no_details = "Нет деталей"
 truncated = "... [обрезано]"
 
 [timeline.reasoning]
-summary = "Сводка:"
-content = "Содержимое:"
 running = "Думаю"
 completed = "Думал"
 
@@ -915,7 +908,6 @@ status_code = "Код статуса: %{status_code}"
 title = "Заголовок: %{title}"
 path = "Путь: %{path}"
 bytes = "Байты: %{bytes}"
-stage = "[Этап] %{value}"
 progress = "[Прогресс] %{value}"
 stderr = "[Ошибка] %{value}"
 

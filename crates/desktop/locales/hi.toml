@@ -2,8 +2,6 @@ _version = 1
 
 [chat.composer]
 placeholder = "सहायक को संदेश भेजें"
-stop = "रोकें"
-stopping = "रोका जा रहा है..."
 stop_reason = "उपयोगकर्ता ने turn रद्द किया"
 
 [chat.composer.mode]
@@ -48,12 +46,7 @@ empty_filter = "इस फ़िल्टर से कोई आर्टिफ
 failed = "आर्टिफैक्ट लोड करने में विफल"
 kind = "प्रकार"
 loading = "आर्टिफैक्ट लोड हो रहे हैं..."
-metadata = "मेटाडेटा"
-preview = "पूर्वावलोकन"
-provenance = "उत्पत्ति"
 provenance_unknown = "कोई उत्पत्ति नहीं"
-sha256 = "SHA-256"
-local_copy = "लोकल कॉपी"
 size = "आकार"
 size_unknown = "अज्ञात आकार"
 source_label = "स्रोत"
@@ -62,13 +55,9 @@ version = "संस्करण"
 version_latest = "नवीनतम"
 
 [artifacts.action]
-attach = "अटैच करें"
 attach_tooltip = "इस आर्टिफैक्ट को composer में इनपुट के रूप में उपयोग करें"
-download = "डाउनलोड करें..."
 download_tooltip = "इस आर्टिफैक्ट को इस कंप्यूटर पर डाउनलोड करें"
-open = "खोलें"
 open_tooltip = "सत्यापित लोकल कॉपी खोलें"
-reveal = "दिखाएं"
 reveal_tooltip = "लोकल कॉपी दिखाएं"
 
 [artifacts.action.error]
@@ -91,18 +80,6 @@ generated = "जनरेटेड"
 images = "चित्र"
 task_output = "टास्क"
 uploaded = "अपलोडेड"
-
-[artifacts.preview_kind]
-json_summary = "JSON सारांश"
-pdf_text = "PDF टेक्स्ट"
-plain_text = "टेक्स्ट पूर्वावलोकन"
-thumbnail = "थंबनेल"
-
-[artifacts.preview_status]
-failed = "विफल"
-pending = "तैयार हो रहा है"
-ready = "तैयार"
-stale = "अपडेट हो रहा है"
 
 [artifacts.source]
 agent = "एजेंट"
@@ -237,7 +214,6 @@ copyright = "© Pioneer Contributors"
 
 [sidebar.action]
 new_thread = "नया थ्रेड"
-providers = "प्रोवाइडर"
 
 [sidebar.thread]
 untitled = "नया थ्रेड"
@@ -251,10 +227,38 @@ new = "नया फ़ोल्डर"
 [sidebar.contextmenu.folder]
 rename = "नाम बदलें"
 delete = "हटाएँ"
+create_agents_doc = "AGENTS.md बनाएँ"
+edit_agents_doc = "AGENTS.md संपादित करें"
+remove_agents_doc_override = "AGENTS.md हटाएँ"
 
 [dialog.folder.rename]
 title = "फ़ोल्डर का नाम बदलें"
 description = "इसे छोटा और याद रखने में आसान रखें।"
+
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "AGENTS.md लोड हो रहा है..."
+load_error = "AGENTS.md लोड नहीं हुआ"
+retry = "फिर कोशिश करें"
+retry_save = "सेव फिर कोशिश करें"
+save_conflict = "AGENTS.md कहीं और बदल गया है। conflict हल करने के बाद reload या retry करें।"
+save_conflict_missing_remote = "AGENTS.md कहीं और बदल गया है, लेकिन remote दस्तावेज़ लोड नहीं हुआ।"
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md conflict"
+description = "यह edit save होने से पहले remote दस्तावेज़ बदल गया।"
+reload_remote = "Remote reload करें"
+overwrite_remote = "Remote overwrite करें"
+local = "Local"
+remote = "Remote"
+
+[editor.agents_doc.save_state]
+clean = "कोई असहेजे बदलाव नहीं"
+dirty = "असहेजे बदलाव"
+saving = "सेव हो रहा है..."
+saved = "सेव हो गया"
+error = "सेव विफल: %{message}"
+conflict = "सेव करने से पहले conflict हल करें"
 
 [providers.screen]
 title = "प्रोवाइडर"
@@ -595,7 +599,6 @@ uninstall = "अनइंस्टॉल"
 not_selected = "MCP सर्वर चयनित नहीं है"
 enabled = "सक्षम"
 implicit = "इम्प्लिसिट"
-refresh = "रीफ़्रेश"
 source = "स्रोत"
 scope = "स्कोप"
 transport = "ट्रांसपोर्ट"
@@ -702,7 +705,6 @@ disabled = "Disabled"
 [skills.source]
 system = "System"
 user = "User"
-workspace = "Workspace"
 registry = "Registry"
 
 [skills.trust]
@@ -723,13 +725,6 @@ preparing = "Preparing skill upload"
 installing = "Uploading skill"
 updating = "Uploading update"
 cancelling = "Cancelling upload"
-
-[skills.dialog]
-install_title = "Install Skill"
-update_title = "Update %{slug}"
-source_kind_description = "Choose a skill folder from disk."
-pick_folder = "Choose folder"
-pick_archive = "Choose archive"
 
 [skills.diagnostics]
 reason = "Reason:"
@@ -843,8 +838,6 @@ no_details = "कोई विवरण नहीं"
 truncated = "... [काटा गया]"
 
 [timeline.reasoning]
-summary = "सारांश:"
-content = "सामग्री:"
 running = "सोच रहा है"
 completed = "सोचा"
 
@@ -915,7 +908,6 @@ status_code = "स्थिति कोड: %{status_code}"
 title = "शीर्षक: %{title}"
 path = "पथ: %{path}"
 bytes = "बाइट: %{bytes}"
-stage = "[चरण] %{value}"
 progress = "[प्रगति] %{value}"
 stderr = "[त्रुटि] %{value}"
 
