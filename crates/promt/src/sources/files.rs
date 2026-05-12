@@ -141,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn agents_md_bootstrap_file_is_ignored() {
+        let root = temp_workspace("agents_md_ignored");
+        std::fs::write(root.join("SOUL.md"), "voice").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "assistant").expect("write IDENTITY");
+        std::fs::write(root.join("USER.md"), "alex").expect("write USER");
+        std::fs::write(root.join("AGENTS.md"), "must not be loaded by bootstrap")
+            .expect("write AGENTS");
+
+        let (files, diagnostics) = load_bootstrap_files(&root, PromptProfile::AssistantFull);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|file| file.name.as_str() != "AGENTS.md"));
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.content.contains("must not be loaded"))
+        );
+    }
+
+    #[test]
     fn missing_file_reports_missing_diagnostic() {
         let root = temp_workspace("missing");
         let (_files, diagnostics) = load_bootstrap_files(&root, PromptProfile::AssistantFull);

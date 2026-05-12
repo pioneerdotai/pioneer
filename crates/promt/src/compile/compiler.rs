@@ -10,8 +10,8 @@ use crate::fingerprint::sha256_hex;
 use crate::profile::PromptProfile;
 use crate::render::text::render_sections;
 use crate::section::{
-    DynamicPromptSectionInput, PromptRuntimeSectionInput, PromptSection, PromptSectionId,
-    PromptStability,
+    DynamicPromptSectionInput, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
+    PromptRuntimeSectionInput, PromptSection, PromptSectionId, PromptStability,
 };
 use crate::sources::budget::{BudgetedBootstrapFile, apply_budgets};
 use crate::sources::files::load_bootstrap_files;
@@ -19,6 +19,8 @@ use crate::sources::files::load_bootstrap_files;
 const DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS: usize = 8_000;
 const DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_TOTAL_CHARS: usize = 16_000;
 const DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT: usize = 16;
+const DEFAULT_RUNTIME_PROMPT_SECTIONS_MAX_TOTAL_CHARS: usize = 24_000;
+const DEFAULT_AGENTS_MD_PROMPT_SECTION_MAX_CHARS: usize = 20_000;
 
 fn build_identity_section() -> PromptSection {
     PromptSection {
@@ -239,10 +241,11 @@ fn build_runtime_prompt_section(
         return None;
     }
 
+    let default_max_chars = runtime_section_default_max_chars(&input.id);
     let section_limit = input
         .max_chars
-        .unwrap_or(DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS)
-        .min(DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS)
+        .unwrap_or(default_max_chars)
+        .min(default_max_chars)
         .min(*remaining_total_chars);
 
     if section_limit == 0 {
@@ -289,6 +292,24 @@ fn build_runtime_prompt_section(
     })
 }
 
+fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
+    match id {
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => {
+            DEFAULT_AGENTS_MD_PROMPT_SECTION_MAX_CHARS
+        }
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall)
+        | PromptRuntimeSectionId::Dynamic(_) => DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS,
+    }
+}
+
+fn runtime_section_order(id: &PromptRuntimeSectionId) -> u8 {
+    match id {
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => 0,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall) => 1,
+        PromptRuntimeSectionId::Dynamic(_) => 2,
+    }
+}
+
 fn build_dynamic_prompt_sections(
     dynamic_sections: &[DynamicPromptSectionInput],
     diagnostics: &mut Vec<PromptDiagnostic>,
@@ -320,9 +341,13 @@ fn build_runtime_prompt_sections(
     diagnostics: &mut Vec<PromptDiagnostic>,
 ) -> Vec<PromptSection> {
     let mut sections = Vec::new();
-    let mut remaining_total_chars = DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_TOTAL_CHARS;
+    let mut remaining_total_chars = DEFAULT_RUNTIME_PROMPT_SECTIONS_MAX_TOTAL_CHARS;
 
-    for input in runtime_sections {
+    let mut ordered_runtime_sections = runtime_sections.iter().enumerate().collect::<Vec<_>>();
+    ordered_runtime_sections
+        .sort_by_key(|(index, input)| (runtime_section_order(&input.id), *index));
+
+    for (_, input) in ordered_runtime_sections {
         if sections.len() >= DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT {
             let section_id = input.id.manifest_id();
             diagnostics.push(PromptDiagnostic::dynamic_section_omitted(
@@ -595,6 +620,19 @@ mod tests {
         }
     }
 
+    fn agents_md_runtime_section(
+        content: &str,
+        max_chars: Option<usize>,
+    ) -> PromptRuntimeSectionInput {
+        PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd),
+            title: None,
+            content: content.to_owned(),
+            max_chars,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn deterministic_output_for_same_input() {
         let root = temp_workspace("deterministic");
@@ -774,6 +812,180 @@ mod tests {
                 .dynamic_system_text
                 .contains("Available memory tools: memory_search")
         );
+    }
+
+    #[test]
+    fn agents_md_runtime_section_renders_as_builtin_dynamic_section() {
+        let root = temp_workspace("agents_md_runtime");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections: vec![agents_md_runtime_section(
+                "Follow project-specific instructions.",
+                Some(20_000),
+            )],
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let agents_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::AgentsMd)
+            .expect("AGENTS.md section should be present");
+        assert_eq!(agents_section.title, "AGENTS.md");
+        assert_eq!(
+            agents_section.stability,
+            crate::section::PromptStability::Dynamic
+        );
+        assert!(compiled.dynamic_system_text.contains("## AGENTS.md"));
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("Follow project-specific instructions.")
+        );
+        assert!(
+            compiled
+                .sections
+                .iter()
+                .any(|section| section.id.manifest_id() == "agents_md"),
+            "manifest section ids should include agents_md"
+        );
+    }
+
+    #[test]
+    fn agents_md_runtime_section_omits_empty_content_with_diagnostic() {
+        let root = temp_workspace("agents_md_empty");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections: vec![agents_md_runtime_section("   ", Some(20_000))],
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(!compiled.dynamic_system_text.contains("## AGENTS.md"));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::DynamicSectionOmitted
+                && diagnostic.section_id.as_deref() == Some("agents_md")
+        }));
+    }
+
+    #[test]
+    fn agents_md_runtime_section_truncates_at_builtin_limit_with_diagnostic() {
+        let root = temp_workspace("agents_md_truncated");
+        let content = "a".repeat(20_005);
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections: vec![agents_md_runtime_section(content.as_str(), Some(25_000))],
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let agents_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::AgentsMd)
+            .expect("AGENTS.md section should be present");
+        assert_eq!(agents_section.content.chars().count(), 20_000);
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PromptDiagnosticCode::DynamicSectionTruncated
+                && diagnostic.section_id.as_deref() == Some("agents_md")
+        }));
+    }
+
+    #[test]
+    fn agents_md_runtime_section_orders_before_other_runtime_sections() {
+        let root = temp_workspace("agents_md_ordering");
+        let runtime_dynamic = PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::Dynamic(
+                PromptDynamicSectionId::new("runtime.custom").expect("valid runtime id"),
+            ),
+            title: Some("Runtime Custom".to_owned()),
+            content: "runtime custom content".to_owned(),
+            max_chars: None,
+            truncated: false,
+        };
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections: vec![
+                runtime_dynamic,
+                memory_recall_runtime_section("memory recall content"),
+                agents_md_runtime_section("agents content", Some(20_000)),
+            ],
+            dynamic_sections: vec![dynamic_section(
+                "test.phase10.after",
+                Some("After"),
+                "after",
+            )],
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let section_ids = compiled
+            .sections
+            .iter()
+            .map(|section| section.id.manifest_id())
+            .collect::<Vec<_>>();
+        let agents_index = section_ids
+            .iter()
+            .position(|id| id == "agents_md")
+            .expect("agents_md section present");
+        let memory_index = section_ids
+            .iter()
+            .position(|id| id == "memory_recall")
+            .expect("memory recall section present");
+        let runtime_dynamic_index = section_ids
+            .iter()
+            .position(|id| id == "runtime.custom")
+            .expect("runtime dynamic section present");
+        let hook_index = section_ids
+            .iter()
+            .position(|id| id == "test.phase10.after")
+            .expect("dynamic section present");
+
+        assert!(agents_index < memory_index);
+        assert!(memory_index < runtime_dynamic_index);
+        assert!(runtime_dynamic_index < hook_index);
     }
 
     #[test]

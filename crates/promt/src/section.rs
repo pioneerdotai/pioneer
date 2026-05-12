@@ -55,12 +55,14 @@ impl fmt::Display for PromptDynamicSectionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptRuntimeBuiltInSectionId {
+    AgentsMd,
     MemoryRecall,
 }
 
 impl PromptRuntimeBuiltInSectionId {
     pub fn from_manifest_id(value: &str) -> Option<Self> {
         match value {
+            "agents_md" => Some(Self::AgentsMd),
             "memory_recall" => Some(Self::MemoryRecall),
             _ => None,
         }
@@ -68,18 +70,21 @@ impl PromptRuntimeBuiltInSectionId {
 
     pub fn manifest_id(self) -> &'static str {
         match self {
+            Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
         }
     }
 
     pub fn prompt_section_id(self) -> PromptSectionId {
         match self {
+            Self::AgentsMd => PromptSectionId::AgentsMd,
             Self::MemoryRecall => PromptSectionId::MemoryRecall,
         }
     }
 
     pub fn default_title(self) -> &'static str {
         match self {
+            Self::AgentsMd => crate::content::SECTION_TITLE_AGENTS_MD,
             Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
         }
     }
@@ -125,6 +130,7 @@ pub enum PromptSectionId {
     UserPersona,
     ToolRecoveryPolicy,
     TaskOrchestrationPolicy,
+    AgentsMd,
     MemoryRecall,
     RecoveryContinuation,
     SkillsRuntimePrompt,
@@ -144,6 +150,7 @@ impl PromptSectionId {
             Self::UserPersona => "user_persona",
             Self::ToolRecoveryPolicy => "tool_recovery_policy",
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
+            Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
             Self::RecoveryContinuation => "recovery_continuation",
             Self::SkillsRuntimePrompt => "skills_runtime_prompt",
@@ -165,6 +172,7 @@ impl PromptSectionId {
                 | "user_persona"
                 | "tool_recovery_policy"
                 | "task_orchestration_policy"
+                | "agents_md"
                 | "memory_recall"
                 | "recovery_continuation"
                 | "skills_runtime_prompt"
@@ -260,8 +268,20 @@ mod tests {
 
     #[test]
     fn dynamic_section_id_rejects_builtin_collision() {
+        assert!(PromptDynamicSectionId::new("agents_md").is_err());
         assert!(PromptDynamicSectionId::new("memory_recall").is_err());
         assert!(PromptDynamicSectionId::new("identity_base").is_err());
+    }
+
+    #[test]
+    fn agents_md_builtin_round_trips_manifest_identity() {
+        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("agents_md")
+            .expect("agents_md builtin should resolve");
+        assert_eq!(id, PromptRuntimeBuiltInSectionId::AgentsMd);
+        assert_eq!(id.manifest_id(), "agents_md");
+        assert_eq!(id.prompt_section_id(), PromptSectionId::AgentsMd);
+        assert_eq!(id.default_title(), "AGENTS.md");
+        assert!(PromptSectionId::is_builtin_manifest_id("agents_md"));
     }
 
     #[test]
