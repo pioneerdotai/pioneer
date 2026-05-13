@@ -4,7 +4,7 @@ use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::convention::is_terminal_task_status_db;
+use crate::convention::{is_terminal_task_status_db, task_run_status_from_db};
 use crate::repositories::{
     ProjectionWriteOutcome, task, task_agent_spec, task_delivery, task_dependency, task_run,
     task_trigger, task_write_lock, thread_lineage,
@@ -261,6 +261,9 @@ impl TaskProjector {
             }
             TaskEventPayload::TaskRescheduled { trigger, .. } => {
                 task_trigger::upsert_trigger(db, trigger).await?;
+                if task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await? {
+                    return Ok(());
+                }
                 let status = if trigger.next_fire_at.is_some() {
                     TaskStatus::Scheduled
                 } else {
@@ -363,6 +366,13 @@ async fn task_is_terminal_db<C: ConnectionTrait>(db: &C, task_id: &str) -> Resul
     Ok(task::find_task_by_id(db, task_id)
         .await?
         .is_some_and(|model| is_terminal_task_status_db(model.status.as_str())))
+}
+
+async fn task_has_nonterminal_run_db<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<bool> {
+    let runs = task_run::list_runs_by_task(db, task_id).await?;
+    Ok(runs.into_iter().any(|run| {
+        task_run_status_from_db(run.status.as_str()).is_some_and(|status| !status.is_terminal())
+    }))
 }
 
 fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {

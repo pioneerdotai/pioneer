@@ -409,6 +409,79 @@ async fn interval_task_fires_repeatedly_after_terminal_runs_and_stays_active() {
 }
 
 #[tokio::test]
+async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_fire_forward() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Interval {
+        interval_seconds: 10,
+        interval_anchor_at: Some(4_000_000_000),
+    });
+    params.concurrency_policy = Some(TaskConcurrencyPolicy {
+        key: None,
+        max_parallel_runs: 1,
+        on_conflict: TaskConcurrencyConflictPolicy::Queue,
+    });
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("interval task should create");
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_000)
+            .await
+            .expect("first interval fire should create one run"),
+        1
+    );
+    let after_first = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read after first fire");
+    assert_eq!(after_first.runs.len(), 1);
+    assert_eq!(after_first.task.status, TaskStatus::Queued);
+    assert_eq!(after_first.triggers[0].next_fire_at, Some(4_000_000_010));
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_010)
+            .await
+            .expect("overlapped interval fire should be skipped"),
+        0
+    );
+    let after_overlap = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read after overlap skip");
+    assert_eq!(after_overlap.runs.len(), 1);
+    assert_eq!(after_overlap.task.status, TaskStatus::Queued);
+    assert_eq!(after_overlap.triggers[0].status, TaskTriggerStatus::Active);
+    assert_eq!(after_overlap.triggers[0].next_fire_at, Some(4_000_000_020));
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_010)
+            .await
+            .expect("repeated scheduler pass before next fire should stay idle"),
+        0
+    );
+    let after_repeat = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should read after repeated pass");
+    assert_eq!(after_repeat.runs.len(), 1);
+    assert_eq!(after_repeat.triggers[0].next_fire_at, Some(4_000_000_020));
+}
+
+#[tokio::test]
 async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted() {
     let runtime = runtime().await;
     runtime

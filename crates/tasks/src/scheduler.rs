@@ -14,7 +14,7 @@ use pioneer_protocol::{
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const ID_LEN: usize = 21;
 
@@ -203,6 +203,14 @@ impl TaskScheduler {
                 .map(|policy| policy.max_parallel_runs <= 1)
                 .unwrap_or(true)
         {
+            if is_recurring(&trigger) && trigger.next_fire_at.is_some_and(|next| next <= now) {
+                self.skip_recurring_fire_for_active_run(
+                    task_response.task.id.clone(),
+                    trigger.clone(),
+                    now,
+                )
+                .await?;
+            }
             return Ok(false);
         }
 
@@ -268,6 +276,38 @@ impl TaskScheduler {
         self.dispatch_run(task_response.task.workspace_id, run)
             .await?;
         Ok(true)
+    }
+
+    async fn skip_recurring_fire_for_active_run(
+        &self,
+        task_id: String,
+        trigger: TaskTrigger,
+        now: i64,
+    ) -> TaskRuntimeResult<()> {
+        let mut updated_trigger = trigger;
+        updated_trigger.next_fire_at =
+            TaskTriggerCalculator::next_after_fire(&updated_trigger, now)?;
+        updated_trigger.status = TaskTriggerStatus::Active;
+        updated_trigger.updated_at = now;
+        let appended = self
+            .projector
+            .append_events(
+                vec![TaskEventPayload::TaskRescheduled {
+                    task_id: task_id.clone(),
+                    trigger: updated_trigger.clone(),
+                    rescheduled_at: now,
+                }],
+                now,
+            )
+            .await?;
+        self.event_bus.publish_many(appended).await;
+        debug!(
+            task_id = %task_id,
+            trigger_id = %updated_trigger.id,
+            next_fire_at = ?updated_trigger.next_fire_at,
+            "skipped recurring task fire because a prior run is still active"
+        );
+        Ok(())
     }
 
     async fn process_retry_run(&self, run: TaskRun, now: i64) -> TaskRuntimeResult<bool> {
