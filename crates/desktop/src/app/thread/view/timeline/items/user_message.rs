@@ -67,6 +67,7 @@ impl PioneerDesktop {
                 .group(format!("user-message-{}", item_view.id))
                 .when(!attachments.is_empty(), |this| {
                     this.child(self.render_user_message_attachment_badges(
+                        item_view.id.as_str(),
                         attachments.clone(),
                         active_workspace_id.clone(),
                         cx,
@@ -110,10 +111,12 @@ impl PioneerDesktop {
 
     fn render_user_message_attachment_badges(
         &self,
+        item_id: &str,
         attachments: Vec<ParsedUserAttachment>,
         workspace_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let item_id = item_id.to_owned();
         h_flex()
             .min_w_0()
             .max_w_3_4()
@@ -127,6 +130,8 @@ impl PioneerDesktop {
                     .into_iter()
                     .enumerate()
                     .map(|(chip_index, attachment)| {
+                        let chip_id =
+                            stable_user_message_attachment_chip_id(item_id.as_str(), chip_index);
                         let artifact = attachment.artifact.clone();
                         let preview_image_path = artifact.as_ref().and_then(|artifact| {
                             if let Some(workspace_id) = workspace_id.as_deref() {
@@ -145,7 +150,7 @@ impl PioneerDesktop {
                             .map(|artifact| artifact.artifact_id.clone());
 
                         h_flex()
-                            .id(("timeline-user-attachment-chip", chip_index))
+                            .id(("timeline-user-attachment-chip", chip_id))
                             .h(px(32.))
                             .max_w(px(196.))
                             .min_w_0()
@@ -294,9 +299,21 @@ fn artifact_from_attachment(attachment: &UserMessageAttachment) -> Option<Artifa
     }
 }
 
+fn stable_user_message_attachment_chip_id(item_id: &str, chip_index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    item_id.hash(&mut hasher);
+    chip_index.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{artifact_from_attachment, display_name_from_attachment};
+    use super::{
+        artifact_from_attachment, display_name_from_attachment,
+        stable_user_message_attachment_chip_id,
+    };
     use pioneer_protocol::{ArtifactKind, ArtifactRef, ArtifactStatus, UserMessageAttachment};
 
     #[test]
@@ -341,6 +358,14 @@ mod tests {
                 .as_ref()
                 .map(|artifact| artifact.artifact_id.as_str()),
             Some("art_1")
+        );
+    }
+
+    #[test]
+    fn attachment_scope_id_is_item_specific() {
+        assert_ne!(
+            stable_user_message_attachment_chip_id("user_turn_1", 0),
+            stable_user_message_attachment_chip_id("user_turn_2", 0)
         );
     }
 }

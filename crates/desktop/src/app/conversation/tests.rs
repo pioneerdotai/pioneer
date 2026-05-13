@@ -1,15 +1,16 @@
 use super::events::EventKind;
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
 use pioneer_protocol::{
-    ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, TaskEvent,
-    TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
-    ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
-    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
-    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnStatus,
-    TurnTimelineResponse, UserInput,
+    ArtifactKind, ArtifactRef, ArtifactStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, TaskEvent, TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind,
+    TaskTurnItem, ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane,
+    TimelineOrigin, TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload,
+    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
+    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
+    ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
+    ToolRetryResolution, ToolStoragePayload, Turn, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    TurnItemTimeoutReason, TurnItemType, TurnStatus, TurnTimelineResponse, UserInput,
+    UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -81,6 +82,7 @@ fn send_stays_blocked_until_terminal_event() {
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
         user_text: "hello".to_owned(),
+        attachments: Vec::new(),
     });
     assert!(!conversation.can_submit_message());
     assert_eq!(pending_request_id(&conversation), Some(PENDING_REQUEST_ID));
@@ -156,6 +158,52 @@ fn user_message_stays_before_work_items_even_if_it_arrives_late() {
 }
 
 #[test]
+fn local_turn_start_projects_optimistic_user_message_with_artifacts() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let artifact = ArtifactRef {
+        artifact_id: "art_000000000000000001".to_owned(),
+        version_id: Some("ver_000000000000000001".to_owned()),
+        display_name: "photo.webp".to_owned(),
+        kind: ArtifactKind::Image,
+        mime_type: Some("image/webp".to_owned()),
+        size_bytes: Some(1234),
+        sha256: Some("sha256".to_owned()),
+        status: ArtifactStatus::Ready,
+        preview: None,
+    };
+
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        user_text: "what is this?".to_owned(),
+        attachments: vec![UserMessageAttachment::Artifact {
+            artifact: artifact.clone(),
+        }],
+    });
+
+    let item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| matches!(item.item, TurnItem::UserMessage { .. }))
+        .expect("optimistic user message");
+    assert_eq!(item.id, format!("user_{TURN_ID}"));
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    let TurnItem::UserMessage {
+        text, attachments, ..
+    } = &item.item
+    else {
+        panic!("expected user message");
+    };
+    assert_eq!(text, "what is this?");
+    assert_eq!(
+        attachments,
+        &vec![UserMessageAttachment::Artifact { artifact }]
+    );
+}
+
+#[test]
 fn send_unlocks_only_on_terminal_failed_or_cancelled() {
     let mut conversation = Conversation::new(THREAD_ID);
 
@@ -164,6 +212,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
         user_text: "hello".to_owned(),
+        attachments: Vec::new(),
     });
 
     conversation.apply(ConversationEvent::TurnFailed {
@@ -185,6 +234,7 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         turn_id: "turn_000000000000000002".to_owned(),
         pending_request_id: "req_000000000000000002".to_owned(),
         user_text: "again".to_owned(),
+        attachments: Vec::new(),
     });
     assert!(!conversation.can_submit_message());
 
@@ -219,6 +269,7 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
         turn_id: TURN_ID.to_owned(),
         pending_request_id: PENDING_REQUEST_ID.to_owned(),
         user_text: "hello".to_owned(),
+        attachments: Vec::new(),
     });
     conversation.apply(ConversationEvent::LocalTurnStartAccepted {
         thread_id: THREAD_ID.to_owned(),

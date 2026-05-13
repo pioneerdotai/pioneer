@@ -9,7 +9,8 @@ use anyhow::{Context as AnyhowContext, Result, anyhow};
 use gpui::{prelude::*, *};
 use pioneer_protocol::{
     ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactKind, ArtifactRef,
-    REQUEST_ID_LEN, TurnCancelParams, TurnStartParams, UserInput, generate_id,
+    REQUEST_ID_LEN, TurnCancelParams, TurnStartParams, UserInput, UserMessageAttachment,
+    generate_id,
 };
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,8 @@ struct PreparedComposerAttachment {
 struct PreparedComposerTurn {
     input: Vec<UserInput>,
     user_text: String,
+    user_message_text: String,
+    user_attachments: Vec<UserMessageAttachment>,
     attachments: Vec<PreparedComposerAttachment>,
 }
 
@@ -210,7 +213,8 @@ impl PioneerDesktop {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             pending_request_id: pending_request_id.clone(),
-                            user_text: prepared.user_text.clone(),
+                            user_text: prepared.user_message_text.clone(),
+                            attachments: prepared.user_attachments.clone(),
                         });
 
                         let ws_sender = turn_start_sender.clone();
@@ -484,10 +488,15 @@ fn prepare_composer_turn(
         build_turn_input_from_prepared_composer(text.as_str(), prepared_attachments.as_slice());
     let user_text =
         user_message_preview_from_prepared_composer(text.as_str(), prepared_attachments.as_slice());
+    let user_message_text = text.trim().to_owned();
+    let user_attachments =
+        user_message_attachments_from_prepared_composer(prepared_attachments.as_slice());
 
     Ok(PreparedComposerTurn {
         input,
         user_text,
+        user_message_text,
+        user_attachments,
         attachments: prepared_attachments,
     })
 }
@@ -565,6 +574,42 @@ fn local_user_input_from_attachment(attachment: &ComposerAttachment) -> UserInpu
             path: attachment.path.clone(),
         },
         ComposerAttachmentKind::File => UserInput::LocalFile {
+            path: attachment.path.clone(),
+        },
+    }
+}
+
+fn user_message_attachments_from_prepared_composer(
+    attachments: &[PreparedComposerAttachment],
+) -> Vec<UserMessageAttachment> {
+    attachments
+        .iter()
+        .map(|prepared| {
+            if let Some(artifact) = prepared.artifact.as_ref() {
+                UserMessageAttachment::Artifact {
+                    artifact: artifact.clone(),
+                }
+            } else {
+                local_user_message_attachment_from_attachment(&prepared.attachment)
+            }
+        })
+        .collect()
+}
+
+fn local_user_message_attachment_from_attachment(
+    attachment: &ComposerAttachment,
+) -> UserMessageAttachment {
+    match attachment.kind {
+        ComposerAttachmentKind::Image => UserMessageAttachment::LocalImage {
+            path: attachment.path.clone(),
+        },
+        ComposerAttachmentKind::Audio => UserMessageAttachment::LocalAudio {
+            path: attachment.path.clone(),
+        },
+        ComposerAttachmentKind::Video => UserMessageAttachment::LocalVideo {
+            path: attachment.path.clone(),
+        },
+        ComposerAttachmentKind::File => UserMessageAttachment::LocalFile {
             path: attachment.path.clone(),
         },
     }

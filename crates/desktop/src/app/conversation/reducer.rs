@@ -3,6 +3,7 @@ use pioneer_protocol::{
     MarkdownDocument, RecoveryJobStatus, SystemEventLevel, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
     ToolRetryResolution, Turn, TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
+    UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -142,9 +143,46 @@ impl ConversationProjector {
         self.view_state.phase_label = state_machine.status_label().to_owned();
     }
 
-    pub(super) fn apply_local_turn_start_requested(&mut self, turn_id: &str, ts_unix_ms: i64) {
+    pub(super) fn apply_local_turn_start_requested(
+        &mut self,
+        turn_id: &str,
+        user_text: &str,
+        attachments: &[UserMessageAttachment],
+        ts_unix_ms: i64,
+    ) {
         self.upsert_turn(turn_id, TurnPhase::Starting, Some(ts_unix_ms), None, None);
         self.view_state.last_error = None;
+
+        if user_text.trim().is_empty() && attachments.is_empty() {
+            return;
+        }
+
+        let item_id = format!("user_{turn_id}");
+        let item = TurnItem::UserMessage {
+            id: item_id.clone(),
+            text: user_text.to_owned(),
+            attachments: attachments.to_vec(),
+        };
+        self.start_item_view(
+            item_id.as_str(),
+            turn_id,
+            "user_message",
+            TimelineEntryStatus::Completed,
+            user_text.to_owned(),
+            None,
+            item.clone(),
+            None,
+            ts_unix_ms,
+        );
+        self.complete_item_view(
+            item_id.as_str(),
+            TimelineEntryStatus::Completed,
+            Some(user_text),
+            None,
+            item,
+            None,
+            ts_unix_ms,
+        );
     }
 
     pub(super) fn apply_local_turn_start_accepted(&mut self, turn_id: &str, ts_unix_ms: i64) {

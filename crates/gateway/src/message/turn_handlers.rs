@@ -202,6 +202,11 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.skip_resolved_artifact_inputs_for_file_capture(
+            outcome.started_notification.turn.id.as_str(),
+            resolved_artifacts.as_slice(),
+        )
+        .await;
 
         if let Err(error) = self
             .agent_manager

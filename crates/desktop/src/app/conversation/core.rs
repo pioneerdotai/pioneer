@@ -62,10 +62,19 @@ impl Conversation {
         self.state_machine.apply(&event);
 
         match event {
-            ConversationEvent::LocalTurnStartRequested { turn_id, .. } => {
+            ConversationEvent::LocalTurnStartRequested {
+                turn_id,
+                user_text,
+                attachments,
+                ..
+            } => {
                 self.pending_completion_turn_id = None;
-                self.projector
-                    .apply_local_turn_start_requested(turn_id.as_str(), ts_unix_ms);
+                self.projector.apply_local_turn_start_requested(
+                    turn_id.as_str(),
+                    user_text.as_str(),
+                    attachments.as_slice(),
+                    ts_unix_ms,
+                );
             }
             ConversationEvent::LocalTurnStartAccepted { turn_id, .. } => {
                 self.pending_completion_turn_id = None;

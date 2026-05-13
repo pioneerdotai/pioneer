@@ -20,6 +20,7 @@ pub(super) struct TurnFileCaptureSession {
     output_roots: Vec<PathBuf>,
     baseline: HashMap<PathBuf, FileBaseline>,
     explicit_events: Vec<FileCaptureEvent>,
+    skip_paths: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +68,15 @@ impl TurnFileCaptureSession {
             output_roots,
             baseline,
             explicit_events: Vec::new(),
+            skip_paths: HashSet::new(),
         })
+    }
+
+    pub(super) fn add_skip_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            let canonical = fs::canonicalize(path.as_path()).unwrap_or(path);
+            self.skip_paths.insert(canonical);
+        }
     }
 
     pub(super) async fn finish(
@@ -75,7 +84,9 @@ impl TurnFileCaptureSession {
         artifact_service: &ArtifactService,
         skip_source_paths: &HashSet<PathBuf>,
     ) -> Result<FileCaptureOutcome> {
-        let candidates = self.collect_candidates(skip_source_paths)?;
+        let mut skip_paths = skip_source_paths.clone();
+        skip_paths.extend(self.skip_paths.iter().cloned());
+        let candidates = self.collect_candidates(&skip_paths)?;
         let mut artifacts = Vec::new();
         let mut diagnostics = Vec::new();
         let mut total_bytes = 0_u64;
@@ -340,6 +351,28 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn skip_resolved_artifact_inputs_for_file_capture(
+        &self,
+        turn_id: &str,
+        resolved_artifacts: &[ResolvedArtifactInput],
+    ) {
+        let paths = resolved_artifacts
+            .iter()
+            .filter_map(|resolved| match &resolved.attachment.source {
+                pioneer_provider::AttachmentDataSource::Path { path } => Some(PathBuf::from(path)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if paths.is_empty() {
+            return;
+        }
+
+        if let Some(session) = self.file_capture_sessions.lock().await.get_mut(turn_id) {
+            session.add_skip_paths(paths);
+        }
+    }
+
     async fn captured_source_paths_for_turn(
         &self,
         workspace_id: &str,
@@ -550,6 +583,34 @@ mod tests {
         fs::write(existing.as_path(), b"after").expect("modify existing");
         fs::write(temp.path().join("target").join("ignored.txt"), b"ignored")
             .expect("write ignored");
+
+        let outcome = session
+            .finish(&service, &HashSet::new())
+            .await
+            .expect("finish session");
+
+        assert!(outcome.artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_capture_skips_resolved_artifact_input_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = artifact_service(temp.path().join("runtime")).await;
+        let mut session = TurnFileCaptureSession::start(
+            "ws_file_capture".to_owned(),
+            "thr_file_capture".to_owned(),
+            "turn_file_capture".to_owned(),
+            ArtifactCapturePolicy {
+                output_roots: vec![temp.path().to_path_buf()],
+                ..ArtifactCapturePolicy::default()
+            },
+            temp.path().to_path_buf(),
+        )
+        .await
+        .expect("start session");
+        let materialized_input = temp.path().join("materialized-input.webp");
+        fs::write(materialized_input.as_path(), b"provider input").expect("write input");
+        session.add_skip_paths(vec![materialized_input]);
 
         let outcome = session
             .finish(&service, &HashSet::new())

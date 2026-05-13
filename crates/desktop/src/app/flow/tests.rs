@@ -543,6 +543,7 @@ fn reconnect_replay_restores_final_turn_result() {
         turn_id: "turn_local".to_owned(),
         pending_request_id: "req_local".to_owned(),
         user_text: "hello".to_owned(),
+        attachments: Vec::new(),
     });
     assert!(!conversation.can_submit_message());
 

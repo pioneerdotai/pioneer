@@ -542,8 +542,18 @@ impl PioneerDesktop {
         artifact_id: String,
         cx: &mut Context<Self>,
     ) {
+        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
+        let artifact_missing_from_cache = !self
+            .thread_artifacts
+            .items_for_active_thread()
+            .iter()
+            .any(|summary| summary.artifact.artifact_id == artifact_id);
+
         self.show_thread_artifacts_sidebar = true;
         self.thread_artifacts.select_artifact(artifact_id);
+        if let Some(thread_id) = active_thread_id {
+            self.refresh_thread_artifacts(thread_id, artifact_missing_from_cache, cx);
+        }
         cx.notify();
     }
 

@@ -230,6 +230,12 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to resolve hidden task artifact input for provider")?;
+        processor
+            .skip_resolved_artifact_inputs_for_file_capture(
+                child_turn_id.as_str(),
+                resolved_artifacts.as_slice(),
+            )
+            .await;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_resolved_artifacts(
@@ -442,6 +448,12 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to resolve restored task artifact input for provider")?;
+        processor
+            .skip_resolved_artifact_inputs_for_file_capture(
+                lineage.child_turn_id.as_str(),
+                resolved_artifacts.as_slice(),
+            )
+            .await;
         processor
             .agent_manager
             .start_turn_with_resolved_artifacts(

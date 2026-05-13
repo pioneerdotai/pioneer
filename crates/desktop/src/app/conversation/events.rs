@@ -1,7 +1,7 @@
 use pioneer_protocol::{
     ItemDeltaStream, MarkdownDocument, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
-    TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
+    TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -42,6 +42,8 @@ pub(crate) enum ConversationEvent {
         turn_id: String,
         pending_request_id: String,
         user_text: String,
+        #[serde(default)]
+        attachments: Vec<UserMessageAttachment>,
     },
     LocalTurnStartAccepted {
         thread_id: String,

@@ -414,9 +414,34 @@ impl MessageProcessor {
             .complete_success(params.upload_id.as_str())
             .await;
 
+        let artifact = summary.artifact.clone();
+        if let Some(thread_id) = session.thread_id.as_deref() {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::ARTIFACT_CREATED,
+                &ArtifactCreatedNotification {
+                    workspace_id: session.workspace_id.clone(),
+                    artifact: summary.clone(),
+                },
+            )
+            .await;
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_ARTIFACTS_CHANGED,
+                &ThreadArtifactsChangedNotification {
+                    workspace_id: session.workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    artifact_ids: vec![artifact.artifact_id.clone()],
+                    reason: "user_upload".to_owned(),
+                    generated_at: now_timestamp_secs(),
+                },
+            )
+            .await;
+        }
+
         let payload = ArtifactUploadFinishResponse {
             upload_id: params.upload_id,
-            artifact: summary.artifact,
+            artifact,
         };
         self.send_artifact_result(
             connection_id,
