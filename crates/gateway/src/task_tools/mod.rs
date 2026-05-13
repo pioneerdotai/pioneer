@@ -7,12 +7,13 @@ use pioneer_agent::{
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAgentContextPolicy,
     TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput,
-    TaskAttachmentMode, TaskCancelParams, TaskCreateParams, TaskCreateResponse, TaskDeliveryPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskGetParams, TaskGetResponse,
-    TaskLifecyclePolicy, TaskListParams, TaskMetadata, TaskOwnerKind, TaskPauseParams,
-    TaskRescheduleParams, TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus,
-    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTurnItem, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
+    TaskAttachmentMode, TaskCancelParams, TaskCancelScope, TaskCreateParams, TaskCreateResponse,
+    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
+    TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
+    TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
+    TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
+    TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
+    TaskTurnItem, TaskWaitMode, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
     constants::events,
 };
 use pioneer_tools::{
@@ -20,7 +21,8 @@ use pioneer_tools::{
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
     ToolRecoveryMetadata, ToolRetryClass, ToolSpec, dynamic_unknown_output_policy,
 };
-use serde::Deserialize;
+use schemars::{JsonSchema, schema_for};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
@@ -256,7 +258,8 @@ impl TaskToolHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let current_call_id = invocation.call_id.clone();
-        let mut params: pioneer_protocol::TaskWaitParams = decode_tool_args(invocation)?;
+        let input: TaskWaitToolInput = decode_tool_args(invocation)?;
+        let mut params = input.into_params()?;
         if !params.return_completed && !params.return_pending {
             params.return_completed = true;
             params.return_pending = true;
@@ -332,7 +335,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskCancelParams = decode_tool_args(invocation)?;
+        let input: TaskCancelToolInput = decode_tool_args(invocation)?;
+        let params = input.into_params()?;
         let response = self
             .processor
             .task_runtime
@@ -349,7 +353,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskDetachParams = decode_tool_args(invocation)?;
+        let input: TaskIdToolInput = decode_tool_args(invocation)?;
+        let params = input.into_detach_params()?;
         let response = self
             .processor
             .task_runtime
@@ -371,8 +376,8 @@ impl TaskToolHandler {
             workspace_id: self.context.workspace_id.clone(),
             owner_kind: input.owner_kind,
             owner_id: input.owner_id,
-            parent_task_id: input.parent_task_id,
-            root_task_id: input.root_task_id,
+            parent_task_id: validate_optional_entity_id(input.parent_task_id, "parentTaskId")?,
+            root_task_id: validate_optional_entity_id(input.root_task_id, "rootTaskId")?,
             status: input.status,
             limit: Some(
                 input
@@ -397,7 +402,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskGetParams = decode_tool_args(invocation)?;
+        let input: TaskIdToolInput = decode_tool_args(invocation)?;
+        let params = input.into_get_params()?;
         let response = self
             .processor
             .task_runtime
@@ -430,7 +436,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskRescheduleParams = decode_tool_args(invocation)?;
+        let input: TaskRescheduleToolInput = decode_tool_args(invocation)?;
+        let params = input.into_params()?;
         let response = self
             .processor
             .task_runtime
@@ -448,7 +455,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskPauseParams = decode_tool_args(invocation)?;
+        let input: TaskPauseToolInput = decode_tool_args(invocation)?;
+        let params = input.into_params()?;
         let response = self
             .processor
             .task_runtime
@@ -466,7 +474,8 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let params: TaskResumeParams = decode_tool_args(invocation)?;
+        let input: TaskResumeToolInput = decode_tool_args(invocation)?;
+        let params = input.into_params()?;
         let response = self
             .processor
             .task_runtime
@@ -484,20 +493,29 @@ impl TaskToolHandler {
         &self,
         input: TaskCreateToolInput,
     ) -> Result<TaskCreateParams, ToolError> {
-        let title = required_tool_string(input.title.as_deref(), "title")?;
-        let goal = required_tool_string(input.goal.as_deref(), "goal")?;
+        let title = required_tool_string(Some(input.title.as_str()), "title")?;
+        let goal = required_tool_string(Some(input.goal.as_str()), "goal")?;
         let (model, model_provider) =
             current_thread_model_identity(&self.processor, &self.context).await?;
-        let trigger = input.trigger.unwrap_or(TaskTriggerInput {
-            spec: TaskTriggerSpec::Immediate,
-        });
-        let executor_kind = input.executor_kind.unwrap_or(TaskExecutorKind::Agent);
+        let trigger = input
+            .trigger
+            .unwrap_or(TaskTriggerToolInput::Immediate)
+            .into_trigger_input()?;
+        let executor_kind = input
+            .executor_kind
+            .unwrap_or(TaskToolExecutorKind::Agent)
+            .into_executor_kind();
         let parent_task_id = current_parent_task_id(&self.processor, &self.context)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let inherited_max_depth =
             inherited_max_depth(&self.processor, parent_task_id.as_deref()).await?;
         let requested_max_depth = input.max_depth.unwrap_or(inherited_max_depth);
+        if requested_max_depth < 0 {
+            return Err(ToolError::invalid_arguments(
+                "`maxDepth` must be greater than or equal to 0",
+            ));
+        }
         let instructions = if input.instructions.is_empty() {
             vec!["Return a concise final result.".to_owned()]
         } else {
@@ -624,73 +642,397 @@ impl TaskToolHandler {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_create. Do not pass runtime-owned fields such as workspaceId, ownerKind, parentTaskId, rootTaskId, depth, model, modelProvider, or trigger.spec.
 struct TaskCreateToolInput {
-    title: Option<String>,
-    goal: Option<String>,
+    /// Short human-readable task title. For child agents this becomes the hidden child thread title.
+    title: String,
+    /// Concrete goal for the task executor.
+    goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    trigger: Option<TaskTriggerInput>,
+    /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For a daily scheduled task use {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    trigger: Option<TaskTriggerToolInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_kind: Option<TaskExecutorKind>,
+    /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
+    executor_kind: Option<TaskToolExecutorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional role label for the subagent, for example "researcher", "reviewer", or "implementer".
     agent_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional short display name for the subagent.
     agent_nickname: Option<String>,
     #[serde(default)]
+    /// Step-by-step instructions for the executor. If omitted the executor returns a concise final result.
     instructions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Plain text input for the child agent. Prefer inputText over input for simple subagent tasks.
     input_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Structured child-agent input with variables, attachments, and references.
     input: Option<TaskAgentInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Additional output constraints for the child agent result.
     output_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced context policy for the child agent. Omit unless the user asks for custom context handling.
     context_policy: Option<TaskAgentContextPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced tool policy for the child agent. Omit unless restricting tools or write access is required.
     tool_policy: Option<pioneer_protocol::TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional result contract. Omit for normal text or markdown subagent results.
     result_contract: Option<TaskAgentResultContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    /// Maximum allowed subagent nesting depth from this task. Omit to inherit the runtime default.
     max_depth: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional scheduling priority. Higher values are preferred by the task service.
     priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced lifecycle policy. Omit for attached subagent work.
     lifecycle_policy: Option<TaskLifecyclePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work.
     delivery_policy: Option<TaskDeliveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced retry policy. Omit to use the task service default.
     retry_policy: Option<TaskRetryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced timeout policy. Omit to use the task service default.
     timeout_policy: Option<TaskTimeoutPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Advanced concurrency policy. Omit unless the task must serialize access to a shared resource.
     concurrency_policy: Option<pioneer_protocol::TaskConcurrencyPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional labels or structured metadata for later task lookup.
     metadata: Option<TaskMetadata>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Model-facing executor kind. Only "agent" is currently supported by task_create.
+enum TaskToolExecutorKind {
+    Agent,
+}
+
+impl TaskToolExecutorKind {
+    fn into_executor_kind(self) -> TaskExecutorKind {
+        match self {
+            Self::Agent => TaskExecutorKind::Agent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+/// Model-facing trigger union. Use it directly as trigger; do not wrap it in {"spec": ...} and do not put cronExpr/timezone at the top level.
+enum TaskTriggerToolInput {
+    /// Run immediately. This is the default when trigger is omitted.
+    Immediate,
+    /// Run once at a Unix timestamp in seconds.
+    ScheduledAt {
+        #[serde(rename = "scheduledAt")]
+        #[schemars(range(min = 1))]
+        /// Unix timestamp in seconds. Do not pass natural language dates here.
+        scheduled_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Optional IANA timezone label for display and scheduling context.
+        timezone: Option<String>,
+    },
+    /// Run every N seconds. The optional anchor is a Unix timestamp in seconds.
+    Interval {
+        #[serde(rename = "intervalSeconds")]
+        #[schemars(range(min = 1))]
+        /// Positive repeat interval in seconds.
+        interval_seconds: i64,
+        #[serde(
+            default,
+            rename = "intervalAnchorAt",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(range(min = 1))]
+        /// Optional Unix timestamp in seconds used as the recurring schedule anchor.
+        interval_anchor_at: Option<i64>,
+    },
+    /// Run on a five-field cron expression in a concrete IANA timezone, for example {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    Cron {
+        #[serde(rename = "cronExpr")]
+        /// Five-field cron expression: minute hour day-of-month month day-of-week.
+        cron_expr: String,
+        /// Required IANA timezone, for example "Europe/Moscow" or "UTC".
+        timezone: String,
+    },
+    /// Create a dormant task that must be triggered manually by an allowed actor.
+    Manual {
+        #[serde(
+            default,
+            rename = "allowedActor",
+            skip_serializing_if = "Option::is_none"
+        )]
+        /// Optional actor allowed to manually fire the task.
+        allowed_actor: Option<TaskManualActor>,
+    },
+    /// Trigger from an external event source.
+    External {
+        /// External source name.
+        source: String,
+        #[serde(default, rename = "eventType", skip_serializing_if = "Option::is_none")]
+        /// Optional external event type.
+        event_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Optional structured event filter.
+        filter: Option<TaskExternalTriggerFilter>,
+    },
+    /// Trigger when dependency policy is satisfied.
+    Dependency { policy: TaskDependencyTriggerPolicy },
+}
+
+impl TaskTriggerToolInput {
+    fn into_trigger_input(self) -> Result<TaskTriggerInput, ToolError> {
+        let spec = match self {
+            Self::Immediate => TaskTriggerSpec::Immediate,
+            Self::ScheduledAt {
+                scheduled_at,
+                timezone,
+            } => {
+                if scheduled_at <= 0 {
+                    return Err(ToolError::invalid_arguments(
+                        "`trigger.scheduledAt` must be a positive Unix timestamp in seconds",
+                    ));
+                }
+                TaskTriggerSpec::ScheduledAt {
+                    scheduled_at,
+                    timezone: clean_optional_string(timezone),
+                }
+            }
+            Self::Interval {
+                interval_seconds,
+                interval_anchor_at,
+            } => {
+                if interval_seconds <= 0 {
+                    return Err(ToolError::invalid_arguments(
+                        "`trigger.intervalSeconds` must be greater than 0",
+                    ));
+                }
+                TaskTriggerSpec::Interval {
+                    interval_seconds,
+                    interval_anchor_at,
+                }
+            }
+            Self::Cron {
+                cron_expr,
+                timezone,
+            } => TaskTriggerSpec::Cron {
+                cron_expr: required_tool_string(Some(cron_expr.as_str()), "trigger.cronExpr")?,
+                timezone: required_tool_string(Some(timezone.as_str()), "trigger.timezone")?,
+            },
+            Self::Manual { allowed_actor } => TaskTriggerSpec::Manual { allowed_actor },
+            Self::External {
+                source,
+                event_type,
+                filter,
+            } => TaskTriggerSpec::External {
+                source: required_tool_string(Some(source.as_str()), "trigger.source")?,
+                event_type: clean_optional_string(event_type),
+                filter,
+            },
+            Self::Dependency { policy } => TaskTriggerSpec::Dependency { policy },
+        };
+        Ok(TaskTriggerInput { spec })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_wait. Provide taskIds and/or runIds arrays; do not use a single taskId field.
+struct TaskWaitToolInput {
+    /// Task ids to join. Each Pioneer entity id is exactly 21 characters. Use taskIds, not taskId, even for one task.
+    #[serde(default)]
+    #[schemars(inner(length(min = 21, max = 21)))]
+    task_ids: Vec<String>,
+    /// Task run ids to join. Each Pioneer entity id is exactly 21 characters.
+    #[serde(default)]
+    #[schemars(inner(length(min = 21, max = 21)))]
+    run_ids: Vec<String>,
+    /// Optional timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    timeout_ms: Option<u64>,
+    /// all_terminal waits for every target; any_terminal returns when one target reaches a terminal state.
+    #[serde(default)]
+    mode: TaskWaitMode,
+    /// Include terminal task results in the response. The handler enables this by default when both return flags are false.
+    #[serde(default)]
+    return_completed: bool,
+    /// Include still-pending task state in timeout responses. The handler enables this by default when both return flags are false.
+    #[serde(default)]
+    return_pending: bool,
+}
+
+impl TaskWaitToolInput {
+    fn into_params(self) -> Result<pioneer_protocol::TaskWaitParams, ToolError> {
+        let task_ids = validate_id_list(self.task_ids, "taskIds")?;
+        let run_ids = validate_id_list(self.run_ids, "runIds")?;
+        if task_ids.is_empty() && run_ids.is_empty() {
+            return Err(ToolError::invalid_arguments(
+                "`task_wait` requires at least one id in `taskIds` or `runIds`",
+            ));
+        }
+        Ok(pioneer_protocol::TaskWaitParams {
+            task_ids,
+            run_ids,
+            timeout_ms: self.timeout_ms,
+            mode: self.mode,
+            return_completed: self.return_completed,
+            return_pending: self.return_pending,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_cancel.
+struct TaskCancelToolInput {
+    /// Task id to cancel. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable cancellation reason.
+    reason: Option<String>,
+    #[serde(default)]
+    /// Cancellation scope. Defaults to attached_subtree.
+    scope: TaskCancelScope,
+}
+
+impl TaskCancelToolInput {
+    fn into_params(self) -> Result<TaskCancelParams, ToolError> {
+        Ok(TaskCancelParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            reason: clean_optional_string(self.reason),
+            scope: self.scope,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_get and task_detach.
+struct TaskIdToolInput {
+    /// Task id. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+}
+
+impl TaskIdToolInput {
+    fn into_get_params(self) -> Result<TaskGetParams, ToolError> {
+        Ok(TaskGetParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+        })
+    }
+
+    fn into_detach_params(self) -> Result<TaskDetachParams, ToolError> {
+        Ok(TaskDetachParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing filters for task_list. Workspace is derived from the current thread and must not be supplied.
 struct TaskListToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional owner kind filter.
     owner_kind: Option<TaskOwnerKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional owner id filter.
     owner_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 21, max = 21))]
+    /// Optional parent task id filter. Pioneer entity ids are exactly 21 characters.
     parent_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 21, max = 21))]
+    /// Optional root task id filter. Pioneer entity ids are exactly 21 characters.
     root_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional task status filter.
     status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    /// Maximum number of tasks to return. The handler clamps this to 1..=100.
     limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_reschedule.
+struct TaskRescheduleToolInput {
+    /// Task id to reschedule. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    /// New model-facing trigger. Use this object directly; do not wrap it in spec.
+    trigger: TaskTriggerToolInput,
+}
+
+impl TaskRescheduleToolInput {
+    fn into_params(self) -> Result<TaskRescheduleParams, ToolError> {
+        Ok(TaskRescheduleParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            trigger: self.trigger.into_trigger_input()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_pause.
+struct TaskPauseToolInput {
+    /// Task id to pause. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable pause reason.
+    reason: Option<String>,
+}
+
+impl TaskPauseToolInput {
+    fn into_params(self) -> Result<TaskPauseParams, ToolError> {
+        Ok(TaskPauseParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            reason: clean_optional_string(self.reason),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_resume.
+struct TaskResumeToolInput {
+    /// Task id to resume. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable resume reason.
+    reason: Option<String>,
+}
+
+impl TaskResumeToolInput {
+    fn into_params(self) -> Result<TaskResumeParams, ToolError> {
+        Ok(TaskResumeParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            reason: clean_optional_string(self.reason),
+        })
+    }
 }
 
 fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task. Immediate agent tasks are attached by default; scheduled, interval, and cron tasks are detached by default. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. For immediate subagents omit trigger. For scheduled work use trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -736,20 +1078,20 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESCHEDULE_TOOL,
-            "Reschedule a non-terminal task through the task service.",
+            "Reschedule a non-terminal task through the task service. Pass trigger directly, for example {\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"} or {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}.",
             task_reschedule_schema(),
             safe_mutation_recovery(),
         ),
         task_tool_spec(
             TASK_PAUSE_TOOL,
             "Pause a non-terminal task through the task service. Running task runs are not cancelled.",
-            task_cancel_schema(),
+            task_pause_schema(),
             safe_mutation_recovery(),
         ),
         task_tool_spec(
             TASK_RESUME_TOOL,
             "Resume a paused task through the task service and recompute its next scheduled fire.",
-            task_cancel_schema(),
+            task_resume_schema(),
             safe_mutation_recovery(),
         ),
     ]
@@ -788,118 +1130,127 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
 }
 
 fn task_create_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "title": { "type": "string", "description": "Short task title." },
-            "goal": { "type": "string", "description": "Concrete task goal for the executor." },
-            "instructions": { "type": "array", "items": { "type": "string" } },
-            "inputText": { "type": "string" },
-            "trigger": { "type": "object", "description": "TaskTriggerInput. Defaults to immediate." },
-            "executorKind": { "type": "string", "enum": ["agent"] },
-            "agentRole": { "type": "string" },
-            "agentNickname": { "type": "string" },
-            "maxDepth": { "type": "integer", "minimum": 0 },
-            "priority": { "type": "integer" },
-            "contextPolicy": { "type": "object" },
-            "toolPolicy": { "type": "object" },
-            "resultContract": { "type": "object" },
-            "lifecyclePolicy": { "type": "object" },
-            "deliveryPolicy": { "type": "object" },
-            "retryPolicy": { "type": "object" },
-            "timeoutPolicy": { "type": "object" },
-            "concurrencyPolicy": { "type": "object" },
-            "metadata": { "type": "object" }
-        },
-        "required": ["title", "goal"],
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskCreateToolInput>()
 }
 
 fn task_wait_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "taskIds": { "type": "array", "items": { "type": "string" } },
-            "runIds": { "type": "array", "items": { "type": "string" } },
-            "timeoutMs": { "type": "integer", "minimum": 1 },
-            "mode": { "type": "string", "enum": ["all_terminal", "any_terminal"] },
-            "returnCompleted": { "type": "boolean" },
-            "returnPending": { "type": "boolean" }
-        },
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskWaitToolInput>()
 }
 
 fn task_cancel_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "taskId": { "type": "string" },
-            "reason": { "type": "string" }
-        },
-        "required": ["taskId"],
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskCancelToolInput>()
 }
 
 fn task_id_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "taskId": { "type": "string" }
-        },
-        "required": ["taskId"],
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskIdToolInput>()
 }
 
 fn task_list_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "ownerKind": { "type": "string", "enum": ["user", "thread", "workspace", "system"] },
-            "ownerId": { "type": "string" },
-            "parentTaskId": { "type": "string" },
-            "rootTaskId": { "type": "string" },
-            "status": { "type": "string", "enum": ["draft", "scheduled", "queued", "running", "waiting", "completed", "failed", "cancelled"] },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-        },
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskListToolInput>()
 }
 
 fn task_reschedule_schema() -> JsonValue {
-    json!({
-        "type": "object",
-        "properties": {
-            "taskId": { "type": "string" },
-            "trigger": { "type": "object", "description": "TaskTriggerInput." }
-        },
-        "required": ["taskId", "trigger"],
-        "additionalProperties": false
-    })
+    tool_input_schema::<TaskRescheduleToolInput>()
+}
+
+fn task_pause_schema() -> JsonValue {
+    tool_input_schema::<TaskPauseToolInput>()
+}
+
+fn task_resume_schema() -> JsonValue {
+    tool_input_schema::<TaskResumeToolInput>()
+}
+
+fn tool_input_schema<T>() -> JsonValue
+where
+    T: JsonSchema,
+{
+    let mut schema = serde_json::to_value(schema_for!(T)).expect("tool schema should serialize");
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+    }
+    schema
 }
 
 fn decode_tool_args<T>(invocation: ToolInvocation) -> Result<T, ToolError>
 where
     T: for<'de> Deserialize<'de>,
 {
+    let tool_name = invocation.tool_name.clone();
     let arguments = match invocation.payload {
         ToolPayload::Function { arguments } => arguments,
         ToolPayload::Custom { input } => serde_json::from_str(&input).map_err(|error| {
-            ToolError::invalid_arguments(format!("failed to parse custom task tool input: {error}"))
+            ToolError::invalid_arguments(format!(
+                "failed to parse custom input for `{tool_name}`: {error}. {}",
+                task_tool_argument_hint(tool_name.as_str())
+            ))
         })?,
         other => {
             return Err(ToolError::invalid_arguments(format!(
-                "task tools require function arguments, got {}",
-                other.log_payload()
+                "`{tool_name}` requires function arguments, got {}",
+                other.log_payload(),
             )));
         }
     };
     serde_json::from_value(arguments).map_err(|error| {
-        ToolError::invalid_arguments(format!("invalid task tool arguments: {error}"))
+        ToolError::invalid_arguments(format!(
+            "invalid arguments for `{tool_name}`: {error}. {}",
+            task_tool_argument_hint(tool_name.as_str())
+        ))
     })
+}
+
+fn task_tool_argument_hint(tool_name: &str) -> &'static str {
+    match tool_name {
+        TASK_CREATE_TOOL => {
+            "Expected: {\"title\":\"...\",\"goal\":\"...\"}. For cron use \"trigger\":{\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
+        }
+        TASK_RESCHEDULE_TOOL => {
+            "Expected: {\"taskId\":\"<21-char task id>\",\"trigger\":{\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"}} or kind \"cron\" with cronExpr/timezone; do not use trigger.spec."
+        }
+        TASK_WAIT_TOOL => {
+            "Expected: {\"taskIds\":[\"<21-char task id>\"],\"timeoutMs\":180000}. Use taskIds or runIds, not a single taskId."
+        }
+        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
+        | TASK_RESUME_TOOL => "Expected: {\"taskId\":\"<21-char task id>\"}.",
+        TASK_LIST_TOOL => {
+            "Expected optional filters such as {\"status\":\"running\",\"limit\":20}."
+        }
+        _ => "Check the tool schema and use the documented camelCase fields.",
+    }
+}
+
+fn validate_id_list(values: Vec<String>, field: &str) -> Result<Vec<String>, ToolError> {
+    values
+        .into_iter()
+        .map(|value| validate_entity_id(value, field))
+        .collect()
+}
+
+fn validate_entity_id(value: String, field: &str) -> Result<String, ToolError> {
+    let value = required_tool_string(Some(value.as_str()), field)?;
+    let char_count = value.chars().count();
+    if char_count != 21 {
+        return Err(ToolError::invalid_arguments(format!(
+            "`{field}` must be a Pioneer entity id with exactly 21 characters, got {char_count}"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_optional_entity_id(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, ToolError> {
+    value
+        .map(|value| validate_entity_id(value, field))
+        .transpose()
+}
+
+fn clean_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
@@ -1440,6 +1791,7 @@ fn owner_kind_label(kind: TaskOwnerKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn prior(timed_out: bool, terminal_count: u32) -> PriorWaitCall {
         PriorWaitCall {
@@ -1467,5 +1819,140 @@ mod tests {
             0,
             3
         ));
+    }
+
+    fn task_tool_invocation(tool_name: &str, arguments: JsonValue) -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call_test".to_owned(),
+            tool_name: tool_name.to_owned(),
+            source: pioneer_tools::ToolCallSource::Model,
+            payload: ToolPayload::Function { arguments },
+            workdir: PathBuf::new(),
+            attempt_id: 0,
+            idempotency_key: None,
+            recovery: ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn task_create_schema_exposes_model_facing_trigger_shape() {
+        let schema_text = task_create_schema().to_string();
+        assert!(
+            schema_text.contains("cronExpr"),
+            "task_create schema should expose the model-facing cronExpr field"
+        );
+        assert!(
+            !schema_text.contains("TaskTriggerInput"),
+            "task_create schema must not expose the internal TaskTriggerInput wrapper"
+        );
+        assert!(
+            schema_text.contains("executorKind") && schema_text.contains("agent"),
+            "task_create schema should document the only model-facing executor kind"
+        );
+    }
+
+    #[test]
+    fn task_tool_schemas_include_model_guidance_hints() {
+        let create_schema = task_create_schema().to_string();
+        for expected in [
+            "Do not pass runtime-owned fields",
+            "do not wrap it in spec",
+            "five-field cron expression",
+            "Prefer inputText over input",
+            "only. Omit this field unless explicitly setting",
+        ] {
+            assert!(
+                create_schema.contains(expected),
+                "task_create schema should include guidance `{expected}`, got: {create_schema}"
+            );
+        }
+
+        let wait_schema = task_wait_schema().to_string();
+        for expected in [
+            "Use taskIds, not taskId",
+            "exactly 21 characters",
+            "do not use a single taskId field",
+        ] {
+            assert!(
+                wait_schema.contains(expected),
+                "task_wait schema should include guidance `{expected}`, got: {wait_schema}"
+            );
+        }
+
+        let reschedule_schema = task_reschedule_schema().to_string();
+        assert!(
+            reschedule_schema.contains("do not wrap it in spec"),
+            "task_reschedule schema should steer the model away from trigger.spec, got: {reschedule_schema}"
+        );
+    }
+
+    #[test]
+    fn task_create_tool_input_maps_flat_cron_trigger_to_protocol_trigger() {
+        let input: TaskCreateToolInput = serde_json::from_value(json!({
+            "title": "Daily Moscow weather",
+            "goal": "Send the daily forecast at 07:00 Moscow time",
+            "trigger": {
+                "kind": "cron",
+                "cronExpr": "0 7 * * *",
+                "timezone": "Europe/Moscow"
+            }
+        }))
+        .expect("model-facing task_create input should decode");
+        let trigger = input
+            .trigger
+            .expect("trigger should exist")
+            .into_trigger_input()
+            .expect("trigger should map to protocol");
+        assert_eq!(
+            trigger.spec,
+            TaskTriggerSpec::Cron {
+                cron_expr: "0 7 * * *".to_owned(),
+                timezone: "Europe/Moscow".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn task_create_decode_error_points_model_away_from_internal_trigger_spec() {
+        let error = decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(
+            TASK_CREATE_TOOL,
+            json!({
+                "title": "Daily Moscow weather",
+                "goal": "Send the daily forecast at 07:00 Moscow time",
+                "trigger": {
+                    "spec": {
+                        "kind": "cron",
+                        "cronExpr": "0 7 * * *",
+                        "timezone": "Europe/Moscow"
+                    }
+                }
+            }),
+        ))
+        .expect_err("internal trigger spec wrapper should be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("do not use trigger.spec"),
+            "decode error should include the model-facing trigger contract, got: {message}"
+        );
+    }
+
+    #[test]
+    fn task_wait_rejects_missing_targets_and_truncated_ids() {
+        let empty: TaskWaitToolInput =
+            serde_json::from_value(json!({})).expect("empty wait input should decode");
+        let error = empty
+            .into_params()
+            .expect_err("wait requires at least one id");
+        assert!(error.to_string().contains("taskIds"));
+
+        let truncated: TaskWaitToolInput = serde_json::from_value(json!({
+            "taskIds": ["tas"]
+        }))
+        .expect("truncated id wait input should decode");
+        let error = truncated
+            .into_params()
+            .expect_err("truncated task id should be rejected");
+        assert!(error.to_string().contains("exactly 21 characters"));
     }
 }

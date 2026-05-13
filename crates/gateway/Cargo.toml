@@ -42,6 +42,7 @@ rand.workspace = true
 reqwest.workspace = true
 markdown.workspace = true
 chrono.workspace = true
+schemars.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tiktoken-rs.workspace = true
 flate2.workspace = true
@@ -51,3 +52,4 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-util.workspace = true
