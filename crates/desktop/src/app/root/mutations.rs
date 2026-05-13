@@ -13,12 +13,16 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
+        let changed = self.active_thread_id != thread_id;
         self.active_thread_id = thread_id;
+        if changed {
+            self.reset_composer_model_selection_for_active_thread();
+        }
     }
 
     pub(in crate::app) fn clear_active_thread_if_matches(&mut self, thread_id: &str) -> bool {
         if self.active_thread_id.as_deref() == Some(thread_id) {
-            self.active_thread_id = None;
+            self.set_active_thread_id(None);
             return true;
         }
         false
@@ -108,7 +112,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         self.remember_active_thread_draft(cx);
-        self.active_thread_id = Some(thread_id.clone());
+        self.set_active_thread_id(Some(thread_id.clone()));
         self.restore_thread_draft(thread_id.as_str(), window, cx);
     }
 
@@ -258,6 +262,9 @@ impl PioneerDesktop {
         self.composer_attachments.clear();
         self.composer_upload_in_progress = false;
         self.composer_upload_error = None;
+        self.composer_selected_provider = None;
+        self.composer_selected_model = None;
+        self.composer_model_selection_manually_selected = false;
         self.thread_folders.clear();
         self.thread_placements.clear();
         self.thread_agents_doc_summaries.clear();

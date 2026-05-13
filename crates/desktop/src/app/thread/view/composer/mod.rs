@@ -19,6 +19,10 @@ impl PioneerDesktop {
             return false;
         }
 
+        if !self.has_complete_composer_model_selection() {
+            return false;
+        }
+
         let Some(conversation) = self.active_thread_conversation() else {
             return false;
         };

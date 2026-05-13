@@ -126,6 +126,7 @@ impl PioneerDesktop {
                             } else if let Some(active_thread_id) = view.active_thread_id.clone() {
                                 view.ensure_thread_history_loaded(active_thread_id.as_str(), cx);
                             }
+                            view.sync_composer_model_selection_for_active_thread();
                         }
                         Err(error) => {
                             warn!(
@@ -282,6 +283,7 @@ impl PioneerDesktop {
                             }
 
                             view.mark_thread_history_loaded(thread_id.as_str(), true);
+                            view.sync_composer_model_selection_for_active_thread();
                         }
                         Err(error) => {
                             warn!(

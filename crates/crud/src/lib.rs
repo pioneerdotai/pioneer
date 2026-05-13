@@ -4076,10 +4076,24 @@ impl CrudStore {
     ) -> Result<Vec<Thread>> {
         let models =
             thread::list_threads_by_workspace(&self.connection, workspace_id, limit).await?;
-        Ok(models
-            .into_iter()
-            .filter_map(thread_from_db_model)
-            .collect())
+        let mut threads = Vec::with_capacity(models.len());
+
+        for model in models {
+            let Some(mut thread) = thread_from_db_model(model) else {
+                continue;
+            };
+
+            if let Some(turn_model) =
+                turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
+                && let Some(turn) = thread_snapshot_turn_from_db_model(turn_model)
+            {
+                thread.turns.push(turn);
+            }
+
+            threads.push(thread);
+        }
+
+        Ok(threads)
     }
 
     pub async fn list_thread_folders(&self, workspace_id: &str) -> Result<Vec<ThreadFolder>> {
@@ -6404,6 +6418,17 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
         agent_nickname: model.agent_nickname,
         agent_role: model.agent_role,
         turns: Vec::new(),
+    })
+}
+
+fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Option<Turn> {
+    let status = turn_status_from_db(model.status.as_str())?;
+
+    Some(Turn {
+        id: model.id,
+        status,
+        error: model.error,
+        prompt_manifest: None,
     })
 }
 
@@ -9338,6 +9363,81 @@ mod tests {
             .expect("must query persisted turn")
             .expect("persisted turn should exist");
         assert_eq!(persisted_turn.prompt_manifest_json, "{}");
+    }
+
+    #[tokio::test]
+    async fn list_threads_for_workspace_includes_latest_turn_marker() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let workspace_id = "ws_000000000000000001";
+        let thread_id = "thr_000000000000000003";
+        let first_timestamp = 1_700_000_000;
+        let second_timestamp = 1_700_000_100;
+
+        let first_thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            created_at: first_timestamp,
+            updated_at: first_timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let first_turn = Turn {
+            id: "turn_000000000000000003".to_owned(),
+            status: TurnStatus::InProgress,
+            error: None,
+            prompt_manifest: None,
+        };
+        store
+            .materialize_turn_start(&first_thread, SandboxMode::FullAccess, &first_turn, &[])
+            .await
+            .expect("first turn start should persist");
+
+        let second_thread = Thread {
+            model: "o3".to_owned(),
+            model_provider: "custom-provider".to_owned(),
+            updated_at: second_timestamp,
+            ..first_thread
+        };
+        let second_turn = Turn {
+            id: "turn_000000000000000004".to_owned(),
+            status: TurnStatus::InProgress,
+            error: None,
+            prompt_manifest: None,
+        };
+        store
+            .materialize_turn_start(&second_thread, SandboxMode::FullAccess, &second_turn, &[])
+            .await
+            .expect("second turn start should persist");
+
+        let threads = store
+            .list_threads_for_workspace(workspace_id, 10)
+            .await
+            .expect("list threads should succeed");
+        let listed = threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .expect("thread should be listed");
+
+        assert_eq!(listed.model, "o3");
+        assert_eq!(listed.model_provider, "custom-provider");
+        assert_eq!(listed.turns.len(), 1);
+        assert_eq!(listed.turns[0].id, second_turn.id);
     }
 
     #[tokio::test]

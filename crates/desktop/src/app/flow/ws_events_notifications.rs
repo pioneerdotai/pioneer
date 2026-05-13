@@ -381,6 +381,7 @@ impl PioneerDesktop {
         self.set_preferred_workspace_id(Some(workspace_id.clone()));
         self.persist_active_gateway_workspace_id(workspace_id);
         self.queue_thread_list_refresh();
+        self.sync_composer_model_selection_for_active_thread();
     }
 
     fn apply_turn_started_notification(
@@ -388,10 +389,8 @@ impl PioneerDesktop {
         notification: pioneer_protocol::TurnStartedNotification,
     ) {
         let thread_id = notification.thread_id.clone();
-        let promoted_from_draft = self.promote_thread_from_draft(thread_id.as_str());
-        if promoted_from_draft {
-            self.queue_thread_list_refresh();
-        }
+        self.promote_thread_from_draft(thread_id.as_str());
+        self.queue_thread_list_refresh();
         if let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str()) {
             if let Some(thread) = coordinator.thread_mut() {
                 thread.status = pioneer_protocol::ThreadStatus::Active;
@@ -403,6 +402,7 @@ impl PioneerDesktop {
                 turn: notification.turn,
             });
         self.reset_thread_resume_state(thread_id.as_str());
+        self.sync_composer_model_selection_for_active_thread();
     }
 
     fn apply_thread_updated_notification(
@@ -414,6 +414,7 @@ impl PioneerDesktop {
         let workspace_id = thread.workspace_id.clone();
         self.upsert_thread_snapshot(thread);
         self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
+        self.sync_composer_model_selection_for_active_thread();
     }
 
     fn apply_turn_completed_notification(

@@ -187,6 +187,12 @@ impl PioneerDesktop {
 
                         if let Some(coordinator) = view.thread_coordinator_mut(thread_id.as_str()) {
                             if let Some(thread) = coordinator.thread_mut() {
+                                if let (Some(model), Some(provider)) =
+                                    (selected_model.as_deref(), selected_provider.as_deref())
+                                {
+                                    thread.model = model.to_owned();
+                                    thread.model_provider = provider.to_owned();
+                                }
                                 if thread.preview.trim().is_empty() {
                                     thread.preview = prepared.user_text.clone();
                                 }

@@ -1,3 +1,4 @@
+mod model_selection;
 mod mutations;
 mod queries;
 mod state;
@@ -372,6 +373,7 @@ pub struct PioneerDesktop {
     pub(super) composer_turn_mode: ThreadMode,
     pub(super) composer_selected_provider: Option<String>,
     pub(super) composer_selected_model: Option<String>,
+    pub(super) composer_model_selection_manually_selected: bool,
     pub(super) main_content_view: MainContentView,
     pub(super) provider_configured_names: HashSet<String>,
     pub(super) provider_filter: ProviderFilter,

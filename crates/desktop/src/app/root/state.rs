@@ -83,6 +83,7 @@ impl PioneerDesktop {
             composer_turn_mode: ThreadMode::Agent,
             composer_selected_provider: None,
             composer_selected_model: None,
+            composer_model_selection_manually_selected: false,
             main_content_view: MainContentView::Threads,
             provider_configured_names: HashSet::new(),
             provider_filter: ProviderFilter::All,

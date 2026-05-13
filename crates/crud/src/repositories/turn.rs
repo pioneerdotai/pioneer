@@ -283,6 +283,19 @@ pub async fn find_terminal_turns_for_thread<C: ConnectionTrait>(
     Ok(rows)
 }
 
+pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<turn::Model>> {
+    turn::Entity::find()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .order_by_desc(turn::Column::CreatedAt)
+        .order_by_desc(turn::Column::Id)
+        .one(db)
+        .await
+        .context("failed to query latest turn for thread")
+}
+
 pub async fn find_oldest_turn_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,

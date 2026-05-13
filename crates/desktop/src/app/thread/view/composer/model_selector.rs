@@ -378,8 +378,7 @@ impl PioneerDesktop {
             let provider = state.selected_provider.borrow().clone();
             let model = state.selected_model.borrow().clone();
             let _ = state.desktop_entity.update(cx, |view, cx| {
-                view.composer_selected_provider = provider;
-                view.composer_selected_model = model;
+                view.set_composer_model_selection_from_user(provider, model);
                 cx.notify();
             });
             true
