@@ -1,5 +1,6 @@
 use crate::message::MessageProcessor;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use pioneer_crud::workspace_agent_memory_scope_key;
 use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
@@ -16,7 +17,7 @@ use pioneer_protocol::{
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
     MemorySensitivity, MemorySourceKind, MemoryStatus,
 };
-use pioneer_provider::{ChatMessage, ChatRequest, Provider};
+use pioneer_provider::{ChatMessage, ChatRequest, Provider, StreamChunk};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -163,34 +164,62 @@ async fn request_post_turn_extractor_json(
     model: &str,
     prompt: String,
 ) -> Result<String, String> {
-    match provider
-        .chat(post_turn_extractor_chat_request(
-            model,
-            prompt.clone(),
-            Some(0.0),
-        ))
-        .await
-    {
-        Ok(response) => Ok(response.text),
+    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), Some(0.0)).await {
+        Ok(json) => Ok(json),
         Err(primary_error) => {
-            let primary_error = format!("{primary_error:#}");
             if !should_retry_post_turn_extractor_without_optional_params(primary_error.as_str()) {
                 return Err(format!(
                     "memory post-turn extractor request failed: {primary_error}"
                 ));
             }
 
-            let fallback = provider
-                .chat(post_turn_extractor_chat_request(model, prompt, None))
+            request_post_turn_extractor_json_once(provider, model, prompt, None)
                 .await
                 .map_err(|fallback_error| {
                     format!(
-                        "memory post-turn extractor request failed: {primary_error}; compatibility fallback failed: {fallback_error:#}"
+                        "memory post-turn extractor request failed: {primary_error}; compatibility fallback failed: {fallback_error}"
                     )
-                })?;
-            Ok(fallback.text)
+                })
         }
     }
+}
+
+async fn request_post_turn_extractor_json_once(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+    temperature: Option<f32>,
+) -> Result<String, String> {
+    let request = post_turn_extractor_chat_request(model, prompt, temperature);
+    if provider.capabilities().streaming {
+        let stream = provider
+            .stream_chat(request)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        return collect_post_turn_extractor_stream(stream).await;
+    }
+
+    provider
+        .chat(request)
+        .await
+        .map(|response| response.text)
+        .map_err(|error| format!("{error:#}"))
+}
+
+async fn collect_post_turn_extractor_stream(
+    mut stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+) -> Result<String, String> {
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("{error:#}"))?;
+        if !chunk.delta.is_empty() {
+            text.push_str(chunk.delta.as_str());
+        }
+        if chunk.is_final {
+            break;
+        }
+    }
+    Ok(text)
 }
 
 fn post_turn_extractor_chat_request(
@@ -1070,7 +1099,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use futures_util::stream::{self, BoxStream};
-    use pioneer_provider::{ChatResponse, StreamChunk};
+    use pioneer_provider::{ChatResponse, ProviderCapabilities, StreamChunk};
     use std::sync::{Arc, Mutex};
 
     struct CompatibilityFallbackProvider {
@@ -1095,7 +1124,27 @@ mod tests {
             "compatibility-fallback"
         }
 
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("request lock poisoned")
+                .push(request);
+            Err(anyhow!(
+                "chat path should not be used for streaming provider"
+            ))
+        }
+
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
             self.requests
                 .lock()
                 .expect("request lock poisoned")
@@ -1107,19 +1156,11 @@ mod tests {
                 ));
             }
 
-            Ok(ChatResponse {
-                text: r#"{"facts":[]}"#.to_owned(),
-                usage: None,
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-            })
-        }
-
-        async fn stream_chat(
-            &self,
-            _request: ChatRequest,
-        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-            Ok(Box::pin(stream::empty()))
+            Ok(Box::pin(stream::iter(vec![
+                Ok(StreamChunk::delta(r#"{"facts":"#.to_owned())),
+                Ok(StreamChunk::delta(r#"[]}"#.to_owned())),
+                Ok(StreamChunk::final_chunk()),
+            ])))
         }
     }
 

@@ -17,6 +17,8 @@ fn phase_19_strict_json_parser_accepts_typed_semantic_fact() {
     assert_eq!(fact.semantic.attribute, MemoryAttribute::Name);
     assert_eq!(fact.content, "Имя пользователя: Александр");
     assert_eq!(fact.value.as_deref(), Some("Александр"));
+    assert!(fact.confidence.expect("computed confidence") > 0.95);
+    assert!(fact.importance.expect("computed importance") > 0.90);
     assert_eq!(
         fact.evidence.quote_or_span.as_deref(),
         Some("Меня зовут Александр")
@@ -24,7 +26,164 @@ fn phase_19_strict_json_parser_accepts_typed_semantic_fact() {
 }
 
 #[test]
-fn phase_19_strict_json_parser_rejects_unknown_enums_and_keys() {
+fn post_turn_parser_computes_scores_instead_of_trusting_llm_numbers() {
+    let raw = serde_json::json!({
+        "facts": [{
+            "semantic": {
+                "intent": "explicit_store",
+                "explicitness": "explicit",
+                "category": "identity",
+                "subject": "current_user",
+                "attribute": "name",
+                "scope_hint": "user_global",
+                "durability": "long_lived",
+                "sensitivity": "personal",
+                "certainty": "high"
+            },
+            "content": "User's name is Александр.",
+            "value": "Александр",
+            "evidence": {
+                "source_ref": "turn.post_turn:user",
+                "quote_or_span": "Меня зовут Александр.",
+                "extractor_reason": "User explicitly stated their name."
+            },
+            "confidence": 0.0,
+            "importance": 0.0
+        }]
+    });
+
+    let parsed = parse_memory_post_turn_extractor_json(
+        raw.to_string().as_str(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .expect("valid extractor JSON parses");
+
+    assert_eq!(parsed.facts.len(), 1);
+    let fact = &parsed.facts[0];
+    assert!(fact.confidence.expect("computed confidence") > 0.95);
+    assert!(fact.importance.expect("computed importance") > 0.90);
+}
+
+#[test]
+fn post_turn_parser_forces_personal_sensitivity_for_user_identity() {
+    let raw = serde_json::json!({
+        "facts": [{
+            "semantic": {
+                "intent": "explicit_store",
+                "explicitness": "explicit",
+                "category": "identity",
+                "subject": "current_user",
+                "attribute": "name",
+                "scope_hint": "user_global",
+                "durability": "long_lived",
+                "sensitivity": "none",
+                "certainty": "high"
+            },
+            "content": "Имя пользователя: Александр.",
+            "value": "Александр",
+            "evidence": {
+                "source_ref": "turn.post_turn:user",
+                "quote_or_span": "Меня зовут Александр.",
+                "extractor_reason": "User explicitly stated their name."
+            }
+        }]
+    });
+
+    let parsed = parse_memory_post_turn_extractor_json(
+        raw.to_string().as_str(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .expect("valid extractor JSON parses");
+
+    assert_eq!(parsed.facts.len(), 1);
+    assert_eq!(
+        parsed.facts[0].semantic.sensitivity,
+        MemorySensitivityHint::Personal
+    );
+
+    let params = memory_semantic_write_params_from_extracted_fact(
+        0,
+        parsed.facts.into_iter().next().expect("fact exists"),
+        &test_memory_turn_context(),
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryPostTurnExtractorConfig::default(),
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .expect("semantic write params are produced");
+    assert_eq!(params.semantic.sensitivity, MemorySensitivityHint::Personal);
+}
+
+#[test]
+fn post_turn_parser_rejects_assistant_self_description_from_assistant_text() {
+    let raw = serde_json::json!({
+        "facts": [
+            {
+                "semantic": {
+                    "intent": "explicit_store",
+                    "explicitness": "explicit",
+                    "category": "identity",
+                    "subject": "current_user",
+                    "attribute": "name",
+                    "scope_hint": "user_global",
+                    "durability": "long_lived",
+                    "sensitivity": "personal",
+                    "certainty": "high"
+                },
+                "content": "User's name is Александр.",
+                "value": "Александр",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "Меня зовут Александр.",
+                    "extractor_reason": "User explicitly stated their name."
+                },
+                "confidence": 0.0,
+                "importance": 0.0
+            },
+            {
+                "semantic": {
+                    "intent": "explicit_store",
+                    "explicitness": "explicit",
+                    "category": "identity",
+                    "subject": "current_agent",
+                    "attribute": "name",
+                    "scope_hint": "agent_global",
+                    "durability": "long_lived",
+                    "sensitivity": "none",
+                    "certainty": "high"
+                },
+                "content": "Agent's name is Pioneer.",
+                "value": "Pioneer",
+                "evidence": {
+                    "source_ref": "turn.post_turn:assistant",
+                    "quote_or_span": "Я Pioneer.",
+                    "extractor_reason": "Assistant introduced itself."
+                },
+                "confidence": 1.0,
+                "importance": 1.0
+            }
+        ]
+    });
+
+    let parsed = parse_memory_post_turn_extractor_json(
+        raw.to_string().as_str(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .expect("valid extractor JSON parses");
+
+    assert_eq!(parsed.raw_fact_count, 2);
+    assert_eq!(parsed.facts.len(), 1);
+    assert_eq!(parsed.facts[0].semantic.subject, MemorySubject::CurrentUser);
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.contains("assistant_self_description") })
+    );
+}
+
+#[test]
+fn phase_19_parser_rejects_unknown_enums_and_ignores_unknown_keys() {
     let unknown_enum = r#"{"facts":[{"semantic":{"intent":"write_now","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
     assert!(
         parse_memory_post_turn_extractor_json(
@@ -34,14 +193,16 @@ fn phase_19_strict_json_parser_rejects_unknown_enums_and_keys() {
         .is_err()
     );
 
-    let canonical_key = r#"{"facts":[{"canonical_key":"user/global:identity:self:name","semantic":{"intent":"explicit_store","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
-    assert!(
-        parse_memory_post_turn_extractor_json(
-            canonical_key,
-            &MemoryPostTurnExtractorConfig::default(),
-        )
-        .is_err()
-    );
+    let unknown_keys = r#"{"unexpected_top_level":"ignored","facts":[{"canonical_key":"user/global:identity:self:name","status":"active","confidence":0.0,"importance":0.0,"semantic":{"intent":"explicit_store","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
+    let parsed = parse_memory_post_turn_extractor_json(
+        unknown_keys,
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .expect("unknown keys are ignored at the LLM boundary");
+    assert_eq!(parsed.raw_fact_count, 1);
+    assert_eq!(parsed.facts.len(), 1);
+    assert_eq!(parsed.facts[0].semantic.category, MemoryCategory::Identity);
+    assert!(parsed.facts[0].confidence.expect("computed confidence") > 0.95);
 }
 
 #[test]
@@ -111,6 +272,8 @@ async fn phase_19_post_turn_extractor_writes_semantic_fact_through_provider() {
     assert_eq!(params.semantic.intent, MemoryIntent::ExplicitStore);
     assert_eq!(params.scope.kind, MemoryScopeKind::User);
     assert_eq!(params.scope.key, MEMORY_DEFAULT_USER_SCOPE_KEY);
+    assert!(params.confidence.expect("computed confidence") > 0.95);
+    assert!(params.importance.expect("computed importance") > 0.90);
     assert!(
         params
             .evidence

@@ -86,7 +86,7 @@ impl Default for MemoryPostTurnExtractorConfig {
             provider_enabled: true,
             proactive_writes_enabled: true,
             await_policy: HookAwaitPolicy::FireAndRecord,
-            timeout_ms: 1_500,
+            timeout_ms: 180_000,
             max_facts_per_turn: 8,
             max_input_chars: 8_000,
             max_manifest_items: 24,

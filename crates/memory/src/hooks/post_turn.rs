@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_protocol::{MemoryAttribute, MemoryExtractorCertainty, MemorySubject};
 
 pub(super) fn memory_post_turn_extractor_context_from_turn(
     context: &MemoryTurnContext,
@@ -139,24 +140,18 @@ pub(super) struct MemoryPostTurnExtractedFact {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct MemoryPostTurnExtractorJson {
     #[serde(default)]
     pub(super) facts: Vec<MemoryPostTurnExtractedFactJson>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct MemoryPostTurnExtractedFactJson {
     semantic: MemorySemanticFields,
     content: String,
     #[serde(default)]
     value: Option<String>,
     evidence: MemoryWriteEvidence,
-    #[serde(default)]
-    confidence: Option<f32>,
-    #[serde(default)]
-    importance: Option<f32>,
 }
 
 pub(super) fn parse_memory_post_turn_extractor_json(
@@ -219,6 +214,17 @@ pub(super) fn validate_memory_post_turn_fact(
     ) {
         return Err("secret_or_regulated");
     }
+    if fact.semantic.subject == MemorySubject::CurrentAgent
+        && fact
+            .evidence
+            .source_ref
+            .as_deref()
+            .map(is_assistant_post_turn_source_ref)
+            .unwrap_or(false)
+    {
+        return Err("assistant_self_description");
+    }
+    let semantic = normalized_post_turn_fact_semantic(fact.semantic);
     let Some(content) = bounded_nonempty_text(fact.content.as_str(), config.max_fact_content_chars)
     else {
         return Err("empty_content");
@@ -239,16 +245,10 @@ pub(super) fn validate_memory_post_turn_fact(
         .extractor_reason
         .as_deref()
         .and_then(|reason| bounded_nonempty_text(reason, 240));
-    let confidence = fact
-        .confidence
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0));
-    let importance = fact
-        .importance
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0));
+    let confidence = Some(computed_post_turn_fact_confidence(&semantic));
+    let importance = Some(computed_post_turn_fact_importance(&semantic));
     Ok(MemoryPostTurnExtractedFact {
-        semantic: fact.semantic,
+        semantic,
         content,
         value: fact
             .value
@@ -258,6 +258,109 @@ pub(super) fn validate_memory_post_turn_fact(
         confidence,
         importance,
     })
+}
+
+fn normalized_post_turn_fact_semantic(mut semantic: MemorySemanticFields) -> MemorySemanticFields {
+    if should_force_personal_sensitivity(&semantic) {
+        semantic.sensitivity = MemorySensitivityHint::Personal;
+    }
+    semantic
+}
+
+fn should_force_personal_sensitivity(semantic: &MemorySemanticFields) -> bool {
+    semantic.subject == MemorySubject::CurrentUser
+        && semantic.category == MemoryCategory::Identity
+        && matches!(
+            semantic.attribute,
+            MemoryAttribute::Name | MemoryAttribute::Birthday
+        )
+}
+
+fn computed_post_turn_fact_confidence(semantic: &MemorySemanticFields) -> f32 {
+    let certainty_score: f32 = match semantic.certainty {
+        MemoryExtractorCertainty::High => 0.82,
+        MemoryExtractorCertainty::Medium => 0.62,
+        MemoryExtractorCertainty::Low => 0.35,
+    };
+    let explicitness_score: f32 = match semantic.explicitness {
+        MemoryExplicitness::Explicit => 0.08,
+        MemoryExplicitness::Implicit => 0.02,
+        MemoryExplicitness::Unclear => -0.10,
+        MemoryExplicitness::None => -0.25,
+    };
+    let intent_score: f32 = match semantic.intent {
+        MemoryIntent::ExplicitStore => 0.05,
+        MemoryIntent::ImplicitCandidate => 0.0,
+        MemoryIntent::ExplicitForget | MemoryIntent::ExplicitNoMemory | MemoryIntent::None => -0.25,
+    };
+    let durability_score: f32 = match semantic.durability {
+        MemoryDurability::LongLived | MemoryDurability::ProjectLifetime => 0.03,
+        MemoryDurability::Unknown => -0.08,
+        MemoryDurability::SessionOnly | MemoryDurability::Transient => -0.25,
+    };
+    let scope_score: f32 = match semantic.scope_hint {
+        MemoryScopeHint::Unknown => -0.08,
+        MemoryScopeHint::UserGlobal
+        | MemoryScopeHint::UserWorkspace
+        | MemoryScopeHint::AgentGlobal
+        | MemoryScopeHint::AgentWorkspace
+        | MemoryScopeHint::ProjectWorkspace => 0.02,
+    };
+    let sensitivity_score: f32 = match semantic.sensitivity {
+        MemorySensitivityHint::None | MemorySensitivityHint::Low => 0.02,
+        MemorySensitivityHint::Personal => -0.03,
+        MemorySensitivityHint::Unknown => -0.05,
+        MemorySensitivityHint::Secret | MemorySensitivityHint::Regulated => -0.25,
+    };
+
+    (certainty_score
+        + explicitness_score
+        + intent_score
+        + durability_score
+        + scope_score
+        + sensitivity_score)
+        .clamp(0.0_f32, 1.0_f32)
+}
+
+fn computed_post_turn_fact_importance(semantic: &MemorySemanticFields) -> f32 {
+    let category_score: f32 = match semantic.category {
+        MemoryCategory::Identity | MemoryCategory::Biography | MemoryCategory::Relationship => 0.72,
+        MemoryCategory::Preference
+        | MemoryCategory::RecurringInstruction
+        | MemoryCategory::ProjectPolicy
+        | MemoryCategory::ProjectDecision
+        | MemoryCategory::Constraint
+        | MemoryCategory::CommunicationStyle => 0.68,
+        MemoryCategory::Procedure => 0.62,
+        MemoryCategory::ProjectFact | MemoryCategory::Custom => 0.56,
+        MemoryCategory::Todo => 0.48,
+    };
+    let attribute_score: f32 = match semantic.attribute {
+        MemoryAttribute::Name | MemoryAttribute::Birthday | MemoryAttribute::PreferredLanguage => {
+            0.10
+        }
+        MemoryAttribute::CommunicationStyle
+        | MemoryAttribute::MigrationPolicy
+        | MemoryAttribute::ReviewStyle
+        | MemoryAttribute::PhaseNaming => 0.06,
+        MemoryAttribute::Custom => 0.0,
+    };
+    let durability_score: f32 = match semantic.durability {
+        MemoryDurability::LongLived | MemoryDurability::ProjectLifetime => 0.06,
+        MemoryDurability::Unknown => -0.08,
+        MemoryDurability::SessionOnly | MemoryDurability::Transient => -0.25,
+    };
+    let certainty_score: f32 = match semantic.certainty {
+        MemoryExtractorCertainty::High => 0.04,
+        MemoryExtractorCertainty::Medium => 0.0,
+        MemoryExtractorCertainty::Low => -0.18,
+    };
+
+    (category_score + attribute_score + durability_score + certainty_score).clamp(0.0_f32, 1.0_f32)
+}
+
+fn is_assistant_post_turn_source_ref(source_ref: &str) -> bool {
+    source_ref.trim().starts_with("turn.post_turn:assistant")
 }
 
 pub(super) fn memory_semantic_write_params_from_extracted_fact(

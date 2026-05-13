@@ -445,6 +445,7 @@ fn phase_21_post_turn_extractor_subscription_is_retryable_with_idempotency_proof
     assert_eq!(subscription.retry_policy.backoff, HookRetryBackoff::Fixed);
     assert_eq!(subscription.retry_policy.initial_delay_ms, Some(1_000));
     assert!(subscription.retry_policy.idempotency_required);
+    assert_eq!(subscription.execution_policy.timeout_ms, Some(180_000));
 
     let handler = runtime
         .handlers()

@@ -18,10 +18,16 @@ pub fn render_memory_post_turn_extractor_prompt(
             "You are not the main assistant. Do not answer the user. Do not give advice. Do not call tools.\n",
             "Inspect only the provided completed turn and memory manifest.\n",
             "Extract only durable semantic facts that are useful for future turns.\n",
+            "Prefer facts stated by the user. Use assistant text only as supporting context for user/project facts.\n",
+            "Do not extract the assistant's own self-description, identity, model/company, tone, or capabilities from assistant text unless the user explicitly asked to store that fact.\n",
+            "Write fact content and value in the primary language of the source user text. If the turn is multilingual, use the language of the evidence quote for that fact.\n",
+            "Do not translate names, quoted phrases, code identifiers, file paths, product names, technical terms, or user-provided labels.\n",
+            "Keep evidence.quote_or_span as an exact source quote.\n",
             "Do not extract one-off commands, temporary debugging state, raw logs, guesses, secrets, passwords, API keys, tokens, credentials, or transient plans.\n",
             "Do not extract sensitive regulated health, legal, or financial facts unless the user explicitly asked to remember them.\n",
             "Do not generate canonical memory keys. Canonical keys are owned by the memory service.\n",
             "Do not decide whether a fact becomes active, pending, or rejected. Final write state is owned by the memory service.\n",
+            "Set semantic fields carefully. The memory service computes final confidence and importance from semantic fields; numeric confidence and importance are non-authoritative and may be null.\n",
             "Return strict JSON only. No markdown. No prose outside JSON.\n",
             "Return at most {max_facts} facts.\n\n",
             "Allowed semantic.intent values for facts: explicit_store, implicit_candidate.\n",
@@ -34,7 +40,7 @@ pub fn render_memory_post_turn_extractor_prompt(
             "Allowed semantic.sensitivity values: none, low, personal, regulated, secret, unknown.\n",
             "Allowed semantic.certainty values: high, medium, low.\n\n",
             "JSON schema shape:\n",
-            "{{\"facts\":[{{\"semantic\":{{\"intent\":\"explicit_store|implicit_candidate\",\"explicitness\":\"explicit|implicit|unclear\",\"category\":\"identity|preference|biography|relationship|recurring_instruction|project_policy|project_fact|project_decision|procedure|todo|constraint|communication_style|custom\",\"subject\":\"current_user|current_agent|workspace|project|person|organization|artifact|custom\",\"attribute\":\"name|birthday|preferred_language|communication_style|migration_policy|review_style|phase_naming|custom\",\"subject_key\":null,\"custom_subject\":null,\"custom_attribute\":null,\"scope_hint\":\"user_global|user_workspace|agent_global|agent_workspace|project_workspace|unknown\",\"durability\":\"long_lived|project_lifetime|session_only|transient|unknown\",\"sensitivity\":\"none|low|personal|regulated|secret|unknown\",\"certainty\":\"high|medium|low\"}},\"content\":\"compact normalized memory sentence\",\"value\":\"optional normalized value or null\",\"evidence\":{{\"source_thread_id\":null,\"source_turn_id\":null,\"source_item_id\":null,\"source_ref\":\"turn.post_turn:user|turn.post_turn:assistant|turn.post_turn:tool\",\"quote_or_span\":\"short exact source quote\",\"extractor_reason\":\"short reason\"}},\"confidence\":0.0,\"importance\":0.0}}]}}\n\n",
+            "{{\"facts\":[{{\"semantic\":{{\"intent\":\"explicit_store|implicit_candidate\",\"explicitness\":\"explicit|implicit|unclear\",\"category\":\"identity|preference|biography|relationship|recurring_instruction|project_policy|project_fact|project_decision|procedure|todo|constraint|communication_style|custom\",\"subject\":\"current_user|current_agent|workspace|project|person|organization|artifact|custom\",\"attribute\":\"name|birthday|preferred_language|communication_style|migration_policy|review_style|phase_naming|custom\",\"subject_key\":null,\"custom_subject\":null,\"custom_attribute\":null,\"scope_hint\":\"user_global|user_workspace|agent_global|agent_workspace|project_workspace|unknown\",\"durability\":\"long_lived|project_lifetime|session_only|transient|unknown\",\"sensitivity\":\"none|low|personal|regulated|secret|unknown\",\"certainty\":\"high|medium|low\"}},\"content\":\"compact normalized memory sentence\",\"value\":\"optional normalized value or null\",\"evidence\":{{\"source_thread_id\":null,\"source_turn_id\":null,\"source_item_id\":null,\"source_ref\":\"turn.post_turn:user|turn.post_turn:assistant|turn.post_turn:tool\",\"quote_or_span\":\"short exact source quote\",\"extractor_reason\":\"short reason\"}},\"confidence\":null,\"importance\":null}}]}}\n\n",
             "Memory manifest:\n{memory_manifest}\n\n",
             "User text:\n{user_text}\n\n",
             "Assistant text:\n{assistant_text}\n\n",
@@ -80,6 +86,10 @@ mod tests {
         assert!(prompt.contains("Return strict JSON only"));
         assert!(prompt.contains("Do not generate canonical memory keys"));
         assert!(prompt.contains("Final write state is owned by the memory service"));
+        assert!(prompt.contains("Prefer facts stated by the user"));
+        assert!(prompt.contains("primary language of the source user text"));
+        assert!(prompt.contains("Keep evidence.quote_or_span as an exact source quote"));
+        assert!(prompt.contains("numeric confidence and importance are non-authoritative"));
         assert!(prompt.contains("explicit_store"));
         assert!(prompt.contains("implicit_candidate"));
         assert!(!prompt.contains("Available memory tools"));
