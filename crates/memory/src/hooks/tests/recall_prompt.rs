@@ -256,7 +256,7 @@ async fn phase_15_active_memory_hook_uses_valid_strict_json_query_hints() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_respects_policy_config_and_trivial_skips() {
+async fn phase_15_active_memory_hook_respects_policy_and_config_skips() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -305,16 +305,44 @@ async fn phase_15_active_memory_hook_respects_policy_config_and_trivial_skips() 
     .expect("deterministic-only config is best-effort");
     assert!(deterministic_only.contributions.is_empty());
 
-    let trivial = hook
+    assert_eq!(provider.recall_call_count(), 0);
+}
+
+#[tokio::test]
+async fn phase_15_active_memory_hook_runs_bounded_generic_recall_for_short_turns() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: None,
+        config: MemoryActiveRecallConfig {
+            max_queries: 1,
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
         .execute(test_active_prompt_context_hook_request(
             memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
             HookPromptContextSet::default(),
-            "what time?",
+            "как меня зовут?",
         ))
         .await
-        .expect("trivial turn is best-effort");
-    assert!(trivial.contributions.is_empty());
-    assert_eq!(provider.recall_call_count(), 0);
+        .expect("active recall hook executes");
+
+    assert_eq!(provider.recall_call_count(), 1);
+    let request = provider
+        .recall_requests()
+        .into_iter()
+        .next()
+        .expect("active recall request recorded");
+    assert_eq!(request.query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
+    assert!(request.categories.is_empty());
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "memory.active_recall.decision"
+            && diagnostic.message.as_str().contains("status=run")
+    }));
 }
 
 #[tokio::test]

@@ -1862,6 +1862,44 @@ async fn recall_for_prompt_uses_prompt_top_k_and_char_budgets() {
 }
 
 #[tokio::test]
+async fn recall_for_prompt_generic_active_query_can_find_profile_identity_memory() {
+    let (_store, _backend, service) = setup_service().await;
+    service
+        .remember(
+            user_context(720),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("user/global:identity:self:name"),
+                "Имя пользователя — Александр.",
+            ),
+        )
+        .await
+        .expect("remember identity");
+
+    let recall = service
+        .recall_for_prompt(
+            user_context(721),
+            MemoryRecallParams {
+                query: "durable user identity preferences biography communication style recurring instructions project facts project decisions procedures constraints todos ongoing tasks"
+                    .to_owned(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recall");
+
+    assert!(
+        recall
+            .items
+            .iter()
+            .any(|item| item.content.contains("Александр")),
+        "generic active recall query should be able to surface stable identity memory"
+    );
+}
+
+#[tokio::test]
 async fn expired_and_repair_needed_records_are_not_visible() {
     let (store, _backend, service) = setup_service().await;
     let expired = service

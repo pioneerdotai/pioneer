@@ -13,7 +13,6 @@ pub(super) enum ActiveMemoryDecisionReasonCode {
     ConfigDisabled,
     DeterministicOnly,
     DeterministicSufficient,
-    TrivialSelfContained,
     MemoryLikely,
     StrictDebug,
     ProviderRun,
@@ -28,7 +27,6 @@ impl ActiveMemoryDecisionReasonCode {
             Self::ConfigDisabled => "config_disabled",
             Self::DeterministicOnly => "deterministic_only",
             Self::DeterministicSufficient => "deterministic_sufficient",
-            Self::TrivialSelfContained => "trivial_self_contained",
             Self::MemoryLikely => "memory_likely",
             Self::StrictDebug => "strict_debug",
             Self::ProviderRun => "provider_run",
@@ -43,7 +41,6 @@ impl ActiveMemoryDecisionReasonCode {
             Self::ConfigDisabled => "memory.active_recall.config_disabled",
             Self::DeterministicOnly => "memory.active_recall.deterministic_only",
             Self::DeterministicSufficient => "memory.active_recall.deterministic_sufficient",
-            Self::TrivialSelfContained => "memory.active_recall.skipped",
             Self::MemoryLikely | Self::StrictDebug | Self::ProviderRun => {
                 "memory.active_recall.started"
             }
@@ -63,21 +60,12 @@ pub(super) struct ActiveMemoryDecision {
 }
 
 pub(super) fn local_active_memory_decision(
-    input_text: &str,
+    _input_text: &str,
     diagnostic: &str,
 ) -> ActiveMemoryDecision {
     let mut diagnostics = Vec::new();
     if !diagnostic.trim().is_empty() {
         diagnostics.push(diagnostic.to_owned());
-    }
-    if is_trivial_self_contained_turn(input_text) {
-        return ActiveMemoryDecision {
-            status: ActiveMemoryDecisionStatus::Skip,
-            reason_code: ActiveMemoryDecisionReasonCode::TrivialSelfContained,
-            confidence: 0.75,
-            query_hints: Vec::new(),
-            diagnostics,
-        };
     }
     ActiveMemoryDecision {
         status: ActiveMemoryDecisionStatus::Run,
@@ -264,16 +252,6 @@ pub(super) enum ActiveMemoryDecisionJsonStatus {
     Skip,
     Run,
     Uncertain,
-}
-
-pub(super) fn is_trivial_self_contained_turn(input_text: &str) -> bool {
-    let trimmed = input_text.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let word_count = trimmed.split_whitespace().count();
-    let char_count = trimmed.chars().count();
-    word_count <= 5 && char_count <= 48
 }
 
 pub(super) fn active_memory_query_plan(
