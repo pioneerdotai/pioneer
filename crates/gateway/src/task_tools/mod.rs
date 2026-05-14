@@ -13,8 +13,8 @@ use pioneer_protocol::{
     TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
     TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
     TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus,
-    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
+    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
+    ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -263,17 +263,28 @@ impl TaskToolHandler {
         let current_call_id = invocation.call_id.clone();
         let input: TaskWaitToolInput = decode_tool_args(invocation)?;
         let mut params = input.into_params()?;
+
         if !params.return_completed && !params.return_pending {
             params.return_completed = true;
             params.return_pending = true;
         }
+
         let signature = TaskWaitSignature::from_params(&params);
+
+        if let Some(guard_output) = self
+            .non_waitable_scheduled_guard(&signature, &params)
+            .await?
+        {
+            return Ok(function_output(guard_output));
+        }
+
         if let Some(guard_output) = self
             .duplicate_wait_guard(signature.clone(), &params, current_call_id.as_str())
             .await?
         {
             return Ok(function_output(guard_output));
         }
+
         let response = self
             .processor
             .task_runtime
@@ -281,8 +292,52 @@ impl TaskToolHandler {
             .wait_tasks(pioneer_tasks::TaskWaitContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+
         Ok(function_output(task_wait_tool_output(
             &response, &signature,
+        )))
+    }
+
+    async fn non_waitable_scheduled_guard(
+        &self,
+        signature: &TaskWaitSignature,
+        params: &pioneer_protocol::TaskWaitParams,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        if params.task_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let now = now_timestamp_secs();
+        let mut non_waitable = Vec::new();
+        let mut waitable_task_ids = Vec::new();
+
+        for task_id in &params.task_ids {
+            let Some(response) = self
+                .processor
+                .crud_store
+                .get_task(task_id.as_str())
+                .await
+                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+            else {
+                continue;
+            };
+
+            if task_wait_target_is_non_waitable_scheduled(&response, now) {
+                non_waitable.push(non_waitable_scheduled_task_output(&response, now));
+            } else {
+                waitable_task_ids.push(task_id.clone());
+            }
+        }
+
+        if non_waitable.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(task_wait_non_waitable_output(
+            signature,
+            non_waitable,
+            waitable_task_ids,
+            !params.run_ids.is_empty(),
         )))
     }
 
@@ -948,7 +1003,7 @@ impl TaskTriggerToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_wait. Provide taskIds and/or runIds arrays; do not use a single taskId field.
 struct TaskWaitToolInput {
-    /// Task ids to join. Each Pioneer entity id is exactly 21 characters. Use taskIds, not taskId, even for one task.
+    /// Active attached task ids to join. Each Pioneer entity id is exactly 21 characters. Use taskIds, not taskId, even for one task. Do not wait on scheduled/interval/cron tasks with waitable=false or runId=null; confirm their schedule instead.
     #[serde(default)]
     #[schemars(inner(length(min = 21, max = 21)))]
     task_ids: Vec<String>,
@@ -1276,7 +1331,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Join one or more task ids or run ids using the task event bus. Use once for attached tasks; it blocks until all targets are terminal by default or timeout. Do not repeatedly call it for the same task set unless the prior wait timed out.",
+            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; it blocks until all targets are terminal by default or timeout. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -1914,18 +1969,47 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
             TaskAttachmentMode::Detached => "detached",
         })
         .unwrap_or("detached");
+
+    let waitable = task_create_response_waitable(response);
+
     json!({
         "taskId": response.task.id,
         "runId": response.run.as_ref().map(|run| run.id.clone()),
+        "waitable": waitable,
+        "waitRecommendation": task_create_wait_recommendation(response, waitable),
         "status": task_status_label(response.task.status),
         "title": response.task.title,
         "attachment": attachment,
         "triggerKind": trigger_kind_label(response.trigger.kind()),
+        "nextFireAt": response.trigger.next_fire_at,
         "depth": anchor.depth,
         "maxDepth": anchor.max_depth,
         "childThreadId": anchor.child_thread_id,
         "childTurnId": anchor.child_turn_id,
     })
+}
+
+fn task_create_response_waitable(response: &TaskCreateResponse) -> bool {
+    response
+        .run
+        .as_ref()
+        .is_some_and(|run| !run.status.is_terminal())
+        || matches!(
+            response.task.status,
+            TaskStatus::Queued | TaskStatus::Running | TaskStatus::Waiting
+        )
+}
+
+fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool) -> &'static str {
+    if waitable {
+        return "call_task_wait_for_active_attached_work_before_final_answer";
+    }
+    match response.trigger.kind() {
+        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron => {
+            "do_not_call_task_wait_confirm_schedule"
+        }
+        _ => "do_not_call_task_wait_unless_an_active_run_exists",
+    }
 }
 
 fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
@@ -1980,6 +2064,75 @@ fn task_wait_guard_output(
         } else {
             "wait_for_timeline_change_or_cancel"
         },
+    })
+}
+
+fn task_wait_non_waitable_output(
+    signature: &TaskWaitSignature,
+    non_waitable: Vec<JsonValue>,
+    waitable_task_ids: Vec<String>,
+    has_run_targets: bool,
+) -> JsonValue {
+    let recommendation = if waitable_task_ids.is_empty() && !has_run_targets {
+        "confirm_scheduled_task"
+    } else {
+        "call_task_wait_again_only_for_waitable_active_runs"
+    };
+
+    json!({
+        "waitable": false,
+        "reason": "scheduled_task_has_no_active_run",
+        "message": "One or more targets are scheduled for future execution and have no active run to wait for. Do not call task_wait for scheduled, interval, or cron tasks after task_create returned waitable=false/runId=null; confirm the schedule instead.",
+        "waitSignature": signature.to_json(),
+        "nonWaitable": non_waitable,
+        "waitableTaskIds": waitable_task_ids,
+        "hasRunTargets": has_run_targets,
+        "recommendation": recommendation,
+        "timedOut": false,
+    })
+}
+
+fn task_wait_target_is_non_waitable_scheduled(response: &TaskGetResponse, now: i64) -> bool {
+    if response.task.status != TaskStatus::Scheduled {
+        return false;
+    }
+    if response.runs.iter().any(|run| !run.status.is_terminal()) {
+        return false;
+    }
+    response.triggers.iter().any(|trigger| {
+        trigger.status == TaskTriggerStatus::Active
+            && matches!(
+                trigger.kind(),
+                TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+            )
+            && trigger
+                .next_fire_at
+                .is_some_and(|next_fire_at| next_fire_at > now)
+    })
+}
+
+fn non_waitable_scheduled_task_output(response: &TaskGetResponse, now: i64) -> JsonValue {
+    let trigger = response
+        .triggers
+        .iter()
+        .rev()
+        .find(|trigger| {
+            trigger.status == TaskTriggerStatus::Active
+                && trigger
+                    .next_fire_at
+                    .is_some_and(|next_fire_at| next_fire_at > now)
+        })
+        .or_else(|| response.triggers.last());
+
+    json!({
+        "taskId": response.task.id,
+        "title": response.task.title,
+        "status": task_status_label(response.task.status),
+        "triggerKind": trigger.map(|trigger| trigger_kind_label(trigger.kind())),
+        "nextFireAt": trigger.and_then(|trigger| trigger.next_fire_at),
+        "runId": null,
+        "waitable": false,
+        "reason": "future_scheduled_task_without_active_run",
     })
 }
 
@@ -2160,6 +2313,116 @@ mod tests {
         }
     }
 
+    fn sample_task(status: TaskStatus) -> Task {
+        Task {
+            id: "task_1234567890123456".to_owned(),
+            workspace_id: "workspace_12345678901".to_owned(),
+            owner_kind: TaskOwnerKind::Workspace,
+            owner_id: Some("workspace_12345678901".to_owned()),
+            created_by_thread_id: Some("thread_12345678901234".to_owned()),
+            created_by_turn_id: Some("turn_123456789012345".to_owned()),
+            root_task_id: None,
+            parent_task_id: None,
+            executor_kind: TaskExecutorKind::Agent,
+            status,
+            title: "Daily Weather Forecast".to_owned(),
+            goal: "Send weather".to_owned(),
+            priority: 0,
+            lifecycle_policy: None,
+            delivery_policy: None,
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: None,
+            result: None,
+            error: None,
+            revision: 1,
+            created_at: 100,
+            updated_at: 100,
+            completed_at: None,
+        }
+    }
+
+    fn sample_cron_trigger(next_fire_at: Option<i64>) -> TaskTrigger {
+        TaskTrigger {
+            id: "trigger_1234567890123".to_owned(),
+            task_id: "task_1234567890123456".to_owned(),
+            status: TaskTriggerStatus::Active,
+            spec: TaskTriggerSpec::Cron {
+                cron_expr: "0 7 * * *".to_owned(),
+                timezone: "Europe/Moscow".to_owned(),
+            },
+            next_fire_at,
+            last_fire_at: None,
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    fn sample_run(status: TaskRunStatus) -> TaskRun {
+        TaskRun {
+            id: "run_12345678901234567".to_owned(),
+            task_id: "task_1234567890123456".to_owned(),
+            trigger_id: Some("trigger_1234567890123".to_owned()),
+            parent_run_id: None,
+            run_group_id: "group_123456789012345".to_owned(),
+            attempt_number: 1,
+            retry_of_run_id: None,
+            ready_at: Some(100),
+            run_number: 1,
+            status,
+            executor_kind: TaskExecutorKind::Agent,
+            started_at: None,
+            completed_at: None,
+            heartbeat_at: None,
+            locked_by: None,
+            lock_expires_at: None,
+            result: None,
+            error: None,
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    fn sample_task_response(
+        task_status: TaskStatus,
+        runs: Vec<TaskRun>,
+        next_fire_at: Option<i64>,
+    ) -> TaskGetResponse {
+        TaskGetResponse {
+            task: sample_task(task_status),
+            triggers: vec![sample_cron_trigger(next_fire_at)],
+            runs,
+            agent_specs: Vec::new(),
+            dependencies: Vec::new(),
+            write_locks: Vec::new(),
+        }
+    }
+
+    fn sample_task_turn_item() -> TaskTurnItem {
+        TaskTurnItem {
+            id: "task_item_task_1234567890123456".to_owned(),
+            task_id: "task_1234567890123456".to_owned(),
+            run_id: None,
+            parent_task_id: None,
+            root_task_id: None,
+            title: "Daily Weather Forecast".to_owned(),
+            status: TaskStatus::Scheduled,
+            trigger_kind: TaskTriggerKind::Cron,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 1,
+            max_depth: 3,
+            next_fire_at: Some(1_000),
+            result_preview: None,
+            error_preview: None,
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
     #[test]
     fn duplicate_wait_guard_blocks_same_pending_state() {
         assert!(duplicate_wait_should_block(&[prior(false, 0)], 0, 3));
@@ -2178,6 +2441,51 @@ mod tests {
             0,
             3
         ));
+    }
+
+    #[test]
+    fn scheduled_task_create_output_is_not_waitable_without_run() {
+        let response = TaskCreateResponse {
+            task: sample_task(TaskStatus::Scheduled),
+            trigger: sample_cron_trigger(Some(1_000)),
+            run: None,
+            agent_spec: None,
+        };
+
+        let output = task_create_tool_output(&response, &sample_task_turn_item());
+
+        assert_eq!(output["waitable"], JsonValue::Bool(false));
+        assert_eq!(output["runId"], JsonValue::Null);
+        assert_eq!(
+            output["waitRecommendation"],
+            JsonValue::String("do_not_call_task_wait_confirm_schedule".to_owned())
+        );
+        assert_eq!(output["nextFireAt"], JsonValue::from(1_000));
+    }
+
+    #[test]
+    fn task_wait_guard_detects_future_scheduled_task_without_active_run() {
+        let response = sample_task_response(TaskStatus::Scheduled, Vec::new(), Some(1_000));
+
+        assert!(task_wait_target_is_non_waitable_scheduled(&response, 500));
+
+        let snapshot = non_waitable_scheduled_task_output(&response, 500);
+        assert_eq!(snapshot["waitable"], JsonValue::Bool(false));
+        assert_eq!(
+            snapshot["reason"],
+            JsonValue::String("future_scheduled_task_without_active_run".to_owned())
+        );
+    }
+
+    #[test]
+    fn task_wait_guard_allows_scheduled_task_with_active_run() {
+        let response = sample_task_response(
+            TaskStatus::Scheduled,
+            vec![sample_run(TaskRunStatus::Running)],
+            Some(1_000),
+        );
+
+        assert!(!task_wait_target_is_non_waitable_scheduled(&response, 500));
     }
 
     fn task_tool_invocation(tool_name: &str, arguments: JsonValue) -> ToolInvocation {
@@ -2235,6 +2543,8 @@ mod tests {
             "Use taskIds, not taskId",
             "exactly 21 characters",
             "do not use a single taskId field",
+            "waitable=false",
+            "confirm their schedule",
         ] {
             assert!(
                 wait_schema.contains(expected),
