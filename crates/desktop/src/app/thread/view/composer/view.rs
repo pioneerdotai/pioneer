@@ -6,6 +6,8 @@ use gpui::{prelude::*, *};
 use gpui_component::{IconName, button::*, input::Input, spinner::Spinner, theme::ActiveTheme, *};
 use std::path::Path;
 
+const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
+
 impl PioneerDesktop {
     pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let composer_state = self.composer_state.clone();
@@ -183,6 +185,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group_id = format!("composer-attachment-chip-{index}");
+
         let file_name = if attachment.file_name.trim().is_empty() {
             Path::new(attachment.path.as_str())
                 .file_name()
@@ -192,34 +195,23 @@ impl PioneerDesktop {
         } else {
             attachment.file_name.clone()
         };
-        let (status_icon, status_text, status_color, is_uploading) = match &attachment.upload_state
-        {
-            ComposerAttachmentUploadState::Local => {
-                (IconName::File, None, cx.theme().foreground, false)
+
+        let (status_icon, status_color, is_uploading) = match &attachment.upload_state {
+            ComposerAttachmentUploadState::Local => (IconName::File, cx.theme().foreground, false),
+            ComposerAttachmentUploadState::Uploading => {
+                (IconName::Loader, cx.theme().muted_foreground, true)
             }
-            ComposerAttachmentUploadState::Uploading => (
-                IconName::Loader,
-                Some("uploading"),
-                cx.theme().muted_foreground,
-                true,
-            ),
-            ComposerAttachmentUploadState::Uploaded { .. } => (
-                IconName::Check,
-                Some("uploaded"),
-                cx.theme().muted_foreground,
-                false,
-            ),
-            ComposerAttachmentUploadState::Failed { .. } => (
-                IconName::TriangleAlert,
-                Some("failed"),
-                cx.theme().danger,
-                false,
-            ),
+            ComposerAttachmentUploadState::Uploaded { .. } => {
+                (IconName::Check, cx.theme().muted_foreground, false)
+            }
+            ComposerAttachmentUploadState::Failed { .. } => {
+                (IconName::TriangleAlert, cx.theme().danger, false)
+            }
         };
 
         h_flex()
             .id(("composer-attachment-chip", index))
-            .flex_1()
+            .flex_initial()
             .max_w(px(196.))
             .min_w_0()
             .h(px(32.))
@@ -234,6 +226,7 @@ impl PioneerDesktop {
             .group(group_id.clone())
             .child(
                 div()
+                    .flex_none()
                     .size(px(20.))
                     .rounded_full()
                     .flex()
@@ -253,33 +246,32 @@ impl PioneerDesktop {
                     }),
             )
             .child(
-                h_flex()
-                    .flex_1()
+                div()
+                    .relative()
+                    .flex_initial()
                     .min_w_0()
                     .overflow_hidden()
-                    .gap_1()
+                    .whitespace_nowrap()
+                    .pr(COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH)
+                    .text_xs()
+                    .child(file_name)
                     .child(
                         div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .child(file_name),
-                    )
-                    .when_some(status_text, |this, status_text| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(status_color)
-                                .whitespace_nowrap()
-                                .child(status_text),
-                        )
-                    }),
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH)
+                            .bg(linear_gradient(
+                                90.,
+                                linear_color_stop(cx.theme().background.opacity(0.), 0.),
+                                linear_color_stop(cx.theme().background, 1.),
+                            )),
+                    ),
             )
             .child(
                 Button::new(("composer-attachment-remove", index))
+                    .flex_none()
                     .ghost()
                     .xsmall()
                     .compact()
