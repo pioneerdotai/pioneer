@@ -24,7 +24,8 @@ use pioneer_protocol::{
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, TransactionTrait,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -136,6 +137,21 @@ pub struct TimeoutCandidate {
     pub item_type: TurnItemType,
     pub attempt_number: i64,
     pub timeout_reason: TurnItemTimeoutReason,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnItemAttemptDeadlines {
+    pub lease_expires_at_unix: Option<i64>,
+    pub idle_deadline_at_unix: Option<i64>,
+    pub hard_deadline_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunningAttemptDeadlineRepairCandidate {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+    pub started_at_unix: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2190,9 +2206,24 @@ impl CrudStore {
         notification: pioneer_protocol::ItemStartedNotification,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.materialize_turn_event(
+        self.materialize_turn_event_with_attempt_deadlines(
             TurnEventPayload::ItemStarted(notification),
             event_timestamp_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn materialize_item_started_with_attempt_deadlines(
+        &self,
+        notification: pioneer_protocol::ItemStartedNotification,
+        event_timestamp_secs: i64,
+        deadlines: TurnItemAttemptDeadlines,
+    ) -> Result<()> {
+        self.materialize_turn_event_with_attempt_deadlines(
+            TurnEventPayload::ItemStarted(notification),
+            event_timestamp_secs,
+            Some(deadlines),
         )
         .await
     }
@@ -4878,6 +4909,35 @@ impl CrudStore {
             .collect())
     }
 
+    pub async fn list_running_attempts_missing_deadlines(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<RunningAttemptDeadlineRepairCandidate>> {
+        let rows = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::Status.eq(ATTEMPT_STATUS_RUNNING))
+            .filter(
+                Condition::any()
+                    .add(pioneer_entity::turn_item_attempt::Column::LeaseExpiresAt.is_null())
+                    .add(pioneer_entity::turn_item_attempt::Column::IdleDeadlineAt.is_null())
+                    .add(pioneer_entity::turn_item_attempt::Column::HardDeadlineAt.is_null()),
+            )
+            .limit(limit)
+            .all(&self.connection)
+            .await
+            .context("failed to list running attempts missing deadlines")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| RunningAttemptDeadlineRepairCandidate {
+                turn_id: row.turn_id,
+                item_id: row.item_id,
+                item_type: turn_item_type_from_db(row.item_type.as_str())
+                    .unwrap_or(TurnItemType::DynamicToolCall),
+                started_at_unix: row.started_at.timestamp(),
+            })
+            .collect())
+    }
+
     pub async fn list_unqueued_timeout_candidates(
         &self,
         limit: u64,
@@ -5587,8 +5647,22 @@ impl CrudStore {
         event: TurnEventPayload,
         event_timestamp_secs: i64,
     ) -> Result<()> {
+        self.materialize_turn_event_with_attempt_deadlines(event, event_timestamp_secs, None)
+            .await
+    }
+
+    async fn materialize_turn_event_with_attempt_deadlines(
+        &self,
+        event: TurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+    ) -> Result<()> {
         self.run_serialized_write(|| {
-            self.materialize_turn_event_once(event.clone(), event_timestamp_secs)
+            self.materialize_turn_event_once(
+                event.clone(),
+                event_timestamp_secs,
+                item_started_deadlines,
+            )
         })
         .await
     }
@@ -5597,6 +5671,7 @@ impl CrudStore {
         &self,
         event: TurnEventPayload,
         event_timestamp_secs: i64,
+        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -5625,6 +5700,29 @@ impl CrudStore {
         {
             let _ = transaction.rollback().await;
             return Err(error);
+        }
+
+        if let (TurnEventPayload::ItemStarted(notification), Some(deadlines)) =
+            (&event, item_started_deadlines)
+        {
+            let configured = turn_item_attempt::configure_running_attempt_deadlines(
+                &transaction,
+                notification.turn_id.as_str(),
+                notification.item.item_id(),
+                created_at,
+                deadlines.lease_expires_at_unix.map(unix_to_datetime),
+                deadlines.idle_deadline_at_unix.map(unix_to_datetime),
+                deadlines.hard_deadline_at_unix.map(unix_to_datetime),
+            )
+            .await
+            .context("failed to configure item attempt deadlines during item/started projection")?;
+            if !configured {
+                let _ = transaction.rollback().await;
+                anyhow::bail!(
+                    "item/started projection did not create a running attempt for item `{}`",
+                    notification.item.item_id()
+                );
+            }
         }
 
         transaction
@@ -6551,8 +6649,8 @@ mod tests {
         ClaimedRecoveryActivation, CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
         McpServerInstallationRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
         SkillInstallationRecord, TaskEventPayload, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
-        ThreadAgentsDocStatus, TurnMcpBindingRecord, TurnSkillBindingRecord,
-        WorkspaceSkillPolicyRecord,
+        ThreadAgentsDocStatus, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
+        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -7554,6 +7652,89 @@ mod tests {
             )
         });
         assert_eq!(history_events_have_snapshot.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn item_started_can_atomically_persist_attempt_deadlines() {
+        let store = test_store_with_workspace("ws_attempt_deadlines").await;
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_attempt_deadlines";
+        let thread_id = "thr_attempt_deadlines";
+        let turn_id = "turn_attempt_deadlines";
+        let item_id = "call_attempt_deadlines";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        let item = TurnItem::DynamicToolCall {
+            id: item_id.to_owned(),
+            tool_name: "task_create".to_owned(),
+            arguments: serde_json::json!({ "title": "Daily weather" }),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("task_create"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::empty(),
+            },
+            recovery: None,
+            success: None,
+            outcome: None,
+            observation: None,
+        };
+        let deadlines = TurnItemAttemptDeadlines {
+            lease_expires_at_unix: Some(timestamp + 121),
+            idle_deadline_at_unix: Some(timestamp + 91),
+            hard_deadline_at_unix: Some(timestamp + 301),
+        };
+
+        store
+            .materialize_item_started_with_attempt_deadlines(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item,
+                },
+                timestamp + 1,
+                deadlines,
+            )
+            .await
+            .expect("item started should persist with deadlines");
+
+        let attempt = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .expect("attempt lookup should succeed")
+            .expect("attempt should exist");
+
+        assert_eq!(
+            attempt.lease_expires_at,
+            deadlines.lease_expires_at_unix.map(unix_to_datetime)
+        );
+        assert_eq!(
+            attempt.idle_deadline_at,
+            deadlines.idle_deadline_at_unix.map(unix_to_datetime)
+        );
+        assert_eq!(
+            attempt.hard_deadline_at,
+            deadlines.hard_deadline_at_unix.map(unix_to_datetime)
+        );
+
+        let missing = store
+            .list_running_attempts_missing_deadlines(10)
+            .await
+            .expect("deadline repair candidates should query");
+        assert!(
+            missing.is_empty(),
+            "attempt with all deadlines should not require repair"
+        );
     }
 
     #[tokio::test]

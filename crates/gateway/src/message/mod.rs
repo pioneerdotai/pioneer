@@ -418,6 +418,26 @@ impl MessageProcessor {
                 );
             }
         }
+        match self
+            .timeout_supervisor
+            .backfill_missing_deadlines(1024)
+            .await
+        {
+            Ok(backfilled) => {
+                if backfilled > 0 {
+                    warn!(
+                        backfilled,
+                        "backfilled missing running item deadlines during startup"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to backfill missing running item deadlines during startup"
+                );
+            }
+        }
         if let Err(error) = self.task_runtime.start().await {
             warn!(error = %format!("{error:#}"), "failed to start task runtime");
         }

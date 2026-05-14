@@ -1,5 +1,5 @@
 use anyhow::Result;
-use pioneer_crud::{CrudStore, TimeoutCandidate};
+use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
 use pioneer_protocol::TurnItemType;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,27 +141,45 @@ impl TimeoutSupervisor {
         }
     }
 
-    pub async fn register_item_attempt(
+    pub fn deadlines_for(
         &self,
-        turn_id: &str,
-        item_id: &str,
         item_type: TurnItemType,
-        now_unix: i64,
-    ) -> Result<()> {
+        started_at_unix: i64,
+    ) -> TurnItemAttemptDeadlines {
         let policy = self.policy_registry.policy_for(item_type);
-        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(now_unix);
-        let _ = self
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
+            policy.deadlines(started_at_unix);
+        TurnItemAttemptDeadlines {
+            lease_expires_at_unix: Some(lease_expires_at),
+            idle_deadline_at_unix: Some(idle_deadline_at),
+            hard_deadline_at_unix: Some(hard_deadline_at),
+        }
+    }
+
+    pub async fn backfill_missing_deadlines(&self, limit: u64) -> Result<usize> {
+        let candidates = self
             .crud_store
-            .configure_turn_item_attempt_deadlines(
-                turn_id,
-                item_id,
-                now_unix,
-                Some(lease_expires_at),
-                Some(idle_deadline_at),
-                Some(hard_deadline_at),
-            )
+            .list_running_attempts_missing_deadlines(limit)
             .await?;
-        Ok(())
+        let mut backfilled = 0usize;
+        for candidate in candidates {
+            let deadlines = self.deadlines_for(candidate.item_type, candidate.started_at_unix);
+            let configured = self
+                .crud_store
+                .configure_turn_item_attempt_deadlines(
+                    candidate.turn_id.as_str(),
+                    candidate.item_id.as_str(),
+                    candidate.started_at_unix,
+                    deadlines.lease_expires_at_unix,
+                    deadlines.idle_deadline_at_unix,
+                    deadlines.hard_deadline_at_unix,
+                )
+                .await?;
+            if configured {
+                backfilled = backfilled.saturating_add(1);
+            }
+        }
+        Ok(backfilled)
     }
 
     pub async fn heartbeat_item_attempt(

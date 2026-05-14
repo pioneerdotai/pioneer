@@ -696,9 +696,18 @@ impl MessageProcessor {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
+                let item_id = notification.item.item_id().to_owned();
+                let item_type = notification.item.item_type();
+                let deadlines = self
+                    .timeout_supervisor
+                    .deadlines_for(item_type, event_timestamp);
                 if let Err(error) = self
                     .crud_store
-                    .materialize_item_started(notification.clone(), event_timestamp)
+                    .materialize_item_started_with_attempt_deadlines(
+                        notification.clone(),
+                        event_timestamp,
+                        deadlines,
+                    )
                     .await
                 {
                     self.mark_turn_failed(
@@ -722,25 +731,13 @@ impl MessageProcessor {
                     TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
-
-                if let Err(error) = self
-                    .timeout_supervisor
-                    .register_item_attempt(
-                        notification.turn_id.as_str(),
-                        notification.item.item_id(),
-                        notification.item.item_type(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    warn!(
-                        thread_id = notification.thread_id,
-                        turn_id = notification.turn_id,
-                        item_id = notification.item.item_id(),
-                        error = %format!("{error:#}"),
-                        "failed to register item attempt deadlines"
-                    );
-                }
+                debug!(
+                    thread_id = notification.thread_id,
+                    turn_id = notification.turn_id,
+                    item_id,
+                    item_type = ?item_type,
+                    "registered item attempt deadlines during item/started projection"
+                );
             }
             AgentDurableEvent::ItemCompleted { notification } => {
                 let mut notification = notification;

@@ -439,6 +439,43 @@ fn late_item_delta_does_not_reopen_completed_item() {
 }
 
 #[test]
+fn terminal_turn_stamps_running_items_completed_at() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let item_id = "item_running_when_turn_completes";
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: item_id.to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
+        },
+    });
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Completed,
+            error: None,
+            prompt_manifest: None,
+        },
+    });
+
+    let item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert!(
+        item.completed_at_unix_ms.is_some(),
+        "terminal turn must freeze elapsed time for running items"
+    );
+}
+
+#[test]
 fn late_item_started_does_not_reopen_completed_item() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_late_start_after_completion";

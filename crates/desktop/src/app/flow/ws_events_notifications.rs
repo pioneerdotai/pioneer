@@ -341,6 +341,7 @@ impl PioneerDesktop {
             | GatewayNotification::TaskFailed(_)
             | GatewayNotification::TaskCancelled(_)
             | GatewayNotification::TaskDetached(_)
+            | GatewayNotification::TaskUpdated(_)
             | GatewayNotification::TaskRescheduled(_)
             | GatewayNotification::TaskPaused(_)
             | GatewayNotification::TaskResumed(_)

@@ -203,7 +203,7 @@ impl ConversationProjector {
             Some(error.to_owned()),
         );
         self.view_state.last_error = Some(error.to_owned());
-        self.mark_turn_items_terminal(turn_id, TimelineEntryStatus::Failed);
+        self.mark_turn_items_terminal(turn_id, TimelineEntryStatus::Failed, ts_unix_ms);
         self.push_system_event_item(
             turn_id,
             SystemEventLevel::Error,
@@ -229,7 +229,6 @@ impl ConversationProjector {
     }
 
     pub(super) fn apply_turn_completed(&mut self, turn: &Turn, ts_unix_ms: i64) {
-        let _ = ts_unix_ms;
         self.upsert_turn(
             turn.id.as_str(),
             TurnPhase::Completing,
@@ -237,7 +236,7 @@ impl ConversationProjector {
             None,
             turn.error.clone(),
         );
-        self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Completed);
+        self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Completed, ts_unix_ms);
     }
 
     pub(super) fn finalize_turn_completed(&mut self, turn_id: &str, ts_unix_ms: i64) {
@@ -268,7 +267,7 @@ impl ConversationProjector {
             Some(ts_unix_ms),
             turn.error.clone(),
         );
-        self.mark_turn_items_terminal(turn.id.as_str(), item_status);
+        self.mark_turn_items_terminal(turn.id.as_str(), item_status, ts_unix_ms);
         self.view_state.last_error = turn.error.clone();
 
         if let Some(error) = turn.error.as_deref()
@@ -848,13 +847,20 @@ impl ConversationProjector {
         self.turn_index.insert(turn_id.to_owned(), index);
     }
 
-    fn mark_turn_items_terminal(&mut self, turn_id: &str, terminal_status: TimelineEntryStatus) {
+    fn mark_turn_items_terminal(
+        &mut self,
+        turn_id: &str,
+        terminal_status: TimelineEntryStatus,
+        ts_unix_ms: i64,
+    ) {
         for item in &mut self.view_state.items {
             if item.turn_id != turn_id {
                 continue;
             }
             if matches!(item.status, TimelineEntryStatus::Running) {
                 item.status = terminal_status;
+                item.updated_at_unix_ms = Some(ts_unix_ms);
+                item.completed_at_unix_ms = Some(ts_unix_ms);
             }
         }
     }
