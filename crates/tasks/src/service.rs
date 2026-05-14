@@ -1556,12 +1556,50 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
         {
             bail!("agent executor requires agent_spec.model_provider");
         }
+        validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
     }
     if params.owner_kind == TaskOwnerKind::Thread && params.owner_id.is_none() {
         bail!("thread-owned task requires owner_id");
     }
     if let Some(policy) = params.delivery_policy.as_ref() {
         validate_delivery_policy(policy)?;
+    }
+    Ok(())
+}
+
+fn validate_agent_spec_for_trigger(
+    trigger_kind: TaskTriggerKind,
+    agent_spec: &pioneer_protocol::TaskAgentSpecInput,
+) -> TaskRuntimeResult<()> {
+    if !matches!(
+        trigger_kind,
+        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+    ) {
+        return Ok(());
+    }
+
+    let instructions = agent_spec
+        .prompt
+        .instructions
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if instructions.is_empty() {
+        bail!("scheduled agent task requires self-contained executor instructions");
+    }
+    if instructions.len() == 1 && instructions[0] == "Return a concise final result." {
+        bail!("scheduled agent task cannot use the generic concise-result prompt");
+    }
+    if agent_spec
+        .prompt
+        .output_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        bail!("scheduled agent task requires output instructions");
     }
     Ok(())
 }

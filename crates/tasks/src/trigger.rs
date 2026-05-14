@@ -189,7 +189,6 @@ impl CronField {
 
     fn matches(&self, value: i64) -> bool {
         self.values.binary_search(&value).is_ok()
-            || (value == 0 && self.values.binary_search(&7).is_ok())
     }
 }
 

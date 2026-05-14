@@ -959,6 +959,77 @@ async fn cron_trigger_computes_next_fire_in_timezone() {
 }
 
 #[tokio::test]
+async fn cron_trigger_computes_moscow_morning_fire_in_utc() {
+    let next = crate::TaskTriggerCalculator::initial_next_fire_at(
+        &TaskTriggerSpec::Cron {
+            cron_expr: "0 7 * * *".to_owned(),
+            timezone: "Europe/Moscow".to_owned(),
+        },
+        1_778_752_618,
+    )
+    .expect("cron should compute")
+    .expect("cron should have next fire");
+    assert_eq!(next, 1_778_817_600);
+}
+
+#[tokio::test]
+async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
+    let runtime = runtime().await;
+
+    let mut missing_prompt = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 7 * * *".to_owned(),
+        timezone: "Europe/Moscow".to_owned(),
+    });
+    missing_prompt.executor_kind = TaskExecutorKind::Agent;
+    missing_prompt.agent_spec = Some(agent_spec(3));
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), missing_prompt)
+        .await
+        .expect_err("scheduled agent task should reject empty prompt");
+    assert!(format!("{error:#}").contains("self-contained executor instructions"));
+
+    let mut missing_output = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 7 * * *".to_owned(),
+        timezone: "Europe/Moscow".to_owned(),
+    });
+    missing_output.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.prompt.instructions = vec![
+        "Use currently available runtime capabilities by capability, not stale tool names."
+            .to_owned(),
+        "If required data is unavailable, report a clear failure.".to_owned(),
+    ];
+    missing_output.agent_spec = Some(spec);
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), missing_output)
+        .await
+        .expect_err("scheduled agent task should reject missing output contract");
+    assert!(format!("{error:#}").contains("output instructions"));
+
+    let mut valid = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 7 * * *".to_owned(),
+        timezone: "Europe/Moscow".to_owned(),
+    });
+    valid.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.prompt.instructions = vec![
+        "Use currently available runtime capabilities by capability, not stale tool names."
+            .to_owned(),
+        "If required data is unavailable, report a clear failure.".to_owned(),
+    ];
+    spec.prompt.output_instructions =
+        Some("Return concise markdown with result fields or explicit failure reason.".to_owned());
+    valid.agent_spec = Some(spec);
+    runtime
+        .service()
+        .create_task(TaskCreateContext::default(), valid)
+        .await
+        .expect("scheduled agent task should accept a durable prompt contract");
+}
+
+#[tokio::test]
 async fn lifecycle_defaults_attach_only_immediate_parent_turn_tasks() {
     let runtime = runtime().await;
     let mut immediate = create_params(TaskTriggerSpec::Immediate);

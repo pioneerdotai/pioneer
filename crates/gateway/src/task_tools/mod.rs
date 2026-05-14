@@ -516,11 +516,10 @@ impl TaskToolHandler {
                 "`maxDepth` must be greater than or equal to 0",
             ));
         }
-        let instructions = if input.instructions.is_empty() {
-            vec!["Return a concise final result.".to_owned()]
-        } else {
-            input.instructions
-        };
+        let trigger_kind = trigger.spec.kind();
+        let instructions = normalize_task_instructions(input.instructions, trigger_kind)?;
+        let output_instructions =
+            normalize_task_output_instructions(input.output_instructions, trigger_kind)?;
         let prompt = TaskAgentPrompt {
             goal: goal.clone(),
             instructions,
@@ -532,7 +531,7 @@ impl TaskToolHandler {
                     references: Vec::new(),
                 })
             }),
-            output_instructions: input.output_instructions,
+            output_instructions,
         };
         let agent_spec = (executor_kind == TaskExecutorKind::Agent).then_some(TaskAgentSpecInput {
             agent_role: input.agent_role,
@@ -648,7 +647,7 @@ impl TaskToolHandler {
 struct TaskCreateToolInput {
     /// Short human-readable task title. For child agents this becomes the hidden child thread title.
     title: String,
-    /// Concrete goal for the task executor.
+    /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For a daily scheduled task use {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
@@ -663,16 +662,16 @@ struct TaskCreateToolInput {
     /// Optional short display name for the subagent.
     agent_nickname: Option<String>,
     #[serde(default)]
-    /// Step-by-step instructions for the executor. If omitted the executor returns a concise final result.
+    /// Step-by-step executor instructions. For scheduled, interval, and cron tasks this is required and must be self-contained for future runs: say what to do, how to choose currently available tools/skills/MCP/built-ins by capability, when to fail clearly, and not to rely on hidden chat context or tool names from task creation time. Immediate subagents may omit this for a concise default.
     instructions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Plain text input for the child agent. Prefer inputText over input for simple subagent tasks.
+    /// Plain text task input and parameters, not behavior instructions. Prefer inputText over input for simple subagent tasks, for example city, path, date range, language, or user-provided facts.
     input_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Structured child-agent input with variables, attachments, and references.
+    /// Structured task input with variables, attachments, and references. Use this for data the future run should consume; keep execution behavior in instructions.
     input: Option<TaskAgentInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Additional output constraints for the child agent result.
+    /// Final result format and delivery contract. Required for scheduled, interval, and cron tasks; specify language, markdown/json structure, required fields, and how to report failure.
     output_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Advanced context policy for the child agent. Omit unless the user asks for custom context handling.
@@ -1032,7 +1031,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. For immediate subagents omit trigger. For scheduled work use trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For immediate subagents omit trigger. For scheduled work use trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -1203,7 +1202,7 @@ where
 fn task_tool_argument_hint(tool_name: &str) -> &'static str {
     match tool_name {
         TASK_CREATE_TOOL => {
-            "Expected: {\"title\":\"...\",\"goal\":\"...\"}. For cron use \"trigger\":{\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
+            "Expected: {\"title\":\"...\",\"goal\":\"...\",\"instructions\":[\"self-contained future-run instruction\",\"choose currently available tools/skills/MCP by capability; fail clearly if unavailable\"],\"inputText\":\"task parameters/data\",\"outputInstructions\":\"final answer format and failure format\"}. For cron use \"trigger\":{\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
         }
         TASK_RESCHEDULE_TOOL => {
             "Expected: {\"taskId\":\"<21-char task id>\",\"trigger\":{\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"}} or kind \"cron\" with cronExpr/timezone; do not use trigger.spec."
@@ -1251,6 +1250,69 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_task_instructions(
+    instructions: Vec<String>,
+    trigger_kind: TaskTriggerKind,
+) -> Result<Vec<String>, ToolError> {
+    let mut instructions = instructions
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    dedup_preserve_order(&mut instructions);
+
+    if !requires_durable_agent_prompt(trigger_kind) {
+        if instructions.is_empty() {
+            instructions.push("Return a concise final result.".to_owned());
+        }
+        return Ok(instructions);
+    }
+
+    if instructions.is_empty() {
+        return Err(ToolError::invalid_arguments(
+            "`instructions` is required for scheduled, interval, and cron task_create calls; include self-contained future-run steps, runtime capability selection guidance, and failure conditions",
+        ));
+    }
+    if instructions.len() == 1 && instructions[0] == "Return a concise final result." {
+        return Err(ToolError::invalid_arguments(
+            "`instructions` for scheduled, interval, and cron task_create calls cannot use the concise default; provide a self-contained future-run prompt",
+        ));
+    }
+
+    instructions.insert(
+        0,
+        "This is a durable task that may run later. On each run, use the current date/time and currently available tools, skills, MCP servers, and built-ins by capability. Do not rely on hidden task-creation chat context or on tool/skill names that are unavailable at run time. If required capability or data is unavailable, fail clearly instead of fabricating a result."
+            .to_owned(),
+    );
+    dedup_preserve_order(&mut instructions);
+    Ok(instructions)
+}
+
+fn normalize_task_output_instructions(
+    output_instructions: Option<String>,
+    trigger_kind: TaskTriggerKind,
+) -> Result<Option<String>, ToolError> {
+    let output_instructions = clean_optional_string(output_instructions);
+    if requires_durable_agent_prompt(trigger_kind) && output_instructions.is_none() {
+        return Err(ToolError::invalid_arguments(
+            "`outputInstructions` is required for scheduled, interval, and cron task_create calls; specify final result format and failure reporting format",
+        ));
+    }
+    Ok(output_instructions)
+}
+
+fn requires_durable_agent_prompt(kind: TaskTriggerKind) -> bool {
+    matches!(
+        kind,
+        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+    )
+}
+
+fn dedup_preserve_order(values: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
@@ -1857,6 +1919,9 @@ mod tests {
         let create_schema = task_create_schema().to_string();
         for expected in [
             "Do not pass runtime-owned fields",
+            "self-contained for future runs",
+            "currently available tools/skills/MCP/built-ins",
+            "Final result format and delivery contract",
             "do not wrap it in spec",
             "five-field cron expression",
             "Prefer inputText over input",
@@ -1935,6 +2000,45 @@ mod tests {
             message.contains("do not use trigger.spec"),
             "decode error should include the model-facing trigger contract, got: {message}"
         );
+    }
+
+    #[test]
+    fn scheduled_task_create_requires_existing_prompt_fields() {
+        let instructions = normalize_task_instructions(Vec::new(), TaskTriggerKind::Cron)
+            .expect_err("scheduled task should require instructions");
+        assert!(instructions.to_string().contains("`instructions`"));
+
+        let output = normalize_task_output_instructions(None, TaskTriggerKind::Cron)
+            .expect_err("scheduled task should require output instructions");
+        assert!(output.to_string().contains("`outputInstructions`"));
+    }
+
+    #[test]
+    fn scheduled_task_create_compiles_runtime_capability_guidance() {
+        let instructions = normalize_task_instructions(
+            vec![
+                "Use an available weather or forecast capability for the requested city."
+                    .to_owned(),
+                "If forecast data is unavailable, report a clear failure.".to_owned(),
+            ],
+            TaskTriggerKind::Cron,
+        )
+        .expect("scheduled task instructions should normalize");
+        let rendered = instructions.join("\n");
+        assert!(rendered.contains("durable task"));
+        assert!(rendered.contains("currently available tools, skills, MCP servers"));
+        assert!(rendered.contains("unavailable at run time"));
+        assert!(rendered.contains("weather or forecast capability"));
+    }
+
+    #[test]
+    fn immediate_task_create_can_omit_instructions_for_concise_default() {
+        let instructions = normalize_task_instructions(Vec::new(), TaskTriggerKind::Immediate)
+            .expect("immediate task should keep concise default");
+        assert_eq!(instructions, vec!["Return a concise final result."]);
+        let output = normalize_task_output_instructions(None, TaskTriggerKind::Immediate)
+            .expect("immediate task should not require output instructions");
+        assert_eq!(output, None);
     }
 
     #[test]
