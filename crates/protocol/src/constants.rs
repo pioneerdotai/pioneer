@@ -47,6 +47,7 @@ pub mod methods {
     pub const TASK_EVENTS: &str = "task/events";
     pub const TASK_WAIT: &str = "task/wait";
     pub const TASK_CANCEL: &str = "task/cancel";
+    pub const TASK_UPDATE: &str = "task/update";
     pub const TASK_RESCHEDULE: &str = "task/reschedule";
     pub const TASK_DETACH: &str = "task/detach";
     pub const TASK_PAUSE: &str = "task/pause";
@@ -135,6 +136,7 @@ pub mod events {
     pub const TASK_FAILED: &str = "task/failed";
     pub const TASK_CANCELLED: &str = "task/cancelled";
     pub const TASK_DETACHED: &str = "task/detached";
+    pub const TASK_UPDATED: &str = "task/updated";
     pub const TASK_RESCHEDULED: &str = "task/rescheduled";
     pub const TASK_TREE_CHANGED: &str = "task/tree/changed";
     pub const TASK_RECOVERED: &str = "task/recovered";

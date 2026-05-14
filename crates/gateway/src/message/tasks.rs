@@ -200,6 +200,32 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            TaskEventPayload::TaskUpdated {
+                task,
+                trigger,
+                agent_spec,
+                changed_fields,
+                ..
+            } => {
+                self.send_notification_to_workspace_connections(
+                    workspace_id.as_str(),
+                    events::TASK_UPDATED,
+                    &pioneer_protocol::TaskUpdatedNotification {
+                        context: context.clone(),
+                        task,
+                        trigger,
+                        agent_spec,
+                        changed_fields,
+                    },
+                )
+                .await;
+                self.send_notification_to_workspace_connections(
+                    workspace_id.as_str(),
+                    events::TASK_TREE_CHANGED,
+                    &pioneer_protocol::TaskTreeChangedNotification { context },
+                )
+                .await;
+            }
             TaskEventPayload::TaskRescheduled { trigger, .. } => {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
@@ -540,6 +566,7 @@ fn should_refresh_parent_task_anchor(payload: &TaskEventPayload) -> bool {
             | TaskEventPayload::TaskFailed { .. }
             | TaskEventPayload::TaskCancelled { .. }
             | TaskEventPayload::TaskDetached { .. }
+            | TaskEventPayload::TaskUpdated { .. }
             | TaskEventPayload::TaskRescheduled { .. }
             | TaskEventPayload::TaskPaused { .. }
             | TaskEventPayload::TaskResumed { .. }

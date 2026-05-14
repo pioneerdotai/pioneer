@@ -20,7 +20,7 @@ use crate::{
     TaskRecoveredNotification, TaskRescheduledNotification, TaskResumedNotification,
     TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunFailedNotification,
     TaskRunStartedNotification, TaskScheduledNotification,
-    TaskTreeChangedNotification as TaskTreeChangedTaskNotification,
+    TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
     ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
     ThreadUpdatedNotification, TurnCompletedNotification, TurnFailedNotification,
@@ -99,6 +99,7 @@ pub enum GatewayNotification {
     TaskFailed(TaskFailedNotification),
     TaskCancelled(TaskCancelledNotification),
     TaskDetached(TaskDetachedNotification),
+    TaskUpdated(TaskUpdatedNotification),
     TaskRescheduled(TaskRescheduledNotification),
     TaskPaused(TaskPausedNotification),
     TaskResumed(TaskResumedNotification),
@@ -367,6 +368,9 @@ impl GatewayNotification {
             events::TASK_DETACHED => serde_json::from_value::<TaskDetachedNotification>(params)
                 .ok()
                 .map(Self::TaskDetached),
+            events::TASK_UPDATED => serde_json::from_value::<TaskUpdatedNotification>(params)
+                .ok()
+                .map(Self::TaskUpdated),
             events::TASK_RESCHEDULED => {
                 serde_json::from_value::<TaskRescheduledNotification>(params)
                     .ok()

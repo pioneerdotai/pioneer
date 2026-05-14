@@ -13,8 +13,8 @@ use pioneer_protocol::{
     TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
     TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
     TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTurnItem, TaskWaitMode, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
-    constants::events,
+    TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus,
+    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -30,6 +30,7 @@ use std::sync::{Arc, Weak};
 const TASK_CREATE_TOOL: &str = "task_create";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_CANCEL_TOOL: &str = "task_cancel";
+const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
 const TASK_LIST_TOOL: &str = "task_list";
 const TASK_GET_TOOL: &str = "task_get";
@@ -223,6 +224,7 @@ impl ToolHandler for TaskToolHandler {
             TASK_CREATE_TOOL => self.handle_create(invocation).await,
             TASK_WAIT_TOOL => self.handle_wait(invocation).await,
             TASK_CANCEL_TOOL => self.handle_cancel(invocation).await,
+            TASK_UPDATE_TOOL => self.handle_update(invocation).await,
             TASK_DETACH_TOOL => self.handle_detach(invocation).await,
             TASK_LIST_TOOL => self.handle_list(invocation).await,
             TASK_GET_TOOL => self.handle_get(invocation).await,
@@ -347,6 +349,22 @@ impl TaskToolHandler {
         Ok(function_output(
             json!({ "task": task_summary(&response.task) }),
         ))
+    }
+
+    async fn handle_update(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskUpdateToolInput = decode_tool_args(invocation)?;
+        let params = self.update_params(input).await?;
+        let response = self
+            .processor
+            .task_runtime
+            .service()
+            .update_task(pioneer_tasks::TaskMutationContext::default(), params)
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        Ok(function_output(task_update_tool_output(&response)))
     }
 
     async fn handle_detach(
@@ -520,17 +538,11 @@ impl TaskToolHandler {
         let instructions = normalize_task_instructions(input.instructions, trigger_kind)?;
         let output_instructions =
             normalize_task_output_instructions(input.output_instructions, trigger_kind)?;
+        let prompt_input = merge_task_agent_input(input.input_text, input.input)?;
         let prompt = TaskAgentPrompt {
             goal: goal.clone(),
             instructions,
-            input: input.input.or_else(|| {
-                input.input_text.map(|text| TaskAgentInput {
-                    text: Some(text),
-                    variables: Vec::new(),
-                    attachments: Vec::new(),
-                    references: Vec::new(),
-                })
-            }),
+            input: prompt_input,
             output_instructions,
         };
         let agent_spec = (executor_kind == TaskExecutorKind::Agent).then_some(TaskAgentSpecInput {
@@ -565,6 +577,94 @@ impl TaskToolHandler {
             concurrency_policy: input.concurrency_policy,
             metadata: input.metadata,
         })
+    }
+
+    async fn update_params(
+        &self,
+        input: TaskUpdateToolInput,
+    ) -> Result<TaskUpdateParams, ToolError> {
+        if !input.has_patch_fields() {
+            return Err(ToolError::invalid_arguments(
+                "`task_update` requires at least one field to change",
+            ));
+        }
+        if input.clear_input && (input.input_text.is_some() || input.input.is_some()) {
+            return Err(ToolError::invalid_arguments(
+                "`task_update` cannot clear and set input in the same request",
+            ));
+        }
+
+        let task_id = validate_entity_id(input.task_id, "taskId")?;
+        let trigger = input
+            .trigger
+            .map(TaskTriggerToolInput::into_trigger_input)
+            .transpose()?;
+        let trigger_kind = match trigger.as_ref() {
+            Some(trigger) => trigger.spec.kind(),
+            None => self.current_task_trigger_kind(task_id.as_str()).await?,
+        };
+        let instructions = input
+            .instructions
+            .map(|instructions| normalize_task_instructions(instructions, trigger_kind))
+            .transpose()?;
+        let output_instructions = input
+            .output_instructions
+            .map(Some)
+            .map(|output| normalize_task_output_instructions(output, trigger_kind))
+            .transpose()?
+            .flatten();
+        let merged_input = merge_task_agent_input(input.input_text, input.input)?;
+
+        Ok(TaskUpdateParams {
+            task_id,
+            expected_revision: input.expected_revision,
+            title: input.title,
+            goal: input.goal,
+            priority: input.priority,
+            trigger,
+            agent_role: input.agent_role,
+            agent_nickname: input.agent_nickname,
+            instructions,
+            input_text: None,
+            input: merged_input,
+            output_instructions,
+            context_policy: input.context_policy,
+            tool_policy: input.tool_policy,
+            result_contract: input.result_contract,
+            lifecycle_policy: input.lifecycle_policy,
+            delivery_policy: input.delivery_policy,
+            retry_policy: input.retry_policy,
+            timeout_policy: input.timeout_policy,
+            concurrency_policy: input.concurrency_policy,
+            metadata: input.metadata,
+            clear_agent_role: input.clear_agent_role,
+            clear_agent_nickname: input.clear_agent_nickname,
+            clear_input: input.clear_input,
+            clear_output_instructions: input.clear_output_instructions,
+            clear_context_policy: input.clear_context_policy,
+            clear_tool_policy: input.clear_tool_policy,
+            clear_result_contract: input.clear_result_contract,
+            clear_timeout_policy: input.clear_timeout_policy,
+            clear_concurrency_policy: input.clear_concurrency_policy,
+            clear_metadata: input.clear_metadata,
+        })
+    }
+
+    async fn current_task_trigger_kind(&self, task_id: &str) -> Result<TaskTriggerKind, ToolError> {
+        let response = self
+            .processor
+            .task_runtime
+            .service()
+            .get_task(TaskGetParams {
+                task_id: task_id.to_owned(),
+            })
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        Ok(response
+            .triggers
+            .last()
+            .map(TaskTrigger::kind)
+            .unwrap_or(TaskTriggerKind::Immediate))
     }
 
     async fn persist_task_anchor(&self, task_id: &str) -> Result<TaskTurnItem, ToolError> {
@@ -917,6 +1017,139 @@ impl TaskCancelToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_update. Patch only the fields that should change; omitted fields keep their current value. Use clear* flags to explicitly remove optional values.
+struct TaskUpdateToolInput {
+    /// Task id to update. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional optimistic-concurrency guard. If supplied, the task service rejects the update when the current revision differs.
+    expected_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement task title. For child agents this is also the human-facing task label.
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement short objective. Keep durable execution steps in instructions.
+    goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement scheduling priority.
+    priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement trigger. Use this object directly; do not wrap it in spec. For daily scheduled work use {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    trigger: Option<TaskTriggerToolInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement role label for an agent task.
+    agent_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement display name for an agent task.
+    agent_nickname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement self-contained executor instructions. For scheduled, interval, and cron tasks these must describe future-run behavior, runtime capability selection, and failure conditions.
+    instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement plain text task input and parameters. Prefer inputText over input for simple updates.
+    input_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement structured task input with variables, attachments, and references.
+    input: Option<TaskAgentInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement final result format and delivery contract. Required by the service for scheduled, interval, and cron agent tasks.
+    output_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement advanced context policy.
+    context_policy: Option<TaskAgentContextPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement advanced tool policy.
+    tool_policy: Option<pioneer_protocol::TaskAgentToolPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement result contract.
+    result_contract: Option<TaskAgentResultContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement lifecycle policy.
+    lifecycle_policy: Option<TaskLifecyclePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement delivery policy.
+    delivery_policy: Option<TaskDeliveryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement retry policy.
+    retry_policy: Option<TaskRetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement timeout policy.
+    timeout_policy: Option<TaskTimeoutPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement concurrency policy.
+    concurrency_policy: Option<pioneer_protocol::TaskConcurrencyPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Replacement labels or structured metadata.
+    metadata: Option<TaskMetadata>,
+    #[serde(default)]
+    /// Clear the agent role.
+    clear_agent_role: bool,
+    #[serde(default)]
+    /// Clear the agent nickname.
+    clear_agent_nickname: bool,
+    #[serde(default)]
+    /// Clear agent input.
+    clear_input: bool,
+    #[serde(default)]
+    /// Clear output instructions. Scheduled, interval, and cron agent tasks cannot remain without output instructions.
+    clear_output_instructions: bool,
+    #[serde(default)]
+    /// Clear context policy.
+    clear_context_policy: bool,
+    #[serde(default)]
+    /// Clear tool policy.
+    clear_tool_policy: bool,
+    #[serde(default)]
+    /// Clear result contract.
+    clear_result_contract: bool,
+    #[serde(default)]
+    /// Clear timeout policy.
+    clear_timeout_policy: bool,
+    #[serde(default)]
+    /// Clear concurrency policy.
+    clear_concurrency_policy: bool,
+    #[serde(default)]
+    /// Clear metadata.
+    clear_metadata: bool,
+}
+
+impl TaskUpdateToolInput {
+    fn has_patch_fields(&self) -> bool {
+        self.title.is_some()
+            || self.goal.is_some()
+            || self.priority.is_some()
+            || self.trigger.is_some()
+            || self.agent_role.is_some()
+            || self.agent_nickname.is_some()
+            || self.instructions.is_some()
+            || self.input_text.is_some()
+            || self.input.is_some()
+            || self.output_instructions.is_some()
+            || self.context_policy.is_some()
+            || self.tool_policy.is_some()
+            || self.result_contract.is_some()
+            || self.lifecycle_policy.is_some()
+            || self.delivery_policy.is_some()
+            || self.retry_policy.is_some()
+            || self.timeout_policy.is_some()
+            || self.concurrency_policy.is_some()
+            || self.metadata.is_some()
+            || self.clear_agent_role
+            || self.clear_agent_nickname
+            || self.clear_input
+            || self.clear_output_instructions
+            || self.clear_context_policy
+            || self.clear_tool_policy
+            || self.clear_result_contract
+            || self.clear_timeout_policy
+            || self.clear_concurrency_policy
+            || self.clear_metadata
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_get and task_detach.
 struct TaskIdToolInput {
     /// Task id. Pioneer entity ids are exactly 21 characters.
@@ -1058,6 +1291,12 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
             safe_mutation_recovery(),
         ),
         task_tool_spec(
+            TASK_UPDATE_TOOL,
+            "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}.",
+            task_update_schema(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_DETACH_TOOL,
             "Detach a task from the current parent turn so it no longer blocks parent completion.",
             task_id_schema(),
@@ -1140,6 +1379,10 @@ fn task_cancel_schema() -> JsonValue {
     tool_input_schema::<TaskCancelToolInput>()
 }
 
+fn task_update_schema() -> JsonValue {
+    tool_input_schema::<TaskUpdateToolInput>()
+}
+
 fn task_id_schema() -> JsonValue {
     tool_input_schema::<TaskIdToolInput>()
 }
@@ -1206,6 +1449,9 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         }
         TASK_RESCHEDULE_TOOL => {
             "Expected: {\"taskId\":\"<21-char task id>\",\"trigger\":{\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"}} or kind \"cron\" with cronExpr/timezone; do not use trigger.spec."
+        }
+        TASK_UPDATE_TOOL => {
+            "Expected: {\"taskId\":\"<21-char task id>\",\"instructions\":[\"self-contained future-run instruction\"],\"inputText\":\"updated task data\",\"outputInstructions\":\"final result format\"} or include trigger directly; do not use trigger.spec. Omitted fields stay unchanged; use clear* flags to remove optional values."
         }
         TASK_WAIT_TOOL => {
             "Expected: {\"taskIds\":[\"<21-char task id>\"],\"timeoutMs\":180000}. Use taskIds or runIds, not a single taskId."
@@ -1301,6 +1547,46 @@ fn normalize_task_output_instructions(
         ));
     }
     Ok(output_instructions)
+}
+
+fn merge_task_agent_input(
+    input_text: Option<String>,
+    input: Option<TaskAgentInput>,
+) -> Result<Option<TaskAgentInput>, ToolError> {
+    let input_text = input_text
+        .map(|value| required_tool_string(Some(value.as_str()), "inputText"))
+        .transpose()?;
+    let mut input = input.map(normalize_task_agent_input);
+    if let Some(input_text) = input_text {
+        match input.as_mut() {
+            Some(input) => match input.text.as_deref() {
+                Some(existing) if existing == input_text => {}
+                Some(existing) => {
+                    return Err(ToolError::invalid_arguments(format!(
+                        "`inputText` conflicts with `input.text`: got different values `{input_text}` and `{existing}`"
+                    )));
+                }
+                None => input.text = Some(input_text),
+            },
+            None => {
+                input = Some(TaskAgentInput {
+                    text: Some(input_text),
+                    variables: Vec::new(),
+                    attachments: Vec::new(),
+                    references: Vec::new(),
+                });
+            }
+        }
+    }
+    Ok(input)
+}
+
+fn normalize_task_agent_input(mut input: TaskAgentInput) -> TaskAgentInput {
+    input.text = input
+        .text
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    input
 }
 
 fn requires_durable_agent_prompt(kind: TaskTriggerKind) -> bool {
@@ -1641,6 +1927,16 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
     })
 }
 
+fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
+    json!({
+        "task": task_summary(&response.task),
+        "changedFields": &response.changed_fields,
+        "trigger": &response.trigger,
+        "agentSpec": &response.agent_spec,
+        "revision": response.task.revision,
+    })
+}
+
 fn task_wait_tool_output(
     response: &pioneer_protocol::TaskWaitResponse,
     signature: &TaskWaitSignature,
@@ -1950,6 +2246,19 @@ mod tests {
             reschedule_schema.contains("do not wrap it in spec"),
             "task_reschedule schema should steer the model away from trigger.spec, got: {reschedule_schema}"
         );
+
+        let update_schema = task_update_schema().to_string();
+        for expected in [
+            "Patch only the fields",
+            "clear* flags",
+            "self-contained executor instructions",
+            "do not wrap it in spec",
+        ] {
+            assert!(
+                update_schema.contains(expected),
+                "task_update schema should include guidance `{expected}`, got: {update_schema}"
+            );
+        }
     }
 
     #[test]
@@ -2000,6 +2309,76 @@ mod tests {
             message.contains("do not use trigger.spec"),
             "decode error should include the model-facing trigger contract, got: {message}"
         );
+    }
+
+    #[test]
+    fn task_update_decode_error_points_model_away_from_internal_trigger_spec() {
+        let error = decode_tool_args::<TaskUpdateToolInput>(task_tool_invocation(
+            TASK_UPDATE_TOOL,
+            json!({
+                "taskId": "123456789012345678901",
+                "trigger": {
+                    "spec": {
+                        "kind": "cron",
+                        "cronExpr": "0 7 * * *",
+                        "timezone": "Europe/Moscow"
+                    }
+                }
+            }),
+        ))
+        .expect_err("internal trigger spec wrapper should be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("do not use trigger.spec"),
+            "decode error should include the model-facing update trigger contract, got: {message}"
+        );
+    }
+
+    #[test]
+    fn task_update_tool_input_requires_a_patch_field() {
+        let input: TaskUpdateToolInput = serde_json::from_value(json!({
+            "taskId": "123456789012345678901"
+        }))
+        .expect("task_update input should decode");
+        assert!(!input.has_patch_fields());
+
+        let input: TaskUpdateToolInput = serde_json::from_value(json!({
+            "taskId": "123456789012345678901",
+            "clearInput": true
+        }))
+        .expect("task_update clear patch should decode");
+        assert!(input.has_patch_fields());
+    }
+
+    #[test]
+    fn task_agent_input_merges_input_text_with_structured_input() {
+        let merged = merge_task_agent_input(
+            Some("city=Moscow".to_owned()),
+            Some(TaskAgentInput {
+                text: None,
+                variables: vec![pioneer_protocol::TaskAgentInputVariable {
+                    name: "units".to_owned(),
+                    value: pioneer_protocol::TaskValue::String("metric".to_owned()),
+                }],
+                attachments: Vec::new(),
+                references: Vec::new(),
+            }),
+        )
+        .expect("inputText should fill missing input.text")
+        .expect("merged input should exist");
+        assert_eq!(merged.text.as_deref(), Some("city=Moscow"));
+        assert_eq!(merged.variables.len(), 1);
+
+        merge_task_agent_input(
+            Some("city=Moscow".to_owned()),
+            Some(TaskAgentInput {
+                text: Some("city=Berlin".to_owned()),
+                variables: Vec::new(),
+                attachments: Vec::new(),
+                references: Vec::new(),
+            }),
+        )
+        .expect_err("conflicting inputText and input.text should be rejected");
     }
 
     #[test]

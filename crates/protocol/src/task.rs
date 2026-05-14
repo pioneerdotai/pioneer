@@ -973,6 +973,16 @@ pub enum TaskEventPayload {
         task: Task,
         detached_at: i64,
     },
+    TaskUpdated {
+        task: Task,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<TaskTrigger>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_spec: Option<TaskAgentSpec>,
+        #[serde(default)]
+        changed_fields: Vec<String>,
+        updated_at: i64,
+    },
     TaskRescheduled {
         task_id: String,
         trigger: TaskTrigger,
@@ -1058,6 +1068,7 @@ impl TaskEventPayload {
             Self::TriggerCreated { trigger } => trigger.task_id.as_str(),
             Self::DependencyCreated { dependency } => dependency.task_id.as_str(),
             Self::AgentSpecCreated { agent_spec } => agent_spec.task_id.as_str(),
+            Self::TaskUpdated { task, .. } => task.id.as_str(),
             Self::TaskScheduled { task_id, .. }
             | Self::TaskQueued { task_id, .. }
             | Self::RunStarted { task_id, .. }
@@ -1095,6 +1106,7 @@ impl TaskEventPayload {
             | Self::TriggerCreated { .. }
             | Self::DependencyCreated { .. }
             | Self::AgentSpecCreated { .. }
+            | Self::TaskUpdated { .. }
             | Self::TaskScheduled { .. }
             | Self::TaskRescheduled { .. }
             | Self::TaskPaused { .. }
@@ -1169,6 +1181,7 @@ impl TaskEventPayload {
             Self::TaskFailed { .. } => events::TASK_FAILED,
             Self::TaskCancelled { .. } => events::TASK_CANCELLED,
             Self::TaskDetached { .. } => events::TASK_DETACHED,
+            Self::TaskUpdated { .. } => events::TASK_UPDATED,
             Self::TaskRescheduled { .. } => events::TASK_RESCHEDULED,
             Self::TaskPaused { .. } => events::TASK_PAUSED,
             Self::TaskResumed { .. } => events::TASK_RESUMED,
@@ -1278,6 +1291,84 @@ pub struct TaskCreateResponse {
     pub run: Option<TaskRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_spec: Option<TaskAgentSpec>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TaskTriggerInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<TaskAgentInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<TaskAgentContextPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<TaskAgentToolPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_contract: Option<TaskAgentResultContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_policy: Option<TaskLifecyclePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_policy: Option<TaskDeliveryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<TaskRetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_policy: Option<TaskTimeoutPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_policy: Option<TaskConcurrencyPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<TaskMetadata>,
+    #[serde(default)]
+    pub clear_agent_role: bool,
+    #[serde(default)]
+    pub clear_agent_nickname: bool,
+    #[serde(default)]
+    pub clear_input: bool,
+    #[serde(default)]
+    pub clear_output_instructions: bool,
+    #[serde(default)]
+    pub clear_context_policy: bool,
+    #[serde(default)]
+    pub clear_tool_policy: bool,
+    #[serde(default)]
+    pub clear_result_contract: bool,
+    #[serde(default)]
+    pub clear_timeout_policy: bool,
+    #[serde(default)]
+    pub clear_concurrency_policy: bool,
+    #[serde(default)]
+    pub clear_metadata: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateResponse {
+    pub task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TaskTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spec: Option<TaskAgentSpec>,
+    #[serde(default)]
+    pub changed_fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
@@ -1699,6 +1790,19 @@ pub struct TaskCancelledNotification {
 pub struct TaskDetachedNotification {
     pub context: TaskNotificationContext,
     pub task: Task,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdatedNotification {
+    pub context: TaskNotificationContext,
+    pub task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TaskTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spec: Option<TaskAgentSpec>,
+    #[serde(default)]
+    pub changed_fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

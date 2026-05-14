@@ -7,14 +7,15 @@ use async_trait::async_trait;
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
-    TaskAgentPrompt, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
-    TaskAttachmentMode, TaskCancelParams, TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy,
-    TaskCreateParams, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryPolicy,
-    TaskDeliveryStatus, TaskDetachParams, TaskError, TaskErrorClass, TaskEventPayload,
-    TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult, TaskResumeParams,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitMode, TaskWaitParams,
+    TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentSpecInput,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCancelParams,
+    TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskDeliveriesParams,
+    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
+    TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
+    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
+    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue,
+    TaskWaitMode, TaskWaitParams,
 };
 use sea_orm::Database;
 use std::sync::Arc;
@@ -1027,6 +1028,161 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
         .create_task(TaskCreateContext::default(), valid)
         .await
         .expect("scheduled agent task should accept a durable prompt contract");
+}
+
+#[tokio::test]
+async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 7 * * *".to_owned(),
+        timezone: "Europe/Moscow".to_owned(),
+    });
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.prompt.instructions = vec![
+        "Use currently available runtime capabilities by capability.".to_owned(),
+        "Fail clearly when required data is unavailable.".to_owned(),
+    ];
+    spec.prompt.output_instructions =
+        Some("Return markdown with result fields or a clear failure reason.".to_owned());
+    params.agent_spec = Some(spec);
+    let created = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("scheduled agent task should create");
+
+    let updated = runtime
+        .service()
+        .update_task(
+            TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: created.task.id.clone(),
+                expected_revision: Some(created.task.revision),
+                title: Some("Updated task".to_owned()),
+                goal: Some("Run the updated task".to_owned()),
+                trigger: Some(TaskTriggerInput {
+                    spec: TaskTriggerSpec::Cron {
+                        cron_expr: "15 8 * * *".to_owned(),
+                        timezone: "Europe/Moscow".to_owned(),
+                    },
+                }),
+                instructions: Some(vec![
+                    "Use currently available runtime capabilities by capability.".to_owned(),
+                    "Report unavailable required data as an explicit failure.".to_owned(),
+                ]),
+                input_text: Some("city=Moscow".to_owned()),
+                input: Some(TaskAgentInput {
+                    text: None,
+                    variables: vec![TaskAgentInputVariable {
+                        name: "units".to_owned(),
+                        value: TaskValue::String("metric".to_owned()),
+                    }],
+                    attachments: Vec::new(),
+                    references: Vec::new(),
+                }),
+                output_instructions: Some("Return concise markdown.".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("task update should succeed");
+
+    assert_eq!(updated.task.title, "Updated task");
+    assert_eq!(updated.task.goal, "Run the updated task");
+    assert_eq!(updated.task.revision, created.task.revision + 1);
+    assert!(updated.changed_fields.contains(&"trigger".to_owned()));
+    assert!(updated.changed_fields.contains(&"instructions".to_owned()));
+    let updated_trigger = updated.trigger.expect("trigger should be updated");
+    assert_eq!(
+        updated_trigger.spec,
+        TaskTriggerSpec::Cron {
+            cron_expr: "15 8 * * *".to_owned(),
+            timezone: "Europe/Moscow".to_owned(),
+        }
+    );
+    let updated_agent_spec = updated.agent_spec.expect("agent spec should be updated");
+    assert_eq!(updated_agent_spec.prompt.goal, "Run the updated task");
+    assert_eq!(
+        updated_agent_spec
+            .prompt
+            .input
+            .as_ref()
+            .and_then(|input| input.text.as_deref()),
+        Some("city=Moscow")
+    );
+    assert_eq!(
+        updated_agent_spec
+            .prompt
+            .input
+            .as_ref()
+            .map(|input| input.variables.len()),
+        Some(1)
+    );
+
+    let fetched = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .expect("updated task should read");
+    assert_eq!(fetched.task.title, "Updated task");
+    assert_eq!(
+        fetched
+            .agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.is_none())
+            .expect("base spec should exist")
+            .prompt
+            .output_instructions
+            .as_deref(),
+        Some("Return concise markdown.")
+    );
+    assert!(
+        fetched
+            .triggers
+            .last()
+            .expect("trigger should exist")
+            .next_fire_at
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn update_task_rejects_scheduled_agent_without_prompt_contract() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(3));
+    let created = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("immediate agent task should create");
+
+    let error = runtime
+        .service()
+        .update_task(
+            TaskMutationContext::default(),
+            TaskUpdateParams {
+                task_id: created.task.id,
+                trigger: Some(TaskTriggerInput {
+                    spec: TaskTriggerSpec::Cron {
+                        cron_expr: "0 7 * * *".to_owned(),
+                        timezone: "Europe/Moscow".to_owned(),
+                    },
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("scheduled update should validate final prompt");
+    assert!(
+        format!("{error:#}").contains("self-contained executor instructions"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]

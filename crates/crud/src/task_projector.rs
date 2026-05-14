@@ -259,6 +259,24 @@ impl TaskProjector {
                 }
                 task::upsert_task(db, task_model).await
             }
+            TaskEventPayload::TaskUpdated {
+                task: task_model,
+                trigger,
+                agent_spec,
+                ..
+            } => {
+                if task_is_terminal_db(db, task_model.id.as_str()).await? {
+                    return Ok(());
+                }
+                task::upsert_task(db, task_model).await?;
+                if let Some(trigger) = trigger {
+                    task_trigger::upsert_trigger(db, trigger).await?;
+                }
+                if let Some(agent_spec) = agent_spec {
+                    task_agent_spec::upsert_agent_spec(db, agent_spec).await?;
+                }
+                Ok(())
+            }
             TaskEventPayload::TaskRescheduled { trigger, .. } => {
                 task_trigger::upsert_trigger(db, trigger).await?;
                 if task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await? {

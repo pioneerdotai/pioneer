@@ -107,9 +107,10 @@ use crate::{
     TaskScheduledNotification, TaskSchema, TaskStatus, TaskTimeoutPolicy, TaskTree,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskTreeParams,
     TaskTreeResponse, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitItem, TaskWaitParams, TaskWaitResponse,
-    TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, TextElement,
-    Thread, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
+    TaskValue, TaskWaitItem, TaskWaitParams, TaskWaitResponse, TaskWriteLock,
+    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, TextElement, Thread,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
     ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
@@ -660,6 +661,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("task_events_response.json", TaskEventsResponse),
         schema_doc!("task_cancel_params.json", TaskCancelParams),
         schema_doc!("task_cancel_response.json", TaskCancelResponse),
+        schema_doc!("task_update_params.json", TaskUpdateParams),
+        schema_doc!("task_update_response.json", TaskUpdateResponse),
         schema_doc!("task_reschedule_params.json", TaskRescheduleParams),
         schema_doc!("task_reschedule_response.json", TaskRescheduleResponse),
         schema_doc!("task_pause_params.json", TaskPauseParams),
@@ -711,6 +714,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             TaskCancelledNotification
         ),
         schema_doc!("task_detached_notification.json", TaskDetachedNotification),
+        schema_doc!("task_updated_notification.json", TaskUpdatedNotification),
         schema_doc!(
             "task_rescheduled_notification.json",
             TaskRescheduledNotification

@@ -133,9 +133,9 @@ pub use task::{
     TaskRunStartedNotification, TaskRunStatus, TaskScheduledNotification, TaskSchema, TaskStatus,
     TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification, TaskTreeParams, TaskTreeResponse,
     TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus,
-    TaskTurnItem, TaskValue, TaskWaitItem, TaskWaitMode, TaskWaitParams, TaskWaitResponse,
-    TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus,
-    ThreadLineage,
+    TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification, TaskValue,
+    TaskWaitItem, TaskWaitMode, TaskWaitParams, TaskWaitResponse, TaskWriteLock,
+    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
 };
 pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadFolder,

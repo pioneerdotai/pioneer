@@ -359,6 +359,7 @@ impl TaskEventPayload {
             | Self::TaskFailed { .. }
             | Self::TaskCancelled { .. }
             | Self::TaskDetached { .. }
+            | Self::TaskUpdated { .. }
             | Self::TaskRescheduled { .. }
             | Self::TaskPaused { .. }
             | Self::TaskResumed { .. }

@@ -14,7 +14,7 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
 use pioneer_crud::{AppendedTaskEvent, CrudStore};
 use pioneer_protocol::{
-    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec, TaskAgentWriteMode,
+    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpec, TaskAgentWriteMode,
     TaskAttachmentMode, TaskCancelParams, TaskCancelResponse, TaskCancelScope,
     TaskConcurrencyConflictPolicy, TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams,
     TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskDeliveryAttemptStatus,
@@ -24,9 +24,9 @@ use pioneer_protocol::{
     TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse,
     TaskRescheduleParams, TaskRescheduleResponse, TaskResumeParams, TaskResumeResponse, TaskRun,
     TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams, TaskTreeResponse, TaskTrigger,
-    TaskTriggerKind, TaskTriggerStatus, TaskWaitItem, TaskWaitMode, TaskWaitParams,
-    TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
-    TaskWriteLockStatus, generate_id,
+    TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse, TaskWaitItem,
+    TaskWaitMode, TaskWaitParams, TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict,
+    TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use std::collections::VecDeque;
 use std::path::{Component, Path};
@@ -506,6 +506,364 @@ impl TaskService {
             .await?;
         self.publish_and_wake(vec![appended]).await;
         Ok(TaskDetachResponse { task })
+    }
+
+    pub async fn update_task(
+        &self,
+        _context: TaskMutationContext,
+        params: TaskUpdateParams,
+    ) -> TaskRuntimeResult<TaskUpdateResponse> {
+        validate_update_params(&params)?;
+        let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
+            bail!("task `{}` not found", params.task_id);
+        };
+        if is_terminal_task(response.task.status) {
+            bail!("terminal task `{}` cannot be updated", params.task_id);
+        }
+        if let Some(expected_revision) = params.expected_revision
+            && response.task.revision != expected_revision
+        {
+            bail!(
+                "task `{}` revision mismatch: expected {}, got {}",
+                params.task_id,
+                expected_revision,
+                response.task.revision
+            );
+        }
+
+        let now = now_timestamp_secs();
+        let wants_agent_update = update_has_agent_patch(&params);
+        let mut task = response.task.clone();
+        let mut changed_fields = Vec::new();
+
+        if let Some(title) = params.title {
+            let title = required_trimmed(&title, "title")?;
+            set_changed(&mut task.title, title, "title", &mut changed_fields);
+        }
+        if let Some(goal) = params.goal {
+            let goal = required_trimmed(&goal, "goal")?;
+            set_changed(&mut task.goal, goal, "goal", &mut changed_fields);
+        }
+        if let Some(priority) = params.priority {
+            set_changed(
+                &mut task.priority,
+                priority,
+                "priority",
+                &mut changed_fields,
+            );
+        }
+        if let Some(policy) = params.lifecycle_policy {
+            set_option_changed(
+                &mut task.lifecycle_policy,
+                Some(policy),
+                "lifecyclePolicy",
+                &mut changed_fields,
+            );
+        }
+        if let Some(policy) = params.delivery_policy {
+            validate_delivery_policy(&policy)?;
+            set_option_changed(
+                &mut task.delivery_policy,
+                Some(policy),
+                "deliveryPolicy",
+                &mut changed_fields,
+            );
+        }
+        if let Some(policy) = params.retry_policy {
+            set_option_changed(
+                &mut task.retry_policy,
+                Some(policy),
+                "retryPolicy",
+                &mut changed_fields,
+            );
+        }
+        if params.clear_timeout_policy {
+            set_option_changed(
+                &mut task.timeout_policy,
+                None,
+                "timeoutPolicy",
+                &mut changed_fields,
+            );
+        } else if let Some(policy) = params.timeout_policy {
+            set_option_changed(
+                &mut task.timeout_policy,
+                Some(policy),
+                "timeoutPolicy",
+                &mut changed_fields,
+            );
+        }
+        if params.clear_concurrency_policy {
+            set_option_changed(
+                &mut task.concurrency_policy,
+                None,
+                "concurrencyPolicy",
+                &mut changed_fields,
+            );
+        } else if let Some(policy) = params.concurrency_policy {
+            set_option_changed(
+                &mut task.concurrency_policy,
+                Some(policy),
+                "concurrencyPolicy",
+                &mut changed_fields,
+            );
+        }
+        if params.clear_metadata {
+            set_option_changed(&mut task.metadata, None, "metadata", &mut changed_fields);
+        } else if let Some(metadata) = params.metadata {
+            set_option_changed(
+                &mut task.metadata,
+                Some(metadata),
+                "metadata",
+                &mut changed_fields,
+            );
+        }
+
+        let current_trigger = response.triggers.last().cloned();
+        let mut updated_trigger = None;
+        if let Some(trigger_input) = params.trigger {
+            TaskTriggerCalculator::validate(&trigger_input.spec)?;
+            let mut trigger = current_trigger.clone().unwrap_or_else(|| TaskTrigger {
+                id: generate_id(ID_LEN),
+                task_id: task.id.clone(),
+                status: TaskTriggerStatus::Active,
+                spec: trigger_input.spec.clone(),
+                next_fire_at: None,
+                last_fire_at: None,
+                created_at: now,
+                updated_at: now,
+            });
+            let next_fire_at =
+                TaskTriggerCalculator::initial_next_fire_at(&trigger_input.spec, now)?;
+            let changed = trigger.spec != trigger_input.spec
+                || trigger.status != TaskTriggerStatus::Active
+                || trigger.next_fire_at != next_fire_at;
+            if changed {
+                trigger.spec = trigger_input.spec;
+                trigger.status = TaskTriggerStatus::Active;
+                trigger.next_fire_at = next_fire_at;
+                trigger.updated_at = now;
+                push_changed(&mut changed_fields, "trigger");
+                updated_trigger = Some(trigger);
+            }
+        }
+
+        let final_trigger_kind = updated_trigger
+            .as_ref()
+            .or(current_trigger.as_ref())
+            .map(TaskTrigger::kind)
+            .unwrap_or(TaskTriggerKind::Immediate);
+        let mut updated_agent_spec = None;
+        let task_goal_changed = changed_fields.iter().any(|field| field == "goal");
+        let existing_base_agent_spec = response
+            .agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.is_none())
+            .cloned();
+        let materialized_base_agent_spec = existing_base_agent_spec.is_none()
+            && matches!(
+                final_trigger_kind,
+                TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+            );
+        let base_agent_spec = existing_base_agent_spec.or_else(|| {
+            response
+                .agent_specs
+                .iter()
+                .rev()
+                .next()
+                .cloned()
+                .map(|mut spec| {
+                    spec.id = generate_id(ID_LEN);
+                    spec.run_id = None;
+                    spec.created_at = now;
+                    spec.updated_at = now;
+                    spec
+                })
+        });
+
+        if task.executor_kind != TaskExecutorKind::Agent && wants_agent_update {
+            bail!("non-agent task `{}` cannot update agent fields", task.id);
+        }
+        if task.executor_kind == TaskExecutorKind::Agent {
+            if wants_agent_update || task_goal_changed || materialized_base_agent_spec {
+                let original_spec = base_agent_spec
+                    .clone()
+                    .ok_or_else(|| anyhow!("agent task `{}` has no base agent spec", task.id))?;
+                let mut spec = original_spec.clone();
+                if task_goal_changed {
+                    set_changed(
+                        &mut spec.prompt.goal,
+                        task.goal.clone(),
+                        "goal",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_agent_role {
+                    set_option_changed(
+                        &mut spec.agent_role,
+                        None,
+                        "agentRole",
+                        &mut changed_fields,
+                    );
+                } else if let Some(agent_role) = params.agent_role {
+                    set_option_changed(
+                        &mut spec.agent_role,
+                        clean_required_optional(agent_role, "agentRole")?,
+                        "agentRole",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_agent_nickname {
+                    set_option_changed(
+                        &mut spec.agent_nickname,
+                        None,
+                        "agentNickname",
+                        &mut changed_fields,
+                    );
+                } else if let Some(agent_nickname) = params.agent_nickname {
+                    set_option_changed(
+                        &mut spec.agent_nickname,
+                        clean_required_optional(agent_nickname, "agentNickname")?,
+                        "agentNickname",
+                        &mut changed_fields,
+                    );
+                }
+                if let Some(instructions) = params.instructions {
+                    set_changed(
+                        &mut spec.prompt.instructions,
+                        normalize_agent_instructions(instructions),
+                        "instructions",
+                        &mut changed_fields,
+                    );
+                }
+                let merged_input =
+                    merge_agent_input(params.input_text.clone(), params.input.clone())?;
+                if params.clear_input {
+                    set_option_changed(&mut spec.prompt.input, None, "input", &mut changed_fields);
+                } else if let Some(input) = merged_input {
+                    set_option_changed(
+                        &mut spec.prompt.input,
+                        Some(input),
+                        "input",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_output_instructions {
+                    set_option_changed(
+                        &mut spec.prompt.output_instructions,
+                        None,
+                        "outputInstructions",
+                        &mut changed_fields,
+                    );
+                } else if let Some(output_instructions) = params.output_instructions {
+                    set_option_changed(
+                        &mut spec.prompt.output_instructions,
+                        clean_required_optional(output_instructions, "outputInstructions")?,
+                        "outputInstructions",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_context_policy {
+                    set_option_changed(
+                        &mut spec.context_policy,
+                        None,
+                        "contextPolicy",
+                        &mut changed_fields,
+                    );
+                } else if let Some(policy) = params.context_policy {
+                    set_option_changed(
+                        &mut spec.context_policy,
+                        Some(policy),
+                        "contextPolicy",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_tool_policy {
+                    set_option_changed(
+                        &mut spec.tool_policy,
+                        None,
+                        "toolPolicy",
+                        &mut changed_fields,
+                    );
+                } else if let Some(policy) = params.tool_policy {
+                    set_option_changed(
+                        &mut spec.tool_policy,
+                        Some(policy),
+                        "toolPolicy",
+                        &mut changed_fields,
+                    );
+                }
+                if params.clear_result_contract {
+                    set_option_changed(
+                        &mut spec.result_contract,
+                        None,
+                        "resultContract",
+                        &mut changed_fields,
+                    );
+                } else if let Some(contract) = params.result_contract {
+                    set_option_changed(
+                        &mut spec.result_contract,
+                        Some(contract),
+                        "resultContract",
+                        &mut changed_fields,
+                    );
+                }
+                validate_agent_prompt_for_trigger(final_trigger_kind, &spec.prompt)?;
+                if materialized_base_agent_spec {
+                    push_changed(&mut changed_fields, "agentSpec");
+                }
+                if materialized_base_agent_spec || spec != original_spec {
+                    spec.updated_at = now;
+                    updated_agent_spec = Some(spec);
+                }
+            } else if let Some(agent_spec) = base_agent_spec.as_ref() {
+                validate_agent_prompt_for_trigger(final_trigger_kind, &agent_spec.prompt)?;
+            } else if matches!(
+                final_trigger_kind,
+                TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+            ) {
+                bail!("scheduled agent task `{}` has no base agent spec", task.id);
+            }
+        }
+
+        if changed_fields.is_empty() {
+            return Ok(TaskUpdateResponse {
+                task,
+                trigger: None,
+                agent_spec: None,
+                changed_fields,
+            });
+        }
+
+        task.updated_at = now;
+        task.revision = task.revision.saturating_add(1);
+        let appended = self
+            .append_event(
+                TaskEventPayload::TaskUpdated {
+                    task: task.clone(),
+                    trigger: updated_trigger.clone(),
+                    agent_spec: updated_agent_spec.clone(),
+                    changed_fields: changed_fields.clone(),
+                    updated_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.publish_and_wake(vec![appended]).await;
+        if updated_trigger.is_some() {
+            self.process_due_once(now).await?;
+        }
+        let response = self
+            .store
+            .get_task(task.id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task disappeared after update"))?;
+        Ok(TaskUpdateResponse {
+            task: response.task,
+            trigger: updated_trigger,
+            agent_spec: updated_agent_spec,
+            changed_fields,
+        })
     }
 
     pub async fn reschedule_task(
@@ -1567,9 +1925,70 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
     Ok(())
 }
 
+fn validate_update_params(params: &TaskUpdateParams) -> TaskRuntimeResult<()> {
+    required_trimmed(params.task_id.as_str(), "task_id")?;
+    if params.clear_input && (params.input_text.is_some() || params.input.is_some()) {
+        bail!("task update cannot clear and set input in the same request");
+    }
+    if params.clear_agent_role && params.agent_role.is_some() {
+        bail!("task update cannot clear and set agent_role in the same request");
+    }
+    if params.clear_agent_nickname && params.agent_nickname.is_some() {
+        bail!("task update cannot clear and set agent_nickname in the same request");
+    }
+    if params.clear_output_instructions && params.output_instructions.is_some() {
+        bail!("task update cannot clear and set output_instructions in the same request");
+    }
+    if params.clear_context_policy && params.context_policy.is_some() {
+        bail!("task update cannot clear and set context_policy in the same request");
+    }
+    if params.clear_tool_policy && params.tool_policy.is_some() {
+        bail!("task update cannot clear and set tool_policy in the same request");
+    }
+    if params.clear_result_contract && params.result_contract.is_some() {
+        bail!("task update cannot clear and set result_contract in the same request");
+    }
+    if params.clear_timeout_policy && params.timeout_policy.is_some() {
+        bail!("task update cannot clear and set timeout_policy in the same request");
+    }
+    if params.clear_concurrency_policy && params.concurrency_policy.is_some() {
+        bail!("task update cannot clear and set concurrency_policy in the same request");
+    }
+    if params.clear_metadata && params.metadata.is_some() {
+        bail!("task update cannot clear and set metadata in the same request");
+    }
+    Ok(())
+}
+
+fn update_has_agent_patch(params: &TaskUpdateParams) -> bool {
+    params.agent_role.is_some()
+        || params.agent_nickname.is_some()
+        || params.instructions.is_some()
+        || params.input_text.is_some()
+        || params.input.is_some()
+        || params.output_instructions.is_some()
+        || params.context_policy.is_some()
+        || params.tool_policy.is_some()
+        || params.result_contract.is_some()
+        || params.clear_agent_role
+        || params.clear_agent_nickname
+        || params.clear_input
+        || params.clear_output_instructions
+        || params.clear_context_policy
+        || params.clear_tool_policy
+        || params.clear_result_contract
+}
+
 fn validate_agent_spec_for_trigger(
     trigger_kind: TaskTriggerKind,
     agent_spec: &pioneer_protocol::TaskAgentSpecInput,
+) -> TaskRuntimeResult<()> {
+    validate_agent_prompt_for_trigger(trigger_kind, &agent_spec.prompt)
+}
+
+fn validate_agent_prompt_for_trigger(
+    trigger_kind: TaskTriggerKind,
+    prompt: &TaskAgentPrompt,
 ) -> TaskRuntimeResult<()> {
     if !matches!(
         trigger_kind,
@@ -1578,8 +1997,7 @@ fn validate_agent_spec_for_trigger(
         return Ok(());
     }
 
-    let instructions = agent_spec
-        .prompt
+    let instructions = prompt
         .instructions
         .iter()
         .map(|value| value.trim())
@@ -1591,8 +2009,7 @@ fn validate_agent_spec_for_trigger(
     if instructions.len() == 1 && instructions[0] == "Return a concise final result." {
         bail!("scheduled agent task cannot use the generic concise-result prompt");
     }
-    if agent_spec
-        .prompt
+    if prompt
         .output_instructions
         .as_deref()
         .map(str::trim)
@@ -1602,6 +2019,99 @@ fn validate_agent_spec_for_trigger(
         bail!("scheduled agent task requires output instructions");
     }
     Ok(())
+}
+
+fn normalize_agent_instructions(instructions: Vec<String>) -> Vec<String> {
+    let instructions = instructions
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut normalized = Vec::new();
+    for instruction in instructions {
+        if !normalized.iter().any(|value| value == &instruction) {
+            normalized.push(instruction);
+        }
+    }
+    normalized
+}
+
+fn merge_agent_input(
+    input_text: Option<String>,
+    input: Option<pioneer_protocol::TaskAgentInput>,
+) -> TaskRuntimeResult<Option<pioneer_protocol::TaskAgentInput>> {
+    let input_text = input_text
+        .map(|value| required_trimmed(value.as_str(), "inputText"))
+        .transpose()?;
+    let mut input = input.map(normalize_agent_input);
+    if let Some(input_text) = input_text {
+        match input.as_mut() {
+            Some(input) => match input.text.as_deref() {
+                Some(existing) if existing == input_text => {}
+                Some(existing) => {
+                    bail!(
+                        "input_text conflicts with input.text: got different values `{}` and `{}`",
+                        input_text,
+                        existing
+                    );
+                }
+                None => input.text = Some(input_text),
+            },
+            None => {
+                input = Some(pioneer_protocol::TaskAgentInput {
+                    text: Some(input_text),
+                    variables: Vec::new(),
+                    attachments: Vec::new(),
+                    references: Vec::new(),
+                });
+            }
+        }
+    }
+    Ok(input)
+}
+
+fn normalize_agent_input(
+    mut input: pioneer_protocol::TaskAgentInput,
+) -> pioneer_protocol::TaskAgentInput {
+    input.text = input
+        .text
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    input
+}
+
+fn clean_required_optional(value: String, field: &str) -> TaskRuntimeResult<Option<String>> {
+    Ok(Some(required_trimmed(value.as_str(), field)?))
+}
+
+fn push_changed(changed_fields: &mut Vec<String>, field: &str) {
+    if !changed_fields.iter().any(|value| value == field) {
+        changed_fields.push(field.to_owned());
+    }
+}
+
+fn set_changed<T>(slot: &mut T, value: T, field: &str, changed_fields: &mut Vec<String>)
+where
+    T: PartialEq,
+{
+    if *slot != value {
+        *slot = value;
+        push_changed(changed_fields, field);
+    }
+}
+
+fn set_option_changed<T>(
+    slot: &mut Option<T>,
+    value: Option<T>,
+    field: &str,
+    changed_fields: &mut Vec<String>,
+) where
+    T: PartialEq,
+{
+    if *slot != value {
+        *slot = value;
+        push_changed(changed_fields, field);
+    }
 }
 
 fn validate_delivery_policy(

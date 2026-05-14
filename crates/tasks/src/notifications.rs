@@ -29,6 +29,7 @@ impl TaskNotificationMapper {
             TaskEventPayload::TaskFailed { .. } => events::TASK_FAILED,
             TaskEventPayload::TaskCancelled { .. } => events::TASK_CANCELLED,
             TaskEventPayload::TaskDetached { .. } => events::TASK_DETACHED,
+            TaskEventPayload::TaskUpdated { .. } => events::TASK_UPDATED,
             TaskEventPayload::TaskRescheduled { .. } => events::TASK_RESCHEDULED,
             TaskEventPayload::TaskPaused { .. } => events::TASK_PAUSED,
             TaskEventPayload::TaskResumed { .. } => events::TASK_RESUMED,

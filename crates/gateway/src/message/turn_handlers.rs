@@ -1117,6 +1117,7 @@ fn is_collapsible_task_event(event_type: &str) -> bool {
             | events::TASK_RUN_COMPLETED
             | events::TASK_RUN_RETRY_SCHEDULED
             | events::TASK_COMPLETED
+            | events::TASK_UPDATED
             | events::TASK_RESCHEDULED
             | events::TASK_TREE_CHANGED
             | events::TASK_DELIVERY_QUEUED
@@ -1250,6 +1251,7 @@ mod tests {
             events::TASK_CREATED,
             events::TASK_RUN_CREATED,
             events::TASK_RESCHEDULED,
+            events::TASK_UPDATED,
             events::TASK_RUN_STARTED,
             events::TASK_PROGRESS,
             events::TASK_RUN_COMPLETED,

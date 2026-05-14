@@ -976,6 +976,7 @@ fn task_event_message(event: &TaskEvent) -> String {
             pioneer_protocol::constants::events::TASK_FAILED => "Task failed".to_owned(),
             pioneer_protocol::constants::events::TASK_CANCELLED => "Task cancelled".to_owned(),
             pioneer_protocol::constants::events::TASK_DETACHED => "Task detached".to_owned(),
+            pioneer_protocol::constants::events::TASK_UPDATED => "Task updated".to_owned(),
             pioneer_protocol::constants::events::TASK_RESCHEDULED => "Task rescheduled".to_owned(),
             pioneer_protocol::constants::events::TASK_PAUSED => "Task paused".to_owned(),
             pioneer_protocol::constants::events::TASK_RESUMED => "Task resumed".to_owned(),
