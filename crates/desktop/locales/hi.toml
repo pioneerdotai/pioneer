@@ -297,10 +297,6 @@ description = "AWS Bedrock के जरिए मॉडल"
 title = "Azure OpenAI"
 description = "Azure OpenAI Service के जरिए मॉडल"
 
-[providers.catalog.claude-code]
-title = "Claude Code CLI"
-description = "Claude Code CLI के जरिए मॉडल उपयोग करें"
-
 [providers.catalog.copilot]
 title = "GitHub Copilot"
 description = "Copilot-compatible API के जरिए मॉडल चलाएं"
@@ -312,10 +308,6 @@ description = "OpenAI-compatible DeepSeek प्रदाता"
 [providers.catalog.gemini]
 title = "Google Gemini"
 description = "Google AI के Gemini मॉडल"
-
-[providers.catalog.gemini-cli]
-title = "Gemini CLI"
-description = "Gemini CLI टूल के जरिए मॉडल उपयोग करें"
 
 [providers.catalog.glm]
 title = "GLM"
@@ -496,10 +488,6 @@ description = "स्थानीय vLLM OpenAI-compatible API"
 [providers.catalog.osaurus]
 title = "OSaurus"
 description = "स्थानीय OSaurus OpenAI-compatible API"
-
-[providers.catalog.kilocli]
-title = "Kilo CLI"
-description = "Kilo CLI के जरिए मॉडल उपयोग करें"
 
 [settings.screen]
 title = "सेटिंग्स"

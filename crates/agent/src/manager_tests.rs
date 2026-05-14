@@ -12,8 +12,8 @@ use pioneer_hooks::{
     HookDiagnosticSeverity, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
     HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInputKind, HookInputPayload,
     HookKind, HookPhase, HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptContextSet,
-    HookPromptSectionTitle, HookRegistry, HookRuntime, HookSectionId, HookSubscription,
-    HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
+    HookPromptSectionTitle, HookRegistry, HookRuntime, HookRuntimeBuilder, HookSectionId,
+    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
     TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
@@ -314,6 +314,39 @@ fn empty_hook_runtime() -> Arc<HookRuntime> {
         Arc::new(HookRegistry::new()),
         Arc::new(HookSubscriptionRegistry::new()),
     ))
+}
+
+async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
+    let memory_provider = manager
+        .memory_provider
+        .read()
+        .await
+        .clone()
+        .expect("memory provider must be configured before installing test memory hooks");
+    let memory_write_provider = manager.memory_write_provider.read().await.clone();
+    let post_turn_extractor_provider = manager
+        .memory_post_turn_extractor_provider
+        .read()
+        .await
+        .clone();
+    let policy_provider = manager.memory_turn_policy_provider.read().await.clone();
+    let current_runtime = manager.hook_runtime.read().await.clone();
+    let builder = current_runtime
+        .as_ref()
+        .map(|runtime| HookRuntimeBuilder::from_runtime(runtime.as_ref()))
+        .unwrap_or_else(HookRuntimeBuilder::new);
+    let runtime = builder
+        .install(pioneer_memory::hooks::package(
+            memory_provider,
+            memory_write_provider,
+            post_turn_extractor_provider,
+            policy_provider,
+            manager.memory_tool_bundle_artifact_store(),
+            manager.tool_loop_config.memory.clone(),
+        ))
+        .expect("test memory hook package installs")
+        .build();
+    manager.set_hook_runtime(Some(runtime)).await;
 }
 
 fn recording_hook_runtime(
@@ -643,24 +676,6 @@ async fn wait_for_hook_phase(
         }
         if Instant::now() >= deadline {
             panic!("timed out waiting for hook phase {phase}");
-        }
-        yield_now().await;
-    }
-}
-
-async fn wait_for_background_hook_queue(runtime: &HookRuntime, expected_len: usize) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let len = runtime
-            .queued_background_len()
-            .expect("background queue len");
-        if len >= expected_len {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for {expected_len} queued background hook runs; observed {len}"
-            );
         }
         yield_now().await;
     }
@@ -2284,8 +2299,13 @@ async fn phase_12_background_post_turn_hook_does_not_delay_completion_notificati
         Some(AgentEvent::TurnCompleted { .. })
     ));
 
-    wait_for_background_hook_queue(runtime.as_ref(), 1).await;
-    assert!(snapshot_hook_calls(&calls).is_empty());
+    let _post_turn = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    assert_eq!(
+        runtime
+            .queued_background_len()
+            .expect("background queue len"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -2382,7 +2402,6 @@ async fn phase_08_policy_hook_contribution_reaches_later_phase_policy_set() {
             false,
         )))
         .await;
-
     let observed = start_simple_turn(
         &manager,
         "thr_phase08_policy_reaches_later",
@@ -2430,7 +2449,6 @@ async fn phase_08_multiple_policy_contributions_merge_deterministically() {
             false,
         )))
         .await;
-
     let observed = start_simple_turn(
         &manager,
         "thr_phase08_policy_merge",
@@ -2632,6 +2650,7 @@ async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
             false,
         )))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -2686,7 +2705,6 @@ async fn phase_09_one_context_contribution_reaches_pre_prompt_compile() {
             false,
         )))
         .await;
-
     let observed = start_simple_turn(
         &manager,
         "thr_phase09_context_one",
@@ -2743,7 +2761,6 @@ async fn phase_09_multiple_context_contributions_order_deterministically() {
             false,
         )))
         .await;
-
     let observed = start_simple_turn(
         &manager,
         "thr_phase09_context_order",
@@ -3086,6 +3103,7 @@ async fn phase_09_memory_path_remains_unchanged() {
             false,
         )))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -3837,6 +3855,7 @@ async fn memory_provider_recall_error_degrades_gracefully() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -3874,6 +3893,7 @@ async fn memory_provider_tool_materialization_error_degrades_gracefully() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -3919,6 +3939,7 @@ async fn memory_provider_receives_turn_context_for_agent_mode() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4010,6 +4031,7 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4075,6 +4097,7 @@ async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_nam
             HookFailurePolicy::BestEffort,
         )))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4149,6 +4172,7 @@ async fn phase_13_memory_tool_bundle_visibility_is_driven_by_hook_policy_set() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4268,6 +4292,7 @@ async fn identity_recall_prompt_contains_relevant_memory() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4347,6 +4372,7 @@ async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4459,6 +4485,7 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4565,6 +4592,7 @@ async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4637,6 +4665,7 @@ async fn memory_provider_without_tools_recalls_but_omits_prompt_contract() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4702,6 +4731,7 @@ async fn memory_policy_classifier_no_use_disables_recall_without_phrase_matching
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4766,6 +4796,7 @@ async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4849,6 +4880,7 @@ async fn phase_12_memory_policy_classifier_contributes_full_hook_policy() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4915,6 +4947,7 @@ async fn memory_policy_invalid_classifier_json_uses_default_allow_fallback() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -4971,6 +5004,7 @@ async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insuffici
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -5038,6 +5072,7 @@ async fn memory_policy_default_allows_proactive_remember_tool() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -5112,6 +5147,7 @@ async fn explicit_remember_request_can_trigger_memory_remember() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -5180,6 +5216,7 @@ async fn explicit_forget_request_can_trigger_memory_forget() {
     manager
         .set_memory_turn_policy_provider(Some(policy_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -5257,6 +5294,7 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let observed = start_simple_turn(
         &manager,
@@ -5489,6 +5527,7 @@ async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
     manager
         .set_memory_provider(Some(memory_trait_provider))
         .await;
+    install_configured_memory_hooks_for_test(&manager).await;
 
     let mut events = start_loop_budget_turn(
         &manager,

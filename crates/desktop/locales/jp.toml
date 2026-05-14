@@ -297,10 +297,6 @@ description = "AWS Bedrock 経由のモデル"
 title = "Azure OpenAI"
 description = "Azure OpenAI Service 経由のモデル"
 
-[providers.catalog.claude-code]
-title = "Claude Code CLI"
-description = "Claude Code CLI 経由でモデルを使用"
-
 [providers.catalog.copilot]
 title = "GitHub Copilot"
 description = "Copilot 互換 API 経由でモデルを実行"
@@ -312,10 +308,6 @@ description = "OpenAI 互換の DeepSeek プロバイダー"
 [providers.catalog.gemini]
 title = "Google Gemini"
 description = "Google AI の Gemini モデル"
-
-[providers.catalog.gemini-cli]
-title = "Gemini CLI"
-description = "Gemini CLI ツール経由でモデルを使用"
 
 [providers.catalog.glm]
 title = "GLM"
@@ -496,10 +488,6 @@ description = "ローカル vLLM OpenAI 互換 API"
 [providers.catalog.osaurus]
 title = "OSaurus"
 description = "ローカル OSaurus OpenAI 互換 API"
-
-[providers.catalog.kilocli]
-title = "Kilo CLI"
-description = "Kilo CLI 経由でモデルを使用"
 
 [settings.screen]
 title = "設定"

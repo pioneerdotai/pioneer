@@ -297,10 +297,6 @@ description = "Modelle über AWS Bedrock"
 title = "Azure OpenAI"
 description = "Modelle über Azure OpenAI Service"
 
-[providers.catalog.claude-code]
-title = "Claude Code CLI"
-description = "Modelle über Claude Code CLI verwenden"
-
 [providers.catalog.copilot]
 title = "GitHub Copilot"
 description = "Modelle über Copilot-kompatible API ausführen"
@@ -312,10 +308,6 @@ description = "OpenAI-kompatibler DeepSeek-Anbieter"
 [providers.catalog.gemini]
 title = "Google Gemini"
 description = "Gemini-Modelle von Google AI"
-
-[providers.catalog.gemini-cli]
-title = "Gemini CLI"
-description = "Modelle über das Gemini CLI-Tool verwenden"
 
 [providers.catalog.glm]
 title = "GLM"
@@ -496,10 +488,6 @@ description = "Lokale OpenAI-kompatible vLLM-API"
 [providers.catalog.osaurus]
 title = "OSaurus"
 description = "Lokale OpenAI-kompatible OSaurus-API"
-
-[providers.catalog.kilocli]
-title = "Kilo CLI"
-description = "Modelle über Kilo CLI verwenden"
 
 [settings.screen]
 title = "Einstellungen"

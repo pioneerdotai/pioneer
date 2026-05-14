@@ -40,11 +40,6 @@ pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Pro
             )))
         }
 
-        // ── CLI providers ───────────────────────────────────────────────
-        // "claude-code" => Ok(Box::new(ClaudeCodeProvider::new())),
-        // "gemini-cli" => Ok(Box::new(GeminiCliProvider::new())),
-        // "kilocli" | "kilo" => Ok(Box::new(KiloCliProvider::new())),
-
         // ── OpenAI-compatible providers ─────────────────────────────────
         "groq" => Ok(Box::new(compat(
             "groq",
@@ -347,15 +342,17 @@ mod tests {
     }
 
     #[test]
-    fn creates_cli_providers() {
-        let provider = create_provider("claude-code", "").unwrap();
-        assert_eq!(provider.name(), "claude_code");
-
-        let provider = create_provider("gemini-cli", "").unwrap();
-        assert_eq!(provider.name(), "gemini_cli");
-
-        let provider = create_provider("kilo", "").unwrap();
-        assert_eq!(provider.name(), "kilo_cli");
+    fn rejects_unused_cli_providers() {
+        for name in ["claude-code", "gemini-cli", "kilocli", "kilo"] {
+            let err = match create_provider(name, "") {
+                Err(error) => error,
+                Ok(_) => panic!("CLI providers are not factory-backed"),
+            };
+            assert!(
+                err.to_string().contains("unknown provider"),
+                "unexpected error for {name}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -393,10 +390,6 @@ mod tests {
             "azure_openai",
             "azure-openai",
             "azure",
-            "claude-code",
-            "gemini-cli",
-            "kilocli",
-            "kilo",
             "groq",
             "mistral",
             "xai",

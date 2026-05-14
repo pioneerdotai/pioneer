@@ -1,2 +1,7 @@
 [env]
 BINDGEN_EXTRA_CLANG_ARGS = "--target=arm64-apple-darwin"
+# Gateway/message tests are intentionally integration-heavy and can exceed
+# the platform default test-thread stack in debug builds. Keep plain
+# `cargo test` reproducible locally and in CI instead of wrapping individual
+# tests with custom large-stack harnesses.
+RUST_MIN_STACK = "33554432"

@@ -274,8 +274,6 @@ impl PioneerDesktop {
             ("cerebras", false) => "logos/providers/cerebras-light.svg",
             ("friendli", true) => "logos/providers/friendli-dark.svg",
             ("friendli", false) => "logos/providers/friendli-light.svg",
-            ("kilocli", true) => "logos/providers/kilocli-dark.svg",
-            ("kilocli", false) => "logos/providers/kilocli-light.svg",
             ("nebius", true) => "logos/providers/nebius-dark.svg",
             ("nebius", false) => "logos/providers/nebius-light.svg",
             ("ollama", true) => "logos/providers/ollama-dark.svg",

@@ -297,10 +297,6 @@ description = "通过 AWS Bedrock 使用模型"
 title = "Azure OpenAI"
 description = "通过 Azure OpenAI 服务使用模型"
 
-[providers.catalog.claude-code]
-title = "Claude Code CLI"
-description = "通过 Claude Code CLI 使用模型"
-
 [providers.catalog.copilot]
 title = "GitHub Copilot"
 description = "通过兼容 Copilot 的 API 运行模型"
@@ -312,10 +308,6 @@ description = "兼容 OpenAI 的 DeepSeek 提供方"
 [providers.catalog.gemini]
 title = "Google Gemini"
 description = "来自 Google AI 的 Gemini 模型"
-
-[providers.catalog.gemini-cli]
-title = "Gemini CLI"
-description = "通过 Gemini CLI 工具使用模型"
 
 [providers.catalog.glm]
 title = "GLM"
@@ -496,10 +488,6 @@ description = "本地 vLLM 兼容 OpenAI API"
 [providers.catalog.osaurus]
 title = "OSaurus"
 description = "本地 OSaurus 兼容 OpenAI API"
-
-[providers.catalog.kilocli]
-title = "Kilo CLI"
-description = "通过 Kilo CLI 使用模型"
 
 [settings.screen]
 title = "设置"

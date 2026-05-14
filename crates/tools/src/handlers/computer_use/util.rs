@@ -63,7 +63,7 @@ pub(crate) fn resolve_snapshot_budget(
         .map(str::to_ascii_lowercase);
 
     let (profile, default_max_bytes, default_max_side_px) = match provider.as_deref() {
-        Some("anthropic") | Some("claude-code") => ("anthropic_remote", 5 * 1024 * 1024, 1120),
+        Some("anthropic") => ("anthropic_remote", 5 * 1024 * 1024, 1120),
         Some("gemini") | Some("google") | Some("google-gemini") => {
             ("gemini_remote", 7 * 1024 * 1024, 1280)
         }

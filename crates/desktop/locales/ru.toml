@@ -297,10 +297,6 @@ description = "Модели через AWS Bedrock"
 title = "Azure OpenAI"
 description = "Модели через Azure OpenAI Service"
 
-[providers.catalog.claude-code]
-title = "Claude Code CLI"
-description = "Используйте модели через Claude Code CLI"
-
 [providers.catalog.copilot]
 title = "GitHub Copilot"
 description = "Запуск моделей через Copilot-совместимый API"
@@ -312,10 +308,6 @@ description = "OpenAI-совместимый провайдер DeepSeek"
 [providers.catalog.gemini]
 title = "Google Gemini"
 description = "Модели Gemini от Google AI"
-
-[providers.catalog.gemini-cli]
-title = "Gemini CLI"
-description = "Используйте модели через Gemini CLI"
 
 [providers.catalog.glm]
 title = "GLM"
@@ -496,10 +488,6 @@ description = "Локальный OpenAI-совместимый API vLLM"
 [providers.catalog.osaurus]
 title = "OSaurus"
 description = "Локальный OpenAI-совместимый API OSaurus"
-
-[providers.catalog.kilocli]
-title = "Kilo CLI"
-description = "Используйте модели через Kilo CLI"
 
 [mcp.screen]
 title = "MCP"
