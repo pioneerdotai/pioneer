@@ -11,7 +11,8 @@ enum TitleAttemptOutcome {
     EmptyTitle,
 }
 
-struct ParentTimelineTarget {
+#[derive(Clone)]
+pub(super) struct ParentTimelineTarget {
     workspace_id: String,
     parent_thread_id: String,
     parent_turn_id: String,
@@ -124,42 +125,61 @@ impl MessageProcessor {
         child_turn_id: &str,
         workspace_id: Option<&str>,
     ) -> Option<ParentTimelineTarget> {
-        let lineage = match self.crud_store.get_thread_lineage(child_thread_id).await {
-            Ok(Some(lineage)) if lineage.child_turn_id == child_turn_id => lineage,
-            Ok(_) => return None,
-            Err(error) => {
-                warn!(
-                    child_thread_id,
-                    child_turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to load child thread lineage for parent timeline notification"
-                );
-                return None;
+        if let Some(cached) = self
+            .parent_timeline_targets
+            .lock()
+            .await
+            .get(child_thread_id)
+            .cloned()
+        {
+            if cached.child_turn_id == child_turn_id {
+                return Some(cached);
             }
-        };
+        }
+
+        let lineage =
+            match message_future(self.crud_store.get_thread_lineage(child_thread_id)).await {
+                Ok(Some(lineage)) => lineage,
+                Ok(None) => return None,
+                Err(error) => {
+                    warn!(
+                        child_thread_id,
+                        child_turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to load child thread lineage for parent timeline notification"
+                    );
+                    return None;
+                }
+            };
+        if lineage.child_turn_id != child_turn_id {
+            return None;
+        }
         let parent_turn_id = lineage.parent_turn_id.clone()?;
         let workspace_id = if let Some(workspace_id) = workspace_id {
             workspace_id.to_owned()
         } else {
-            match self
-                .crud_store
-                .get_thread_model(lineage.parent_thread_id.as_str())
-                .await
+            match message_future(
+                self.crud_store
+                    .get_thread_model(lineage.parent_thread_id.as_str()),
+            )
+            .await
             {
                 Ok(Some(thread)) => thread.workspace_id,
-                Ok(None) => match self.crud_store.get_thread_model(child_thread_id).await {
-                    Ok(Some(thread)) => thread.workspace_id,
-                    Ok(None) => return None,
-                    Err(error) => {
-                        warn!(
-                            child_thread_id,
-                            child_turn_id,
-                            error = %format!("{error:#}"),
-                            "failed to load child thread workspace for parent timeline notification"
-                        );
-                        return None;
+                Ok(None) => {
+                    match message_future(self.crud_store.get_thread_model(child_thread_id)).await {
+                        Ok(Some(thread)) => thread.workspace_id,
+                        Ok(None) => return None,
+                        Err(error) => {
+                            warn!(
+                                child_thread_id,
+                                child_turn_id,
+                                error = %format!("{error:#}"),
+                                "failed to load child thread workspace for parent timeline notification"
+                            );
+                            return None;
+                        }
                     }
-                },
+                }
                 Err(error) => {
                     warn!(
                         parent_thread_id = lineage.parent_thread_id,
@@ -173,7 +193,7 @@ impl MessageProcessor {
             }
         };
 
-        Some(ParentTimelineTarget {
+        let target = ParentTimelineTarget {
             workspace_id,
             parent_thread_id: lineage.parent_thread_id,
             parent_turn_id,
@@ -181,7 +201,12 @@ impl MessageProcessor {
             run_id: lineage.task_run_id,
             child_thread_id: lineage.child_thread_id,
             child_turn_id: lineage.child_turn_id,
-        })
+        };
+        self.parent_timeline_targets
+            .lock()
+            .await
+            .insert(child_thread_id.to_owned(), target.clone());
+        Some(target)
     }
 
     pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) {
@@ -494,7 +519,7 @@ impl MessageProcessor {
 
     pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) {
         let thread_id = durable_event_thread_id(&event).map(str::to_owned);
-        let committed = self.persist_durable_agent_event(event.clone()).await;
+        let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
         if committed && let Some(thread_id) = thread_id {
             self.agent_manager
                 .publish_committed(thread_id.as_str(), event)
@@ -701,14 +726,15 @@ impl MessageProcessor {
                 let deadlines = self
                     .timeout_supervisor
                     .deadlines_for(item_type, event_timestamp);
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_item_started_with_attempt_deadlines(
-                        notification.clone(),
-                        event_timestamp,
-                        deadlines,
-                    )
-                    .await
+                if let Err(error) = message_future(
+                    self.crud_store
+                        .materialize_item_started_with_attempt_deadlines(
+                            notification.clone(),
+                            event_timestamp,
+                            deadlines,
+                        ),
+                )
+                .await
                 {
                     self.mark_turn_failed(
                         thread_id,
@@ -745,10 +771,11 @@ impl MessageProcessor {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .crud_store
-                    .materialize_item_completed(notification.clone(), event_timestamp)
-                    .await
+                if let Err(error) = message_future(
+                    self.crud_store
+                        .materialize_item_completed(notification.clone(), event_timestamp),
+                )
+                .await
                 {
                     self.mark_turn_failed(
                         thread_id,
@@ -1928,36 +1955,55 @@ impl MessageProcessor {
         self.agent_message_buffers.lock().await.remove(key.as_str());
     }
 
-    pub(super) async fn notify_parent_timeline_changed_for_child_turn(
+    pub(super) fn notify_parent_timeline_changed_for_child_turn(
         &self,
         child_thread_id: &str,
         child_turn_id: &str,
         workspace_id: Option<&str>,
         reason: TurnTimelineChangedReason,
-    ) {
-        let Some(target) = self
-            .parent_timeline_target_for_child_turn(child_thread_id, child_turn_id, workspace_id)
-            .await
-        else {
-            return;
-        };
+    ) -> MessageFuture<'static, ()> {
+        let processor = self.clone();
+        let child_thread_id = child_thread_id.to_owned();
+        let child_turn_id = child_turn_id.to_owned();
+        let workspace_id = workspace_id.map(str::to_owned);
+        message_future(async move {
+            let handle = tokio::spawn(async move {
+                let Some(target) = processor
+                    .parent_timeline_target_for_child_turn(
+                        child_thread_id.as_str(),
+                        child_turn_id.as_str(),
+                        workspace_id.as_deref(),
+                    )
+                    .await
+                else {
+                    return;
+                };
 
-        let notification = TurnTimelineChangedNotification {
-            workspace_id: target.workspace_id,
-            thread_id: target.parent_thread_id,
-            turn_id: target.parent_turn_id,
-            task_id: Some(target.task_id),
-            run_id: Some(target.run_id),
-            child_thread_id: Some(target.child_thread_id),
-            child_turn_id: Some(target.child_turn_id),
-            reason,
-        };
-        self.send_notification_to_thread_subscribers(
-            notification.thread_id.as_str(),
-            events::TURN_TIMELINE_CHANGED,
-            &notification,
-        )
-        .await;
+                let notification = TurnTimelineChangedNotification {
+                    workspace_id: target.workspace_id,
+                    thread_id: target.parent_thread_id,
+                    turn_id: target.parent_turn_id,
+                    task_id: Some(target.task_id),
+                    run_id: Some(target.run_id),
+                    child_thread_id: Some(target.child_thread_id),
+                    child_turn_id: Some(target.child_turn_id),
+                    reason,
+                };
+                processor
+                    .send_notification_to_thread_subscribers(
+                        notification.thread_id.as_str(),
+                        events::TURN_TIMELINE_CHANGED,
+                        &notification,
+                    )
+                    .await;
+            });
+            if let Err(error) = handle.await {
+                warn!(
+                    error = %error,
+                    "parent timeline changed notification task failed"
+                );
+            }
+        })
     }
 
     async fn forward_child_reasoning_delta_to_parent_turn(
@@ -2549,7 +2595,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
         let Some((text, attachments)) = payload else {
             return;
         };
@@ -2568,10 +2613,11 @@ impl MessageProcessor {
         };
 
         let started_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .crud_store
-            .materialize_item_started(started.clone(), started_timestamp)
-            .await
+        if let Err(error) = message_future(
+            self.crud_store
+                .materialize_item_started(started.clone(), started_timestamp),
+        )
+        .await
         {
             warn!(
                 thread_id = thread_id,
@@ -2592,10 +2638,11 @@ impl MessageProcessor {
         };
 
         let completed_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .crud_store
-            .materialize_item_completed(completed.clone(), completed_timestamp)
-            .await
+        if let Err(error) = message_future(
+            self.crud_store
+                .materialize_item_completed(completed.clone(), completed_timestamp),
+        )
+        .await
         {
             warn!(
                 thread_id = thread_id,

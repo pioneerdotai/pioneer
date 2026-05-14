@@ -243,13 +243,14 @@ impl TaskToolHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: TaskCreateToolInput = decode_tool_args(invocation)?;
         let params = self.create_params(input).await?;
-        let response = self
-            .processor
-            .task_runtime
-            .service()
-            .create_task(pioneer_tasks::TaskCreateContext::default(), params)
-            .await
-            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        let response = crate::message::message_future(
+            self.processor
+                .task_runtime
+                .service()
+                .create_task(pioneer_tasks::TaskCreateContext::default(), params),
+        )
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
         let output = task_create_tool_output(&response, &anchor);
         Ok(function_output(output))

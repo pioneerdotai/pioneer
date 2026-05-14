@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{ThreadStatus, TurnItemAttemptStatus};
 use sea_orm::ConnectionTrait;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_status_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
@@ -11,6 +13,16 @@ use crate::turn_item_terminal::{
 };
 use crate::util::unix_to_datetime;
 
+type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+// Keep each event branch out of the outer projector future; projection payloads are large.
+fn project_future<'a, F>(future: F) -> ProjectFuture<'a>
+where
+    F: Future<Output = Result<()>> + Send + 'a,
+{
+    Box::pin(future)
+}
+
 #[derive(Clone, Default)]
 pub struct TurnProjector;
 
@@ -19,21 +31,24 @@ impl TurnProjector {
         Self
     }
 
-    pub async fn project<C: ConnectionTrait>(
+    pub async fn project<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         event: &AppendedTurnEvent,
     ) -> Result<()> {
-        match &event.payload {
-            TurnEventPayload::TurnStarted(payload) => self.project_turn_started(db, payload).await,
-            TurnEventPayload::ItemStarted(payload) => {
+        let created_at = event.created_at;
+        let future: ProjectFuture<'_> = match &event.payload {
+            TurnEventPayload::TurnStarted(payload) => {
+                project_future(self.project_turn_started(db, payload))
+            }
+            TurnEventPayload::ItemStarted(payload) => project_future(async move {
                 turn::upsert_turn_item(
                     db,
                     payload.turn_id.as_str(),
                     &payload.item,
                     Some(TURN_ITEM_STATUS_IN_PROGRESS),
-                    event.created_at,
-                    event.created_at,
+                    created_at,
+                    created_at,
                 )
                 .await?;
 
@@ -51,13 +66,13 @@ impl TurnProjector {
                         idle_deadline_at: None,
                         hard_deadline_at: None,
                     },
-                    event.created_at,
+                    created_at,
                 )
                 .await?;
 
                 Ok(())
-            }
-            TurnEventPayload::ItemCompleted(payload) => {
+            }),
+            TurnEventPayload::ItemCompleted(payload) => project_future(async move {
                 let turn_item_status = terminal_turn_item_status_from_payload(&payload.item);
 
                 turn::upsert_turn_item(
@@ -65,8 +80,8 @@ impl TurnProjector {
                     payload.turn_id.as_str(),
                     &payload.item,
                     Some(turn_item_status),
-                    event.created_at,
-                    event.created_at,
+                    created_at,
+                    created_at,
                 )
                 .await?;
 
@@ -85,13 +100,13 @@ impl TurnProjector {
                     payload.item.item_id(),
                     attempt_status,
                     failure_reason,
-                    event.created_at,
+                    created_at,
                 )
                 .await?;
 
                 Ok(())
-            }
-            TurnEventPayload::ItemUpdated(payload) => {
+            }),
+            TurnEventPayload::ItemUpdated(payload) => project_future(async move {
                 let turn_item_status = terminal_turn_item_status_from_payload(&payload.item);
 
                 turn::upsert_turn_item(
@@ -99,11 +114,11 @@ impl TurnProjector {
                     payload.turn_id.as_str(),
                     &payload.item,
                     Some(turn_item_status),
-                    event.created_at,
-                    event.created_at,
+                    created_at,
+                    created_at,
                 )
                 .await
-            }
+            }),
             TurnEventPayload::ItemTimeoutDetected(_)
             | TurnEventPayload::ItemRecoveryOpened(_)
             | TurnEventPayload::ItemRecoveryAttached(_)
@@ -114,41 +129,42 @@ impl TurnProjector {
             | TurnEventPayload::ItemToolRetryScheduled(_)
             | TurnEventPayload::ItemToolRetryResolved(_)
             | TurnEventPayload::ItemToolRetryExhausted(_)
-            | TurnEventPayload::TurnToolLoopBudgetExceeded(_) => Ok(()),
-            TurnEventPayload::TurnCompleted(payload) => {
+            | TurnEventPayload::TurnToolLoopBudgetExceeded(_) => project_future(async { Ok(()) }),
+            TurnEventPayload::TurnCompleted(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(
                     db,
                     payload.turn.id.as_str(),
-                    event.created_at,
+                    created_at,
                 )
                 .await?;
                 self.project_turn_finished(
                     db,
                     payload.thread_id.as_str(),
                     &payload.turn,
-                    event.created_at,
+                    created_at,
                 )
                 .await
-            }
-            TurnEventPayload::TurnFailed(payload) => {
+            }),
+            TurnEventPayload::TurnFailed(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(
                     db,
                     payload.turn.id.as_str(),
-                    event.created_at,
+                    created_at,
                 )
                 .await?;
                 self.project_turn_finished(
                     db,
                     payload.thread_id.as_str(),
                     &payload.turn,
-                    event.created_at,
+                    created_at,
                 )
                 .await
-            }
-        }
+            }),
+        };
+        future.await
     }
 
-    async fn project_turn_started<C: ConnectionTrait>(
+    async fn project_turn_started<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         payload: &TurnStartedEventPayload,
@@ -208,7 +224,7 @@ impl TurnProjector {
         Ok(())
     }
 
-    async fn project_turn_finished<C: ConnectionTrait>(
+    async fn project_turn_finished<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         thread_id: &str,
@@ -251,7 +267,7 @@ impl TurnProjector {
         Ok(())
     }
 
-    async fn close_running_attempts_for_terminal_turn<C: ConnectionTrait>(
+    async fn close_running_attempts_for_terminal_turn<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         turn_id: &str,

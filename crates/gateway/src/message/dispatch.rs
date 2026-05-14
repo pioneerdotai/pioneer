@@ -20,7 +20,15 @@ use pioneer_protocol::{
 };
 
 impl MessageProcessor {
-    pub async fn process_request(&self, connection_id: ConnectionId, payload: &str) {
+    pub fn process_request<'a>(
+        &'a self,
+        connection_id: ConnectionId,
+        payload: &'a str,
+    ) -> MessageFuture<'a, ()> {
+        message_future(self.process_request_inner(connection_id, payload))
+    }
+
+    async fn process_request_inner(&self, connection_id: ConnectionId, payload: &str) {
         let request_value = match serde_json::from_str::<JsonValue>(payload) {
             Ok(value) => value,
             Err(_) => {
@@ -536,7 +544,7 @@ impl MessageProcessor {
                 let params_value = request.params.unwrap_or_else(empty_object_value);
                 match serde_json::from_value::<TurnStartParams>(params_value) {
                     Ok(params) => {
-                        self.turn_start(connection_id, request.id, params).await;
+                        message_future(self.turn_start(connection_id, request.id, params)).await;
                     }
                     Err(error) => {
                         self.send_error(

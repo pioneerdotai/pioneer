@@ -29,7 +29,9 @@ use pioneer_protocol::{
     TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::{Component, Path};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -38,6 +40,16 @@ use tokio::time::{Duration, timeout};
 const ID_LEN: usize = 21;
 const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
+
+type TaskServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// Task mutations append and project large event payloads; keep those futures off caller stacks.
+fn task_service_future<'a, F, T>(future: F) -> TaskServiceFuture<'a, T>
+where
+    F: Future<Output = T> + Send + 'a,
+{
+    Box::pin(future)
+}
 
 pub struct TaskRuntime {
     service: Arc<TaskService>,
@@ -952,17 +964,16 @@ impl TaskService {
                 trigger
             })
             .collect::<Vec<_>>();
-        let appended = self
-            .append_event(
-                TaskEventPayload::TaskPaused {
-                    task: task.clone(),
-                    triggers: triggers.clone(),
-                    reason: params.reason,
-                    paused_at: now,
-                },
-                now,
-            )
-            .await?;
+        let appended = task_service_future(self.append_event(
+            TaskEventPayload::TaskPaused {
+                task: task.clone(),
+                triggers: triggers.clone(),
+                reason: params.reason,
+                paused_at: now,
+            },
+            now,
+        ))
+        .await?;
         self.publish_and_wake(vec![appended]).await;
         Ok(TaskPauseResponse { task, triggers })
     }
@@ -1004,17 +1015,16 @@ impl TaskService {
         };
         task.updated_at = now;
         task.revision = task.revision.saturating_add(1);
-        let appended = self
-            .append_event(
-                TaskEventPayload::TaskResumed {
-                    task: task.clone(),
-                    triggers: triggers.clone(),
-                    reason: params.reason,
-                    resumed_at: now,
-                },
-                now,
-            )
-            .await?;
+        let appended = task_service_future(self.append_event(
+            TaskEventPayload::TaskResumed {
+                task: task.clone(),
+                triggers: triggers.clone(),
+                reason: params.reason,
+                resumed_at: now,
+            },
+            now,
+        ))
+        .await?;
         self.publish_and_wake(vec![appended]).await;
         self.process_due_once(now).await?;
         Ok(TaskResumeResponse { task, triggers })

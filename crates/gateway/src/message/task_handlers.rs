@@ -7,7 +7,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskCreateParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .create_task(pioneer_tasks::TaskCreateContext::default(), params),
@@ -168,7 +168,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskCancelParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .cancel_task(pioneer_tasks::TaskMutationContext::default(), params),
@@ -199,7 +199,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskDetachParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .detach_task(pioneer_tasks::TaskMutationContext::default(), params),
@@ -230,7 +230,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskRescheduleParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .reschedule_task(pioneer_tasks::TaskMutationContext::default(), params),
@@ -261,7 +261,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskPauseParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .pause_task(pioneer_tasks::TaskMutationContext::default(), params),
@@ -292,7 +292,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskResumeParams,
     ) {
-        match Box::pin(
+        match message_future(
             self.task_runtime
                 .service()
                 .resume_task(pioneer_tasks::TaskMutationContext::default(), params),
@@ -323,7 +323,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: TaskAgendaParams,
     ) {
-        match self.task_runtime.service().list_agenda(params).await {
+        match message_future(self.task_runtime.service().list_agenda(params)).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await
@@ -367,34 +367,36 @@ impl MessageProcessor {
         }
     }
 
-    async fn send_task_response<T: Serialize>(
-        &self,
+    fn send_task_response<'a, T: Serialize + Sync + 'a>(
+        &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
-        response_payload: &T,
-    ) {
-        let response = match JsonRpcResponse::from_result(request_id, response_payload) {
-            Ok(response) => response,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        format!("failed to encode response: {error}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+        response_payload: &'a T,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let response = match JsonRpcResponse::from_result(request_id, response_payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            format!("failed to encode response: {error}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
-        if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(
-                connection_id,
-                error = %format!("{error:#}"),
-                "failed to send task response"
-            );
-        }
+            if let Err(error) = self.send_json(connection_id, &response).await {
+                warn!(
+                    connection_id,
+                    error = %format!("{error:#}"),
+                    "failed to send task response"
+                );
+            }
+        })
     }
 }

@@ -1,4 +1,4 @@
-use super::MessageProcessor;
+use super::{MessageProcessor, message_future};
 use crate::bootstrap::bootstrap;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
@@ -725,7 +725,7 @@ async fn install_recoverable_test_hook_runtime(
 
 #[test]
 fn phase_15_message_processor_ensure_hook_runtime_attaches_crud_store() {
-    run_gateway_message_test_with_large_stack("phase15-hook-runtime", || async {
+    run_gateway_message_test("phase15-hook-runtime", || async {
         let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
         let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
         let runtime = phase_13_empty_hook_runtime();
@@ -748,7 +748,7 @@ fn phase_15_message_processor_ensure_hook_runtime_attaches_crud_store() {
 
 #[test]
 fn phase_21_message_processor_starts_generic_hook_recovery_worker() {
-    run_gateway_message_test_with_large_stack("phase21-hook-recovery-worker", || async {
+    run_gateway_message_test("phase21-hook-recovery-worker", || async {
         let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
         let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
         harness
@@ -1260,7 +1260,7 @@ async fn create_task_for_test(
     processor: &Arc<MessageProcessor>,
     params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
-    Box::pin(
+    message_future(
         processor
             .task_runtime
             .service()
@@ -1286,7 +1286,7 @@ async fn cancel_task_for_test(
     processor: &Arc<MessageProcessor>,
     params: pioneer_protocol::TaskCancelParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCancelResponse> {
-    Box::pin(
+    message_future(
         processor
             .task_runtime
             .service()
@@ -1300,7 +1300,7 @@ async fn detach_task_for_test(
     processor: &Arc<MessageProcessor>,
     params: pioneer_protocol::TaskDetachParams,
 ) -> anyhow::Result<pioneer_protocol::TaskDetachResponse> {
-    Box::pin(
+    message_future(
         processor
             .task_runtime
             .service()
@@ -3439,7 +3439,7 @@ async fn task_detach_updates_lifecycle_policy() {
 
 #[test]
 fn agent_mode_materializes_task_tools_and_chat_mode_does_not() {
-    run_gateway_message_test_with_large_stack(
+    run_gateway_message_test(
         "agent_mode_materializes_task_tools_and_chat_mode_does_not",
         || async {
             agent_mode_materializes_task_tools_and_chat_mode_does_not_impl().await;
@@ -3574,7 +3574,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
 
 #[test]
 fn task_create_tool_persists_anchor_and_composed_timeline() {
-    run_gateway_message_test_with_large_stack(
+    run_gateway_message_test(
         "task_create_tool_persists_anchor_and_composed_timeline",
         || async {
             task_create_tool_persists_anchor_and_composed_timeline_impl().await;
@@ -3968,7 +3968,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
         test_tool_loop_config(),
     ));
 
-    let task = processor
+    let task_id = processor
         .task_runtime
         .service()
         .create_task(
@@ -4001,139 +4001,151 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
         )
         .await
         .expect("scheduled task should create")
-        .task;
+        .task
+        .id;
 
-    let agenda_request = json!({
-        "jsonrpc": "2.0",
-        "id": "taskagendarpc00000002",
-        "method": "task/agenda",
-        "params": {
-            "workspaceId": workspace_id,
-            "ownerKind": "thread",
-            "ownerId": "thr_agenda_owner",
-            "limit": 10
-        }
-    });
-    processor
-        .process_request(connection_id, &agenda_request.to_string())
-        .await;
-    let agenda_response = recv_response_by_id(&mut rx, "taskagendarpc00000002").await;
-    let agenda: TaskAgendaResponse =
-        serde_json::from_value(agenda_response.result).expect("task/agenda response should decode");
-    let agenda_item = agenda
-        .items
-        .iter()
-        .find(|item| item.task.id == task.id)
-        .expect("agenda should include active scheduled task");
-    assert_eq!(agenda_item.next_fire_at, Some(4_000_000_000));
-    assert_eq!(agenda_item.trigger_status, Some(TaskTriggerStatus::Active));
-
-    let pause_request = json!({
-        "jsonrpc": "2.0",
-        "id": "taskpauserpc000000001",
-        "method": "task/pause",
-        "params": {
-            "taskId": task.id,
-            "reason": "contract test"
-        }
-    });
-    processor
-        .process_request(connection_id, &pause_request.to_string())
-        .await;
-    let pause_response = recv_response_by_id(&mut rx, "taskpauserpc000000001").await;
-    let paused: TaskPauseResponse =
-        serde_json::from_value(pause_response.result).expect("task/pause response should decode");
-    assert_eq!(paused.task.id, task.id);
-    assert!(
-        paused
-            .triggers
-            .iter()
-            .all(|trigger| trigger.status == TaskTriggerStatus::Paused)
-    );
-
-    let agenda_without_paused_request = json!({
-        "jsonrpc": "2.0",
-        "id": "taskagendarpc00000003",
-        "method": "task/agenda",
-        "params": {
-            "workspaceId": workspace_id,
-            "ownerKind": "thread",
-            "ownerId": "thr_agenda_owner",
-            "limit": 10
-        }
-    });
-    processor
-        .process_request(connection_id, &agenda_without_paused_request.to_string())
-        .await;
-    let agenda_without_paused_response =
-        recv_response_by_id(&mut rx, "taskagendarpc00000003").await;
-    let agenda_without_paused: TaskAgendaResponse =
-        serde_json::from_value(agenda_without_paused_response.result)
+    {
+        let agenda_request = json!({
+            "jsonrpc": "2.0",
+            "id": "taskagendarpc00000002",
+            "method": "task/agenda",
+            "params": {
+                "workspaceId": workspace_id.as_str(),
+                "ownerKind": "thread",
+                "ownerId": "thr_agenda_owner",
+                "limit": 10
+            }
+        });
+        processor
+            .process_request(connection_id, &agenda_request.to_string())
+            .await;
+        let agenda_response = recv_response_by_id(&mut rx, "taskagendarpc00000002").await;
+        let agenda: TaskAgendaResponse = serde_json::from_value(agenda_response.result)
             .expect("task/agenda response should decode");
-    assert!(
-        agenda_without_paused
+        let agenda_item = agenda
             .items
             .iter()
-            .all(|item| item.task.id != task.id),
-        "paused task should be hidden unless includePaused is requested"
-    );
+            .find(|item| item.task.id == task_id)
+            .expect("agenda should include active scheduled task");
+        assert_eq!(agenda_item.next_fire_at, Some(4_000_000_000));
+        assert_eq!(agenda_item.trigger_status, Some(TaskTriggerStatus::Active));
+    }
 
-    let agenda_with_paused_request = json!({
-        "jsonrpc": "2.0",
-        "id": "taskagendarpc00000004",
-        "method": "task/agenda",
-        "params": {
-            "workspaceId": workspace_id,
-            "ownerKind": "thread",
-            "ownerId": "thr_agenda_owner",
-            "includePaused": true,
-            "limit": 10
-        }
-    });
-    processor
-        .process_request(connection_id, &agenda_with_paused_request.to_string())
-        .await;
-    let agenda_with_paused_response = recv_response_by_id(&mut rx, "taskagendarpc00000004").await;
-    let agenda_with_paused: TaskAgendaResponse =
-        serde_json::from_value(agenda_with_paused_response.result)
-            .expect("task/agenda response should decode");
-    assert!(agenda_with_paused.items.iter().any(|item| {
-        item.task.id == task.id && item.trigger_status == Some(TaskTriggerStatus::Paused)
-    }));
+    {
+        let pause_request = json!({
+            "jsonrpc": "2.0",
+            "id": "taskpauserpc000000001",
+            "method": "task/pause",
+            "params": {
+                "taskId": task_id.as_str(),
+                "reason": "contract test"
+            }
+        });
+        processor
+            .process_request(connection_id, &pause_request.to_string())
+            .await;
+        let pause_response = recv_response_by_id(&mut rx, "taskpauserpc000000001").await;
+        let paused: TaskPauseResponse = serde_json::from_value(pause_response.result)
+            .expect("task/pause response should decode");
+        assert_eq!(paused.task.id, task_id);
+        assert!(
+            paused
+                .triggers
+                .iter()
+                .all(|trigger| trigger.status == TaskTriggerStatus::Paused)
+        );
+    }
 
-    let resume_request = json!({
-        "jsonrpc": "2.0",
-        "id": "taskresumerpc00000001",
-        "method": "task/resume",
-        "params": {
-            "taskId": task.id,
-            "reason": "contract test"
-        }
-    });
-    processor
-        .process_request(connection_id, &resume_request.to_string())
-        .await;
-    let resume_response = recv_response_by_id(&mut rx, "taskresumerpc00000001").await;
-    let resumed: TaskResumeResponse =
-        serde_json::from_value(resume_response.result).expect("task/resume response should decode");
-    assert_eq!(resumed.task.id, task.id);
-    assert!(
-        resumed
-            .triggers
-            .iter()
-            .all(|trigger| trigger.status == TaskTriggerStatus::Active)
-    );
-    assert!(
-        resumed
-            .triggers
-            .iter()
-            .all(|trigger| trigger.next_fire_at == Some(4_000_000_000))
-    );
+    {
+        let agenda_without_paused_request = json!({
+            "jsonrpc": "2.0",
+            "id": "taskagendarpc00000003",
+            "method": "task/agenda",
+            "params": {
+                "workspaceId": workspace_id.as_str(),
+                "ownerKind": "thread",
+                "ownerId": "thr_agenda_owner",
+                "limit": 10
+            }
+        });
+        processor
+            .process_request(connection_id, &agenda_without_paused_request.to_string())
+            .await;
+        let agenda_without_paused_response =
+            recv_response_by_id(&mut rx, "taskagendarpc00000003").await;
+        let agenda_without_paused: TaskAgendaResponse =
+            serde_json::from_value(agenda_without_paused_response.result)
+                .expect("task/agenda response should decode");
+        assert!(
+            agenda_without_paused
+                .items
+                .iter()
+                .all(|item| item.task.id != task_id),
+            "paused task should be hidden unless includePaused is requested"
+        );
+    }
+
+    {
+        let agenda_with_paused_request = json!({
+            "jsonrpc": "2.0",
+            "id": "taskagendarpc00000004",
+            "method": "task/agenda",
+            "params": {
+                "workspaceId": workspace_id.as_str(),
+                "ownerKind": "thread",
+                "ownerId": "thr_agenda_owner",
+                "includePaused": true,
+                "limit": 10
+            }
+        });
+        processor
+            .process_request(connection_id, &agenda_with_paused_request.to_string())
+            .await;
+        let agenda_with_paused_response =
+            recv_response_by_id(&mut rx, "taskagendarpc00000004").await;
+        let agenda_with_paused: TaskAgendaResponse =
+            serde_json::from_value(agenda_with_paused_response.result)
+                .expect("task/agenda response should decode");
+        assert!(agenda_with_paused.items.iter().any(|item| {
+            item.task.id == task_id && item.trigger_status == Some(TaskTriggerStatus::Paused)
+        }));
+    }
+
+    {
+        let resume_request = json!({
+            "jsonrpc": "2.0",
+            "id": "taskresumerpc00000001",
+            "method": "task/resume",
+            "params": {
+                "taskId": task_id.as_str(),
+                "reason": "contract test"
+            }
+        });
+        processor
+            .process_request(connection_id, &resume_request.to_string())
+            .await;
+        let resume_response = recv_response_by_id(&mut rx, "taskresumerpc00000001").await;
+        let resumed: TaskResumeResponse = serde_json::from_value(resume_response.result)
+            .expect("task/resume response should decode");
+        assert_eq!(resumed.task.id, task_id);
+        assert!(
+            resumed
+                .triggers
+                .iter()
+                .all(|trigger| trigger.status == TaskTriggerStatus::Active)
+        );
+        assert!(
+            resumed
+                .triggers
+                .iter()
+                .all(|trigger| trigger.next_fire_at == Some(4_000_000_000))
+        );
+    }
 }
 
 #[test]
 fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
-    run_gateway_message_test_with_large_stack("task-parent-turn-guard", || async {
+    run_gateway_message_test("task-parent-turn-guard", || async {
         let (tx, mut rx) = mpsc::channel(128);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id = session_manager.register_connection(tx).await;
@@ -4237,7 +4249,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
 
 #[test]
 fn parent_turn_cancel_cancels_attached_child_tasks_through_service() {
-    run_gateway_message_test_with_large_stack(
+    run_gateway_message_test(
         "parent_turn_cancel_cancels_attached_child_tasks_through_service",
         || async {
             parent_turn_cancel_cancels_attached_child_tasks_through_service_impl().await;
@@ -5909,7 +5921,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
 
 #[test]
 fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
-    run_gateway_message_test_with_large_stack("prompt-manifest-hook-sources", || async {
+    run_gateway_message_test("prompt-manifest-hook-sources", || async {
         let (tx, mut rx) = mpsc::channel(8);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id = session_manager.register_connection(tx).await;
@@ -7264,34 +7276,28 @@ async fn thread_tree_includes_agents_doc_summaries_without_content() {
     );
 }
 
-fn run_gateway_message_test_with_large_stack<F, Fut>(name: &str, test: F)
+fn run_gateway_message_test<F, Fut>(name: &str, test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name(name.to_owned())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_stack_size(16 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .expect("test runtime should build")
-                .block_on(test());
-        })
-        .expect("test thread should spawn")
-        .join()
-        .expect("test thread should finish");
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name(name)
+        .enable_all()
+        .build()
+        .expect("test runtime should build")
+        .block_on(async move {
+            tokio::spawn(test()).await.expect("test task should finish");
+        });
 }
 
 fn run_thread_agents_doc_rpc_test<F, Fut>(test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    run_gateway_message_test_with_large_stack("thread-agents-doc-rpc-test", test);
+    run_gateway_message_test("thread-agents-doc-rpc-test", test);
 }
 
 #[test]
@@ -12572,20 +12578,9 @@ async fn memory_bridge_not_bound_when_runtime_disabled() {
 
 #[test]
 fn chat_mode_russian_remember_does_not_mutate_agent_memory() {
-    std::thread::Builder::new()
-        .name("chat_mode_russian_remember".to_owned())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("test runtime should build")
-                .block_on(chat_mode_russian_remember_does_not_mutate_agent_memory_impl());
-        })
-        .expect("test thread should spawn")
-        .join()
-        .expect("test thread should finish");
+    run_gateway_message_test("chat_mode_russian_remember", || async {
+        chat_mode_russian_remember_does_not_mutate_agent_memory_impl().await;
+    });
 }
 
 async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {

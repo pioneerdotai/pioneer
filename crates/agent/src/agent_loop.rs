@@ -12,6 +12,8 @@ use crate::hooks::{
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{AgentDurableEvent, RecoveryAttemptContext, ThreadMode, UserInput};
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -19,6 +21,16 @@ use tokio::time::{Duration, sleep};
 use tracing::error;
 
 const TURN_CANCEL_GRACE_MS: u64 = 750;
+
+type TurnFlowFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// Agent turn execution composes prompt, hook, provider, and tool-loop futures; keep it off worker stacks.
+fn turn_flow_future<'a, F, T>(future: F) -> TurnFlowFuture<'a, T>
+where
+    F: Future<Output = T> + Send + 'a,
+{
+    Box::pin(future)
+}
 
 pub(super) async fn run_agent_loop(
     thread_id: String,
@@ -539,7 +551,7 @@ fn spawn_turn_task(
     run_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result = execute_turn_flow(
+        let result = turn_flow_future(execute_turn_flow(
             thread_id,
             turn_request.turn_id.clone(),
             workspace_id,
@@ -561,7 +573,7 @@ fn spawn_turn_task(
             turn_control,
             recovery,
             event_hub,
-        )
+        ))
         .await;
 
         let _ = command_tx
@@ -608,7 +620,7 @@ async fn execute_turn_flow(
     event_hub: Arc<AgentEventHub>,
 ) -> TurnTaskCompletion {
     match mode {
-        ThreadMode::Chat | ThreadMode::Agent => chat::execute_chat_turn_flow(
+        ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(chat::execute_chat_turn_flow(
             thread_id,
             turn_id,
             workspace_id,
@@ -630,7 +642,7 @@ async fn execute_turn_flow(
             turn_control,
             recovery,
             event_hub,
-        )
+        ))
         .await
         .map(|outcome| TurnTaskCompletion {
             result: Ok(()),

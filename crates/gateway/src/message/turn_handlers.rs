@@ -38,7 +38,6 @@ impl MessageProcessor {
             .await;
             return;
         }
-
         let outcome = match self.thread_manager.turn_start(connection_id, params).await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -54,7 +53,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
         if let Err(error) = self
             .validate_artifact_user_inputs(
                 outcome.started_notification.workspace_id.as_str(),
@@ -76,16 +74,13 @@ impl MessageProcessor {
             .await;
             return;
         }
-
-        if let Err(error) = self
-            .crud_store
-            .materialize_turn_start(
-                &outcome.materialization.thread,
-                outcome.materialization.sandbox_mode,
-                &outcome.materialization.turn,
-                &outcome.materialization.input,
-            )
-            .await
+        if let Err(error) = message_future(self.crud_store.materialize_turn_start(
+            &outcome.materialization.thread,
+            outcome.materialization.sandbox_mode,
+            &outcome.materialization.turn,
+            &outcome.materialization.input,
+        ))
+        .await
         {
             self.thread_manager
                 .rollback_turn_start(outcome.rollback_context.clone())
@@ -102,16 +97,13 @@ impl MessageProcessor {
             .await;
             return;
         }
-
         self.start_file_capture_session(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
         )
         .await;
-
         self.ensure_hook_runtime_with_run_store().await;
-
         if let Err(error) = self
             .agent_manager
             .ensure_thread(
@@ -137,17 +129,14 @@ impl MessageProcessor {
             .await;
             return;
         }
-
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await;
-
         let history = self
             .load_conversation_history(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
             .await;
-
         let workspace_skill_policies = match self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -174,7 +163,6 @@ impl MessageProcessor {
                 std::collections::HashMap::new()
             }
         };
-
         let resolved_artifacts = match self
             .resolve_provider_artifact_inputs(
                 outcome.started_notification.workspace_id.as_str(),
@@ -207,7 +195,6 @@ impl MessageProcessor {
             resolved_artifacts.as_slice(),
         )
         .await;
-
         if let Err(error) = self
             .agent_manager
             .start_turn_with_resolved_artifacts(
@@ -240,14 +227,12 @@ impl MessageProcessor {
             .await;
             return;
         }
-
         self.session_manager
             .set_connection_workspace(
                 connection_id,
                 Some(outcome.started_notification.workspace_id.clone()),
             )
             .await;
-
         let response = match JsonRpcResponse::from_result(request_id, &outcome.response) {
             Ok(response) => response,
             Err(error) => {
@@ -263,7 +248,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
         if let Err(error) = self.send_json(connection_id, &response).await {
             warn!(
                 connection_id,
@@ -272,7 +256,6 @@ impl MessageProcessor {
             );
             return;
         }
-
         let notification = match JsonRpcNotification::from_params(
             events::TURN_STARTED,
             &outcome.started_notification,
@@ -283,7 +266,6 @@ impl MessageProcessor {
                 return;
             }
         };
-
         match serde_json::to_string(&notification) {
             Ok(payload) => {
                 for notification_connection_id in outcome.started_notification_connection_ids {
@@ -304,13 +286,12 @@ impl MessageProcessor {
                 warn!(error = %error, "failed to serialize turn/started notification");
             }
         }
-
-        self.emit_user_message_item_lifecycle(
+        message_future(self.emit_user_message_item_lifecycle(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.input.as_slice(),
-        )
+        ))
         .await;
 
         // Spawn background title generation on first turn (fire-and-forget) only for user-origin threads.

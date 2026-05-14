@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use pioneer_protocol::{TaskError, TaskErrorClass, TaskRunStatus, TaskStatus, TaskValue};
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use tracing::warn;
 
 use crate::convention::{is_terminal_task_status_db, task_run_status_from_db};
@@ -12,6 +14,16 @@ use crate::repositories::{
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::util::unix_to_datetime;
 
+type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+// Keep each event branch out of the outer projector future; task payloads are large.
+fn project_future<'a, F>(future: F) -> ProjectFuture<'a>
+where
+    F: Future<Output = Result<()>> + Send + 'a,
+{
+    Box::pin(future)
+}
+
 #[derive(Clone, Default)]
 pub struct TaskProjector;
 
@@ -20,73 +32,64 @@ impl TaskProjector {
         Self
     }
 
-    pub async fn project<C: ConnectionTrait>(
+    pub async fn project<C: ConnectionTrait + Sync>(
         &self,
         db: &C,
         event: &AppendedTaskEvent,
     ) -> Result<()> {
-        match &event.payload {
+        let created_at = event.created_at;
+        let future: ProjectFuture<'_> = match &event.payload {
             TaskEventPayload::TaskCreated { task: task_model } => {
-                task::upsert_task(db, task_model).await
+                project_future(task::upsert_task(db, task_model))
             }
             TaskEventPayload::TriggerCreated { trigger } => {
-                task_trigger::upsert_trigger(db, trigger).await
+                project_future(task_trigger::upsert_trigger(db, trigger))
             }
             TaskEventPayload::DependencyCreated { dependency } => {
-                task_dependency::upsert_dependency(db, dependency).await
+                project_future(task_dependency::upsert_dependency(db, dependency))
             }
             TaskEventPayload::AgentSpecCreated { agent_spec } => {
-                task_agent_spec::upsert_agent_spec(db, agent_spec).await
+                project_future(task_agent_spec::upsert_agent_spec(db, agent_spec))
             }
             TaskEventPayload::TaskScheduled {
                 task_id,
                 trigger_id,
                 next_fire_at,
-            } => {
+            } => project_future(async move {
                 task_trigger::update_trigger_schedule(
                     db,
                     trigger_id,
                     pioneer_protocol::TaskTriggerStatus::Active,
                     next_fire_at.map(unix_to_datetime),
                     None,
-                    event.created_at,
+                    created_at,
                 )
                 .await?;
-                let outcome = task::update_task_status(
-                    db,
-                    task_id,
-                    TaskStatus::Scheduled,
-                    event.created_at,
-                    None,
-                )
-                .await?;
+                let outcome =
+                    task::update_task_status(db, task_id, TaskStatus::Scheduled, created_at, None)
+                        .await?;
                 handle_projection_outcome("task_scheduled", task_id, &outcome);
                 Ok(())
-            }
-            TaskEventPayload::TaskQueued { task_id, .. } => {
-                let outcome = task::update_task_status(
-                    db,
-                    task_id,
-                    TaskStatus::Queued,
-                    event.created_at,
-                    None,
-                )
-                .await?;
+            }),
+            TaskEventPayload::TaskQueued { task_id, .. } => project_future(async move {
+                let outcome =
+                    task::update_task_status(db, task_id, TaskStatus::Queued, created_at, None)
+                        .await?;
                 handle_projection_outcome("task_queued", task_id, &outcome);
                 Ok(())
-            }
-            TaskEventPayload::RunCreated { run, agent_spec } => {
+            }),
+            TaskEventPayload::RunCreated { run, agent_spec } => project_future(async move {
                 task_run::upsert_run(db, run).await?;
                 if let Some(agent_spec) = agent_spec {
                     task_agent_spec::upsert_agent_spec(db, agent_spec).await?;
                 }
                 Ok(())
-            }
+            }),
             TaskEventPayload::RunStarted {
                 task_id,
                 run_id,
                 started_at,
-            } => {
+            } => project_future(async move {
                 let started_at = unix_to_datetime(*started_at);
                 let run_outcome = task_run::update_run_started(db, run_id, started_at)
                     .await
@@ -104,14 +107,14 @@ impl TaskProjector {
                     handle_projection_outcome("run_started_task_status", task_id, &task_outcome);
                 }
                 Ok(())
-            }
-            TaskEventPayload::Progress { .. } => Ok(()),
+            }),
+            TaskEventPayload::Progress { .. } => project_future(async { Ok(()) }),
             TaskEventPayload::RunCompleted {
                 task_id: _,
                 run_id,
                 result,
                 completed_at,
-            } => {
+            } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
                 let outcome = task_run::update_run_result(
                     db,
@@ -123,13 +126,13 @@ impl TaskProjector {
                 .await?;
                 handle_projection_outcome("run_completed", run_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::RunFailed {
                 task_id: _,
                 run_id,
                 error,
                 completed_at,
-            } => {
+            } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
                 let status = if task_error_is_cancellation(error.as_ref()) {
                     TaskRunStatus::Cancelled
@@ -141,14 +144,14 @@ impl TaskProjector {
                         .await?;
                 handle_projection_outcome("run_failed", run_id, &outcome);
                 Ok(())
-            }
-            TaskEventPayload::RunRetryScheduled { retry_run, .. } => {
+            }),
+            TaskEventPayload::RunRetryScheduled { retry_run, .. } => project_future(async move {
                 task_run::upsert_run(db, retry_run).await?;
                 let outcome = task::update_task_status(
                     db,
                     retry_run.task_id.as_str(),
                     TaskStatus::Queued,
-                    event.created_at,
+                    created_at,
                     None,
                 )
                 .await?;
@@ -158,14 +161,14 @@ impl TaskProjector {
                     &outcome,
                 );
                 Ok(())
-            }
-            TaskEventPayload::RunRetryExhausted { .. } => Ok(()),
+            }),
+            TaskEventPayload::RunRetryExhausted { .. } => project_future(async { Ok(()) }),
             TaskEventPayload::RunCancelled {
                 task_id: _,
                 run_id,
                 reason,
                 cancelled_at,
-            } => {
+            } => project_future(async move {
                 let cancelled_at = unix_to_datetime(*cancelled_at);
                 let error = reason.as_ref().map(|reason| TaskError {
                     code: "task_run_cancelled".to_owned(),
@@ -184,12 +187,12 @@ impl TaskProjector {
                 .await?;
                 handle_projection_outcome("run_cancelled", run_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::TaskCompleted {
                 task_id,
                 result,
                 completed_at,
-            } => {
+            } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
                 let outcome = task::update_task_result(
                     db,
@@ -202,12 +205,12 @@ impl TaskProjector {
                 .await?;
                 handle_projection_outcome("task_completed", task_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::TaskFailed {
                 task_id,
                 error,
                 completed_at,
-            } => {
+            } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
                 let status = if task_error_is_cancellation(error.as_ref()) {
                     TaskStatus::Cancelled
@@ -225,12 +228,12 @@ impl TaskProjector {
                 .await?;
                 handle_projection_outcome("task_failed", task_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::TaskCancelled {
                 task_id,
                 reason,
                 completed_at,
-            } => {
+            } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
                 let error = reason.as_ref().map(|reason| TaskError {
                     code: "task_cancelled".to_owned(),
@@ -250,21 +253,21 @@ impl TaskProjector {
                 .await?;
                 handle_projection_outcome("task_cancelled", task_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::TaskDetached {
                 task: task_model, ..
-            } => {
+            } => project_future(async move {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
                 task::upsert_task(db, task_model).await
-            }
+            }),
             TaskEventPayload::TaskUpdated {
                 task: task_model,
                 trigger,
                 agent_spec,
                 ..
-            } => {
+            } => project_future(async move {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
@@ -276,8 +279,8 @@ impl TaskProjector {
                     task_agent_spec::upsert_agent_spec(db, agent_spec).await?;
                 }
                 Ok(())
-            }
-            TaskEventPayload::TaskRescheduled { trigger, .. } => {
+            }),
+            TaskEventPayload::TaskRescheduled { trigger, .. } => project_future(async move {
                 task_trigger::upsert_trigger(db, trigger).await?;
                 if task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await? {
                     return Ok(());
@@ -291,13 +294,13 @@ impl TaskProjector {
                     db,
                     trigger.task_id.as_str(),
                     status,
-                    event.created_at,
+                    created_at,
                     None,
                 )
                 .await?;
                 handle_projection_outcome("task_rescheduled", trigger.task_id.as_str(), &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::TaskPaused {
                 task: task_model,
                 triggers,
@@ -307,7 +310,7 @@ impl TaskProjector {
                 task: task_model,
                 triggers,
                 ..
-            } => {
+            } => project_future(async move {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
@@ -316,17 +319,17 @@ impl TaskProjector {
                     task_trigger::upsert_trigger(db, trigger).await?;
                 }
                 Ok(())
-            }
-            TaskEventPayload::TaskRecovered { .. } => Ok(()),
+            }),
+            TaskEventPayload::TaskRecovered { .. } => project_future(async { Ok(()) }),
             TaskEventPayload::ChildThreadLinked { lineage } => {
-                thread_lineage::upsert_lineage(db, lineage).await
+                project_future(thread_lineage::upsert_lineage(db, lineage))
             }
             TaskEventPayload::DepthLimitExceeded {
                 task_id,
                 run_id,
                 depth,
                 max_depth,
-            } => {
+            } => project_future(async move {
                 let error = TaskError {
                     code: "task_depth_limit_exceeded".to_owned(),
                     message: format!("task depth {depth} exceeds max depth {max_depth}"),
@@ -343,7 +346,7 @@ impl TaskProjector {
                         run_id,
                         TaskRunStatus::Failed,
                         Some(&error),
-                        event.created_at,
+                        created_at,
                     )
                     .await?;
                     handle_projection_outcome("depth_limit_run_failed", run_id, &outcome);
@@ -353,40 +356,46 @@ impl TaskProjector {
                     task_id,
                     TaskStatus::Failed,
                     Some(&error),
-                    event.created_at,
-                    Some(event.created_at),
+                    created_at,
+                    Some(created_at),
                 )
                 .await?;
                 handle_projection_outcome("depth_limit_task_failed", task_id, &outcome);
                 Ok(())
-            }
+            }),
             TaskEventPayload::DeliveryQueued { delivery }
             | TaskEventPayload::DeliveryCancelled { delivery, .. } => {
-                task_delivery::upsert_delivery(db, delivery).await
+                project_future(task_delivery::upsert_delivery(db, delivery))
             }
             TaskEventPayload::DeliveryStarted { delivery, attempt }
             | TaskEventPayload::DeliveryDelivered { delivery, attempt }
             | TaskEventPayload::DeliveryFailed { delivery, attempt } => {
-                task_delivery::upsert_delivery(db, delivery).await?;
-                task_delivery::upsert_attempt(db, attempt).await
+                project_future(async move {
+                    task_delivery::upsert_delivery(db, delivery).await?;
+                    task_delivery::upsert_attempt(db, attempt).await
+                })
             }
             TaskEventPayload::WriteLockAcquired { lock }
             | TaskEventPayload::WriteLockReleased { lock, .. }
             | TaskEventPayload::WriteLockExpired { lock, .. } => {
-                task_write_lock::upsert_lock(db, lock).await
+                project_future(task_write_lock::upsert_lock(db, lock))
             }
-            TaskEventPayload::WriteLockBlocked { .. } => Ok(()),
-        }
+            TaskEventPayload::WriteLockBlocked { .. } => project_future(async { Ok(()) }),
+        };
+        future.await
     }
 }
 
-async fn task_is_terminal_db<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<bool> {
+async fn task_is_terminal_db<C: ConnectionTrait + Sync>(db: &C, task_id: &str) -> Result<bool> {
     Ok(task::find_task_by_id(db, task_id)
         .await?
         .is_some_and(|model| is_terminal_task_status_db(model.status.as_str())))
 }
 
-async fn task_has_nonterminal_run_db<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<bool> {
+async fn task_has_nonterminal_run_db<C: ConnectionTrait + Sync>(
+    db: &C,
+    task_id: &str,
+) -> Result<bool> {
     let runs = task_run::list_runs_by_task(db, task_id).await?;
     Ok(runs.into_iter().any(|run| {
         task_run_status_from_db(run.status.as_str()).is_some_and(|status| !status.is_terminal())

@@ -87,7 +87,9 @@ use pioneer_tasks::TaskRuntime;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -105,6 +107,16 @@ use crate::secrets::GatewaySecrets;
 use crate::session::{ConnectionId, SessionManager};
 use crate::thread::ThreadManager;
 use crate::workspace::{WorkspaceError, WorkspaceManager};
+
+pub(crate) type MessageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// Gateway handlers compose large protocol and CRUD futures; this is the explicit heap boundary.
+pub(crate) fn message_future<'a, F, T>(future: F) -> MessageFuture<'a, T>
+where
+    F: Future<Output = T> + Send + 'a,
+{
+    Box::pin(future)
+}
 
 #[derive(Clone, Copy)]
 pub struct ContextBudget {
@@ -147,6 +159,7 @@ pub struct MessageProcessor {
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
+    parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
@@ -246,6 +259,7 @@ impl MessageProcessor {
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
@@ -1049,6 +1063,7 @@ impl MessageProcessor {
             },
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
