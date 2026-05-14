@@ -119,6 +119,11 @@ struct StartOutput {
 }
 
 #[derive(Debug, Deserialize)]
+struct VersionOutput {
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
 }
@@ -232,6 +237,25 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         });
     }
 
+    let installed_version = match query_binary_version(&target_binary) {
+        Ok(version) => version,
+        Err(error) => {
+            restore_binary_and_config(
+                &target_binary,
+                &rollback_binary,
+                runtime_home.as_deref(),
+                config_backup_dir.as_deref(),
+            );
+            maybe_restore_service_after_rollback(
+                &target_binary,
+                &rollback_binary,
+                was_active,
+                &options.managed_by,
+            );
+            bail!("installed binary failed version probe: {error:#}; update rolled back");
+        }
+    };
+
     let link_result = match ensure_global_command_link(&config, &target_binary) {
         Ok(result) => result,
         Err(error) => {
@@ -290,7 +314,12 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         }
     }
 
-    if let Err(error) = persist_install_state(&options.managed_by, &target_binary, &install_root) {
+    if let Err(error) = persist_install_state(
+        &options.managed_by,
+        &target_binary,
+        &install_root,
+        installed_version.as_str(),
+    ) {
         rollback_and_restore(
             &target_binary,
             &rollback_binary,
@@ -324,7 +353,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             InstallCommand::Install => "install",
             InstallCommand::Update => "update",
         },
-        installed_version: env!("CARGO_PKG_VERSION").to_owned(),
+        installed_version,
         installed_binary: target_binary.display().to_string(),
         install_root: install_root.display().to_string(),
         service_active: post_status.service_active,
@@ -513,6 +542,7 @@ fn persist_install_state(
     managed_by: &InstallManagedBy,
     target_binary: &Path,
     install_root: &Path,
+    installed_version: &str,
 ) -> Result<()> {
     let config = AppConfig::load().context("failed to load app config for install-state update")?;
     let install_state_path = config
@@ -521,7 +551,7 @@ fn persist_install_state(
     let state = InstallState {
         version: InstallState::CURRENT_VERSION,
         managed_by: managed_by.clone(),
-        installed_version: env!("CARGO_PKG_VERSION").to_owned(),
+        installed_version: installed_version.to_owned(),
         install_root: Some(install_root.to_path_buf()),
         binary_path: target_binary.to_path_buf(),
         updated_at_unix: unix_timestamp_secs()?,
@@ -617,6 +647,31 @@ fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
         gateway_reachable: parsed.gateway_reachable,
         runtime_home,
     }))
+}
+
+fn query_binary_version(binary: &Path) -> Result<String> {
+    let output = Command::new(binary)
+        .arg("version")
+        .arg("--json")
+        .output()
+        .with_context(|| format!("failed to run `{}` version --json", binary.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "command `{}` failed during version probe: {}",
+            render_binary_command(binary, &["version", "--json"]),
+            command_output_details(&output)
+        );
+    }
+
+    let parsed: VersionOutput =
+        serde_json::from_slice(&output.stdout).context("failed to parse version probe output")?;
+    let version = parsed.version.trim();
+    if version.is_empty() {
+        bail!("version probe output did not include a version");
+    }
+
+    Ok(version.to_owned())
 }
 
 fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
