@@ -1,6 +1,7 @@
 mod error;
 mod event_bus;
 mod executor;
+mod invariant;
 mod notifications;
 mod policy;
 mod ports;
@@ -19,6 +20,10 @@ pub use event_bus::{TaskEventBus, TaskEventFilter, TaskEventSubscription};
 pub use executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRecoveryOutcome,
     TaskExecutorRegistry, TaskExecutorStartOutcome,
+};
+pub use invariant::{
+    TaskRuntimeChildLinkRef, TaskRuntimeInvariantReport, TaskRuntimeInvariantScanner,
+    TaskRuntimeInvariantSeverity, TaskRuntimeInvariantViolation, TaskRuntimeInvariantViolationKind,
 };
 pub use notifications::TaskNotificationMapper;
 pub use policy::{TaskCreateContext, TaskMutationContext, TaskWaitContext};

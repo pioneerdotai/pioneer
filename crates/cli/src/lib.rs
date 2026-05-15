@@ -1,6 +1,7 @@
 mod installer;
 mod secrets;
 mod service;
+mod task_invariants;
 
 use anyhow::{Context, Result, bail};
 use pioneer_config::InstallManagedBy;
@@ -60,6 +61,7 @@ fn run() -> Result<()> {
             ensure_no_extra_args(args)?;
             service::issue_superuser_token()
         }
+        Some("task-invariants") => task_invariants::run(args),
         Some("secrets") => secrets::run(args),
         Some("status") => {
             let json_output = parse_optional_json_flag(args)?;
@@ -426,6 +428,8 @@ fn help_text() -> String {
   {command} start [--json]      Install and start the persistent gateway service
   {command} status [--json]     Show gateway service status
   {command} issue-superuser-token  Generate a superuser JWT and print it
+  {command} task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]
+                                Scan task/subagent runtime invariants in a SQLite gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} secrets rotate-jwt-token superuser [--json]  Rotate superuser JWT signing material

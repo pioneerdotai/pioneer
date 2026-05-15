@@ -13,6 +13,8 @@ chrono-tz.workspace = true
 pioneer-crud.workspace = true
 pioneer-protocol.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 sha2.workspace = true
 hex.workspace = true
 tokio.workspace = true
