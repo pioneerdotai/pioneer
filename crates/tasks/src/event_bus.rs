@@ -71,6 +71,9 @@ impl TaskEventBus {
     }
 
     pub async fn publish(&self, event: AppendedTaskEvent) {
+        if !event.append_status.is_inserted() {
+            return;
+        }
         let _ = self.sender.send(event);
     }
 

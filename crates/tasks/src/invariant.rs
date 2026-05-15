@@ -673,98 +673,7 @@ async fn load_thread_lineage_by_run<C: ConnectionTrait>(
 }
 
 fn lifecycle_semantic_key(payload: &TaskEventPayload) -> Option<String> {
-    match payload {
-        TaskEventPayload::TaskCreated { task } => Some(format!("task:{}:created", task.id)),
-        TaskEventPayload::TriggerCreated { trigger } => {
-            Some(format!("trigger:{}:created", trigger.id))
-        }
-        TaskEventPayload::DependencyCreated { dependency } => {
-            Some(format!("dependency:{}:created", dependency.id))
-        }
-        TaskEventPayload::AgentSpecCreated { agent_spec } => {
-            Some(format!("agent_spec:{}:created", agent_spec.id))
-        }
-        TaskEventPayload::RunCreated { run, .. } => Some(format!("run:{}:created", run.id)),
-        TaskEventPayload::RunStarted { run_id, .. } => Some(format!("run:{run_id}:started")),
-        TaskEventPayload::RunCompleted { run_id, .. }
-        | TaskEventPayload::RunFailed { run_id, .. }
-        | TaskEventPayload::RunCancelled { run_id, .. } => Some(format!("run:{run_id}:terminal")),
-        TaskEventPayload::RunRetryScheduled { retry_run, .. } => {
-            Some(format!("run:{}:retry_created", retry_run.id))
-        }
-        TaskEventPayload::RunRetryExhausted {
-            run_group_id,
-            final_run_id,
-            ..
-        } => Some(format!(
-            "run_group:{run_group_id}:retry_exhausted:{final_run_id}"
-        )),
-        TaskEventPayload::TaskCompleted { task_id, .. }
-        | TaskEventPayload::TaskFailed { task_id, .. }
-        | TaskEventPayload::TaskCancelled { task_id, .. } => {
-            Some(format!("task:{task_id}:terminal"))
-        }
-        TaskEventPayload::TaskDetached { task, .. } => Some(format!("task:{}:detached", task.id)),
-        TaskEventPayload::TaskUpdated { task, .. } => Some(format!("task:{}:updated", task.id)),
-        TaskEventPayload::TaskRescheduled { trigger, .. } => {
-            Some(format!("trigger:{}:rescheduled", trigger.id))
-        }
-        TaskEventPayload::TaskPaused { task, .. } => Some(format!("task:{}:paused", task.id)),
-        TaskEventPayload::TaskResumed { task, .. } => Some(format!("task:{}:resumed", task.id)),
-        TaskEventPayload::ChildThreadLinked { lineage } => {
-            Some(format!("run:{}:child_thread_linked", lineage.task_run_id))
-        }
-        TaskEventPayload::DeliveryQueued { delivery } => {
-            Some(format!("delivery:{}:queued", delivery.id))
-        }
-        TaskEventPayload::DeliveryStarted { delivery, attempt } => Some(format!(
-            "delivery:{}:attempt:{}:started",
-            delivery.id, attempt.id
-        )),
-        TaskEventPayload::DeliveryDelivered { delivery, .. } => {
-            Some(format!("delivery:{}:delivered", delivery.id))
-        }
-        TaskEventPayload::DeliveryFailed { delivery, attempt } => Some(format!(
-            "delivery:{}:attempt:{}:failed",
-            delivery.id, attempt.id
-        )),
-        TaskEventPayload::DeliveryCancelled { delivery, .. } => {
-            Some(format!("delivery:{}:cancelled", delivery.id))
-        }
-        TaskEventPayload::WriteLockAcquired { lock } => {
-            Some(format!("write_lock:{}:acquired", lock.id))
-        }
-        TaskEventPayload::WriteLockReleased { lock, .. } => {
-            Some(format!("write_lock:{}:released", lock.id))
-        }
-        TaskEventPayload::WriteLockExpired { lock, .. } => {
-            Some(format!("write_lock:{}:expired", lock.id))
-        }
-        TaskEventPayload::TaskScheduled {
-            task_id,
-            trigger_id,
-            ..
-        } => Some(format!("task:{task_id}:trigger:{trigger_id}:scheduled")),
-        TaskEventPayload::TaskQueued { task_id, run_id } => run_id
-            .as_deref()
-            .map(|run_id| format!("task:{task_id}:run:{run_id}:queued")),
-        TaskEventPayload::TaskRecovered {
-            task_id, run_id, ..
-        } => Some(format!(
-            "task:{task_id}:run:{}:recovered",
-            run_id.as_deref().unwrap_or("none")
-        )),
-        TaskEventPayload::DepthLimitExceeded {
-            task_id, run_id, ..
-        } => Some(format!(
-            "task:{task_id}:run:{}:depth_limit_exceeded",
-            run_id.as_deref().unwrap_or("none")
-        )),
-        TaskEventPayload::WriteLockBlocked {
-            task_id, run_id, ..
-        } => Some(format!("task:{task_id}:run:{run_id}:write_lock_blocked")),
-        TaskEventPayload::Progress { .. } => None,
-    }
+    payload.idempotency_key()
 }
 
 fn task_result_bool_flag(result: &TaskResult, flag: &str) -> Option<bool> {
@@ -817,7 +726,7 @@ fn sqlite_read_only_connection_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::ThreadLineage;
+    use pioneer_protocol::{TaskError, TaskErrorClass, ThreadLineage};
     use sea_orm::{ConnectionTrait, Database};
 
     fn violation(kind: TaskRuntimeInvariantViolationKind) -> TaskRuntimeInvariantViolation {
@@ -1212,6 +1121,65 @@ mod tests {
             report.violations.iter().any(|violation| matches!(
                 violation.kind,
                 TaskRuntimeInvariantViolationKind::StaleInProgressTurn { .. }
+            )),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_reports_contradictory_run_terminal_events() {
+        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
+        create_minimal_scanner_schema(&db).await;
+
+        insert_task_event(
+            &db,
+            "event_run_completed",
+            1,
+            &TaskEventPayload::RunCompleted {
+                task_id: "task_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                result: Some(TaskResult {
+                    summary: Some("done".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some("run_1".to_owned()),
+                }),
+                completed_at: 10,
+            },
+        )
+        .await;
+        insert_task_event(
+            &db,
+            "event_run_failed",
+            2,
+            &TaskEventPayload::RunFailed {
+                task_id: "task_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                error: Some(TaskError {
+                    code: "late_failure".to_owned(),
+                    message: "late failure".to_owned(),
+                    class: TaskErrorClass::Internal,
+                    details: None,
+                    failed_run_id: Some("run_1".to_owned()),
+                }),
+                completed_at: 11,
+            },
+        )
+        .await;
+
+        let report = TaskRuntimeInvariantScanner::new()
+            .scan_connection(&db, 2_000_000_000)
+            .await
+            .expect("scan should succeed");
+
+        assert!(
+            report.violations.iter().any(|violation| matches!(
+                &violation.kind,
+                TaskRuntimeInvariantViolationKind::DuplicateLifecycleEvents {
+                    run_id: Some(run_id),
+                    semantic_key,
+                    ..
+                } if run_id == "run_1" && semantic_key == "run:run_1:terminal"
             )),
             "{report}"
         );

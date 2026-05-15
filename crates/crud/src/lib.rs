@@ -76,7 +76,7 @@ use crate::repositories::{
     task_write_lock, thread, thread_agents_doc, thread_lineage, thread_tree, turn, turn_event,
     turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
-pub use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
+pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
 use crate::turn_item_terminal::{
     TurnItemTerminalState, terminalize_turn_item_payload, tool_call_status,
@@ -2934,14 +2934,17 @@ impl CrudStore {
         }
 
         let created_at = unix_to_datetime(started_at);
+        let payload = TaskEventPayload::RunStarted {
+            task_id,
+            run_id: run_id.clone(),
+            started_at,
+        };
+        let idempotency_key = payload.idempotency_key();
         let mut appended_event = match task_event::append_event(
             &transaction,
-            &TaskEventPayload::RunStarted {
-                task_id,
-                run_id: run_id.clone(),
-                started_at,
-            },
+            &payload,
             created_at,
+            idempotency_key.as_deref(),
         )
         .await
         {
@@ -2952,14 +2955,16 @@ impl CrudStore {
             }
         };
 
-        if let Err(error) = self
-            .task_projector
-            .project(&transaction, &appended_event)
-            .await
-            .context("failed to project task run started event")
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
+        if appended_event.append_status.is_inserted() {
+            if let Err(error) = self
+                .task_projector
+                .project(&transaction, &appended_event)
+                .await
+                .context("failed to project task run started event")
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
         }
 
         if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
@@ -6083,24 +6088,33 @@ impl CrudStore {
             .context("failed to begin task event materialization transaction")?;
 
         let created_at = unix_to_datetime(event_timestamp_secs);
+        let idempotency_key = event.idempotency_key();
 
-        let mut appended_event =
-            match task_event::append_event(&transaction, &event, created_at).await {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-        if let Err(error) = self
-            .task_projector
-            .project(&transaction, &appended_event)
-            .await
-            .context("failed to project task event to read models")
+        let mut appended_event = match task_event::append_event(
+            &transaction,
+            &event,
+            created_at,
+            idempotency_key.as_deref(),
+        )
+        .await
         {
-            let _ = transaction.rollback().await;
-            return Err(error);
+            Ok(event) => event,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if appended_event.append_status.is_inserted() {
+            if let Err(error) = self
+                .task_projector
+                .project(&transaction, &appended_event)
+                .await
+                .context("failed to project task event to read models")
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
         }
 
         if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
@@ -6134,23 +6148,32 @@ impl CrudStore {
         let mut appended_events = Vec::with_capacity(events.len());
 
         for event in events {
-            let mut appended_event =
-                match task_event::append_event(&transaction, &event, created_at).await {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
-                    }
-                };
-
-            if let Err(error) = self
-                .task_projector
-                .project(&transaction, &appended_event)
-                .await
-                .context("failed to project task event to read models")
+            let idempotency_key = event.idempotency_key();
+            let mut appended_event = match task_event::append_event(
+                &transaction,
+                &event,
+                created_at,
+                idempotency_key.as_deref(),
+            )
+            .await
             {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                Ok(event) => event,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            if appended_event.append_status.is_inserted() {
+                if let Err(error) = self
+                    .task_projector
+                    .project(&transaction, &appended_event)
+                    .await
+                    .context("failed to project task event to read models")
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
             }
 
             if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)

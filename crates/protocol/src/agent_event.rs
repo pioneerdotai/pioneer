@@ -410,6 +410,7 @@ mod tests {
             turn_id: None,
             sequence: 1,
             event_type: payload.event_type().to_owned(),
+            idempotency_key: payload.idempotency_key(),
             payload,
             created_at: 10,
         }

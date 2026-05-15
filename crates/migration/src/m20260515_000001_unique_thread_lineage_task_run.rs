@@ -3,6 +3,12 @@ use sea_orm_migration::{prelude::*, schema::*, sea_orm::DbBackend};
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+#[derive(DeriveIden)]
+enum TaskEvent {
+    Table,
+    IdempotencyKey,
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -21,11 +27,13 @@ impl MigrationTrait for Migration {
             .await?;
 
         create_task_run_execution_table(manager).await?;
+        add_task_event_idempotency(manager).await?;
 
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_task_event_idempotency(manager).await?;
         drop_task_run_execution_table(manager).await?;
 
         manager
@@ -66,6 +74,63 @@ async fn deduplicate_existing_thread_lineage_runs(
     };
 
     manager.get_connection().execute_unprepared(sql).await?;
+
+    Ok(())
+}
+
+async fn add_task_event_idempotency(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if !manager.has_column("task_event", "idempotency_key").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(TaskEvent::Table)
+                    .add_column(
+                        ColumnDef::new(TaskEvent::IdempotencyKey)
+                            .string_len(256)
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("uidx_task_event_task_idempotency_key")
+                .table(TaskEvent::Table)
+                .col("task_id")
+                .col(TaskEvent::IdempotencyKey)
+                .unique()
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn drop_task_event_idempotency(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("uidx_task_event_task_idempotency_key")
+                .table(TaskEvent::Table)
+                .to_owned(),
+        )
+        .await?;
+
+    if manager.has_column("task_event", "idempotency_key").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(TaskEvent::Table)
+                    .drop_column(TaskEvent::IdempotencyKey)
+                    .to_owned(),
+            )
+            .await?;
+    }
 
     Ok(())
 }

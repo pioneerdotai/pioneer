@@ -902,6 +902,8 @@ pub struct TaskEvent {
     pub turn_id: Option<String>,
     pub sequence: i64,
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub payload: TaskEventPayload,
     pub created_at: i64,
 }
@@ -1248,6 +1250,95 @@ impl TaskEventPayload {
             Self::WriteLockReleased { .. } => events::TASK_WRITE_LOCK_RELEASED,
             Self::WriteLockBlocked { .. } => events::TASK_WRITE_LOCK_BLOCKED,
             Self::WriteLockExpired { .. } => events::TASK_WRITE_LOCK_EXPIRED,
+        }
+    }
+
+    pub fn idempotency_key(&self) -> Option<String> {
+        match self {
+            Self::TaskCreated { task } => Some(format!("task:{}:created", task.id)),
+            Self::TriggerCreated { trigger } => Some(format!("trigger:{}:created", trigger.id)),
+            Self::DependencyCreated { dependency } => {
+                Some(format!("dependency:{}:created", dependency.id))
+            }
+            Self::AgentSpecCreated { agent_spec } => {
+                Some(format!("agent_spec:{}:created", agent_spec.id))
+            }
+            Self::TaskScheduled {
+                trigger_id,
+                next_fire_at,
+                ..
+            } => Some(format!(
+                "trigger:{trigger_id}:scheduled:{}",
+                next_fire_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            )),
+            Self::TaskQueued { task_id, run_id } => run_id
+                .as_deref()
+                .map(|run_id| format!("task:{task_id}:run:{run_id}:queued")),
+            Self::RunCreated { run, .. } => Some(format!("run:{}:created", run.id)),
+            Self::RunStarted { run_id, .. } => Some(format!("run:{run_id}:started")),
+            Self::RunCompleted { run_id, .. }
+            | Self::RunFailed { run_id, .. }
+            | Self::RunCancelled { run_id, .. } => Some(format!("run:{run_id}:terminal")),
+            Self::RunRetryScheduled { retry_run, .. } => {
+                Some(format!("run:{}:retry_created", retry_run.id))
+            }
+            Self::RunRetryExhausted {
+                run_group_id,
+                final_run_id,
+                ..
+            } => Some(format!(
+                "run_group:{run_group_id}:retry_exhausted:{final_run_id}"
+            )),
+            Self::TaskCompleted { task_id, .. }
+            | Self::TaskFailed { task_id, .. }
+            | Self::TaskCancelled { task_id, .. } => Some(format!("task:{task_id}:terminal")),
+            Self::TaskDetached { task, detached_at } => Some(format!(
+                "task:{}:detached:{}:{detached_at}",
+                task.id, task.revision
+            )),
+            Self::TaskUpdated { .. }
+            | Self::TaskRescheduled { .. }
+            | Self::TaskPaused { .. }
+            | Self::TaskResumed { .. } => None,
+            Self::TaskRecovered { .. } => None,
+            Self::ChildThreadLinked { lineage } => {
+                Some(format!("run:{}:child_thread_linked", lineage.task_run_id))
+            }
+            Self::DepthLimitExceeded {
+                task_id,
+                run_id,
+                depth,
+                max_depth,
+            } => Some(format!(
+                "task:{task_id}:run:{}:depth_limit_exceeded:{depth}:{max_depth}",
+                run_id.as_deref().unwrap_or("none")
+            )),
+            Self::DeliveryQueued { delivery } => Some(format!("delivery:{}:queued", delivery.id)),
+            Self::DeliveryStarted { delivery, attempt } => Some(format!(
+                "delivery:{}:attempt:{}:started",
+                delivery.id, attempt.id
+            )),
+            Self::DeliveryDelivered { delivery, .. } => {
+                Some(format!("delivery:{}:delivered", delivery.id))
+            }
+            Self::DeliveryFailed { delivery, attempt } => Some(format!(
+                "delivery:{}:attempt:{}:failed",
+                delivery.id, attempt.id
+            )),
+            Self::DeliveryCancelled { delivery, .. } => {
+                Some(format!("delivery:{}:cancelled", delivery.id))
+            }
+            Self::WriteLockAcquired { lock } => Some(format!("write_lock:{}:acquired", lock.id)),
+            Self::WriteLockReleased { lock, released_at } => {
+                Some(format!("write_lock:{}:released:{released_at}", lock.id))
+            }
+            Self::WriteLockBlocked { .. } => None,
+            Self::WriteLockExpired { lock, expired_at } => {
+                Some(format!("write_lock:{}:expired:{expired_at}", lock.id))
+            }
+            Self::Progress { .. } => None,
         }
     }
 }

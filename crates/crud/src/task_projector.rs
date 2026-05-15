@@ -68,14 +68,14 @@ impl TaskProjector {
                 let outcome =
                     task::update_task_status(db, task_id, TaskStatus::Scheduled, created_at, None)
                         .await?;
-                handle_projection_outcome("task_scheduled", task_id, &outcome);
+                handle_projection_outcome("task_scheduled", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskQueued { task_id, .. } => project_future(async move {
                 let outcome =
                     task::update_task_status(db, task_id, TaskStatus::Queued, created_at, None)
                         .await?;
-                handle_projection_outcome("task_queued", task_id, &outcome);
+                handle_projection_outcome("task_queued", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::RunCreated { run, agent_spec } => project_future(async move {
@@ -94,7 +94,7 @@ impl TaskProjector {
                 let run_outcome = task_run::update_run_started(db, run_id, started_at)
                     .await
                     .with_context(|| format!("failed to project task run `{run_id}` started"))?;
-                handle_projection_outcome("run_started", run_id, &run_outcome);
+                handle_projection_outcome("run_started", run_id, &run_outcome)?;
                 if matches!(run_outcome, ProjectionWriteOutcome::Applied) {
                     let task_outcome = task::update_task_status(
                         db,
@@ -104,7 +104,7 @@ impl TaskProjector {
                         None,
                     )
                     .await?;
-                    handle_projection_outcome("run_started_task_status", task_id, &task_outcome);
+                    handle_projection_outcome("run_started_task_status", task_id, &task_outcome)?;
                 }
                 Ok(())
             }),
@@ -124,7 +124,7 @@ impl TaskProjector {
                     completed_at,
                 )
                 .await?;
-                handle_projection_outcome("run_completed", run_id, &outcome);
+                handle_projection_outcome("run_completed", run_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::RunFailed {
@@ -142,7 +142,7 @@ impl TaskProjector {
                 let outcome =
                     task_run::update_run_error(db, run_id, status, error.as_ref(), completed_at)
                         .await?;
-                handle_projection_outcome("run_failed", run_id, &outcome);
+                handle_projection_outcome("run_failed", run_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::RunRetryScheduled { retry_run, .. } => project_future(async move {
@@ -159,7 +159,7 @@ impl TaskProjector {
                     "run_retry_scheduled",
                     retry_run.task_id.as_str(),
                     &outcome,
-                );
+                )?;
                 Ok(())
             }),
             TaskEventPayload::RunRetryExhausted { .. } => project_future(async { Ok(()) }),
@@ -185,7 +185,7 @@ impl TaskProjector {
                     cancelled_at,
                 )
                 .await?;
-                handle_projection_outcome("run_cancelled", run_id, &outcome);
+                handle_projection_outcome("run_cancelled", run_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskCompleted {
@@ -203,7 +203,7 @@ impl TaskProjector {
                     Some(completed_at),
                 )
                 .await?;
-                handle_projection_outcome("task_completed", task_id, &outcome);
+                handle_projection_outcome("task_completed", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskFailed {
@@ -226,7 +226,7 @@ impl TaskProjector {
                     Some(completed_at),
                 )
                 .await?;
-                handle_projection_outcome("task_failed", task_id, &outcome);
+                handle_projection_outcome("task_failed", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskCancelled {
@@ -251,7 +251,7 @@ impl TaskProjector {
                     Some(completed_at),
                 )
                 .await?;
-                handle_projection_outcome("task_cancelled", task_id, &outcome);
+                handle_projection_outcome("task_cancelled", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskDetached {
@@ -298,7 +298,7 @@ impl TaskProjector {
                     None,
                 )
                 .await?;
-                handle_projection_outcome("task_rescheduled", trigger.task_id.as_str(), &outcome);
+                handle_projection_outcome("task_rescheduled", trigger.task_id.as_str(), &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskPaused {
@@ -349,7 +349,7 @@ impl TaskProjector {
                         created_at,
                     )
                     .await?;
-                    handle_projection_outcome("depth_limit_run_failed", run_id, &outcome);
+                    handle_projection_outcome("depth_limit_run_failed", run_id, &outcome)?;
                 }
                 let outcome = task::update_task_error(
                     db,
@@ -360,7 +360,7 @@ impl TaskProjector {
                     Some(created_at),
                 )
                 .await?;
-                handle_projection_outcome("depth_limit_task_failed", task_id, &outcome);
+                handle_projection_outcome("depth_limit_task_failed", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::DeliveryQueued { delivery }
@@ -416,12 +416,16 @@ fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
     ) || code.contains("cancel")
 }
 
-fn handle_projection_outcome(scope: &str, entity_id: &str, outcome: &ProjectionWriteOutcome) {
+fn handle_projection_outcome(
+    scope: &str,
+    entity_id: &str,
+    outcome: &ProjectionWriteOutcome,
+) -> Result<()> {
     match outcome {
         ProjectionWriteOutcome::Applied
         | ProjectionWriteOutcome::NoopAlreadyStarted
         | ProjectionWriteOutcome::NoopAlreadyTerminal
-        | ProjectionWriteOutcome::NoopDuplicateTerminal => {}
+        | ProjectionWriteOutcome::NoopDuplicateTerminal => Ok(()),
         ProjectionWriteOutcome::InvariantViolation { reason } => {
             warn!(
                 scope = scope,
@@ -429,6 +433,9 @@ fn handle_projection_outcome(scope: &str, entity_id: &str, outcome: &ProjectionW
                 reason = reason.as_str(),
                 "task projector invariant violation"
             );
+            anyhow::bail!(
+                "task projector invariant violation in {scope} for `{entity_id}`: {reason}"
+            )
         }
     }
 }

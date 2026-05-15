@@ -7,7 +7,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
 
-use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
+use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 
 const DB_ID_LEN: usize = 21;
 
@@ -15,8 +15,16 @@ pub async fn append_event<C: ConnectionTrait>(
     db: &C,
     payload: &TaskEventPayload,
     created_at: DateTimeWithTimeZone,
+    idempotency_key: Option<&str>,
 ) -> Result<AppendedTaskEvent> {
     let task_id = payload.task_id().to_owned();
+    if let Some(idempotency_key) = idempotency_key
+        && let Some(existing) =
+            find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
+    {
+        return existing_event_outcome(existing, payload, idempotency_key);
+    }
+
     let run_id = payload.run_id().map(str::to_owned);
     let thread_id = payload.thread_id().map(str::to_owned);
     let turn_id = payload.turn_id().map(str::to_owned);
@@ -37,6 +45,7 @@ pub async fn append_event<C: ConnectionTrait>(
             Alias::new("turn_id"),
             Alias::new("sequence"),
             Alias::new("event_type"),
+            Alias::new("idempotency_key"),
             Alias::new("payload_json"),
             Alias::new("created_at"),
         ])
@@ -48,13 +57,20 @@ pub async fn append_event<C: ConnectionTrait>(
             turn_id.clone().into(),
             sequence.into(),
             event_type.clone().into(),
+            idempotency_key.map(str::to_owned).into(),
             payload_json.into(),
             created_at.into(),
         ]);
 
-    db.execute(&insert)
-        .await
-        .context("failed to append task event")?;
+    if let Err(error) = db.execute(&insert).await {
+        if let Some(idempotency_key) = idempotency_key
+            && let Some(existing) =
+                find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
+        {
+            return existing_event_outcome(existing, payload, idempotency_key);
+        }
+        return Err(error).context("failed to append task event");
+    }
 
     Ok(AppendedTaskEvent {
         id,
@@ -64,12 +80,84 @@ pub async fn append_event<C: ConnectionTrait>(
         turn_id,
         sequence,
         event_type,
+        idempotency_key: idempotency_key.map(str::to_owned),
         payload: payload.clone(),
         workspace_id: None,
         root_task_id: None,
         parent_task_id: None,
         created_at,
+        append_status: TaskEventAppendStatus::Inserted,
     })
+}
+
+async fn find_event_by_idempotency_key<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<task_event::Model>> {
+    task_event::Entity::find()
+        .filter(task_event::Column::TaskId.eq(task_id.to_owned()))
+        .filter(task_event::Column::IdempotencyKey.eq(idempotency_key.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query task event by idempotency key")
+}
+
+fn existing_event_outcome(
+    model: task_event::Model,
+    attempted_payload: &TaskEventPayload,
+    idempotency_key: &str,
+) -> Result<AppendedTaskEvent> {
+    let existing = appended_task_event_from_model(model, TaskEventAppendStatus::AlreadyExists)?;
+    if existing.payload != *attempted_payload
+        && !equivalent_cancelled_terminal_payload(&existing.payload, attempted_payload)
+    {
+        anyhow::bail!(
+            "task event idempotency key `{}` already exists with a different payload",
+            idempotency_key
+        );
+    }
+    Ok(existing)
+}
+
+fn equivalent_cancelled_terminal_payload(
+    existing: &TaskEventPayload,
+    attempted: &TaskEventPayload,
+) -> bool {
+    matches!(terminal_outcome(existing), Some(TerminalOutcome::Cancelled))
+        && matches!(
+            terminal_outcome(attempted),
+            Some(TerminalOutcome::Cancelled)
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
+    match payload {
+        TaskEventPayload::RunCompleted { .. } | TaskEventPayload::TaskCompleted { .. } => {
+            Some(TerminalOutcome::Succeeded)
+        }
+        TaskEventPayload::RunFailed { error, .. } | TaskEventPayload::TaskFailed { error, .. } => {
+            if error
+                .as_ref()
+                .is_some_and(|error| error.class == pioneer_protocol::TaskErrorClass::Cancelled)
+            {
+                Some(TerminalOutcome::Cancelled)
+            } else {
+                Some(TerminalOutcome::Failed)
+            }
+        }
+        TaskEventPayload::RunCancelled { .. } | TaskEventPayload::TaskCancelled { .. } => {
+            Some(TerminalOutcome::Cancelled)
+        }
+        _ => None,
+    }
 }
 
 pub async fn list_events_for_task<C: ConnectionTrait>(
@@ -131,8 +219,33 @@ pub fn task_event_from_model(model: task_event::Model) -> Result<TaskEvent> {
         turn_id: model.turn_id,
         sequence: model.sequence,
         event_type: model.event_type,
+        idempotency_key: model.idempotency_key,
         payload,
         created_at: model.created_at.timestamp(),
+    })
+}
+
+fn appended_task_event_from_model(
+    model: task_event::Model,
+    append_status: TaskEventAppendStatus,
+) -> Result<AppendedTaskEvent> {
+    let payload: TaskEventPayload = serde_json::from_str(model.payload_json.as_str())
+        .context("failed to decode task_event payload_json")?;
+    Ok(AppendedTaskEvent {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        sequence: model.sequence,
+        event_type: model.event_type,
+        idempotency_key: model.idempotency_key,
+        payload,
+        workspace_id: None,
+        root_task_id: None,
+        parent_task_id: None,
+        created_at: model.created_at,
+        append_status,
     })
 }
 

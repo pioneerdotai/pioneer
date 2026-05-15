@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use migration::{Migrator, MigratorTrait};
-use pioneer_crud::CrudStore;
+use pioneer_crud::{CrudStore, TaskEventAppendStatus};
 use pioneer_protocol::{
     TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentSpecInput,
     TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCancelParams,
@@ -306,6 +306,70 @@ async fn runtime() -> TaskRuntime {
         .await
         .expect("migration should apply");
     TaskRuntime::new(Arc::new(CrudStore::new(connection)))
+}
+
+#[tokio::test]
+async fn task_event_idempotency_index_rejects_duplicate_key_for_task() {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("sqlite memory database should connect");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migration should apply");
+
+    connection
+        .execute_unprepared(
+            r#"
+            insert into task_event (
+                id,
+                task_id,
+                sequence,
+                event_type,
+                idempotency_key,
+                payload_json,
+                created_at
+            ) values (
+                'event_00000000000001',
+                'task_0000000000001',
+                1,
+                'task/run/started',
+                'run:run_00000000000001:started',
+                '{}',
+                CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .await
+        .expect("first keyed event should insert");
+
+    let duplicate = connection
+        .execute_unprepared(
+            r#"
+            insert into task_event (
+                id,
+                task_id,
+                sequence,
+                event_type,
+                idempotency_key,
+                payload_json,
+                created_at
+            ) values (
+                'event_00000000000002',
+                'task_0000000000001',
+                2,
+                'task/run/started',
+                'run:run_00000000000001:started',
+                '{}',
+                CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .await;
+
+    assert!(
+        duplicate.is_err(),
+        "task_event(task_id, idempotency_key) must reject duplicate non-null keys"
+    );
 }
 
 fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
@@ -2645,7 +2709,7 @@ async fn projector_replay_run_started_after_terminal_run_is_noop() {
         )
         .await
         .expect("late run started should append");
-    runtime
+    let late_failure = runtime
         .service()
         .append_event(
             TaskEventPayload::RunFailed {
@@ -2662,8 +2726,11 @@ async fn projector_replay_run_started_after_terminal_run_is_noop() {
             },
             12,
         )
-        .await
-        .expect("late run failed should append");
+        .await;
+    assert!(
+        late_failure.is_err(),
+        "contradictory terminal run event should be rejected"
+    );
 
     let task = runtime
         .service()
@@ -2672,6 +2739,131 @@ async fn projector_replay_run_started_after_terminal_run_is_noop() {
         .expect("task should read");
     assert_eq!(task.runs.last().unwrap().status, TaskRunStatus::Succeeded);
     assert_eq!(task.task.status, TaskStatus::Queued);
+}
+
+#[tokio::test]
+async fn duplicate_keyed_run_started_append_is_noop_without_new_sequence() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let task_id = response.task.id.clone();
+    let run_id = response.run.expect("run should exist").id;
+    let event = TaskEventPayload::RunStarted {
+        task_id: task_id.clone(),
+        run_id: run_id.clone(),
+        started_at: 11,
+    };
+
+    let first = runtime
+        .service()
+        .append_event(event.clone(), 11)
+        .await
+        .expect("first run started should append");
+    let duplicate = runtime
+        .service()
+        .append_event(event, 11)
+        .await
+        .expect("duplicate run started should be a no-op");
+
+    assert_eq!(first.append_status, TaskEventAppendStatus::Inserted);
+    assert_eq!(
+        duplicate.append_status,
+        TaskEventAppendStatus::AlreadyExists
+    );
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(duplicate.sequence, first.sequence);
+    let expected_key = format!("run:{run_id}:started");
+    assert_eq!(
+        duplicate.idempotency_key.as_deref(),
+        Some(expected_key.as_str())
+    );
+
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id,
+            after_sequence: None,
+        })
+        .await
+        .expect("task events should read");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| event.idempotency_key.as_deref() == Some(expected_key.as_str()))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn duplicate_child_thread_link_append_is_noop_without_new_sequence() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let task_id = response.task.id.clone();
+    let run_id = response.run.expect("run should exist").id;
+    let lineage = ThreadLineage {
+        child_thread_id: "child_thread_0000001".to_owned(),
+        child_turn_id: "child_turn_00000001".to_owned(),
+        parent_thread_id: "parent_thread_000000".to_owned(),
+        parent_turn_id: Some("parent_turn_0000001".to_owned()),
+        task_id: task_id.clone(),
+        task_run_id: run_id.clone(),
+        root_thread_id: "parent_thread_000000".to_owned(),
+        depth: 1,
+        created_at: 12,
+    };
+    let event = TaskEventPayload::ChildThreadLinked { lineage };
+
+    let first = runtime
+        .service()
+        .append_event(event.clone(), 12)
+        .await
+        .expect("first child link should append");
+    let duplicate = runtime
+        .service()
+        .append_event(event, 12)
+        .await
+        .expect("duplicate child link should be a no-op");
+
+    assert_eq!(first.append_status, TaskEventAppendStatus::Inserted);
+    assert_eq!(
+        duplicate.append_status,
+        TaskEventAppendStatus::AlreadyExists
+    );
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(duplicate.sequence, first.sequence);
+
+    let expected_key = format!("run:{run_id}:child_thread_linked");
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id,
+            after_sequence: None,
+        })
+        .await
+        .expect("task events should read");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| event.idempotency_key.as_deref() == Some(expected_key.as_str()))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

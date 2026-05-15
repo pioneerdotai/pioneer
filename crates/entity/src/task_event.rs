@@ -17,6 +17,7 @@ pub struct Model {
     #[sea_orm(unique_key = "uidx_task_event_task_sequence")]
     pub sequence: i64,
     pub event_type: String,
+    pub idempotency_key: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub payload_json: String,
     pub created_at: DateTimeWithTimeZone,
