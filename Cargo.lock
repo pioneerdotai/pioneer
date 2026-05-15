@@ -7342,9 +7342,11 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "hex",
  "insta",
  "pioneer-hooks",
+ "pioneer-protocol",
  "pretty_assertions",
  "serde",
  "serde_json",

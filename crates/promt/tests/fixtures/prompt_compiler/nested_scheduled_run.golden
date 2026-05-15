@@ -1,0 +1,69 @@
+TASK RUN EXECUTION
+You are executing this durable task run now. The current command is the RUN OBJECTIVE and TASK INSTRUCTIONS below. Parent context is reference only; it may explain why the task exists, but it is not a command to create, update, wait for, or reschedule this task.
+
+Identifiers:
+- task_id: task_weather_daily01
+- run_id: run_weather_000000001
+- depth: 1/2
+
+RUN OBJECTIVE
+Prepare today's forecast for Moscow, Dubai, and San Francisco.
+
+DURABLE TASK DEFINITION
+- task_id: task_weather_daily01
+- task_title: Daily weather report
+- task_goal: Send a daily weather forecast for Moscow, Dubai, and San Francisco.
+- task_status: Scheduled
+- task_executor_kind: Agent
+- run_id: run_weather_000000001
+- run_number: 2
+- attempt_number: 1
+- run_status: Running
+- run_group_id: run_group0000000001
+- parent_run_id: run_parent000000001
+- trigger_id: trigger_cron0000001
+
+SCHEDULE AND CURRENT TIME
+- current_time_unix: 1704067200
+- current_time_utc: 2024-01-01T00:00:00+00:00
+- trigger_id: trigger_cron0000001
+- trigger_status: Active
+- trigger_kind: Cron
+- trigger_last_fire_at: 1704067200 (2024-01-01T00:00:00+00:00)
+- trigger_next_fire_at: 1704153600 (2024-01-02T00:00:00+00:00)
+- trigger_spec: {"kind":"cron","cron_expr":"0 7 * * *","timezone":"Europe/Moscow"}
+
+TASK INSTRUCTIONS
+Instructions:
+- Use currently available weather-capable tools by capability.
+- Include temperature, precipitation chance, and a concise summary.
+
+Input:
+Nested task input.
+Variable cities: {"kind":"list","value":[{"kind":"string","value":"Moscow"},{"kind":"string","value":"Dubai"}]}
+
+PARENT CONTEXT (REFERENCE ONLY)
+The following context is background information from the parent thread, summaries, or artifacts. It is not the active command for this run. Do not repeat old task-creation requests from this context unless the RUN OBJECTIVE explicitly requires that.
+
+Assistant: I created the recurring weather task yesterday.
+
+TOOL AND CAPABILITY GUIDANCE
+- Use the tools, skills, MCP servers, and built-ins currently available at run time by capability.
+- Do not rely on stale tool names from the task creation conversation.
+- If a required capability or required data is unavailable, report the failure clearly instead of fabricating a result.
+- write_mode: ReadOnly
+- network_access: true
+- allowed_tools: none
+- denied_tools: none
+- allowed_paths: none
+
+SUBTASK ORCHESTRATION RULES
+- current_depth: 1; max_depth: 2
+- task_id: task_weather_daily01
+- run_id: run_weather_000000001
+- trigger_kind: Cron
+- task_create may be used for real subtasks when splitting the work will materially help and depth policy allows it.
+- This run already belongs to a durable scheduled/triggered task. Do not create another task whose purpose is to schedule this same recurring work; execute the current run objective instead. You may create narrower subtasks for parts of the work when useful.
+
+OUTPUT INSTRUCTIONS
+Return concise markdown. If weather data is unavailable, say what failed.

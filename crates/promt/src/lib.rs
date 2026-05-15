@@ -34,6 +34,7 @@ pub use render::{
     memory_turn_policy::{
         MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,
     },
+    task_run::{TaskRunPromptCompiler, TaskRunPromptInput},
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
 };
