@@ -13,11 +13,11 @@ use pioneer_protocol::{
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
     TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
-    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue,
-    TaskWaitMode, TaskWaitParams,
+    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskRunExecutionStatus,
+    TaskRunStatus, TaskStatus, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
+    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, ThreadLineage,
 };
-use sea_orm::Database;
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -169,6 +169,90 @@ impl TaskExecutor for SlowAgentExecutor {
         _handle: TaskExecutionHandle,
     ) -> TaskRuntimeResult<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LineageRecordingAgentExecutor {
+    starts: Arc<AtomicUsize>,
+    recoveries: Arc<AtomicUsize>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl TaskExecutor for LineageRecordingAgentExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::Agent
+    }
+
+    async fn start_run(
+        &self,
+        _context: TaskExecutionContext,
+        run: TaskRun,
+        handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorStartOutcome> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let execution = handle
+            .load_execution()
+            .await?
+            .expect("agent execution should be reserved before start");
+        handle.mark_started(run.created_at).await?;
+        handle
+            .link_child_thread(
+                ThreadLineage {
+                    child_thread_id: execution
+                        .child_thread_id
+                        .clone()
+                        .expect("agent execution should have child thread"),
+                    child_turn_id: execution
+                        .child_turn_id
+                        .clone()
+                        .expect("agent execution should have child turn"),
+                    parent_thread_id: "parent_thread".to_owned(),
+                    parent_turn_id: Some("parent_turn".to_owned()),
+                    task_id: run.task_id.clone(),
+                    task_run_id: run.id.clone(),
+                    root_thread_id: "parent_thread".to_owned(),
+                    depth: 1,
+                    created_at: run.created_at,
+                },
+                run.created_at,
+            )
+            .await?;
+        self.release.notified().await;
+        handle
+            .complete_run(
+                Some(TaskResult {
+                    summary: Some("lineage executor complete".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some(run.id.clone()),
+                }),
+                run.created_at.saturating_add(1),
+            )
+            .await?;
+        Ok(TaskExecutorStartOutcome::Started)
+    }
+
+    async fn cancel_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn recover_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run: TaskRun,
+        handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorRecoveryOutcome> {
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+        assert!(handle.load_execution().await?.is_some());
+        Ok(TaskExecutorRecoveryOutcome::AlreadyRunning)
     }
 }
 
@@ -375,6 +459,16 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
         .expect("task should read");
     assert_eq!(task.runs.len(), 1);
     assert_eq!(task.runs[0].status, TaskRunStatus::Starting);
+    let execution = runtime
+        .service()
+        .store()
+        .load_execution_for_run(task.runs[0].id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::Starting);
+    assert!(execution.child_thread_id.is_some());
+    assert!(execution.child_turn_id.is_some());
 
     release.notify_waiters();
     timeout(Duration::from_secs(2), async {
@@ -394,6 +488,194 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
     })
     .await
     .expect("agent task should complete");
+}
+
+#[tokio::test]
+async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
+    let runtime = runtime().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let recoveries = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    runtime
+        .register_executor(Arc::new(LineageRecordingAgentExecutor {
+            starts: starts.clone(),
+            recoveries: recoveries.clone(),
+            release: release.clone(),
+        }))
+        .await;
+
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(2));
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("agent task should create");
+    let run = response.run.expect("immediate run");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if starts.load(Ordering::SeqCst) == 1
+                && !runtime
+                    .service()
+                    .store()
+                    .list_thread_lineage_for_run(run.id.as_str())
+                    .await
+                    .expect("lineage should load")
+                    .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent run should link one child");
+    let initial_execution = runtime
+        .service()
+        .store()
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    runtime
+        .service()
+        .store()
+        .heartbeat_execution(
+            initial_execution.id.as_str(),
+            run.created_at,
+            Some(run.created_at.saturating_sub(1)),
+        )
+        .await
+        .expect("execution lease should be made recoverable");
+
+    runtime
+        .start()
+        .await
+        .expect("runtime recovery should start");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if recoveries.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("running run should be recovered once");
+
+    let store = runtime.service().store();
+    let execution = store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    let lineage = store
+        .list_thread_lineage_for_run(run.id.as_str())
+        .await
+        .expect("lineage should load");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(lineage.len(), 1);
+    assert_eq!(
+        lineage[0].child_thread_id,
+        execution.child_thread_id.unwrap()
+    );
+    assert_eq!(lineage[0].child_turn_id, execution.child_turn_id.unwrap());
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "select count(*) as execution_count from task_run_execution where task_run_id = '{}'",
+                run.id.replace('\'', "''")
+            ),
+        ))
+        .await
+        .expect("execution count query should work")
+        .expect("execution count row should exist");
+    assert_eq!(
+        row.try_get::<i64>("", "execution_count")
+            .expect("execution count should decode"),
+        1
+    );
+
+    release.notify_waiters();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let task = runtime
+                .service()
+                .get_task(pioneer_protocol::TaskGetParams {
+                    task_id: response.task.id.clone(),
+                })
+                .await
+                .expect("task should read");
+            if task.runs[0].status == TaskRunStatus::Succeeded {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent run should complete after release");
+}
+
+#[tokio::test]
+async fn starting_agent_recovery_reuses_reserved_execution_identity() {
+    let runtime = runtime().await;
+    let recoveries = Arc::new(AtomicUsize::new(0));
+
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(2));
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("agent task should create");
+    let run = response.run.expect("immediate run");
+    let store = runtime.service().store();
+    let claimed = store
+        .claim_task_run_for_dispatch(run.id.as_str(), run.created_at)
+        .await
+        .expect("run claim should work")
+        .expect("run should claim");
+    assert_eq!(claimed.status, TaskRunStatus::Starting);
+    let reserved = store
+        .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
+        .await
+        .expect("execution should reserve");
+    runtime
+        .register_executor(Arc::new(LineageRecordingAgentExecutor {
+            starts: Arc::new(AtomicUsize::new(0)),
+            recoveries: recoveries.clone(),
+            release: Arc::new(Notify::new()),
+        }))
+        .await;
+
+    runtime
+        .start()
+        .await
+        .expect("runtime recovery should start");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if recoveries.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("starting run should be recovered once");
+
+    let recovered = store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(recovered.id, reserved.id);
+    assert_eq!(recovered.child_thread_id, reserved.child_thread_id);
+    assert_eq!(recovered.child_turn_id, reserved.child_turn_id);
 }
 
 #[tokio::test]
@@ -449,7 +731,64 @@ async fn mark_started_is_idempotent_and_emits_one_started_event() {
 }
 
 #[tokio::test]
-async fn one_task_run_can_link_only_one_child_thread() {
+async fn concurrent_execution_reservations_reuse_one_child_identity() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(2));
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("agent task should create");
+    let run = response.run.expect("immediate run");
+    let store = runtime.service().store();
+
+    let (left, right) = tokio::join!(
+        store.reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at),
+        store.reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at),
+    );
+    let left = left.expect("left reservation should succeed");
+    let right = right.expect("right reservation should succeed");
+
+    assert_eq!(left.id, right.id);
+    assert_eq!(left.task_run_id, run.id);
+    assert_eq!(right.task_run_id, run.id);
+    assert_eq!(left.status, TaskRunExecutionStatus::Reserved);
+    assert_eq!(left.child_thread_id, right.child_thread_id);
+    assert_eq!(left.child_turn_id, right.child_turn_id);
+    assert!(left.child_thread_id.is_some());
+    assert!(left.child_turn_id.is_some());
+
+    let loaded = store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(loaded.id, left.id);
+    assert_eq!(loaded.child_thread_id, left.child_thread_id);
+    assert_eq!(loaded.child_turn_id, left.child_turn_id);
+
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "select count(*) as execution_count from task_run_execution where task_run_id = '{}'",
+                run.id.replace('\'', "''")
+            ),
+        ))
+        .await
+        .expect("count query should work")
+        .expect("count row should exist");
+    let count = row
+        .try_get::<i64>("", "execution_count")
+        .expect("count should decode");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn execution_repository_tracks_claim_running_heartbeat_and_terminal_state() {
     let runtime = runtime().await;
     let response = runtime
         .service()
@@ -460,6 +799,92 @@ async fn one_task_run_can_link_only_one_child_thread() {
         .await
         .expect("task should create");
     let run = response.run.expect("immediate run");
+    let store = runtime.service().store();
+    let execution = store
+        .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::System, run.created_at)
+        .await
+        .expect("execution should reserve");
+
+    assert_eq!(execution.status, TaskRunExecutionStatus::Reserved);
+    assert!(execution.child_thread_id.is_none());
+    assert!(execution.child_turn_id.is_none());
+
+    let claimed = store
+        .claim_execution(execution.id.as_str(), "worker_1", run.created_at + 60)
+        .await
+        .expect("execution should claim")
+        .expect("execution should still exist");
+    assert_eq!(claimed.status, TaskRunExecutionStatus::Starting);
+    assert_eq!(claimed.worker_id.as_deref(), Some("worker_1"));
+    assert_eq!(claimed.lease_until, Some(run.created_at + 60));
+
+    let running = store
+        .mark_execution_running(
+            execution.id.as_str(),
+            run.created_at + 1,
+            Some(run.created_at + 90),
+        )
+        .await
+        .expect("execution should mark running")
+        .expect("execution should still exist");
+    assert_eq!(running.status, TaskRunExecutionStatus::Running);
+    assert_eq!(running.started_at, Some(run.created_at + 1));
+    assert_eq!(running.heartbeat_at, Some(run.created_at + 1));
+    assert_eq!(running.lease_until, Some(run.created_at + 90));
+
+    let heartbeat = store
+        .heartbeat_execution(
+            execution.id.as_str(),
+            run.created_at + 2,
+            Some(run.created_at + 120),
+        )
+        .await
+        .expect("execution should heartbeat")
+        .expect("execution should still exist");
+    assert_eq!(heartbeat.heartbeat_at, Some(run.created_at + 2));
+    assert_eq!(heartbeat.lease_until, Some(run.created_at + 120));
+
+    let result = TaskResult {
+        summary: Some("done".to_owned()),
+        data: Some(TaskValue::String("ok".to_owned())),
+        artifacts: Vec::new(),
+        completed_by_run_id: Some(run.id.clone()),
+    };
+    let terminal = store
+        .mark_execution_terminal(
+            execution.id.as_str(),
+            TaskRunExecutionStatus::Succeeded,
+            run.created_at + 3,
+            Some(&result),
+            None,
+        )
+        .await
+        .expect("execution should mark terminal")
+        .expect("execution should still exist");
+    assert_eq!(terminal.status, TaskRunExecutionStatus::Succeeded);
+    assert_eq!(terminal.completed_at, Some(run.created_at + 3));
+    assert_eq!(terminal.lease_until, None);
+    assert_eq!(terminal.result, Some(result));
+}
+
+#[tokio::test]
+async fn one_task_run_can_link_only_one_child_thread() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(2));
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate run");
+    let execution = runtime
+        .service()
+        .store()
+        .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
+        .await
+        .expect("execution should reserve");
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),
@@ -470,8 +895,14 @@ async fn one_task_run_can_link_only_one_child_thread() {
     let parent_turn_id = pioneer_protocol::generate_id(21);
     let root_thread_id = parent_thread_id.clone();
     let first = pioneer_protocol::ThreadLineage {
-        child_thread_id: pioneer_protocol::generate_id(21),
-        child_turn_id: pioneer_protocol::generate_id(21),
+        child_thread_id: execution
+            .child_thread_id
+            .clone()
+            .expect("execution should reserve child thread"),
+        child_turn_id: execution
+            .child_turn_id
+            .clone()
+            .expect("execution should reserve child turn"),
         parent_thread_id: parent_thread_id.clone(),
         parent_turn_id: Some(parent_turn_id.clone()),
         task_id: run.task_id.clone(),
@@ -501,7 +932,9 @@ async fn one_task_run_can_link_only_one_child_thread() {
         .await
         .expect_err("second lineage for same run must fail");
     assert!(
-        format!("{error:#}").contains("thread lineage") || format!("{error:#}").contains("UNIQUE")
+        format!("{error:#}").contains("thread lineage")
+            || format!("{error:#}").contains("UNIQUE")
+            || format!("{error:#}").contains("reserved task run execution")
     );
 }
 

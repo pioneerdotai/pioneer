@@ -15,12 +15,13 @@ use pioneer_protocol::{
     PromptManifest, ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus,
     RecoveryTrigger, SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams,
     TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
-    TaskDeliveryAttempt, TaskDependency, TaskEventsResponse, TaskGetResponse, TaskListParams,
-    TaskRun, TaskRunStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage,
-    ThreadPlacement, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
-    Turn, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, UserInput, generate_id,
+    TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
+    TaskGetResponse, TaskListParams, TaskResult, TaskRun, TaskRunExecution, TaskRunExecutionStatus,
+    TaskRunStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread,
+    ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
+    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
+    UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
@@ -31,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
 use crate::convention::{
-    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, MEMORY_EVENT_ACCESSED,
+    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, DB_ID_LEN, MEMORY_EVENT_ACCESSED,
     MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
     MEMORY_EVENT_CANDIDATE_EXPIRED, MEMORY_EVENT_CANDIDATE_REJECTED,
     MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED, MEMORY_EVENT_CREATED, MEMORY_EVENT_EXPIRED,
@@ -43,11 +44,12 @@ use crate::convention::{
     recovery_job_status_from_db, recovery_trigger_from_db,
     task_concurrency_conflict_policy_from_db, task_delivery_attempt_status_from_db,
     task_delivery_mode_from_db, task_delivery_status_from_db, task_executor_kind_from_db,
-    task_owner_kind_from_db, task_owner_kind_to_db, task_run_status_from_db, task_status_from_db,
-    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
-    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
-    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_status_from_db,
+    task_owner_kind_from_db, task_owner_kind_to_db, task_run_execution_status_from_db,
+    task_run_status_from_db, task_status_from_db, task_status_to_db, task_trigger_kind_from_db,
+    task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
+    task_write_lock_status_from_db, thread_mode_from_db, thread_origin_kind_from_db,
+    thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_type_from_db,
+    turn_status_from_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -70,9 +72,9 @@ use crate::repositories::{
     hook_run, mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy,
     recovery_job, skill_audit_event, skill_dependency_snapshot, skill_installation,
     skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
-    task_delivery, task_dependency, task_event, task_run, task_trigger, task_write_lock, thread,
-    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_item_attempt,
-    turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    task_delivery, task_dependency, task_event, task_run, task_run_execution, task_trigger,
+    task_write_lock, thread, thread_agents_doc, thread_lineage, thread_tree, turn, turn_event,
+    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -2638,6 +2640,214 @@ impl CrudStore {
             .await?
             .map(task_run_from_db_model)
             .transpose()
+    }
+
+    pub async fn reserve_execution_for_run(
+        &self,
+        run_id: &str,
+        executor_kind: TaskExecutorKind,
+        now: i64,
+    ) -> Result<TaskRunExecution> {
+        self.run_serialized_write(|| {
+            self.reserve_execution_for_run_once(run_id.to_owned(), executor_kind, now)
+        })
+        .await
+    }
+
+    async fn reserve_execution_for_run_once(
+        &self,
+        run_id: String,
+        executor_kind: TaskExecutorKind,
+        now: i64,
+    ) -> Result<TaskRunExecution> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin task run execution reservation transaction")?;
+
+        let result = async {
+            if let Some(existing) =
+                task_run_execution::find_execution_by_run(&transaction, run_id.as_str()).await?
+            {
+                let execution = task_run_execution_from_db_model(existing)?;
+                if execution.executor_kind != executor_kind {
+                    anyhow::bail!(
+                        "task run execution `{}` already exists for executor kind `{:?}`, requested `{:?}`",
+                        execution.id,
+                        execution.executor_kind,
+                        executor_kind
+                    );
+                }
+                return Ok(execution);
+            }
+
+            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+            else {
+                anyhow::bail!("task run `{run_id}` not found for execution reservation");
+            };
+            let run = task_run_from_db_model(run_model)?;
+            if run.executor_kind != executor_kind {
+                anyhow::bail!(
+                    "task run `{}` has executor kind `{:?}`, requested `{:?}`",
+                    run.id,
+                    run.executor_kind,
+                    executor_kind
+                );
+            }
+
+            let (child_thread_id, child_turn_id) = if executor_kind == TaskExecutorKind::Agent {
+                (Some(generate_id(DB_ID_LEN)), Some(generate_id(DB_ID_LEN)))
+            } else {
+                (None, None)
+            };
+
+            task_run_execution::insert_execution_if_absent(
+                &transaction,
+                task_run_execution::NewTaskRunExecution {
+                    id: generate_id(DB_ID_LEN),
+                    task_id: run.task_id.clone(),
+                    task_run_id: run.id.clone(),
+                    executor_kind,
+                    status: TaskRunExecutionStatus::Reserved,
+                    worker_id: None,
+                    lease_until: None,
+                    heartbeat_at: None,
+                    child_thread_id,
+                    child_turn_id,
+                    started_at: None,
+                    completed_at: None,
+                    result: None,
+                    error: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await?;
+
+            let execution = task_run_execution::find_execution_by_run(&transaction, run.id.as_str())
+                .await?
+                .context("task run execution missing after reservation")?;
+            task_run_execution_from_db_model(execution)
+        }
+        .await;
+
+        match result {
+            Ok(execution) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit task run execution reservation transaction")?;
+                Ok(execution)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn load_execution_for_run(&self, run_id: &str) -> Result<Option<TaskRunExecution>> {
+        task_run_execution::find_execution_by_run(&self.connection, run_id)
+            .await?
+            .map(task_run_execution_from_db_model)
+            .transpose()
+    }
+
+    pub async fn claim_execution(
+        &self,
+        execution_id: &str,
+        worker_id: &str,
+        lease_until: i64,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.claim_execution_at(execution_id, worker_id, lease_until, lease_until)
+            .await
+    }
+
+    pub async fn claim_execution_at(
+        &self,
+        execution_id: &str,
+        worker_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.run_serialized_write(|| async {
+            task_run_execution::claim_execution(
+                &self.connection,
+                execution_id,
+                worker_id,
+                unix_to_datetime(now),
+                unix_to_datetime(lease_until),
+            )
+            .await?
+            .map(task_run_execution_from_db_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn mark_execution_running(
+        &self,
+        execution_id: &str,
+        started_at: i64,
+        lease_until: Option<i64>,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.run_serialized_write(|| async {
+            task_run_execution::mark_execution_running(
+                &self.connection,
+                execution_id,
+                unix_to_datetime(started_at),
+                lease_until.map(unix_to_datetime),
+            )
+            .await?
+            .map(task_run_execution_from_db_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn mark_execution_terminal(
+        &self,
+        execution_id: &str,
+        status: TaskRunExecutionStatus,
+        completed_at: i64,
+        result: Option<&TaskResult>,
+        error: Option<&TaskError>,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.run_serialized_write(|| async {
+            task_run_execution::mark_execution_terminal(
+                &self.connection,
+                execution_id,
+                status,
+                unix_to_datetime(completed_at),
+                result,
+                error,
+            )
+            .await?
+            .map(task_run_execution_from_db_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn heartbeat_execution(
+        &self,
+        execution_id: &str,
+        heartbeat_at: i64,
+        lease_until: Option<i64>,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.run_serialized_write(|| async {
+            task_run_execution::heartbeat_execution(
+                &self.connection,
+                execution_id,
+                unix_to_datetime(heartbeat_at),
+                lease_until.map(unix_to_datetime),
+            )
+            .await?
+            .map(task_run_execution_from_db_model)
+            .transpose()
+        })
+        .await
     }
 
     pub async fn claim_task_run_for_dispatch(
@@ -6128,6 +6338,39 @@ fn task_run_from_db_model(model: pioneer_entity::task_run::Model) -> Result<Task
         heartbeat_at: model.heartbeat_at.map(|value| value.timestamp()),
         locked_by: model.locked_by,
         lock_expires_at: model.lock_expires_at.map(|value| value.timestamp()),
+        result: optional_typed_json_from_db(model.result_json)?,
+        error: optional_typed_json_from_db(model.error_json)?,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+    })
+}
+
+fn task_run_execution_from_db_model(
+    model: pioneer_entity::task_run_execution::Model,
+) -> Result<TaskRunExecution> {
+    let executor_kind =
+        task_executor_kind_from_db(model.executor_kind.as_str()).with_context(|| {
+            format!(
+                "unknown task run execution executor kind `{}`",
+                model.executor_kind
+            )
+        })?;
+    let status = task_run_execution_status_from_db(model.status.as_str())
+        .with_context(|| format!("unknown task run execution status `{}`", model.status))?;
+
+    Ok(TaskRunExecution {
+        id: model.id,
+        task_id: model.task_id,
+        task_run_id: model.task_run_id,
+        executor_kind,
+        status,
+        worker_id: model.worker_id,
+        lease_until: model.lease_until.map(|value| value.timestamp()),
+        heartbeat_at: model.heartbeat_at.map(|value| value.timestamp()),
+        child_thread_id: model.child_thread_id,
+        child_turn_id: model.child_turn_id,
+        started_at: model.started_at.map(|value| value.timestamp()),
+        completed_at: model.completed_at.map(|value| value.timestamp()),
         result: optional_typed_json_from_db(model.result_json)?,
         error: optional_typed_json_from_db(model.error_json)?,
         created_at: model.created_at.timestamp(),

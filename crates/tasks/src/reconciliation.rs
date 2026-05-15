@@ -2,15 +2,16 @@ use crate::TaskRuntimeResult;
 use crate::event_bus::TaskEventBus;
 use crate::executor::{TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry};
 use crate::projector::TaskProjector;
-use crate::scheduler::TaskSchedulerHandle;
+use crate::scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskSchedulerHandle};
 use pioneer_crud::CrudStore;
-use pioneer_protocol::{TaskEventPayload, TaskRun, TaskRunStatus, TaskTriggerStatus};
+use pioneer_protocol::{TaskEventPayload, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id};
 use std::sync::Arc;
 use tracing::warn;
 
 const DORMANT_TRIGGER_RECOVERY_MESSAGE: &str =
     "active trigger has no next_fire_at; scheduler will keep it dormant";
 const DISPATCHABLE_RUN_RECOVERY_MESSAGE: &str = "queued run is dispatchable after startup";
+const ID_LEN: usize = 21;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationReport {
@@ -152,7 +153,23 @@ impl TaskStartupReconciler {
             self.event_bus.publish(appended).await;
             emitted_recovery_event = true;
         }
+        if run.status == TaskRunStatus::Queued {
+            return Ok(emitted_recovery_event);
+        }
 
+        let execution = self
+            .store
+            .reserve_execution_for_run(run.id.as_str(), run.executor_kind, now)
+            .await?;
+        let worker_id = format!("task-recovery-{}", generate_id(ID_LEN));
+        let lease_until = now.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
+        let Some(execution) = self
+            .store
+            .claim_execution_at(execution.id.as_str(), worker_id.as_str(), now, lease_until)
+            .await?
+        else {
+            return Ok(emitted_recovery_event);
+        };
         let handle = TaskExecutionHandle::new(
             self.store.clone(),
             self.event_bus.clone(),
@@ -164,6 +181,8 @@ impl TaskStartupReconciler {
                 TaskExecutionContext {
                     workspace_id: task_response.task.workspace_id,
                     task_id: run.task_id.clone(),
+                    execution_id: Some(execution.id),
+                    worker_id,
                 },
                 run.clone(),
                 handle,

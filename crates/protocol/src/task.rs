@@ -207,6 +207,27 @@ impl TaskRunStatus {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskRunExecutionStatus {
+    Reserved,
+    Starting,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl TaskRunExecutionStatus {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskOwnerKind {
     User,
     Thread,
@@ -781,6 +802,36 @@ pub struct TaskRun {
     pub locked_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TaskError>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunExecution {
+    pub id: String,
+    pub task_id: String,
+    pub task_run_id: String,
+    pub executor_kind: TaskExecutorKind,
+    pub status: TaskRunExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

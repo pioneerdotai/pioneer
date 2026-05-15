@@ -5,10 +5,10 @@ use pioneer_protocol::{
     MemorySourceKind, MemoryStatus, PromptManifestProfile, ProviderFailureClass,
     ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
     TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus,
-    TaskExecutorKind, TaskOwnerKind, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
-    TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
-    TurnItemType, TurnStatus, UserInput,
+    TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus, TaskStatus,
+    TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus,
+    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
 };
 
 pub const DB_ID_LEN: usize = 21;
@@ -470,6 +470,35 @@ pub fn is_terminal_task_run_status(status: TaskRunStatus) -> bool {
 
 pub fn is_terminal_task_run_status_db(status: &str) -> bool {
     task_run_status_from_db(status).is_some_and(TaskRunStatus::is_terminal)
+}
+
+pub fn task_run_execution_status_to_db(status: TaskRunExecutionStatus) -> &'static str {
+    match status {
+        TaskRunExecutionStatus::Reserved => "reserved",
+        TaskRunExecutionStatus::Starting => "starting",
+        TaskRunExecutionStatus::Running => "running",
+        TaskRunExecutionStatus::Succeeded => "succeeded",
+        TaskRunExecutionStatus::Failed => "failed",
+        TaskRunExecutionStatus::Cancelled => "cancelled",
+        TaskRunExecutionStatus::TimedOut => "timed_out",
+    }
+}
+
+pub fn task_run_execution_status_from_db(value: &str) -> Option<TaskRunExecutionStatus> {
+    match value {
+        "reserved" => Some(TaskRunExecutionStatus::Reserved),
+        "starting" => Some(TaskRunExecutionStatus::Starting),
+        "running" => Some(TaskRunExecutionStatus::Running),
+        "succeeded" => Some(TaskRunExecutionStatus::Succeeded),
+        "failed" => Some(TaskRunExecutionStatus::Failed),
+        "cancelled" => Some(TaskRunExecutionStatus::Cancelled),
+        "timed_out" => Some(TaskRunExecutionStatus::TimedOut),
+        _ => None,
+    }
+}
+
+pub fn is_terminal_task_run_execution_status(status: TaskRunExecutionStatus) -> bool {
+    status.is_terminal()
 }
 
 pub fn task_delivery_mode_to_db(mode: TaskDeliveryMode) -> &'static str {

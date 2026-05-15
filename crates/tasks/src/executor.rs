@@ -1,13 +1,15 @@
 use crate::TaskRuntimeResult;
 use crate::event_bus::TaskEventBus;
 use crate::projector::TaskProjector;
+use anyhow::bail;
 use async_trait::async_trait;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
     TaskCompletionBehavior, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskProgressDetails,
-    TaskResult, TaskRetryBackoffKind, TaskRun, TaskRunStatus, TaskTriggerKind, TaskTriggerStatus,
-    TaskWriteLockStatus, ThreadLineage, generate_id,
+    TaskResult, TaskRetryBackoffKind, TaskRun, TaskRunExecution, TaskRunExecutionStatus,
+    TaskRunStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockStatus, ThreadLineage,
+    generate_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -20,6 +22,8 @@ const ID_LEN: usize = 21;
 pub struct TaskExecutionContext {
     pub workspace_id: String,
     pub task_id: String,
+    pub execution_id: Option<String>,
+    pub worker_id: String,
 }
 
 #[derive(Clone)]
@@ -61,6 +65,25 @@ impl TaskExecutionHandle {
         lineage: ThreadLineage,
         event_timestamp_secs: i64,
     ) -> TaskRuntimeResult<()> {
+        let Some(execution) = self
+            .store
+            .load_execution_for_run(self.run_id.as_str())
+            .await?
+        else {
+            bail!(
+                "cannot link child thread for task run `{}` without task run execution",
+                self.run_id
+            );
+        };
+        if execution.child_thread_id.as_deref() != Some(lineage.child_thread_id.as_str())
+            || execution.child_turn_id.as_deref() != Some(lineage.child_turn_id.as_str())
+        {
+            bail!(
+                "child lineage for task run `{}` does not match reserved task run execution `{}`",
+                self.run_id,
+                execution.id
+            );
+        }
         self.append_and_publish(
             vec![TaskEventPayload::ChildThreadLinked { lineage }],
             event_timestamp_secs,
@@ -140,7 +163,14 @@ impl TaskExecutionHandle {
         }
         self.push_delivery_queued(&mut events, completed_at, result.clone(), None)
             .await?;
-        self.append_and_publish(events, completed_at).await
+        self.append_and_publish(events, completed_at).await?;
+        self.mark_execution_terminal(
+            TaskRunExecutionStatus::Succeeded,
+            completed_at,
+            result.as_ref(),
+            None,
+        )
+        .await
     }
 
     pub async fn fail_run(
@@ -200,7 +230,14 @@ impl TaskExecutionHandle {
         }
         self.push_delivery_queued(&mut events, completed_at, None, error.clone())
             .await?;
-        self.append_and_publish(events, completed_at).await
+        self.append_and_publish(events, completed_at).await?;
+        self.mark_execution_terminal(
+            failure_execution_status(error.as_ref()),
+            completed_at,
+            None,
+            error.as_ref(),
+        )
+        .await
     }
 
     pub async fn cancel_run(
@@ -249,7 +286,46 @@ impl TaskExecutionHandle {
         });
         self.push_delivery_queued(&mut events, cancelled_at, None, error)
             .await?;
-        self.append_and_publish(events, cancelled_at).await
+        self.append_and_publish(events, cancelled_at).await?;
+        let terminal_error = reason.as_ref().map(|message| TaskError {
+            code: "task_run_cancelled".to_owned(),
+            message: message.clone(),
+            class: TaskErrorClass::Cancelled,
+            details: None,
+            failed_run_id: Some(self.run_id.clone()),
+        });
+        self.mark_execution_terminal(
+            TaskRunExecutionStatus::Cancelled,
+            cancelled_at,
+            None,
+            terminal_error.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn heartbeat_execution(
+        &self,
+        heartbeat_at: i64,
+        lease_until: Option<i64>,
+    ) -> TaskRuntimeResult<()> {
+        if let Some(execution) = self
+            .store
+            .load_execution_for_run(self.run_id.as_str())
+            .await?
+            && !execution.status.is_terminal()
+        {
+            let _ = self
+                .store
+                .heartbeat_execution(execution.id.as_str(), heartbeat_at, lease_until)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_execution(&self) -> TaskRuntimeResult<Option<TaskRunExecution>> {
+        self.store
+            .load_execution_for_run(self.run_id.as_str())
+            .await
     }
 
     async fn append_and_publish(
@@ -531,6 +607,27 @@ impl TaskExecutionHandle {
         }
         Ok(())
     }
+
+    async fn mark_execution_terminal(
+        &self,
+        status: TaskRunExecutionStatus,
+        completed_at: i64,
+        result: Option<&TaskResult>,
+        error: Option<&TaskError>,
+    ) -> TaskRuntimeResult<()> {
+        if let Some(execution) = self
+            .store
+            .load_execution_for_run(self.run_id.as_str())
+            .await?
+            && !execution.status.is_terminal()
+        {
+            let _ = self
+                .store
+                .mark_execution_terminal(execution.id.as_str(), status, completed_at, result, error)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn retry_delay_seconds(
@@ -673,6 +770,13 @@ fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
         code.as_str(),
         "task_cancelled" | "task_run_cancelled" | "child_turn_cancelled" | "cancelled"
     ) || code.contains("cancel")
+}
+
+fn failure_execution_status(error: Option<&TaskError>) -> TaskRunExecutionStatus {
+    match error.map(|error| error.class) {
+        Some(TaskErrorClass::Timeout) => TaskRunExecutionStatus::TimedOut,
+        _ => TaskRunExecutionStatus::Failed,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

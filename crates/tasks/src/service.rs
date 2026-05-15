@@ -1589,6 +1589,8 @@ impl TaskService {
                         TaskExecutionContext {
                             workspace_id: response.task.workspace_id.clone(),
                             task_id: response.task.id.clone(),
+                            execution_id: None,
+                            worker_id: format!("task-cancel-{}", generate_id(ID_LEN)),
                         },
                         run.id.as_str(),
                         reason,

@@ -34,6 +34,7 @@ pub mod task_delivery_attempt;
 pub mod task_dependency;
 pub mod task_event;
 pub mod task_run;
+pub mod task_run_execution;
 pub mod task_trigger;
 pub mod task_write_lock;
 pub mod thread;

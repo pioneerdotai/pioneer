@@ -13,6 +13,7 @@ pub struct Model {
     pub parent_thread_id: String,
     pub parent_turn_id: Option<String>,
     pub task_id: String,
+    #[sea_orm(unique)]
     pub task_run_id: String,
     pub root_thread_id: String,
     pub depth: i64,

@@ -32,6 +32,7 @@ pub use super::task_delivery_attempt::Entity as TaskDeliveryAttempt;
 pub use super::task_dependency::Entity as TaskDependency;
 pub use super::task_event::Entity as TaskEvent;
 pub use super::task_run::Entity as TaskRun;
+pub use super::task_run_execution::Entity as TaskRunExecution;
 pub use super::task_trigger::Entity as TaskTrigger;
 pub use super::task_write_lock::Entity as TaskWriteLock;
 pub use super::thread::Entity as Thread;

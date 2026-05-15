@@ -29,6 +29,6 @@ pub use notifications::TaskNotificationMapper;
 pub use policy::{TaskCreateContext, TaskMutationContext, TaskWaitContext};
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};
-pub use scheduler::{TaskScheduler, TaskSchedulerHandle};
+pub use scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskScheduler, TaskSchedulerHandle};
 pub use service::{TaskRuntime, TaskService, WriteLockDecision};
 pub use trigger::TaskTriggerCalculator;

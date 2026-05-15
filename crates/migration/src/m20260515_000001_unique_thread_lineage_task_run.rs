@@ -1,4 +1,4 @@
-use sea_orm_migration::{prelude::*, sea_orm::DbBackend};
+use sea_orm_migration::{prelude::*, schema::*, sea_orm::DbBackend};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -18,10 +18,16 @@ impl MigrationTrait for Migration {
                     .unique()
                     .to_owned(),
             )
-            .await
+            .await?;
+
+        create_task_run_execution_table(manager).await?;
+
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_task_run_execution_table(manager).await?;
+
         manager
             .drop_index(
                 Index::drop()
@@ -60,6 +66,147 @@ async fn deduplicate_existing_thread_lineage_runs(
     };
 
     manager.get_connection().execute_unprepared(sql).await?;
+
+    Ok(())
+}
+
+async fn create_task_run_execution_table(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table("task_run_execution")
+                .if_not_exists()
+                .col(string("id").string_len(21).primary_key())
+                .col(string("task_id").string_len(21))
+                .col(string("task_run_id").string_len(21))
+                .col(string("executor_kind").string_len(32))
+                .col(string("status").string_len(32))
+                .col(string_null("worker_id").string_len(128))
+                .col(timestamp_with_time_zone_null("lease_until"))
+                .col(timestamp_with_time_zone_null("heartbeat_at"))
+                .col(string_null("child_thread_id").string_len(21))
+                .col(string_null("child_turn_id").string_len(21))
+                .col(timestamp_with_time_zone_null("started_at"))
+                .col(timestamp_with_time_zone_null("completed_at"))
+                .col(text_null("result_json"))
+                .col(text_null("error_json"))
+                .col(timestamp_with_time_zone("created_at").default(Expr::current_timestamp()))
+                .col(timestamp_with_time_zone("updated_at").default(Expr::current_timestamp()))
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("uidx_task_run_execution_run")
+                .table("task_run_execution")
+                .col("task_run_id")
+                .unique()
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("uidx_task_run_execution_child_thread")
+                .table("task_run_execution")
+                .col("child_thread_id")
+                .unique()
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("uidx_task_run_execution_child_turn")
+                .table("task_run_execution")
+                .col("child_turn_id")
+                .unique()
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_task_run_execution_task")
+                .table("task_run_execution")
+                .col("task_id")
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_task_run_execution_status_lease")
+                .table("task_run_execution")
+                .col("status")
+                .col("lease_until")
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn drop_task_run_execution_table(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("idx_task_run_execution_status_lease")
+                .table("task_run_execution")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("idx_task_run_execution_task")
+                .table("task_run_execution")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("uidx_task_run_execution_child_turn")
+                .table("task_run_execution")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("uidx_task_run_execution_child_thread")
+                .table("task_run_execution")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_index(
+            Index::drop()
+                .if_exists()
+                .name("uidx_task_run_execution_run")
+                .table("task_run_execution")
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .drop_table(Table::drop().table("task_run_execution").to_owned())
+        .await?;
 
     Ok(())
 }

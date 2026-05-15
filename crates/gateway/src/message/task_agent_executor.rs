@@ -9,19 +9,20 @@ use pioneer_protocol::{
     TaskAgentContextMode, TaskAgentInput, TaskAgentInputAttachmentKind,
     TaskAgentInputReferenceKind, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat,
     TaskAgentSpec, TaskArtifact, TaskError, TaskErrorClass, TaskExecutorKind, TaskGetResponse,
-    TaskResult, TaskRun, TaskRunStatus, TaskValue, ThreadLineage, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, TurnStartParams, TurnStatus, UserInput, generate_id,
+    TaskResult, TaskRun, TaskRunExecution, TaskRunStatus, TaskValue, ThreadLineage, ThreadMode,
+    ThreadOriginKind, ThreadSidebarVisibility, TurnStartParams, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
-    TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRecoveryOutcome,
-    TaskExecutorStartOutcome, WriteLockDecision,
+    TASK_EXECUTION_LEASE_SECONDS, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
+    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, WriteLockDecision,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{RwLock as StdRwLock, Weak};
+use tokio::time::{Duration, sleep};
 
-const ID_LEN: usize = 21;
+const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
 #[derive(Default)]
 pub(super) struct TaskAgentExecutor {
@@ -65,6 +66,12 @@ impl TaskAgentExecutor {
         }
         let agent_spec = select_agent_spec(&task_response, run.id.as_str())
             .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", run.task_id))?;
+        let Some(execution) = self
+            .load_or_reserve_execution(&processor, &context, &run)
+            .await?
+        else {
+            return Ok(TaskExecutorStartOutcome::Queued);
+        };
 
         if let Some(lineage) = processor
             .crud_store
@@ -73,12 +80,14 @@ impl TaskAgentExecutor {
             .into_iter()
             .last()
         {
+            ensure_lineage_matches_execution(&lineage, &execution)?;
             return self
                 .recover_existing_child_turn(
                     &processor,
                     &task_response,
                     &run,
                     &agent_spec,
+                    &execution,
                     lineage,
                     handle,
                 )
@@ -93,6 +102,30 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Started => {}
             outcome => return Ok(outcome),
         }
+        if let Some(lineage) = self
+            .rebuild_missing_lineage_from_execution(
+                &processor,
+                &task_response.task,
+                &run,
+                &agent_spec,
+                &parent,
+                &execution,
+                handle.clone(),
+            )
+            .await?
+        {
+            return self
+                .recover_existing_child_turn(
+                    &processor,
+                    &task_response,
+                    &run,
+                    &agent_spec,
+                    &execution,
+                    lineage,
+                    handle,
+                )
+                .await;
+        }
         self.start_new_child_turn(
             &processor,
             &context,
@@ -100,9 +133,76 @@ impl TaskAgentExecutor {
             &run,
             &agent_spec,
             &parent,
+            execution,
             handle,
         )
         .await
+    }
+
+    async fn load_or_reserve_execution(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        context: &TaskExecutionContext,
+        run: &TaskRun,
+    ) -> Result<Option<TaskRunExecution>> {
+        let now = now_timestamp_secs();
+        let reserved = processor
+            .crud_store
+            .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, now)
+            .await
+            .context("failed to reserve task run execution")?;
+        if let Some(context_execution_id) = context.execution_id.as_deref()
+            && context_execution_id != reserved.id
+        {
+            bail!(
+                "task run `{}` context execution `{}` does not match reserved execution `{}`",
+                run.id,
+                context_execution_id,
+                reserved.id
+            );
+        }
+        let lease_until = now.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
+        let claimed = processor
+            .crud_store
+            .claim_execution_at(
+                reserved.id.as_str(),
+                context.worker_id.as_str(),
+                now,
+                lease_until,
+            )
+            .await
+            .context("failed to claim task run execution")?;
+        Ok(claimed)
+    }
+
+    async fn rebuild_missing_lineage_from_execution(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        task: &Task,
+        run: &TaskRun,
+        agent_spec: &TaskAgentSpec,
+        parent: &TaskParentRuntimeContext,
+        execution: &TaskRunExecution,
+        handle: TaskExecutionHandle,
+    ) -> Result<Option<ThreadLineage>> {
+        let Some(child_thread_id) = execution.child_thread_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(child_turn_id) = execution.child_turn_id.as_deref() else {
+            return Ok(None);
+        };
+        if processor
+            .crud_store
+            .get_turn(child_thread_id, child_turn_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let now = now_timestamp_secs();
+        let lineage = lineage_from_execution(task, run, agent_spec, parent, execution, now)?;
+        handle.link_child_thread(lineage.clone(), now).await?;
+        Ok(Some(lineage))
     }
 
     async fn start_new_child_turn(
@@ -113,10 +213,17 @@ impl TaskAgentExecutor {
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
         parent: &TaskParentRuntimeContext,
+        execution: TaskRunExecution,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
-        let child_thread_id = generate_id(ID_LEN);
-        let child_turn_id = generate_id(ID_LEN);
+        let child_thread_id = execution
+            .child_thread_id
+            .clone()
+            .ok_or_else(|| anyhow!("agent task execution has no reserved child thread id"))?;
+        let child_turn_id = execution
+            .child_turn_id
+            .clone()
+            .ok_or_else(|| anyhow!("agent task execution has no reserved child turn id"))?;
         let effective_model = effective_agent_model(agent_spec)?;
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
@@ -193,22 +300,8 @@ impl TaskAgentExecutor {
             .await;
 
         let now = now_timestamp_secs();
-        handle
-            .link_child_thread(
-                ThreadLineage {
-                    child_thread_id: child_thread_id.clone(),
-                    child_turn_id: child_turn_id.clone(),
-                    parent_thread_id: parent.parent_thread_id.clone(),
-                    parent_turn_id: parent.parent_turn_id.clone(),
-                    task_id: task.id.clone(),
-                    task_run_id: run.id.clone(),
-                    root_thread_id: parent.root_thread_id.clone(),
-                    depth: agent_spec.depth,
-                    created_at: now,
-                },
-                now,
-            )
-            .await?;
+        let lineage = lineage_from_execution(task, run, agent_spec, parent, &execution, now)?;
+        handle.link_child_thread(lineage, now).await?;
 
         processor.ensure_hook_runtime_with_run_store().await;
         processor
@@ -220,7 +313,17 @@ impl TaskAgentExecutor {
             .ensure_agent_listener_task(child_thread_id.as_str())
             .await;
 
-        handle.mark_started(now_timestamp_secs()).await?;
+        let started_at = now_timestamp_secs();
+        handle.mark_started(started_at).await?;
+        processor
+            .crud_store
+            .mark_execution_running(
+                execution.id.as_str(),
+                started_at,
+                Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+            )
+            .await
+            .context("failed to mark task run execution running")?;
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
         let resolved_artifacts = processor
@@ -260,6 +363,13 @@ impl TaskAgentExecutor {
                 .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
+        spawn_execution_heartbeat(
+            processor,
+            execution.id,
+            child_thread_id,
+            child_turn_id,
+            run.id.clone(),
+        );
 
         Ok(TaskExecutorStartOutcome::Started)
     }
@@ -270,6 +380,7 @@ impl TaskAgentExecutor {
         task_response: &TaskGetResponse,
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
+        execution: &TaskRunExecution,
         lineage: ThreadLineage,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
@@ -314,6 +425,7 @@ impl TaskAgentExecutor {
                     &task_response.task,
                     run,
                     agent_spec,
+                    execution,
                     &lineage,
                     handle,
                 )
@@ -328,6 +440,7 @@ impl TaskAgentExecutor {
         task: &Task,
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
+        execution: &TaskRunExecution,
         lineage: &ThreadLineage,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
@@ -407,6 +520,13 @@ impl TaskAgentExecutor {
                 processor
                     .ensure_agent_listener_task(lineage.child_thread_id.as_str())
                     .await;
+                spawn_execution_heartbeat(
+                    processor,
+                    execution.id.clone(),
+                    lineage.child_thread_id.clone(),
+                    lineage.child_turn_id.clone(),
+                    run.id.clone(),
+                );
                 return Ok(TaskExecutorStartOutcome::Queued);
             }
             Err(error) => return Err(error).context("failed to restore hidden task turn"),
@@ -437,7 +557,17 @@ impl TaskAgentExecutor {
             .await;
 
         if run.status != TaskRunStatus::Running {
-            handle.mark_started(now_timestamp_secs()).await?;
+            let started_at = now_timestamp_secs();
+            handle.mark_started(started_at).await?;
+            processor
+                .crud_store
+                .mark_execution_running(
+                    execution.id.as_str(),
+                    started_at,
+                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await
+                .context("failed to mark restored task run execution running")?;
         }
         let workspace_skill_policies =
             load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
@@ -469,6 +599,13 @@ impl TaskAgentExecutor {
             )
             .await
             .map_err(|error| anyhow!("failed to redispatch child task turn: {error}"))?;
+        spawn_execution_heartbeat(
+            processor,
+            execution.id.clone(),
+            lineage.child_thread_id.clone(),
+            lineage.child_turn_id.clone(),
+            run.id.clone(),
+        );
 
         Ok(TaskExecutorStartOutcome::Started)
     }
@@ -652,6 +789,26 @@ impl TaskExecutor for TaskAgentExecutor {
                 )
                 .await;
         }
+        if let Some(execution) = processor.crud_store.load_execution_for_run(run_id).await?
+            && !execution.status.is_terminal()
+        {
+            let error = task_error(
+                "task_run_cancelled",
+                reason.to_owned(),
+                TaskErrorClass::Cancelled,
+                Some(run_id.to_owned()),
+            );
+            let _ = processor
+                .crud_store
+                .mark_execution_terminal(
+                    execution.id.as_str(),
+                    pioneer_protocol::TaskRunExecutionStatus::Cancelled,
+                    now_timestamp_secs(),
+                    None,
+                    Some(&error),
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -717,6 +874,95 @@ async fn resolve_parent_context(
         parent_turn_id: task.created_by_turn_id.clone(),
         root_thread_id,
     })
+}
+
+fn lineage_from_execution(
+    task: &Task,
+    run: &TaskRun,
+    agent_spec: &TaskAgentSpec,
+    parent: &TaskParentRuntimeContext,
+    execution: &TaskRunExecution,
+    created_at: i64,
+) -> Result<ThreadLineage> {
+    let child_thread_id = execution
+        .child_thread_id
+        .clone()
+        .ok_or_else(|| anyhow!("agent task execution has no child thread id"))?;
+    let child_turn_id = execution
+        .child_turn_id
+        .clone()
+        .ok_or_else(|| anyhow!("agent task execution has no child turn id"))?;
+    Ok(ThreadLineage {
+        child_thread_id,
+        child_turn_id,
+        parent_thread_id: parent.parent_thread_id.clone(),
+        parent_turn_id: parent.parent_turn_id.clone(),
+        task_id: task.id.clone(),
+        task_run_id: run.id.clone(),
+        root_thread_id: parent.root_thread_id.clone(),
+        depth: agent_spec.depth,
+        created_at,
+    })
+}
+
+fn ensure_lineage_matches_execution(
+    lineage: &ThreadLineage,
+    execution: &TaskRunExecution,
+) -> Result<()> {
+    if execution.child_thread_id.as_deref() != Some(lineage.child_thread_id.as_str())
+        || execution.child_turn_id.as_deref() != Some(lineage.child_turn_id.as_str())
+    {
+        bail!(
+            "thread lineage for run `{}` does not match task run execution `{}`",
+            lineage.task_run_id,
+            execution.id
+        );
+    }
+    Ok(())
+}
+
+fn spawn_execution_heartbeat(
+    processor: &Arc<MessageProcessor>,
+    execution_id: String,
+    child_thread_id: String,
+    child_turn_id: String,
+    run_id: String,
+) {
+    let processor = processor.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(TASK_EXECUTION_HEARTBEAT_SECONDS)).await;
+            let Ok(Some(execution)) = processor.crud_store.load_execution_for_run(&run_id).await
+            else {
+                break;
+            };
+            if execution.id != execution_id || execution.status.is_terminal() {
+                break;
+            }
+            let Ok(turn) = processor
+                .crud_store
+                .get_turn(child_thread_id.as_str(), child_turn_id.as_str())
+                .await
+            else {
+                break;
+            };
+            let Some((_, turn)) = turn else {
+                break;
+            };
+            if turn.status != TurnStatus::InProgress {
+                break;
+            }
+            let now = now_timestamp_secs();
+            let _ = processor
+                .crud_store
+                .heartbeat_execution(
+                    execution_id.as_str(),
+                    now,
+                    Some(now.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await;
+        }
+    });
 }
 
 fn effective_agent_model(agent_spec: &TaskAgentSpec) -> Result<EffectiveAgentModel> {

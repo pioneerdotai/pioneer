@@ -17,6 +17,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 
 const ID_LEN: usize = 21;
+pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
 
 #[derive(Clone)]
 pub struct TaskSchedulerHandle {
@@ -345,9 +346,10 @@ impl TaskScheduler {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
+        let claimed_at = now_timestamp_secs();
         let Some(run) = self
             .store
-            .claim_task_run_for_dispatch(run.id.as_str(), now_timestamp_secs())
+            .claim_task_run_for_dispatch(run.id.as_str(), claimed_at)
             .await?
         else {
             debug!(
@@ -358,9 +360,35 @@ impl TaskScheduler {
             );
             return Ok(false);
         };
+        let execution = self
+            .store
+            .reserve_execution_for_run(run.id.as_str(), run.executor_kind, claimed_at)
+            .await?;
+        let worker_id = format!("task-worker-{}", generate_id(ID_LEN));
+        let lease_until = claimed_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
+        let Some(execution) = self
+            .store
+            .claim_execution_at(
+                execution.id.as_str(),
+                worker_id.as_str(),
+                claimed_at,
+                lease_until,
+            )
+            .await?
+        else {
+            debug!(
+                task_id = %run.task_id,
+                run_id = %run.id,
+                execution_id = %execution.id,
+                "task run dispatch skipped because execution is terminal"
+            );
+            return Ok(false);
+        };
         let context = TaskExecutionContext {
             workspace_id,
             task_id: run.task_id.clone(),
+            execution_id: Some(execution.id),
+            worker_id,
         };
         let handle = TaskExecutionHandle::new(
             self.store.clone(),
