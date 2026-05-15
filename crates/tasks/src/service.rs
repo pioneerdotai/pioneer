@@ -108,6 +108,7 @@ impl TaskRuntime {
         self.reconciler.reconcile(now).await?;
         self.service.recover_retry_and_lock_state(now).await?;
         self.service.recover_stuck_deliveries(now, 1024).await?;
+        self.scheduler.process_due_once(now).await?;
         let mut guard = self.scheduler_task.lock().await;
         if guard.is_none() {
             let scheduler = self.scheduler.clone();

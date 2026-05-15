@@ -2349,6 +2349,39 @@ async fn startup_reconciliation_emits_recovered_event_for_dormant_active_trigger
 }
 
 #[tokio::test]
+async fn runtime_start_processes_overdue_scheduled_triggers_before_returning() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 1,
+                timezone: Some("UTC".to_owned()),
+            }),
+        )
+        .await
+        .expect("overdue scheduled task should create");
+
+    runtime.start().await.expect("runtime should start");
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(task.runs.len(), 1);
+    assert_eq!(task.runs[0].status, TaskRunStatus::Succeeded);
+    assert_eq!(task.triggers[0].status, TaskTriggerStatus::Exhausted);
+    assert_eq!(task.triggers[0].next_fire_at, None);
+}
+
+#[tokio::test]
 async fn startup_reconciliation_is_idempotent() {
     let runtime = runtime().await;
     let response = runtime
