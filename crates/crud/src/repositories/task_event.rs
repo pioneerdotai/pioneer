@@ -5,7 +5,7 @@ use pioneer_entity::task_event;
 use pioneer_protocol::{TaskEvent, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 
@@ -176,6 +176,18 @@ pub async fn list_events_for_task<C: ConnectionTrait>(
     query.all(db).await.context("failed to query task events")
 }
 
+pub async fn list_event_task_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    task_event::Entity::find()
+        .select_only()
+        .column(task_event::Column::TaskId)
+        .distinct()
+        .order_by_asc(task_event::Column::TaskId)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to query task event task ids")
+}
+
 pub async fn list_events_for_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
@@ -225,7 +237,7 @@ pub fn task_event_from_model(model: task_event::Model) -> Result<TaskEvent> {
     })
 }
 
-fn appended_task_event_from_model(
+pub(crate) fn appended_task_event_from_model(
     model: task_event::Model,
     append_status: TaskEventAppendStatus,
 ) -> Result<AppendedTaskEvent> {

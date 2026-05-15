@@ -27,6 +27,19 @@
     "mode": {
       "$ref": "#/$defs/TaskWaitMode"
     },
+    "nonWaitable": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskWaitNonWaitableItem"
+      }
+    },
+    "nonWaitableCount": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 0,
+      "minimum": 0
+    },
     "pending": {
       "type": "array",
       "default": [],
@@ -911,6 +924,34 @@
       "enum": [
         "all_terminal",
         "any_terminal"
+      ]
+    },
+    "TaskWaitNonWaitableItem": {
+      "type": "object",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/TaskWaitItem"
+        },
+        "nextFireAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "reason": {
+          "$ref": "#/$defs/TaskWaitNonWaitableReason"
+        }
+      },
+      "required": [
+        "item",
+        "reason"
+      ]
+    },
+    "TaskWaitNonWaitableReason": {
+      "type": "string",
+      "enum": [
+        "future_scheduled_task_without_active_run"
       ]
     }
   }

@@ -586,15 +586,85 @@ impl MessageProcessor {
             .event_bus()
             .subscribe(pioneer_tasks::TaskEventFilter::default());
         *guard = Some(tokio::spawn(async move {
-            while let Some(event) = subscription.recv().await {
-                if let Err(error) = this.emit_task_event(event).await {
-                    warn!(
-                        error = %format!("{error:#}"),
-                        "failed to fan out committed task event"
-                    );
+            let mut cursors_by_task: HashMap<String, i64> = HashMap::new();
+            loop {
+                match subscription.recv().await {
+                    pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
+                        if let Err(error) = this
+                            .emit_committed_task_events_after_cursor(
+                                wake.task_id.as_str(),
+                                &mut cursors_by_task,
+                            )
+                            .await
+                        {
+                            warn!(
+                                task_id = %wake.task_id,
+                                event_id = %wake.event_id,
+                                sequence = wake.sequence,
+                                error = %format!("{error:#}"),
+                                "failed to fan out committed task events after wake"
+                            );
+                        }
+                    }
+                    pioneer_tasks::TaskEventWakeDelivery::Lagged(count) => {
+                        let task_ids =
+                            match this.task_runtime.service().list_task_event_task_ids().await {
+                                Ok(task_ids) => task_ids,
+                                Err(error) => {
+                                    warn!(
+                                        missed_wakes = count,
+                                        error = %format!("{error:#}"),
+                                        "failed to enumerate task event log after wake bus lag"
+                                    );
+                                    cursors_by_task.keys().cloned().collect::<Vec<_>>()
+                                }
+                            };
+                        warn!(
+                            missed_wakes = count,
+                            task_count = task_ids.len(),
+                            "task wake bus lagged; rescanning committed task event log"
+                        );
+                        for task_id in task_ids {
+                            if let Err(error) = this
+                                .emit_committed_task_events_after_cursor(
+                                    task_id.as_str(),
+                                    &mut cursors_by_task,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    task_id = %task_id,
+                                    error = %format!("{error:#}"),
+                                    "failed to rescan committed task events after lag"
+                                );
+                            }
+                        }
+                    }
+                    pioneer_tasks::TaskEventWakeDelivery::Closed => break,
                 }
             }
         }));
+    }
+
+    async fn emit_committed_task_events_after_cursor(
+        &self,
+        task_id: &str,
+        cursors_by_task: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        let after_sequence = cursors_by_task.get(task_id).copied().unwrap_or(0);
+        let events = self
+            .task_runtime
+            .service()
+            .list_task_events_after(task_id, after_sequence)
+            .await?;
+
+        for event in events {
+            let sequence = event.sequence;
+            self.emit_task_event(event).await?;
+            cursors_by_task.insert(task_id.to_owned(), sequence);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn current_skills_snapshot_version(&self) -> u64 {

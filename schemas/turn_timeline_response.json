@@ -1915,6 +1915,12 @@
         "id": {
           "type": "string"
         },
+        "idempotencyKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "payload": {
           "$ref": "#/$defs/TaskEventPayload"
         },

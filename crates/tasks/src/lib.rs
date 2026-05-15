@@ -16,7 +16,9 @@ mod wait;
 mod tests;
 
 pub use error::{TaskRuntimeError, TaskRuntimeResult};
-pub use event_bus::{TaskEventBus, TaskEventFilter, TaskEventSubscription};
+pub use event_bus::{
+    TaskEventBus, TaskEventFilter, TaskEventSubscription, TaskEventWake, TaskEventWakeDelivery,
+};
 pub use executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRecoveryOutcome,
     TaskExecutorRegistry, TaskExecutorStartOutcome,

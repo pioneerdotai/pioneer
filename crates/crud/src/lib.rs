@@ -2615,6 +2615,30 @@ impl CrudStore {
         })
     }
 
+    pub async fn list_task_events_after(
+        &self,
+        task_id: &str,
+        after_sequence: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let rows =
+            task_event::list_events_for_task(&self.connection, task_id, Some(after_sequence))
+                .await?;
+        let mut events = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut event =
+                task_event::appended_task_event_from_model(row, TaskEventAppendStatus::Inserted)?;
+            hydrate_task_event_metadata(&self.connection, &mut event).await?;
+            events.push(event);
+        }
+
+        Ok(events)
+    }
+
+    pub async fn list_task_event_task_ids(&self) -> Result<Vec<String>> {
+        task_event::list_event_task_ids(&self.connection).await
+    }
+
     pub async fn list_task_events_for_thread_turn(
         &self,
         thread_id: &str,

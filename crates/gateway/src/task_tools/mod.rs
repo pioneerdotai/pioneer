@@ -13,8 +13,8 @@ use pioneer_protocol::{
     TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
     TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
     TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
-    ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
+    TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus,
+    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -25,6 +25,8 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 const TASK_CREATE_TOOL: &str = "task_create";
@@ -40,6 +42,16 @@ const TASK_RESUME_TOOL: &str = "task_resume";
 const DEFAULT_ROOT_MAX_DEPTH: i64 = 3;
 const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
 const GUARD_TASK_LIST_LIMIT: u32 = 500;
+
+type TaskToolFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// Task tool handlers compose large protocol and CRUD futures; this is the explicit heap boundary.
+fn task_tool_future<'a, F, T>(future: F) -> TaskToolFuture<'a, T>
+where
+    F: Future<Output = T> + Send + 'a,
+{
+    Box::pin(future)
+}
 
 #[derive(Clone)]
 pub(crate) struct GatewayTaskToolProvider {
@@ -221,16 +233,16 @@ impl ToolHandler for TaskToolHandler {
         _trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         match invocation.tool_name.as_str() {
-            TASK_CREATE_TOOL => self.handle_create(invocation).await,
-            TASK_WAIT_TOOL => self.handle_wait(invocation).await,
-            TASK_CANCEL_TOOL => self.handle_cancel(invocation).await,
-            TASK_UPDATE_TOOL => self.handle_update(invocation).await,
-            TASK_DETACH_TOOL => self.handle_detach(invocation).await,
-            TASK_LIST_TOOL => self.handle_list(invocation).await,
-            TASK_GET_TOOL => self.handle_get(invocation).await,
-            TASK_RESCHEDULE_TOOL => self.handle_reschedule(invocation).await,
-            TASK_PAUSE_TOOL => self.handle_pause(invocation).await,
-            TASK_RESUME_TOOL => self.handle_resume(invocation).await,
+            TASK_CREATE_TOOL => task_tool_future(self.handle_create(invocation)).await,
+            TASK_WAIT_TOOL => task_tool_future(self.handle_wait(invocation)).await,
+            TASK_CANCEL_TOOL => task_tool_future(self.handle_cancel(invocation)).await,
+            TASK_UPDATE_TOOL => task_tool_future(self.handle_update(invocation)).await,
+            TASK_DETACH_TOOL => task_tool_future(self.handle_detach(invocation)).await,
+            TASK_LIST_TOOL => task_tool_future(self.handle_list(invocation)).await,
+            TASK_GET_TOOL => task_tool_future(self.handle_get(invocation)).await,
+            TASK_RESCHEDULE_TOOL => task_tool_future(self.handle_reschedule(invocation)).await,
+            TASK_PAUSE_TOOL => task_tool_future(self.handle_pause(invocation)).await,
+            TASK_RESUME_TOOL => task_tool_future(self.handle_resume(invocation)).await,
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -243,7 +255,7 @@ impl TaskToolHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: TaskCreateToolInput = decode_tool_args(invocation)?;
         let params = self.create_params(input).await?;
-        let response = crate::message::message_future(
+        let response = task_tool_future(
             self.processor
                 .task_runtime
                 .service()
@@ -307,31 +319,37 @@ impl TaskToolHandler {
             return Ok(None);
         }
 
-        let now = now_timestamp_secs();
-        let mut non_waitable = Vec::new();
-        let mut waitable_task_ids = Vec::new();
+        let mut snapshot_params = params.clone();
+        snapshot_params.timeout_ms = Some(0);
+        snapshot_params.return_completed = true;
+        snapshot_params.return_pending = true;
+        let snapshot = self
+            .processor
+            .task_runtime
+            .service()
+            .get_wait_state_snapshot(snapshot_params)
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
-        for task_id in &params.task_ids {
-            let Some(response) = self
-                .processor
-                .crud_store
-                .get_task(task_id.as_str())
-                .await
-                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
-            else {
-                continue;
-            };
-
-            if task_wait_target_is_non_waitable_scheduled(&response, now) {
-                non_waitable.push(non_waitable_scheduled_task_output(&response, now));
-            } else {
-                waitable_task_ids.push(task_id.clone());
-            }
-        }
-
-        if non_waitable.is_empty() {
+        if snapshot.non_waitable.is_empty() {
             return Ok(None);
         }
+        let non_waitable_ids = snapshot
+            .non_waitable
+            .iter()
+            .map(|item| item.item.task.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let waitable_task_ids = params
+            .task_ids
+            .iter()
+            .filter(|task_id| !non_waitable_ids.contains(task_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let non_waitable = snapshot
+            .non_waitable
+            .iter()
+            .map(non_waitable_guard_item_output)
+            .collect::<Vec<_>>();
 
         Ok(Some(task_wait_non_waitable_output(
             signature,
@@ -2036,6 +2054,8 @@ fn task_wait_tool_output(
         "failed": response.failed.iter().map(wait_item_output).collect::<Vec<_>>(),
         "cancelled": response.cancelled.iter().map(wait_item_output).collect::<Vec<_>>(),
         "pending": response.pending.iter().map(wait_item_output).collect::<Vec<_>>(),
+        "nonWaitable": response.non_waitable.iter().map(non_waitable_item_output).collect::<Vec<_>>(),
+        "nonWaitableCount": response.non_waitable_count,
         "timedOut": response.timed_out,
     })
 }
@@ -2092,6 +2112,24 @@ fn task_wait_non_waitable_output(
     })
 }
 
+fn non_waitable_guard_item_output(item: &pioneer_protocol::TaskWaitNonWaitableItem) -> JsonValue {
+    json!({
+        "taskId": item.item.task.id,
+        "title": item.item.task.title,
+        "status": task_status_label(item.item.task.status),
+        "triggerKind": null,
+        "nextFireAt": item.next_fire_at,
+        "runId": null,
+        "waitable": false,
+        "reason": match item.reason {
+            pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun => {
+                "future_scheduled_task_without_active_run"
+            }
+        },
+    })
+}
+
+#[cfg(test)]
 fn task_wait_target_is_non_waitable_scheduled(response: &TaskGetResponse, now: i64) -> bool {
     if response.task.status != TaskStatus::Scheduled {
         return false;
@@ -2100,7 +2138,7 @@ fn task_wait_target_is_non_waitable_scheduled(response: &TaskGetResponse, now: i
         return false;
     }
     response.triggers.iter().any(|trigger| {
-        trigger.status == TaskTriggerStatus::Active
+        trigger.status == pioneer_protocol::TaskTriggerStatus::Active
             && matches!(
                 trigger.kind(),
                 TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
@@ -2111,13 +2149,14 @@ fn task_wait_target_is_non_waitable_scheduled(response: &TaskGetResponse, now: i
     })
 }
 
+#[cfg(test)]
 fn non_waitable_scheduled_task_output(response: &TaskGetResponse, now: i64) -> JsonValue {
     let trigger = response
         .triggers
         .iter()
         .rev()
         .find(|trigger| {
-            trigger.status == TaskTriggerStatus::Active
+            trigger.status == pioneer_protocol::TaskTriggerStatus::Active
                 && trigger
                     .next_fire_at
                     .is_some_and(|next_fire_at| next_fire_at > now)
@@ -2154,6 +2193,18 @@ fn wait_item_output(item: &pioneer_protocol::TaskWaitItem) -> JsonValue {
         "error": run.and_then(|run| run.error.clone()).or_else(|| item.task.error.clone()),
         "childThreadId": item.child_thread_id,
         "childTurnId": item.child_turn_id,
+    })
+}
+
+fn non_waitable_item_output(item: &pioneer_protocol::TaskWaitNonWaitableItem) -> JsonValue {
+    json!({
+        "item": wait_item_output(&item.item),
+        "reason": match item.reason {
+            pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun => {
+                "future_scheduled_task_without_active_run"
+            }
+        },
+        "nextFireAt": item.next_fire_at,
     })
 }
 
@@ -2347,7 +2398,7 @@ mod tests {
         TaskTrigger {
             id: "trigger_1234567890123".to_owned(),
             task_id: "task_1234567890123456".to_owned(),
-            status: TaskTriggerStatus::Active,
+            status: pioneer_protocol::TaskTriggerStatus::Active,
             spec: TaskTriggerSpec::Cron {
                 cron_expr: "0 7 * * *".to_owned(),
                 timezone: "Europe/Moscow".to_owned(),

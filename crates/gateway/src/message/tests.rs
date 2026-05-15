@@ -3253,6 +3253,68 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.start_task_event_listener().await;
+
+    let response = create_task_for_test(
+        &processor,
+        TaskCreateParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: TaskOwnerKind::Workspace,
+            owner_id: Some(workspace_id.clone()),
+            created_by_thread_id: None,
+            created_by_turn_id: None,
+            parent_task_id: None,
+            executor_kind: TaskExecutorKind::System,
+            title: "Notify task".to_owned(),
+            goal: "Emit committed notification".to_owned(),
+            priority: 0,
+            trigger: TaskTriggerInput {
+                spec: TaskTriggerSpec::Manual {
+                    allowed_actor: None,
+                },
+            },
+            agent_spec: None,
+            lifecycle_policy: None,
+            delivery_policy: None,
+            retry_policy: None,
+            timeout_policy: None,
+            concurrency_policy: None,
+            metadata: None,
+        },
+    )
+    .await
+    .expect("task should create");
+
+    let notification = recv_notification_by_method(&mut rx, events::TASK_CREATED).await;
+    let params = notification
+        .params
+        .expect("task created notification should have params");
+    assert_eq!(params["task"]["id"], response.task.id);
+    assert_eq!(params["context"]["taskId"], response.task.id);
+    assert_eq!(params["context"]["sequence"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_agent_without_explicit_model_or_provider_is_rejected() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("global-default-model", "openai"));

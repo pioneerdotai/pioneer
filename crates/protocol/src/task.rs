@@ -1715,6 +1715,21 @@ pub struct TaskWaitItem {
     pub child_turn_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWaitNonWaitableReason {
+    FutureScheduledTaskWithoutActiveRun,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskWaitNonWaitableItem {
+    pub item: TaskWaitItem,
+    pub reason: TaskWaitNonWaitableReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskWaitResponse {
@@ -1726,10 +1741,14 @@ pub struct TaskWaitResponse {
     pub cancelled: Vec<TaskWaitItem>,
     #[serde(default)]
     pub pending: Vec<TaskWaitItem>,
+    #[serde(default)]
+    pub non_waitable: Vec<TaskWaitNonWaitableItem>,
     pub timed_out: bool,
     pub total_count: u32,
     pub terminal_count: u32,
     pub pending_count: u32,
+    #[serde(default)]
+    pub non_waitable_count: u32,
     pub mode: TaskWaitMode,
 }
 

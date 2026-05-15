@@ -2313,9 +2313,8 @@ async fn wait_wakes_from_event_bus_on_terminal_event() {
         .service()
         .create_task(
             TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
             }),
         )
         .await
@@ -2416,15 +2415,68 @@ async fn wait_classifies_terminal_run_even_before_task_terminal_event() {
 }
 
 #[tokio::test]
+async fn wait_detects_terminal_state_without_in_memory_wake_delivery() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run_id = response.run.expect("run should exist").id;
+    let task_id = response.task.id;
+
+    let waiter = tokio::spawn({
+        let service = runtime.service();
+        let run_id = run_id.clone();
+        async move {
+            service
+                .wait_tasks(
+                    TaskWaitContext::default(),
+                    TaskWaitParams {
+                        task_ids: Vec::new(),
+                        run_ids: vec![run_id],
+                        timeout_ms: Some(5_000),
+                        return_completed: true,
+                        return_pending: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("wait should complete from durable state")
+        }
+    });
+
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::RunCompleted {
+                task_id,
+                run_id,
+                result: None,
+                completed_at: 42,
+            },
+            42,
+        )
+        .await
+        .expect("run completion event should append");
+
+    let waited = waiter.await.expect("waiter should join");
+    assert_eq!(waited.completed.len(), 1);
+    assert!(!waited.timed_out);
+}
+
+#[tokio::test]
 async fn wait_timeout_returns_partial_pending_state() {
     let runtime = runtime().await;
     let response = runtime
         .service()
         .create_task(
             TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
             }),
         )
         .await
@@ -2456,9 +2508,8 @@ async fn wait_return_pending_false_still_waits_on_internal_pending_state() {
         .service()
         .create_task(
             TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
             }),
         )
         .await
@@ -2486,9 +2537,9 @@ async fn wait_return_pending_false_still_waits_on_internal_pending_state() {
 }
 
 #[tokio::test]
-async fn wait_any_terminal_returns_after_first_target_finishes() {
+async fn wait_returns_non_waitable_snapshot_for_future_scheduled_task_without_active_run() {
     let runtime = runtime().await;
-    let first = runtime
+    let response = runtime
         .service()
         .create_task(
             TaskCreateContext::default(),
@@ -2498,14 +2549,53 @@ async fn wait_any_terminal_returns_after_first_target_finishes() {
             }),
         )
         .await
+        .expect("task should create");
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext::default(),
+            TaskWaitParams {
+                task_ids: vec![response.task.id],
+                run_ids: Vec::new(),
+                timeout_ms: None,
+                return_completed: true,
+                return_pending: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("wait should return non-waitable snapshot immediately");
+
+    assert!(!waited.timed_out);
+    assert_eq!(waited.pending_count, 0);
+    assert_eq!(waited.non_waitable_count, 1);
+    assert_eq!(waited.non_waitable.len(), 1);
+    assert_eq!(
+        waited.non_waitable[0].reason,
+        pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun
+    );
+}
+
+#[tokio::test]
+async fn wait_any_terminal_returns_after_first_target_finishes() {
+    let runtime = runtime().await;
+    let first = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
         .expect("first task should create");
     let second = runtime
         .service()
         .create_task(
             TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
             }),
         )
         .await
@@ -2933,12 +3023,110 @@ async fn event_bus_filters_committed_events_by_workspace_and_root() {
         .await
         .expect("task should create");
 
-    let event = timeout(Duration::from_secs(1), subscription.recv())
+    let delivery = timeout(Duration::from_secs(1), subscription.recv())
         .await
-        .expect("subscription should receive")
-        .expect("event bus should be open");
-    assert_eq!(event.workspace_id.as_deref(), Some("ws_tasks"));
-    assert_eq!(event.task_id, response.task.id);
+        .expect("subscription should receive");
+    let crate::TaskEventWakeDelivery::Wake(wake) = delivery else {
+        panic!("event bus should deliver a wake");
+    };
+    assert_eq!(wake.workspace_id.as_deref(), Some("ws_tasks"));
+    assert_eq!(wake.task_id, response.task.id);
+}
+
+#[tokio::test]
+async fn event_bus_ignores_non_inserted_duplicate_events() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("task should create");
+    let task_id = response.task.id.clone();
+    let event = TaskEventPayload::TaskCompleted {
+        task_id: task_id.clone(),
+        result: None,
+        completed_at: 15,
+    };
+
+    runtime
+        .service()
+        .append_event(event.clone(), 15)
+        .await
+        .expect("first terminal event should insert");
+    let duplicate = runtime
+        .service()
+        .append_event(event, 15)
+        .await
+        .expect("duplicate terminal event should be idempotent");
+    assert_eq!(
+        duplicate.append_status,
+        TaskEventAppendStatus::AlreadyExists
+    );
+
+    let mut subscription = runtime.event_bus().subscribe(crate::TaskEventFilter {
+        task_ids: vec![task_id],
+        ..Default::default()
+    });
+    runtime.event_bus().publish(duplicate).await;
+
+    timeout(Duration::from_millis(50), subscription.recv())
+        .await
+        .expect_err("duplicate event should not wake subscribers");
+}
+
+#[tokio::test]
+async fn task_event_cursor_reads_committed_history_after_runtime_restart() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("task should create");
+    let store = runtime.service().store();
+    let task_id = response.task.id.clone();
+
+    let initial_events = runtime
+        .service()
+        .list_task_events_after(task_id.as_str(), 0)
+        .await
+        .expect("cursor should read committed events");
+    assert!(!initial_events.is_empty());
+    let last_sequence = initial_events
+        .last()
+        .expect("events checked as non-empty")
+        .sequence;
+
+    let restarted_runtime = TaskRuntime::new(store);
+    let replayed_events = restarted_runtime
+        .service()
+        .list_task_events_after(task_id.as_str(), 0)
+        .await
+        .expect("cursor should replay committed events after runtime restart");
+    assert_eq!(replayed_events.len(), initial_events.len());
+
+    let no_new_events = restarted_runtime
+        .service()
+        .list_task_events_after(task_id.as_str(), last_sequence)
+        .await
+        .expect("cursor should honor after_sequence");
+    assert!(no_new_events.is_empty());
+
+    let task_ids = restarted_runtime
+        .service()
+        .list_task_event_task_ids()
+        .await
+        .expect("task event task ids should be discoverable after restart");
+    assert!(task_ids.iter().any(|id| id == &task_id));
 }
 
 #[tokio::test]

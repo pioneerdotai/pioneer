@@ -1,5 +1,5 @@
 use crate::TaskRuntimeResult;
-use crate::event_bus::{TaskEventBus, TaskEventFilter};
+use crate::event_bus::{TaskEventBus, TaskEventFilter, TaskEventWakeDelivery};
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
 };
@@ -25,8 +25,9 @@ use pioneer_protocol::{
     TaskRescheduleParams, TaskRescheduleResponse, TaskResumeParams, TaskResumeResponse, TaskRun,
     TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams, TaskTreeResponse, TaskTrigger,
     TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse, TaskWaitItem,
-    TaskWaitMode, TaskWaitParams, TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict,
-    TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
+    TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
+    TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
+    TaskWriteLockStatus, generate_id,
 };
 use std::collections::VecDeque;
 use std::future::Future;
@@ -35,11 +36,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 
 const ID_LEN: usize = 21;
 const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
+const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 
 type TaskServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -355,39 +357,57 @@ impl TaskService {
             params.return_pending = true;
         }
 
-        let initial = self.collect_wait_state(&params).await?;
+        let plan = self.build_wait_target_plan(&params).await?;
+        let initial = self.collect_wait_state_for_plan(&plan).await?;
         if wait_condition_satisfied(&initial) {
+            return Ok(initial);
+        }
+        if !has_wait_targets(&plan.wait_params) {
             return Ok(initial);
         }
 
         let mut subscription = self.event_bus.subscribe(TaskEventFilter {
-            task_ids: params.task_ids.clone(),
-            run_ids: params.run_ids.clone(),
+            task_ids: plan.wait_params.task_ids.clone(),
+            run_ids: plan.wait_params.run_ids.clone(),
             ..Default::default()
         });
-        let after_subscribe = self.collect_wait_state(&params).await?;
+        let after_subscribe = self.collect_wait_state_for_plan(&plan).await?;
         if wait_condition_satisfied(&after_subscribe) {
             return Ok(after_subscribe);
         }
 
         let wait_future = async {
+            let mut bus_closed = false;
+            let mut rescan = interval(WAIT_RESCAN_INTERVAL);
+            rescan.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            rescan.tick().await;
             loop {
-                if subscription.recv().await.is_none() {
-                    break;
+                if bus_closed {
+                    rescan.tick().await;
+                } else {
+                    tokio::select! {
+                        delivery = subscription.recv() => {
+                            match delivery {
+                                TaskEventWakeDelivery::Wake(_) | TaskEventWakeDelivery::Lagged(_) => {}
+                                TaskEventWakeDelivery::Closed => bus_closed = true,
+                            }
+                        }
+                        _ = rescan.tick() => {}
+                    };
                 }
-                let response = self.collect_wait_state(&params).await?;
+
+                let response = self.collect_wait_state_for_plan(&plan).await?;
                 if wait_condition_satisfied(&response) {
                     return Ok(response);
                 }
             }
-            self.collect_wait_state(&params).await
         };
 
         if let Some(timeout_ms) = params.timeout_ms {
             match timeout(Duration::from_millis(timeout_ms), wait_future).await {
                 Ok(response) => response,
                 Err(_) => {
-                    let mut response = self.collect_wait_state(&params).await?;
+                    let mut response = self.collect_wait_state_for_plan(&plan).await?;
                     response.timed_out = true;
                     Ok(response)
                 }
@@ -395,6 +415,21 @@ impl TaskService {
         } else {
             wait_future.await
         }
+    }
+
+    pub async fn get_wait_state_snapshot(
+        &self,
+        mut params: TaskWaitParams,
+    ) -> TaskRuntimeResult<TaskWaitResponse> {
+        if params.task_ids.is_empty() && params.run_ids.is_empty() {
+            bail!("`task_ids` or `run_ids` is required");
+        }
+        if !params.return_completed && !params.return_pending {
+            params.return_completed = true;
+            params.return_pending = true;
+        }
+        let plan = self.build_wait_target_plan(&params).await?;
+        self.collect_wait_state_for_plan(&plan).await
     }
 
     pub async fn cancel_task(
@@ -1216,6 +1251,20 @@ impl TaskService {
             .await
     }
 
+    pub async fn list_task_events_after(
+        &self,
+        task_id: &str,
+        after_sequence: i64,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        self.store
+            .list_task_events_after(task_id, after_sequence)
+            .await
+    }
+
+    pub async fn list_task_event_task_ids(&self) -> TaskRuntimeResult<Vec<String>> {
+        self.store.list_task_event_task_ids().await
+    }
+
     pub async fn acquire_write_locks_for_run(
         &self,
         run_id: &str,
@@ -1552,12 +1601,107 @@ impl TaskService {
             failed,
             cancelled,
             pending,
+            non_waitable: Vec::new(),
             timed_out: false,
             total_count,
             terminal_count,
             pending_count,
+            non_waitable_count: 0,
             mode: params.mode,
         })
+    }
+
+    async fn build_wait_target_plan(
+        &self,
+        params: &TaskWaitParams,
+    ) -> TaskRuntimeResult<WaitTargetPlan> {
+        let now = now_timestamp_secs();
+        let mut wait_params = params.clone();
+        let mut wait_task_ids = Vec::with_capacity(params.task_ids.len());
+        let mut non_waitable = Vec::new();
+
+        for task_id in &params.task_ids {
+            if let Some(item) = self
+                .non_waitable_scheduled_task_without_active_run(task_id.as_str(), now)
+                .await?
+            {
+                non_waitable.push(item);
+            } else {
+                wait_task_ids.push(task_id.clone());
+            }
+        }
+
+        wait_params.task_ids = wait_task_ids;
+
+        Ok(WaitTargetPlan {
+            wait_params,
+            non_waitable,
+        })
+    }
+
+    async fn collect_wait_state_for_plan(
+        &self,
+        plan: &WaitTargetPlan,
+    ) -> TaskRuntimeResult<TaskWaitResponse> {
+        let mut response = if has_wait_targets(&plan.wait_params) {
+            self.collect_wait_state(&plan.wait_params).await?
+        } else {
+            empty_wait_response(plan.wait_params.mode)
+        };
+
+        response.non_waitable = plan.non_waitable.clone();
+        response.non_waitable_count = usize_to_u32(response.non_waitable.len());
+        response.total_count = response
+            .total_count
+            .saturating_add(response.non_waitable_count);
+
+        Ok(response)
+    }
+
+    async fn non_waitable_scheduled_task_without_active_run(
+        &self,
+        task_id: &str,
+        now: i64,
+    ) -> TaskRuntimeResult<Option<TaskWaitNonWaitableItem>> {
+        let Some(response) = self.store.get_task(task_id).await? else {
+            return Ok(None);
+        };
+        if response.task.status != TaskStatus::Scheduled {
+            return Ok(None);
+        }
+        if response.runs.iter().any(|run| !run.status.is_terminal()) {
+            return Ok(None);
+        }
+        let next_fire_at = response
+            .triggers
+            .iter()
+            .filter(|trigger| {
+                trigger.status == TaskTriggerStatus::Active
+                    && matches!(
+                        trigger.kind(),
+                        TaskTriggerKind::ScheduledAt
+                            | TaskTriggerKind::Interval
+                            | TaskTriggerKind::Cron
+                    )
+            })
+            .filter_map(|trigger| trigger.next_fire_at)
+            .filter(|next_fire_at| *next_fire_at > now)
+            .min();
+
+        let Some(next_fire_at) = next_fire_at else {
+            return Ok(None);
+        };
+
+        Ok(Some(TaskWaitNonWaitableItem {
+            item: TaskWaitItem {
+                task: response.task,
+                run: None,
+                child_thread_id: None,
+                child_turn_id: None,
+            },
+            reason: TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun,
+            next_fire_at: Some(next_fire_at),
+        }))
     }
 
     async fn push_cancel_task_events(
@@ -1597,6 +1741,13 @@ impl TaskService {
                         handle,
                     )
                     .await;
+            }
+            if let Some(current_run) = self.store.get_task_run(run.id.as_str()).await?
+                && is_terminal_run(current_run.status)
+            {
+                self.push_cancelled_write_locks_for_run(run.id.as_str(), reason, now, events)
+                    .await?;
+                continue;
             }
             events.push(TaskEventPayload::RunCancelled {
                 task_id: response.task.id.clone(),
@@ -1644,6 +1795,11 @@ impl TaskService {
                 reason: Some(reason.to_owned()),
             });
             cancelled_deliveries.push(delivery);
+        }
+        if let Some(current_response) = self.store.get_task(response.task.id.as_str()).await?
+            && is_terminal_task(current_response.task.status)
+        {
+            return Ok(());
         }
         events.push(TaskEventPayload::TaskCancelled {
             task_id: response.task.id.clone(),
@@ -2239,6 +2395,36 @@ fn select_wait_run(runs: &[TaskRun], run_ids: &[String]) -> Option<TaskRun> {
         .cloned()
 }
 
+#[derive(Debug, Clone)]
+struct WaitTargetPlan {
+    wait_params: TaskWaitParams,
+    non_waitable: Vec<TaskWaitNonWaitableItem>,
+}
+
+fn has_wait_targets(params: &TaskWaitParams) -> bool {
+    !params.task_ids.is_empty() || !params.run_ids.is_empty()
+}
+
+fn empty_wait_response(mode: TaskWaitMode) -> TaskWaitResponse {
+    TaskWaitResponse {
+        completed: Vec::new(),
+        failed: Vec::new(),
+        cancelled: Vec::new(),
+        pending: Vec::new(),
+        non_waitable: Vec::new(),
+        timed_out: false,
+        total_count: 0,
+        terminal_count: 0,
+        pending_count: 0,
+        non_waitable_count: 0,
+        mode,
+    }
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitItemState {
     Completed,
@@ -2266,9 +2452,12 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
 }
 
 fn wait_condition_satisfied(response: &TaskWaitResponse) -> bool {
+    let waitable_total = response
+        .total_count
+        .saturating_sub(response.non_waitable_count);
     match response.mode {
         TaskWaitMode::AllTerminal => response.pending_count == 0,
-        TaskWaitMode::AnyTerminal => response.terminal_count > 0 || response.total_count == 0,
+        TaskWaitMode::AnyTerminal => response.terminal_count > 0 || waitable_total == 0,
     }
 }
 
