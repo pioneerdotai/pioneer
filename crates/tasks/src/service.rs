@@ -153,6 +153,11 @@ impl TaskService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> Arc<CrudStore> {
+        self.store.clone()
+    }
+
     pub async fn create_task(
         &self,
         _context: TaskCreateContext,

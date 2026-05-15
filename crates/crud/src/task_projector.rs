@@ -419,6 +419,7 @@ fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
 fn handle_projection_outcome(scope: &str, entity_id: &str, outcome: &ProjectionWriteOutcome) {
     match outcome {
         ProjectionWriteOutcome::Applied
+        | ProjectionWriteOutcome::NoopAlreadyStarted
         | ProjectionWriteOutcome::NoopAlreadyTerminal
         | ProjectionWriteOutcome::NoopDuplicateTerminal => {}
         ProjectionWriteOutcome::InvariantViolation { reason } => {

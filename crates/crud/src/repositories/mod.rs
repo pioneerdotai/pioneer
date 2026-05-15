@@ -38,6 +38,7 @@ pub mod turn_skill_binding;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionWriteOutcome {
     Applied,
+    NoopAlreadyStarted,
     NoopAlreadyTerminal,
     NoopDuplicateTerminal,
     InvariantViolation { reason: String },

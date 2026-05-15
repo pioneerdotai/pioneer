@@ -18,7 +18,11 @@ use pioneer_protocol::{
     TaskWaitMode, TaskWaitParams,
 };
 use sea_orm::Database;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
 #[derive(Default)]
@@ -119,6 +123,52 @@ impl TaskExecutor for FailingSystemExecutor {
         _handle: TaskExecutionHandle,
     ) -> TaskRuntimeResult<TaskExecutorRecoveryOutcome> {
         Ok(TaskExecutorRecoveryOutcome::LeftUnchanged)
+    }
+}
+
+#[derive(Clone)]
+struct SlowAgentExecutor {
+    starts: Arc<AtomicUsize>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl TaskExecutor for SlowAgentExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::Agent
+    }
+
+    async fn start_run(
+        &self,
+        _context: TaskExecutionContext,
+        run: TaskRun,
+        handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<TaskExecutorStartOutcome> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        handle.mark_started(run.created_at).await?;
+        handle
+            .complete_run(
+                Some(TaskResult {
+                    summary: Some("agent complete".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some(run.id.clone()),
+                }),
+                run.created_at,
+            )
+            .await?;
+        Ok(TaskExecutorStartOutcome::Started)
+    }
+
+    async fn cancel_run(
+        &self,
+        _context: TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: TaskExecutionHandle,
+    ) -> TaskRuntimeResult<()> {
+        Ok(())
     }
 }
 
@@ -268,6 +318,191 @@ async fn duplicate_scheduler_wakeups_do_not_create_duplicate_one_shot_runs() {
         .await
         .expect("task should read");
     assert_eq!(task.runs.len(), 1);
+}
+
+#[tokio::test]
+async fn agent_run_is_atomically_claimed_before_spawn() {
+    let runtime = runtime().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    runtime
+        .register_executor(Arc::new(SlowAgentExecutor {
+            starts: starts.clone(),
+            release: release.clone(),
+        }))
+        .await;
+
+    let mut params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 10,
+        timezone: Some("UTC".to_owned()),
+    });
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(2);
+    spec.prompt.instructions = vec!["Execute the scheduled test run once.".to_owned()];
+    spec.prompt.output_instructions = Some("Return a concise test result.".to_owned());
+    params.agent_spec = Some(spec);
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("scheduled agent task should create");
+
+    assert_eq!(
+        runtime
+            .process_due_once(10)
+            .await
+            .expect("first scheduler pass should dispatch"),
+        1
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        runtime
+            .process_due_once(10)
+            .await
+            .expect("second scheduler pass should not redispatch claimed run"),
+        0
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(task.runs.len(), 1);
+    assert_eq!(task.runs[0].status, TaskRunStatus::Starting);
+
+    release.notify_waiters();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let task = runtime
+                .service()
+                .get_task(pioneer_protocol::TaskGetParams {
+                    task_id: response.task.id.clone(),
+                })
+                .await
+                .expect("task should read");
+            if task.runs[0].status == TaskRunStatus::Succeeded {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent task should complete");
+}
+
+#[tokio::test]
+async fn mark_started_is_idempotent_and_emits_one_started_event() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate run");
+    let claimed = runtime
+        .service()
+        .store()
+        .claim_task_run_for_dispatch(run.id.as_str(), run.created_at)
+        .await
+        .expect("run should claim")
+        .expect("claim should apply");
+    assert_eq!(claimed.status, TaskRunStatus::Starting);
+
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    handle
+        .mark_started(run.created_at)
+        .await
+        .expect("first mark_started should work");
+    handle
+        .mark_started(run.created_at)
+        .await
+        .expect("second mark_started should no-op");
+
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+        })
+        .await
+        .expect("events should read");
+    let started_count = events
+        .events
+        .iter()
+        .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
+        .count();
+    assert_eq!(started_count, 1);
+}
+
+#[tokio::test]
+async fn one_task_run_can_link_only_one_child_thread() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate run");
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    let parent_thread_id = pioneer_protocol::generate_id(21);
+    let parent_turn_id = pioneer_protocol::generate_id(21);
+    let root_thread_id = parent_thread_id.clone();
+    let first = pioneer_protocol::ThreadLineage {
+        child_thread_id: pioneer_protocol::generate_id(21),
+        child_turn_id: pioneer_protocol::generate_id(21),
+        parent_thread_id: parent_thread_id.clone(),
+        parent_turn_id: Some(parent_turn_id.clone()),
+        task_id: run.task_id.clone(),
+        task_run_id: run.id.clone(),
+        root_thread_id: root_thread_id.clone(),
+        depth: 1,
+        created_at: run.created_at,
+    };
+    handle
+        .link_child_thread(first, run.created_at)
+        .await
+        .expect("first lineage should link");
+
+    let duplicate = pioneer_protocol::ThreadLineage {
+        child_thread_id: pioneer_protocol::generate_id(21),
+        child_turn_id: pioneer_protocol::generate_id(21),
+        parent_thread_id,
+        parent_turn_id: Some(parent_turn_id),
+        task_id: run.task_id.clone(),
+        task_run_id: run.id.clone(),
+        root_thread_id,
+        depth: 1,
+        created_at: run.created_at,
+    };
+    let error = handle
+        .link_child_thread(duplicate, run.created_at)
+        .await
+        .expect_err("second lineage for same run must fail");
+    assert!(
+        format!("{error:#}").contains("thread lineage") || format!("{error:#}").contains("UNIQUE")
+    );
 }
 
 #[tokio::test]
@@ -1259,6 +1494,39 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
             .iter()
             .all(|event| !matches!(event.payload, TaskEventPayload::DepthLimitExceeded { .. }))
     );
+}
+
+#[tokio::test]
+async fn scheduled_parent_task_can_create_child_when_depth_allows() {
+    let runtime = runtime().await;
+    let mut root = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 7 * * *".to_owned(),
+        timezone: "UTC".to_owned(),
+    });
+    root.executor_kind = TaskExecutorKind::Agent;
+    let mut root_spec = agent_spec(3);
+    root_spec.prompt.instructions = vec!["Run the scheduled parent task.".to_owned()];
+    root_spec.prompt.output_instructions = Some("Return the scheduled result.".to_owned());
+    root.agent_spec = Some(root_spec);
+    let root = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), root)
+        .await
+        .expect("scheduled root task should create");
+
+    let mut child = create_params(TaskTriggerSpec::Immediate);
+    child.executor_kind = TaskExecutorKind::Agent;
+    child.parent_task_id = Some(root.task.id.clone());
+    child.agent_spec = Some(agent_spec(3));
+    let child = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), child)
+        .await
+        .expect("child task should be allowed while depth remains within max_depth");
+    let child_spec = child.agent_spec.expect("child agent spec");
+    assert!(child_spec.depth > 0);
+    assert!(child_spec.depth <= child_spec.max_depth);
+    assert_eq!(child_spec.max_depth, 3);
 }
 
 #[tokio::test]

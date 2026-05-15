@@ -823,6 +823,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "task_updated"
+        },
+        "params": {
+          "$ref": "#/$defs/TaskUpdatedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "task_rescheduled"
         },
         "params": {
@@ -3944,6 +3960,424 @@
         "updatedAt"
       ]
     },
+    "TaskAgentContext": {
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputAttachment"
+          }
+        },
+        "references": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputReference"
+          }
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "variables": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputVariable"
+          }
+        }
+      }
+    },
+    "TaskAgentContextMode": {
+      "type": "string",
+      "enum": [
+        "inherit_parent",
+        "last_n_turns",
+        "summary_only",
+        "empty",
+        "custom"
+      ]
+    },
+    "TaskAgentContextPolicy": {
+      "type": "object",
+      "properties": {
+        "customContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "includeArtifacts": {
+          "type": "boolean"
+        },
+        "includeParentSummary": {
+          "type": "boolean"
+        },
+        "maxTurns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskAgentContextMode"
+        }
+      },
+      "required": [
+        "mode",
+        "includeParentSummary",
+        "includeArtifacts"
+      ]
+    },
+    "TaskAgentInput": {
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputAttachment"
+          }
+        },
+        "references": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputReference"
+          }
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "variables": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskAgentInputVariable"
+          }
+        }
+      }
+    },
+    "TaskAgentInputAttachment": {
+      "type": "object",
+      "properties": {
+        "artifactId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskAgentInputAttachmentKind"
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "TaskAgentInputAttachmentKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "artifact",
+        "url"
+      ]
+    },
+    "TaskAgentInputReference": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskAgentInputReferenceKind"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "TaskAgentInputReferenceKind": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "turn",
+        "task",
+        "task_run",
+        "artifact"
+      ]
+    },
+    "TaskAgentInputVariable": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/TaskValue"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "TaskAgentPrompt": {
+      "type": "object",
+      "properties": {
+        "goal": {
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "instructions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputInstructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "goal"
+      ]
+    },
+    "TaskAgentResultContract": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/TaskAgentResultFormat"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "schema": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskSchema"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "format",
+        "required"
+      ]
+    },
+    "TaskAgentResultFormat": {
+      "type": "string",
+      "enum": [
+        "text",
+        "markdown",
+        "json",
+        "artifact"
+      ]
+    },
+    "TaskAgentSpec": {
+      "type": "object",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contextPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentContextPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "maxDepth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelProvider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prompt": {
+          "$ref": "#/$defs/TaskAgentPrompt"
+        },
+        "resultContract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentResultContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "toolPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentToolPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "prompt",
+        "depth",
+        "maxDepth",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TaskAgentToolPolicy": {
+      "type": "object",
+      "properties": {
+        "allowedPaths": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowedTools": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "deniedTools": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "networkAccess": {
+          "type": "boolean"
+        },
+        "writeMode": {
+          "$ref": "#/$defs/TaskAgentWriteMode"
+        }
+      },
+      "required": [
+        "writeMode",
+        "networkAccess"
+      ]
+    },
+    "TaskAgentWriteMode": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "workspace_write",
+        "scoped_write",
+        "full_access"
+      ]
+    },
     "TaskArtifact": {
       "type": "object",
       "properties": {
@@ -5169,6 +5603,29 @@
         "trigger"
       ]
     },
+    "TaskSchema": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "$ref": "#/$defs/TaskValue"
+        }
+      },
+      "required": [
+        "schema"
+      ]
+    },
     "TaskStatus": {
       "type": "string",
       "enum": [
@@ -5438,6 +5895,48 @@
         "paused",
         "exhausted",
         "cancelled"
+      ]
+    },
+    "TaskUpdatedNotification": {
+      "type": "object",
+      "properties": {
+        "agentSpec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changedFields": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "context": {
+          "$ref": "#/$defs/TaskNotificationContext"
+        },
+        "task": {
+          "$ref": "#/$defs/Task"
+        },
+        "trigger": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskTrigger"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "context",
+        "task"
       ]
     },
     "TaskValue": {

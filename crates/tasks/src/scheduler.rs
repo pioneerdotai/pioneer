@@ -322,8 +322,7 @@ impl TaskScheduler {
             return Ok(false);
         }
         self.dispatch_run(task_response.task.workspace_id, run)
-            .await?;
-        Ok(true)
+            .await
     }
 
     async fn process_queued_run(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
@@ -339,13 +338,25 @@ impl TaskScheduler {
             return Ok(false);
         }
         self.dispatch_run(task_response.task.workspace_id, run)
-            .await?;
-        Ok(true)
+            .await
     }
 
-    async fn dispatch_run(&self, workspace_id: String, run: TaskRun) -> TaskRuntimeResult<()> {
+    async fn dispatch_run(&self, workspace_id: String, run: TaskRun) -> TaskRuntimeResult<bool> {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
-            return Ok(());
+            return Ok(false);
+        };
+        let Some(run) = self
+            .store
+            .claim_task_run_for_dispatch(run.id.as_str(), now_timestamp_secs())
+            .await?
+        else {
+            debug!(
+                task_id = %run.task_id,
+                run_id = %run.id,
+                status = ?run.status,
+                "task run dispatch skipped because it was already claimed"
+            );
+            return Ok(false);
         };
         let context = TaskExecutionContext {
             workspace_id,
@@ -364,10 +375,11 @@ impl TaskScheduler {
                     warn!(error = %format!("{error:#}"), "agent task dispatch failed");
                 }
             });
-            return Ok(());
+            return Ok(true);
         }
 
-        dispatch_run_to_executor(executor, context, run, handle).await
+        dispatch_run_to_executor(executor, context, run, handle).await?;
+        Ok(true)
     }
 }
 

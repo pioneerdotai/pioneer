@@ -69,15 +69,14 @@ impl TaskExecutionHandle {
     }
 
     pub async fn mark_started(&self, started_at: i64) -> TaskRuntimeResult<()> {
-        self.append_and_publish(
-            vec![TaskEventPayload::RunStarted {
-                task_id: self.task_id.clone(),
-                run_id: self.run_id.clone(),
-                started_at,
-            }],
-            started_at,
-        )
-        .await
+        if let Some(appended) = self
+            .store
+            .append_task_run_started_once(self.task_id.clone(), self.run_id.clone(), started_at)
+            .await?
+        {
+            self.event_bus.publish(appended).await;
+        }
+        Ok(())
     }
 
     pub async fn progress(

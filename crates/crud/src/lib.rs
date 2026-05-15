@@ -2640,6 +2640,134 @@ impl CrudStore {
             .transpose()
     }
 
+    pub async fn claim_task_run_for_dispatch(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+    ) -> Result<Option<TaskRun>> {
+        self.run_serialized_write(|| {
+            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at)
+        })
+        .await
+    }
+
+    async fn claim_task_run_for_dispatch_once(
+        &self,
+        run_id: String,
+        claimed_at: i64,
+    ) -> Result<Option<TaskRun>> {
+        task_run::claim_run_for_dispatch(
+            &self.connection,
+            run_id.as_str(),
+            unix_to_datetime(claimed_at),
+        )
+        .await?
+        .map(task_run_from_db_model)
+        .transpose()
+    }
+
+    pub async fn append_task_run_started_once(
+        &self,
+        task_id: String,
+        run_id: String,
+        started_at: i64,
+    ) -> Result<Option<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_task_run_started_once_inner(task_id.clone(), run_id.clone(), started_at)
+        })
+        .await
+    }
+
+    async fn append_task_run_started_once_inner(
+        &self,
+        task_id: String,
+        run_id: String,
+        started_at: i64,
+    ) -> Result<Option<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin task run started transaction")?;
+
+        let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback missing task run started transaction")?;
+            return Ok(None);
+        };
+        let Some(status) = task_run_status_from_db(run_model.status.as_str()) else {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback invalid task run started transaction")?;
+            anyhow::bail!(
+                "task run `{}` has unknown status `{}`",
+                run_id,
+                run_model.status
+            );
+        };
+        if matches!(status, TaskRunStatus::Running) || status.is_terminal() {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback duplicate task run started transaction")?;
+            return Ok(None);
+        }
+        if !matches!(status, TaskRunStatus::Queued | TaskRunStatus::Starting) {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback non-startable task run started transaction")?;
+            return Ok(None);
+        }
+
+        let created_at = unix_to_datetime(started_at);
+        let mut appended_event = match task_event::append_event(
+            &transaction,
+            &TaskEventPayload::RunStarted {
+                task_id,
+                run_id: run_id.clone(),
+                started_at,
+            },
+            created_at,
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self
+            .task_projector
+            .project(&transaction, &appended_event)
+            .await
+            .context("failed to project task run started event")
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
+        if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
+            .await
+            .context("failed to hydrate task run started event metadata")
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit task run started transaction")?;
+
+        Ok(Some(appended_event))
+    }
+
     pub async fn list_task_runs_by_status(
         &self,
         status: TaskRunStatus,

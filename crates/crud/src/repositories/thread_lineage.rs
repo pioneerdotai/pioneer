@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use pioneer_entity::thread_lineage;
 use pioneer_protocol::ThreadLineage;
 use sea_orm::sea_query::OnConflict;
@@ -7,6 +7,26 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder
 use crate::util::unix_to_datetime;
 
 pub async fn upsert_lineage<C: ConnectionTrait>(db: &C, lineage: &ThreadLineage) -> Result<()> {
+    if let Some(existing) =
+        find_lineage_by_child_thread(db, lineage.child_thread_id.as_str()).await?
+        && existing.task_run_id != lineage.task_run_id
+    {
+        bail!(
+            "thread lineage `{}` is already linked to task run `{}`",
+            lineage.child_thread_id,
+            existing.task_run_id
+        );
+    }
+    for existing in list_lineage_for_run(db, lineage.task_run_id.as_str()).await? {
+        if existing.child_thread_id != lineage.child_thread_id {
+            bail!(
+                "thread lineage for task run `{}` already exists as child thread `{}`",
+                lineage.task_run_id,
+                existing.child_thread_id
+            );
+        }
+    }
+
     thread_lineage::Entity::insert(thread_lineage::ActiveModel {
         child_thread_id: Set(lineage.child_thread_id.clone()),
         child_turn_id: Set(lineage.child_turn_id.clone()),

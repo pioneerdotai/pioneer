@@ -105,6 +105,29 @@ pub async fn list_due_retry_runs<C: ConnectionTrait>(
         .context("failed to list due retry task runs")
 }
 
+pub async fn claim_run_for_dispatch<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    claimed_at: DateTimeWithTimeZone,
+) -> Result<Option<task_run::Model>> {
+    let result = task_run::Entity::update_many()
+        .filter(task_run::Column::Id.eq(run_id.to_owned()))
+        .filter(task_run::Column::Status.eq(task_run_status_to_db(TaskRunStatus::Queued)))
+        .col_expr(
+            task_run::Column::Status,
+            Expr::value(task_run_status_to_db(TaskRunStatus::Starting)),
+        )
+        .col_expr(task_run::Column::HeartbeatAt, Expr::value(claimed_at))
+        .col_expr(task_run::Column::UpdatedAt, Expr::value(claimed_at))
+        .exec(db)
+        .await
+        .context("failed to claim task run for dispatch")?;
+    if result.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_run_by_id(db, run_id).await
+}
+
 pub async fn next_run_number<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<i64> {
     let max_run_number = db
         .query_one(
@@ -172,6 +195,9 @@ pub async fn update_run_started<C: ConnectionTrait>(
             reason: format!("task run `{run_id}` missing for run start"),
         });
     };
+    if task_run_status_from_db(model.status.as_str()) == Some(TaskRunStatus::Running) {
+        return Ok(ProjectionWriteOutcome::NoopAlreadyStarted);
+    }
     if let Some(outcome) =
         terminal_run_transition_guard(run_id, model.status.as_str(), TaskRunStatus::Running)
     {

@@ -2593,6 +2593,62 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_updated"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "agent_spec": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/TaskAgentSpec"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "changed_fields": {
+                  "type": "array",
+                  "default": [],
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "task": {
+                  "$ref": "#/$defs/Task"
+                },
+                "trigger": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/TaskTrigger"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "updated_at": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              },
+              "required": [
+                "task",
+                "updated_at"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_rescheduled"
             },
             "payload": {
