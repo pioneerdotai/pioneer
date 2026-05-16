@@ -72,43 +72,59 @@ pub(super) fn build_timeline_rows(
     let mut work_member_to_anchor_index = HashMap::<usize, usize>::new();
     let mut work_members_by_anchor_index = HashMap::<usize, Vec<usize>>::new();
 
-    let mut index = 0;
-    while index < timeline.len() {
-        let turn_id = timeline[index].turn_id.as_str();
-        let turn_start = index;
-        while index < timeline.len() && timeline[index].turn_id == turn_id {
-            index = index.saturating_add(1);
-        }
-        let turn_end = index;
+    let mut turn_indices = HashMap::<&str, Vec<usize>>::new();
+    for (timeline_index, entry) in timeline.iter().enumerate() {
+        turn_indices
+            .entry(entry.turn_id.as_str())
+            .or_default()
+            .push(timeline_index);
+    }
 
-        let mut cursor = turn_start;
-        while cursor < turn_end {
-            let Some(user_index) = (cursor..turn_end).find(|ix| {
+    for indices in turn_indices.values() {
+        let mut cursor = 0;
+        while cursor < indices.len() {
+            let Some(user_pos) = (cursor..indices.len()).find(|pos| {
+                let timeline_index = indices[*pos];
                 projection
-                    .item_for_timeline_entry(&timeline[*ix])
+                    .item_for_timeline_entry(&timeline[timeline_index])
                     .is_some_and(|item_view| matches!(item_view.item, TurnItem::UserMessage { .. }))
             }) else {
                 break;
             };
 
-            let Some(agent_index) = ((user_index + 1)..turn_end).find(|ix| {
+            let Some(agent_pos) = ((user_pos + 1)..indices.len()).find(|pos| {
+                let timeline_index = indices[*pos];
                 projection
-                    .item_for_timeline_entry(&timeline[*ix])
+                    .item_for_timeline_entry(&timeline[timeline_index])
                     .is_some_and(is_terminal_parent_agent_message)
             }) else {
                 break;
             };
 
-            let work_indices = ((user_index + 1)..agent_index)
-                .filter(|ix| {
+            let user_index = indices[user_pos];
+            let agent_index = indices[agent_pos];
+            let mut work_indices = ((user_pos + 1)..agent_pos)
+                .filter_map(|pos| {
+                    let timeline_index = indices[pos];
                     projection
-                        .item_for_timeline_entry(&timeline[*ix])
+                        .item_for_timeline_entry(&timeline[timeline_index])
                         .is_some_and(|item_view| {
                             !matches!(item_view.item, TurnItem::UserMessage { .. })
                                 && !is_parent_agent_message(item_view)
                         })
+                        .then_some(timeline_index)
                 })
                 .collect::<Vec<_>>();
+            let extra_task_event_indices = ((user_index + 1)..agent_index)
+                .filter(|timeline_index| {
+                    !work_indices.contains(timeline_index)
+                        && projection
+                            .item_for_timeline_entry(&timeline[*timeline_index])
+                            .is_some_and(is_task_system_work_event)
+                })
+                .collect::<Vec<_>>();
+            work_indices.extend(extra_task_event_indices);
+            work_indices.sort_unstable();
 
             if !work_indices.is_empty() {
                 let anchor_entry_id = timeline[user_index].id.clone();
@@ -131,7 +147,7 @@ pub(super) fn build_timeline_rows(
                 }
             }
 
-            cursor = agent_index.saturating_add(1);
+            cursor = agent_pos.saturating_add(1);
         }
     }
 
@@ -604,6 +620,16 @@ fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
         )
 }
 
+fn is_task_system_work_event(item_view: &ItemView) -> bool {
+    let TurnItem::SystemEvent { code, .. } = &item_view.item else {
+        return false;
+    };
+    task_timeline_origin_group_key(item_view).is_some()
+        || code
+            .as_deref()
+            .is_some_and(|code| code.starts_with("task/"))
+}
+
 fn is_completed_dynamic_tool(item_view: &ItemView) -> bool {
     matches!(
         &item_view.item,
@@ -634,11 +660,13 @@ fn completed_task_wait_signature(item_view: &ItemView) -> Option<String> {
 mod tests {
     use super::*;
     use crate::app::conversation::{
-        ItemView, TimelineEntry, TimelineEntryStatus, TurnPhase, TurnView,
+        Conversation, ItemView, TimelineEntry, TimelineEntryStatus, TurnPhase, TurnView,
     };
     use pioneer_protocol::{
-        SystemEventLevel, TaskExecutorKind, TaskTriggerKind, TaskTurnItem, ToolCallStatus,
-        ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload,
+        SystemEventLevel, TaskEvent, TaskEventPayload, TaskExecutorKind, TaskTriggerKind,
+        TaskTurnItem, ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane,
+        TimelineOrigin, TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload,
+        ToolOutputPolicySnapshot, ToolStoragePayload, Turn, TurnStatus, TurnTimelineResponse,
     };
 
     fn timeline_entry(id: &str, turn_id: &str, item_id: &str, item_index: usize) -> TimelineEntry {
@@ -790,7 +818,12 @@ mod tests {
                 timeline_entry("entry_user", "turn_parent", "user_1", 0),
                 timeline_entry("entry_task_list", "turn_parent", "task_list_1", 1),
                 timeline_entry("entry_task_cancel", "turn_parent", "task_cancel_1", 2),
-                timeline_entry("entry_task_cancelled", "turn_parent", "task_cancelled_1", 3),
+                timeline_entry(
+                    "entry_task_cancelled",
+                    "turn_task_event",
+                    "task_cancelled_1",
+                    3,
+                ),
                 timeline_entry("entry_parent_agent", "turn_parent", "parent_agent_1", 4),
             ],
             items: vec![
@@ -955,6 +988,488 @@ mod tests {
                 "parent_agent_1"
             ]
         );
+    }
+
+    #[test]
+    fn completed_parent_work_collapses_when_other_turn_items_are_interleaved() {
+        let mut projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_other_user", "turn_other", "other_user", 1),
+                timeline_entry("entry_task_list", "turn_parent", "task_list_1", 2),
+                timeline_entry("entry_other_agent", "turn_other", "other_agent", 3),
+                timeline_entry("entry_parent_agent", "turn_parent", "parent_agent_1", 4),
+            ],
+            items: vec![
+                ItemView {
+                    id: "user_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "user_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: Some(1),
+                    completed_at_unix_ms: Some(1),
+                    partial_text: "List tasks".to_owned(),
+                    final_text: Some("List tasks".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "List tasks".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "other_user".to_owned(),
+                    turn_id: "turn_other".to_owned(),
+                    item_type: "user_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(2),
+                    updated_at_unix_ms: Some(2),
+                    completed_at_unix_ms: Some(2),
+                    partial_text: "Other".to_owned(),
+                    final_text: Some("Other".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::UserMessage {
+                        id: "other_user".to_owned(),
+                        text: "Other".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "task_list_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "dynamic_tool_call".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(3),
+                    updated_at_unix_ms: Some(3),
+                    completed_at_unix_ms: Some(3),
+                    partial_text: "task_list".to_owned(),
+                    final_text: Some("task_list".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::DynamicToolCall {
+                        id: "task_list_1".to_owned(),
+                        tool_name: "task_list".to_owned(),
+                        arguments: serde_json::json!({"ownerKind": "thread"}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("task_list"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "other_agent".to_owned(),
+                    turn_id: "turn_other".to_owned(),
+                    item_type: "agent_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(4),
+                    updated_at_unix_ms: Some(4),
+                    completed_at_unix_ms: Some(4),
+                    partial_text: "Other done".to_owned(),
+                    final_text: Some("Other done".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::AgentMessage {
+                        id: "other_agent".to_owned(),
+                        text: "Other done".to_owned(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "parent_agent_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "agent_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(5),
+                    updated_at_unix_ms: Some(5),
+                    completed_at_unix_ms: Some(5),
+                    partial_text: "Done".to_owned(),
+                    final_text: Some("Done".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::AgentMessage {
+                        id: "parent_agent_1".to_owned(),
+                        text: "Done".to_owned(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let rows = build_timeline_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &rows),
+            vec!["user_1", "other_user", "other_agent", "parent_agent_1"]
+        );
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row.kind,
+                TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow { .. })
+            )
+        }));
+
+        let expanded_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec![
+                "user_1",
+                "task_list_1",
+                "other_user",
+                "other_agent",
+                "parent_agent_1"
+            ]
+        );
+
+        projection.timeline.swap(1, 2);
+        let rows = build_timeline_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &rows),
+            vec!["user_1", "other_user", "other_agent", "parent_agent_1"]
+        );
+    }
+
+    #[test]
+    fn hydrated_cancel_turn_with_composed_task_cancelled_event_collapses_work() {
+        let workspace_id = "ws_000000000000000001";
+        let thread_id = "thread_cancel";
+        let turn_id = "turn_cancel";
+
+        let task_list = TurnItem::DynamicToolCall {
+            id: "task_list_call".to_owned(),
+            tool_name: "task_list".to_owned(),
+            arguments: serde_json::json!({"ownerKind": "thread"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("task_list"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::None,
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        let task_cancel = TurnItem::DynamicToolCall {
+            id: "task_cancel_call".to_owned(),
+            tool_name: "task_cancel".to_owned(),
+            arguments: serde_json::json!({"taskId": "task_1"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("task_cancel"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::None,
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+
+        let mut conversation = Conversation::new(thread_id);
+        conversation.hydrate_history(&[
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 1,
+                created_at: 1_000,
+                payload: ThreadHistoryEventPayload::TurnStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: Turn {
+                        id: turn_id.to_owned(),
+                        status: TurnStatus::InProgress,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
+                        error: None,
+                        prompt_manifest: None,
+                    },
+                    input: Vec::new(),
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 2,
+                created_at: 1_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: "user_cancel".to_owned(),
+                        text: "Cancel this task".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 3,
+                created_at: 1_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_1".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 4,
+                created_at: 1_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: "user_cancel".to_owned(),
+                        text: "Cancel this task".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 5,
+                created_at: 10_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_1".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 6,
+                created_at: 10_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: task_list.clone(),
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 7,
+                created_at: 10_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: task_list,
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 8,
+                created_at: 10_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_2".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 9,
+                created_at: 17_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_2".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 10,
+                created_at: 17_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: task_cancel.clone(),
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 11,
+                created_at: 17_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: task_cancel,
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 12,
+                created_at: 17_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_3".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 13,
+                created_at: 23_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_3".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 14,
+                created_at: 23_000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::AgentMessage {
+                        id: "agent_final".to_owned(),
+                        text: String::new(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 15,
+                created_at: 23_000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::AgentMessage {
+                        id: "agent_final".to_owned(),
+                        text: "Task cancelled.".to_owned(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: turn_id.to_owned(),
+                sequence: 16,
+                created_at: 23_000,
+                payload: ThreadHistoryEventPayload::TurnCompleted {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: Turn {
+                        id: turn_id.to_owned(),
+                        status: TurnStatus::Completed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
+                        error: None,
+                        prompt_manifest: None,
+                    },
+                },
+            },
+        ]);
+
+        conversation.apply_composed_turn_timeline(&TurnTimelineResponse {
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            last_sequence: 1,
+            items: vec![TimelineItem {
+                id: "task:task_1:1".to_owned(),
+                origin: TimelineOrigin {
+                    kind: TimelineOriginKind::TaskEvent,
+                    task_id: Some("task_1".to_owned()),
+                    run_id: None,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    origin_event_id: Some("task_event_cancelled".to_owned()),
+                    origin_turn_item_id: None,
+                    origin_sequence: 1,
+                    occurred_at: 17_000,
+                    lane: TimelineLane::Task,
+                },
+                payload: TimelinePayload::TaskEvent {
+                    event: TaskEvent {
+                        id: "task_event_cancelled".to_owned(),
+                        task_id: "task_1".to_owned(),
+                        run_id: None,
+                        thread_id: None,
+                        turn_id: None,
+                        sequence: 1,
+                        event_type: pioneer_protocol::constants::events::TASK_CANCELLED.to_owned(),
+                        idempotency_key: None,
+                        payload: TaskEventPayload::TaskCancelled {
+                            task_id: "task_1".to_owned(),
+                            reason: Some("User requested cancellation".to_owned()),
+                            completed_at: 17,
+                        },
+                        created_at: 17,
+                    },
+                },
+            }],
+        });
+
+        let rows = build_timeline_rows(conversation.projection(), &HashSet::new());
+        assert_eq!(
+            visible_item_ids(conversation.projection(), &rows),
+            vec!["user_cancel", "agent_final"]
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row.kind,
+            TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow { .. })
+        )));
     }
 
     #[test]
