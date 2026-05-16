@@ -537,10 +537,11 @@ impl TaskToolHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: TaskListToolInput = decode_tool_args(invocation)?;
         let owner_kind = input.owner_kind;
-        let owner_id = match (owner_kind, input.owner_id) {
-            (Some(TaskOwnerKind::Thread), None) => Some(self.context.thread_id.clone()),
-            (_, owner_id) => owner_id,
-        };
+        let owner_id = normalize_task_list_owner_id(
+            owner_kind,
+            input.owner_id,
+            self.context.thread_id.as_str(),
+        )?;
         let params = TaskListParams {
             workspace_id: self.context.workspace_id.clone(),
             owner_kind,
@@ -592,7 +593,7 @@ impl TaskToolHandler {
         }
         let payload = json!({
             "task": response.task,
-            "triggers": response.triggers,
+            "triggers": task_trigger_details_output(&response.triggers),
             "runs": response.runs,
             "agentSpecs": response.agent_specs,
             "dependencies": response.dependencies,
@@ -667,7 +668,7 @@ impl TaskToolHandler {
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({
             "task": task_summary(&response.task),
-            "triggers": response.triggers,
+            "triggers": task_trigger_details_output(&response.triggers),
         });
         if let Some(key) = cache_key {
             mutation_outputs.insert(key, output.clone());
@@ -704,7 +705,7 @@ impl TaskToolHandler {
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({
             "task": task_summary(&response.task),
-            "triggers": response.triggers,
+            "triggers": task_trigger_details_output(&response.triggers),
         });
         if let Some(key) = cache_key {
             mutation_outputs.insert(key, output.clone());
@@ -825,8 +826,7 @@ impl TaskToolHandler {
             else {
                 continue;
             };
-            if id == invocation.call_id
-                || tool_name != invocation.tool_name
+            if tool_name != invocation.tool_name
                 || status != ToolCallStatus::Completed
                 || success == Some(false)
             {
@@ -1491,10 +1491,10 @@ impl TaskIdToolInput {
 /// Model-facing filters for task_list. Workspace is derived from the current thread and must not be supplied.
 struct TaskListToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional owner kind filter.
+    /// Optional owner kind filter. With ownerKind=thread and omitted ownerId, task_list uses the current thread.
     owner_kind: Option<TaskOwnerKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional owner id filter.
+    /// Optional owner id filter. Omit it with ownerKind=thread to list tasks owned by the current thread.
     owner_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 21, max = 21))]
@@ -1821,9 +1821,23 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
             "Expected field: taskId. The value must be a 21-character Pioneer entity id."
         }
         TASK_LIST_TOOL => {
-            "Expected optional filters such as status and limit. Example status value: running. Example limit value: 20."
+            "Expected optional filters such as ownerKind, status, and limit. For current thread tasks, use ownerKind=thread and omit ownerId. Example status value: running. Example limit value: 20."
         }
         _ => "Check the tool schema and use the documented camelCase fields.",
+    }
+}
+
+fn normalize_task_list_owner_id(
+    owner_kind: Option<TaskOwnerKind>,
+    owner_id: Option<String>,
+    current_thread_id: &str,
+) -> Result<Option<String>, ToolError> {
+    match (owner_kind, owner_id) {
+        (Some(TaskOwnerKind::Thread), None) => Ok(Some(current_thread_id.to_owned())),
+        (None, Some(_)) => Err(ToolError::invalid_arguments(
+            "`ownerId` requires `ownerKind`; omit ownerId for current workspace tasks, or use ownerKind=thread without ownerId for the current thread",
+        )),
+        (_, owner_id) => Ok(owner_id),
     }
 }
 
@@ -2368,6 +2382,38 @@ fn task_trigger_model_output(trigger: &TaskTrigger) -> JsonValue {
     })
 }
 
+fn task_trigger_details_output(triggers: &[TaskTrigger]) -> Vec<JsonValue> {
+    triggers.iter().map(task_trigger_detail_output).collect()
+}
+
+fn task_trigger_detail_output(trigger: &TaskTrigger) -> JsonValue {
+    let mut value = task_trigger_model_output(trigger);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    object.insert(
+        "triggerId".to_owned(),
+        JsonValue::String(trigger.id.clone()),
+    );
+    object.insert(
+        "taskId".to_owned(),
+        JsonValue::String(trigger.task_id.clone()),
+    );
+    object.insert(
+        "status".to_owned(),
+        serde_json::to_value(trigger.status).unwrap_or(JsonValue::Null),
+    );
+    if let Some(next_fire_at) = trigger.next_fire_at {
+        object.insert("nextFireAt".to_owned(), JsonValue::from(next_fire_at));
+    }
+    if let Some(last_fire_at) = trigger.last_fire_at {
+        object.insert("lastFireAt".to_owned(), JsonValue::from(last_fire_at));
+    }
+    object.insert("createdAt".to_owned(), JsonValue::from(trigger.created_at));
+    object.insert("updatedAt".to_owned(), JsonValue::from(trigger.updated_at));
+    value
+}
+
 fn strip_json_nulls(value: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(object) => JsonValue::Object(
@@ -2432,7 +2478,7 @@ fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
     json!({
         "task": task_summary(&response.task),
         "changedFields": &response.changed_fields,
-        "trigger": &response.trigger,
+        "trigger": response.trigger.as_ref().map(task_trigger_detail_output),
         "agentSpec": &response.agent_spec,
         "revision": response.task.revision,
     })
@@ -2993,6 +3039,42 @@ mod tests {
     }
 
     #[test]
+    fn task_trigger_detail_output_keeps_model_facing_shape() {
+        let trigger = sample_cron_trigger(Some(1_000));
+
+        let output = task_trigger_detail_output(&trigger);
+
+        assert_eq!(output["kind"], "cron");
+        assert_eq!(output["cronExpr"], "0 7 * * *");
+        assert_eq!(output["timezone"], "Europe/Moscow");
+        assert_eq!(output["triggerId"], "trigger_1234567890123");
+        assert_eq!(output["nextFireAt"], JsonValue::from(1_000));
+        assert!(
+            output.get("spec").is_none(),
+            "model-facing trigger output must not expose internal trigger.spec"
+        );
+    }
+
+    #[test]
+    fn task_update_tool_output_uses_model_facing_trigger_shape() {
+        let response = TaskUpdateResponse {
+            task: sample_task(TaskStatus::Scheduled),
+            trigger: Some(sample_cron_trigger(Some(1_000))),
+            agent_spec: None,
+            changed_fields: vec!["trigger".to_owned()],
+        };
+
+        let output = task_update_tool_output(&response);
+
+        assert_eq!(output["trigger"]["kind"], "cron");
+        assert_eq!(output["trigger"]["cronExpr"], "0 7 * * *");
+        assert!(
+            output["trigger"].get("spec").is_none(),
+            "task_update output should not teach the model to use trigger.spec"
+        );
+    }
+
+    #[test]
     fn task_wait_guard_detects_future_scheduled_task_without_active_run() {
         let response = sample_task_response(TaskStatus::Scheduled, Vec::new(), Some(1_000));
 
@@ -3029,6 +3111,62 @@ mod tests {
             recovery: ToolRecoveryMetadata::default(),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[test]
+    fn task_list_owner_kind_thread_without_owner_id_targets_current_thread() {
+        let owner_id = normalize_task_list_owner_id(
+            Some(TaskOwnerKind::Thread),
+            None,
+            "thread_12345678901234",
+        )
+        .expect("current thread owner id should be filled");
+
+        assert_eq!(owner_id.as_deref(), Some("thread_12345678901234"));
+    }
+
+    #[test]
+    fn task_list_owner_kind_thread_preserves_explicit_owner_id() {
+        let owner_id = normalize_task_list_owner_id(
+            Some(TaskOwnerKind::Thread),
+            Some("thread_explicit123456".to_owned()),
+            "thread_current1234567",
+        )
+        .expect("explicit thread owner id should be preserved");
+
+        assert_eq!(owner_id.as_deref(), Some("thread_explicit123456"));
+    }
+
+    #[test]
+    fn task_list_non_thread_owner_without_owner_id_stays_unscoped() {
+        let owner_id = normalize_task_list_owner_id(
+            Some(TaskOwnerKind::Workspace),
+            None,
+            "thread_current1234567",
+        )
+        .expect("workspace owner without owner id should stay unscoped");
+
+        assert_eq!(owner_id, None);
+    }
+
+    #[test]
+    fn task_list_owner_id_without_owner_kind_is_rejected() {
+        let error = normalize_task_list_owner_id(
+            None,
+            Some("thread_current1234567".to_owned()),
+            "thread_current1234567",
+        )
+        .expect_err("ownerId without ownerKind would be silently ignored by list_tasks");
+
+        assert!(error.to_string().contains("`ownerId` requires `ownerKind`"));
+    }
+
+    #[test]
+    fn mutation_idempotency_key_falls_back_to_tool_and_item_id() {
+        let key = mutation_idempotency_key_for_item(TASK_CREATE_TOOL, "call_123", &json!({}))
+            .expect("mutation key should always be derivable for completed mutation items");
+
+        assert_eq!(key, "task_create:call_123");
     }
 
     #[test]

@@ -150,11 +150,18 @@ impl TaskTriggerCatchUpPolicy {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRescheduleReason {
+    Unknown,
     UserRequested,
     TriggerFired,
     MissedFireSkipped,
     RunTerminalStatusRefresh,
     TaskCancelled,
+}
+
+impl Default for TaskRescheduleReason {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -1095,6 +1102,7 @@ pub enum TaskEventPayload {
         task_id: String,
         trigger: TaskTrigger,
         rescheduled_at: i64,
+        #[serde(default)]
         reason: TaskRescheduleReason,
     },
     TaskPaused {
@@ -2164,8 +2172,8 @@ pub struct TaskTurnItem {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskExecutorKind, TaskOwnerKind, TaskStatus, TaskTriggerKind, TaskTriggerSpec,
-        TaskTriggerStatus, TaskTurnItem,
+        TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRescheduleReason, TaskStatus,
+        TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
     };
     use serde_json::json;
 
@@ -2201,6 +2209,37 @@ mod tests {
         let decoded: TaskTriggerSpec =
             serde_json::from_value(encoded).expect("trigger spec should decode");
         assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn task_rescheduled_without_reason_decodes_as_unknown() {
+        let decoded: TaskEventPayload = serde_json::from_value(json!({
+            "kind": "task_rescheduled",
+            "payload": {
+                "task_id": "task_1",
+                "trigger": {
+                    "id": "trigger_1",
+                    "taskId": "task_1",
+                    "status": "active",
+                    "spec": {
+                        "kind": "cron",
+                        "cron_expr": "0 7 * * *",
+                        "timezone": "Europe/Moscow"
+                    },
+                    "nextFireAt": 1_700_000_000,
+                    "lastFireAt": 1_699_913_600,
+                    "createdAt": 1_699_900_000,
+                    "updatedAt": 1_699_913_600
+                },
+                "rescheduled_at": 1_699_913_600
+            }
+        }))
+        .expect("legacy task/rescheduled payload without reason should decode");
+
+        let TaskEventPayload::TaskRescheduled { reason, .. } = decoded else {
+            panic!("expected task rescheduled event");
+        };
+        assert_eq!(reason, TaskRescheduleReason::Unknown);
     }
 
     #[test]

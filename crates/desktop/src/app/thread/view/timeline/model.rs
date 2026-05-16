@@ -68,18 +68,9 @@ pub(super) fn build_timeline_rows(
         return Vec::new();
     }
 
-    let turn_completed = projection
-        .turns
-        .iter()
-        .map(|turn| {
-            let completed = turn.completed_at_unix_ms.is_some()
-                && turn.error.as_deref().is_none_or(str::is_empty);
-            (turn.id.as_str(), completed)
-        })
-        .collect::<HashMap<_, _>>();
-
     let mut groups_by_anchor_index = HashMap::<usize, TurnWorkGroupRow>::new();
     let mut work_member_to_anchor_index = HashMap::<usize, usize>::new();
+    let mut work_members_by_anchor_index = HashMap::<usize, Vec<usize>>::new();
 
     let mut index = 0;
     while index < timeline.len() {
@@ -89,10 +80,6 @@ pub(super) fn build_timeline_rows(
             index = index.saturating_add(1);
         }
         let turn_end = index;
-
-        if !turn_completed.get(turn_id).copied().unwrap_or(false) {
-            continue;
-        }
 
         let mut cursor = turn_start;
         while cursor < turn_end {
@@ -107,7 +94,7 @@ pub(super) fn build_timeline_rows(
             let Some(agent_index) = ((user_index + 1)..turn_end).find(|ix| {
                 projection
                     .item_for_timeline_entry(&timeline[*ix])
-                    .is_some_and(is_parent_agent_message)
+                    .is_some_and(is_terminal_parent_agent_message)
             }) else {
                 break;
             };
@@ -135,7 +122,12 @@ pub(super) fn build_timeline_rows(
 
                 groups_by_anchor_index.insert(user_index, group);
                 for work_index in work_indices {
-                    work_member_to_anchor_index.insert(work_index, user_index);
+                    register_work_group_member(
+                        &mut work_member_to_anchor_index,
+                        &mut work_members_by_anchor_index,
+                        work_index,
+                        user_index,
+                    );
                 }
             }
 
@@ -179,9 +171,12 @@ pub(super) fn build_timeline_rows(
                 elapsed_ms: None,
                 is_open: expanded.contains(toggle_key.as_str()),
             });
-        work_member_to_anchor_index
-            .entry(timeline_index)
-            .or_insert(anchor_index);
+        register_work_group_member(
+            &mut work_member_to_anchor_index,
+            &mut work_members_by_anchor_index,
+            timeline_index,
+            anchor_index,
+        );
     }
 
     let mut coalesced_groups_by_start_index = HashMap::<usize, TimelineCoalescedToolsRow>::new();
@@ -268,48 +263,93 @@ pub(super) fn build_timeline_rows(
 
     let mut rows = Vec::with_capacity(timeline.len());
     for (timeline_index, entry) in timeline.iter().enumerate() {
-        if let Some(anchor_index) = work_member_to_anchor_index.get(&timeline_index).copied()
-            && groups_by_anchor_index
-                .get(&anchor_index)
-                .is_some_and(|group| !group.is_open)
-        {
+        if work_member_to_anchor_index.contains_key(&timeline_index) {
             continue;
         }
 
-        if let Some(group) = coalesced_groups_by_start_index
-            .get(&timeline_index)
-            .cloned()
-        {
-            rows.push(TimelineRow {
-                key: group.toggle_key.clone(),
-                kind: TimelineRowKind::CoalescedTools(group),
-            });
-        }
-
-        if let Some(group_start_index) = coalesced_member_to_start_index
-            .get(&timeline_index)
-            .copied()
-            && coalesced_groups_by_start_index
-                .get(&group_start_index)
-                .is_some_and(|group| !group.is_open)
-        {
-            continue;
-        }
-
-        rows.push(TimelineRow {
-            key: entry.id.clone(),
-            kind: TimelineRowKind::Item { timeline_index },
-        });
+        push_timeline_item_rows(
+            &mut rows,
+            timeline_index,
+            entry.id.as_str(),
+            &coalesced_groups_by_start_index,
+            &coalesced_member_to_start_index,
+        );
 
         if let Some(group) = groups_by_anchor_index.get(&timeline_index).cloned() {
+            let group_is_open = group.is_open;
             rows.push(TimelineRow {
                 key: group.toggle_key.clone(),
                 kind: TimelineRowKind::TurnWorkToggle(group),
             });
+            if group_is_open
+                && let Some(member_indices) = work_members_by_anchor_index.get(&timeline_index)
+            {
+                for member_index in member_indices {
+                    let Some(member_entry) = timeline.get(*member_index) else {
+                        continue;
+                    };
+                    push_timeline_item_rows(
+                        &mut rows,
+                        *member_index,
+                        member_entry.id.as_str(),
+                        &coalesced_groups_by_start_index,
+                        &coalesced_member_to_start_index,
+                    );
+                }
+            }
         }
     }
 
     rows
+}
+
+fn register_work_group_member(
+    work_member_to_anchor_index: &mut HashMap<usize, usize>,
+    work_members_by_anchor_index: &mut HashMap<usize, Vec<usize>>,
+    member_index: usize,
+    anchor_index: usize,
+) {
+    if work_member_to_anchor_index.contains_key(&member_index) {
+        return;
+    }
+    work_member_to_anchor_index.insert(member_index, anchor_index);
+    work_members_by_anchor_index
+        .entry(anchor_index)
+        .or_default()
+        .push(member_index);
+}
+
+fn push_timeline_item_rows(
+    rows: &mut Vec<TimelineRow>,
+    timeline_index: usize,
+    entry_id: &str,
+    coalesced_groups_by_start_index: &HashMap<usize, TimelineCoalescedToolsRow>,
+    coalesced_member_to_start_index: &HashMap<usize, usize>,
+) {
+    if let Some(group) = coalesced_groups_by_start_index
+        .get(&timeline_index)
+        .cloned()
+    {
+        rows.push(TimelineRow {
+            key: group.toggle_key.clone(),
+            kind: TimelineRowKind::CoalescedTools(group),
+        });
+    }
+
+    if let Some(group_start_index) = coalesced_member_to_start_index
+        .get(&timeline_index)
+        .copied()
+        && coalesced_groups_by_start_index
+            .get(&group_start_index)
+            .is_some_and(|group| !group.is_open)
+    {
+        return;
+    }
+
+    rows.push(TimelineRow {
+        key: entry_id.to_owned(),
+        kind: TimelineRowKind::Item { timeline_index },
+    });
 }
 
 pub(super) fn timeline_rows_layout_hash(
@@ -554,6 +594,16 @@ fn is_parent_agent_message(item_view: &ItemView) -> bool {
         && task_timeline_origin_group_key(item_view).is_none()
 }
 
+fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
+    is_parent_agent_message(item_view)
+        && matches!(
+            item_view.status,
+            crate::app::conversation::TimelineEntryStatus::Completed
+                | crate::app::conversation::TimelineEntryStatus::Failed
+                | crate::app::conversation::TimelineEntryStatus::Cancelled
+        )
+}
+
 fn is_completed_dynamic_tool(item_view: &ItemView) -> bool {
     matches!(
         &item_view.item,
@@ -731,6 +781,180 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn completed_parent_agent_message_collapses_turn_work_without_turn_metadata() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_task_list", "turn_parent", "task_list_1", 1),
+                timeline_entry("entry_task_cancel", "turn_parent", "task_cancel_1", 2),
+                timeline_entry("entry_task_cancelled", "turn_parent", "task_cancelled_1", 3),
+                timeline_entry("entry_parent_agent", "turn_parent", "parent_agent_1", 4),
+            ],
+            items: vec![
+                ItemView {
+                    id: "user_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "user_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: Some(1),
+                    completed_at_unix_ms: Some(1),
+                    partial_text: "Cancel this task".to_owned(),
+                    final_text: Some("Cancel this task".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Cancel this task".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "task_list_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "dynamic_tool_call".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(2),
+                    updated_at_unix_ms: Some(2),
+                    completed_at_unix_ms: Some(2),
+                    partial_text: "task_list".to_owned(),
+                    final_text: Some("task_list".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::DynamicToolCall {
+                        id: "task_list_1".to_owned(),
+                        tool_name: "task_list".to_owned(),
+                        arguments: serde_json::json!({"ownerKind": "thread"}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("task_list"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "task_cancel_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "dynamic_tool_call".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(3),
+                    updated_at_unix_ms: Some(3),
+                    completed_at_unix_ms: Some(3),
+                    partial_text: "task_cancel".to_owned(),
+                    final_text: Some("task_cancel".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::DynamicToolCall {
+                        id: "task_cancel_1".to_owned(),
+                        tool_name: "task_cancel".to_owned(),
+                        arguments: serde_json::json!({"taskId": "task_1"}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("task_cancel"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "task_cancelled_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "system_event".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(4),
+                    updated_at_unix_ms: Some(4),
+                    completed_at_unix_ms: Some(4),
+                    partial_text: "Task cancelled".to_owned(),
+                    final_text: Some("Task cancelled".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::SystemEvent {
+                        id: "task_cancelled_1".to_owned(),
+                        level: SystemEventLevel::Info,
+                        message: "Task cancelled".to_owned(),
+                        code: Some(pioneer_protocol::constants::events::TASK_CANCELLED.to_owned()),
+                        details: None,
+                    },
+                    timeline_origin: Some(pioneer_protocol::TimelineOrigin {
+                        kind: pioneer_protocol::TimelineOriginKind::TaskEvent,
+                        task_id: Some("task_1".to_owned()),
+                        run_id: None,
+                        child_thread_id: None,
+                        child_turn_id: None,
+                        origin_event_id: Some("task_event_1".to_owned()),
+                        origin_turn_item_id: None,
+                        origin_sequence: 1,
+                        occurred_at: 4,
+                        lane: pioneer_protocol::TimelineLane::Task,
+                    }),
+                    opaque_meta: None,
+                },
+                ItemView {
+                    id: "parent_agent_1".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "agent_message".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(5),
+                    updated_at_unix_ms: Some(5),
+                    completed_at_unix_ms: Some(5),
+                    partial_text: "Task cancelled.".to_owned(),
+                    final_text: Some("Task cancelled.".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::AgentMessage {
+                        id: "parent_agent_1".to_owned(),
+                        text: "Task cancelled.".to_owned(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+            ],
+            turns: Vec::new(),
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["user_1", "parent_agent_1"]
+        );
+        assert!(collapsed_rows.iter().any(|row| matches!(
+            row.kind,
+            TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow { .. })
+        )));
+
+        let expanded_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec![
+                "user_1",
+                "task_list_1",
+                "task_cancel_1",
+                "task_cancelled_1",
+                "parent_agent_1"
+            ]
+        );
     }
 
     #[test]
@@ -1033,6 +1257,44 @@ mod tests {
                 "child_agent_run_1",
                 "task_anchor_run_2",
             ]
+        );
+    }
+
+    #[test]
+    fn task_group_members_render_under_anchor_even_when_timeline_order_is_early() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_child_tool", "run_1", "child_tool_1", 1),
+                timeline_entry("entry_task_anchor", "run_1", "task_anchor_run_1", 0),
+                timeline_entry("entry_child_agent", "run_1", "child_agent_1", 2),
+            ],
+            items: vec![
+                task_child_tool("child_tool_1", "task_1", "run_1"),
+                task_anchor_item(
+                    "task_anchor_run_1",
+                    "task_1",
+                    "run_1",
+                    "run_1",
+                    TaskTriggerKind::Interval,
+                ),
+                task_child_agent("child_agent_1", "task_1", "run_1"),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["task_anchor_run_1"]
+        );
+
+        let expanded_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_task_anchor")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec!["task_anchor_run_1", "child_tool_1", "child_agent_1"]
         );
     }
 

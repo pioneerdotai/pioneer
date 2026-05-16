@@ -1394,6 +1394,35 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
 }
 
 #[test]
+fn turn_completed_finalizes_projection_even_when_flow_is_not_in_flight() {
+    let mut conversation = Conversation::new(THREAD_ID);
+
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+
+            prompt_manifest: None,
+        },
+    });
+
+    let turn = conversation
+        .projection()
+        .turns
+        .iter()
+        .find(|turn| turn.id == TURN_ID)
+        .expect("completed turn should be projected");
+    assert_eq!(turn.phase, TurnPhase::Completed);
+    assert!(turn.completed_at_unix_ms.is_some());
+    assert!(!conversation.tick());
+    assert!(conversation.can_submit_message());
+}
+
+#[test]
 fn event_log_is_bounded() {
     let mut conversation = Conversation::new(THREAD_ID);
 

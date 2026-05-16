@@ -59,6 +59,8 @@ impl Conversation {
 
         let ts_unix_ms = now_unix_ms();
         self.push_event_log(&event, ts_unix_ms);
+        let in_flight_turn_id_before_event =
+            self.state_machine.in_flight_turn_id().map(str::to_owned);
         self.state_machine.apply(&event);
 
         match event {
@@ -102,9 +104,15 @@ impl Conversation {
                 self.projector.apply_turn_started(&turn, ts_unix_ms);
             }
             ConversationEvent::TurnCompleted { turn, .. } => {
-                if self.state_machine.in_flight_turn_id() == Some(turn.id.as_str()) {
-                    self.projector.apply_turn_completed(&turn, ts_unix_ms);
+                self.projector.apply_turn_completed(&turn, ts_unix_ms);
+                if in_flight_turn_id_before_event.as_deref() == Some(turn.id.as_str()) {
                     self.pending_completion_turn_id = Some(turn.id);
+                } else {
+                    let _ = self
+                        .state_machine
+                        .finalize_completing_turn(turn.id.as_str());
+                    self.projector
+                        .finalize_turn_completed(turn.id.as_str(), ts_unix_ms);
                 }
             }
             ConversationEvent::TurnFailed { turn, .. } => {
