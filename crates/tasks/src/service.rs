@@ -315,6 +315,7 @@ impl TaskService {
                 task_id: task_id.clone(),
                 trigger: exhausted_trigger,
                 rescheduled_at: now,
+                reason: pioneer_protocol::TaskRescheduleReason::TriggerFired,
             });
         }
         let appended = self.append_events(events, now).await?;
@@ -961,6 +962,7 @@ impl TaskService {
                     task_id: params.task_id.clone(),
                     trigger: trigger.clone(),
                     rescheduled_at: now,
+                    reason: pioneer_protocol::TaskRescheduleReason::UserRequested,
                 },
                 now,
             )
@@ -1772,6 +1774,7 @@ impl TaskService {
                 task_id: response.task.id.clone(),
                 trigger,
                 rescheduled_at: now,
+                reason: pioneer_protocol::TaskRescheduleReason::TaskCancelled,
             });
         }
         for mut delivery in self

@@ -12,9 +12,9 @@ use pioneer_protocol::{
     TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
     TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
     TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
-    TaskTimeoutPolicy, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus,
-    ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
+    TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
+    ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -913,6 +913,13 @@ enum TaskTriggerToolInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Optional IANA timezone label for display and scheduling context.
         timezone: Option<String>,
+        #[serde(
+            default,
+            rename = "catchUpPolicy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        /// Optional missed-fire policy. Defaults to run_once_for_latest_missed.
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     /// Run every N seconds. The optional anchor is a Unix timestamp in seconds.
     Interval {
@@ -928,6 +935,13 @@ enum TaskTriggerToolInput {
         #[schemars(range(min = 1))]
         /// Optional Unix timestamp in seconds used as the recurring schedule anchor.
         interval_anchor_at: Option<i64>,
+        #[serde(
+            default,
+            rename = "catchUpPolicy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        /// Optional missed-fire policy. Defaults to run_once_for_latest_missed.
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     /// Run on a five-field cron expression in a concrete IANA timezone, for example {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
     Cron {
@@ -936,6 +950,13 @@ enum TaskTriggerToolInput {
         cron_expr: String,
         /// Required IANA timezone, for example "Europe/Moscow" or "UTC".
         timezone: String,
+        #[serde(
+            default,
+            rename = "catchUpPolicy",
+            skip_serializing_if = "Option::is_none"
+        )]
+        /// Optional missed-fire policy. Defaults to run_once_for_latest_missed.
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     /// Create a dormant task that must be triggered manually by an allowed actor.
     Manual {
@@ -969,6 +990,7 @@ impl TaskTriggerToolInput {
             Self::ScheduledAt {
                 scheduled_at,
                 timezone,
+                catch_up_policy,
             } => {
                 if scheduled_at <= 0 {
                     return Err(ToolError::invalid_arguments(
@@ -978,11 +1000,13 @@ impl TaskTriggerToolInput {
                 TaskTriggerSpec::ScheduledAt {
                     scheduled_at,
                     timezone: clean_optional_string(timezone),
+                    catch_up_policy,
                 }
             }
             Self::Interval {
                 interval_seconds,
                 interval_anchor_at,
+                catch_up_policy,
             } => {
                 if interval_seconds <= 0 {
                     return Err(ToolError::invalid_arguments(
@@ -992,14 +1016,17 @@ impl TaskTriggerToolInput {
                 TaskTriggerSpec::Interval {
                     interval_seconds,
                     interval_anchor_at,
+                    catch_up_policy,
                 }
             }
             Self::Cron {
                 cron_expr,
                 timezone,
+                catch_up_policy,
             } => TaskTriggerSpec::Cron {
                 cron_expr: required_tool_string(Some(cron_expr.as_str()), "trigger.cronExpr")?,
                 timezone: required_tool_string(Some(timezone.as_str()), "trigger.timezone")?,
+                catch_up_policy,
             },
             Self::Manual { allowed_actor } => TaskTriggerSpec::Manual { allowed_actor },
             Self::External {
@@ -2402,6 +2429,7 @@ mod tests {
             spec: TaskTriggerSpec::Cron {
                 cron_expr: "0 7 * * *".to_owned(),
                 timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: None,
             },
             next_fire_at,
             last_fire_at: None,
@@ -2645,6 +2673,7 @@ mod tests {
             TaskTriggerSpec::Cron {
                 cron_expr: "0 7 * * *".to_owned(),
                 timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: None,
             }
         );
     }

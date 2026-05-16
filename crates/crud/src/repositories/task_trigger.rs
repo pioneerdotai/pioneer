@@ -43,6 +43,16 @@ pub async fn list_triggers_by_task<C: ConnectionTrait>(
         .context("failed to list task triggers")
 }
 
+pub async fn find_trigger_by_id<C: ConnectionTrait>(
+    db: &C,
+    trigger_id: &str,
+) -> Result<Option<task_trigger::Model>> {
+    task_trigger::Entity::find_by_id(trigger_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query task trigger by id")
+}
+
 pub async fn list_due_active_triggers<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

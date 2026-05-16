@@ -1,10 +1,23 @@
 use anyhow::{Context, bail};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
-use pioneer_protocol::{TaskTrigger, TaskTriggerSpec};
+use pioneer_protocol::{
+    TaskTrigger, TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy, TaskTriggerKind, TaskTriggerSpec,
+};
 use std::str::FromStr;
 
 use crate::TaskRuntimeResult;
+
+const DEFAULT_RUN_ALL_MISSED_MAX_COUNT: u32 = 32;
+const MAX_CATCH_UP_SCAN_COUNT: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTriggerCatchUpPlan {
+    pub fire_times: Vec<i64>,
+    pub last_fire_at: Option<i64>,
+    pub next_fire_at: Option<i64>,
+    pub exhausted: bool,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskTriggerCalculator;
@@ -16,6 +29,7 @@ impl TaskTriggerCalculator {
             TaskTriggerSpec::ScheduledAt {
                 scheduled_at,
                 timezone,
+                catch_up_policy,
             } => {
                 if *scheduled_at <= 0 {
                     bail!("scheduled_at must be a positive unix timestamp");
@@ -23,11 +37,13 @@ impl TaskTriggerCalculator {
                 if let Some(timezone) = timezone {
                     validate_timezone(timezone)?;
                 }
+                validate_catch_up_policy(catch_up_policy.as_ref())?;
                 Ok(())
             }
             TaskTriggerSpec::Interval {
                 interval_seconds,
                 interval_anchor_at,
+                catch_up_policy,
             } => {
                 if *interval_seconds <= 0 {
                     bail!("interval_seconds must be positive");
@@ -35,14 +51,17 @@ impl TaskTriggerCalculator {
                 if interval_anchor_at.is_some_and(|value| value <= 0) {
                     bail!("interval_anchor_at must be positive when present");
                 }
+                validate_catch_up_policy(catch_up_policy.as_ref())?;
                 Ok(())
             }
             TaskTriggerSpec::Cron {
                 cron_expr,
                 timezone,
+                catch_up_policy,
             } => {
                 let tz = validate_timezone(timezone)?;
                 CronSpec::parse(cron_expr)?;
+                validate_catch_up_policy(catch_up_policy.as_ref())?;
                 let _ = tz;
                 Ok(())
             }
@@ -63,6 +82,7 @@ impl TaskTriggerCalculator {
             TaskTriggerSpec::Interval {
                 interval_seconds,
                 interval_anchor_at,
+                ..
             } => Ok(Some(next_interval_fire(
                 interval_anchor_at.unwrap_or(now),
                 *interval_seconds,
@@ -71,6 +91,7 @@ impl TaskTriggerCalculator {
             TaskTriggerSpec::Cron {
                 cron_expr,
                 timezone,
+                ..
             } => next_cron_fire(cron_expr, timezone, now).map(Some),
             TaskTriggerSpec::Manual { .. }
             | TaskTriggerSpec::External { .. }
@@ -83,6 +104,7 @@ impl TaskTriggerCalculator {
             TaskTriggerSpec::Interval {
                 interval_seconds,
                 interval_anchor_at,
+                ..
             } => Ok(Some(next_interval_fire(
                 interval_anchor_at.unwrap_or(fired_at),
                 *interval_seconds,
@@ -91,10 +113,197 @@ impl TaskTriggerCalculator {
             TaskTriggerSpec::Cron {
                 cron_expr,
                 timezone,
+                ..
             } => next_cron_fire(cron_expr, timezone, fired_at).map(Some),
             _ => Ok(None),
         }
     }
+
+    pub fn catch_up_plan(
+        trigger: &TaskTrigger,
+        now: i64,
+    ) -> TaskRuntimeResult<TaskTriggerCatchUpPlan> {
+        let Some(first_due_at) = trigger.next_fire_at else {
+            return Ok(TaskTriggerCatchUpPlan {
+                fire_times: Vec::new(),
+                last_fire_at: trigger.last_fire_at,
+                next_fire_at: None,
+                exhausted: false,
+            });
+        };
+        if first_due_at > now {
+            return Ok(TaskTriggerCatchUpPlan {
+                fire_times: Vec::new(),
+                last_fire_at: trigger.last_fire_at,
+                next_fire_at: Some(first_due_at),
+                exhausted: false,
+            });
+        }
+
+        let policy = catch_up_policy_for_trigger(trigger);
+        let missed = missed_fire_times(trigger, first_due_at, now, missed_scan_limit(policy))?;
+        let Some(latest_missed) = missed.last().copied() else {
+            return Ok(TaskTriggerCatchUpPlan {
+                fire_times: Vec::new(),
+                last_fire_at: trigger.last_fire_at,
+                next_fire_at: trigger.next_fire_at,
+                exhausted: false,
+            });
+        };
+
+        match policy.mode {
+            TaskTriggerCatchUpMode::SkipMissed => Ok(TaskTriggerCatchUpPlan {
+                fire_times: Vec::new(),
+                last_fire_at: Some(latest_missed),
+                next_fire_at: next_after_missed(trigger, latest_missed)?,
+                exhausted: !is_recurring_trigger(trigger),
+            }),
+            TaskTriggerCatchUpMode::RunOnceForLatestMissed => Ok(TaskTriggerCatchUpPlan {
+                fire_times: vec![latest_missed],
+                last_fire_at: Some(latest_missed),
+                next_fire_at: next_after_missed(trigger, latest_missed)?,
+                exhausted: !is_recurring_trigger(trigger),
+            }),
+            TaskTriggerCatchUpMode::RunAllMissed => {
+                let max_count = policy
+                    .max_count
+                    .unwrap_or(DEFAULT_RUN_ALL_MISSED_MAX_COUNT)
+                    .max(1) as usize;
+                let fire_times = missed.into_iter().take(max_count).collect::<Vec<_>>();
+                let last_emitted = fire_times
+                    .last()
+                    .copied()
+                    .expect("missed fire list should not be empty");
+                Ok(TaskTriggerCatchUpPlan {
+                    fire_times,
+                    last_fire_at: Some(last_emitted),
+                    next_fire_at: next_after_missed(trigger, last_emitted)?,
+                    exhausted: !is_recurring_trigger(trigger),
+                })
+            }
+        }
+    }
+}
+
+fn validate_catch_up_policy(policy: Option<&TaskTriggerCatchUpPolicy>) -> TaskRuntimeResult<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    if matches!(policy.mode, TaskTriggerCatchUpMode::RunAllMissed)
+        && policy.max_count.is_some_and(|count| count == 0)
+    {
+        bail!("catch_up_policy.max_count must be positive for run_all_missed");
+    }
+    Ok(())
+}
+
+fn catch_up_policy_for_trigger(trigger: &TaskTrigger) -> TaskTriggerCatchUpPolicy {
+    match &trigger.spec {
+        TaskTriggerSpec::ScheduledAt {
+            catch_up_policy, ..
+        }
+        | TaskTriggerSpec::Interval {
+            catch_up_policy, ..
+        }
+        | TaskTriggerSpec::Cron {
+            catch_up_policy, ..
+        } => catch_up_policy.unwrap_or_else(TaskTriggerCatchUpPolicy::run_once_for_latest_missed),
+        _ => TaskTriggerCatchUpPolicy::run_once_for_latest_missed(),
+    }
+}
+
+fn missed_scan_limit(policy: TaskTriggerCatchUpPolicy) -> usize {
+    match policy.mode {
+        TaskTriggerCatchUpMode::RunAllMissed => policy
+            .max_count
+            .unwrap_or(DEFAULT_RUN_ALL_MISSED_MAX_COUNT)
+            .max(1) as usize,
+        TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed => {
+            MAX_CATCH_UP_SCAN_COUNT
+        }
+    }
+}
+
+fn missed_fire_times(
+    trigger: &TaskTrigger,
+    first_due_at: i64,
+    now: i64,
+    limit: usize,
+) -> TaskRuntimeResult<Vec<i64>> {
+    if !is_recurring_trigger(trigger) {
+        return Ok((first_due_at <= now)
+            .then_some(first_due_at)
+            .into_iter()
+            .collect());
+    }
+    if let TaskTriggerSpec::Interval {
+        interval_seconds, ..
+    } = &trigger.spec
+    {
+        let interval_seconds = *interval_seconds;
+        if interval_seconds <= 0 {
+            bail!("interval_seconds must be positive");
+        }
+        let policy = catch_up_policy_for_trigger(trigger);
+        return match policy.mode {
+            TaskTriggerCatchUpMode::RunAllMissed => {
+                let mut fire_times = Vec::new();
+                let mut current = first_due_at;
+                while current <= now && fire_times.len() < limit {
+                    fire_times.push(current);
+                    current = current.saturating_add(interval_seconds);
+                }
+                Ok(fire_times)
+            }
+            TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed => {
+                let missed_intervals = now.saturating_sub(first_due_at) / interval_seconds;
+                Ok(vec![first_due_at.saturating_add(
+                    missed_intervals.saturating_mul(interval_seconds),
+                )])
+            }
+        };
+    }
+
+    let mut fire_times = Vec::new();
+    let mut current = first_due_at;
+    while current <= now && fire_times.len() < limit {
+        fire_times.push(current);
+        let Some(next) = TaskTriggerCalculator::next_after_fire(trigger, current)? else {
+            break;
+        };
+        if next <= current {
+            bail!("trigger `{}` did not advance after fire", trigger.id);
+        }
+        current = next;
+    }
+    if current <= now
+        && matches!(
+            catch_up_policy_for_trigger(trigger).mode,
+            TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed
+        )
+    {
+        bail!(
+            "trigger `{}` catch-up scan exceeded {} missed fires",
+            trigger.id,
+            MAX_CATCH_UP_SCAN_COUNT
+        );
+    }
+    Ok(fire_times)
+}
+
+fn next_after_missed(trigger: &TaskTrigger, missed_at: i64) -> TaskRuntimeResult<Option<i64>> {
+    if is_recurring_trigger(trigger) {
+        TaskTriggerCalculator::next_after_fire(trigger, missed_at)
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_recurring_trigger(trigger: &TaskTrigger) -> bool {
+    matches!(
+        trigger.kind(),
+        TaskTriggerKind::Interval | TaskTriggerKind::Cron
+    )
 }
 
 fn validate_timezone(timezone: &str) -> TaskRuntimeResult<Tz> {

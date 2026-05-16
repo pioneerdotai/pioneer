@@ -8,8 +8,8 @@ use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
 use crate::trigger::TaskTriggerCalculator;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
-    TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskRun, TaskRunStatus, TaskTrigger,
-    TaskTriggerKind, TaskTriggerStatus, generate_id,
+    TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskRescheduleReason, TaskRun,
+    TaskRunStatus, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, generate_id,
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
+const TASK_SCHEDULER_MAX_SLEEP_SECONDS: u64 = 60;
 
 #[derive(Clone)]
 pub struct TaskSchedulerHandle {
@@ -97,9 +98,7 @@ impl TaskScheduler {
         let due = self.store.list_due_active_task_triggers(now).await?;
         let mut created = 0usize;
         for trigger in due {
-            if self.process_trigger(trigger, now).await? {
-                created = created.saturating_add(1);
-            }
+            created = created.saturating_add(self.process_trigger(trigger, now).await?);
         }
         for run in self.store.list_due_retry_task_runs(now, 1024).await? {
             if self.process_retry_run(run, now).await? {
@@ -176,34 +175,36 @@ impl TaskScheduler {
                     )
                 }
             })
-            .unwrap_or_else(|| Duration::from_secs(60))
+            .map(|duration| duration.min(Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)))
+            .unwrap_or_else(|| Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS))
     }
 
-    async fn process_trigger(&self, trigger: TaskTrigger, now: i64) -> TaskRuntimeResult<bool> {
+    async fn process_trigger(&self, trigger: TaskTrigger, now: i64) -> TaskRuntimeResult<usize> {
         let Some(task_response) = self.store.get_task(trigger.task_id.as_str()).await? else {
-            return Ok(false);
+            return Ok(0);
         };
         if is_terminal_task(task_response.task.status)
             || trigger.status != TaskTriggerStatus::Active
         {
-            return Ok(false);
+            return Ok(0);
         }
         if task_response.runs.iter().any(|run| {
             run.trigger_id.as_deref() == Some(trigger.id.as_str()) && !is_recurring(&trigger)
         }) {
-            return Ok(false);
+            return Ok(0);
         }
-        if task_response
+        let active_run_count = task_response
             .runs
             .iter()
-            .any(|run| !crate::service::is_terminal_run(run.status))
-            && task_response
-                .task
-                .concurrency_policy
-                .as_ref()
-                .map(|policy| policy.max_parallel_runs <= 1)
-                .unwrap_or(true)
-        {
+            .filter(|run| !crate::service::is_terminal_run(run.status))
+            .count();
+        let max_parallel_runs = task_response
+            .task
+            .concurrency_policy
+            .as_ref()
+            .map(|policy| usize::try_from(policy.max_parallel_runs.max(1)).unwrap_or(1))
+            .unwrap_or(1);
+        if active_run_count >= max_parallel_runs {
             if is_recurring(&trigger) && trigger.next_fire_at.is_some_and(|next| next <= now) {
                 self.skip_recurring_fire_for_active_run(
                     task_response.task.id.clone(),
@@ -212,71 +213,121 @@ impl TaskScheduler {
                 )
                 .await?;
             }
-            return Ok(false);
+            return Ok(0);
         }
 
-        let run = TaskRun {
-            id: generate_id(ID_LEN),
-            task_id: task_response.task.id.clone(),
-            trigger_id: Some(trigger.id.clone()),
-            parent_run_id: task_response.runs.last().map(|run| run.id.clone()),
-            run_group_id: generate_id(ID_LEN),
-            attempt_number: 1,
-            retry_of_run_id: None,
-            ready_at: Some(now),
-            run_number: task_response
-                .runs
-                .last()
-                .map(|run| run.run_number.saturating_add(1))
-                .unwrap_or(1),
-            status: TaskRunStatus::Queued,
-            executor_kind: task_response.task.executor_kind,
-            started_at: None,
-            completed_at: None,
-            heartbeat_at: None,
-            locked_by: None,
-            lock_expires_at: None,
-            result: None,
-            error: None,
-            created_at: now,
-            updated_at: now,
-        };
-
+        let catch_up = TaskTriggerCalculator::catch_up_plan(&trigger, now)?;
+        let available_run_slots = max_parallel_runs.saturating_sub(active_run_count).max(1);
+        let planned_fire_count = catch_up.fire_times.len();
+        let mut fire_times = catch_up.fire_times;
+        if fire_times.len() > available_run_slots {
+            fire_times.truncate(available_run_slots);
+        }
         let mut updated_trigger = trigger.clone();
-        updated_trigger.last_fire_at = Some(now);
+        updated_trigger.last_fire_at = fire_times.last().copied().or(catch_up.last_fire_at);
         updated_trigger.updated_at = now;
-        if is_recurring(&trigger) {
-            updated_trigger.next_fire_at = TaskTriggerCalculator::next_after_fire(&trigger, now)?;
+        if fire_times.len() < planned_fire_count {
+            updated_trigger.next_fire_at = match fire_times.last().copied() {
+                Some(fire_at) => TaskTriggerCalculator::next_after_fire(&trigger, fire_at)?,
+                None => catch_up.next_fire_at,
+            };
+            updated_trigger.status = TaskTriggerStatus::Active;
+        } else if catch_up.exhausted {
+            updated_trigger.next_fire_at = None;
+            updated_trigger.status = TaskTriggerStatus::Exhausted;
+        } else if is_recurring(&trigger) {
+            updated_trigger.next_fire_at = catch_up.next_fire_at;
             updated_trigger.status = TaskTriggerStatus::Active;
         } else {
             updated_trigger.next_fire_at = None;
             updated_trigger.status = TaskTriggerStatus::Exhausted;
         }
 
-        let events = vec![
-            TaskEventPayload::TaskQueued {
+        let mut runs = Vec::new();
+        let mut events = Vec::new();
+        let mut next_run_number = task_response
+            .runs
+            .last()
+            .map(|run| run.run_number.saturating_add(1))
+            .unwrap_or(1);
+        let mut parent_run_id = task_response.runs.last().map(|run| run.id.clone());
+        for _fire_at in fire_times {
+            let run = TaskRun {
+                id: generate_id(ID_LEN),
+                task_id: task_response.task.id.clone(),
+                trigger_id: Some(trigger.id.clone()),
+                parent_run_id: parent_run_id.clone(),
+                run_group_id: generate_id(ID_LEN),
+                attempt_number: 1,
+                retry_of_run_id: None,
+                ready_at: Some(now),
+                run_number: next_run_number,
+                status: TaskRunStatus::Queued,
+                executor_kind: task_response.task.executor_kind,
+                started_at: None,
+                completed_at: None,
+                heartbeat_at: None,
+                locked_by: None,
+                lock_expires_at: None,
+                result: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            events.push(TaskEventPayload::TaskQueued {
                 task_id: task_response.task.id.clone(),
                 run_id: Some(run.id.clone()),
-            },
-            TaskEventPayload::RunCreated {
+            });
+            events.push(TaskEventPayload::RunCreated {
                 run: run.clone(),
                 agent_spec: task_response.agent_specs.last().cloned().map(|mut spec| {
                     spec.run_id = Some(run.id.clone());
                     spec.updated_at = now;
                     spec
                 }),
+            });
+            parent_run_id = Some(run.id.clone());
+            next_run_number = next_run_number.saturating_add(1);
+            runs.push(run);
+        }
+        events.push(TaskEventPayload::TaskRescheduled {
+            task_id: task_response.task.id.clone(),
+            trigger: updated_trigger,
+            rescheduled_at: now,
+            reason: if runs.is_empty() {
+                TaskRescheduleReason::MissedFireSkipped
+            } else {
+                TaskRescheduleReason::TriggerFired
             },
-            TaskEventPayload::TaskRescheduled {
-                task_id: task_response.task.id.clone(),
-                trigger: updated_trigger,
-                rescheduled_at: now,
-            },
-        ];
-        let appended = self.projector.append_events(events, now).await?;
-        self.event_bus.publish_many(appended).await;
-        self.dispatch_run(task_response.task.workspace_id, run)
+        });
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(0);
+        };
+        let reserve_executions = runs
+            .iter()
+            .map(|run| (run.id.clone(), run.executor_kind))
+            .collect::<Vec<_>>();
+        let appended = self
+            .store
+            .append_due_trigger_task_events(
+                trigger.id.as_str(),
+                expected_next_fire_at,
+                now,
+                events,
+                reserve_executions,
+            )
             .await?;
-        Ok(true)
+        if appended.is_empty() {
+            return Ok(0);
+        }
+        self.event_bus.publish_many(appended).await;
+        let created_count = runs.len();
+        for run in runs {
+            let _ = self
+                .dispatch_run(task_response.task.workspace_id.clone(), run)
+                .await?;
+        }
+        Ok(created_count)
     }
 
     async fn skip_recurring_fire_for_active_run(
@@ -297,6 +348,7 @@ impl TaskScheduler {
                     task_id: task_id.clone(),
                     trigger: updated_trigger.clone(),
                     rescheduled_at: now,
+                    reason: TaskRescheduleReason::MissedFireSkipped,
                 }],
                 now,
             )

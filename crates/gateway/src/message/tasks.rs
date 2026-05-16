@@ -226,11 +226,17 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TaskEventPayload::TaskRescheduled { trigger, .. } => {
+            TaskEventPayload::TaskRescheduled {
+                trigger, reason, ..
+            } => {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
                     events::TASK_RESCHEDULED,
-                    &pioneer_protocol::TaskRescheduledNotification { context, trigger },
+                    &pioneer_protocol::TaskRescheduledNotification {
+                        context,
+                        trigger,
+                        reason,
+                    },
                 )
                 .await;
             }

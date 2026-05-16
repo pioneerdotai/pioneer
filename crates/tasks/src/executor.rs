@@ -8,8 +8,7 @@ use pioneer_protocol::{
     TaskCompletionBehavior, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskProgressDetails,
     TaskResult, TaskRetryBackoffKind, TaskRun, TaskRunExecution, TaskRunExecutionStatus,
-    TaskRunStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockStatus, ThreadLineage,
-    generate_id,
+    TaskRunStatus, TaskWriteLockStatus, ThreadLineage, generate_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -411,22 +410,12 @@ impl TaskExecutionHandle {
             .into_iter()
             .find(|trigger| trigger.id == trigger_id)
         {
-            if trigger.status == TaskTriggerStatus::Active
-                && matches!(
-                    trigger.kind(),
-                    TaskTriggerKind::Interval | TaskTriggerKind::Cron
-                )
-            {
-                trigger.next_fire_at = crate::trigger::TaskTriggerCalculator::next_after_fire(
-                    &trigger,
-                    event_timestamp_secs,
-                )?;
-                trigger.updated_at = event_timestamp_secs;
-            }
+            trigger.updated_at = event_timestamp_secs;
             events.push(TaskEventPayload::TaskRescheduled {
                 task_id: self.task_id.clone(),
                 trigger,
                 rescheduled_at: event_timestamp_secs,
+                reason: pioneer_protocol::TaskRescheduleReason::RunTerminalStatusRefresh,
             });
         }
         Ok(())

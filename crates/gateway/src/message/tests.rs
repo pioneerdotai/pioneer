@@ -3875,6 +3875,7 @@ async fn task_delivery_worker_materializes_owner_thread_turn() {
                     spec: TaskTriggerSpec::ScheduledAt {
                         scheduled_at: 4_000_000_000,
                         timezone: Some("UTC".to_owned()),
+                        catch_up_policy: None,
                     },
                 },
                 agent_spec: None,
@@ -4050,6 +4051,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
                     spec: TaskTriggerSpec::ScheduledAt {
                         scheduled_at: 4_000_000_000,
                         timezone: Some("UTC".to_owned()),
+                        catch_up_policy: None,
                     },
                 },
                 agent_spec: None,

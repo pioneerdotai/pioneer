@@ -352,6 +352,7 @@ mod tests {
             spec: TaskTriggerSpec::Cron {
                 cron_expr: "0 7 * * *".to_owned(),
                 timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: None,
             },
             next_fire_at: Some(NOW + 86_400),
             last_fire_at: Some(NOW),

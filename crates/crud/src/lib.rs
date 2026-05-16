@@ -118,6 +118,73 @@ fn memory_candidate_status_event_kind(status: MemoryCandidateStatus) -> &'static
     }
 }
 
+async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
+    db: &C,
+    run_id: String,
+    executor_kind: TaskExecutorKind,
+    now: i64,
+) -> Result<TaskRunExecution> {
+    if let Some(existing) = task_run_execution::find_execution_by_run(db, run_id.as_str()).await? {
+        let execution = task_run_execution_from_db_model(existing)?;
+        if execution.executor_kind != executor_kind {
+            anyhow::bail!(
+                "task run execution `{}` already exists for executor kind `{:?}`, requested `{:?}`",
+                execution.id,
+                execution.executor_kind,
+                executor_kind
+            );
+        }
+        return Ok(execution);
+    }
+
+    let Some(run_model) = task_run::find_run_by_id(db, run_id.as_str()).await? else {
+        anyhow::bail!("task run `{run_id}` not found for execution reservation");
+    };
+    let run = task_run_from_db_model(run_model)?;
+    if run.executor_kind != executor_kind {
+        anyhow::bail!(
+            "task run `{}` has executor kind `{:?}`, requested `{:?}`",
+            run.id,
+            run.executor_kind,
+            executor_kind
+        );
+    }
+
+    let (child_thread_id, child_turn_id) = if executor_kind == TaskExecutorKind::Agent {
+        (Some(generate_id(DB_ID_LEN)), Some(generate_id(DB_ID_LEN)))
+    } else {
+        (None, None)
+    };
+
+    task_run_execution::insert_execution_if_absent(
+        db,
+        task_run_execution::NewTaskRunExecution {
+            id: generate_id(DB_ID_LEN),
+            task_id: run.task_id.clone(),
+            task_run_id: run.id.clone(),
+            executor_kind,
+            status: TaskRunExecutionStatus::Reserved,
+            worker_id: None,
+            lease_until: None,
+            heartbeat_at: None,
+            child_thread_id,
+            child_turn_id,
+            started_at: None,
+            completed_at: None,
+            result: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    let execution = task_run_execution::find_execution_by_run(db, run.id.as_str())
+        .await?
+        .context("task run execution missing after reservation")?;
+    task_run_execution_from_db_model(execution)
+}
+
 /// A single turn's conversation content: user input + assistant reply.
 #[derive(Debug, Clone)]
 pub struct ConversationEntry {
@@ -2432,6 +2499,26 @@ impl CrudStore {
         .await
     }
 
+    pub async fn append_due_trigger_task_events(
+        &self,
+        trigger_id: &str,
+        expected_next_fire_at: i64,
+        now: i64,
+        events: Vec<TaskEventPayload>,
+        reserve_executions: Vec<(String, TaskExecutorKind)>,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_due_trigger_task_events_once(
+                trigger_id.to_owned(),
+                expected_next_fire_at,
+                now,
+                events.clone(),
+                reserve_executions.clone(),
+            )
+        })
+        .await
+    }
+
     pub async fn get_task(&self, task_id: &str) -> Result<Option<TaskGetResponse>> {
         let Some(task_model) = task_repository::find_task_by_id(&self.connection, task_id).await?
         else {
@@ -2690,71 +2777,8 @@ impl CrudStore {
             .await
             .context("failed to begin task run execution reservation transaction")?;
 
-        let result = async {
-            if let Some(existing) =
-                task_run_execution::find_execution_by_run(&transaction, run_id.as_str()).await?
-            {
-                let execution = task_run_execution_from_db_model(existing)?;
-                if execution.executor_kind != executor_kind {
-                    anyhow::bail!(
-                        "task run execution `{}` already exists for executor kind `{:?}`, requested `{:?}`",
-                        execution.id,
-                        execution.executor_kind,
-                        executor_kind
-                    );
-                }
-                return Ok(execution);
-            }
-
-            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
-            else {
-                anyhow::bail!("task run `{run_id}` not found for execution reservation");
-            };
-            let run = task_run_from_db_model(run_model)?;
-            if run.executor_kind != executor_kind {
-                anyhow::bail!(
-                    "task run `{}` has executor kind `{:?}`, requested `{:?}`",
-                    run.id,
-                    run.executor_kind,
-                    executor_kind
-                );
-            }
-
-            let (child_thread_id, child_turn_id) = if executor_kind == TaskExecutorKind::Agent {
-                (Some(generate_id(DB_ID_LEN)), Some(generate_id(DB_ID_LEN)))
-            } else {
-                (None, None)
-            };
-
-            task_run_execution::insert_execution_if_absent(
-                &transaction,
-                task_run_execution::NewTaskRunExecution {
-                    id: generate_id(DB_ID_LEN),
-                    task_id: run.task_id.clone(),
-                    task_run_id: run.id.clone(),
-                    executor_kind,
-                    status: TaskRunExecutionStatus::Reserved,
-                    worker_id: None,
-                    lease_until: None,
-                    heartbeat_at: None,
-                    child_thread_id,
-                    child_turn_id,
-                    started_at: None,
-                    completed_at: None,
-                    result: None,
-                    error: None,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .await?;
-
-            let execution = task_run_execution::find_execution_by_run(&transaction, run.id.as_str())
-                .await?
-                .context("task run execution missing after reservation")?;
-            task_run_execution_from_db_model(execution)
-        }
-        .await;
+        let result =
+            reserve_execution_for_run_in_connection(&transaction, run_id, executor_kind, now).await;
 
         match result {
             Ok(execution) => {
@@ -6168,53 +6192,111 @@ impl CrudStore {
             .await
             .context("failed to begin task event batch materialization transaction")?;
 
-        let created_at = unix_to_datetime(event_timestamp_secs);
-        let mut appended_events = Vec::with_capacity(events.len());
-
-        for event in events {
-            let idempotency_key = event.idempotency_key();
-            let mut appended_event = match task_event::append_event(
-                &transaction,
-                &event,
-                created_at,
-                idempotency_key.as_deref(),
-            )
+        let appended_events = match self
+            .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
             .await
-            {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-            if appended_event.append_status.is_inserted() {
-                if let Err(error) = self
-                    .task_projector
-                    .project(&transaction, &appended_event)
-                    .await
-                    .context("failed to project task event to read models")
-                {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            }
-
-            if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
-                .await
-                .context("failed to hydrate task event metadata")
-            {
+        {
+            Ok(appended_events) => appended_events,
+            Err(error) => {
                 let _ = transaction.rollback().await;
                 return Err(error);
             }
-
-            appended_events.push(appended_event);
-        }
+        };
 
         transaction
             .commit()
             .await
             .context("failed to commit task event batch materialization transaction")?;
+
+        Ok(appended_events)
+    }
+
+    async fn append_due_trigger_task_events_once(
+        &self,
+        trigger_id: String,
+        expected_next_fire_at: i64,
+        now: i64,
+        events: Vec<TaskEventPayload>,
+        reserve_executions: Vec<(String, TaskExecutorKind)>,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin due task trigger materialization transaction")?;
+
+        let result = async {
+            let Some(trigger) =
+                task_trigger::find_trigger_by_id(&transaction, trigger_id.as_str()).await?
+            else {
+                return Ok(Vec::new());
+            };
+            if trigger.status != "active"
+                || trigger.next_fire_at.map(|value| value.timestamp())
+                    != Some(expected_next_fire_at)
+                || expected_next_fire_at > now
+            {
+                return Ok(Vec::new());
+            }
+
+            let appended_events = self
+                .append_task_events_in_connection(&transaction, events, now)
+                .await?;
+            for (run_id, executor_kind) in reserve_executions {
+                let _ = reserve_execution_for_run_in_connection(
+                    &transaction,
+                    run_id,
+                    executor_kind,
+                    now,
+                )
+                .await?;
+            }
+            Ok(appended_events)
+        }
+        .await;
+
+        match result {
+            Ok(appended_events) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit due task trigger materialization transaction")?;
+                Ok(appended_events)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn append_task_events_in_connection<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let created_at = unix_to_datetime(event_timestamp_secs);
+        let mut appended_events = Vec::with_capacity(events.len());
+
+        for event in events {
+            let idempotency_key = event.idempotency_key();
+            let mut appended_event =
+                task_event::append_event(db, &event, created_at, idempotency_key.as_deref())
+                    .await?;
+
+            if appended_event.append_status.is_inserted() {
+                self.task_projector
+                    .project(db, &appended_event)
+                    .await
+                    .context("failed to project task event to read models")?;
+            }
+
+            hydrate_task_event_metadata(db, &mut appended_event)
+                .await
+                .context("failed to hydrate task event metadata")?;
+            appended_events.push(appended_event);
+        }
 
         Ok(appended_events)
     }
@@ -7450,6 +7532,7 @@ mod tests {
             spec: TaskTriggerSpec::ScheduledAt {
                 scheduled_at: timestamp + 3600,
                 timezone: Some("Europe/Berlin".to_owned()),
+                catch_up_policy: None,
             },
             next_fire_at: Some(timestamp + 3600),
             last_fire_at: None,

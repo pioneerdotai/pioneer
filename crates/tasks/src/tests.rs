@@ -12,10 +12,11 @@ use pioneer_protocol::{
     TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskDeliveriesParams,
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskRunExecutionStatus,
-    TaskRunStatus, TaskStatus, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
-    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, ThreadLineage,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
+    TaskRescheduleReason, TaskResult, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy,
+    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerCatchUpPolicy,
+    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue,
+    TaskWaitMode, TaskWaitParams, ThreadLineage,
 };
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use std::sync::{
@@ -448,6 +449,7 @@ async fn duplicate_scheduler_wakeups_do_not_create_duplicate_one_shot_runs() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 10,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -483,6 +485,7 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
     let mut params = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 10,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     params.executor_kind = TaskExecutorKind::Agent;
     let mut spec = agent_spec(2);
@@ -1012,6 +1015,7 @@ async fn scheduled_create_does_not_fire_before_due_time() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1036,6 +1040,7 @@ async fn scheduled_trigger_fires_when_due() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 10,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1066,6 +1071,7 @@ async fn interval_trigger_recomputes_next_fire_at() {
             create_params(TaskTriggerSpec::Interval {
                 interval_seconds: 10,
                 interval_anchor_at: Some(4_000_000_000),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1104,6 +1110,7 @@ async fn interval_task_fires_repeatedly_after_terminal_runs_and_stays_active() {
             create_params(TaskTriggerSpec::Interval {
                 interval_seconds: 10,
                 interval_anchor_at: Some(4_000_000_000),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1147,6 +1154,7 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
     let mut params = create_params(TaskTriggerSpec::Interval {
         interval_seconds: 10,
         interval_anchor_at: Some(4_000_000_000),
+        catch_up_policy: None,
     });
     params.concurrency_policy = Some(TaskConcurrencyPolicy {
         key: None,
@@ -1212,6 +1220,231 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
         .expect("task should read after repeated pass");
     assert_eq!(after_repeat.runs.len(), 1);
     assert_eq!(after_repeat.triggers[0].next_fire_at, Some(4_000_000_020));
+}
+
+#[tokio::test]
+async fn daily_cron_catches_up_latest_missed_once_and_advances_to_next_day() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "0 7 * * *".to_owned(),
+                timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("cron task should create");
+    let first_fire = response
+        .trigger
+        .next_fire_at
+        .expect("cron should have initial fire");
+    let missed_by_two_hours = first_fire + 2 * 60 * 60;
+
+    assert_eq!(
+        runtime
+            .process_due_once(missed_by_two_hours)
+            .await
+            .expect("missed daily cron should catch up once"),
+        1
+    );
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(task.runs.len(), 1);
+    assert_eq!(task.triggers[0].last_fire_at, Some(first_fire));
+    assert_eq!(
+        task.triggers[0].next_fire_at,
+        Some(first_fire + 24 * 60 * 60)
+    );
+
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: response.task.id,
+            after_sequence: None,
+        })
+        .await
+        .expect("events should read");
+    assert!(events.events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            TaskEventPayload::TaskRescheduled {
+                reason: TaskRescheduleReason::TriggerFired,
+                trigger,
+                ..
+            } if trigger.last_fire_at == Some(first_fire)
+        )
+    }));
+}
+
+#[tokio::test]
+async fn skip_missed_cron_advances_trigger_without_creating_run() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Cron {
+                cron_expr: "0 7 * * *".to_owned(),
+                timezone: "Europe/Moscow".to_owned(),
+                catch_up_policy: Some(TaskTriggerCatchUpPolicy::skip_missed()),
+            }),
+        )
+        .await
+        .expect("cron task should create");
+    let first_fire = response
+        .trigger
+        .next_fire_at
+        .expect("cron should have initial fire");
+    let missed_by_two_hours = first_fire + 2 * 60 * 60;
+
+    assert_eq!(
+        runtime
+            .process_due_once(missed_by_two_hours)
+            .await
+            .expect("missed cron should skip without creating a run"),
+        0
+    );
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read");
+    assert!(task.runs.is_empty());
+    assert_eq!(task.triggers[0].last_fire_at, Some(first_fire));
+    assert_eq!(
+        task.triggers[0].next_fire_at,
+        Some(first_fire + 24 * 60 * 60)
+    );
+
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: response.task.id,
+            after_sequence: None,
+        })
+        .await
+        .expect("events should read");
+    assert!(events.events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            TaskEventPayload::TaskRescheduled {
+                reason: TaskRescheduleReason::MissedFireSkipped,
+                trigger,
+                ..
+            } if trigger.last_fire_at == Some(first_fire)
+        )
+    }));
+}
+
+#[tokio::test]
+async fn default_interval_catch_up_computes_latest_missed_without_scan_limit_failure() {
+    let runtime = runtime().await;
+    let anchor = 4_000_000_000;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Interval {
+                interval_seconds: 15,
+                interval_anchor_at: Some(anchor),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("interval task should create");
+    let latest_missed = anchor + 15 * 20_000;
+
+    assert_eq!(
+        runtime
+            .process_due_once(latest_missed + 5)
+            .await
+            .expect("long-missed interval should catch up arithmetically"),
+        1
+    );
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(task.runs.len(), 1);
+    assert_eq!(task.triggers[0].last_fire_at, Some(latest_missed));
+    assert_eq!(task.triggers[0].next_fire_at, Some(latest_missed + 15));
+}
+
+#[tokio::test]
+async fn run_all_missed_interval_respects_batch_limit_and_active_run_slots() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Interval {
+        interval_seconds: 10,
+        interval_anchor_at: Some(4_000_000_000),
+        catch_up_policy: Some(TaskTriggerCatchUpPolicy::run_all_missed(4)),
+    });
+    params.concurrency_policy = Some(TaskConcurrencyPolicy {
+        key: None,
+        max_parallel_runs: 2,
+        on_conflict: TaskConcurrencyConflictPolicy::Queue,
+    });
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("interval task should create");
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_035)
+            .await
+            .expect("scheduler should create only available run slots"),
+        2
+    );
+    let after_first_batch = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(after_first_batch.runs.len(), 2);
+    assert_eq!(
+        after_first_batch.triggers[0].last_fire_at,
+        Some(4_000_000_010)
+    );
+    assert_eq!(
+        after_first_batch.triggers[0].next_fire_at,
+        Some(4_000_000_020)
+    );
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_035)
+            .await
+            .expect("active runs should prevent another parallel batch"),
+        0
+    );
+    let after_overlap = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should read after overlap");
+    assert_eq!(after_overlap.runs.len(), 2);
+    assert_eq!(after_overlap.triggers[0].next_fire_at, Some(4_000_000_040));
 }
 
 #[tokio::test]
@@ -1446,6 +1679,7 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1499,6 +1733,7 @@ async fn cron_trigger_can_fire_repeatedly_with_timezone() {
             create_params(TaskTriggerSpec::Cron {
                 cron_expr: "0 9 * * *".to_owned(),
                 timezone: "UTC".to_owned(),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1543,6 +1778,7 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
     let mut params = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 4_000_000_000,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     params.owner_kind = TaskOwnerKind::Thread;
     params.owner_id = Some("thr_owner".to_owned());
@@ -1592,6 +1828,7 @@ async fn cancel_task_cancels_pending_deliveries() {
     let mut params = create_params(TaskTriggerSpec::Interval {
         interval_seconds: 10,
         interval_anchor_at: Some(4_000_000_000),
+        catch_up_policy: None,
     });
     params.owner_kind = TaskOwnerKind::Thread;
     params.owner_id = Some("thr_owner".to_owned());
@@ -1653,6 +1890,7 @@ async fn invalid_cron_timezone_is_rejected() {
             create_params(TaskTriggerSpec::Cron {
                 cron_expr: "0 8 * * *".to_owned(),
                 timezone: "Not/AZone".to_owned(),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1670,6 +1908,7 @@ async fn invalid_interval_is_rejected() {
             create_params(TaskTriggerSpec::Interval {
                 interval_seconds: 0,
                 interval_anchor_at: None,
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1683,6 +1922,7 @@ async fn cron_trigger_computes_next_fire_in_timezone() {
         &TaskTriggerSpec::Cron {
             cron_expr: "0 9 * * *".to_owned(),
             timezone: "UTC".to_owned(),
+            catch_up_policy: None,
         },
         1_700_000_000,
     )
@@ -1697,6 +1937,7 @@ async fn cron_trigger_computes_moscow_morning_fire_in_utc() {
         &TaskTriggerSpec::Cron {
             cron_expr: "0 7 * * *".to_owned(),
             timezone: "Europe/Moscow".to_owned(),
+            catch_up_policy: None,
         },
         1_778_752_618,
     )
@@ -1712,6 +1953,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     let mut missing_prompt = create_params(TaskTriggerSpec::Cron {
         cron_expr: "0 7 * * *".to_owned(),
         timezone: "Europe/Moscow".to_owned(),
+        catch_up_policy: None,
     });
     missing_prompt.executor_kind = TaskExecutorKind::Agent;
     missing_prompt.agent_spec = Some(agent_spec(3));
@@ -1725,6 +1967,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     let mut missing_output = create_params(TaskTriggerSpec::Cron {
         cron_expr: "0 7 * * *".to_owned(),
         timezone: "Europe/Moscow".to_owned(),
+        catch_up_policy: None,
     });
     missing_output.executor_kind = TaskExecutorKind::Agent;
     let mut spec = agent_spec(3);
@@ -1744,6 +1987,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     let mut valid = create_params(TaskTriggerSpec::Cron {
         cron_expr: "0 7 * * *".to_owned(),
         timezone: "Europe/Moscow".to_owned(),
+        catch_up_policy: None,
     });
     valid.executor_kind = TaskExecutorKind::Agent;
     let mut spec = agent_spec(3);
@@ -1768,6 +2012,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
     let mut params = create_params(TaskTriggerSpec::Cron {
         cron_expr: "0 7 * * *".to_owned(),
         timezone: "Europe/Moscow".to_owned(),
+        catch_up_policy: None,
     });
     params.executor_kind = TaskExecutorKind::Agent;
     let mut spec = agent_spec(3);
@@ -1797,6 +2042,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
                     spec: TaskTriggerSpec::Cron {
                         cron_expr: "15 8 * * *".to_owned(),
                         timezone: "Europe/Moscow".to_owned(),
+                        catch_up_policy: None,
                     },
                 }),
                 instructions: Some(vec![
@@ -1831,6 +2077,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
         TaskTriggerSpec::Cron {
             cron_expr: "15 8 * * *".to_owned(),
             timezone: "Europe/Moscow".to_owned(),
+            catch_up_policy: None,
         }
     );
     let updated_agent_spec = updated.agent_spec.expect("agent spec should be updated");
@@ -1904,6 +2151,7 @@ async fn update_task_rejects_scheduled_agent_without_prompt_contract() {
                     spec: TaskTriggerSpec::Cron {
                         cron_expr: "0 7 * * *".to_owned(),
                         timezone: "Europe/Moscow".to_owned(),
+                        catch_up_policy: None,
                     },
                 }),
                 ..Default::default()
@@ -1940,6 +2188,7 @@ async fn lifecycle_defaults_attach_only_immediate_parent_turn_tasks() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -1999,6 +2248,7 @@ async fn scheduled_parent_task_can_create_child_when_depth_allows() {
     let mut root = create_params(TaskTriggerSpec::Cron {
         cron_expr: "0 7 * * *".to_owned(),
         timezone: "UTC".to_owned(),
+        catch_up_policy: None,
     });
     root.executor_kind = TaskExecutorKind::Agent;
     let mut root_spec = agent_spec(3);
@@ -2036,6 +2286,7 @@ async fn reschedule_updates_trigger_and_wakes_scheduler() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -2051,6 +2302,7 @@ async fn reschedule_updates_trigger_and_wakes_scheduler() {
                     spec: TaskTriggerSpec::ScheduledAt {
                         scheduled_at: 10,
                         timezone: Some("UTC".to_owned()),
+                        catch_up_policy: None,
                     },
                 },
             },
@@ -2142,6 +2394,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -2150,6 +2403,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     let mut attached_cancel = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 4_000_000_000,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     attached_cancel.parent_task_id = Some(root.task.id.clone());
     attached_cancel.lifecycle_policy = Some(TaskLifecyclePolicy {
@@ -2167,6 +2421,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     let mut attached_detach = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 4_000_000_000,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     attached_detach.parent_task_id = Some(root.task.id.clone());
     attached_detach.lifecycle_policy = Some(TaskLifecyclePolicy {
@@ -2184,6 +2439,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     let mut detached_keep = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 4_000_000_000,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     detached_keep.parent_task_id = Some(root.task.id.clone());
     detached_keep.lifecycle_policy = Some(TaskLifecyclePolicy {
@@ -2276,6 +2532,7 @@ async fn detach_task_updates_attachment_without_cancelling() {
     let mut params = create_params(TaskTriggerSpec::ScheduledAt {
         scheduled_at: 4_000_000_000,
         timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
     });
     params.lifecycle_policy = Some(pioneer_protocol::TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Attached,
@@ -2546,6 +2803,7 @@ async fn wait_returns_non_waitable_snapshot_for_future_scheduled_task_without_ac
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 4_000_000_000,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await
@@ -3174,6 +3432,7 @@ async fn runtime_start_processes_overdue_scheduled_triggers_before_returning() {
             create_params(TaskTriggerSpec::ScheduledAt {
                 scheduled_at: 1,
                 timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
             }),
         )
         .await

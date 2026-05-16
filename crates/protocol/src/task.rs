@@ -108,6 +108,55 @@ pub enum TaskDependencyTriggerMode {
     AllTerminal,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTriggerCatchUpMode {
+    RunOnceForLatestMissed,
+    SkipMissed,
+    RunAllMissed,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskTriggerCatchUpPolicy {
+    pub mode: TaskTriggerCatchUpMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count: Option<u32>,
+}
+
+impl TaskTriggerCatchUpPolicy {
+    pub const fn run_once_for_latest_missed() -> Self {
+        Self {
+            mode: TaskTriggerCatchUpMode::RunOnceForLatestMissed,
+            max_count: None,
+        }
+    }
+
+    pub const fn skip_missed() -> Self {
+        Self {
+            mode: TaskTriggerCatchUpMode::SkipMissed,
+            max_count: None,
+        }
+    }
+
+    pub const fn run_all_missed(max_count: u32) -> Self {
+        Self {
+            mode: TaskTriggerCatchUpMode::RunAllMissed,
+            max_count: Some(max_count),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRescheduleReason {
+    UserRequested,
+    TriggerFired,
+    MissedFireSkipped,
+    RunTerminalStatusRefresh,
+    TaskCancelled,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDependencyTriggerPolicy {
@@ -133,15 +182,21 @@ pub enum TaskTriggerSpec {
         scheduled_at: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     Interval {
         interval_seconds: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interval_anchor_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     Cron {
         cron_expr: String,
         timezone: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
     Manual {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1040,6 +1095,7 @@ pub enum TaskEventPayload {
         task_id: String,
         trigger: TaskTrigger,
         rescheduled_at: i64,
+        reason: TaskRescheduleReason,
     },
     TaskPaused {
         task: Task,
@@ -1298,10 +1354,25 @@ impl TaskEventPayload {
                 "task:{}:detached:{}:{detached_at}",
                 task.id, task.revision
             )),
-            Self::TaskUpdated { .. }
-            | Self::TaskRescheduled { .. }
-            | Self::TaskPaused { .. }
-            | Self::TaskResumed { .. } => None,
+            Self::TaskUpdated { .. } | Self::TaskPaused { .. } | Self::TaskResumed { .. } => None,
+            Self::TaskRescheduled {
+                trigger,
+                reason,
+                rescheduled_at,
+                ..
+            } => Some(format!(
+                "trigger:{}:rescheduled:{reason:?}:{:?}:{}:{}",
+                trigger.id,
+                trigger.status,
+                trigger
+                    .next_fire_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                trigger
+                    .last_fire_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| rescheduled_at.to_string())
+            )),
             Self::TaskRecovered { .. } => None,
             Self::ChildThreadLinked { lineage } => {
                 Some(format!("run:{}:child_thread_linked", lineage.task_run_id))
@@ -1971,6 +2042,7 @@ pub struct TaskUpdatedNotification {
 pub struct TaskRescheduledNotification {
     pub context: TaskNotificationContext,
     pub trigger: TaskTrigger,
+    pub reason: TaskRescheduleReason,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2118,6 +2190,7 @@ mod tests {
         let spec = TaskTriggerSpec::ScheduledAt {
             scheduled_at: 1_700_000_000,
             timezone: Some("Europe/Moscow".to_owned()),
+            catch_up_policy: None,
         };
 
         let encoded = serde_json::to_value(&spec).expect("trigger spec should encode");
