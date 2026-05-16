@@ -1,6 +1,6 @@
 use super::state_machine::TurnStateMachine;
 use pioneer_protocol::{
-    MarkdownDocument, RecoveryJobStatus, SystemEventLevel, ToolLoopBudgetAction,
+    MarkdownDocument, RecoveryJobStatus, SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
     ToolRetryResolution, Turn, TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
     UserMessageAttachment,
@@ -53,6 +53,7 @@ pub(crate) struct ItemView {
     pub partial_markdown: Option<MarkdownDocument>,
     pub final_markdown: Option<MarkdownDocument>,
     pub item: TurnItem,
+    pub timeline_origin: Option<TimelineOrigin>,
     pub opaque_meta: Option<JsonValue>,
 }
 
@@ -118,11 +119,15 @@ impl ConversationProjector {
         self.view_state.revision = self.view_state.revision.saturating_add(1);
     }
 
-    pub(super) fn set_item_opaque_meta(&mut self, item_id: &str, opaque_meta: JsonValue) {
+    pub(super) fn set_item_timeline_origin(
+        &mut self,
+        item_id: &str,
+        timeline_origin: TimelineOrigin,
+    ) {
         if let Some(index) = self.item_index.get(item_id).copied()
             && let Some(item) = self.view_state.items.get_mut(index)
         {
-            item.opaque_meta = Some(opaque_meta);
+            item.timeline_origin = Some(timeline_origin);
         }
     }
 
@@ -130,9 +135,13 @@ impl ConversationProjector {
         self.view_state.items.len()
     }
 
-    pub(super) fn set_item_opaque_meta_from(&mut self, start_index: usize, opaque_meta: JsonValue) {
+    pub(super) fn set_item_timeline_origin_from(
+        &mut self,
+        start_index: usize,
+        timeline_origin: TimelineOrigin,
+    ) {
         for item in self.view_state.items.iter_mut().skip(start_index) {
-            item.opaque_meta = Some(opaque_meta.clone());
+            item.timeline_origin = Some(timeline_origin.clone());
         }
     }
 
@@ -732,6 +741,7 @@ impl ConversationProjector {
                 partial_markdown: markdown.clone(),
                 final_markdown: None,
                 item: item_payload.clone(),
+                timeline_origin: None,
                 opaque_meta: opaque_meta.clone(),
             });
             let index = self.view_state.items.len().saturating_sub(1);
@@ -1077,16 +1087,7 @@ fn merge_item_opaque_meta(existing: &mut Option<JsonValue>, incoming: Option<Jso
     let Some(incoming) = incoming else {
         return;
     };
-    let existing_is_timeline_meta = opaque_meta_timeline_group(existing.as_ref()).is_some();
-    let incoming_is_timeline_meta = opaque_meta_timeline_group(Some(&incoming)).is_some();
-    if existing_is_timeline_meta && !incoming_is_timeline_meta {
-        return;
-    }
     *existing = Some(incoming);
-}
-
-fn opaque_meta_timeline_group(meta: Option<&JsonValue>) -> Option<&str> {
-    meta?.get("timeline_group").and_then(JsonValue::as_str)
 }
 
 fn is_recovery_failure_error(error: &str) -> bool {

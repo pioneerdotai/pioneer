@@ -82,6 +82,7 @@ use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,7 +111,10 @@ impl pioneer_tasks::TaskExecutor for CompletingSystemExecutor {
             .complete_run(
                 Some(TaskResult {
                     summary: Some("delivered scheduled result".to_owned()),
-                    data: Some(TaskValue::String("ok".to_owned())),
+                    data: Some(TaskValue::Object(BTreeMap::from([(
+                        "rawText".to_owned(),
+                        TaskValue::String("delivered scheduled result\nfull detail".to_owned()),
+                    )]))),
                     artifacts: Vec::new(),
                     completed_by_run_id: Some(run.id.clone()),
                 }),
@@ -3419,7 +3423,9 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
             TurnItemEventPayload::ItemCompleted {
                 item: TurnItem::Task { item },
                 ..
-            } if item.task_id == response.task.id && item.run_id.as_deref() == Some(run.id.as_str())
+            } if item.id == crate::task_tools::task_run_anchor_id(run.id.as_str())
+                && item.task_id == response.task.id
+                && item.run_id.as_deref() == Some(run.id.as_str())
         )),
         "occurrence turn should persist a parent-visible task anchor for desktop reload"
     );
@@ -4138,7 +4144,7 @@ async fn task_create_tool_persists_anchor_and_composed_timeline_impl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_delivery_worker_materializes_owner_thread_turn() {
+async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -4185,7 +4191,8 @@ async fn task_delivery_worker_materializes_owner_thread_turn() {
                 "method": "thread/start",
                 "params": {
                     "thread_id": owner_thread_id,
-                    "workspace_id": workspace_id
+                    "workspace_id": workspace_id,
+                    "mode": "Agent"
                 }
             })
             .to_string(),
@@ -4240,6 +4247,64 @@ async fn task_delivery_worker_materializes_owner_thread_turn() {
         .process_due_once(4_000_000_000)
         .await
         .expect("scheduled task should fire");
+
+    let task_after_run = processor
+        .crud_store
+        .get_task(task_id.as_str())
+        .await
+        .expect("task should read")
+        .expect("task should exist");
+    let run = task_after_run
+        .runs
+        .last()
+        .expect("scheduled run should exist")
+        .clone();
+    let parent_thread = processor
+        .thread_manager
+        .thread_get(owner_thread_id)
+        .await
+        .expect("owner thread should be loaded");
+    let occurrence_turn = Turn {
+        id: run.id.clone(),
+        status: TurnStatus::Completed,
+        turn_kind: TurnKind::TaskRun,
+        origin: TurnOrigin::ScheduledTask,
+        error: None,
+        prompt_manifest: None,
+    };
+    processor
+        .crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..occurrence_turn.clone()
+            },
+            &[],
+        )
+        .await
+        .expect("occurrence turn start should persist");
+    processor
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: owner_thread_id.to_owned(),
+                turn: occurrence_turn,
+            },
+            4_000_000_000,
+        )
+        .await
+        .expect("occurrence turn completion should persist");
+    connection
+        .execute_unprepared(&format!(
+            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at) values ('child_delivery_thread_1', 'child_delivery_turn_1', '{owner_thread_id}', '{}', '{task_id}', '{}', '{owner_thread_id}', 0, '2096-10-02T07:06:40+00:00')",
+            run.id, run.id
+        ))
+        .await
+        .expect("lineage should persist");
+
     processor
         .process_due_task_deliveries(4_000_000_000, 10)
         .await
@@ -4266,18 +4331,38 @@ async fn task_delivery_worker_materializes_owner_thread_turn() {
         .delivered_turn_id
         .as_deref()
         .expect("owner thread delivery should record turn id");
+    assert_eq!(
+        delivered_turn_id,
+        run.id.as_str(),
+        "owner thread delivery must use thread_lineage.parent_turn_id instead of creating a delivery turn"
+    );
     let items = crud_store
         .get_turn_item_events(owner_thread_id, delivered_turn_id)
         .await
         .expect("items should read")
-        .expect("delivery turn should exist");
+        .expect("occurrence turn should exist");
+    assert!(
+        !items.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemStarted {
+                    item: TurnItem::Task { .. },
+                    ..
+                } | TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::Task { .. },
+                    ..
+                }
+            )
+        }),
+        "delivery turn should not duplicate the scheduled run task anchor"
+    );
     assert!(items.events.iter().any(|event| {
         matches!(
             &event.payload,
-            TurnItemEventPayload::ItemCompleted {
-                item: TurnItem::Task { .. },
+            TurnItemEventPayload::ItemStarted {
+                item: TurnItem::AgentMessage { text, .. },
                 ..
-            }
+            } if text == "delivered scheduled result\nfull detail"
         )
     }));
     assert!(items.events.iter().any(|event| {
@@ -4286,9 +4371,15 @@ async fn task_delivery_worker_materializes_owner_thread_turn() {
             TurnItemEventPayload::ItemCompleted {
                 item: TurnItem::AgentMessage { text, .. },
                 ..
-            } if text == "delivered scheduled result"
+            } if text == "delivered scheduled result\nfull detail"
         )
     }));
+    let owner_thread = crud_store
+        .get_thread_model(owner_thread_id)
+        .await
+        .expect("owner thread should read")
+        .expect("owner thread should still exist");
+    assert_eq!(owner_thread.mode, ThreadMode::Agent);
 
     let deliveries_request = json!({
         "jsonrpc": "2.0",
@@ -13669,7 +13760,7 @@ async fn wait_for_task_anchor_status(
     task_id: &str,
     expected_status: pioneer_protocol::TaskStatus,
 ) -> pioneer_protocol::TaskStatus {
-    let item_id = format!("task_item_{task_id}");
+    let item_id = format!("task_{task_id}");
     for _ in 0..100 {
         if let Some(TurnItem::Task { item }) = crud_store
             .get_turn_item(turn_id, item_id.as_str())

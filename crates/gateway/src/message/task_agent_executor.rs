@@ -1031,7 +1031,13 @@ async fn ensure_task_run_occurrence_anchor(
     parent_thread_id: &str,
     occurrence_turn_id: &str,
 ) -> Result<()> {
-    let item = crate::task_tools::task_turn_item_from_response(processor, task_response).await?;
+    let item = crate::task_tools::task_turn_item_from_response_for_run(
+        processor,
+        task_response,
+        occurrence_turn_id,
+        crate::task_tools::task_run_anchor_id(occurrence_turn_id),
+    )
+    .await?;
     if processor
         .crud_store
         .get_turn_item(occurrence_turn_id, item.id.as_str())

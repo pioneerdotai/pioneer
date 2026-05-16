@@ -10,6 +10,12 @@ const TIMELINE_TURN_WORK_GROUP_PREFIX: &str = "timeline-turn-work-group::";
 const TIMELINE_COALESCED_TOOLS_PREFIX: &str = "timeline-coalesced-tools::";
 const LIVE_TASK_VISIBLE_COMPLETED_TOOL_ROWS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TaskTimelineGroupKey<'a> {
+    task_id: &'a str,
+    run_id: Option<&'a str>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TurnWorkGroupRow {
     pub(super) toggle_key: String,
@@ -137,26 +143,27 @@ pub(super) fn build_timeline_rows(
         }
     }
 
-    let task_anchor_by_task_id = timeline
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let item_view = projection.item_for_timeline_entry(entry)?;
-            let TurnItem::Task { item } = &item_view.item else {
-                return None;
-            };
-            Some((item.task_id.as_str(), index))
-        })
-        .collect::<HashMap<_, _>>();
+    let mut task_anchor_by_group_key = HashMap::<TaskTimelineGroupKey<'_>, usize>::new();
+    for (index, entry) in timeline.iter().enumerate() {
+        let Some(item_view) = projection.item_for_timeline_entry(entry) else {
+            continue;
+        };
+        let TurnItem::Task { item } = &item_view.item else {
+            continue;
+        };
+        task_anchor_by_group_key
+            .entry(task_anchor_group_key(entry.turn_id.as_str(), item))
+            .or_insert(index);
+    }
 
     for (timeline_index, entry) in timeline.iter().enumerate() {
         let Some(item_view) = projection.item_for_timeline_entry(entry) else {
             continue;
         };
-        let Some(task_id) = task_timeline_meta_task_id(item_view) else {
+        let Some(group_key) = task_timeline_origin_group_key(item_view) else {
             continue;
         };
-        let Some(anchor_index) = task_anchor_by_task_id.get(task_id).copied() else {
+        let Some(anchor_index) = task_anchor_by_group_key.get(&group_key).copied() else {
             continue;
         };
         if anchor_index == timeline_index {
@@ -180,19 +187,21 @@ pub(super) fn build_timeline_rows(
     let mut coalesced_groups_by_start_index = HashMap::<usize, TimelineCoalescedToolsRow>::new();
     let mut coalesced_member_to_start_index = HashMap::<usize, usize>::new();
 
-    let task_anchor_by_task_id_any_status = timeline
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let item_view = projection.item_for_timeline_entry(entry)?;
-            let TurnItem::Task { item } = &item_view.item else {
-                return None;
-            };
-            Some((item.task_id.as_str(), (index, item.status)))
-        })
-        .collect::<HashMap<_, _>>();
+    let mut task_anchor_by_group_key_any_status =
+        HashMap::<TaskTimelineGroupKey<'_>, (usize, TaskStatus)>::new();
+    for (index, entry) in timeline.iter().enumerate() {
+        let Some(item_view) = projection.item_for_timeline_entry(entry) else {
+            continue;
+        };
+        let TurnItem::Task { item } = &item_view.item else {
+            continue;
+        };
+        task_anchor_by_group_key_any_status
+            .entry(task_anchor_group_key(entry.turn_id.as_str(), item))
+            .or_insert((index, item.status));
+    }
 
-    for (task_id, (anchor_index, status)) in task_anchor_by_task_id_any_status {
+    for (group_key, (anchor_index, status)) in task_anchor_by_group_key_any_status {
         if matches!(
             status,
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
@@ -208,7 +217,7 @@ pub(super) fn build_timeline_rows(
                     return None;
                 }
                 let item_view = projection.item_for_timeline_entry(entry)?;
-                (task_timeline_meta_task_id(item_view) == Some(task_id)
+                (task_timeline_origin_group_key(item_view) == Some(group_key)
                     && is_completed_dynamic_tool(item_view))
                 .then_some(timeline_index)
             })
@@ -223,7 +232,7 @@ pub(super) fn build_timeline_rows(
             &mut coalesced_groups_by_start_index,
             &mut coalesced_member_to_start_index,
             hidden_indices,
-            format!("task-tools-{task_id}"),
+            format!("task-tools-{}", task_timeline_group_id(group_key)),
             TimelineCoalescedToolsKind::CompletedTaskTools,
             expanded,
         );
@@ -505,17 +514,44 @@ fn timeline_work_group_elapsed_ms(
     }
 }
 
-fn task_timeline_meta_task_id(item_view: &ItemView) -> Option<&str> {
-    let meta = item_view.opaque_meta.as_ref()?;
-    if meta.get("timeline_group")?.as_str()? != "task" {
-        return None;
+fn task_anchor_group_key<'a>(
+    turn_id: &'a str,
+    item: &'a pioneer_protocol::TaskTurnItem,
+) -> TaskTimelineGroupKey<'a> {
+    let run_id = match item.run_id.as_deref() {
+        Some(run_id) if item.trigger_kind == pioneer_protocol::TaskTriggerKind::Immediate => {
+            Some(run_id)
+        }
+        Some(run_id) if run_id == turn_id => Some(run_id),
+        Some(_) if item.trigger_kind != pioneer_protocol::TaskTriggerKind::Immediate => {
+            Some(turn_id)
+        }
+        _ => None,
+    };
+    TaskTimelineGroupKey {
+        task_id: item.task_id.as_str(),
+        run_id,
     }
-    meta.get("task_id")?.as_str()
+}
+
+fn task_timeline_origin_group_key(item_view: &ItemView) -> Option<TaskTimelineGroupKey<'_>> {
+    let origin = item_view.timeline_origin.as_ref()?;
+    Some(TaskTimelineGroupKey {
+        task_id: origin.task_id.as_deref()?,
+        run_id: origin.run_id.as_deref(),
+    })
+}
+
+fn task_timeline_group_id(group_key: TaskTimelineGroupKey<'_>) -> String {
+    match group_key.run_id {
+        Some(run_id) => format!("{}::{run_id}", group_key.task_id),
+        None => group_key.task_id.to_owned(),
+    }
 }
 
 fn is_parent_agent_message(item_view: &ItemView) -> bool {
     matches!(item_view.item, TurnItem::AgentMessage { .. })
-        && task_timeline_meta_task_id(item_view).is_none()
+        && task_timeline_origin_group_key(item_view).is_none()
 }
 
 fn is_completed_dynamic_tool(item_view: &ItemView) -> bool {
@@ -554,6 +590,148 @@ mod tests {
         SystemEventLevel, TaskExecutorKind, TaskTriggerKind, TaskTurnItem, ToolCallStatus,
         ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload,
     };
+
+    fn timeline_entry(id: &str, turn_id: &str, item_id: &str, item_index: usize) -> TimelineEntry {
+        TimelineEntry {
+            id: id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            item_index,
+        }
+    }
+
+    fn task_anchor_item(
+        id: &str,
+        task_id: &str,
+        turn_id: &str,
+        run_id: &str,
+        trigger_kind: TaskTriggerKind,
+    ) -> ItemView {
+        ItemView {
+            id: id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_type: "task".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: Some(1),
+            updated_at_unix_ms: Some(2),
+            completed_at_unix_ms: Some(2),
+            partial_text: "Task".to_owned(),
+            final_text: Some("Task".to_owned()),
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::Task {
+                item: TaskTurnItem {
+                    id: id.to_owned(),
+                    task_id: task_id.to_owned(),
+                    run_id: Some(run_id.to_owned()),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: "Task".to_owned(),
+                    status: TaskStatus::Completed,
+                    trigger_kind,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    result_preview: None,
+                    error_preview: None,
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            },
+            timeline_origin: None,
+            opaque_meta: None,
+        }
+    }
+
+    fn task_timeline_origin(task_id: &str, run_id: &str) -> pioneer_protocol::TimelineOrigin {
+        pioneer_protocol::TimelineOrigin {
+            kind: pioneer_protocol::TimelineOriginKind::ChildTurn,
+            task_id: Some(task_id.to_owned()),
+            run_id: Some(run_id.to_owned()),
+            child_thread_id: Some("child_thread".to_owned()),
+            child_turn_id: Some("child_turn".to_owned()),
+            origin_event_id: None,
+            origin_turn_item_id: None,
+            origin_sequence: 1,
+            occurred_at: 1,
+            lane: pioneer_protocol::TimelineLane::ChildTool,
+        }
+    }
+
+    fn task_child_tool(id: &str, task_id: &str, run_id: &str) -> ItemView {
+        ItemView {
+            id: id.to_owned(),
+            turn_id: run_id.to_owned(),
+            item_type: "dynamic_tool_call".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: Some(2),
+            updated_at_unix_ms: Some(3),
+            completed_at_unix_ms: Some(3),
+            partial_text: "tool".to_owned(),
+            final_text: Some("tool".to_owned()),
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::DynamicToolCall {
+                id: id.to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({"path": "file"}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::None,
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            },
+            timeline_origin: Some(task_timeline_origin(task_id, run_id)),
+            opaque_meta: None,
+        }
+    }
+
+    fn task_child_agent(id: &str, task_id: &str, run_id: &str) -> ItemView {
+        ItemView {
+            id: id.to_owned(),
+            turn_id: run_id.to_owned(),
+            item_type: "agent_message".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: Some(3),
+            updated_at_unix_ms: Some(4),
+            completed_at_unix_ms: Some(4),
+            partial_text: "Child result".to_owned(),
+            final_text: Some("Child result".to_owned()),
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::AgentMessage {
+                id: id.to_owned(),
+                text: "Child result".to_owned(),
+                markdown: None,
+                markdown_version: None,
+            },
+            timeline_origin: Some(task_timeline_origin(task_id, run_id)),
+            opaque_meta: None,
+        }
+    }
+
+    fn visible_item_ids<'a>(
+        projection: &'a ConversationViewState,
+        rows: &[TimelineRow],
+    ) -> Vec<&'a str> {
+        rows.iter()
+            .filter_map(|row| match row.kind {
+                TimelineRowKind::Item { timeline_index } => projection
+                    .timeline
+                    .get(timeline_index)
+                    .map(|entry| entry.item_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
 
     #[test]
     fn completed_task_group_collapses_members_by_default() {
@@ -614,6 +792,7 @@ mod tests {
                             updated_at: 3,
                         },
                     },
+                    timeline_origin: None,
                     opaque_meta: None,
                 },
                 ItemView {
@@ -637,10 +816,8 @@ mod tests {
                         ),
                         details: None,
                     },
-                    opaque_meta: Some(serde_json::json!({
-                        "timeline_group": "task",
-                        "task_id": "task_1",
-                    })),
+                    timeline_origin: Some(task_timeline_origin("task_1", "run_1")),
+                    opaque_meta: None,
                 },
                 ItemView {
                     id: "child_tool_1".to_owned(),
@@ -661,10 +838,8 @@ mod tests {
                         code: None,
                         details: None,
                     },
-                    opaque_meta: Some(serde_json::json!({
-                        "timeline_group": "task",
-                        "task_id": "task_1",
-                    })),
+                    timeline_origin: Some(task_timeline_origin("task_1", "run_1")),
+                    opaque_meta: None,
                 },
             ],
             ..ConversationViewState::default()
@@ -724,6 +899,7 @@ mod tests {
                     updated_at: 1,
                 },
             },
+            timeline_origin: None,
             opaque_meta: None,
         });
 
@@ -761,10 +937,8 @@ mod tests {
                     outcome: None,
                     observation: None,
                 },
-                opaque_meta: Some(serde_json::json!({
-                    "timeline_group": "task",
-                    "task_id": "task_1",
-                })),
+                timeline_origin: Some(task_timeline_origin("task_1", "run_1")),
+                opaque_meta: None,
             });
         }
 
@@ -797,6 +971,189 @@ mod tests {
                 .filter(|row| matches!(row.kind, TimelineRowKind::Item { .. }))
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn recurring_task_runs_with_same_task_id_use_distinct_work_groups() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_task_run_1", "run_1", "task_anchor_run_1", 0),
+                timeline_entry("entry_child_tool_run_1", "run_1", "child_tool_run_1", 1),
+                timeline_entry("entry_child_agent_run_1", "run_1", "child_agent_run_1", 2),
+                timeline_entry("entry_task_run_2", "run_2", "task_anchor_run_2", 0),
+                timeline_entry("entry_child_tool_run_2", "run_2", "child_tool_run_2", 1),
+                timeline_entry("entry_child_agent_run_2", "run_2", "child_agent_run_2", 2),
+            ],
+            items: vec![
+                task_anchor_item(
+                    "task_anchor_run_1",
+                    "task_1",
+                    "run_1",
+                    "run_1",
+                    TaskTriggerKind::Immediate,
+                ),
+                task_child_tool("child_tool_run_1", "task_1", "run_1"),
+                task_child_agent("child_agent_run_1", "task_1", "run_1"),
+                task_anchor_item(
+                    "task_anchor_run_2",
+                    "task_1",
+                    "run_2",
+                    "run_2",
+                    TaskTriggerKind::Immediate,
+                ),
+                task_child_tool("child_tool_run_2", "task_1", "run_2"),
+                task_child_agent("child_agent_run_2", "task_1", "run_2"),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["task_anchor_run_1", "task_anchor_run_2"]
+        );
+        assert_eq!(
+            collapsed_rows
+                .iter()
+                .filter(|row| matches!(row.kind, TimelineRowKind::TurnWorkToggle(_)))
+                .count(),
+            2
+        );
+
+        let run_1_expanded_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_task_run_1")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &run_1_expanded_rows),
+            vec![
+                "task_anchor_run_1",
+                "child_tool_run_1",
+                "child_agent_run_1",
+                "task_anchor_run_2",
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_scheduled_task_anchor_does_not_steal_later_run_group() {
+        let mut stale_anchor = match task_anchor_item(
+            "task_task_1",
+            "task_1",
+            "run_1",
+            "run_2",
+            TaskTriggerKind::Interval,
+        )
+        .item
+        {
+            TurnItem::Task { item } => item,
+            _ => unreachable!(),
+        };
+        stale_anchor.id = "task_task_1".to_owned();
+        stale_anchor.trigger_kind = TaskTriggerKind::Interval;
+        let mut run_2_anchor = match task_anchor_item(
+            "task_run_run_2",
+            "task_1",
+            "run_2",
+            "run_2",
+            TaskTriggerKind::Interval,
+        )
+        .item
+        {
+            TurnItem::Task { item } => item,
+            _ => unreachable!(),
+        };
+        run_2_anchor.id = "task_run_run_2".to_owned();
+        run_2_anchor.trigger_kind = TaskTriggerKind::Interval;
+
+        let projection = ConversationViewState {
+            timeline: vec![
+                TimelineEntry {
+                    id: "entry_stale_run_1_anchor".to_owned(),
+                    turn_id: "run_1".to_owned(),
+                    item_id: "task_task_1".to_owned(),
+                    item_index: 0,
+                },
+                TimelineEntry {
+                    id: "entry_child_tool_run_1".to_owned(),
+                    turn_id: "run_1".to_owned(),
+                    item_id: "child_tool_run_1".to_owned(),
+                    item_index: 1,
+                },
+                TimelineEntry {
+                    id: "entry_run_2_anchor".to_owned(),
+                    turn_id: "run_2".to_owned(),
+                    item_id: "task_run_run_2".to_owned(),
+                    item_index: 0,
+                },
+                TimelineEntry {
+                    id: "entry_child_tool_run_2".to_owned(),
+                    turn_id: "run_2".to_owned(),
+                    item_id: "child_tool_run_2".to_owned(),
+                    item_index: 1,
+                },
+            ],
+            items: vec![
+                ItemView {
+                    id: "task_task_1".to_owned(),
+                    turn_id: "run_1".to_owned(),
+                    item_type: "task".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: Some(2),
+                    completed_at_unix_ms: Some(2),
+                    partial_text: "Task".to_owned(),
+                    final_text: Some("Task".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::Task { item: stale_anchor },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                task_child_tool("child_tool_run_1", "task_1", "run_1"),
+                ItemView {
+                    id: "task_run_run_2".to_owned(),
+                    turn_id: "run_2".to_owned(),
+                    item_type: "task".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(3),
+                    updated_at_unix_ms: Some(4),
+                    completed_at_unix_ms: Some(4),
+                    partial_text: "Task".to_owned(),
+                    final_text: Some("Task".to_owned()),
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::Task { item: run_2_anchor },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                task_child_tool("child_tool_run_2", "task_1", "run_2"),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let run_1_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_stale_run_1_anchor")]),
+        );
+        let run_1_visible = visible_item_ids(&projection, &run_1_rows);
+        assert!(run_1_visible.contains(&"child_tool_run_1"));
+        assert!(!run_1_visible.contains(&"child_tool_run_2"));
+
+        let run_2_rows = build_timeline_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_run_2_anchor")]),
+        );
+        let run_2_visible = visible_item_ids(&projection, &run_2_rows);
+        assert!(!run_2_visible.contains(&"child_tool_run_1"));
+        assert!(run_2_visible.contains(&"child_tool_run_2"));
+        assert_eq!(
+            run_2_rows
+                .iter()
+                .filter(|row| matches!(row.kind, TimelineRowKind::TurnWorkToggle(_)))
+                .count(),
+            2
         );
     }
 
@@ -838,6 +1195,7 @@ mod tests {
                     outcome: None,
                     observation: None,
                 },
+                timeline_origin: None,
                 opaque_meta: None,
             });
         }
@@ -910,6 +1268,7 @@ mod tests {
                         text: "Run subagent".to_owned(),
                         attachments: Vec::new(),
                     },
+                    timeline_origin: None,
                     opaque_meta: None,
                 },
                 ItemView {
@@ -947,6 +1306,7 @@ mod tests {
                             updated_at: 4,
                         },
                     },
+                    timeline_origin: None,
                     opaque_meta: None,
                 },
                 ItemView {
@@ -967,13 +1327,8 @@ mod tests {
                         markdown: None,
                         markdown_version: None,
                     },
-                    opaque_meta: Some(serde_json::json!({
-                        "timeline_group": "task",
-                        "task_id": "task_1",
-                        "run_id": "run_1",
-                        "child_thread_id": "child_thread_1",
-                        "child_turn_id": "child_turn_1",
-                    })),
+                    timeline_origin: Some(task_timeline_origin("task_1", "run_1")),
+                    opaque_meta: None,
                 },
                 ItemView {
                     id: "child_tool_1".to_owned(),
@@ -1001,13 +1356,8 @@ mod tests {
                         outcome: None,
                         observation: None,
                     },
-                    opaque_meta: Some(serde_json::json!({
-                        "timeline_group": "task",
-                        "task_id": "task_1",
-                        "run_id": "run_1",
-                        "child_thread_id": "child_thread_1",
-                        "child_turn_id": "child_turn_1",
-                    })),
+                    timeline_origin: Some(task_timeline_origin("task_1", "run_1")),
+                    opaque_meta: None,
                 },
                 ItemView {
                     id: "parent_agent_1".to_owned(),
@@ -1027,6 +1377,7 @@ mod tests {
                         markdown: None,
                         markdown_version: None,
                     },
+                    timeline_origin: None,
                     opaque_meta: None,
                 },
             ],

@@ -2322,11 +2322,12 @@ fn composed_child_answer_live_progress_matches_reloaded_projection() {
                     item.item_type.clone(),
                     item.status,
                     item.partial_text.clone(),
-                    item.opaque_meta
+                    item.timeline_origin
                         .as_ref()
-                        .and_then(|meta| meta.get("timeline_group"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
+                        .and_then(|origin| origin.task_id.clone()),
+                    item.timeline_origin
+                        .as_ref()
+                        .and_then(|origin| origin.run_id.clone()),
                 )
             })
             .collect::<Vec<_>>()
@@ -2338,16 +2339,15 @@ fn composed_child_answer_live_progress_matches_reloaded_projection() {
             && item.status == TimelineEntryStatus::Completed
             && item.partial_text == "Child final answer"
             && item
-                .opaque_meta
+                .timeline_origin
                 .as_ref()
-                .and_then(|meta| meta.get("timeline_group"))
-                .and_then(serde_json::Value::as_str)
-                == Some("task")
+                .and_then(|origin| origin.task_id.as_deref())
+                == Some("task_live_reload")
     }));
 }
 
 #[test]
-fn composed_child_retry_events_tag_synthetic_rows_with_task_meta() {
+fn composed_child_retry_events_tag_synthetic_rows_with_timeline_origin() {
     let mut conversation = Conversation::new(THREAD_ID);
 
     let timeline = TurnTimelineResponse {
@@ -2415,22 +2415,12 @@ fn composed_child_retry_events_tag_synthetic_rows_with_task_meta() {
         "re-applying the same composed child event must be idempotent"
     );
     let retry_event = retry_events[0];
-    let opaque_meta = retry_event
-        .opaque_meta
+    let timeline_origin = retry_event
+        .timeline_origin
         .as_ref()
-        .expect("synthetic child system event should carry task metadata");
-    assert_eq!(
-        opaque_meta
-            .get("timeline_group")
-            .and_then(serde_json::Value::as_str),
-        Some("task")
-    );
-    assert_eq!(
-        opaque_meta
-            .get("task_id")
-            .and_then(serde_json::Value::as_str),
-        Some("task_1")
-    );
+        .expect("synthetic child system event should carry typed timeline origin");
+    assert_eq!(timeline_origin.task_id.as_deref(), Some("task_1"));
+    assert_eq!(timeline_origin.run_id.as_deref(), Some("run_1"));
 }
 
 #[test]
@@ -2684,15 +2674,16 @@ fn composed_task_event_uses_origin_task_group_for_metadata() {
         .iter()
         .find(|item| item.id == "task_event_task_event_child_1")
         .expect("task event should be projected");
-    let meta = task_event_item
-        .opaque_meta
+    let timeline_origin = task_event_item
+        .timeline_origin
         .as_ref()
-        .expect("task event must carry task timeline metadata");
+        .expect("task event must carry typed timeline origin");
     assert_eq!(
-        meta.get("task_id").and_then(serde_json::Value::as_str),
+        timeline_origin.task_id.as_deref(),
         Some(parent_task_id),
         "grouping should use composed origin.task_id (anchor), not source event.task_id"
     );
+    assert_eq!(timeline_origin.run_id.as_deref(), Some("run_child_1"));
 
     let details = match &task_event_item.item {
         TurnItem::SystemEvent {

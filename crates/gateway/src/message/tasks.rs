@@ -54,6 +54,7 @@ impl MessageProcessor {
                 &task_response,
                 notification.thread_id.as_str(),
                 notification.turn_id.as_str(),
+                notification.run_id.as_deref(),
             )
             .await?;
         }
@@ -448,7 +449,7 @@ impl MessageProcessor {
         let Some(parent_turn_id) = response.task.created_by_turn_id.as_deref() else {
             return Ok(false);
         };
-        self.refresh_task_anchor_in_turn(response, parent_thread_id, parent_turn_id)
+        self.refresh_task_anchor_in_turn(response, parent_thread_id, parent_turn_id, None)
             .await
     }
 
@@ -457,8 +458,29 @@ impl MessageProcessor {
         response: &TaskGetResponse,
         thread_id: &str,
         turn_id: &str,
+        run_id: Option<&str>,
     ) -> Result<bool> {
-        let item = crate::task_tools::task_turn_item_from_response(self, response).await?;
+        let item = match run_id {
+            Some(run_id) if task_run_uses_creation_anchor(response, run_id) => {
+                crate::task_tools::task_turn_item_from_response_for_run(
+                    self,
+                    response,
+                    run_id,
+                    crate::task_tools::task_anchor_id(response.task.id.as_str()),
+                )
+                .await?
+            }
+            Some(run_id) => {
+                crate::task_tools::task_turn_item_from_response_for_run(
+                    self,
+                    response,
+                    run_id,
+                    crate::task_tools::task_run_anchor_id(run_id),
+                )
+                .await?
+            }
+            None => crate::task_tools::task_turn_item_from_response(self, response).await?,
+        };
         let Some(existing) = self
             .crud_store
             .get_turn_item(turn_id, item.id.as_str())
@@ -507,7 +529,7 @@ impl MessageProcessor {
         else {
             return;
         };
-        let item_id = parent_task_anchor_item_id(task_id);
+        let item_id = parent_task_anchor_item_id(response, run_id.as_deref());
         if !self
             .task_progress_target_has_anchor(parent_turn_id.as_str(), item_id.as_str())
             .await
@@ -550,8 +572,7 @@ impl MessageProcessor {
         response: &TaskGetResponse,
         payload: &TaskEventPayload,
     ) {
-        let task_id = payload.task_id();
-        let item_id = parent_task_anchor_item_id(task_id);
+        let item_id = parent_task_anchor_item_id(response, payload.run_id());
         for (parent_thread_id, parent_turn_id) in
             self.task_progress_flush_targets(response, payload).await
         {
@@ -758,8 +779,13 @@ fn task_run_uses_creation_anchor(response: &TaskGetResponse, run_id: &str) -> bo
         .unwrap_or(false)
 }
 
-fn parent_task_anchor_item_id(task_id: &str) -> String {
-    format!("task_item_{task_id}")
+fn parent_task_anchor_item_id(response: &TaskGetResponse, run_id: Option<&str>) -> String {
+    match run_id {
+        Some(run_id) if !task_run_uses_creation_anchor(response, run_id) => {
+            crate::task_tools::task_run_anchor_id(run_id)
+        }
+        _ => crate::task_tools::task_anchor_id(response.task.id.as_str()),
+    }
 }
 
 async fn task_event_child_lineage(

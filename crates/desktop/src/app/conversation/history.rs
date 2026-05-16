@@ -29,19 +29,13 @@ impl Conversation {
                         &event.payload,
                         item.origin.occurred_at,
                     );
-                    if let Some(task_id) = item.origin.task_id.as_deref() {
-                        let opaque_meta = task_timeline_meta(
-                            task_id,
-                            item.origin.run_id.as_deref(),
-                            item.origin.child_thread_id.as_deref(),
-                            item.origin.child_turn_id.as_deref(),
-                        );
+                    if item.origin.task_id.is_some() {
                         if let Some(item_id) = timeline_turn_item_payload_id(&event.payload) {
                             self.projector
-                                .set_item_opaque_meta(item_id, opaque_meta.clone());
+                                .set_item_timeline_origin(item_id, item.origin.clone());
                         }
                         self.projector
-                            .set_item_opaque_meta_from(item_count_before, opaque_meta);
+                            .set_item_timeline_origin_from(item_count_before, item.origin.clone());
                     }
                     changed = true;
                 }
@@ -869,17 +863,9 @@ impl Conversation {
             .apply_started(&mut self.projector, parent_turn_id, &item, ts_unix_ms);
         self.item_handlers
             .apply_completed(&mut self.projector, parent_turn_id, &item, ts_unix_ms);
-        self.projector.set_item_opaque_meta(
+        self.projector.set_item_timeline_origin(
             format!("task_event_{}", event.id).as_str(),
-            task_timeline_meta(
-                grouped_task_id,
-                origin.run_id.as_deref().or(event.run_id.as_deref()),
-                origin
-                    .child_thread_id
-                    .as_deref()
-                    .or(event.thread_id.as_deref()),
-                origin.child_turn_id.as_deref().or(event.turn_id.as_deref()),
-            ),
+            task_event_timeline_origin(origin, event),
         );
     }
 
@@ -909,19 +895,24 @@ fn timeline_turn_item_payload_id(payload: &TurnItemEventPayload) -> Option<&str>
     }
 }
 
-fn task_timeline_meta(
-    task_id: &str,
-    run_id: Option<&str>,
-    child_thread_id: Option<&str>,
-    child_turn_id: Option<&str>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "timeline_group": "task",
-        "task_id": task_id,
-        "run_id": run_id,
-        "child_thread_id": child_thread_id,
-        "child_turn_id": child_turn_id,
-    })
+fn task_event_timeline_origin(
+    origin: &pioneer_protocol::TimelineOrigin,
+    event: &TaskEvent,
+) -> pioneer_protocol::TimelineOrigin {
+    let mut timeline_origin = origin.clone();
+    if timeline_origin.task_id.is_none() {
+        timeline_origin.task_id = Some(event.task_id.clone());
+    }
+    if timeline_origin.run_id.is_none() {
+        timeline_origin.run_id = event.run_id.clone();
+    }
+    if timeline_origin.child_thread_id.is_none() {
+        timeline_origin.child_thread_id = event.thread_id.clone();
+    }
+    if timeline_origin.child_turn_id.is_none() {
+        timeline_origin.child_turn_id = event.turn_id.clone();
+    }
+    timeline_origin
 }
 
 fn task_event_message(event: &TaskEvent) -> String {

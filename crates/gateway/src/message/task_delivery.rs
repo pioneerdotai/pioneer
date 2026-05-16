@@ -55,7 +55,12 @@ impl MessageProcessor {
                 self.complete_delivery(delivery, attempt, None, None, None, None)
                     .await
             }
-            TaskDeliveryMode::OwnerThread | TaskDeliveryMode::Thread => {
+            TaskDeliveryMode::OwnerThread => {
+                let turn_id = self.deliver_to_owner_thread(&delivery).await?;
+                self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
+                    .await
+            }
+            TaskDeliveryMode::Thread => {
                 let turn_id = self.deliver_to_thread(&delivery).await?;
                 self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
                     .await
@@ -94,6 +99,49 @@ impl MessageProcessor {
         Ok(())
     }
 
+    async fn deliver_to_owner_thread(&self, delivery: &TaskDelivery) -> Result<String> {
+        let thread_id = delivery
+            .target_thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("owner thread delivery has no target_thread_id"))?;
+
+        if let Some(parent_turn_id) = self
+            .lineage_parent_turn_for_owner_delivery(delivery, thread_id)
+            .await?
+        {
+            self.ensure_delivery_thread_loaded(thread_id, delivery.workspace_id.as_str())
+                .await?;
+            self.persist_delivery_item(
+                delivery.workspace_id.as_str(),
+                thread_id,
+                parent_turn_id.as_str(),
+                delivery_summary_item(delivery),
+            )
+            .await?;
+            return Ok(parent_turn_id);
+        }
+
+        self.deliver_to_thread(delivery).await
+    }
+
+    async fn lineage_parent_turn_for_owner_delivery(
+        &self,
+        delivery: &TaskDelivery,
+        target_thread_id: &str,
+    ) -> Result<Option<String>> {
+        let lineages = self
+            .crud_store
+            .list_thread_lineage_for_run(delivery.run_id.as_str())
+            .await?;
+        Ok(lineages.into_iter().rev().find_map(|lineage| {
+            if lineage.parent_thread_id == target_thread_id {
+                lineage.parent_turn_id
+            } else {
+                None
+            }
+        }))
+    }
+
     async fn deliver_to_thread(&self, delivery: &TaskDelivery) -> Result<String> {
         let thread_id = delivery
             .target_thread_id
@@ -112,7 +160,7 @@ impl MessageProcessor {
                 model: None,
                 model_provider: None,
                 sandbox_policy: None,
-                mode: Some(pioneer_protocol::ThreadMode::Chat),
+                mode: None,
             })
             .await?;
         if let Err(error) = self
@@ -130,15 +178,13 @@ impl MessageProcessor {
                 .await;
             return Err(error).map_err(|error| anyhow!("{error:#}"));
         }
-
-        let task_item = self.task_turn_item_for_delivery(delivery).await?;
-        self.persist_delivery_item(
-            delivery.workspace_id.as_str(),
-            thread_id,
-            turn_id.as_str(),
-            TurnItem::Task { item: task_item },
+        self.send_notification_to_connections(
+            events::TURN_STARTED,
+            &turn_outcome.started_notification,
+            turn_outcome.started_notification_connection_ids.clone(),
         )
-        .await?;
+        .await;
+
         self.persist_delivery_item(
             delivery.workspace_id.as_str(),
             thread_id,
@@ -195,7 +241,13 @@ impl MessageProcessor {
         turn_id: &str,
         item: TurnItem,
     ) -> Result<()> {
-        let notification = pioneer_protocol::ItemCompletedNotification {
+        let started = pioneer_protocol::ItemStartedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item: item.clone(),
+        };
+        let completed = pioneer_protocol::ItemCompletedNotification {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -203,77 +255,17 @@ impl MessageProcessor {
         };
         let now = now_timestamp_secs();
         self.crud_store
-            .materialize_item_completed(notification.clone(), now)
+            .materialize_item_started(started.clone(), now)
             .await?;
-        self.send_notification_to_thread_subscribers(
-            thread_id,
-            events::ITEM_COMPLETED,
-            &notification,
-        )
-        .await;
-        Ok(())
-    }
+        self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
+            .await;
 
-    async fn task_turn_item_for_delivery(&self, delivery: &TaskDelivery) -> Result<TaskTurnItem> {
-        let response = self
-            .crud_store
-            .get_task(delivery.task_id.as_str())
-            .await?
-            .ok_or_else(|| anyhow!("delivery task `{}` not found", delivery.task_id))?;
-        let run = response
-            .runs
-            .iter()
-            .rev()
-            .find(|run| run.id == delivery.run_id);
-        let trigger = response.triggers.iter().rev().next();
-        let agent_spec = run
-            .and_then(|run| {
-                response
-                    .agent_specs
-                    .iter()
-                    .rev()
-                    .find(|spec| spec.run_id.as_deref() == Some(run.id.as_str()))
-            })
-            .or_else(|| response.agent_specs.iter().rev().next());
-        let lineage = self
-            .crud_store
-            .list_thread_lineage_for_run(delivery.run_id.as_str())
-            .await?
-            .into_iter()
-            .last();
-        Ok(TaskTurnItem {
-            id: format!("task_delivery_item_{}", delivery.id),
-            task_id: response.task.id.clone(),
-            run_id: Some(delivery.run_id.clone()),
-            parent_task_id: response.task.parent_task_id.clone(),
-            root_task_id: response.task.root_task_id.clone(),
-            title: response.task.title.clone(),
-            status: response.task.status,
-            trigger_kind: trigger
-                .map(TaskTrigger::kind)
-                .unwrap_or(pioneer_protocol::TaskTriggerKind::Manual),
-            executor_kind: response.task.executor_kind,
-            child_thread_id: lineage
-                .as_ref()
-                .map(|lineage| lineage.child_thread_id.clone()),
-            child_turn_id: lineage
-                .as_ref()
-                .map(|lineage| lineage.child_turn_id.clone()),
-            agent_role: agent_spec.and_then(|spec| spec.agent_role.clone()),
-            depth: agent_spec.map(|spec| spec.depth).unwrap_or(0),
-            max_depth: agent_spec.map(|spec| spec.max_depth).unwrap_or(3),
-            next_fire_at: trigger.and_then(|trigger| trigger.next_fire_at),
-            result_preview: delivery
-                .result_snapshot
-                .as_ref()
-                .and_then(|result| result.summary.clone()),
-            error_preview: delivery
-                .error_snapshot
-                .as_ref()
-                .map(|error| error.message.clone()),
-            created_at: response.task.created_at,
-            updated_at: response.task.updated_at,
-        })
+        self.crud_store
+            .materialize_item_completed(completed.clone(), now)
+            .await?;
+        self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
+            .await;
+        Ok(())
     }
 
     async fn deliver_webhook(
@@ -357,13 +349,38 @@ fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
     let text = delivery
         .result_snapshot
         .as_ref()
-        .and_then(|result| result.summary.clone())
+        .map(delivery_result_display_text)
+        .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "Task completed.".to_owned());
     TurnItem::AgentMessage {
         id: format!("task_delivery_result_{}", delivery.id),
         markdown: Some(super::markdown::parse_markdown_document(text.as_str())),
         markdown_version: Some(MARKDOWN_AST_VERSION),
         text,
+    }
+}
+
+fn delivery_result_display_text(result: &pioneer_protocol::TaskResult) -> String {
+    result
+        .data
+        .as_ref()
+        .and_then(task_value_raw_text)
+        .or(result.summary.as_deref())
+        .unwrap_or("Task completed.")
+        .to_owned()
+}
+
+fn task_value_raw_text(value: &pioneer_protocol::TaskValue) -> Option<&str> {
+    match value {
+        pioneer_protocol::TaskValue::String(text) => Some(text.as_str()),
+        pioneer_protocol::TaskValue::Object(values) => values.get("rawText").and_then(|value| {
+            if let pioneer_protocol::TaskValue::String(text) = value {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        }),
+        _ => None,
     }
 }
 

@@ -186,10 +186,7 @@ impl PioneerDesktop {
 }
 
 fn is_task_timeline_agent_message(item_view: &ItemView) -> bool {
-    item_view
-        .opaque_meta
-        .as_ref()
-        .and_then(|meta| meta.get("timeline_group"))
-        .and_then(|value| value.as_str())
-        == Some("task")
+    item_view.timeline_origin.as_ref().is_some_and(|origin| {
+        origin.task_id.is_some() || origin.run_id.is_some() || origin.child_turn_id.is_some()
+    })
 }

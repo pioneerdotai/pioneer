@@ -536,10 +536,15 @@ impl TaskToolHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: TaskListToolInput = decode_tool_args(invocation)?;
+        let owner_kind = input.owner_kind;
+        let owner_id = match (owner_kind, input.owner_id) {
+            (Some(TaskOwnerKind::Thread), None) => Some(self.context.thread_id.clone()),
+            (_, owner_id) => owner_id,
+        };
         let params = TaskListParams {
             workspace_id: self.context.workspace_id.clone(),
-            owner_kind: input.owner_kind,
-            owner_id: input.owner_id,
+            owner_kind,
+            owner_id,
             parent_task_id: validate_optional_entity_id(input.parent_task_id, "parentTaskId")?,
             root_task_id: validate_optional_entity_id(input.root_task_id, "rootTaskId")?,
             status: input.status,
@@ -2632,9 +2637,51 @@ pub(crate) async fn task_turn_item_from_response(
     processor: &MessageProcessor,
     response: &TaskGetResponse,
 ) -> anyhow::Result<TaskTurnItem> {
+    let run = select_task_anchor_run(response);
+    task_turn_item_from_response_with_run(
+        processor,
+        response,
+        run,
+        task_anchor_id(response.task.id.as_str()),
+    )
+    .await
+}
+
+pub(crate) async fn task_turn_item_from_response_for_run(
+    processor: &MessageProcessor,
+    response: &TaskGetResponse,
+    run_id: &str,
+    item_id: String,
+) -> anyhow::Result<TaskTurnItem> {
+    let run = response.runs.iter().find(|run| run.id == run_id);
+    task_turn_item_from_response_with_run(processor, response, run, item_id).await
+}
+
+pub(crate) fn task_anchor_id(task_id: &str) -> String {
+    format!("task_{task_id}")
+}
+
+pub(crate) fn task_run_anchor_id(run_id: &str) -> String {
+    format!("task_run_{run_id}")
+}
+
+async fn task_turn_item_from_response_with_run(
+    processor: &MessageProcessor,
+    response: &TaskGetResponse,
+    run: Option<&TaskRun>,
+    item_id: String,
+) -> anyhow::Result<TaskTurnItem> {
     let task = &response.task;
-    let run = response.runs.last();
-    let trigger = response.triggers.last();
+    let trigger = run
+        .and_then(|run| {
+            run.trigger_id.as_ref().and_then(|trigger_id| {
+                response
+                    .triggers
+                    .iter()
+                    .find(|trigger| trigger.id == *trigger_id)
+            })
+        })
+        .or_else(|| response.triggers.last());
     let agent_spec = select_anchor_agent_spec(response, run);
     let lineage = match run {
         Some(run) => processor
@@ -2646,7 +2693,7 @@ pub(crate) async fn task_turn_item_from_response(
         None => None,
     };
     Ok(TaskTurnItem {
-        id: format!("task_item_{}", task.id),
+        id: item_id,
         task_id: task.id.clone(),
         run_id: run.map(|run| run.id.clone()),
         parent_task_id: task.parent_task_id.clone(),
@@ -2680,6 +2727,34 @@ pub(crate) async fn task_turn_item_from_response(
         created_at: task.created_at,
         updated_at: task.updated_at,
     })
+}
+
+fn select_task_anchor_run(response: &TaskGetResponse) -> Option<&TaskRun> {
+    let run = response.runs.last()?;
+    task_run_uses_task_anchor(response, run).then_some(run)
+}
+
+fn task_run_uses_task_anchor(response: &TaskGetResponse, run: &TaskRun) -> bool {
+    let attached = response
+        .task
+        .lifecycle_policy
+        .as_ref()
+        .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+        .unwrap_or(false);
+    if !attached {
+        return false;
+    }
+
+    run.trigger_id
+        .as_ref()
+        .and_then(|trigger_id| {
+            response
+                .triggers
+                .iter()
+                .find(|trigger| trigger.id == *trigger_id)
+        })
+        .map(|trigger| trigger.kind() == TaskTriggerKind::Immediate)
+        .unwrap_or(false)
 }
 
 fn select_anchor_agent_spec<'a>(
@@ -2846,7 +2921,7 @@ mod tests {
 
     fn sample_task_turn_item() -> TaskTurnItem {
         TaskTurnItem {
-            id: "task_item_task_1234567890123456".to_owned(),
+            id: "task_task_1234567890123456".to_owned(),
             task_id: "task_1234567890123456".to_owned(),
             run_id: None,
             parent_task_id: None,
