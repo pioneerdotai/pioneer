@@ -3,7 +3,8 @@ use super::{
     AgentPostTurnHookDispatchPolicy, AgentStartError, MemoryExtractionPolicy, MemoryRecallItem,
     MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
     MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
-    ToolLoopConfig, TurnExecutionControl,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
+    TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -34,8 +35,9 @@ use pioneer_provider::{
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind,
-    ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolLoopBudgetConfig,
-    ToolPayload, ToolRetryBudgetConfig, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
+    ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolIdempotencyMode,
+    ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata, ToolRetryBudgetConfig,
+    ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -748,6 +750,118 @@ impl SequencedToolProvider {
     }
 }
 
+#[derive(Default)]
+struct AlwaysTaskCreateProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    next_index: AtomicUsize,
+}
+
+impl AlwaysTaskCreateProvider {
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("always task_create provider lock poisoned")
+            .clone()
+    }
+}
+
+#[derive(Default)]
+struct FailingTaskMutationToolProvider {
+    handler: Arc<FailingTaskCreateHandler>,
+}
+
+#[derive(Default)]
+struct FailingTaskCreateHandler {
+    calls: AtomicUsize,
+}
+
+impl FailingTaskCreateHandler {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for FailingTaskCreateHandler {
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ToolError::invalid_arguments(
+            "`trigger` must be a JSON object with shape {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskToolProvider for FailingTaskMutationToolProvider {
+    async fn materialize_task_tools(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        let spec = ToolSpec::new(
+            "task_create",
+            "Create a durable task.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "goal": { "type": "string" },
+                    "trigger": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            PayloadKind::Function,
+        )
+        .with_recovery(ToolRecoveryMetadata {
+            retry_class: ToolRetryClass::Arguments,
+            idempotency_mode: ToolIdempotencyMode::RequiresKey,
+            max_attempts: 1,
+            can_resume: false,
+        });
+        let configured = ConfiguredToolSpec::new(
+            spec,
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+        );
+        Ok(TaskToolMaterialization {
+            bundles: vec![ToolExtensionBundle {
+                specs: vec![configured],
+                handlers: vec![("task_create".to_owned(), self.handler.clone())],
+            }],
+            diagnostics: Vec::new(),
+        })
+    }
+
+    async fn pending_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn terminal_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn cleanup_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+        _reason: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LoopBudgetProviderMode {
     ToolWhileAvailableThenFinal,
@@ -1356,6 +1470,58 @@ impl Provider for LoopBudgetProvider {
 }
 
 #[async_trait::async_trait]
+impl Provider for AlwaysTaskCreateProvider {
+    fn name(&self) -> &str {
+        "always-task-create"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.requests
+            .lock()
+            .expect("always task_create provider lock poisoned")
+            .push(request);
+
+        let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        Ok(ChatResponse {
+            text: String::new(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: vec![ProviderToolCall {
+                id: format!("call_task_create_loop_{round_index}"),
+                name: "task_create".to_owned(),
+                arguments: serde_json::json!({
+                    "title": "Daily weather",
+                    "goal": "Create the scheduled task",
+                    "trigger": "every day at 07:00"
+                })
+                .to_string(),
+            }],
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for ProviderRecoveryBoundaryProvider {
     fn name(&self) -> &str {
         "provider-recovery-boundary"
@@ -1681,6 +1847,18 @@ fn assert_turn_failed(observed: &[AgentEvent], expected_error: &str) {
         panic!("expected terminal turn failure, observed {observed:?}");
     };
     assert_eq!(error, expected_error);
+}
+
+fn completed_agent_message_text(observed: &[AgentEvent]) -> Option<String> {
+    observed.iter().rev().find_map(|event| {
+        let AgentEvent::ItemCompleted(notification) = event else {
+            return None;
+        };
+        let TurnItem::AgentMessage { text, .. } = &notification.item else {
+            return None;
+        };
+        Some(text.clone())
+    })
 }
 
 async fn start_simple_turn(
@@ -5626,6 +5804,167 @@ async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
         tool_result_message_count(&requests[1]),
         1,
         "only the first tool-capable round should execute a tool"
+    );
+}
+
+#[tokio::test]
+async fn failed_task_create_cannot_finalize_as_success_claim() {
+    let task_tools = Arc::new(FailingTaskMutationToolProvider::default());
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_task_create_failed_then_claim_success".to_owned(),
+            name: "task_create".to_owned(),
+            arguments: serde_json::json!({
+                "title": "Daily weather",
+                "goal": "Create the scheduled task",
+                "trigger": "every day at 07:00"
+            })
+            .to_string(),
+        }],
+        "задача настроена",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(task_tools.clone()))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_task_mutation_guard",
+        "ws_task_mutation_guard",
+        "turn_task_mutation_guard",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "create a scheduled task",
+    )
+    .await;
+
+    assert_turn_completed(&observed);
+    let final_text =
+        completed_agent_message_text(&observed).expect("final assistant text should be emitted");
+    assert!(
+        final_text.contains("Task mutation failed"),
+        "final text should report the primary failed mutation, got: {final_text}"
+    );
+    assert!(
+        !final_text.contains("задача настроена"),
+        "failed mutation guard must not pass through a success claim: {final_text}"
+    );
+    assert_eq!(
+        task_tools.handler.calls(),
+        0,
+        "invalid task_create arguments must fail before mutation side effects"
+    );
+}
+
+#[tokio::test]
+async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_after_disabled() {
+    let task_tools = Arc::new(FailingTaskMutationToolProvider::default());
+    let provider = Arc::new(AlwaysTaskCreateProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "always-task-create",
+        provider.clone(),
+    ));
+    let mut config = test_tool_loop_config();
+    config.budget.max_agent_rounds_per_turn = 1;
+    config.budget.max_tool_calls_per_turn = 16;
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = AgentManager::new(registry, config);
+    manager
+        .set_task_tool_provider(Some(task_tools.clone()))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_task_mutation_provider_tools_disabled",
+        "ws_task_mutation_provider_tools_disabled",
+        "turn_task_mutation_provider_tools_disabled",
+        ThreadMode::Agent,
+        "always-task-create",
+        "create a scheduled task",
+    )
+    .await;
+
+    assert_turn_completed(&observed);
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnToolLoopBudgetExceeded(notification)
+            if notification.limit_kind
+                == ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
+                && notification.action == ToolLoopBudgetAction::FailTurn
+    )));
+    let final_text =
+        completed_agent_message_text(&observed).expect("final assistant text should be emitted");
+    assert!(final_text.contains("Task mutation failed"), "{final_text}");
+    assert!(final_text.contains("task_create"), "{final_text}");
+    assert!(
+        !final_text.contains("provider_returned_tools_after_tools_disabled"),
+        "root cause must stay the task mutation failure, got: {final_text}"
+    );
+    assert_eq!(
+        task_tools.handler.calls(),
+        0,
+        "invalid task_create arguments and final no-tools tool calls must not execute mutations"
+    );
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].tools.is_none());
+}
+
+#[tokio::test]
+async fn partial_task_tool_name_does_not_emit_visible_truncated_tool_row() {
+    let task_tools = Arc::new(FailingTaskMutationToolProvider::default());
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_partial_task_tool_name".to_owned(),
+            name: "tas".to_owned(),
+            arguments: serde_json::json!({}).to_string(),
+        }],
+        "final after partial tool name",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(task_tools.clone()))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_partial_task_tool_name",
+        "ws_partial_task_tool_name",
+        "turn_partial_task_tool_name",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "create a scheduled task",
+    )
+    .await;
+
+    assert_turn_completed(&observed);
+    assert_eq!(
+        task_tools.handler.calls(),
+        0,
+        "partial prefix must not dispatch as task_create"
+    );
+    assert!(
+        !observed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemStarted(ItemStartedNotification {
+                item: TurnItem::DynamicToolCall { tool_name, .. },
+                ..
+            }) | AgentEvent::ItemCompleted(ItemCompletedNotification {
+                item: TurnItem::DynamicToolCall { tool_name, .. },
+                ..
+            }) if tool_name == "tas"
+        )),
+        "partial tool name prefixes must not create visible `tas` rows: {observed:?}"
     );
 }
 

@@ -1,3 +1,4 @@
+mod argument_normalizer;
 mod classifier;
 mod context;
 mod error;
@@ -18,6 +19,9 @@ mod web;
 
 pub mod handlers;
 
+pub use argument_normalizer::{
+    ToolArgumentCoercion, ToolArgumentNormalization, normalize_tool_arguments_from_schema,
+};
 pub use classifier::{DefaultErrorClassifier, ErrorClassifier, classify_tool_error};
 pub use context::{
     AnyToolResult, CallToolResult, ExecCommandArgs, FunctionToolOutput, LocalShellPayload,

@@ -20,14 +20,16 @@ use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
     ToolRecoveryMetadata, ToolRetryClass, ToolSpec, dynamic_unknown_output_policy,
+    normalize_tool_arguments_from_schema,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
 
 const TASK_CREATE_TOOL: &str = "task_create";
 const TASK_WAIT_TOOL: &str = "task_wait";
@@ -77,7 +79,11 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         context: TaskTurnContext,
     ) -> Result<TaskToolMaterialization, String> {
         let processor = self.processor()?;
-        let handler = Arc::new(TaskToolHandler { processor, context });
+        let handler = Arc::new(TaskToolHandler {
+            processor,
+            context,
+            mutation_cache: Arc::new(TaskToolMutationCache::default()),
+        });
         let mut bundle = ToolExtensionBundle::default();
         for configured in task_tool_specs() {
             let name = configured.spec.name.clone();
@@ -223,6 +229,12 @@ impl TaskToolProvider for GatewayTaskToolProvider {
 struct TaskToolHandler {
     processor: Arc<MessageProcessor>,
     context: TaskTurnContext,
+    mutation_cache: Arc<TaskToolMutationCache>,
+}
+
+#[derive(Default)]
+struct TaskToolMutationCache {
+    outputs: Mutex<HashMap<String, JsonValue>>,
 }
 
 #[async_trait]
@@ -249,11 +261,34 @@ impl ToolHandler for TaskToolHandler {
 }
 
 impl TaskToolHandler {
+    fn mutation_cache_key(&self, invocation: &ToolInvocation) -> Option<String> {
+        invocation
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("{}:{value}", invocation.tool_name))
+    }
+
     async fn handle_create(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskCreateToolInput = decode_tool_args(invocation)?;
+        let input: TaskCreateToolInput = decode_tool_args(invocation.clone())?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let params = self.create_params(input).await?;
         let response = task_tool_future(
             self.processor
@@ -265,6 +300,9 @@ impl TaskToolHandler {
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
         let output = task_create_tool_output(&response, &anchor);
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
         Ok(function_output(output))
     }
 
@@ -411,8 +449,22 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskCancelToolInput = decode_tool_args(invocation)?;
+        let input: TaskCancelToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let response = self
             .processor
             .task_runtime
@@ -420,17 +472,33 @@ impl TaskToolHandler {
             .cancel_task(pioneer_tasks::TaskMutationContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(
-            json!({ "task": task_summary(&response.task) }),
-        ))
+        let output = json!({ "task": task_summary(&response.task) });
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn handle_update(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskUpdateToolInput = decode_tool_args(invocation)?;
+        let input: TaskUpdateToolInput = decode_tool_args(invocation.clone())?;
         let params = self.update_params(input).await?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let response = self
             .processor
             .task_runtime
@@ -438,7 +506,11 @@ impl TaskToolHandler {
             .update_task(pioneer_tasks::TaskMutationContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(task_update_tool_output(&response)))
+        let output = task_update_tool_output(&response);
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn handle_detach(
@@ -528,8 +600,22 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskRescheduleToolInput = decode_tool_args(invocation)?;
+        let input: TaskRescheduleToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let response = self
             .processor
             .task_runtime
@@ -537,18 +623,36 @@ impl TaskToolHandler {
             .reschedule_task(pioneer_tasks::TaskMutationContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(json!({
+        let output = json!({
             "task": task_summary(&response.task),
-            "trigger": response.trigger,
-        })))
+            "trigger": task_trigger_model_output(&response.trigger),
+        });
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn handle_pause(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskPauseToolInput = decode_tool_args(invocation)?;
+        let input: TaskPauseToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let response = self
             .processor
             .task_runtime
@@ -556,18 +660,36 @@ impl TaskToolHandler {
             .pause_task(pioneer_tasks::TaskMutationContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(json!({
+        let output = json!({
             "task": task_summary(&response.task),
             "triggers": response.triggers,
-        })))
+        });
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn handle_resume(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskResumeToolInput = decode_tool_args(invocation)?;
+        let input: TaskResumeToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
         let response = self
             .processor
             .task_runtime
@@ -575,10 +697,14 @@ impl TaskToolHandler {
             .resume_task(pioneer_tasks::TaskMutationContext::default(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(json!({
+        let output = json!({
             "task": task_summary(&response.task),
             "triggers": response.triggers,
-        })))
+        });
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn create_params(
@@ -651,6 +777,68 @@ impl TaskToolHandler {
             concurrency_policy: input.concurrency_policy,
             metadata: input.metadata,
         })
+    }
+
+    async fn prior_successful_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        let Some(current_key) = invocation
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(parent_events) = self
+            .processor
+            .crud_store
+            .get_turn_item_events(
+                self.context.thread_id.as_str(),
+                self.context.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+        else {
+            return Ok(None);
+        };
+
+        for event in parent_events.events.into_iter().rev() {
+            let TurnItemEventPayload::ItemCompleted { item, .. } = event.payload else {
+                continue;
+            };
+            let TurnItem::DynamicToolCall {
+                id,
+                tool_name,
+                arguments,
+                status,
+                storage,
+                success,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if id == invocation.call_id
+                || tool_name != invocation.tool_name
+                || status != ToolCallStatus::Completed
+                || success == Some(false)
+            {
+                continue;
+            }
+            if mutation_idempotency_key_for_item(tool_name.as_str(), id.as_str(), &arguments)
+                .as_deref()
+                != Some(current_key)
+            {
+                continue;
+            }
+            if let Some(output) = wait_result_from_storage(&storage) {
+                return Ok(Some(output));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn update_params(
@@ -824,7 +1012,7 @@ struct TaskCreateToolInput {
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For a daily scheduled task use {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
@@ -881,6 +1069,13 @@ struct TaskCreateToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional labels or structured metadata for later task lookup.
     metadata: Option<TaskMetadata>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -900,7 +1095,7 @@ impl TaskToolExecutorKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-/// Model-facing trigger union. Use it directly as trigger; do not wrap it in {"spec": ...} and do not put cronExpr/timezone at the top level.
+/// Model-facing trigger union. Use it directly as trigger; do not use the internal spec wrapper and do not put trigger-specific fields at the top level.
 enum TaskTriggerToolInput {
     /// Run immediately. This is the default when trigger is omitted.
     Immediate,
@@ -908,10 +1103,10 @@ enum TaskTriggerToolInput {
     ScheduledAt {
         #[serde(rename = "scheduledAt")]
         #[schemars(range(min = 1))]
-        /// Unix timestamp in seconds. Do not pass natural language dates here.
+        /// Unix timestamp in seconds. Do not pass natural language dates here. Example value: 1893456000.
         scheduled_at: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Optional IANA timezone label for display and scheduling context.
+        /// Optional IANA timezone label for display and scheduling context. Example value: Europe/Moscow.
         timezone: Option<String>,
         #[serde(
             default,
@@ -925,7 +1120,7 @@ enum TaskTriggerToolInput {
     Interval {
         #[serde(rename = "intervalSeconds")]
         #[schemars(range(min = 1))]
-        /// Positive repeat interval in seconds.
+        /// Positive repeat interval in seconds. Example value: 900.
         interval_seconds: i64,
         #[serde(
             default,
@@ -933,7 +1128,7 @@ enum TaskTriggerToolInput {
             skip_serializing_if = "Option::is_none"
         )]
         #[schemars(range(min = 1))]
-        /// Optional Unix timestamp in seconds used as the recurring schedule anchor.
+        /// Optional Unix timestamp in seconds used as the recurring schedule anchor. Example value: 1893456000.
         interval_anchor_at: Option<i64>,
         #[serde(
             default,
@@ -943,12 +1138,12 @@ enum TaskTriggerToolInput {
         /// Optional missed-fire policy. Defaults to run_once_for_latest_missed.
         catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
     },
-    /// Run on a five-field cron expression in a concrete IANA timezone, for example {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    /// Run on a five-field cron expression in a concrete IANA timezone.
     Cron {
         #[serde(rename = "cronExpr")]
-        /// Five-field cron expression: minute hour day-of-month month day-of-week.
+        /// Five-field cron expression: minute hour day-of-month month day-of-week. Example value: 0 7 * * *.
         cron_expr: String,
-        /// Required IANA timezone, for example "Europe/Moscow" or "UTC".
+        /// Required IANA timezone. Example value: Europe/Moscow.
         timezone: String,
         #[serde(
             default,
@@ -970,10 +1165,10 @@ enum TaskTriggerToolInput {
     },
     /// Trigger from an external event source.
     External {
-        /// External source name.
+        /// External source name. Example value: calendar.webhook.
         source: String,
         #[serde(default, rename = "eventType", skip_serializing_if = "Option::is_none")]
-        /// Optional external event type.
+        /// Optional external event type. Example value: event.created.
         event_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Optional structured event filter.
@@ -1104,6 +1299,13 @@ struct TaskCancelToolInput {
     #[serde(default)]
     /// Cancellation scope. Defaults to attached_subtree.
     scope: TaskCancelScope,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 impl TaskCancelToolInput {
@@ -1136,7 +1338,7 @@ struct TaskUpdateToolInput {
     /// Replacement scheduling priority.
     priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Replacement trigger. Use this object directly; do not wrap it in spec. For daily scheduled work use {"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}.
+    /// Replacement trigger. Use this object directly; do not wrap it in spec. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Replacement role label for an agent task.
@@ -1213,6 +1415,13 @@ struct TaskUpdateToolInput {
     #[serde(default)]
     /// Clear metadata.
     clear_metadata: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 impl TaskUpdateToolInput {
@@ -1308,6 +1517,13 @@ struct TaskRescheduleToolInput {
     task_id: String,
     /// New model-facing trigger. Use this object directly; do not wrap it in spec.
     trigger: TaskTriggerToolInput,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 impl TaskRescheduleToolInput {
@@ -1329,6 +1545,13 @@ struct TaskPauseToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional human-readable pause reason.
     reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 impl TaskPauseToolInput {
@@ -1350,6 +1573,13 @@ struct TaskResumeToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional human-readable resume reason.
     reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
 }
 
 impl TaskResumeToolInput {
@@ -1365,7 +1595,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For immediate subagents omit trigger. For scheduled work use trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For immediate subagents omit trigger. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -1393,7 +1623,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_UPDATE_TOOL,
-            "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, for example {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}.",
+            "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.",
             task_update_schema(),
             safe_mutation_recovery(),
         ),
@@ -1417,7 +1647,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESCHEDULE_TOOL,
-            "Reschedule a non-terminal task through the task service. Pass trigger directly, for example {\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"} or {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not wrap trigger in {\"spec\":...}.",
+            "Reschedule a non-terminal task through the task service. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as scheduledAt, cronExpr, and timezone. Do not wrap trigger in spec.",
             task_reschedule_schema(),
             safe_mutation_recovery(),
         ),
@@ -1535,6 +1765,15 @@ where
             )));
         }
     };
+    let schema = task_tool_schema_for_name(tool_name.as_str());
+    let arguments = normalize_tool_arguments_from_schema(arguments, &schema)
+        .map_err(|error| {
+            ToolError::invalid_arguments(format!(
+                "{error}. {}",
+                task_tool_argument_hint(tool_name.as_str())
+            ))
+        })?
+        .arguments;
     serde_json::from_value(arguments).map_err(|error| {
         ToolError::invalid_arguments(format!(
             "invalid arguments for `{tool_name}`: {error}. {}",
@@ -1543,24 +1782,41 @@ where
     })
 }
 
+fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
+    match tool_name {
+        TASK_CREATE_TOOL => task_create_schema(),
+        TASK_WAIT_TOOL => task_wait_schema(),
+        TASK_CANCEL_TOOL => task_cancel_schema(),
+        TASK_UPDATE_TOOL => task_update_schema(),
+        TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
+        TASK_LIST_TOOL => task_list_schema(),
+        TASK_RESCHEDULE_TOOL => task_reschedule_schema(),
+        TASK_PAUSE_TOOL => task_pause_schema(),
+        TASK_RESUME_TOOL => task_resume_schema(),
+        _ => json!({ "type": "object" }),
+    }
+}
+
 fn task_tool_argument_hint(tool_name: &str) -> &'static str {
     match tool_name {
         TASK_CREATE_TOOL => {
-            "Expected: {\"title\":\"...\",\"goal\":\"...\",\"instructions\":[\"self-contained future-run instruction\",\"choose currently available tools/skills/MCP by capability; fail clearly if unavailable\"],\"inputText\":\"task parameters/data\",\"outputInstructions\":\"final answer format and failure format\"}. For cron use \"trigger\":{\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}; do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
+            "Expected fields: title, goal, instructions, inputText or input, outputInstructions, and optional trigger. For cron set trigger.kind to cron, trigger.cronExpr to 0 7 * * *, and trigger.timezone to Europe/Moscow. Do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
         }
         TASK_RESCHEDULE_TOOL => {
-            "Expected: {\"taskId\":\"<21-char task id>\",\"trigger\":{\"kind\":\"scheduled_at\",\"scheduledAt\":1893456000,\"timezone\":\"UTC\"}} or kind \"cron\" with cronExpr/timezone; do not use trigger.spec."
+            "Expected fields: taskId and trigger. For scheduled_at set trigger.scheduledAt to a Unix timestamp such as 1893456000 and optional trigger.timezone to UTC. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec."
         }
         TASK_UPDATE_TOOL => {
-            "Expected: {\"taskId\":\"<21-char task id>\",\"instructions\":[\"self-contained future-run instruction\"],\"inputText\":\"updated task data\",\"outputInstructions\":\"final result format\"} or include trigger directly; do not use trigger.spec. Omitted fields stay unchanged; use clear* flags to remove optional values."
+            "Expected field: taskId plus at least one patch field such as instructions, inputText, input, outputInstructions, or trigger. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec. Omitted fields stay unchanged; use clear* flags to remove optional values."
         }
         TASK_WAIT_TOOL => {
-            "Expected: {\"taskIds\":[\"<21-char task id>\"],\"timeoutMs\":180000}. Use taskIds or runIds, not a single taskId."
+            "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
         }
         TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
-        | TASK_RESUME_TOOL => "Expected: {\"taskId\":\"<21-char task id>\"}.",
+        | TASK_RESUME_TOOL => {
+            "Expected field: taskId. The value must be a 21-character Pioneer entity id."
+        }
         TASK_LIST_TOOL => {
-            "Expected optional filters such as {\"status\":\"running\",\"limit\":20}."
+            "Expected optional filters such as status and limit. Example status value: running. Example limit value: 20."
         }
         _ => "Check the tool schema and use the documented camelCase fields.",
     }
@@ -1996,6 +2252,21 @@ fn wait_result_from_storage(storage: &ToolStoragePayload) -> Option<JsonValue> {
     }
 }
 
+fn mutation_idempotency_key_for_item(
+    tool_name: &str,
+    item_id: &str,
+    arguments: &JsonValue,
+) -> Option<String> {
+    arguments
+        .get("idempotencyKey")
+        .or_else(|| arguments.get("idempotency_key"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| Some(format!("{tool_name}:{item_id}")))
+}
+
 fn json_u32(value: &JsonValue, key: &str) -> u32 {
     value
         .get(key)
@@ -2025,13 +2296,108 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
         "status": task_status_label(response.task.status),
         "title": response.task.title,
         "attachment": attachment,
+        "trigger": task_trigger_model_output(&response.trigger),
         "triggerKind": trigger_kind_label(response.trigger.kind()),
         "nextFireAt": response.trigger.next_fire_at,
+        "validationHints": task_create_validation_hints(response, waitable),
         "depth": anchor.depth,
         "maxDepth": anchor.max_depth,
         "childThreadId": anchor.child_thread_id,
         "childTurnId": anchor.child_turn_id,
     })
+}
+
+fn task_trigger_model_output(trigger: &TaskTrigger) -> JsonValue {
+    strip_json_nulls(match &trigger.spec {
+        TaskTriggerSpec::Immediate => json!({
+            "kind": "immediate",
+        }),
+        TaskTriggerSpec::ScheduledAt {
+            scheduled_at,
+            timezone,
+            catch_up_policy,
+        } => json!({
+            "kind": "scheduled_at",
+            "scheduledAt": scheduled_at,
+            "timezone": timezone,
+            "catchUpPolicy": catch_up_policy,
+        }),
+        TaskTriggerSpec::Interval {
+            interval_seconds,
+            interval_anchor_at,
+            catch_up_policy,
+        } => json!({
+            "kind": "interval",
+            "intervalSeconds": interval_seconds,
+            "intervalAnchorAt": interval_anchor_at,
+            "catchUpPolicy": catch_up_policy,
+        }),
+        TaskTriggerSpec::Cron {
+            cron_expr,
+            timezone,
+            catch_up_policy,
+        } => json!({
+            "kind": "cron",
+            "cronExpr": cron_expr,
+            "timezone": timezone,
+            "catchUpPolicy": catch_up_policy,
+        }),
+        TaskTriggerSpec::Manual { allowed_actor } => json!({
+            "kind": "manual",
+            "allowedActor": allowed_actor,
+        }),
+        TaskTriggerSpec::External {
+            source,
+            event_type,
+            filter,
+        } => json!({
+            "kind": "external",
+            "source": source,
+            "eventType": event_type,
+            "filter": filter,
+        }),
+        TaskTriggerSpec::Dependency { policy } => json!({
+            "kind": "dependency",
+            "policy": policy,
+        }),
+    })
+}
+
+fn strip_json_nulls(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(object) => JsonValue::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let value = strip_json_nulls(value);
+                    (!value.is_null()).then_some((key, value))
+                })
+                .collect(),
+        ),
+        JsonValue::Array(items) => {
+            JsonValue::Array(items.into_iter().map(strip_json_nulls).collect())
+        }
+        other => other,
+    }
+}
+
+fn task_create_validation_hints(
+    response: &TaskCreateResponse,
+    waitable: bool,
+) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    if matches!(
+        response.trigger.kind(),
+        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+    ) {
+        hints.push("scheduled_task_has_no_active_run_until_due");
+        hints.push("do_not_call_task_wait_when_waitable_false");
+        hints.push("future_run_prompt_must_be_self_contained");
+    }
+    if waitable {
+        hints.push("active_attached_task_should_be_joined_before_final_answer");
+    }
+    hints
 }
 
 fn task_create_response_waitable(response: &TaskCreateResponse) -> bool {
@@ -2540,6 +2906,15 @@ mod tests {
             JsonValue::String("do_not_call_task_wait_confirm_schedule".to_owned())
         );
         assert_eq!(output["nextFireAt"], JsonValue::from(1_000));
+        assert_eq!(output["trigger"]["kind"], "cron");
+        assert_eq!(output["trigger"]["cronExpr"], "0 7 * * *");
+        assert!(
+            output["validationHints"]
+                .as_array()
+                .expect("validation hints should be an array")
+                .iter()
+                .any(|hint| hint == "do_not_call_task_wait_when_waitable_false")
+        );
     }
 
     #[test]
@@ -2583,7 +2958,8 @@ mod tests {
 
     #[test]
     fn task_create_schema_exposes_model_facing_trigger_shape() {
-        let schema_text = task_create_schema().to_string();
+        let schema = task_create_schema();
+        let schema_text = schema.to_string();
         assert!(
             schema_text.contains("cronExpr"),
             "task_create schema should expose the model-facing cronExpr field"
@@ -2595,6 +2971,16 @@ mod tests {
         assert!(
             schema_text.contains("executorKind") && schema_text.contains("agent"),
             "task_create schema should document the only model-facing executor kind"
+        );
+        assert!(
+            !schema_text.contains("\"trigger\":{\"type\":\"string\""),
+            "task_create trigger must not be described as a string: {schema_text}"
+        );
+        assert!(
+            schema
+                .pointer("/properties/trigger")
+                .is_some_and(|trigger| trigger.is_object()),
+            "task_create trigger should be an object-valued schema property"
         );
     }
 
@@ -2608,6 +2994,8 @@ mod tests {
             "Final result format and delivery contract",
             "do not wrap it in spec",
             "five-field cron expression",
+            "Example value: 0 7 * * *",
+            "Example value: Europe/Moscow",
             "Prefer inputText over input",
             "only. Omit this field unless explicitly setting",
         ] {
@@ -2649,6 +3037,50 @@ mod tests {
                 "task_update schema should include guidance `{expected}`, got: {update_schema}"
             );
         }
+    }
+
+    #[test]
+    fn task_tool_hints_do_not_embed_json_object_examples() {
+        for configured in task_tool_specs() {
+            assert_no_json_object_example(
+                configured.spec.description.as_str(),
+                &format!("{} tool description", configured.spec.name),
+            );
+            assert_schema_descriptions_have_no_json_object_examples(
+                &configured.spec.parameters,
+                &configured.spec.name,
+            );
+            assert_no_json_object_example(
+                task_tool_argument_hint(configured.spec.name.as_str()),
+                &format!("{} validation hint", configured.spec.name),
+            );
+        }
+    }
+
+    fn assert_schema_descriptions_have_no_json_object_examples(value: &JsonValue, label: &str) {
+        match value {
+            JsonValue::Object(object) => {
+                if let Some(description) = object.get("description").and_then(JsonValue::as_str) {
+                    assert_no_json_object_example(description, label);
+                }
+                for value in object.values() {
+                    assert_schema_descriptions_have_no_json_object_examples(value, label);
+                }
+            }
+            JsonValue::Array(values) => {
+                for value in values {
+                    assert_schema_descriptions_have_no_json_object_examples(value, label);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_no_json_object_example(value: &str, label: &str) {
+        assert!(
+            !value.contains('{') && !value.contains('}'),
+            "{label} should not include JSON object examples: {value}"
+        );
     }
 
     #[test]
@@ -2697,8 +3129,54 @@ mod tests {
         .expect_err("internal trigger spec wrapper should be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("do not use trigger.spec"),
+            message.contains("Do not use trigger.spec"),
             "decode error should include the model-facing trigger contract, got: {message}"
+        );
+    }
+
+    #[test]
+    fn task_create_decode_normalizes_stringified_trigger_object() {
+        let input = decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(
+            TASK_CREATE_TOOL,
+            json!({
+                "title": "Daily Moscow weather",
+                "goal": "Send the daily forecast at 07:00 Moscow time",
+                "trigger": "{\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}",
+                "instructions": ["Use a currently available weather capability."],
+                "outputInstructions": "Return the forecast or a clear failure."
+            }),
+        ))
+        .expect("stringified trigger object should normalize before decode");
+        let trigger = input
+            .trigger
+            .expect("trigger should decode")
+            .into_trigger_input()
+            .expect("trigger should map to protocol");
+        assert!(matches!(trigger.spec, TaskTriggerSpec::Cron { .. }));
+    }
+
+    #[test]
+    fn task_create_decode_rejects_plain_trigger_string_with_shape_hint() {
+        let error = decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(
+            TASK_CREATE_TOOL,
+            json!({
+                "title": "Daily Moscow weather",
+                "goal": "Send the daily forecast at 07:00 Moscow time",
+                "trigger": "every day at 07:00 Moscow",
+            }),
+        ))
+        .expect_err("plain trigger string should be rejected");
+        let message = error.to_string();
+        assert!(message.contains("$.trigger"), "{message}");
+        assert!(message.contains("must be a JSON object"), "{message}");
+        assert!(message.contains("trigger.kind to cron"), "{message}");
+        assert!(
+            message.contains("trigger.cronExpr to 0 7 * * *"),
+            "{message}"
+        );
+        assert!(
+            message.contains("trigger.timezone to Europe/Moscow"),
+            "{message}"
         );
     }
 
@@ -2720,7 +3198,7 @@ mod tests {
         .expect_err("internal trigger spec wrapper should be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("do not use trigger.spec"),
+            message.contains("Do not use trigger.spec"),
             "decode error should include the model-facing update trigger contract, got: {message}"
         );
     }
@@ -2770,6 +3248,21 @@ mod tests {
             }),
         )
         .expect_err("conflicting inputText and input.text should be rejected");
+    }
+
+    #[test]
+    fn task_wait_decode_error_points_to_task_ids_not_task_id() {
+        let error = decode_tool_args::<TaskWaitToolInput>(task_tool_invocation(
+            TASK_WAIT_TOOL,
+            json!({
+                "taskId": "123456789012345678901",
+                "timeoutMs": 1000
+            }),
+        ))
+        .expect_err("taskId should be rejected in favor of taskIds");
+        let message = error.to_string();
+        assert!(message.contains("Use taskIds or runIds"), "{message}");
+        assert!(message.contains("not a single taskId"), "{message}");
     }
 
     #[test]

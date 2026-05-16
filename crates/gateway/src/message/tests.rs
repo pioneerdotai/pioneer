@@ -3644,6 +3644,100 @@ fn task_create_tool_persists_anchor_and_composed_timeline() {
     );
 }
 
+#[test]
+fn task_create_tool_idempotency_key_deduplicates_parallel_mutations() {
+    run_gateway_message_test(
+        "task_create_tool_idempotency_key_deduplicates_parallel_mutations",
+        || async {
+            task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl().await;
+        },
+    );
+}
+
+async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let child_title = "Idempotent delegated task";
+    let task_arguments = json!({
+        "title": child_title,
+        "goal": "Return a short delegated result",
+        "instructions": ["Return a concise final answer."],
+        "idempotencyKey": "same-task-create-key"
+    })
+    .to_string();
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![
+            ProviderToolCall {
+                id: "call_task_create_idem_1".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: task_arguments.clone(),
+            },
+            ProviderToolCall {
+                id: "call_task_create_idem_2".to_owned(),
+                name: "task_create".to_owned(),
+                arguments: task_arguments,
+            },
+        ],
+        "parent observed child result",
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "parent",
+        provider.clone(),
+    ));
+    provider_registry.insert("echo", Arc::new(EchoProvider::new()));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.start_resilience_workers().await;
+
+    start_thread_and_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_task_tool_idempotency",
+        "turn_task_tool_idempotency",
+        "Agent",
+        "parent",
+    )
+    .await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let turn_items = crud_store
+        .get_turn_item_events("thr_task_tool_idempotency", "turn_task_tool_idempotency")
+        .await
+        .expect("turn items should load")
+        .expect("turn should exist");
+    let task_anchor_count = turn_items
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemCompleted {
+                    item: TurnItem::Task { item },
+                    ..
+                } if item.title == child_title
+            )
+        })
+        .count();
+    assert_eq!(
+        task_anchor_count, 1,
+        "same idempotency key in one provider round must create one durable task anchor"
+    );
+}
+
 async fn task_create_tool_persists_anchor_and_composed_timeline_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());

@@ -55,8 +55,8 @@ use pioneer_provider::{
 };
 use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
-    RawToolCall, ToolErrorClass, ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome,
-    ToolOutcomeStatus, ToolRecoveryView, ToolRetryController, ToolRetryDecision,
+    RawToolCall, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
+    ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolRetryController, ToolRetryDecision,
     ToolRetryObservation, build_builtin_tools, build_tools, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
@@ -108,6 +108,17 @@ struct ExecutedToolResult {
     message: ChatMessage,
 }
 
+#[derive(Debug, Clone)]
+struct TaskMutationFailure {
+    tool_name: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct TaskMutationFinalizationGuard {
+    failures_since_last_success: Vec<TaskMutationFailure>,
+}
+
 #[derive(Debug)]
 struct RenderedTaskObservation {
     task_ids: Vec<String>,
@@ -128,6 +139,34 @@ impl ExecutedToolResult {
         )
         .with_recovery_view(self.recovery_view.clone())
     }
+}
+
+impl TaskMutationFinalizationGuard {
+    fn observe(&mut self, result: &ExecutedToolResult) {
+        if !is_guarded_task_mutation_tool(result.tool_name.as_str()) {
+            return;
+        }
+        if result.success {
+            self.failures_since_last_success.clear();
+            return;
+        }
+        self.failures_since_last_success.push(TaskMutationFailure {
+            tool_name: result.tool_name.clone(),
+            error: result.model_visible_text.clone(),
+        });
+    }
+
+    fn deterministic_failure_message(&self) -> Option<String> {
+        let failure = self.failures_since_last_success.last()?;
+        Some(format!(
+            "Task mutation failed and no later task mutation succeeded. Do not report the task as created, updated, or rescheduled. Failed tool: {}. Primary error: {}",
+            failure.tool_name, failure.error
+        ))
+    }
+}
+
+fn is_guarded_task_mutation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "task_create" | "task_update" | "task_reschedule")
 }
 
 fn append_text_fragment(target: &mut String, fragment: &str) {
@@ -1783,6 +1822,7 @@ async fn execute_agent_provider_response(
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
     let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
+    let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
     let mut post_turn_assistant_text = String::new();
     let mut post_turn_tool_events = Vec::new();
     let mut post_turn_domain_events = Vec::new();
@@ -2067,6 +2107,78 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    if budget_exceeded.reason
+                        == ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled
+                        && let Some(final_text) =
+                            task_mutation_finalization_guard.deterministic_failure_message()
+                    {
+                        post_turn_assistant_text = final_text.clone();
+                        send_reasoning_completed(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            current_thinking_id.as_str(),
+                            round.reasoning.as_str(),
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        emit_durable_event(
+                            event_tx.as_ref(),
+                            AgentDurableEvent::ItemStarted {
+                                notification: ItemStartedNotification {
+                                    workspace_id: workspace_id.to_owned(),
+                                    thread_id: thread_id.to_owned(),
+                                    turn_id: turn_id.to_owned(),
+                                    item: TurnItem::AgentMessage {
+                                        id: message_item_id.to_owned(),
+                                        text: String::new(),
+                                        markdown: None,
+                                        markdown_version: None,
+                                    },
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        emit_progress_event(
+                            event_tx.as_ref(),
+                            AgentProgressEvent::ItemDelta {
+                                notification: ItemDeltaNotification {
+                                    workspace_id: workspace_id.to_owned(),
+                                    thread_id: thread_id.to_owned(),
+                                    turn_id: turn_id.to_owned(),
+                                    item_id: message_item_id.to_owned(),
+                                    delta: final_text.clone(),
+                                    stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                                    payload: None,
+                                    markdown: None,
+                                    markdown_version: None,
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        emit_durable_event(
+                            event_tx.as_ref(),
+                            AgentDurableEvent::ItemCompleted {
+                                notification: ItemCompletedNotification {
+                                    workspace_id: workspace_id.to_owned(),
+                                    thread_id: thread_id.to_owned(),
+                                    turn_id: turn_id.to_owned(),
+                                    item: TurnItem::AgentMessage {
+                                        id: message_item_id.to_owned(),
+                                        text: final_text,
+                                        markdown: None,
+                                        markdown_version: None,
+                                    },
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        return Ok(());
+                    }
                     return Err((
                         ChatTurnError::Terminal(message),
                         current_thinking_id.clone(),
@@ -2175,6 +2287,13 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
+                let final_text = task_mutation_finalization_guard
+                    .deterministic_failure_message()
+                    .unwrap_or_else(|| round.text.clone());
+                if final_text != round.text {
+                    post_turn_assistant_text = final_text.clone();
+                }
+
                 send_reasoning_completed(
                     workspace_id,
                     thread_id,
@@ -2205,7 +2324,7 @@ async fn execute_agent_provider_response(
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
 
-                if !round.text.is_empty() {
+                if !final_text.is_empty() {
                     emit_progress_event(
                         event_tx.as_ref(),
                         AgentProgressEvent::ItemDelta {
@@ -2214,7 +2333,7 @@ async fn execute_agent_provider_response(
                                 thread_id: thread_id.to_owned(),
                                 turn_id: turn_id.to_owned(),
                                 item_id: message_item_id.to_owned(),
-                                delta: round.text.clone(),
+                                delta: final_text.clone(),
                                 stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
                                 payload: None,
                                 markdown: None,
@@ -2235,7 +2354,7 @@ async fn execute_agent_provider_response(
                             turn_id: turn_id.to_owned(),
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
-                                text: round.text,
+                                text: final_text,
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -2432,6 +2551,9 @@ async fn execute_agent_provider_response(
                         }) {
                             Ok(tool_call) => tool_call,
                             Err(error) => {
+                                let suppress_partial_unknown_tool_ui =
+                                    matches!(&error, pioneer_tools::ToolError::NotFound(_))
+                                        && router.has_spec_name_with_prefix(tool_name.as_str());
                                 let error_text = error.to_string();
                                 {
                                     let mut pending = pending_tool_ui.lock().await;
@@ -2446,42 +2568,44 @@ async fn execute_agent_provider_response(
                                         error_text.clone(),
                                     ),
                                 );
-                                let _ = event_tx
-                                    .publish_durable(AgentDurableEvent::ItemStarted {
-                                        notification: ItemStartedNotification {
-                                            workspace_id: workspace_id.clone(),
-                                            thread_id: thread_id.clone(),
-                                            turn_id: turn_id.clone(),
-                                            item: tooling::build_started_tool_turn_item(
-                                                item_id.clone(),
-                                                tool_name.clone(),
-                                                arguments.clone(),
-                                                Some(recovery_policy.clone()),
-                                                output_policy.clone(),
-                                                None,
-                                            ),
-                                        },
-                                    })
-                                    .await;
-                                let _ = event_tx
-                                    .publish_durable(AgentDurableEvent::ItemCompleted {
-                                        notification: ItemCompletedNotification {
-                                            workspace_id,
-                                            thread_id,
-                                            turn_id,
-                                            item: tooling::build_failed_tool_turn_item(
-                                                item_id.clone(),
-                                                tool_name.clone(),
-                                                arguments.clone(),
-                                                error_text.clone(),
-                                                outcome.clone(),
-                                                Some(recovery_policy.clone()),
-                                                output_policy,
-                                                None,
-                                            ),
-                                        },
-                                    })
-                                    .await;
+                                if !suppress_partial_unknown_tool_ui {
+                                    let _ = event_tx
+                                        .publish_durable(AgentDurableEvent::ItemStarted {
+                                            notification: ItemStartedNotification {
+                                                workspace_id: workspace_id.clone(),
+                                                thread_id: thread_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                                item: tooling::build_started_tool_turn_item(
+                                                    item_id.clone(),
+                                                    tool_name.clone(),
+                                                    arguments.clone(),
+                                                    Some(recovery_policy.clone()),
+                                                    output_policy.clone(),
+                                                    None,
+                                                ),
+                                            },
+                                        })
+                                        .await;
+                                    let _ = event_tx
+                                        .publish_durable(AgentDurableEvent::ItemCompleted {
+                                            notification: ItemCompletedNotification {
+                                                workspace_id,
+                                                thread_id,
+                                                turn_id,
+                                                item: tooling::build_failed_tool_turn_item(
+                                                    item_id.clone(),
+                                                    tool_name.clone(),
+                                                    arguments.clone(),
+                                                    error_text.clone(),
+                                                    outcome.clone(),
+                                                    Some(recovery_policy.clone()),
+                                                    output_policy,
+                                                    None,
+                                                ),
+                                            },
+                                        })
+                                        .await;
+                                }
                                 return ExecutedToolResult {
                                     item_id: item_id.clone(),
                                     item_type,
@@ -2590,6 +2714,7 @@ async fn execute_agent_provider_response(
 
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
+                task_mutation_finalization_guard.observe(result);
             }
             post_turn_tool_events.extend(
                 executed_results
@@ -3075,21 +3200,57 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_recovered_tool_llm_context, build_user_message,
-        compile_agent_prompt_bundle_with_prompt_root, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
+        ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
+        build_user_message, compile_agent_prompt_bundle_with_prompt_root,
+        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
+        retain_chat_mode_attachment_messages,
     };
     use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
     use pioneer_promt::{
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
-    use pioneer_protocol::UserInput;
+    use pioneer_protocol::{TurnItemType, UserInput};
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
         Role,
     };
+    use pioneer_tools::{ToolErrorClass, ToolOutcome};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
+        ExecutedToolResult {
+            item_id: "item_1234567890123456".to_owned(),
+            item_type: TurnItemType::DynamicToolCall,
+            attempt_number: 1,
+            tool_name: tool_name.to_owned(),
+            arguments: "{}".to_owned(),
+            model_visible_text: text.to_owned(),
+            success,
+            outcome: if success {
+                ToolOutcome::ok()
+            } else {
+                ToolOutcome::fatal(ToolErrorClass::InvalidArguments, Some(text.to_owned()))
+            },
+            recovery_view: None,
+            message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
+        }
+    }
+
+    #[test]
+    fn task_mutation_finalization_guard_reports_failed_mutation_until_success() {
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&task_result("task_create", false, "trigger must be object"));
+
+        let message = guard
+            .deterministic_failure_message()
+            .expect("failed task mutation should block success finalization");
+        assert!(message.contains("task_create"));
+        assert!(message.contains("trigger must be object"));
+
+        guard.observe(&task_result("task_create", true, "{\"taskId\":\"abc\"}"));
+        assert!(guard.deterministic_failure_message().is_none());
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let now_nanos = SystemTime::now()

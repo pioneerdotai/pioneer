@@ -3,6 +3,7 @@ use crate::context::{
 };
 use crate::error::ToolError;
 use crate::events::{ToolEventBus, ToolEventTrace};
+use crate::normalize_tool_arguments_from_schema;
 use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{ToolOutputPolicySnapshot, ToolOutputProjectionKind};
 use crate::registry::ToolRegistry;
@@ -92,6 +93,16 @@ impl ToolRouter {
         self.specs.get(tool_name)
     }
 
+    pub fn has_spec_name_with_prefix(&self, prefix: &str) -> bool {
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            return false;
+        }
+        self.specs
+            .keys()
+            .any(|name| name.as_str() != prefix && name.starts_with(prefix))
+    }
+
     pub fn build_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
         let trace_id = self.event_bus.new_trace_id();
         let trace = self.event_bus.trace_with_id(
@@ -125,20 +136,30 @@ impl ToolRouter {
             }
         };
 
-        let payload = match Self::parse_payload(
+        let (payload, argument_coercions) = match Self::parse_payload(
             &configured,
             call.tool_name.as_str(),
             call.arguments.as_str(),
         ) {
-            Ok(payload) => {
+            Ok(parsed) => {
                 trace.emit_stage(1, "router.parse.completed", None, None);
-                payload
+                parsed
             }
             Err(error) => {
                 trace.emit_stage(1, "router.parse.failed", Some(error.to_string()), None);
                 return Err(error);
             }
         };
+        if !argument_coercions.is_empty() {
+            trace.emit_stage(
+                1,
+                "router.arguments.normalized",
+                None,
+                Some(serde_json::json!({
+                    "coercions": argument_coercions,
+                })),
+            );
+        }
 
         let call_id = call.call_id;
         let tool_name = call.tool_name;
@@ -193,24 +214,36 @@ impl ToolRouter {
         configured: &ConfiguredToolSpec,
         tool_name: &str,
         arguments: &str,
-    ) -> Result<ToolPayload, ToolError> {
+    ) -> Result<(ToolPayload, Vec<crate::ToolArgumentCoercion>), ToolError> {
         match configured.spec.payload_kind {
             PayloadKind::Function => {
                 let parsed = parse_json_arguments(arguments)?;
-                Ok(ToolPayload::Function { arguments: parsed })
+                let normalized =
+                    normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
+                Ok((
+                    ToolPayload::Function {
+                        arguments: normalized.arguments,
+                    },
+                    normalized.coercions,
+                ))
             }
             PayloadKind::Mcp => {
                 let parsed = parse_json_arguments(arguments)?;
+                let normalized =
+                    normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
                 match &configured.payload_binding {
                     ToolPayloadBinding::Mcp {
                         server_id,
                         raw_tool_name,
                         ..
-                    } => Ok(ToolPayload::Mcp {
-                        server: server_id.clone(),
-                        tool: raw_tool_name.clone(),
-                        arguments: parsed,
-                    }),
+                    } => Ok((
+                        ToolPayload::Mcp {
+                            server: server_id.clone(),
+                            tool: raw_tool_name.clone(),
+                            arguments: normalized.arguments,
+                        },
+                        normalized.coercions,
+                    )),
                     ToolPayloadBinding::Function => Err(ToolError::NotFound(format!(
                         "MCP tool `{tool_name}` has no materialized binding"
                     ))),
@@ -225,7 +258,10 @@ impl ToolRouter {
                                 "failed to parse write_stdin arguments: {error}"
                             ))
                         })?;
-                    Ok(ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)))
+                    Ok((
+                        ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)),
+                        Vec::new(),
+                    ))
                 } else {
                     let args =
                         serde_json::from_value::<ExecCommandArgs>(parsed).map_err(|error| {
@@ -233,9 +269,10 @@ impl ToolRouter {
                                 "failed to parse {tool_name} arguments: {error}"
                             ))
                         })?;
-                    Ok(ToolPayload::LocalShell(LocalShellPayload::ExecCommand(
-                        args,
-                    )))
+                    Ok((
+                        ToolPayload::LocalShell(LocalShellPayload::ExecCommand(args)),
+                        Vec::new(),
+                    ))
                 }
             }
             PayloadKind::ToolSearch => {
@@ -252,33 +289,48 @@ impl ToolRouter {
                     .and_then(JsonValue::as_u64)
                     .and_then(|value| usize::try_from(value).ok());
                 let include_hidden = parsed.get("include_hidden").and_then(JsonValue::as_bool);
-                Ok(ToolPayload::ToolSearch {
-                    query,
-                    limit,
-                    include_hidden,
-                })
+                Ok((
+                    ToolPayload::ToolSearch {
+                        query,
+                        limit,
+                        include_hidden,
+                    },
+                    Vec::new(),
+                ))
             }
             PayloadKind::Custom => {
                 let parsed = parse_json_arguments(arguments)
                     .unwrap_or_else(|_| JsonValue::String(arguments.to_owned()));
                 if let Some(input) = parsed.get("input").and_then(JsonValue::as_str) {
-                    return Ok(ToolPayload::Custom {
-                        input: input.to_owned(),
-                    });
+                    return Ok((
+                        ToolPayload::Custom {
+                            input: input.to_owned(),
+                        },
+                        Vec::new(),
+                    ));
                 }
                 if let Some(input) = parsed.get("patch").and_then(JsonValue::as_str) {
-                    return Ok(ToolPayload::Custom {
-                        input: input.to_owned(),
-                    });
+                    return Ok((
+                        ToolPayload::Custom {
+                            input: input.to_owned(),
+                        },
+                        Vec::new(),
+                    ));
                 }
                 if let Some(input) = parsed.as_str() {
-                    return Ok(ToolPayload::Custom {
-                        input: input.to_owned(),
-                    });
+                    return Ok((
+                        ToolPayload::Custom {
+                            input: input.to_owned(),
+                        },
+                        Vec::new(),
+                    ));
                 }
-                Ok(ToolPayload::Custom {
-                    input: arguments.to_owned(),
-                })
+                Ok((
+                    ToolPayload::Custom {
+                        input: arguments.to_owned(),
+                    },
+                    Vec::new(),
+                ))
             }
         }
     }
@@ -318,6 +370,7 @@ impl ToolRouter {
         let explicit = match payload {
             ToolPayload::Function { arguments } | ToolPayload::Mcp { arguments, .. } => arguments
                 .get("idempotency_key")
+                .or_else(|| arguments.get("idempotencyKey"))
                 .and_then(JsonValue::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned),
@@ -370,6 +423,14 @@ mod tests {
                 payload_kind,
             ),
             execution_class,
+            crate::dynamic_unknown_output_policy(),
+        )
+    }
+
+    fn configured_function_spec_with_schema(name: &str, schema: JsonValue) -> ConfiguredToolSpec {
+        ConfiguredToolSpec::new(
+            ToolSpec::new(name, "test tool", schema, PayloadKind::Function),
+            ExecutionClass::Shared,
             crate::dynamic_unknown_output_policy(),
         )
     }
@@ -443,6 +504,77 @@ mod tests {
             ToolPayload::Custom { input } => assert_eq!(input, patch),
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_tool_call_normalizes_stringified_object_arguments_from_schema() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "schedule",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "trigger": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        )]);
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_normalize".to_owned(),
+                tool_name: "schedule".to_owned(),
+                arguments: r#"{"trigger":"{\"kind\":\"cron\"}"}"#.to_owned(),
+            })
+            .expect("stringified object should normalize");
+
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                assert_eq!(arguments["trigger"]["kind"], "cron");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tool_call_rejects_string_for_object_schema_field() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "schedule",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "trigger": { "type": "object" }
+                }
+            }),
+        )]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_bad_trigger".to_owned(),
+                tool_name: "schedule".to_owned(),
+                arguments: r#"{"trigger":"every 15 minutes"}"#.to_owned(),
+            })
+            .expect_err("plain string should be rejected for object field");
+
+        assert!(error.to_string().contains("$.trigger"));
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn detects_partial_tool_name_prefixes_without_hardcoded_tool_names() {
+        let router = router_with_specs(vec![
+            configured_spec("task_create", PayloadKind::Function, ExecutionClass::Shared),
+            configured_spec("read_file", PayloadKind::Function, ExecutionClass::Shared),
+        ]);
+
+        assert!(router.has_spec_name_with_prefix("tas"));
+        assert!(router.has_spec_name_with_prefix("task_"));
+        assert!(!router.has_spec_name_with_prefix("task_create"));
+        assert!(!router.has_spec_name_with_prefix("unknown"));
+        assert!(!router.has_spec_name_with_prefix(""));
     }
 
     #[tokio::test]
