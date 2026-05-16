@@ -49,7 +49,7 @@ use crate::convention::{
     task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
     task_write_lock_status_from_db, thread_mode_from_db, thread_origin_kind_from_db,
     thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_type_from_db,
-    turn_status_from_db,
+    turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -3334,6 +3334,8 @@ impl CrudStore {
             Turn {
                 id: turn_model.id,
                 status,
+                turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
+                origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
                 error: turn_model.error,
                 prompt_manifest,
             },
@@ -7025,6 +7027,8 @@ fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Opt
     Some(Turn {
         id: model.id,
         status,
+        turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
+        origin: turn_origin_from_db(model.origin.as_str()).unwrap_or_default(),
         error: model.error,
         prompt_manifest: None,
     })
@@ -7173,8 +7177,8 @@ mod tests {
         ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
         ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
         ToolRetryResolution, ToolStoragePayload, Turn, TurnCompletedNotification, TurnItem,
-        TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnStatus,
-        TurnToolLoopBudgetExceededNotification, UserInput,
+        TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnOrigin,
+        TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter, Set,
@@ -7483,6 +7487,8 @@ mod tests {
         Turn {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         }
@@ -8036,6 +8042,8 @@ mod tests {
         let turn = Turn {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -8550,6 +8558,8 @@ mod tests {
                     turn: Turn {
                         id: turn_id.to_owned(),
                         status: TurnStatus::Completed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
                     },
@@ -9005,6 +9015,8 @@ mod tests {
             let turn = Turn {
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
             };
@@ -9022,6 +9034,8 @@ mod tests {
                     turn: Turn {
                         id: terminal_turn_id.to_owned(),
                         status: TurnStatus::Completed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
                     },
@@ -9195,6 +9209,8 @@ mod tests {
         let turn = Turn {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -9438,6 +9454,8 @@ mod tests {
         let turn = Turn {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -10015,6 +10033,8 @@ mod tests {
         let turn = Turn {
             id: "turn_000000000000000001".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -10045,6 +10065,73 @@ mod tests {
             .expect("must query persisted turn")
             .expect("persisted turn should exist");
         assert_eq!(persisted_turn.prompt_manifest_json, "{}");
+    }
+
+    #[tokio::test]
+    async fn task_run_occurrence_turn_kind_and_origin_roundtrip() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_000000000000000001".to_owned(),
+            id: "thr_000000000000000001".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: "run_0000000000000000001".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::TaskRun,
+            origin: TurnOrigin::ScheduledTask,
+            error: None,
+            prompt_manifest: None,
+        };
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("task run occurrence turn start should persist");
+
+        let (_, fetched_turn) = store
+            .get_turn(thread.id.as_str(), turn.id.as_str())
+            .await
+            .expect("must read turn")
+            .expect("turn should exist");
+        assert_eq!(fetched_turn.turn_kind, TurnKind::TaskRun);
+        assert_eq!(fetched_turn.origin, TurnOrigin::ScheduledTask);
+
+        let threads = store
+            .list_threads_for_workspace(thread.workspace_id.as_str(), 10)
+            .await
+            .expect("must list threads");
+        let listed_thread = threads
+            .iter()
+            .find(|candidate| candidate.id == thread.id)
+            .expect("thread should exist");
+        let snapshot_turn = listed_thread
+            .turns
+            .iter()
+            .find(|candidate| candidate.id == turn.id)
+            .expect("task run occurrence turn should appear in owner thread");
+        assert_eq!(snapshot_turn.turn_kind, TurnKind::TaskRun);
+        assert_eq!(snapshot_turn.origin, TurnOrigin::ScheduledTask);
     }
 
     #[tokio::test]
@@ -10082,6 +10169,8 @@ mod tests {
         let first_turn = Turn {
             id: "turn_000000000000000003".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -10099,6 +10188,8 @@ mod tests {
         let second_turn = Turn {
             id: "turn_000000000000000004".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -10153,6 +10244,8 @@ mod tests {
         let turn = Turn {
             id: "turn_000000000000000002".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };

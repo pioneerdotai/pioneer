@@ -181,11 +181,11 @@ pub use turn::{
     ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn, TurnCancelParams,
     TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
     TurnGetResponse, TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnItemsParams, TurnItemsResponse, TurnStartParams,
-    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
-    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
-    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment,
-    WebFetchLink, WebSearchResultItem,
+    TurnItemTimeoutReason, TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnOrigin,
+    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    TurnStatusChangedNotification, TurnTimelineChangedNotification, TurnTimelineChangedReason,
+    TurnTimelineParams, TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UserInput,
+    UserMessageAttachment, WebFetchLink, WebSearchResultItem,
 };
 pub use workspace::{
     Workspace, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,

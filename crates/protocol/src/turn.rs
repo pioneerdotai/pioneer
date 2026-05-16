@@ -694,10 +694,32 @@ pub struct TurnItemEvent {
 pub struct Turn {
     pub id: String,
     pub status: TurnStatus,
+    #[serde(default)]
+    pub turn_kind: TurnKind,
+    #[serde(default)]
+    pub origin: TurnOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_manifest: Option<PromptManifest>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnKind {
+    #[default]
+    Conversation,
+    TaskRun,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    #[default]
+    User,
+    ScheduledTask,
+    DetachedTask,
+    AttachedTask,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

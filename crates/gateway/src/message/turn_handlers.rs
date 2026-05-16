@@ -1,4 +1,7 @@
 use super::*;
+use pioneer_protocol::{
+    TaskAttachmentMode, TaskEvent, TaskEventPayload, TaskGetResponse, ThreadLineage, TurnKind,
+};
 
 impl MessageProcessor {
     pub(super) async fn turn_start(
@@ -768,6 +771,13 @@ impl MessageProcessor {
         &self,
         params: TurnTimelineParams,
     ) -> anyhow::Result<Option<TurnTimelineResponse>> {
+        let Some((_workspace_id, requested_turn)) = self
+            .crud_store
+            .get_turn(params.thread_id.as_str(), params.turn_id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
         let Some(mut parent) = self
             .crud_store
             .get_turn_item_events(params.thread_id.as_str(), params.turn_id.as_str())
@@ -814,6 +824,28 @@ impl MessageProcessor {
                     task_anchor_ids.insert(task.id);
                 }
             }
+            if requested_turn.turn_kind == TurnKind::TaskRun {
+                if let Some(run) = self
+                    .crud_store
+                    .get_task_run(params.turn_id.as_str())
+                    .await?
+                {
+                    task_anchor_ids.insert(run.task_id);
+                }
+                for lineage in self
+                    .crud_store
+                    .list_child_thread_lineage_for_parent(params.thread_id.as_str())
+                    .await?
+                {
+                    if lineage_targets_turn(
+                        &lineage,
+                        params.thread_id.as_str(),
+                        params.turn_id.as_str(),
+                    ) {
+                        task_anchor_ids.insert(lineage.task_id);
+                    }
+                }
+            }
 
             let mut task_group_by_task_id = std::collections::BTreeMap::<String, String>::new();
             for anchor_task_id in &task_anchor_ids {
@@ -850,11 +882,26 @@ impl MessageProcessor {
                     .get(task_id.as_str())
                     .cloned()
                     .unwrap_or_else(|| task_id.clone());
+                let task_response = self.crud_store.get_task(task_id.as_str()).await?;
+                let lineages = self
+                    .crud_store
+                    .list_thread_lineage_for_task(task_id.as_str())
+                    .await?;
                 let task_events = self
                     .crud_store
                     .get_task_events(task_id.as_str(), None)
                     .await?;
                 for event in task_events.events {
+                    if !task_event_targets_turn(
+                        &event,
+                        task_response.as_ref(),
+                        &requested_turn,
+                        params.thread_id.as_str(),
+                        params.turn_id.as_str(),
+                        lineages.as_slice(),
+                    ) {
+                        continue;
+                    }
                     if !params.include_collapsed_task_events
                         && is_collapsible_task_event(event.event_type.as_str())
                     {
@@ -880,11 +927,14 @@ impl MessageProcessor {
                 }
 
                 let max_child_items = params.max_child_items_per_task.unwrap_or(100) as usize;
-                for lineage in self
-                    .crud_store
-                    .list_thread_lineage_for_task(task_id.as_str())
-                    .await?
-                {
+                for lineage in lineages {
+                    if !lineage_targets_turn(
+                        &lineage,
+                        params.thread_id.as_str(),
+                        params.turn_id.as_str(),
+                    ) {
+                        continue;
+                    }
                     let Some(mut child_items) = self
                         .crud_store
                         .get_turn_item_events(
@@ -945,6 +995,113 @@ impl MessageProcessor {
             last_sequence,
         }))
     }
+
+    #[cfg(test)]
+    pub(super) async fn compose_turn_timeline_for_test(
+        &self,
+        params: TurnTimelineParams,
+    ) -> anyhow::Result<Option<TurnTimelineResponse>> {
+        self.compose_turn_timeline(params).await
+    }
+}
+
+fn task_event_targets_turn(
+    event: &TaskEvent,
+    response: Option<&TaskGetResponse>,
+    requested_turn: &pioneer_protocol::Turn,
+    thread_id: &str,
+    turn_id: &str,
+    lineages: &[ThreadLineage],
+) -> bool {
+    if let Some(run_id) = event.run_id.as_deref() {
+        if requested_turn.turn_kind == TurnKind::TaskRun && run_id == turn_id {
+            return true;
+        }
+        if lineages.iter().any(|lineage| {
+            lineage.task_run_id == run_id && lineage_targets_turn(lineage, thread_id, turn_id)
+        }) {
+            return true;
+        }
+        return response
+            .map(|response| task_run_uses_creation_turn(response, run_id, turn_id))
+            .unwrap_or(false);
+    }
+
+    if let TaskEventPayload::ChildThreadLinked { lineage } = &event.payload {
+        return lineage_targets_turn(lineage, thread_id, turn_id);
+    }
+
+    match requested_turn.turn_kind {
+        TurnKind::Conversation => response
+            .map(|response| {
+                response.task.created_by_turn_id.as_deref() == Some(turn_id)
+                    && task_definition_event_belongs_to_creation_turn(&event.payload)
+            })
+            .unwrap_or(false),
+        TurnKind::TaskRun => response
+            .map(|response| {
+                response.runs.iter().any(|run| run.id == turn_id)
+                    && task_terminal_event_without_run_id(&event.payload)
+            })
+            .unwrap_or(false),
+    }
+}
+
+fn lineage_targets_turn(lineage: &ThreadLineage, thread_id: &str, turn_id: &str) -> bool {
+    lineage.parent_thread_id == thread_id && lineage.parent_turn_id.as_deref() == Some(turn_id)
+}
+
+fn task_run_uses_creation_turn(response: &TaskGetResponse, run_id: &str, turn_id: &str) -> bool {
+    if response.task.created_by_turn_id.as_deref() != Some(turn_id) {
+        return false;
+    }
+    if !response
+        .task
+        .lifecycle_policy
+        .as_ref()
+        .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    response
+        .runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .and_then(|run| run.trigger_id.as_deref())
+        .and_then(|trigger_id| {
+            response
+                .triggers
+                .iter()
+                .find(|trigger| trigger.id == trigger_id)
+        })
+        .map(|trigger| trigger.kind() == pioneer_protocol::TaskTriggerKind::Immediate)
+        .unwrap_or(false)
+}
+
+fn task_definition_event_belongs_to_creation_turn(payload: &TaskEventPayload) -> bool {
+    matches!(
+        payload,
+        TaskEventPayload::TaskCreated { .. }
+            | TaskEventPayload::TriggerCreated { .. }
+            | TaskEventPayload::DependencyCreated { .. }
+            | TaskEventPayload::AgentSpecCreated { .. }
+            | TaskEventPayload::TaskScheduled { .. }
+            | TaskEventPayload::TaskUpdated { .. }
+            | TaskEventPayload::TaskPaused { .. }
+            | TaskEventPayload::TaskResumed { .. }
+            | TaskEventPayload::TaskDetached { .. }
+            | TaskEventPayload::TaskCancelled { .. }
+    )
+}
+
+fn task_terminal_event_without_run_id(payload: &TaskEventPayload) -> bool {
+    matches!(
+        payload,
+        TaskEventPayload::TaskCompleted { .. }
+            | TaskEventPayload::TaskFailed { .. }
+            | TaskEventPayload::TaskCancelled { .. }
+    )
 }
 
 fn collect_task_id_from_turn_event(

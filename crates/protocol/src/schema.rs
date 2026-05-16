@@ -131,12 +131,12 @@ use crate::{
     ToolStoragePayload, Turn, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
     TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
-    TurnStatusChangedNotification, TurnTimelineChangedNotification, TurnTimelineChangedReason,
-    TurnTimelineParams, TurnTimelineResponse, TurnToolLoopBudgetExceededNotification,
-    UnknownGatewayNotification, UserInput, Workspace, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse,
+    TurnItemsResponse, TurnKind, TurnOrigin, TurnStartParams, TurnStartResponse,
+    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
+    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification,
+    UserInput, Workspace, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
 };
 
 pub struct SchemaDocument {
@@ -795,6 +795,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("turn_timeline_params.json", TurnTimelineParams),
         schema_doc!("turn_timeline_response.json", TurnTimelineResponse),
+        schema_doc!("turn_kind.json", TurnKind),
+        schema_doc!("turn_origin.json", TurnOrigin),
         schema_doc!("turn_item.json", TurnItem),
         schema_doc!("turn_started_notification.json", TurnStartedNotification),
         schema_doc!(

@@ -773,8 +773,8 @@ impl ConversationProjector {
             item.partial_text.push_str(delta);
             if !preserve_terminal {
                 item.status = TimelineEntryStatus::Running;
+                item.updated_at_unix_ms = Some(ts_unix_ms);
             }
-            item.updated_at_unix_ms = Some(ts_unix_ms);
             if let Some(markdown) = markdown.clone() {
                 item.partial_markdown = Some(markdown);
             }

@@ -22,6 +22,8 @@ pub struct Model {
     pub prompt_fingerprint_full: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub turn_kind: String,
+    pub origin: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

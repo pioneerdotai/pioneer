@@ -2008,6 +2008,8 @@ mod tests {
         let turn = pioneer_protocol::Turn {
             id: turn_id.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -2470,6 +2472,8 @@ mod tests {
         let turn = pioneer_protocol::Turn {
             id: "turn_terminal_backfill".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -2535,6 +2539,8 @@ mod tests {
                     turn: pioneer_protocol::Turn {
                         id: turn.id.clone(),
                         status: TurnStatus::Completed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
                     },

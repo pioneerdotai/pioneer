@@ -290,6 +290,8 @@ fn ws_event_fencing_handles_all_event_kinds() {
                     turn: pioneer_protocol::Turn {
                         id: "turn_123".to_owned(),
                         status: pioneer_protocol::TurnStatus::InProgress,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: None,
 
                         prompt_manifest: None,
@@ -306,6 +308,8 @@ fn ws_event_fencing_handles_all_event_kinds() {
                     turn: pioneer_protocol::Turn {
                         id: "turn_123".to_owned(),
                         status: pioneer_protocol::TurnStatus::Completed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: None,
 
                         prompt_manifest: None,
@@ -322,6 +326,8 @@ fn ws_event_fencing_handles_all_event_kinds() {
                     turn: pioneer_protocol::Turn {
                         id: "turn_123".to_owned(),
                         status: pioneer_protocol::TurnStatus::Failed,
+                        turn_kind: Default::default(),
+                        origin: Default::default(),
                         error: Some("failed".to_owned()),
 
                         prompt_manifest: None,
@@ -737,6 +743,8 @@ fn reconnect_replay_restores_final_turn_result() {
     let completed_turn = Turn {
         id: "turn_local".to_owned(),
         status: TurnStatus::Completed,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -783,6 +791,8 @@ fn turn_items_replay_applies_tool_retry_lifecycle_like_live_events() {
     let turn = Turn {
         id: "turn_local".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };

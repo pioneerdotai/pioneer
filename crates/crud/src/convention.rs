@@ -659,6 +659,40 @@ pub fn turn_status_from_db(value: &str) -> Option<TurnStatus> {
     }
 }
 
+pub fn turn_kind_to_db(kind: pioneer_protocol::TurnKind) -> &'static str {
+    match kind {
+        pioneer_protocol::TurnKind::Conversation => "conversation",
+        pioneer_protocol::TurnKind::TaskRun => "task_run",
+    }
+}
+
+pub fn turn_kind_from_db(value: &str) -> Option<pioneer_protocol::TurnKind> {
+    match value {
+        "conversation" => Some(pioneer_protocol::TurnKind::Conversation),
+        "task_run" => Some(pioneer_protocol::TurnKind::TaskRun),
+        _ => None,
+    }
+}
+
+pub fn turn_origin_to_db(origin: pioneer_protocol::TurnOrigin) -> &'static str {
+    match origin {
+        pioneer_protocol::TurnOrigin::User => "user",
+        pioneer_protocol::TurnOrigin::ScheduledTask => "scheduled_task",
+        pioneer_protocol::TurnOrigin::DetachedTask => "detached_task",
+        pioneer_protocol::TurnOrigin::AttachedTask => "attached_task",
+    }
+}
+
+pub fn turn_origin_from_db(value: &str) -> Option<pioneer_protocol::TurnOrigin> {
+    match value {
+        "user" => Some(pioneer_protocol::TurnOrigin::User),
+        "scheduled_task" => Some(pioneer_protocol::TurnOrigin::ScheduledTask),
+        "detached_task" => Some(pioneer_protocol::TurnOrigin::DetachedTask),
+        "attached_task" => Some(pioneer_protocol::TurnOrigin::AttachedTask),
+        _ => None,
+    }
+}
+
 pub fn turn_item_id_and_type_to_db(item: &TurnItem) -> (&str, &'static str) {
     (item.item_id(), turn_item_type_to_db(item.item_type()))
 }

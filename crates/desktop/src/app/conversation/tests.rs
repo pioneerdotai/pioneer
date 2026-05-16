@@ -1,4 +1,5 @@
 use super::events::EventKind;
+use super::reducer::ConversationProjector;
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus,
@@ -99,6 +100,8 @@ fn send_stays_blocked_until_terminal_event() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -111,6 +114,8 @@ fn send_stays_blocked_until_terminal_event() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -220,6 +225,8 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Failed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: Some("network".to_owned()),
 
             prompt_manifest: None,
@@ -243,6 +250,8 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
         turn: Turn {
             id: "turn_000000000000000002".to_owned(),
             status: TurnStatus::Interrupted,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: Some("cancelled".to_owned()),
 
             prompt_manifest: None,
@@ -310,6 +319,8 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Interrupted,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: Some("stopped by user".to_owned()),
 
             prompt_manifest: None,
@@ -392,6 +403,31 @@ fn item_delta_streams_text_until_completion() {
 }
 
 #[test]
+fn item_delta_without_started_item_does_not_create_orphan_row() {
+    let mut conversation = Conversation::new(THREAD_ID);
+
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "call_partial_task_tool_name".to_owned(),
+        delta: "tas".to_owned(),
+        stream: Some(ItemDeltaStream::ToolProgress),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    });
+
+    assert!(
+        conversation.projection().items.is_empty(),
+        "progress for an unknown durable item must not create a visible orphan row"
+    );
+    assert!(
+        conversation.projection().timeline.is_empty(),
+        "unknown progress must not append a timeline entry"
+    );
+}
+
+#[test]
 fn late_item_delta_does_not_reopen_completed_item() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_late_delta_after_completion";
@@ -439,6 +475,59 @@ fn late_item_delta_does_not_reopen_completed_item() {
 }
 
 #[test]
+fn late_item_delta_does_not_move_terminal_item_clock() {
+    let mut projector = ConversationProjector::default();
+    let item_id = "item_terminal_clock";
+
+    projector.start_item_view(
+        item_id,
+        TURN_ID,
+        "agent_message",
+        TimelineEntryStatus::Running,
+        String::new(),
+        None,
+        TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: String::new(),
+            markdown: None,
+            markdown_version: None,
+        },
+        None,
+        1_000,
+    );
+    projector.complete_item_view(
+        item_id,
+        TimelineEntryStatus::Completed,
+        Some("done"),
+        None,
+        TurnItem::AgentMessage {
+            id: item_id.to_owned(),
+            text: "done".to_owned(),
+            markdown: None,
+            markdown_version: None,
+        },
+        None,
+        2_000,
+    );
+    projector.append_item_delta(item_id, " late", None, 9_000);
+
+    let item = projector
+        .view_state()
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("item should exist");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert_eq!(item.completed_at_unix_ms, Some(2_000));
+    assert_eq!(
+        item.updated_at_unix_ms,
+        Some(2_000),
+        "late progress must not move the terminal clock"
+    );
+    assert!(item.partial_text.contains("late"));
+}
+
+#[test]
 fn terminal_turn_stamps_running_items_completed_at() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_running_when_turn_completes";
@@ -457,6 +546,8 @@ fn terminal_turn_stamps_running_items_completed_at() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         },
@@ -764,6 +855,8 @@ fn history_hydration_preserves_tool_recovery_policy_snapshot() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
                 },
@@ -833,6 +926,8 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
                 },
@@ -1030,6 +1125,8 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
                 },
@@ -1093,6 +1190,8 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Failed,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: Some(format!(
                         "recovery failed for item `{item_id}`: recovery policy marks this failure as terminal"
                     )),
@@ -1133,6 +1232,8 @@ fn foreign_thread_events_do_not_modify_local_projection() {
         turn: Turn {
             id: "turn_foreign".to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1153,6 +1254,8 @@ fn replay_style_sequence_restores_final_state() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1211,6 +1314,8 @@ fn replay_style_sequence_restores_final_state() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1239,6 +1344,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1250,6 +1357,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1264,6 +1373,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
 
             prompt_manifest: None,
@@ -1323,6 +1434,8 @@ fn tool_retry_events_are_logged_without_recovery_projection() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         },
@@ -1418,6 +1531,8 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
         turn: Turn {
             id: TURN_ID.to_owned(),
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         },
@@ -1458,6 +1573,8 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
                 },
@@ -1542,6 +1659,8 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
 
                     prompt_manifest: None,
@@ -1670,6 +1789,8 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Completed,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
 
                     prompt_manifest: None,
@@ -1745,6 +1866,8 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
 
                     prompt_manifest: None,
@@ -1811,6 +1934,8 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Completed,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
 
                     prompt_manifest: None,
@@ -1968,6 +2093,7 @@ fn composed_turn_timeline_projects_task_events_and_child_tool_items() {
                         sequence: 1,
                         event_type: pioneer_protocol::constants::events::TASK_RUN_STARTED
                             .to_owned(),
+                        idempotency_key: None,
                         payload: TaskEventPayload::RunStarted {
                             task_id: "task_1".to_owned(),
                             run_id: "run_1".to_owned(),
@@ -2056,6 +2182,168 @@ fn composed_turn_timeline_projects_task_events_and_child_tool_items() {
             .iter()
             .any(|entry| entry.item_id == "child_cmd_1")
     );
+}
+
+#[test]
+fn composed_child_answer_live_progress_matches_reloaded_projection() {
+    let workspace_id = "ws_000000000000000001".to_owned();
+    let task_anchor_event = ThreadHistoryEvent {
+        turn_id: TURN_ID.to_owned(),
+        sequence: 1,
+        created_at: 1_000,
+        payload: ThreadHistoryEventPayload::ItemStarted {
+            workspace_id: workspace_id.clone(),
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+            item: TurnItem::Task {
+                item: TaskTurnItem {
+                    id: "task_anchor_live_reload".to_owned(),
+                    task_id: "task_live_reload".to_owned(),
+                    run_id: Some("run_live_reload".to_owned()),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: "Live reload task".to_owned(),
+                    status: TaskStatus::Running,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: Some("child_thread_live_reload".to_owned()),
+                    child_turn_id: Some("child_turn_live_reload".to_owned()),
+                    agent_role: None,
+                    depth: 1,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    result_preview: None,
+                    error_preview: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            },
+        },
+    };
+    let timeline = TurnTimelineResponse {
+        thread_id: THREAD_ID.to_owned(),
+        workspace_id: workspace_id.clone(),
+        turn_id: TURN_ID.to_owned(),
+        last_sequence: 3,
+        items: vec![
+            TimelineItem {
+                id: "child:child_agent_live_reload:2".to_owned(),
+                origin: TimelineOrigin {
+                    kind: TimelineOriginKind::ChildTurn,
+                    task_id: Some("task_live_reload".to_owned()),
+                    run_id: Some("run_live_reload".to_owned()),
+                    child_thread_id: Some("child_thread_live_reload".to_owned()),
+                    child_turn_id: Some("child_turn_live_reload".to_owned()),
+                    origin_event_id: None,
+                    origin_turn_item_id: Some("child_agent_live_reload".to_owned()),
+                    origin_sequence: 2,
+                    occurred_at: 2,
+                    lane: TimelineLane::ChildResult,
+                },
+                payload: TimelinePayload::TurnItemEvent {
+                    event: TurnItemEvent {
+                        sequence: 2,
+                        created_at: 2,
+                        payload: TurnItemEventPayload::ItemStarted {
+                            workspace_id: workspace_id.clone(),
+                            thread_id: "child_thread_live_reload".to_owned(),
+                            turn_id: "child_turn_live_reload".to_owned(),
+                            item: TurnItem::AgentMessage {
+                                id: "child_agent_live_reload".to_owned(),
+                                text: String::new(),
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                    },
+                },
+            },
+            TimelineItem {
+                id: "child:child_agent_live_reload:3".to_owned(),
+                origin: TimelineOrigin {
+                    kind: TimelineOriginKind::ChildTurn,
+                    task_id: Some("task_live_reload".to_owned()),
+                    run_id: Some("run_live_reload".to_owned()),
+                    child_thread_id: Some("child_thread_live_reload".to_owned()),
+                    child_turn_id: Some("child_turn_live_reload".to_owned()),
+                    origin_event_id: None,
+                    origin_turn_item_id: Some("child_agent_live_reload".to_owned()),
+                    origin_sequence: 3,
+                    occurred_at: 3,
+                    lane: TimelineLane::ChildResult,
+                },
+                payload: TimelinePayload::TurnItemEvent {
+                    event: TurnItemEvent {
+                        sequence: 3,
+                        created_at: 3,
+                        payload: TurnItemEventPayload::ItemCompleted {
+                            workspace_id: workspace_id.clone(),
+                            thread_id: "child_thread_live_reload".to_owned(),
+                            turn_id: "child_turn_live_reload".to_owned(),
+                            item: TurnItem::AgentMessage {
+                                id: "child_agent_live_reload".to_owned(),
+                                text: "Child final answer".to_owned(),
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+    };
+
+    let mut live = Conversation::new(THREAD_ID);
+    live.hydrate_history(std::slice::from_ref(&task_anchor_event));
+    live.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "child_agent_live_reload".to_owned(),
+        delta: "Child partial".to_owned(),
+        stream: Some(ItemDeltaStream::AgentMessage),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    });
+    live.apply_composed_turn_timeline(&timeline);
+
+    let mut reloaded = Conversation::new(THREAD_ID);
+    reloaded.hydrate_history(&[task_anchor_event]);
+    reloaded.apply_composed_turn_timeline(&timeline);
+
+    let projection_shape = |conversation: &Conversation| {
+        conversation
+            .projection()
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.id.clone(),
+                    item.item_type.clone(),
+                    item.status,
+                    item.partial_text.clone(),
+                    item.opaque_meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("timeline_group"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(projection_shape(&live), projection_shape(&reloaded));
+    assert!(live.projection().items.iter().any(|item| {
+        item.id == "child_agent_live_reload"
+            && item.status == TimelineEntryStatus::Completed
+            && item.partial_text == "Child final answer"
+            && item
+                .opaque_meta
+                .as_ref()
+                .and_then(|meta| meta.get("timeline_group"))
+                .and_then(serde_json::Value::as_str)
+                == Some("task")
+    }));
 }
 
 #[test]
@@ -2242,6 +2530,8 @@ fn composed_timeline_inserts_late_task_events_by_event_time() {
                 turn: Turn {
                     id: TURN_ID.to_owned(),
                     status: TurnStatus::Completed,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
                 },
@@ -2277,6 +2567,7 @@ fn composed_timeline_inserts_late_task_events_by_event_time() {
                     turn_id: None,
                     sequence: 1,
                     event_type: pioneer_protocol::constants::events::TASK_RUN_STARTED.to_owned(),
+                    idempotency_key: None,
                     payload: TaskEventPayload::RunStarted {
                         task_id: "task_early".to_owned(),
                         run_id: "run_early".to_owned(),
@@ -2375,6 +2666,7 @@ fn composed_task_event_uses_origin_task_group_for_metadata() {
                     turn_id: Some("child_turn_1".to_owned()),
                     sequence: 1,
                     event_type: pioneer_protocol::constants::events::TASK_RUN_STARTED.to_owned(),
+                    idempotency_key: None,
                     payload: TaskEventPayload::RunStarted {
                         task_id: child_task_id.to_owned(),
                         run_id: "run_child_1".to_owned(),

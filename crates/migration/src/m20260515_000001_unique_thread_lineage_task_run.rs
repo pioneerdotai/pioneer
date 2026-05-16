@@ -9,6 +9,13 @@ enum TaskEvent {
     IdempotencyKey,
 }
 
+#[derive(DeriveIden)]
+enum Turn {
+    Table,
+    TurnKind,
+    Origin,
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -28,11 +35,13 @@ impl MigrationTrait for Migration {
 
         create_task_run_execution_table(manager).await?;
         add_task_event_idempotency(manager).await?;
+        add_turn_kind_origin(manager).await?;
 
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_turn_kind_origin(manager).await?;
         drop_task_event_idempotency(manager).await?;
         drop_task_run_execution_table(manager).await?;
 
@@ -74,6 +83,68 @@ async fn deduplicate_existing_thread_lineage_runs(
     };
 
     manager.get_connection().execute_unprepared(sql).await?;
+
+    Ok(())
+}
+
+async fn add_turn_kind_origin(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if !manager.has_column("turn", "turn_kind").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Turn::Table)
+                    .add_column(
+                        string(Turn::TurnKind)
+                            .string_len(32)
+                            .not_null()
+                            .default("conversation"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    if !manager.has_column("turn", "origin").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Turn::Table)
+                    .add_column(
+                        string(Turn::Origin)
+                            .string_len(32)
+                            .not_null()
+                            .default("user"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn drop_turn_kind_origin(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager.has_column("turn", "origin").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Turn::Table)
+                    .drop_column(Turn::Origin)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    if manager.has_column("turn", "turn_kind").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Turn::Table)
+                    .drop_column(Turn::TurnKind)
+                    .to_owned(),
+            )
+            .await?;
+    }
 
     Ok(())
 }

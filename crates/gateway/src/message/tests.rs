@@ -51,22 +51,22 @@ use pioneer_protocol::{
     SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt,
     TaskAgentSpecInput, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
     TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskDeliveryStatus, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
-    TaskTriggerStatus, TaskValue, TaskWaitParams, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
-    ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineResponse, UserInput,
-    UserMessageAttachment, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, constants::events,
+    TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
+    TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
+    TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput,
+    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, Thread,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
+    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnSkillBinding, TurnStartResponse,
+    TurnStatus, TurnTimelineParams, TurnTimelineResponse, UserInput, UserMessageAttachment,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -1724,6 +1724,8 @@ async fn setup_progress_delta_harness(
     let turn = Turn {
         id: turn_id.clone(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -2090,6 +2092,8 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
     let seed_turn = Turn {
         id: "turn_seed_russian_0000001".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -2164,6 +2168,8 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
     let seed_turn = Turn {
         id: "turn_seed_singleflight_01".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -2244,6 +2250,8 @@ async fn title_generation_retries_after_transient_failure() {
     let seed_turn = Turn {
         id: "turn_seed_retry_000000001".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -2324,6 +2332,8 @@ async fn child_thread_scope_skips_auto_title_generation() {
     let seed_turn = Turn {
         id: "turn_seed_child_scope_00001".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -2502,6 +2512,8 @@ async fn materialize_artifact_api_thread(
     let turn = Turn {
         id: turn_id.to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -3181,6 +3193,11 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         .expect("immediate task should create run");
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
     assert!(!lineage.child_turn_id.is_empty());
+    assert_eq!(
+        lineage.parent_turn_id.as_deref(),
+        Some("turn_parent_task_test"),
+        "immediate attached subagent should stay under the live parent turn"
+    );
 
     let child_thread = crud_store
         .get_thread_model(lineage.child_thread_id.as_str())
@@ -3250,6 +3267,233 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     assert!(event_types.contains(&events::TASK_RUN_STARTED));
     assert!(event_types.contains(&events::TASK_RUN_COMPLETED));
     assert!(event_types.contains(&events::TASK_COMPLETED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let parent_thread_id = "thr_parent_scheduled_task";
+    let creation_turn_id = "turn_parent_scheduled_task";
+    let parent_thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: parent_thread_id.to_owned(),
+        name: Some("Scheduled parent".to_owned()),
+        preview: "schedule task".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "test-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        created_at,
+        updated_at: created_at,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let creation_turn = Turn {
+        id: creation_turn_id.to_owned(),
+        status: TurnStatus::Completed,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error: None,
+        prompt_manifest: None,
+    };
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..creation_turn.clone()
+            },
+            &[],
+        )
+        .await
+        .expect("creation turn start should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: creation_turn,
+            },
+            created_at,
+        )
+        .await
+        .expect("creation turn completion should persist");
+
+    let due_at = created_at.saturating_add(1);
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        creation_turn_id,
+        "Scheduled child result",
+        3,
+    );
+    params.trigger = TaskTriggerInput {
+        spec: TaskTriggerSpec::ScheduledAt {
+            scheduled_at: due_at,
+            timezone: Some("UTC".to_owned()),
+            catch_up_policy: None,
+        },
+    };
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    if let Some(agent_spec) = params.agent_spec.as_mut() {
+        agent_spec.prompt.instructions =
+            vec!["Execute this scheduled test task and return a short result.".to_owned()];
+        agent_spec.prompt.output_instructions =
+            Some("Return one sentence confirming scheduled execution.".to_owned());
+    }
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("scheduled task_create should succeed");
+
+    processor
+        .task_runtime
+        .process_due_once(due_at)
+        .await
+        .expect("scheduled run should dispatch");
+
+    wait_for_task_status(
+        crud_store.clone(),
+        response.task.id.as_str(),
+        pioneer_protocol::TaskStatus::Completed,
+    )
+    .await;
+    let task_response = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task query should succeed")
+        .expect("task should exist");
+    let run = task_response
+        .runs
+        .iter()
+        .find(|run| run.trigger_id.is_some())
+        .expect("scheduled run should exist");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    assert_eq!(lineage.parent_thread_id, parent_thread_id);
+    assert_eq!(lineage.parent_turn_id.as_deref(), Some(run.id.as_str()));
+    assert_ne!(lineage.parent_turn_id.as_deref(), Some(creation_turn_id));
+
+    let (_, occurrence_turn) = crud_store
+        .get_turn(parent_thread_id, run.id.as_str())
+        .await
+        .expect("occurrence turn lookup should succeed")
+        .expect("occurrence turn should exist");
+    assert_eq!(occurrence_turn.turn_kind, TurnKind::TaskRun);
+    assert_eq!(occurrence_turn.origin, TurnOrigin::ScheduledTask);
+    assert_eq!(occurrence_turn.status, TurnStatus::Completed);
+    let occurrence_items = crud_store
+        .get_turn_item_events(parent_thread_id, run.id.as_str())
+        .await
+        .expect("occurrence turn items should load")
+        .expect("occurrence turn item stream should exist");
+    assert!(
+        occurrence_items.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::Task { item },
+                ..
+            } if item.task_id == response.task.id && item.run_id.as_deref() == Some(run.id.as_str())
+        )),
+        "occurrence turn should persist a parent-visible task anchor for desktop reload"
+    );
+    let progress_target = processor
+        .task_progress_parent_target_for_test(
+            &task_response,
+            &TaskEventPayload::Progress {
+                task_id: response.task.id.clone(),
+                run_id: Some(run.id.clone()),
+                message: "working".to_owned(),
+                details: None,
+            },
+        )
+        .await
+        .expect("scheduled run progress should have a parent timeline target");
+    assert_eq!(
+        progress_target,
+        (parent_thread_id.to_owned(), run.id.clone()),
+        "live scheduled run progress must patch the occurrence turn, not the creation turn"
+    );
+
+    let (_, old_creation_turn) = crud_store
+        .get_turn(parent_thread_id, creation_turn_id)
+        .await
+        .expect("creation turn lookup should succeed")
+        .expect("creation turn should still exist");
+    assert_eq!(old_creation_turn.turn_kind, TurnKind::Conversation);
+    assert_eq!(old_creation_turn.status, TurnStatus::Completed);
+
+    let creation_timeline = processor
+        .compose_turn_timeline_for_test(TurnTimelineParams {
+            thread_id: parent_thread_id.to_owned(),
+            turn_id: creation_turn_id.to_owned(),
+            compose_tasks: true,
+            include_collapsed_task_events: true,
+            max_child_items_per_task: None,
+        })
+        .await
+        .expect("creation turn/timeline should compose")
+        .expect("creation turn/timeline should exist");
+    assert!(
+        creation_timeline.items.iter().all(|item| {
+            item.origin.kind != TimelineOriginKind::ChildTurn
+                && item.origin.run_id.as_deref() != Some(run.id.as_str())
+        }),
+        "creation turn timeline must not compose future scheduled run activity"
+    );
+
+    let occurrence_timeline = processor
+        .compose_turn_timeline_for_test(TurnTimelineParams {
+            thread_id: parent_thread_id.to_owned(),
+            turn_id: run.id.clone(),
+            compose_tasks: true,
+            include_collapsed_task_events: true,
+            max_child_items_per_task: None,
+        })
+        .await
+        .expect("occurrence turn/timeline should compose")
+        .expect("occurrence turn/timeline should exist");
+    assert!(
+        occurrence_timeline
+            .items
+            .iter()
+            .any(|item| item.origin.kind == TimelineOriginKind::TaskEvent
+                && item.origin.run_id.as_deref() == Some(run.id.as_str())),
+        "occurrence turn timeline should include the scheduled run lifecycle"
+    );
+    assert!(
+        occurrence_timeline
+            .items
+            .iter()
+            .any(|item| item.origin.kind == TimelineOriginKind::ChildTurn),
+        "occurrence turn timeline should include scheduled child turn activity"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4813,6 +5057,8 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
             &Turn {
                 id: turn_id.to_owned(),
                 status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
             },
@@ -8017,6 +8263,8 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
     let turn = Turn {
         id: "turn_000000000000000099".to_owned(),
         status: TurnStatus::InProgress,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     };
@@ -11062,6 +11310,8 @@ fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
     Turn {
         id: turn_id.to_owned(),
         status,
+        turn_kind: Default::default(),
+        origin: Default::default(),
         error: None,
         prompt_manifest: None,
     }
@@ -12681,6 +12931,8 @@ async fn memory_provider_recall_calls_memory_service() {
             &Turn {
                 id: recall_context.turn_id.clone(),
                 status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
             },

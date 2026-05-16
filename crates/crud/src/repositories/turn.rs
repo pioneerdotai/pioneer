@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_status_history};
-use pioneer_protocol::{TurnItem, TurnStatus, UserInput, generate_id};
+use pioneer_protocol::{Turn, TurnItem, TurnStatus, UserInput, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
@@ -8,7 +8,10 @@ use sea_orm::{
     QuerySelect, Set,
 };
 
-use crate::convention::{input_type_and_text, turn_item_id_and_type_to_db, turn_status_to_db};
+use crate::convention::{
+    input_type_and_text, turn_item_id_and_type_to_db, turn_kind_to_db, turn_origin_to_db,
+    turn_status_to_db,
+};
 
 const DB_ID_LEN: usize = 21;
 
@@ -50,8 +53,7 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     thread_id: &str,
-    status: TurnStatus,
-    error: Option<String>,
+    turn_model: &Turn,
     prompt_manifest: Option<&TurnPromptManifestColumns>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
@@ -59,8 +61,10 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     turn::Entity::insert(turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
-        status: Set(turn_status_to_db(status).to_owned()),
-        error: Set(error),
+        status: Set(turn_status_to_db(turn_model.status).to_owned()),
+        turn_kind: Set(turn_kind_to_db(turn_model.turn_kind).to_owned()),
+        origin: Set(turn_origin_to_db(turn_model.origin).to_owned()),
+        error: Set(turn_model.error.clone()),
         prompt_manifest_json: Set(prompt_manifest
             .map(|manifest| manifest.prompt_manifest_json.clone())
             .unwrap_or_else(|| "{}".to_owned())),
@@ -85,6 +89,8 @@ pub async fn upsert_turn<C: ConnectionTrait>(
             .update_columns([
                 turn::Column::ThreadId,
                 turn::Column::Status,
+                turn::Column::TurnKind,
+                turn::Column::Origin,
                 turn::Column::Error,
                 turn::Column::UpdatedAt,
             ])

@@ -489,6 +489,8 @@ impl ThreadManager {
         let turn = pioneer_protocol::Turn {
             id: turn_id,
             status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
             error: None,
             prompt_manifest: None,
         };
@@ -989,6 +991,8 @@ mod tests {
             turns: vec![pioneer_protocol::Turn {
                 id: "turn_000000000000000099".to_owned(),
                 status: TurnStatus::Completed,
+                turn_kind: Default::default(),
+                origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
             }],

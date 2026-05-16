@@ -6,12 +6,15 @@ use pioneer_artifacts::{
 };
 use pioneer_promt::{TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    ArtifactCreatedByKind, ArtifactKind, ArtifactSummary, SandboxMode, Task, TaskAgentContext,
-    TaskAgentContextMode, TaskAgentInput, TaskAgentInputAttachmentKind,
-    TaskAgentInputReferenceKind, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
-    TaskArtifact, TaskError, TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskResult,
-    TaskRun, TaskRunExecution, TaskRunStatus, TaskTrigger, TaskValue, ThreadLineage, ThreadMode,
-    ThreadOriginKind, ThreadSidebarVisibility, TurnStartParams, TurnStatus, UserInput,
+    ArtifactCreatedByKind, ArtifactKind, ArtifactSummary, ItemCompletedNotification,
+    ItemStartedNotification, SandboxMode, Task, TaskAgentContext, TaskAgentContextMode,
+    TaskAgentInput, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskArtifact,
+    TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskResult,
+    TaskRun, TaskRunExecution, TaskRunStatus, TaskTrigger, TaskTriggerKind, TaskValue,
+    ThreadLineage, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn,
+    TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin, TurnStartParams,
+    TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
     TASK_EXECUTION_LEASE_SECONDS, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
@@ -103,6 +106,8 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Started => {}
             outcome => return Ok(outcome),
         }
+        let parent =
+            ensure_task_run_occurrence_context(&processor, &task_response, &run, parent).await?;
         if let Some(lineage) = self
             .rebuild_missing_lineage_from_execution(
                 &processor,
@@ -728,9 +733,16 @@ impl TaskAgentExecutor {
                 handle
                     .complete_run(Some(result), now_timestamp_secs())
                     .await?;
+                mark_task_run_occurrence_turn_completed(processor, lineage).await?;
             }
             Err(error) => {
                 handle.fail_run(Some(error), now_timestamp_secs()).await?;
+                mark_task_run_occurrence_turn_failed(
+                    processor,
+                    lineage,
+                    "child task result extraction failed",
+                )
+                .await?;
             }
         }
         Ok(())
@@ -742,6 +754,7 @@ impl TaskAgentExecutor {
         error_message: &str,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        let processor = self.processor()?;
         handle
             .fail_run(
                 Some(task_error(
@@ -753,6 +766,7 @@ impl TaskAgentExecutor {
                 now_timestamp_secs(),
             )
             .await?;
+        mark_task_run_occurrence_turn_failed(&processor, lineage, error_message).await?;
         Ok(())
     }
 }
@@ -793,6 +807,7 @@ impl TaskExecutor for TaskAgentExecutor {
                     reason,
                 )
                 .await;
+            mark_task_run_occurrence_turn_failed(&processor, &lineage, reason).await?;
         }
         if let Some(execution) = processor.crud_store.load_execution_for_run(run_id).await?
             && !execution.status.is_terminal()
@@ -879,6 +894,286 @@ async fn resolve_parent_context(
         parent_turn_id: task.created_by_turn_id.clone(),
         root_thread_id,
     })
+}
+
+async fn ensure_task_run_occurrence_context(
+    processor: &Arc<MessageProcessor>,
+    task_response: &TaskGetResponse,
+    run: &TaskRun,
+    mut parent: TaskParentRuntimeContext,
+) -> Result<TaskParentRuntimeContext> {
+    let Some(origin) = task_run_occurrence_origin(task_response, run) else {
+        return Ok(parent);
+    };
+    ensure_task_run_occurrence_turn(
+        processor,
+        &task_response.task,
+        parent.parent_thread_id.as_str(),
+        run,
+        origin,
+    )
+    .await?;
+    ensure_task_run_occurrence_anchor(
+        processor,
+        task_response,
+        parent.parent_thread_id.as_str(),
+        run.id.as_str(),
+    )
+    .await?;
+    parent.parent_turn_id = Some(run.id.clone());
+    Ok(parent)
+}
+
+fn task_run_occurrence_origin(
+    task_response: &TaskGetResponse,
+    run: &TaskRun,
+) -> Option<TurnOrigin> {
+    let trigger_kind = run
+        .trigger_id
+        .as_deref()
+        .and_then(|trigger_id| find_task_run_trigger(task_response, trigger_id))
+        .map(TaskTrigger::kind);
+    let attachment = task_response
+        .task
+        .lifecycle_policy
+        .as_ref()
+        .map(|policy| policy.attachment)
+        .unwrap_or(TaskAttachmentMode::Detached);
+    let immediate_attached_to_live_parent = trigger_kind == Some(TaskTriggerKind::Immediate)
+        && attachment == TaskAttachmentMode::Attached
+        && task_response.task.created_by_turn_id.is_some();
+    if immediate_attached_to_live_parent {
+        return None;
+    }
+    if matches!(
+        trigger_kind,
+        Some(TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron)
+    ) {
+        return Some(TurnOrigin::ScheduledTask);
+    }
+    if attachment == TaskAttachmentMode::Detached {
+        return Some(TurnOrigin::DetachedTask);
+    }
+    Some(TurnOrigin::AttachedTask)
+}
+
+async fn ensure_task_run_occurrence_turn(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    parent_thread_id: &str,
+    run: &TaskRun,
+    origin: TurnOrigin,
+) -> Result<()> {
+    if processor
+        .crud_store
+        .get_turn(parent_thread_id, run.id.as_str())
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(mut parent_thread) = processor
+        .crud_store
+        .get_thread_model(parent_thread_id)
+        .await?
+    else {
+        bail!(
+            "cannot create task run occurrence turn for task `{}` without parent thread `{}`",
+            task.id,
+            parent_thread_id
+        );
+    };
+    let now = now_timestamp_secs();
+    parent_thread.updated_at = now;
+    parent_thread.status = ThreadStatus::Active;
+    parent_thread.turns.clear();
+    let occurrence_turn = Turn {
+        id: run.id.clone(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::TaskRun,
+        origin,
+        error: None,
+        prompt_manifest: None,
+    };
+    let sandbox_mode = processor
+        .crud_store
+        .get_thread_sandbox_mode(parent_thread_id)
+        .await?
+        .unwrap_or(SandboxMode::FullAccess);
+    processor
+        .crud_store
+        .materialize_turn_start(&parent_thread, sandbox_mode, &occurrence_turn, &[])
+        .await
+        .with_context(|| {
+            format!(
+                "failed to persist task run occurrence turn `{}` for task `{}`",
+                run.id, task.id
+            )
+        })?;
+    processor
+        .send_notification_to_thread_subscribers(
+            parent_thread_id,
+            events::TURN_STARTED,
+            &TurnStartedNotification {
+                workspace_id: task.workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: occurrence_turn,
+            },
+        )
+        .await;
+    Ok(())
+}
+
+async fn ensure_task_run_occurrence_anchor(
+    processor: &Arc<MessageProcessor>,
+    task_response: &TaskGetResponse,
+    parent_thread_id: &str,
+    occurrence_turn_id: &str,
+) -> Result<()> {
+    let item = crate::task_tools::task_turn_item_from_response(processor, task_response).await?;
+    if processor
+        .crud_store
+        .get_turn_item(occurrence_turn_id, item.id.as_str())
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let now = now_timestamp_secs();
+    let item = pioneer_protocol::TurnItem::Task { item };
+    let started = ItemStartedNotification {
+        workspace_id: task_response.task.workspace_id.clone(),
+        thread_id: parent_thread_id.to_owned(),
+        turn_id: occurrence_turn_id.to_owned(),
+        item: item.clone(),
+    };
+    processor
+        .crud_store
+        .materialize_item_started(started.clone(), now)
+        .await
+        .with_context(|| {
+            format!("failed to persist task run occurrence anchor for turn `{occurrence_turn_id}`")
+        })?;
+    processor
+        .send_notification_to_thread_subscribers(parent_thread_id, events::ITEM_STARTED, &started)
+        .await;
+
+    let completed = ItemCompletedNotification {
+        workspace_id: task_response.task.workspace_id.clone(),
+        thread_id: parent_thread_id.to_owned(),
+        turn_id: occurrence_turn_id.to_owned(),
+        item,
+    };
+    processor
+        .crud_store
+        .materialize_item_completed(completed.clone(), now)
+        .await
+        .with_context(|| {
+            format!("failed to complete task run occurrence anchor for turn `{occurrence_turn_id}`")
+        })?;
+    processor
+        .send_notification_to_thread_subscribers(
+            parent_thread_id,
+            events::ITEM_COMPLETED,
+            &completed,
+        )
+        .await;
+    Ok(())
+}
+
+async fn mark_task_run_occurrence_turn_completed(
+    processor: &Arc<MessageProcessor>,
+    lineage: &ThreadLineage,
+) -> Result<()> {
+    mark_task_run_occurrence_turn_terminal(
+        processor,
+        lineage,
+        TurnStatus::Completed,
+        None,
+        now_timestamp_secs(),
+    )
+    .await
+}
+
+async fn mark_task_run_occurrence_turn_failed(
+    processor: &Arc<MessageProcessor>,
+    lineage: &ThreadLineage,
+    error_message: &str,
+) -> Result<()> {
+    mark_task_run_occurrence_turn_terminal(
+        processor,
+        lineage,
+        TurnStatus::Failed,
+        Some(error_message.to_owned()),
+        now_timestamp_secs(),
+    )
+    .await
+}
+
+async fn mark_task_run_occurrence_turn_terminal(
+    processor: &Arc<MessageProcessor>,
+    lineage: &ThreadLineage,
+    status: TurnStatus,
+    error: Option<String>,
+    completed_at: i64,
+) -> Result<()> {
+    let Some(parent_turn_id) = lineage.parent_turn_id.as_deref() else {
+        return Ok(());
+    };
+    let Some((workspace_id, mut turn)) = processor
+        .crud_store
+        .get_turn(lineage.parent_thread_id.as_str(), parent_turn_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if turn.turn_kind != TurnKind::TaskRun || turn.status != TurnStatus::InProgress {
+        return Ok(());
+    }
+    turn.status = status;
+    turn.error = error;
+    match status {
+        TurnStatus::Completed => {
+            let notification = TurnCompletedNotification {
+                workspace_id,
+                thread_id: lineage.parent_thread_id.clone(),
+                turn,
+            };
+            processor
+                .crud_store
+                .materialize_turn_completed(notification.clone(), completed_at)
+                .await?;
+            processor
+                .send_notification_to_thread_subscribers(
+                    lineage.parent_thread_id.as_str(),
+                    events::TURN_COMPLETED,
+                    &notification,
+                )
+                .await;
+        }
+        TurnStatus::Failed | TurnStatus::Interrupted => {
+            let notification = TurnFailedNotification {
+                workspace_id,
+                thread_id: lineage.parent_thread_id.clone(),
+                turn,
+            };
+            processor
+                .crud_store
+                .materialize_turn_failed(notification.clone(), completed_at)
+                .await?;
+            processor
+                .send_notification_to_thread_subscribers(
+                    lineage.parent_thread_id.as_str(),
+                    events::TURN_FAILED,
+                    &notification,
+                )
+                .await;
+        }
+        TurnStatus::InProgress => {}
+    }
+    Ok(())
 }
 
 fn lineage_from_execution(
