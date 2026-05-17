@@ -24,6 +24,7 @@ impl PioneerDesktop {
         &mut self,
         endpoint_name: String,
         address: String,
+        cx: &mut Context<Self>,
     ) {
         self.gateway.status = format!(
             "{}: {} ({})",
@@ -35,11 +36,12 @@ impl PioneerDesktop {
         self.gateway.connection_state = GatewayConnectionState::Connected;
         self.gateway.error = None;
         self.thread_list_loading = false;
+        self.set_workspaces_loading(false);
+        self.set_workspaces_error(None);
         self.reset_thread_start_state();
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
-        self.request_thread_start_if_needed();
-        self.queue_thread_list_refresh();
+        self.refresh_workspace_list(cx);
 
         if matches!(
             self.main_content_view,
@@ -70,6 +72,7 @@ impl PioneerDesktop {
         self.gateway.connection_state = GatewayConnectionState::Reconnecting;
         self.gateway.error = Some(reason);
         self.thread_list_loading = false;
+        self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {
             self.set_active_thread_id(None);
         }
@@ -102,6 +105,7 @@ impl PioneerDesktop {
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(reason);
         self.thread_list_loading = false;
+        self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {
             self.set_active_thread_id(None);
         }
@@ -134,6 +138,7 @@ impl PioneerDesktop {
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(error);
         self.thread_list_loading = false;
+        self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {
             self.set_active_thread_id(None);
         }

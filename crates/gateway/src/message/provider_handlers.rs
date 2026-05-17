@@ -1,8 +1,28 @@
 use super::*;
 
 impl MessageProcessor {
-    pub(super) async fn provider_list(&self, connection_id: ConnectionId, request_id: RequestId) {
-        let provider_names = match self.gateway_secrets.list_configured_provider_names() {
+    pub(super) async fn provider_list(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: ProviderListParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_LIST,
+                params.workspace_id,
+            )
+            .await
+        else {
+            return;
+        };
+
+        let provider_names = match self
+            .gateway_secrets
+            .list_configured_workspace_provider_names(workspace_id.as_str())
+        {
             Ok(provider_names) => provider_names,
             Err(error) => {
                 self.send_error(
@@ -56,6 +76,18 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ProviderListModelsParams,
     ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_MODELS_LIST,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
         if params.provider.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -72,7 +104,10 @@ impl MessageProcessor {
             return;
         }
 
-        let provider = match self.provider_registry.get_or_create(&params.provider) {
+        let provider = match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        {
             Ok(p) => p,
             Err(error) => {
                 self.send_error(
@@ -178,6 +213,18 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ProviderSetApiKeyParams,
     ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_SET_API_KEY,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
         if params.provider.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -231,10 +278,12 @@ impl MessageProcessor {
         }
 
         let raw_provider = params.provider;
-        let normalized_provider = match self
-            .gateway_secrets
-            .set_provider_api_key(&raw_provider, params.api_key.as_str())
-        {
+
+        let normalized_provider = match self.gateway_secrets.set_workspace_provider_api_key(
+            workspace_id.as_str(),
+            &raw_provider,
+            params.api_key.as_str(),
+        ) {
             Ok(normalized_provider) => normalized_provider,
             Err(error) => {
                 self.send_error(
@@ -290,6 +339,18 @@ impl MessageProcessor {
         request_id: RequestId,
         params: ProviderDeleteApiKeyParams,
     ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_DELETE_API_KEY,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
         if params.provider.trim().is_empty() {
             self.send_error(
                 connection_id,
@@ -326,22 +387,25 @@ impl MessageProcessor {
         }
 
         let raw_provider = params.provider;
-        let (normalized_provider, deleted) =
-            match self.gateway_secrets.delete_provider_api_key(&raw_provider) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to delete provider api key: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
+
+        let (normalized_provider, deleted) = match self
+            .gateway_secrets
+            .delete_workspace_provider_api_key(workspace_id.as_str(), &raw_provider)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to delete provider api key: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
         if deleted {
             self.provider_registry.invalidate(&raw_provider);
@@ -716,5 +780,38 @@ impl MessageProcessor {
         }
 
         messages
+    }
+
+    async fn validate_provider_workspace(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        method: &str,
+        workspace_id: String,
+    ) -> Option<String> {
+        let workspace_id = match self
+            .workspace_manager
+            .validate_workspace_id(workspace_id.as_str())
+            .await
+        {
+            Ok(workspace_id) => workspace_id,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!("failed to validate workspace for `{method}`: {error}"),
+                    ),
+                )
+                .await;
+                return None;
+            }
+        };
+
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+        Some(workspace_id)
     }
 }

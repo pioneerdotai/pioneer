@@ -1,6 +1,16 @@
 use super::*;
 
 impl MessageProcessor {
+    pub(super) async fn send_notification_to_all_connections<T: Serialize>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) {
+        let connection_ids = self.session_manager.connection_ids().await;
+        self.send_notification_to_connections(method, payload, connection_ids)
+            .await;
+    }
+
     pub(super) async fn send_notification_to_workspace_connections<T: Serialize>(
         &self,
         workspace_id: &str,

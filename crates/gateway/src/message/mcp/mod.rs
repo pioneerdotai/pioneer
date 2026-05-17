@@ -337,15 +337,15 @@ impl MessageProcessor {
                         json!({"workspace_id": workspace_id}),
                     )
                 }
-                WorkspaceError::InvalidWorkspaceId | WorkspaceError::InvalidWorkspaceName => {
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_PARAMS_CODE,
-                        MCP_ERROR_INVALID_REQUEST,
-                        format!("invalid workspace_id for `{method}`"),
-                        json!({"workspace_id": workspace_id}),
-                    )
-                }
+                WorkspaceError::InvalidWorkspaceId
+                | WorkspaceError::InvalidWorkspaceName
+                | WorkspaceError::NoWorkspaceUpdateFields => mcp_error(
+                    Some(request_id.clone()),
+                    INVALID_PARAMS_CODE,
+                    MCP_ERROR_INVALID_REQUEST,
+                    format!("invalid workspace_id for `{method}`"),
+                    json!({"workspace_id": workspace_id}),
+                ),
             })?;
 
         self.session_manager

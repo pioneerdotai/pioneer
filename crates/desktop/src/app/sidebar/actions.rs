@@ -46,7 +46,7 @@ impl PioneerDesktop {
             return;
         };
 
-        let name = self.next_new_folder_name();
+        let name = self.next_new_folder_name(workspace_id.as_str());
         let ws_sender = self.gateway.ws_command_sender.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -98,6 +98,12 @@ impl PioneerDesktop {
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
+        let Some(active_workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+        if folder.workspace_id != active_workspace_id {
+            return;
+        }
         let trimmed_name = new_name.trim();
         if trimmed_name.is_empty() || folder.name == trimmed_name {
             return;
@@ -202,6 +208,12 @@ impl PioneerDesktop {
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
+        let Some(active_workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+        if folder.workspace_id != active_workspace_id {
+            return;
+        }
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -264,6 +276,12 @@ impl PioneerDesktop {
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
+        let Some(active_workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+        if folder.workspace_id != active_workspace_id {
+            return;
+        }
 
         self.open_agents_doc_editor(
             ThreadAgentsDocEditorScope::Folder {
@@ -298,8 +316,11 @@ impl PioneerDesktop {
         let Some(connection_id) = self.gateway.ws_connection_id else {
             return;
         };
+        let Some(workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
         let Some(summary) = self
-            .thread_agents_doc_summary(folder_id.as_deref())
+            .thread_agents_doc_summary_for_workspace(folder_id.as_deref(), workspace_id.as_str())
             .cloned()
         else {
             return;
@@ -426,13 +447,12 @@ impl PioneerDesktop {
         let Some(connection_id) = self.gateway.ws_connection_id else {
             return;
         };
-        let Some(workspace_id) = self
-            .thread_workspace_id(thread_id.as_str())
-            .map(str::to_owned)
-            .or_else(|| self.sidebar_workspace_id())
-        else {
+        let Some(workspace_id) = self.sidebar_workspace_id() else {
             return;
         };
+        if self.thread_workspace_id(thread_id.as_str()) != Some(workspace_id.as_str()) {
+            return;
+        }
 
         if let Some(folder_id) = folder_id.as_deref() {
             let Some(folder) = self.thread_folder(folder_id) else {
@@ -492,6 +512,12 @@ impl PioneerDesktop {
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
+        let Some(active_workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+        if folder.workspace_id != active_workspace_id {
+            return;
+        }
 
         if let Some(parent_folder_id) = parent_folder_id.as_deref() {
             let Some(parent_folder) = self.thread_folder(parent_folder_id) else {
@@ -541,23 +567,21 @@ impl PioneerDesktop {
     }
 
     fn sidebar_workspace_id(&self) -> Option<String> {
-        self.preferred_workspace_id()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.gateway
-                    .runtime
-                    .as_ref()
-                    .and_then(crate::gateway::GatewayRuntime::active_workspace_id)
-                    .map(str::to_owned)
-            })
+        self.active_workspace_id().map(str::to_owned).or_else(|| {
+            self.gateway
+                .runtime
+                .as_ref()
+                .and_then(crate::gateway::GatewayRuntime::active_workspace_id)
+                .map(str::to_owned)
+        })
     }
 
-    fn next_new_folder_name(&self) -> String {
+    fn next_new_folder_name(&self, workspace_id: &str) -> String {
         let base_name = t!("sidebar.folder.new").to_string();
         if !self
             .thread_folders
             .values()
-            .any(|folder| folder.name == base_name)
+            .any(|folder| folder.workspace_id == workspace_id && folder.name == base_name)
         {
             return base_name;
         }
@@ -567,7 +591,7 @@ impl PioneerDesktop {
             if !self
                 .thread_folders
                 .values()
-                .any(|folder| folder.name == name)
+                .any(|folder| folder.workspace_id == workspace_id && folder.name == name)
             {
                 return name;
             }

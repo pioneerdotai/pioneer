@@ -68,7 +68,8 @@ use crate::{
     PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
     PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderSetApiKeyParams,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTransportKind, SandboxMode, SandboxPolicy,
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
     SkillHealthItem, SkillHealthSummary, SkillHealthTarget, SkillInstallState,
@@ -136,8 +137,10 @@ use crate::{
     TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
     TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
     TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification,
-    UserInput, Workspace, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    UserInput, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse,
 };
 
 pub struct SchemaDocument {
@@ -165,8 +168,17 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("workspace_list_response.json", WorkspaceListResponse),
         schema_doc!("workspace_create_params.json", WorkspaceCreateParams),
         schema_doc!("workspace_create_response.json", WorkspaceCreateResponse),
+        schema_doc!("workspace_select_params.json", WorkspaceSelectParams),
+        schema_doc!("workspace_select_response.json", WorkspaceSelectResponse),
+        schema_doc!("workspace_update_params.json", WorkspaceUpdateParams),
+        schema_doc!("workspace_update_response.json", WorkspaceUpdateResponse),
         schema_doc!("workspace_default_params.json", WorkspaceDefaultParams),
         schema_doc!("workspace_default_response.json", WorkspaceDefaultResponse),
+        schema_doc!("workspace_change_kind.json", WorkspaceChangeKind),
+        schema_doc!(
+            "workspace_changed_notification.json",
+            WorkspaceChangedNotification
+        ),
         schema_doc!("artifact_kind.json", ArtifactKind),
         schema_doc!("artifact_status.json", ArtifactStatus),
         schema_doc!("artifact_created_by_kind.json", ArtifactCreatedByKind),
@@ -896,6 +908,13 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("provider_transport_kind.json", ProviderTransportKind),
         schema_doc!("provider_failure_stage.json", ProviderFailureStage),
         schema_doc!("provider_failure_details.json", ProviderFailureDetails),
+        schema_doc!("provider_list_params.json", ProviderListParams),
+        schema_doc!("provider_list_response.json", ProviderListResponse),
+        schema_doc!("provider_list_models_params.json", ProviderListModelsParams),
+        schema_doc!(
+            "provider_list_models_response.json",
+            ProviderListModelsResponse
+        ),
         schema_doc!(
             "context_compressing_notification.json",
             ContextCompressingNotification

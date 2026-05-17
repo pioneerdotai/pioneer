@@ -11,5 +11,6 @@ mod settings;
 mod sidebar;
 mod skills;
 mod thread;
+mod workspaces;
 
 pub use root::PioneerDesktop;

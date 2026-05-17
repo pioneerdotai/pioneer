@@ -9,6 +9,8 @@ use tracing::warn;
 
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
 
+const WORKSPACE_PROVIDER_API_KEY_PREFIX: &str = "workspace:";
+
 #[derive(Clone)]
 pub(crate) struct GatewaySecrets {
     store: Arc<dyn SecretStore>,
@@ -32,6 +34,15 @@ pub(crate) struct McpSecretDeleteFailure {
 pub(crate) struct SuperuserJwtMaterialRotation {
     pub material_existed: bool,
     pub rotated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSecretWorkspaceMigrationReport {
+    pub workspace_id: String,
+    pub legacy_keys: usize,
+    pub copied: usize,
+    pub skipped_existing: usize,
+    pub deleted_legacy: usize,
 }
 
 impl GatewaySecrets {
@@ -59,6 +70,19 @@ impl GatewaySecrets {
             .context("failed to read provider api key from keystore")
     }
 
+    pub(crate) fn get_workspace_provider_api_key(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
+            .context("invalid workspace provider api key id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read workspace provider api key from keystore")
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn set_provider_api_key(&self, provider: &str, api_key: &str) -> Result<String> {
         if api_key.trim().is_empty() {
             bail!("provider api key must not be empty");
@@ -88,6 +112,43 @@ impl GatewaySecrets {
         Ok(normalized_provider)
     }
 
+    pub(crate) fn set_workspace_provider_api_key(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        if api_key.trim().is_empty() {
+            bail!("provider api key must not be empty");
+        }
+
+        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
+            .context("invalid workspace provider api key id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_provider_secret_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+
+        self.store
+            .put_string(
+                &id,
+                api_key,
+                SecretMeta {
+                    kind: SecretKind::ProviderApiKey,
+                    label: Some(normalized_provider.clone()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write workspace provider api key to keystore")?;
+
+        Ok(normalized_provider)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn delete_provider_api_key(&self, provider: &str) -> Result<(String, bool)> {
         let id = SecretId::provider_api_key(provider).context("invalid provider name")?;
         let normalized_provider = id.user().to_owned();
@@ -98,6 +159,23 @@ impl GatewaySecrets {
         Ok((normalized_provider, deleted))
     }
 
+    pub(crate) fn delete_workspace_provider_api_key(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<(String, bool)> {
+        let id = SecretId::workspace_provider_api_key(workspace_id, provider)
+            .context("invalid workspace provider api key id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let deleted = self
+            .store
+            .delete(&id)
+            .context("failed to delete workspace provider api key from keystore")?;
+        Ok((normalized_provider, deleted))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn list_configured_provider_names(&self) -> Result<Vec<String>> {
         let entries = self
             .store
@@ -107,6 +185,31 @@ impl GatewaySecrets {
         let mut names = BTreeSet::new();
         for entry in entries {
             names.insert(entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
+        }
+
+        Ok(names.into_iter().collect())
+    }
+
+    pub(crate) fn list_configured_workspace_provider_names(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<String>> {
+        let prefix = Self::workspace_provider_secret_user_prefix(workspace_id)?;
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
+            .context("failed to list provider api keys from keystore")?;
+
+        let mut names = BTreeSet::new();
+        for entry in entries {
+            if !entry.id.user().starts_with(prefix.as_str()) {
+                continue;
+            }
+
+            names.insert(
+                Self::provider_name_from_workspace_provider_id(&entry.id)
+                    .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned())),
+            );
         }
 
         Ok(names.into_iter().collect())
@@ -129,6 +232,140 @@ impl GatewaySecrets {
                 String::new()
             }
         }
+    }
+
+    pub(crate) fn resolve_workspace_provider_api_key(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> String {
+        if is_local_provider(provider_name) {
+            return String::new();
+        }
+
+        match self.get_workspace_provider_api_key(workspace_id, provider_name) {
+            Ok(Some(value)) => value,
+            Ok(None) => String::new(),
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    provider = provider_name,
+                    error = %format!("{error:#}"),
+                    "failed to resolve workspace provider api key from keystore"
+                );
+                String::new()
+            }
+        }
+    }
+
+    // TODO: Remove sometime
+    pub(crate) fn migrate_legacy_provider_api_keys_to_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ProviderSecretWorkspaceMigrationReport> {
+        let workspace_id = workspace_id.trim().to_owned();
+        SecretId::workspace_provider_api_key(workspace_id.as_str(), "validation")
+            .context("invalid provider key migration workspace id")?;
+
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
+            .context("failed to list provider api keys for workspace migration")?;
+        let now = current_unix_i64()?;
+        let mut report = ProviderSecretWorkspaceMigrationReport {
+            workspace_id: workspace_id.clone(),
+            legacy_keys: 0,
+            copied: 0,
+            skipped_existing: 0,
+            deleted_legacy: 0,
+        };
+
+        for entry in entries {
+            if Self::provider_name_from_workspace_provider_id(&entry.id).is_some() {
+                continue;
+            }
+
+            let provider_id = SecretId::provider_api_key(entry.id.user())
+                .with_context(|| format!("invalid legacy provider key `{}`", entry.id.user()))?;
+            let provider_name = provider_id.user().to_owned();
+            let target_id =
+                SecretId::workspace_provider_api_key(workspace_id.as_str(), provider_name.as_str())
+                    .context("invalid workspace provider key id")?;
+
+            report.legacy_keys = report.legacy_keys.saturating_add(1);
+            if self
+                .store
+                .exists(&target_id)
+                .context("failed to check workspace provider api key during migration")?
+            {
+                report.skipped_existing = report.skipped_existing.saturating_add(1);
+                if self
+                    .store
+                    .delete(&entry.id)
+                    .context("failed to delete migrated legacy provider api key")?
+                {
+                    report.deleted_legacy = report.deleted_legacy.saturating_add(1);
+                }
+                continue;
+            }
+
+            let Some(api_key) = self
+                .store
+                .get_string(&entry.id)
+                .context("failed to read legacy provider api key during migration")?
+            else {
+                if self
+                    .store
+                    .delete(&entry.id)
+                    .context("failed to delete empty legacy provider api key")?
+                {
+                    report.deleted_legacy = report.deleted_legacy.saturating_add(1);
+                }
+                continue;
+            };
+
+            self.store
+                .put_string(
+                    &target_id,
+                    api_key.as_str(),
+                    SecretMeta {
+                        kind: SecretKind::ProviderApiKey,
+                        label: Some(provider_name),
+                        created_at_unix: entry.created_at_unix.unwrap_or(now),
+                        updated_at_unix: entry.updated_at_unix.unwrap_or(now),
+                    },
+                )
+                .context("failed to write migrated workspace provider api key")?;
+            report.copied = report.copied.saturating_add(1);
+            if self
+                .store
+                .delete(&entry.id)
+                .context("failed to delete migrated legacy provider api key")?
+            {
+                report.deleted_legacy = report.deleted_legacy.saturating_add(1);
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn workspace_provider_secret_user_prefix(workspace_id: &str) -> Result<String> {
+        const SENTINEL_PROVIDER: &str = "validation";
+
+        let id = SecretId::workspace_provider_api_key(workspace_id, SENTINEL_PROVIDER)
+            .context("invalid provider workspace id")?;
+        Ok(id
+            .user()
+            .strip_suffix(SENTINEL_PROVIDER)
+            .unwrap_or(id.user())
+            .to_owned())
+    }
+
+    fn provider_name_from_workspace_provider_id(id: &SecretId) -> Option<String> {
+        id.user()
+            .strip_prefix(WORKSPACE_PROVIDER_API_KEY_PREFIX)
+            .and_then(|value| value.split_once(":provider:"))
+            .map(|(_, provider)| provider.to_owned())
     }
 
     pub(crate) fn load_or_create_superuser_jwt_material(
@@ -435,6 +672,94 @@ mod tests {
                 .get_string(&SecretId::provider_api_key("openrouter").expect("id"))
                 .expect("read second"),
             Some("second".to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_provider_keys_are_moved_to_workspace_scope() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+
+        secrets
+            .set_provider_api_key("OpenRouter", "sk-legacy")
+            .expect("set legacy provider key");
+
+        let report = secrets
+            .migrate_legacy_provider_api_keys_to_workspace("ws_default")
+            .expect("migrate provider keys");
+        assert_eq!(
+            report,
+            ProviderSecretWorkspaceMigrationReport {
+                workspace_id: "ws_default".to_owned(),
+                legacy_keys: 1,
+                copied: 1,
+                skipped_existing: 0,
+                deleted_legacy: 1,
+            }
+        );
+        assert_eq!(
+            secrets
+                .get_workspace_provider_api_key("ws_default", "openrouter")
+                .expect("read migrated key"),
+            Some("sk-legacy".to_owned())
+        );
+        assert_eq!(
+            secrets
+                .get_provider_api_key("openrouter")
+                .expect("legacy key removed"),
+            None
+        );
+        assert_eq!(
+            secrets
+                .list_configured_workspace_provider_names("ws_default")
+                .expect("list migrated workspace providers"),
+            vec!["openrouter".to_owned()]
+        );
+        assert!(
+            secrets
+                .list_configured_workspace_provider_names("ws_other")
+                .expect("list other workspace providers")
+                .is_empty()
+        );
+
+        let second_report = secrets
+            .migrate_legacy_provider_api_keys_to_workspace("ws_default")
+            .expect("rerun migration");
+        assert_eq!(second_report.legacy_keys, 0);
+        assert_eq!(second_report.copied, 0);
+        assert_eq!(second_report.skipped_existing, 0);
+        assert_eq!(second_report.deleted_legacy, 0);
+    }
+
+    #[test]
+    fn legacy_provider_migration_does_not_overwrite_scoped_key() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+
+        secrets
+            .set_provider_api_key("openrouter", "sk-legacy")
+            .expect("set legacy provider key");
+        secrets
+            .set_workspace_provider_api_key("ws_default", "openrouter", "sk-scoped")
+            .expect("set scoped provider key");
+
+        let report = secrets
+            .migrate_legacy_provider_api_keys_to_workspace("ws_default")
+            .expect("migrate provider keys");
+
+        assert_eq!(report.legacy_keys, 1);
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.skipped_existing, 1);
+        assert_eq!(report.deleted_legacy, 1);
+        assert_eq!(
+            secrets
+                .get_workspace_provider_api_key("ws_default", "openrouter")
+                .expect("read scoped key"),
+            Some("sk-scoped".to_owned())
+        );
+        assert_eq!(
+            secrets
+                .get_provider_api_key("openrouter")
+                .expect("legacy key removed"),
+            None
         );
     }
 

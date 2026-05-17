@@ -62,6 +62,63 @@ impl PioneerDesktop {
         self.preferred_workspace_id = workspace_id;
     }
 
+    pub(in crate::app) fn load_thread_folder_expansion_for_workspace(
+        &mut self,
+        workspace_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.thread_folder_expanded =
+            state::thread_folders_expanded_for_workspace(cx, Some(workspace_id));
+    }
+
+    pub(in crate::app) fn set_workspaces(&mut self, workspaces: Vec<Workspace>) {
+        self.workspaces = workspaces;
+    }
+
+    pub(in crate::app) fn set_workspaces_loading(&mut self, loading: bool) {
+        self.workspaces_loading = loading;
+    }
+
+    pub(in crate::app) fn set_workspaces_error(&mut self, error: Option<String>) {
+        self.workspaces_error = error;
+    }
+
+    pub(in crate::app) fn set_workspace_action_in_progress(&mut self, in_progress: bool) {
+        self.workspace_action_in_progress = in_progress;
+    }
+
+    pub(in crate::app) fn remember_last_active_thread_for_workspace(
+        &mut self,
+        workspace_id: &str,
+        thread_id: Option<String>,
+    ) {
+        match thread_id {
+            Some(thread_id) => {
+                self.last_active_thread_by_workspace
+                    .insert(workspace_id.to_owned(), thread_id);
+            }
+            None => {
+                self.last_active_thread_by_workspace.remove(workspace_id);
+            }
+        }
+    }
+
+    pub(in crate::app) fn remember_draft_thread_for_workspace(
+        &mut self,
+        workspace_id: &str,
+        thread_id: Option<String>,
+    ) {
+        match thread_id {
+            Some(thread_id) => {
+                self.draft_thread_by_workspace
+                    .insert(workspace_id.to_owned(), thread_id);
+            }
+            None => {
+                self.draft_thread_by_workspace.remove(workspace_id);
+            }
+        }
+    }
+
     pub(in crate::app) fn remember_active_thread_draft(&mut self, cx: &Context<Self>) {
         let Some(thread_id) = self.active_thread_id.as_ref().map(ToOwned::to_owned) else {
             return;
@@ -314,14 +371,7 @@ impl PioneerDesktop {
                 .insert(folder_id.to_owned(), true);
         }
 
-        if let Err(error) =
-            state::set_thread_folders_expanded(cx, self.thread_folder_expanded.clone())
-        {
-            warn!(
-                error = %format!("{error:#}"),
-                "failed to save sidebar folder expansion state"
-            );
-        }
+        self.save_thread_folder_expansion_for_active_workspace(cx);
     }
 
     pub(in crate::app) fn set_thread_folder_expanded(
@@ -333,9 +383,19 @@ impl PioneerDesktop {
         self.thread_folder_expanded
             .insert(folder_id.to_owned(), expanded);
 
-        if let Err(error) =
-            state::set_thread_folders_expanded(cx, self.thread_folder_expanded.clone())
-        {
+        self.save_thread_folder_expansion_for_active_workspace(cx);
+    }
+
+    fn save_thread_folder_expansion_for_active_workspace(&self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
+            return;
+        };
+
+        if let Err(error) = state::set_thread_folders_expanded_for_workspace(
+            cx,
+            workspace_id.as_str(),
+            self.thread_folder_expanded.clone(),
+        ) {
             warn!(
                 error = %format!("{error:#}"),
                 "failed to save sidebar folder expansion state"

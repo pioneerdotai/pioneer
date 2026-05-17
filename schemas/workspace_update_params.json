@@ -1,11 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "WorkspaceCreateParams",
+  "title": "WorkspaceUpdateParams",
   "type": "object",
   "properties": {
-    "make_current": {
-      "type": "boolean"
-    },
     "name": {
       "type": [
         "string",

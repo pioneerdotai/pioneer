@@ -23,6 +23,15 @@ impl SecretId {
         Self::from_service_user(PROVIDER_API_KEY_SERVICE, provider)
     }
 
+    pub fn workspace_provider_api_key(workspace_id: &str, provider: &str) -> Result<Self> {
+        let workspace_id = validate_user("workspace id", workspace_id)?;
+        let provider = validate_user("provider", provider)?.to_ascii_lowercase();
+        Self::from_service_user(
+            PROVIDER_API_KEY_SERVICE,
+            format!("workspace:{workspace_id}:provider:{provider}"),
+        )
+    }
+
     pub fn user_jwt_token(token_id: &str) -> Result<Self> {
         let token_id = validate_user("user jwt token id", token_id)?;
         Self::from_service_user(USER_JWT_TOKEN_SERVICE, token_id)
@@ -193,6 +202,15 @@ mod tests {
 
         assert_eq!(id.service(), PROVIDER_API_KEY_SERVICE);
         assert_eq!(id.user(), "openrouter");
+    }
+
+    #[test]
+    fn workspace_provider_id_is_scoped_by_workspace() {
+        let id = SecretId::workspace_provider_api_key("  ws_1  ", "  OpenRouter  ")
+            .expect("provider id");
+
+        assert_eq!(id.service(), PROVIDER_API_KEY_SERVICE);
+        assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
     }
 
     #[test]

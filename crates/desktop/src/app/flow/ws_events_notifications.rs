@@ -328,6 +328,9 @@ impl PioneerDesktop {
             GatewayNotification::TurnTimelineChanged(notification) => {
                 self.refresh_turn_timeline(notification.thread_id, notification.turn_id, cx);
             }
+            GatewayNotification::WorkspaceChanged(notification) => {
+                self.apply_workspace_changed_notification(notification);
+            }
             GatewayNotification::TaskCreated(_)
             | GatewayNotification::TaskScheduled(_)
             | GatewayNotification::TaskQueued(_)
@@ -369,20 +372,57 @@ impl PioneerDesktop {
         self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
 
         let pending_thread_id = self.thread_start_coordinator().pending_thread_id.clone();
-        let started_local_pending = pending_thread_id.as_deref() == Some(thread_id.as_str());
+        let started_local_pending = should_accept_thread_started_as_local_pending(
+            pending_thread_id.as_deref(),
+            thread_id.as_str(),
+        );
         if started_local_pending {
             self.set_draft_thread_id(Some(thread_id.clone()));
             if self.current_active_thread_id().is_none() {
                 self.set_active_thread_id(Some(thread_id.clone()));
             }
+            self.set_preferred_workspace_id(Some(workspace_id.clone()));
+            self.persist_active_gateway_workspace_id(workspace_id.clone());
             self.reset_thread_start_state();
             self.clear_thread_start_queue();
         }
 
-        self.set_preferred_workspace_id(Some(workspace_id.clone()));
-        self.persist_active_gateway_workspace_id(workspace_id);
-        self.queue_thread_list_refresh();
+        let active_workspace = self.active_workspace_scope_for_notifications();
+        if started_local_pending
+            || should_refresh_workspace_bound_data(
+                active_workspace.as_deref(),
+                workspace_id.as_str(),
+            )
+        {
+            self.queue_thread_list_refresh();
+        }
         self.sync_composer_model_selection_for_active_thread();
+    }
+
+    fn apply_workspace_changed_notification(&mut self, notification: WorkspaceChangedNotification) {
+        apply_workspace_changed_to_catalog(&mut self.workspaces, &notification);
+        self.ensure_active_workspace_preference_is_valid();
+    }
+
+    fn ensure_active_workspace_preference_is_valid(&mut self) {
+        let Some(preferred_workspace_id) = self.preferred_workspace_id().map(str::to_owned) else {
+            return;
+        };
+
+        let preferred_still_active = self
+            .workspace_by_id(preferred_workspace_id.as_str())
+            .is_some_and(|workspace| workspace.is_active);
+        if preferred_still_active {
+            return;
+        }
+
+        let fallback_workspace_id =
+            resolve_active_workspace_id(None, self.workspaces()).map(str::to_owned);
+        self.set_preferred_workspace_id(fallback_workspace_id.clone());
+        if let Some(workspace_id) = fallback_workspace_id {
+            self.persist_active_gateway_workspace_id(workspace_id);
+            self.queue_thread_list_refresh();
+        }
     }
 
     fn apply_turn_started_notification(
@@ -499,8 +539,9 @@ impl PioneerDesktop {
     }
 
     fn active_workspace_scope_for_notifications(&self) -> Option<String> {
-        self.preferred_workspace_id()
+        self.active_workspace_id()
             .map(str::to_owned)
+            .or_else(|| self.preferred_workspace_id().map(str::to_owned))
             .or_else(|| {
                 self.gateway
                     .runtime
@@ -511,9 +552,32 @@ impl PioneerDesktop {
     }
 }
 
+pub(super) fn apply_workspace_changed_to_catalog(
+    workspaces: &mut Vec<Workspace>,
+    notification: &WorkspaceChangedNotification,
+) {
+    let workspace = notification.workspace.clone();
+    if matches!(notification.kind, WorkspaceChangeKind::CurrentChanged) && workspace.is_current {
+        for existing in workspaces.iter_mut() {
+            if existing.id != workspace.id {
+                existing.is_current = false;
+            }
+        }
+    }
+
+    upsert_workspace_catalog_item(workspaces, workspace);
+}
+
 pub(super) fn should_refresh_workspace_bound_data(
     active_workspace: Option<&str>,
     notification_workspace: &str,
 ) -> bool {
     active_workspace == Some(notification_workspace)
+}
+
+pub(super) fn should_accept_thread_started_as_local_pending(
+    pending_thread_id: Option<&str>,
+    started_thread_id: &str,
+) -> bool {
+    pending_thread_id == Some(started_thread_id)
 }

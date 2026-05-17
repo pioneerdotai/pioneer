@@ -145,6 +145,52 @@ impl MessageProcessor {
                     }
                 }
             }
+            methods::WORKSPACE_SELECT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<WorkspaceSelectParams>(params_value) {
+                    Ok(params) => {
+                        self.workspace_select(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::WORKSPACE_SELECT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::WORKSPACE_UPDATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<WorkspaceUpdateParams>(params_value) {
+                    Ok(params) => {
+                        self.workspace_update(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::WORKSPACE_UPDATE
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
             methods::MEMORY_SEARCH => {
                 let params_value = request.params.unwrap_or_else(empty_object_value);
                 match serde_json::from_value::<MemorySearchParams>(params_value) {
@@ -677,7 +723,23 @@ impl MessageProcessor {
                 }
             }
             methods::PROVIDER_LIST => {
-                self.provider_list(connection_id, request.id).await;
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ProviderListParams>(params_value) {
+                    Ok(params) => {
+                        self.provider_list(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::PROVIDER_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
             methods::PROVIDER_MODELS_LIST => {
                 let params_value = request.params.unwrap_or_else(empty_object_value);

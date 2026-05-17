@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 // --- Provider list ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ProviderListParams {}
+pub struct ProviderListParams {
+    pub workspace_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderListResponse {
@@ -20,6 +22,7 @@ pub struct ProviderSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderListModelsParams {
+    pub workspace_id: String,
     pub provider: String,
 }
 
@@ -76,6 +79,7 @@ pub struct ProviderModelInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderSetApiKeyParams {
+    pub workspace_id: String,
     pub provider: String,
     pub api_key: String,
 }
@@ -88,6 +92,7 @@ pub struct ProviderSetApiKeyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderDeleteApiKeyParams {
+    pub workspace_id: String,
     pub provider: String,
 }
 

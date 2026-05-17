@@ -8,7 +8,8 @@ use crate::gateway::types::GatewayEndpointKind;
 use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
     GatewayNotification, ThreadStartParams, ThreadUnsubscribeStatus, TurnStartParams, TurnStatus,
-    UserInput, constants::events, generate_id,
+    UserInput, WorkspaceChangeKind, WorkspaceCreateParams, WorkspaceSelectParams,
+    WorkspaceUpdateParams, constants::events, generate_id,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -157,6 +158,55 @@ fn process_text_payload_maps_thread_updated_notifications() {
             assert_eq!(notification.thread.workspace_id, "ws_123");
             assert_eq!(notification.thread.id, "thr_123");
             assert_eq!(notification.thread.name.as_deref(), Some("New title"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn process_text_payload_maps_workspace_changed_notifications() {
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut pending_requests = HashMap::new();
+    let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": events::WORKSPACE_CHANGED,
+        "params": {
+            "kind": "updated",
+            "workspace": {
+                "id": "ws_123",
+                "name": "Renamed Workspace",
+                "is_active": true,
+                "is_current": false,
+                "created_at": 1,
+                "updated_at": 2
+            }
+        }
+    })
+    .to_string();
+
+    process_text_payload(
+        &payload,
+        17,
+        &mut pending_requests,
+        &mut pending_upload_chunks,
+        &mut pending_artifact_upload_chunks,
+        &event_tx,
+    );
+
+    let event = event_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected websocket event");
+    match event {
+        GatewayWsEvent::Notification {
+            connection_id,
+            notification: GatewayNotification::WorkspaceChanged(notification),
+        } => {
+            assert_eq!(connection_id, 17);
+            assert_eq!(notification.kind, WorkspaceChangeKind::Updated);
+            assert_eq!(notification.workspace.id, "ws_123");
+            assert_eq!(notification.workspace.name, "Renamed Workspace");
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -674,6 +724,63 @@ fn thread_start_rejects_missing_workspace_id_before_request() {
         })
         .expect_err("empty workspace_id must fail before JSON-RPC send");
     assert!(format!("{error:#}").contains("workspace_id"));
+
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn workspace_create_rejects_missing_workspace_id_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let error = sender
+        .workspace_create(WorkspaceCreateParams {
+            workspace_id: "   ".to_owned(),
+            name: Some("Workspace".to_owned()),
+            make_current: false,
+        })
+        .expect_err("empty workspace_id must fail before JSON-RPC send");
+    assert!(format!("{error:#}").contains("workspace_id"));
+
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn workspace_select_rejects_missing_workspace_id_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let error = sender
+        .workspace_select(WorkspaceSelectParams {
+            workspace_id: "   ".to_owned(),
+            make_current: true,
+        })
+        .expect_err("empty workspace_id must fail before JSON-RPC send");
+    assert!(format!("{error:#}").contains("workspace_id"));
+
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn workspace_update_rejects_missing_fields_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let error = sender
+        .workspace_update(WorkspaceUpdateParams {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            name: None,
+        })
+        .expect_err("missing update fields must fail before JSON-RPC send");
+    assert!(format!("{error:#}").contains("at least one field"));
+
+    let error = sender
+        .workspace_update(WorkspaceUpdateParams {
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            name: Some("   ".to_owned()),
+        })
+        .expect_err("empty name must fail before JSON-RPC send");
+    assert!(format!("{error:#}").contains("name"));
 
     let _ = sender.shutdown();
 }

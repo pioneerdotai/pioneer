@@ -35,7 +35,8 @@ pub async fn compress_context(
         .as_deref()
         .unwrap_or(thread.model.as_str());
 
-    let provider = registry.get_or_create(model_provider)?;
+    let provider =
+        registry.get_or_create_for_workspace(thread.workspace_id.as_str(), model_provider)?;
 
     let request = ChatRequest {
         model: model.to_owned(),
@@ -90,7 +91,9 @@ pub async fn generate_thread_title(
         .as_deref()
         .unwrap_or(thread.model.as_str());
 
-    let provider = registry.get_or_create(model_provider)?;
+    let provider =
+        registry.get_or_create_for_workspace(thread.workspace_id.as_str(), model_provider)?;
+
     let request = ChatRequest {
         model: model.to_owned(),
         messages: vec![ChatMessage::user(prompt)],

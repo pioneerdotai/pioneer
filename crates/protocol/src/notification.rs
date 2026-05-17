@@ -25,7 +25,7 @@ use crate::{
     ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
     ThreadUpdatedNotification, TurnCompletedNotification, TurnFailedNotification,
     TurnStartedNotification, TurnTimelineChangedNotification,
-    TurnToolLoopBudgetExceededNotification,
+    TurnToolLoopBudgetExceededNotification, WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ pub struct UnknownGatewayNotification {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum GatewayNotification {
+    WorkspaceChanged(WorkspaceChangedNotification),
     ThreadStarted(ThreadStartedNotification),
     ThreadClosed(ThreadClosedNotification),
     ThreadUpdated(ThreadUpdatedNotification),
@@ -123,6 +124,11 @@ impl GatewayNotification {
         let params = notification.params?;
 
         match method.as_str() {
+            events::WORKSPACE_CHANGED => {
+                serde_json::from_value::<WorkspaceChangedNotification>(params)
+                    .ok()
+                    .map(Self::WorkspaceChanged)
+            }
             events::THREAD_STARTED => serde_json::from_value::<ThreadStartedNotification>(params)
                 .ok()
                 .map(Self::ThreadStarted),
@@ -438,6 +444,7 @@ impl GatewayNotification {
                 || method.starts_with("context/")
                 || method.starts_with("task/")
                 || method.starts_with("memory/")
+                || method.starts_with("workspace/")
                 || method.starts_with("artifact/")
                 || method.starts_with("thread/artifacts_") =>
             {
@@ -519,7 +526,7 @@ mod tests {
         ItemDeltaStream, JsonRpcNotification, MemoryCandidateCreatedNotification,
         MemoryChangedNotification, MemoryForgottenNotification, RecoveryAction, RecoveryJobStatus,
         RecoveryTrigger, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
-        ToolRetryExhaustionKind, ToolRetryResolution, TurnItemType,
+        ToolRetryExhaustionKind, ToolRetryResolution, TurnItemType, WorkspaceChangeKind,
     };
     use serde_json::json;
 
@@ -542,6 +549,36 @@ mod tests {
         let mapped =
             GatewayNotification::from_jsonrpc(notification).expect("known notification should map");
         assert!(matches!(mapped, GatewayNotification::TurnStarted(_)));
+    }
+
+    #[test]
+    fn maps_workspace_changed_notification() {
+        let notification: JsonRpcNotification = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/changed",
+            "params": {
+                "kind": "updated",
+                "workspace": {
+                    "id": "ws_000000000000000001",
+                    "name": "Renamed",
+                    "is_active": true,
+                    "is_current": false,
+                    "created_at": 1,
+                    "updated_at": 2
+                }
+            }
+        }))
+        .expect("notification should decode");
+
+        let mapped =
+            GatewayNotification::from_jsonrpc(notification).expect("workspace change should map");
+        match mapped {
+            GatewayNotification::WorkspaceChanged(notification) => {
+                assert_eq!(notification.kind, WorkspaceChangeKind::Updated);
+                assert_eq!(notification.workspace.id, "ws_000000000000000001");
+            }
+            other => panic!("expected workspace changed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -925,6 +962,12 @@ mod tests {
             "tool_recovery_retry_class.json",
             "tool_recovery_idempotency_mode.json",
             "gateway_notification.json",
+            "workspace_select_params.json",
+            "workspace_select_response.json",
+            "workspace_update_params.json",
+            "workspace_update_response.json",
+            "workspace_change_kind.json",
+            "workspace_changed_notification.json",
             "mcp_list_params.json",
             "mcp_list_response.json",
             "mcp_scope_kind.json",

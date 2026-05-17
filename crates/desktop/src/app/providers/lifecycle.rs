@@ -2,6 +2,7 @@ use super::{PROVIDERS_FILTER_ALL_NODE_ID, PROVIDERS_FILTER_CONNECTED_NODE_ID};
 use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, ProviderFilter};
 use gpui::{prelude::*, *};
 use gpui_component::tree::TreeItem;
+use pioneer_protocol::ProviderListParams;
 use std::collections::HashSet;
 use tracing::warn;
 
@@ -36,7 +37,7 @@ impl PioneerDesktop {
         cx.notify();
     }
 
-    pub(super) fn refresh_configured_providers(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn refresh_configured_providers(&mut self, cx: &mut Context<Self>) {
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.providers_loading = false;
             self.providers_error = Some(t!("providers.error.gateway_not_connected").to_string());
@@ -48,6 +49,11 @@ impl PioneerDesktop {
             self.providers_error = Some(t!("providers.error.gateway_not_connected").to_string());
             return;
         };
+        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
+            self.providers_loading = false;
+            self.providers_error = Some(t!("providers.error.workspace_not_selected").to_string());
+            return;
+        };
 
         self.providers_loading = true;
         self.providers_error = None;
@@ -57,7 +63,9 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.provider_list() })
+                    .background_spawn(async move {
+                        ws_sender.provider_list(ProviderListParams { workspace_id })
+                    })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {

@@ -189,8 +189,10 @@ pub use turn::{
     UserMessageAttachment, WebFetchLink, WebSearchResultItem,
 };
 pub use workspace::{
-    Workspace, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse,
 };
 
 pub use schema::{protocol_schema_documents, write_protocol_schemas};

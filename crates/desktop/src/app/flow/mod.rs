@@ -13,13 +13,14 @@ mod turn_resume_execute;
 mod turn_resume_queue;
 mod turn_resume_schedule;
 mod workspace_bootstrap;
+mod workspace_switch;
 mod ws_events_connection;
 mod ws_events_notifications;
 mod ws_events_pump;
 
 use super::root::{
     GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
-    MainContentView, PioneerDesktop,
+    MainContentView, PioneerDesktop, resolve_active_workspace_id,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{
@@ -43,16 +44,20 @@ use pioneer_protocol::generate_id;
 use pioneer_protocol::{
     GatewayNotification, ThreadHistoryParams, ThreadHistoryResponse, ThreadStartParams,
     ThreadTreeParams, TurnGetParams, TurnItemEventPayload, TurnItemsParams, TurnTimelineParams,
-    TurnTimelineResponse,
+    TurnTimelineResponse, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceSelectParams,
 };
 use std::time::Duration;
 use tracing::warn;
 
 use helpers::*;
-use workspace_bootstrap::*;
+pub(crate) use workspace_bootstrap::*;
 
 #[cfg(test)]
-use ws_events_notifications::should_refresh_workspace_bound_data;
+use ws_events_notifications::{
+    apply_workspace_changed_to_catalog, should_accept_thread_started_as_local_pending,
+    should_refresh_workspace_bound_data,
+};
 
 const THREAD_START_RETRY_INITIAL_DELAY_MS: u64 = 500;
 const THREAD_START_RETRY_MAX_DELAY_MS: u64 = 5_000;

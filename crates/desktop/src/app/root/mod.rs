@@ -4,6 +4,8 @@ mod queries;
 mod state;
 mod view;
 
+pub(in crate::app) use queries::resolve_active_workspace_id;
+
 use crate::{
     app::{
         conversation::Conversation,
@@ -22,6 +24,7 @@ use gpui_terminal::TerminalView;
 use pioneer_protocol::{
     ArtifactRef, ArtifactSummary, McpListItem, McpServerDetailsResponse, SkillHealthItem,
     SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement,
+    Workspace,
 };
 use std::{
     cell::RefCell,
@@ -373,6 +376,12 @@ pub struct PioneerDesktop {
     pub(super) active_thread_id: Option<String>,
     pub(super) draft_thread_id: Option<String>,
     pub(super) preferred_workspace_id: Option<String>,
+    pub(super) workspaces: Vec<Workspace>,
+    pub(super) workspaces_loading: bool,
+    pub(super) workspaces_error: Option<String>,
+    pub(super) workspace_action_in_progress: bool,
+    pub(super) last_active_thread_by_workspace: HashMap<String, String>,
+    pub(super) draft_thread_by_workspace: HashMap<String, String>,
     pub(super) composer_state: Entity<InputState>,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
     pub(super) composer_upload_in_progress: bool,

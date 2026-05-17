@@ -105,7 +105,7 @@ impl PioneerDesktop {
                 endpoint_name,
                 address,
                 ..
-            } => self.apply_ws_connected_event(endpoint_name, address),
+            } => self.apply_ws_connected_event(endpoint_name, address, cx),
             GatewayWsEvent::Reconnecting {
                 endpoint_id: _endpoint_id,
                 endpoint_name,

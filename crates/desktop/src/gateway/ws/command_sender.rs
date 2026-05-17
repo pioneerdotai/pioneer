@@ -207,6 +207,62 @@ impl GatewayWsCommandSender {
         )
     }
 
+    pub fn workspace_list(&self) -> Result<WorkspaceListResponse> {
+        self.send_request_typed(
+            methods::WORKSPACE_LIST,
+            &WorkspaceListParams::default(),
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn workspace_create(
+        &self,
+        params: WorkspaceCreateParams,
+    ) -> Result<WorkspaceCreateResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for workspace/create"));
+        }
+        if params
+            .name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(anyhow!("name must not be empty for workspace/create"));
+        }
+
+        self.send_request_typed(methods::WORKSPACE_CREATE, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn workspace_select(
+        &self,
+        params: WorkspaceSelectParams,
+    ) -> Result<WorkspaceSelectResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for workspace/select"));
+        }
+
+        self.send_request_typed(methods::WORKSPACE_SELECT, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn workspace_update(
+        &self,
+        params: WorkspaceUpdateParams,
+    ) -> Result<WorkspaceUpdateResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for workspace/update"));
+        }
+        let Some(name) = params.name.as_deref() else {
+            return Err(anyhow!(
+                "at least one field is required for workspace/update"
+            ));
+        };
+        if name.trim().is_empty() {
+            return Err(anyhow!("name must not be empty for workspace/update"));
+        }
+
+        self.send_request_typed(methods::WORKSPACE_UPDATE, &params, RPC_REQUEST_TIMEOUT)
+    }
+
     pub fn thread_unsubscribe(&self, thread_id: String) -> Result<ThreadUnsubscribeResponse> {
         self.send_request_typed(
             methods::THREAD_UNSUBSCRIBE,
@@ -237,18 +293,21 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::TURN_CANCEL, &params, RPC_REQUEST_TIMEOUT)
     }
 
-    pub fn provider_list(&self) -> Result<ProviderListResponse> {
-        self.send_request_typed(
-            methods::PROVIDER_LIST,
-            &ProviderListParams {},
-            RPC_REQUEST_TIMEOUT,
-        )
+    pub fn provider_list(&self, params: ProviderListParams) -> Result<ProviderListResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for provider/list"));
+        }
+
+        self.send_request_typed(methods::PROVIDER_LIST, &params, RPC_REQUEST_TIMEOUT)
     }
 
     pub fn provider_list_models(
         &self,
         params: ProviderListModelsParams,
     ) -> Result<ProviderListModelsResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for provider/list_models"));
+        }
         if params.provider.trim().is_empty() {
             return Err(anyhow!("provider is required for provider/list_models"));
         }
@@ -264,6 +323,9 @@ impl GatewayWsCommandSender {
         &self,
         params: ProviderSetApiKeyParams,
     ) -> Result<ProviderSetApiKeyResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for provider/set_api_key"));
+        }
         if params.provider.trim().is_empty() {
             return Err(anyhow!("provider is required for provider/set_api_key"));
         }
@@ -278,6 +340,11 @@ impl GatewayWsCommandSender {
         &self,
         params: ProviderDeleteApiKeyParams,
     ) -> Result<ProviderDeleteApiKeyResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!(
+                "workspace_id is required for provider/delete_api_key"
+            ));
+        }
         if params.provider.trim().is_empty() {
             return Err(anyhow!("provider is required for provider/delete_api_key"));
         }

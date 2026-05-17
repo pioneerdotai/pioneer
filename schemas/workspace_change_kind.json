@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceChangeKind",
+  "type": "string",
+  "enum": [
+    "created",
+    "updated",
+    "current_changed"
+  ]
+}

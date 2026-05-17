@@ -40,7 +40,7 @@ impl GatewayMemoryTurnPolicyProvider {
             .ok_or_else(|| "missing model for memory policy classification".to_owned())?;
         let provider = self
             .provider_registry
-            .get_or_create(provider_name)
+            .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| format!("failed to create memory policy provider: {error}"))?;
 
         let prompt =

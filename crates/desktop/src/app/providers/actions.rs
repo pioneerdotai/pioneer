@@ -19,6 +19,10 @@ impl PioneerDesktop {
             self.providers_error = Some(t!("providers.error.gateway_not_connected").to_string());
             return;
         };
+        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
+            self.providers_error = Some(t!("providers.error.workspace_not_selected").to_string());
+            return;
+        };
 
         let canonical_provider_id = Self::canonical_provider_id(provider_id.as_str());
         let provider_for_request = provider_id;
@@ -33,6 +37,7 @@ impl PioneerDesktop {
                 let result = cx
                     .background_spawn(async move {
                         ws_sender.provider_set_api_key(ProviderSetApiKeyParams {
+                            workspace_id,
                             provider: provider_for_request,
                             api_key,
                         })
@@ -78,6 +83,10 @@ impl PioneerDesktop {
             self.providers_error = Some(t!("providers.error.gateway_not_connected").to_string());
             return;
         };
+        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
+            self.providers_error = Some(t!("providers.error.workspace_not_selected").to_string());
+            return;
+        };
 
         let canonical_provider_id = Self::canonical_provider_id(provider_id.as_str());
         let provider_for_request = provider_id;
@@ -92,6 +101,7 @@ impl PioneerDesktop {
                 let result = cx
                     .background_spawn(async move {
                         ws_sender.provider_delete_api_key(ProviderDeleteApiKeyParams {
+                            workspace_id,
                             provider: provider_for_request,
                         })
                     })

@@ -24,17 +24,20 @@ fn should_accept_local_thread_started(
 
 use super::super::conversation::{Conversation, ConversationEvent, TimelineEntryStatus};
 use super::thread_list::{
-    TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
+    TurnTimelineRefreshTransitionEvent, resolve_thread_tree_workspace_id,
+    transition_turn_timeline_refresh_state,
 };
+use super::workspace_switch::{workspace_switch_is_noop, workspace_switch_target_is_known_active};
 use super::{
-    build_remote_candidate_ws_connect_spec, build_ws_connect_spec,
-    default_user_command_bin_dir_label, gateway_activation_is_noop,
+    apply_workspace_changed_to_catalog, build_remote_candidate_ws_connect_spec,
+    build_ws_connect_spec, default_user_command_bin_dir_label, gateway_activation_is_noop,
     gateway_activation_requires_local_start, gateway_has_ready_ws_connection,
-    is_transient_thread_start_error, normalize_workspace_id, should_apply_gateway_operation_result,
+    is_transient_thread_start_error, normalize_workspace_id,
+    should_accept_thread_started_as_local_pending, should_apply_gateway_operation_result,
     should_apply_ws_event, should_refresh_workspace_bound_data, thread_start_retry_delay,
-    turn_resume_retry_delay, warning_notification_messages,
+    turn_resume_retry_delay, upsert_workspace_catalog_item, warning_notification_messages,
 };
-use crate::app::root::GatewayConnectionState;
+use crate::app::root::{GatewayConnectionState, resolve_active_workspace_id};
 use crate::gateway::{
     GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning, GatewayRuntime, GatewayWsEvent,
 };
@@ -43,7 +46,8 @@ use pioneer_protocol::{
     ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
     ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnItem, TurnItemEventPayload, TurnItemType, TurnStatus,
+    TurnItem, TurnItemEventPayload, TurnItemType, TurnStatus, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification,
 };
 use std::time::Duration;
 
@@ -1094,4 +1098,177 @@ fn workspace_id_normalization_trims_and_rejects_empty_values() {
     );
     assert!(normalize_workspace_id(Some("   ".to_owned())).is_none());
     assert!(normalize_workspace_id(None).is_none());
+}
+
+fn workspace(id: &str, is_active: bool, is_current: bool) -> Workspace {
+    Workspace {
+        id: id.to_owned(),
+        name: format!("{id} workspace"),
+        is_active,
+        is_current,
+        created_at: 1,
+        updated_at: 2,
+    }
+}
+
+#[test]
+fn thread_tree_workspace_uses_resolved_workspace_before_persisted_fallback() {
+    assert_eq!(
+        resolve_thread_tree_workspace_id(
+            Some("ws_resolved"),
+            Some("ws_persisted"),
+            Some("ws_runtime")
+        )
+        .as_deref(),
+        Some("ws_resolved")
+    );
+}
+
+#[test]
+fn invalid_persisted_workspace_falls_back_to_current_for_bootstrap() {
+    let catalog = vec![
+        workspace("ws_first", true, false),
+        workspace("ws_current", true, true),
+    ];
+    let resolved = resolve_active_workspace_id(Some("ws_missing"), catalog.as_slice());
+
+    assert_eq!(resolved, Some("ws_current"));
+    assert_eq!(
+        resolve_thread_tree_workspace_id(resolved, Some("ws_missing"), None).as_deref(),
+        Some("ws_current")
+    );
+}
+
+#[test]
+fn empty_workspace_catalog_can_be_seeded_from_default_workspace() {
+    let mut catalog = Vec::new();
+    assert_eq!(resolve_active_workspace_id(None, catalog.as_slice()), None);
+
+    upsert_workspace_catalog_item(&mut catalog, workspace("ws_default", true, true));
+
+    assert_eq!(
+        resolve_active_workspace_id(None, catalog.as_slice()),
+        Some("ws_default")
+    );
+}
+
+#[test]
+fn workspace_catalog_upsert_replaces_selected_item() {
+    let mut catalog = vec![workspace("ws_1", true, false)];
+    let mut selected = workspace("ws_1", true, true);
+    selected.name = "Selected".to_owned();
+
+    upsert_workspace_catalog_item(&mut catalog, selected);
+
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].name, "Selected");
+    assert!(catalog[0].is_current);
+}
+
+#[test]
+fn workspace_switch_noop_compares_normalized_current_workspace() {
+    assert!(workspace_switch_is_noop(Some("  ws_1  "), "ws_1"));
+    assert!(!workspace_switch_is_noop(Some("ws_1"), "ws_2"));
+    assert!(!workspace_switch_is_noop(None, "ws_1"));
+}
+
+#[test]
+fn workspace_switch_target_must_be_active_when_catalog_is_loaded() {
+    let catalog = vec![
+        workspace("ws_active", true, false),
+        workspace("ws_inactive", false, false),
+    ];
+
+    assert!(workspace_switch_target_is_known_active(
+        catalog.as_slice(),
+        "ws_active"
+    ));
+    assert!(!workspace_switch_target_is_known_active(
+        catalog.as_slice(),
+        "ws_inactive"
+    ));
+    assert!(!workspace_switch_target_is_known_active(
+        catalog.as_slice(),
+        "ws_missing"
+    ));
+    assert!(workspace_switch_target_is_known_active(&[], "ws_missing"));
+}
+
+#[test]
+fn workspace_rename_notification_updates_local_catalog_label() {
+    let mut catalog = vec![workspace("ws_1", true, true)];
+    let mut renamed = workspace("ws_1", true, true);
+    renamed.name = "Renamed".to_owned();
+
+    apply_workspace_changed_to_catalog(
+        &mut catalog,
+        &WorkspaceChangedNotification {
+            kind: WorkspaceChangeKind::Updated,
+            workspace: renamed,
+        },
+    );
+
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].name, "Renamed");
+}
+
+#[test]
+fn workspace_created_notification_adds_local_catalog_item_without_current_switch() {
+    let mut catalog = vec![workspace("ws_current", true, true)];
+
+    apply_workspace_changed_to_catalog(
+        &mut catalog,
+        &WorkspaceChangedNotification {
+            kind: WorkspaceChangeKind::Created,
+            workspace: workspace("ws_created", true, false),
+        },
+    );
+
+    assert_eq!(catalog.len(), 2);
+    assert_eq!(
+        resolve_active_workspace_id(None, catalog.as_slice()),
+        Some("ws_current")
+    );
+}
+
+#[test]
+fn workspace_current_changed_notification_updates_current_flags_only() {
+    let mut catalog = vec![
+        workspace("ws_old", true, true),
+        workspace("ws_new", true, false),
+    ];
+    let mut next_current = workspace("ws_new", true, true);
+    next_current.name = "New Current".to_owned();
+
+    apply_workspace_changed_to_catalog(
+        &mut catalog,
+        &WorkspaceChangedNotification {
+            kind: WorkspaceChangeKind::CurrentChanged,
+            workspace: next_current,
+        },
+    );
+
+    assert!(
+        !catalog
+            .iter()
+            .find(|workspace| workspace.id == "ws_old")
+            .unwrap()
+            .is_current
+    );
+    assert!(
+        catalog
+            .iter()
+            .find(|workspace| workspace.id == "ws_new")
+            .unwrap()
+            .is_current
+    );
+}
+
+#[test]
+fn inactive_thread_started_notification_does_not_qualify_as_local_pending() {
+    assert!(!should_accept_thread_started_as_local_pending(
+        Some("thr_local"),
+        "thr_remote"
+    ));
+    assert!(!should_refresh_workspace_bound_data(Some("ws_a"), "ws_b"));
 }

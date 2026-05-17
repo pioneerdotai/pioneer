@@ -37,6 +37,10 @@ impl PioneerDesktop {
             return;
         }
 
+        if self.workspaces_loading() {
+            return;
+        }
+
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -44,16 +48,16 @@ impl PioneerDesktop {
             return;
         };
 
-        let workspace_id = self
-            .preferred_workspace_id()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.gateway
-                    .runtime
-                    .as_ref()
-                    .and_then(GatewayRuntime::active_workspace_id)
-                    .map(str::to_owned)
-            });
+        let runtime_workspace_id = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(GatewayRuntime::active_workspace_id);
+        let workspace_id = resolve_thread_tree_workspace_id(
+            self.active_workspace_id(),
+            self.preferred_workspace_id(),
+            runtime_workspace_id,
+        );
         let Some(workspace_id) = workspace_id else {
             if self.current_active_thread_id().is_none() {
                 self.request_thread_start_if_needed();
@@ -80,6 +84,20 @@ impl PioneerDesktop {
 
                 let _ = this.update(&mut cx, |view, cx| {
                     if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+
+                    let runtime_workspace_id = view
+                        .gateway
+                        .runtime
+                        .as_ref()
+                        .and_then(GatewayRuntime::active_workspace_id);
+                    let current_workspace_id = resolve_thread_tree_workspace_id(
+                        view.active_workspace_id(),
+                        view.preferred_workspace_id(),
+                        runtime_workspace_id,
+                    );
+                    if current_workspace_id.as_deref() != Some(workspace_id.as_str()) {
                         return;
                     }
 
@@ -133,7 +151,7 @@ impl PioneerDesktop {
                                 error = %format!("{error:#}"),
                                 "failed to refresh thread tree"
                             );
-                            if !view.has_known_threads()
+                            if !view.has_known_threads_for_workspace(workspace_id.as_str())
                                 && view.current_active_thread_id().is_none()
                             {
                                 view.request_thread_start_if_needed();
@@ -460,6 +478,19 @@ impl PioneerDesktop {
         self.turn_timeline_refresh
             .remove(&(thread_id.to_owned(), turn_id.to_owned()));
     }
+}
+
+pub(crate) fn resolve_thread_tree_workspace_id(
+    active_workspace_id: Option<&str>,
+    preferred_workspace_id: Option<&str>,
+    runtime_workspace_id: Option<&str>,
+) -> Option<String> {
+    normalize_workspace_id(
+        active_workspace_id
+            .or(preferred_workspace_id)
+            .or(runtime_workspace_id)
+            .map(str::to_owned),
+    )
 }
 
 fn load_task_turn_timelines(

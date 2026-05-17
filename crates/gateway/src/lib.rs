@@ -100,6 +100,12 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let crud_store = Arc::new(CrudStore::new(database.clone()));
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
+    migrate_legacy_provider_api_keys_to_current_workspace(
+        workspace_manager.as_ref(),
+        gateway_secrets.as_ref(),
+    )
+    .await;
+
     match garbage_collection_orphan_mcp_secrets(
         crud_store.as_ref(),
         gateway_secrets.as_ref(),
@@ -138,9 +144,15 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         crud_store.clone(),
     )));
 
-    let provider_registry = Arc::new(ProviderRegistry::new({
+    let provider_registry = Arc::new(ProviderRegistry::new_scoped({
         let gateway_secrets = gateway_secrets.clone();
-        move |provider_name| gateway_secrets.resolve_provider_api_key(provider_name)
+        move |workspace_id, provider_name| {
+            workspace_id
+                .map(|workspace_id| {
+                    gateway_secrets.resolve_workspace_provider_api_key(workspace_id, provider_name)
+                })
+                .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
+        }
     }));
 
     let summary_config = SummaryConfig {
@@ -386,6 +398,55 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .context("failed to close gateway database connection")?;
 
     Ok(())
+}
+
+// TODO: Remove sometime
+async fn migrate_legacy_provider_api_keys_to_current_workspace(
+    workspace_manager: &WorkspaceManager,
+    gateway_secrets: &GatewaySecrets,
+) {
+    let workspaces = match workspace_manager.list_workspaces().await {
+        Ok(workspaces) => workspaces,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "failed to list workspaces for provider key migration"
+            );
+            return;
+        }
+    };
+
+    let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active && workspace.is_current)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
+    else {
+        warn!("provider key migration skipped because no active workspace exists");
+        return;
+    };
+
+    match gateway_secrets.migrate_legacy_provider_api_keys_to_workspace(workspace.id.as_str()) {
+        Ok(report)
+            if report.copied > 0 || report.skipped_existing > 0 || report.deleted_legacy > 0 =>
+        {
+            info!(
+                workspace_id = report.workspace_id.as_str(),
+                legacy_keys = report.legacy_keys,
+                copied = report.copied,
+                skipped_existing = report.skipped_existing,
+                deleted_legacy = report.deleted_legacy,
+                "legacy provider api keys migrated into workspace scope"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                workspace_id = workspace.id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to migrate legacy provider api keys into workspace scope"
+            );
+        }
+    }
 }
 
 pub fn issue_superuser_token(config: &AppConfig, runtime_home: &Path) -> Result<String> {

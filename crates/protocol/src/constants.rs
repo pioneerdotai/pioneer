@@ -2,6 +2,8 @@ pub mod methods {
     pub const WORKSPACE_LIST: &str = "workspace/list";
     pub const WORKSPACE_CREATE: &str = "workspace/create";
     pub const WORKSPACE_DEFAULT: &str = "workspace/default";
+    pub const WORKSPACE_SELECT: &str = "workspace/select";
+    pub const WORKSPACE_UPDATE: &str = "workspace/update";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
     pub const THREAD_MOVE: &str = "thread/move";
@@ -87,6 +89,7 @@ pub mod methods {
 }
 
 pub mod events {
+    pub const WORKSPACE_CHANGED: &str = "workspace/changed";
     pub const THREAD_STARTED: &str = "thread/started";
     pub const THREAD_UPDATED: &str = "thread/updated";
     pub const THREAD_CLOSED: &str = "thread/closed";

@@ -39,15 +39,15 @@ impl MessageProcessor {
                         json!({"workspace_id": workspace_id}),
                     )
                 }
-                WorkspaceError::InvalidWorkspaceId | WorkspaceError::InvalidWorkspaceName => {
-                    skills_error(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        SKILLS_ERROR_INVALID_REQUEST,
-                        format!("invalid workspace_id for `{method}`"),
-                        json!({"workspace_id": workspace_id}),
-                    )
-                }
+                WorkspaceError::InvalidWorkspaceId
+                | WorkspaceError::InvalidWorkspaceName
+                | WorkspaceError::NoWorkspaceUpdateFields => skills_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    SKILLS_ERROR_INVALID_REQUEST,
+                    format!("invalid workspace_id for `{method}`"),
+                    json!({"workspace_id": workspace_id}),
+                ),
             })?;
 
         self.session_manager

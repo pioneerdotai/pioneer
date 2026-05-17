@@ -38,6 +38,14 @@ struct SidebarState {
 struct ThreadsState {
     #[serde(default)]
     folders: ThreadFoldersState,
+    #[serde(default)]
+    workspaces: HashMap<String, WorkspaceThreadsState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspaceThreadsState {
+    #[serde(default)]
+    folders: ThreadFoldersState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -78,7 +86,10 @@ pub(crate) fn set_window(cx: &mut App, window: WindowState) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn thread_folders_expanded(cx: &mut App) -> HashMap<String, bool> {
+pub(crate) fn thread_folders_expanded_for_workspace(
+    cx: &mut App,
+    workspace_id: Option<&str>,
+) -> HashMap<String, bool> {
     if let Err(error) = ensure_loaded(cx) {
         warn!(
             error = %format!("{error:#}"),
@@ -88,12 +99,13 @@ pub(crate) fn thread_folders_expanded(cx: &mut App) -> HashMap<String, bool> {
     }
 
     cx.try_global::<DesktopStateStore>()
-        .map(|state| state.state.sidebar.threads.folders.expanded.clone())
+        .map(|state| thread_folders_expanded_from_state(&state.state, workspace_id))
         .unwrap_or_default()
 }
 
-pub(crate) fn set_thread_folders_expanded(
+pub(crate) fn set_thread_folders_expanded_for_workspace(
     cx: &mut App,
+    workspace_id: &str,
     expanded: HashMap<String, bool>,
 ) -> Result<()> {
     ensure_loaded(cx)?;
@@ -101,12 +113,49 @@ pub(crate) fn set_thread_folders_expanded(
     let (path, serialized) = {
         let state = cx.global_mut::<DesktopStateStore>();
         state.state.version = DESKTOP_STATE_VERSION;
-        state.state.sidebar.threads.folders.expanded = expanded;
+        set_thread_folders_expanded_for_workspace_in_state(
+            &mut state.state,
+            workspace_id,
+            expanded,
+        );
         (state.path.clone(), serialize_state(&state.state)?)
     };
 
     write_state_file(path.as_path(), serialized)?;
     Ok(())
+}
+
+fn thread_folders_expanded_from_state(
+    state: &DesktopStateFile,
+    workspace_id: Option<&str>,
+) -> HashMap<String, bool> {
+    if let Some(expanded) = workspace_id.and_then(|workspace_id| {
+        state
+            .sidebar
+            .threads
+            .workspaces
+            .get(workspace_id)
+            .map(|workspace| workspace.folders.expanded.clone())
+    }) {
+        return expanded;
+    }
+
+    state.sidebar.threads.folders.expanded.clone()
+}
+
+fn set_thread_folders_expanded_for_workspace_in_state(
+    state: &mut DesktopStateFile,
+    workspace_id: &str,
+    expanded: HashMap<String, bool>,
+) {
+    state
+        .sidebar
+        .threads
+        .workspaces
+        .entry(workspace_id.to_owned())
+        .or_default()
+        .folders
+        .expanded = expanded;
 }
 
 fn ensure_loaded(cx: &mut App) -> Result<()> {
@@ -160,4 +209,99 @@ fn serialize_state(state: &DesktopStateFile) -> Result<String> {
 fn write_state_file(path: &std::path::Path, serialized: String) -> Result<()> {
     fs::write(path, serialized)
         .with_context(|| format!("failed to write desktop state `{}`", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expanded(entries: &[(&str, bool)]) -> HashMap<String, bool> {
+        entries
+            .iter()
+            .map(|(folder_id, expanded)| ((*folder_id).to_owned(), *expanded))
+            .collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn thread_folders_expanded_reads_legacy_global_shape_as_workspace_fallback() {
+        let state: DesktopStateFile = toml::from_str(
+            r#"
+version = 1
+
+[sidebar.threads.folders.expanded]
+fld_legacy = true
+"#,
+        )
+        .expect("legacy desktop state should parse");
+
+        assert_eq!(
+            thread_folders_expanded_from_state(&state, Some("ws_a")),
+            expanded(&[("fld_legacy", true)])
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn thread_folders_expanded_prefers_workspace_shape_over_legacy_global_shape() {
+        let state: DesktopStateFile = toml::from_str(
+            r#"
+version = 1
+
+[sidebar.threads.folders.expanded]
+fld_legacy = true
+
+[sidebar.threads.workspaces.ws_a.folders.expanded]
+fld_a = true
+"#,
+        )
+        .expect("workspace desktop state should parse");
+
+        assert_eq!(
+            thread_folders_expanded_from_state(&state, Some("ws_a")),
+            expanded(&[("fld_a", true)])
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn thread_folders_expanded_writes_workspace_scoped_shape() {
+        let mut state = DesktopStateFile::default();
+
+        set_thread_folders_expanded_for_workspace_in_state(
+            &mut state,
+            "ws_a",
+            expanded(&[("fld_a", true), ("fld_b", false)]),
+        );
+
+        assert_eq!(
+            thread_folders_expanded_from_state(&state, Some("ws_a")),
+            expanded(&[("fld_a", true), ("fld_b", false)])
+        );
+
+        let serialized = serialize_state(&state).expect("state should serialize");
+        assert!(serialized.contains("[sidebar.threads.workspaces.ws_a.folders.expanded]"));
+        assert!(!serialized.contains("[sidebar.threads.folders.expanded]\nfld_a"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn thread_folders_expanded_loads_requested_workspace_set() {
+        let mut state = DesktopStateFile::default();
+        set_thread_folders_expanded_for_workspace_in_state(
+            &mut state,
+            "ws_a",
+            expanded(&[("fld_a", true)]),
+        );
+        set_thread_folders_expanded_for_workspace_in_state(
+            &mut state,
+            "ws_b",
+            expanded(&[("fld_b", true)]),
+        );
+
+        assert_eq!(
+            thread_folders_expanded_from_state(&state, Some("ws_a")),
+            expanded(&[("fld_a", true)])
+        );
+        assert_eq!(
+            thread_folders_expanded_from_state(&state, Some("ws_b")),
+            expanded(&[("fld_b", true)])
+        );
+    }
 }

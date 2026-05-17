@@ -1645,7 +1645,18 @@ impl RecoveryCoordinator {
         let Some(failed_model) = provider_snapshot_field(job, "model") else {
             return Ok(None);
         };
-        let provider = match self.provider_registry.get_or_create(provider_name) {
+        let workspace_id = self
+            .crud_store
+            .get_turn_location(job.turn_id.as_str())
+            .await?
+            .map(|(_, workspace_id)| workspace_id);
+        let Some(workspace_id) = workspace_id else {
+            return Ok(None);
+        };
+        let provider = match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id.as_str(), provider_name)
+        {
             Ok(provider) => provider,
             Err(_) => return Ok(None),
         };

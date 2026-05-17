@@ -1,22 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "WorkspaceCreateParams",
+  "title": "ProviderListModelsParams",
   "type": "object",
   "properties": {
-    "make_current": {
-      "type": "boolean"
-    },
-    "name": {
-      "type": [
-        "string",
-        "null"
-      ]
+    "provider": {
+      "type": "string"
     },
     "workspace_id": {
       "type": "string"
     }
   },
   "required": [
-    "workspace_id"
+    "workspace_id",
+    "provider"
   ]
 }

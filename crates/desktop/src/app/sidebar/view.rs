@@ -15,7 +15,9 @@ use gpui_component::{
     tree::{TreeItem, tree},
     *,
 };
-use pioneer_protocol::{ThreadAgentsDocStatus, ThreadAgentsDocSummary};
+use pioneer_protocol::{
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement,
+};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +52,16 @@ enum SidebarTreeNodeKey<'a> {
 struct SidebarTreeModel {
     items: Vec<TreeItem>,
     visible_node_ids: Vec<String>,
+}
+
+struct SidebarTreeSourceData<'a> {
+    workspace_id: &'a str,
+    folders: Vec<&'a ThreadFolder>,
+    placements: Vec<&'a ThreadPlacement>,
+    sorted_thread_ids: Vec<String>,
+    agents_doc_summaries: Vec<&'a ThreadAgentsDocSummary>,
+    active_agents_doc_editor_scope: Option<&'a ThreadAgentsDocEditorScope>,
+    expanded_folder_ids: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,10 +138,28 @@ impl PioneerDesktop {
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
+        let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
-        let folders_by_id = self.thread_folders.clone();
-        let agents_doc_summaries = self.thread_agents_doc_summaries.clone();
-        let active_agents_doc_editor_scope = self.active_agents_doc_editor_scope.clone();
+        let folders_by_id: HashMap<String, ThreadFolder> = active_workspace_id
+            .as_deref()
+            .map(|workspace_id| {
+                self.thread_folders_for_workspace(workspace_id)
+                    .into_iter()
+                    .map(|folder| (folder.id.clone(), folder.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let agents_doc_summaries: HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> =
+            active_workspace_id
+                .as_deref()
+                .map(|workspace_id| {
+                    self.thread_agents_doc_summaries
+                        .iter()
+                        .filter(|(_, summary)| summary.workspace_id == workspace_id)
+                        .map(|(key, summary)| (key.clone(), summary.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
         let root_agents_doc_summary = agents_doc_summaries.get(&ThreadAgentsDocSummaryKey::Root);
         let root_agents_doc_active = agents_doc_has_active_explicit_badge(root_agents_doc_summary);
         let root_agents_doc_edit_menu_label =
@@ -312,15 +342,7 @@ impl PioneerDesktop {
                         )
                 }
                 SidebarTreeNodeKey::AgentsDocRoot => {
-                    let workspace_id = agents_doc_summaries
-                        .get(&ThreadAgentsDocSummaryKey::Root)
-                        .map(|summary| summary.workspace_id.clone())
-                        .or_else(|| {
-                            active_agents_doc_editor_scope
-                                .as_ref()
-                                .filter(|scope| scope.folder_id().is_none())
-                                .map(|scope| scope.workspace_id().to_owned())
-                        });
+                    let workspace_id = active_workspace_id.clone();
                     let open_listener = window.listener_for(
                         &desktop_entity,
                         move |view, _: &ClickEvent, window, cx| {
@@ -580,48 +602,56 @@ impl PioneerDesktop {
             .p_0()
             .gap_5()
             .child(
-                v_flex().pt_4().px_2().gap_1().child(
-                    Button::new("create-thread-session")
-                        .ghost()
-                        .justify_start()
-                        .px_2()
-                        .group("new-agent-btn")
-                        .selected(is_new_thread_active)
-                        .child({
-                            let icon_bg = cx.theme().foreground.opacity(0.075);
-                            let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                            div()
-                                .id("new-agent-icon")
-                                .size_6()
-                                .rounded_full()
-                                .bg(icon_bg)
-                                .group_hover("new-agent-btn", move |s| s.bg(icon_bg_hover))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(IconName::Plus)
-                                        .size_4()
-                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                        .when(is_new_thread_active, |this| this.opacity(1.0)),
-                                )
-                        })
+                v_flex().pt_4().px_2().gap_5().child(
+                    div()
+                        .w_full()
+                        .child(self.render_workspaces_popover(cx)),
+                ).child(
+                    v_flex()
+                        .gap_2()
                         .child(
-                            div()
-                                .flex_none()
-                                .line_height(relative(1.))
-                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                .when(is_new_thread_active, |this| this.opacity(1.0))
-                                .child(t!("sidebar.action.new_thread").to_string()),
-                        )
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.open_or_create_new_thread_from_sidebar(window, cx);
-                            cx.notify();
-                        })),
+                            Button::new("create-thread-session")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .group("new-agent-btn")
+                                .selected(is_new_thread_active)
+                                .child({
+                                    let icon_bg = cx.theme().foreground.opacity(0.075);
+                                    let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                    div()
+                                        .id("new-agent-icon")
+                                        .size_6()
+                                        .rounded_full()
+                                        .bg(icon_bg)
+                                        .group_hover("new-agent-btn", move |s| s.bg(icon_bg_hover))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::Plus)
+                                                .size_4()
+                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                                .when(is_new_thread_active, |this| this.opacity(1.0)),
+                                        )
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .line_height(relative(1.))
+                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                        .when(is_new_thread_active, |this| this.opacity(1.0))
+                                        .child(t!("sidebar.action.new_thread").to_string()),
+                                )
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.open_or_create_new_thread_from_sidebar(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
                 ),
             )
             .child(
-                v_flex().size_full().child(
+                div().flex_1().min_h_0().w_full().overflow_hidden().child(
                     div()
                         .size_full()
                         .id("thread-tree-root-drop")
@@ -687,7 +717,11 @@ impl PioneerDesktop {
     }
 
     fn sidebar_rows_by_thread_id(&self) -> HashMap<String, SidebarThreadRow> {
-        self.sorted_thread_ids()
+        let Some(workspace_id) = self.active_workspace_id() else {
+            return HashMap::new();
+        };
+
+        self.sorted_thread_ids_for_workspace(workspace_id)
             .into_iter()
             .map(|thread_id| {
                 let coordinator = self.thread_coordinator(thread_id.as_str());
@@ -708,122 +742,189 @@ impl PioneerDesktop {
     }
 
     fn build_sidebar_tree_items(&self) -> Vec<TreeItem> {
-        let mut folders_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        let Some(workspace_id) = self.active_workspace_id() else {
+            return sidebar_tree_items_with_header(Vec::new());
+        };
 
-        for folder in self.thread_folders.values() {
-            let parent_key = folder
-                .parent_folder_id
-                .as_deref()
-                .filter(|parent_id| self.thread_folders.contains_key(*parent_id))
-                .unwrap_or_default()
-                .to_owned();
-            folders_by_parent
-                .entry(parent_key)
-                .or_default()
-                .push(folder.id.clone());
-        }
+        build_sidebar_tree_items_from_workspace_data(SidebarTreeSourceData {
+            workspace_id,
+            folders: self.thread_folders_for_workspace(workspace_id),
+            placements: self.thread_placements_for_workspace(workspace_id),
+            sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
+            agents_doc_summaries: self
+                .thread_agents_doc_summaries
+                .values()
+                .filter(|summary| summary.workspace_id == workspace_id)
+                .collect(),
+            active_agents_doc_editor_scope: self.active_agents_doc_editor_scope.as_ref(),
+            expanded_folder_ids: self
+                .thread_folder_expanded
+                .iter()
+                .filter_map(|(folder_id, expanded)| expanded.then_some(folder_id.clone()))
+                .collect(),
+        })
+    }
+}
 
-        for folder_ids in folders_by_parent.values_mut() {
-            folder_ids.sort_by(|lhs, rhs| {
-                let lhs_name = self
-                    .thread_folders
-                    .get(lhs.as_str())
-                    .map(|folder| folder.name.as_str())
-                    .unwrap_or_default();
-                let rhs_name = self
-                    .thread_folders
-                    .get(rhs.as_str())
-                    .map(|folder| folder.name.as_str())
-                    .unwrap_or_default();
-                lhs_name
-                    .to_lowercase()
-                    .cmp(&rhs_name.to_lowercase())
-                    .then_with(|| lhs.cmp(rhs))
-            });
-        }
+fn build_sidebar_tree_items_from_workspace_data(data: SidebarTreeSourceData<'_>) -> Vec<TreeItem> {
+    let folders_by_id: HashMap<String, &ThreadFolder> = data
+        .folders
+        .into_iter()
+        .filter(|folder| folder.workspace_id == data.workspace_id)
+        .map(|folder| (folder.id.clone(), folder))
+        .collect();
+    let folder_id_set: HashSet<String> = folders_by_id.keys().cloned().collect();
+    let placements_by_thread_id: HashMap<String, &ThreadPlacement> = data
+        .placements
+        .into_iter()
+        .filter(|placement| placement.workspace_id == data.workspace_id)
+        .map(|placement| (placement.thread_id.clone(), placement))
+        .collect();
+    let mut visible_agents_doc_keys: HashSet<ThreadAgentsDocSummaryKey> = data
+        .agents_doc_summaries
+        .into_iter()
+        .filter(|summary| summary.workspace_id == data.workspace_id)
+        .map(|summary| ThreadAgentsDocSummaryKey::from_folder_id(summary.folder_id.as_deref()))
+        .collect();
 
-        let mut threads_by_folder: HashMap<String, Vec<String>> = HashMap::new();
-        for thread_id in self.sorted_thread_ids() {
-            let folder_key = self
-                .thread_placement_folder_id(thread_id.as_str())
-                .filter(|folder_id| self.thread_folders.contains_key(*folder_id))
-                .unwrap_or_default()
-                .to_owned();
-            threads_by_folder
-                .entry(folder_key)
-                .or_default()
-                .push(thread_id);
-        }
-
-        let mut visited_folders = HashSet::new();
-        let mut items = self.build_sidebar_tree_branch(
-            "",
-            &folders_by_parent,
-            &threads_by_folder,
-            &mut visited_folders,
-        );
-        if self.agents_doc_tree_file_visible(None) {
-            items.insert(0, TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"));
-        }
-        items.insert(
-            0,
-            TreeItem::new(THREADS_HEADER_NODE_ID, "threads-header").disabled(true),
-        );
-        items
+    if let Some(scope) = data
+        .active_agents_doc_editor_scope
+        .filter(|scope| scope.workspace_id() == data.workspace_id)
+    {
+        visible_agents_doc_keys
+            .insert(ThreadAgentsDocSummaryKey::from_folder_id(scope.folder_id()));
     }
 
-    fn build_sidebar_tree_branch(
-        &self,
-        parent_key: &str,
-        folders_by_parent: &HashMap<String, Vec<String>>,
-        threads_by_folder: &HashMap<String, Vec<String>>,
-        visited_folders: &mut HashSet<String>,
-    ) -> Vec<TreeItem> {
-        let mut items = Vec::new();
+    let mut folders_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for folder in folders_by_id.values() {
+        let parent_key = folder
+            .parent_folder_id
+            .as_deref()
+            .filter(|parent_id| folder_id_set.contains(*parent_id))
+            .unwrap_or_default()
+            .to_owned();
+        folders_by_parent
+            .entry(parent_key)
+            .or_default()
+            .push(folder.id.clone());
+    }
 
-        if let Some(folder_ids) = folders_by_parent.get(parent_key) {
-            for folder_id in folder_ids {
-                if !visited_folders.insert(folder_id.clone()) {
-                    continue;
-                }
+    for folder_ids in folders_by_parent.values_mut() {
+        folder_ids.sort_by(|lhs, rhs| {
+            let lhs_name = folders_by_id
+                .get(lhs.as_str())
+                .map(|folder| folder.name.as_str())
+                .unwrap_or_default();
+            let rhs_name = folders_by_id
+                .get(rhs.as_str())
+                .map(|folder| folder.name.as_str())
+                .unwrap_or_default();
+            lhs_name
+                .to_lowercase()
+                .cmp(&rhs_name.to_lowercase())
+                .then_with(|| lhs.cmp(rhs))
+        });
+    }
 
-                let mut children = self.build_sidebar_tree_branch(
-                    folder_id.as_str(),
-                    folders_by_parent,
-                    threads_by_folder,
-                    visited_folders,
+    let mut threads_by_folder: HashMap<String, Vec<String>> = HashMap::new();
+    for thread_id in data.sorted_thread_ids {
+        let folder_key = placements_by_thread_id
+            .get(thread_id.as_str())
+            .and_then(|placement| placement.folder_id.as_deref())
+            .filter(|folder_id| folder_id_set.contains(*folder_id))
+            .unwrap_or_default()
+            .to_owned();
+        threads_by_folder
+            .entry(folder_key)
+            .or_default()
+            .push(thread_id);
+    }
+
+    let mut visited_folders = HashSet::new();
+    let mut items = build_sidebar_tree_branch_from_workspace_data(
+        "",
+        &folders_by_id,
+        &folders_by_parent,
+        &threads_by_folder,
+        &visible_agents_doc_keys,
+        &data.expanded_folder_ids,
+        &mut visited_folders,
+    );
+    if visible_agents_doc_keys.contains(&ThreadAgentsDocSummaryKey::Root) {
+        items.insert(0, TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"));
+    }
+
+    sidebar_tree_items_with_header(items)
+}
+
+fn sidebar_tree_items_with_header(mut items: Vec<TreeItem>) -> Vec<TreeItem> {
+    if items.is_empty() {
+        return items;
+    }
+
+    items.insert(
+        0,
+        TreeItem::new(THREADS_HEADER_NODE_ID, "threads-header").disabled(true),
+    );
+    items
+}
+
+fn build_sidebar_tree_branch_from_workspace_data(
+    parent_key: &str,
+    folders_by_id: &HashMap<String, &ThreadFolder>,
+    folders_by_parent: &HashMap<String, Vec<String>>,
+    threads_by_folder: &HashMap<String, Vec<String>>,
+    visible_agents_doc_keys: &HashSet<ThreadAgentsDocSummaryKey>,
+    expanded_folder_ids: &HashSet<String>,
+    visited_folders: &mut HashSet<String>,
+) -> Vec<TreeItem> {
+    let mut items = Vec::new();
+
+    if let Some(folder_ids) = folders_by_parent.get(parent_key) {
+        for folder_id in folder_ids {
+            if !visited_folders.insert(folder_id.clone()) {
+                continue;
+            }
+
+            let mut children = build_sidebar_tree_branch_from_workspace_data(
+                folder_id.as_str(),
+                folders_by_id,
+                folders_by_parent,
+                threads_by_folder,
+                visible_agents_doc_keys,
+                expanded_folder_ids,
+                visited_folders,
+            );
+            let folder_summary_key = ThreadAgentsDocSummaryKey::Folder(folder_id.clone());
+            if visible_agents_doc_keys.contains(&folder_summary_key) {
+                children.insert(
+                    0,
+                    TreeItem::new(agents_doc_folder_node_key(folder_id.as_str()), "AGENTS.md"),
                 );
-                if self.agents_doc_tree_file_visible(Some(folder_id.as_str())) {
-                    children.insert(
-                        0,
-                        TreeItem::new(agents_doc_folder_node_key(folder_id.as_str()), "AGENTS.md"),
-                    );
-                }
-
-                let folder_name = self
-                    .thread_folders
-                    .get(folder_id.as_str())
-                    .map(|folder| folder.name.clone())
-                    .unwrap_or_else(|| folder_id.clone());
-
-                let item = TreeItem::new(folder_node_key(folder_id.as_str()), folder_name)
-                    .children(children)
-                    .expanded(self.is_thread_folder_expanded(folder_id.as_str()));
-                items.push(item);
             }
-        }
 
-        if let Some(thread_ids) = threads_by_folder.get(parent_key) {
-            for thread_id in thread_ids {
-                items.push(TreeItem::new(
-                    thread_node_key(thread_id.as_str()),
-                    thread_id.clone(),
-                ));
-            }
-        }
+            let folder_name = folders_by_id
+                .get(folder_id.as_str())
+                .map(|folder| folder.name.clone())
+                .unwrap_or_else(|| folder_id.clone());
 
-        items
+            let item = TreeItem::new(folder_node_key(folder_id.as_str()), folder_name)
+                .children(children)
+                .expanded(expanded_folder_ids.contains(folder_id.as_str()));
+            items.push(item);
+        }
     }
+
+    if let Some(thread_ids) = threads_by_folder.get(parent_key) {
+        for thread_id in thread_ids {
+            items.push(TreeItem::new(
+                thread_node_key(thread_id.as_str()),
+                thread_id.clone(),
+            ));
+        }
+    }
+
+    items
 }
 
 fn thread_node_key(thread_id: &str) -> String {
@@ -1015,15 +1116,47 @@ mod tests {
     };
 
     fn agents_doc_summary(status: ThreadAgentsDocStatus) -> ThreadAgentsDocSummary {
+        agents_doc_summary_for_workspace("ws_1", Some("fld_1"), status)
+    }
+
+    fn agents_doc_summary_for_workspace(
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        status: ThreadAgentsDocStatus,
+    ) -> ThreadAgentsDocSummary {
         ThreadAgentsDocSummary {
             id: "agd_1".to_owned(),
-            workspace_id: "ws_1".to_owned(),
-            folder_id: Some("fld_1".to_owned()),
+            workspace_id: workspace_id.to_owned(),
+            folder_id: folder_id.map(str::to_owned),
             status,
             content_sha256: "sha256:test".to_owned(),
             version: 1,
             char_count: 20,
             updated_at: 1_700_000_000,
+        }
+    }
+
+    fn folder(
+        folder_id: &str,
+        workspace_id: &str,
+        parent_folder_id: Option<&str>,
+        name: &str,
+    ) -> ThreadFolder {
+        ThreadFolder {
+            id: folder_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            parent_folder_id: parent_folder_id.map(str::to_owned),
+            name: name.to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn placement(thread_id: &str, workspace_id: &str, folder_id: Option<&str>) -> ThreadPlacement {
+        ThreadPlacement {
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            folder_id: folder_id.map(str::to_owned),
         }
     }
 
@@ -1107,6 +1240,54 @@ mod tests {
                 agents_doc_folder_node_key("b")
             ]
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn sidebar_tree_header_is_hidden_for_empty_tree() {
+        assert!(sidebar_tree_items_with_header(Vec::new()).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn sidebar_tree_builder_filters_folders_placements_and_agents_docs_by_workspace() {
+        let folder_a = folder("fld_a", "ws_a", None, "Alpha");
+        let folder_b = folder("fld_b", "ws_b", None, "Beta");
+        let placement_a = placement("thr_a", "ws_a", Some("fld_a"));
+        let placement_b = placement("thr_b", "ws_b", Some("fld_b"));
+        let root_agents_doc_a =
+            agents_doc_summary_for_workspace("ws_a", None, ThreadAgentsDocStatus::Active);
+        let folder_agents_doc_a =
+            agents_doc_summary_for_workspace("ws_a", Some("fld_a"), ThreadAgentsDocStatus::Active);
+        let root_agents_doc_b =
+            agents_doc_summary_for_workspace("ws_b", None, ThreadAgentsDocStatus::Active);
+
+        let items = build_sidebar_tree_items_from_workspace_data(SidebarTreeSourceData {
+            workspace_id: "ws_a",
+            folders: vec![&folder_a, &folder_b],
+            placements: vec![&placement_a, &placement_b],
+            sorted_thread_ids: vec!["thr_a".to_owned(), "thr_orphan".to_owned()],
+            agents_doc_summaries: vec![
+                &root_agents_doc_a,
+                &folder_agents_doc_a,
+                &root_agents_doc_b,
+            ],
+            active_agents_doc_editor_scope: None,
+            expanded_folder_ids: HashSet::from(["fld_a".to_owned()]),
+        });
+
+        let ids = collect_visible_node_ids(items.as_slice());
+        assert_eq!(
+            ids,
+            vec![
+                THREADS_HEADER_NODE_ID.to_owned(),
+                agents_doc_root_node_key(),
+                folder_node_key("fld_a"),
+                agents_doc_folder_node_key("fld_a"),
+                thread_node_key("thr_a"),
+                thread_node_key("thr_orphan"),
+            ]
+        );
+        assert!(!ids.contains(&folder_node_key("fld_b")));
+        assert!(!ids.contains(&thread_node_key("thr_b")));
     }
 
     #[::core::prelude::v1::test]

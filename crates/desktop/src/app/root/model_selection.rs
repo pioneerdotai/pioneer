@@ -65,7 +65,9 @@ impl PioneerDesktop {
 
     fn resolve_composer_model_selection(&self) -> Option<ComposerModelSelection> {
         let active_thread_id = self.current_active_thread_id()?;
-        let active_workspace_id = self.thread_workspace_id(active_thread_id);
+        let active_workspace_id = self
+            .active_workspace_id()
+            .or_else(|| self.thread_workspace_id(active_thread_id));
 
         resolve_composer_model_selection(
             Some(active_thread_id),
@@ -121,21 +123,21 @@ pub(super) fn resolve_composer_model_selection(
 ) -> Option<ComposerModelSelection> {
     let active_thread_id = active_thread_id?;
 
-    if let Some(active) = candidates
+    let active_candidate = candidates
         .iter()
-        .find(|candidate| candidate.thread_id == active_thread_id)
-    {
-        if active.has_turns {
-            return active.selection.clone();
-        }
-    }
-
+        .find(|candidate| candidate.thread_id == active_thread_id);
     let workspace_id = active_workspace_id.map(str::to_owned).or_else(|| {
         candidates
             .iter()
             .find(|candidate| candidate.thread_id == active_thread_id)
             .map(|candidate| candidate.workspace_id.clone())
     })?;
+
+    if let Some(active) = active_candidate {
+        if active.workspace_id == workspace_id && active.has_turns {
+            return active.selection.clone();
+        }
+    }
 
     candidates
         .into_iter()
@@ -249,5 +251,26 @@ mod tests {
         );
 
         assert_eq!(resolved, selection("openai", "gpt-5.4"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_old_active"),
+            Some("ws_b"),
+            vec![
+                candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
+                candidate(
+                    "thread_b",
+                    "ws_b",
+                    20,
+                    true,
+                    "openrouter",
+                    "anthropic/claude",
+                ),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
     }
 }

@@ -61,6 +61,18 @@ impl Render for PioneerDesktop {
             } else {
                 self.render_sidebar(cx)
             };
+            let sidebar = v_flex()
+                .size_full()
+                .bg(cx.theme().sidebar)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(sidebar),
+                )
+                .into_any_element();
 
             v_flex()
                 .size_full()

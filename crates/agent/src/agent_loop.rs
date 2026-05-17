@@ -89,7 +89,9 @@ pub(super) async fn run_agent_loop(
                     execution_options: super::TurnExecutionOptions::default(),
                 };
 
-                let provider = match provider_registry.get_or_create(&provider_name) {
+                let provider = match provider_registry
+                    .get_or_create_for_workspace(workspace_id.as_str(), &provider_name)
+                {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = ack.send(Err(AgentStartError::Internal(format!(
@@ -403,9 +405,10 @@ pub(super) async fn run_agent_loop(
                     text_elements: Vec::new(),
                 });
 
-                let provider = match provider_registry
-                    .get_or_create(turn_request.provider_name.as_str())
-                {
+                let provider = match provider_registry.get_or_create_for_workspace(
+                    workspace_id.as_str(),
+                    turn_request.provider_name.as_str(),
+                ) {
                     Ok(provider) => provider,
                     Err(error) => {
                         let _ = ack.send(Err(super::AgentControlError::Internal(format!(
@@ -463,9 +466,10 @@ pub(super) async fn run_agent_loop(
                         provider_registry.invalidate(turn_request.provider_name.as_str());
                     }
 
-                    let provider = match provider_registry
-                        .get_or_create(turn_request.provider_name.as_str())
-                    {
+                    let provider = match provider_registry.get_or_create_for_workspace(
+                        workspace_id.as_str(),
+                        turn_request.provider_name.as_str(),
+                    ) {
                         Ok(provider) => provider,
                         Err(error) => {
                             let _ = ack.send(Err(super::AgentControlError::Internal(format!(
@@ -557,17 +561,19 @@ pub(super) async fn run_agent_loop(
                     provider_registry.invalidate(turn_request.provider_name.as_str());
                 }
 
-                let provider =
-                    match provider_registry.get_or_create(turn_request.provider_name.as_str()) {
-                        Ok(provider) => provider,
-                        Err(error) => {
-                            let _ = ack.send(Err(super::AgentControlError::Internal(format!(
-                                "failed to recreate provider `{}` for recovery: {error}",
-                                turn_request.provider_name
-                            ))));
-                            continue;
-                        }
-                    };
+                let provider = match provider_registry.get_or_create_for_workspace(
+                    workspace_id.as_str(),
+                    turn_request.provider_name.as_str(),
+                ) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                            "failed to recreate provider `{}` for recovery: {error}",
+                            turn_request.provider_name
+                        ))));
+                        continue;
+                    }
+                };
 
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);

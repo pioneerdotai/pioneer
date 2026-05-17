@@ -43,30 +43,32 @@ use pioneer_protocol::{
     PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
     PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
     PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
-    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
-    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
-    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
-    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentSpecInput, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
-    TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
-    TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, Thread,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
-    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
-    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnSkillBinding, TurnStartResponse,
-    TurnStatus, TurnTimelineParams, TurnTimelineResponse, UserInput, UserMessageAttachment,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse, constants::events,
+    ProviderDeleteApiKeyResponse, ProviderListParams, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger,
+    SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
+    SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
+    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
+    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
+    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
+    TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
+    TaskTriggerStatus, TaskValue, TaskWaitParams, Thread, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
+    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
+    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+    ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
+    TurnKind, TurnOrigin, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
+    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -1051,13 +1053,15 @@ async fn setup_provider_api_key_processor(
     Arc<MemorySecretStore>,
     mpsc::Receiver<Message>,
     u64,
+    Arc<WorkspaceManager>,
+    String,
     std::path::PathBuf,
 ) {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, rx) = mpsc::channel(16);
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let secret_store = Arc::new(MemorySecretStore::new());
     let gateway_secrets = Arc::new(GatewaySecrets::new(secret_store.clone()));
     let base_dir = unique_temp_dir(case_id);
@@ -1067,7 +1071,7 @@ async fn setup_provider_api_key_processor(
         thread_manager,
         test_provider(),
         session_manager,
-        workspace_manager,
+        workspace_manager.clone(),
         crud_store,
         gateway_secrets,
         test_summary_config(),
@@ -1075,19 +1079,42 @@ async fn setup_provider_api_key_processor(
         test_tool_loop_config(),
     );
 
-    (processor, secret_store, rx, connection_id, settings_path)
+    (
+        processor,
+        secret_store,
+        rx,
+        connection_id,
+        workspace_manager,
+        workspace_id,
+        settings_path,
+    )
 }
 
 #[tokio::test]
 async fn provider_api_key_handlers_use_keystore_without_settings_write() {
-    let (processor, secret_store, mut rx, connection_id, settings_path) =
-        setup_provider_api_key_processor("provider_api_key_handlers").await;
+    let (
+        processor,
+        secret_store,
+        mut rx,
+        connection_id,
+        workspace_manager,
+        workspace_id,
+        settings_path,
+    ) = setup_provider_api_key_processor("provider_api_key_handlers").await;
+    let other_workspace_id = workspace_manager
+        .create_workspace("provider_scope_other", Some("Provider Scope Other"))
+        .await
+        .expect("create other workspace")
+        .id;
     let set_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "set"))
             .expect("valid set request id");
     let list_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list"))
             .expect("valid list request id");
+    let other_list_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list_other"))
+            .expect("valid other list request id");
     let delete_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "delete"))
             .expect("valid delete request id");
@@ -1100,6 +1127,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
             connection_id,
             set_request_id.clone(),
             ProviderSetApiKeyParams {
+                workspace_id: workspace_id.clone(),
                 provider: "  OpenRouter  ".to_owned(),
                 api_key: "sk-secret-provider-key".to_owned(),
             },
@@ -1112,7 +1140,10 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     assert!(set_payload.updated);
     assert_eq!(
         secret_store
-            .get_string(&SecretId::provider_api_key("openrouter").expect("provider id"))
+            .get_string(
+                &SecretId::workspace_provider_api_key(workspace_id.as_str(), "openrouter")
+                    .expect("provider id"),
+            )
             .expect("read provider key"),
         Some("sk-secret-provider-key".to_owned())
     );
@@ -1122,7 +1153,13 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     );
 
     processor
-        .provider_list(connection_id, list_request_id.clone())
+        .provider_list(
+            connection_id,
+            list_request_id.clone(),
+            ProviderListParams {
+                workspace_id: workspace_id.clone(),
+            },
+        )
         .await;
     let list_response = recv_response_by_id(&mut rx, list_request_id.as_str()).await;
     let list_payload: ProviderListResponse =
@@ -1131,10 +1168,25 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     assert_eq!(list_payload.providers[0].name, "openrouter");
 
     processor
+        .provider_list(
+            connection_id,
+            other_list_request_id.clone(),
+            ProviderListParams {
+                workspace_id: other_workspace_id,
+            },
+        )
+        .await;
+    let other_list_response = recv_response_by_id(&mut rx, other_list_request_id.as_str()).await;
+    let other_list_payload: ProviderListResponse =
+        serde_json::from_value(other_list_response.result).expect("provider/list other payload");
+    assert!(other_list_payload.providers.is_empty());
+
+    processor
         .provider_delete_api_key(
             connection_id,
             delete_request_id.clone(),
             ProviderDeleteApiKeyParams {
+                workspace_id: workspace_id.clone(),
                 provider: "OpenRouter".to_owned(),
             },
         )
@@ -1146,7 +1198,10 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     assert!(delete_payload.deleted);
     assert_eq!(
         secret_store
-            .get_string(&SecretId::provider_api_key("openrouter").expect("provider id"))
+            .get_string(
+                &SecretId::workspace_provider_api_key(workspace_id.as_str(), "openrouter")
+                    .expect("provider id"),
+            )
             .expect("read deleted provider key"),
         None
     );
@@ -1156,6 +1211,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
             connection_id,
             delete_missing_request_id.clone(),
             ProviderDeleteApiKeyParams {
+                workspace_id,
                 provider: "openrouter".to_owned(),
             },
         )
@@ -1171,8 +1227,15 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
 
 #[tokio::test]
 async fn provider_set_api_key_rejects_empty_key_without_store_write() {
-    let (processor, secret_store, mut rx, connection_id, _settings_path) =
-        setup_provider_api_key_processor("provider_api_key_empty").await;
+    let (
+        processor,
+        secret_store,
+        mut rx,
+        connection_id,
+        _workspace_manager,
+        workspace_id,
+        _settings_path,
+    ) = setup_provider_api_key_processor("provider_api_key_empty").await;
     let request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "empty"))
             .expect("valid request id");
@@ -1182,6 +1245,7 @@ async fn provider_set_api_key_rejects_empty_key_without_store_write() {
             connection_id,
             request_id.clone(),
             ProviderSetApiKeyParams {
+                workspace_id,
                 provider: "openrouter".to_owned(),
                 api_key: "   ".to_owned(),
             },
@@ -5750,6 +5814,271 @@ async fn workspace_create_rejects_missing_workspace_id() {
     assert!(
         message.contains("workspace_id"),
         "error should mention missing workspace_id, got: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_select_returns_workspace_and_sets_session_scope() {
+    let (processor, session_manager, connection_id, mut rx, workspace_manager, _) =
+        setup_workspace_message_processor().await;
+    let selected = workspace_manager
+        .create_workspace("ws_000000000000000112", Some("Selected Workspace"))
+        .await
+        .expect("workspace create should succeed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "aaaaaaaaaaaaaaaaaaaaa",
+        "method": "workspace/select",
+        "params": {
+            "workspace_id": selected.id,
+            "make_current": true
+        }
+    });
+
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let response = recv_text(&mut rx).await;
+    let rpc_response: JsonRpcResponse =
+        serde_json::from_str(&response).expect("workspace/select response should decode");
+    let selected_response: WorkspaceSelectResponse =
+        serde_json::from_value(rpc_response.result).expect("workspace/select result decode");
+    assert_eq!(selected_response.workspace.id, "ws_000000000000000112");
+    assert!(selected_response.workspace.is_current);
+    assert_eq!(
+        session_manager.connection_workspace_id(connection_id).await,
+        Some("ws_000000000000000112".to_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_update_returns_updated_workspace_without_switching_session() {
+    let (
+        processor,
+        session_manager,
+        connection_id,
+        mut rx,
+        workspace_manager,
+        current_workspace_id,
+    ) = setup_workspace_message_processor().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(current_workspace_id.clone()))
+        .await;
+    let updated = workspace_manager
+        .create_workspace("ws_000000000000000113", Some("Before Rename"))
+        .await
+        .expect("workspace create should succeed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "aaaaaaaaaaaaaaaaaaaaa",
+        "method": "workspace/update",
+        "params": {
+            "workspace_id": updated.id,
+            "name": "  After Rename  "
+        }
+    });
+
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let response = recv_text(&mut rx).await;
+    let rpc_response: JsonRpcResponse =
+        serde_json::from_str(&response).expect("workspace/update response should decode");
+    let updated_response: WorkspaceUpdateResponse =
+        serde_json::from_value(rpc_response.result).expect("workspace/update result decode");
+    assert_eq!(updated_response.workspace.id, "ws_000000000000000113");
+    assert_eq!(updated_response.workspace.name, "After Rename");
+    assert_eq!(
+        session_manager.connection_workspace_id(connection_id).await,
+        Some(current_workspace_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_select_rejects_malformed_params_without_mutating_session_scope() {
+    let (processor, session_manager, connection_id, mut rx, _, current_workspace_id) =
+        setup_workspace_message_processor().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(current_workspace_id.clone()))
+        .await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "aaaaaaaaaaaaaaaaaaaaa",
+        "method": "workspace/select",
+        "params": {
+            "make_current": true
+        }
+    });
+
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let response = recv_text(&mut rx).await;
+    let payload: serde_json::Value =
+        serde_json::from_str(&response).expect("workspace/select error should decode");
+    assert_eq!(
+        payload
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_i64),
+        Some(pioneer_protocol::INVALID_PARAMS_CODE as i64)
+    );
+    assert_eq!(
+        session_manager.connection_workspace_id(connection_id).await,
+        Some(current_workspace_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
+    let (tx_a, mut rx_a) = mpsc::channel(8);
+    let (tx_b, mut rx_b) = mpsc::channel(8);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_a = session_manager.register_connection(tx_a).await;
+    let connection_b = session_manager.register_connection(tx_b).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, current_workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_b, Some(current_workspace_id))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "workspacecreate000001",
+        "method": "workspace/create",
+        "params": {
+            "workspace_id": "ws_000000000000000114",
+            "name": "Broadcast Workspace"
+        }
+    });
+
+    processor
+        .process_request(connection_a, &request.to_string())
+        .await;
+
+    let (_response, notification_a) = recv_response_and_notification_by_id_method(
+        &mut rx_a,
+        "workspacecreate000001",
+        events::WORKSPACE_CHANGED,
+    )
+    .await;
+    let notification_b = recv_notification_by_method(&mut rx_b, events::WORKSPACE_CHANGED).await;
+
+    for notification in [notification_a, notification_b] {
+        let changed: WorkspaceChangedNotification =
+            serde_json::from_value(notification.params.expect("workspace/changed params"))
+                .expect("workspace/changed payload decodes");
+        assert_eq!(changed.kind, WorkspaceChangeKind::Created);
+        assert_eq!(changed.workspace.id, "ws_000000000000000114");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_update_broadcasts_updated_notification() {
+    let (processor, _session_manager, connection_id, mut rx, workspace_manager, _) =
+        setup_workspace_message_processor().await;
+    let workspace = workspace_manager
+        .create_workspace("ws_000000000000000115", Some("Before"))
+        .await
+        .expect("workspace create should succeed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "workspaceupdate000001",
+        "method": "workspace/update",
+        "params": {
+            "workspace_id": workspace.id,
+            "name": "After"
+        }
+    });
+
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let (_response, notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "workspaceupdate000001",
+        events::WORKSPACE_CHANGED,
+    )
+    .await;
+    let changed: WorkspaceChangedNotification =
+        serde_json::from_value(notification.params.expect("workspace/changed params"))
+            .expect("workspace/changed payload decodes");
+    assert_eq!(changed.kind, WorkspaceChangeKind::Updated);
+    assert_eq!(changed.workspace.name, "After");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_select_broadcasts_current_change_only_when_current_changes() {
+    let (processor, _session_manager, connection_id, mut rx, workspace_manager, _) =
+        setup_workspace_message_processor().await;
+    let workspace = workspace_manager
+        .create_workspace("ws_000000000000000116", Some("Selectable"))
+        .await
+        .expect("workspace create should succeed");
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "workspaceselect000001",
+        "method": "workspace/select",
+        "params": {
+            "workspace_id": workspace.id,
+            "make_current": true
+        }
+    });
+
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let (_response, notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "workspaceselect000001",
+        events::WORKSPACE_CHANGED,
+    )
+    .await;
+    let changed: WorkspaceChangedNotification =
+        serde_json::from_value(notification.params.expect("workspace/changed params"))
+            .expect("workspace/changed payload decodes");
+    assert_eq!(changed.kind, WorkspaceChangeKind::CurrentChanged);
+    assert_eq!(changed.workspace.id, "ws_000000000000000116");
+
+    let repeat = json!({
+        "jsonrpc": "2.0",
+        "id": "workspaceselect000002",
+        "method": "workspace/select",
+        "params": {
+            "workspace_id": "ws_000000000000000116",
+            "make_current": true
+        }
+    });
+
+    processor
+        .process_request(connection_id, &repeat.to_string())
+        .await;
+
+    let _response = recv_response_by_id(&mut rx, "workspaceselect000002").await;
+    assert!(
+        timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "repeat selection of already-current workspace must not emit workspace/changed"
     );
 }
 
@@ -11306,6 +11635,41 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
     (
         workspace_manager,
         Arc::new(CrudStore::new(connection)),
+        workspace_id,
+    )
+}
+
+async fn setup_workspace_message_processor() -> (
+    MessageProcessor,
+    Arc<SessionManager>,
+    crate::session::ConnectionId,
+    mpsc::Receiver<Message>,
+    Arc<WorkspaceManager>,
+    String,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager.clone(),
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    (
+        processor,
+        session_manager,
+        connection_id,
+        rx,
+        workspace_manager,
         workspace_id,
     )
 }

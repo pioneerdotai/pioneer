@@ -15,7 +15,9 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_protocol::{ProviderListModelsParams, ProviderModelInfo, ProviderSummary};
+use pioneer_protocol::{
+    ProviderListModelsParams, ProviderListParams, ProviderModelInfo, ProviderSummary,
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -34,6 +36,7 @@ const SELECTOR_POPOVER_FALLBACK_WIDTH: f32 = 380.0;
 struct ModelSelectorDialogState {
     desktop_entity: Entity<PioneerDesktop>,
     ws_sender: GatewayWsCommandSender,
+    workspace_id: String,
     providers: Rc<RefCell<Vec<ProviderSummary>>>,
     models: Rc<RefCell<Vec<ProviderModelInfo>>>,
     selected_provider: Rc<RefCell<Option<String>>>,
@@ -171,6 +174,15 @@ impl PioneerDesktop {
     fn open_model_selector_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let desktop_entity = cx.entity().clone();
         let ws_sender = self.gateway.ws_command_sender.clone();
+        let workspace_id = self
+            .active_workspace_id()
+            .or_else(|| {
+                self.active_thread_id
+                    .as_deref()
+                    .and_then(|thread_id| self.thread_workspace_id(thread_id))
+            })
+            .map(str::to_owned)
+            .unwrap_or_default();
 
         // Shared dialog state via Rc<RefCell<..>>
         let providers: Rc<RefCell<Vec<ProviderSummary>>> = Rc::new(RefCell::new(Vec::new()));
@@ -200,6 +212,7 @@ impl PioneerDesktop {
         let state = ModelSelectorDialogState {
             desktop_entity,
             ws_sender,
+            workspace_id,
             providers,
             models,
             selected_provider,
@@ -230,12 +243,15 @@ impl PioneerDesktop {
         let loading_providers = state.loading_providers.clone();
         let error_message = state.error_message.clone();
         let ws_sender = state.ws_sender.clone();
+        let workspace_id = state.workspace_id.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.provider_list() })
+                    .background_spawn(async move {
+                        ws_sender.provider_list(ProviderListParams { workspace_id })
+                    })
                     .await;
                 let _ = this.update(&mut cx, |_view, cx| {
                     match result {
@@ -276,6 +292,7 @@ impl PioneerDesktop {
         let model_row_layout_cache = state.model_row_layout_cache.clone();
         let ws_sender = state.ws_sender.clone();
         let desktop_entity = state.desktop_entity.clone();
+        let workspace_id = state.workspace_id.clone();
 
         cx.spawn(move |cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -283,6 +300,7 @@ impl PioneerDesktop {
                 let result = cx
                     .background_spawn(async move {
                         ws_sender.provider_list_models(ProviderListModelsParams {
+                            workspace_id,
                             provider: provider_name,
                         })
                     })

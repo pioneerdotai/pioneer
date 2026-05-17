@@ -7,6 +7,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "workspace_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/WorkspaceChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "thread_started"
         },
         "params": {
@@ -8694,6 +8710,62 @@
         "url",
         "snippet",
         "source"
+      ]
+    },
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkspaceChangeKind": {
+      "type": "string",
+      "enum": [
+        "created",
+        "updated",
+        "current_changed"
+      ]
+    },
+    "WorkspaceChangedNotification": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/WorkspaceChangeKind"
+        },
+        "workspace": {
+          "$ref": "#/$defs/Workspace"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace"
       ]
     }
   }
