@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` debe ser mayor 
 [errors.gateway]
 address_conflict_inactive_service = "la dirección `%{listen_addr}` ya está ocupada, pero el servicio configurado `%{service_name}` no está activo; detén el proceso/servicio en conflicto o cambia gateway.listen_addr"
 address_empty = "la dirección de la pasarela no debe estar vacía"
+address_already_exists = "la pasarela `%{address}` ya está en la lista"
 id_not_found = "no se encontró el id de pasarela `%{id}`"
 invalid_address = "dirección de pasarela no válida `%{normalized}`; se espera host:port"
+local_delete_unsupported = "la pasarela local no se puede eliminar de la lista"
+remote_edit_only = "solo se pueden editar pasarelas remotas"
 resolve_empty = "la dirección de pasarela `%{listen_addr}` no resolvió a ninguna dirección de socket"
 resolve_failed = "no se pudo resolver la dirección de pasarela `%{listen_addr}`"
 start_command_failed_manual_help = "no se pudo instalar o iniciar automáticamente la pasarela local; vuelve a intentarlo y verifica la configuración local del gateway"
@@ -145,12 +148,22 @@ open_failed = "no se pudo abrir la ventana de escritorio"
 [gateway.action]
 add = "Añadir pasarela"
 connect_remote = "Conectar pasarela remota"
+delete = "Eliminar"
+edit = "Editar pasarela"
 start_local = "Iniciar pasarela local"
 
 [gateway.add]
 description = "Conecta una pasarela remota o inicia la pasarela local."
 description_remote_only = "Conecta una pasarela remota."
 title = "Añadir pasarela"
+
+[gateway.delete]
+confirm_description = "Esto elimina la pasarela de este escritorio. Los datos del servidor no se eliminan."
+confirm_title = "¿Eliminar %{name}?"
+
+[gateway.edit]
+description = "Actualiza los detalles de conexión de la pasarela."
+title = "Editar %{name}"
 
 [gateway.endpoint]
 local_name = "Pasarela local"
@@ -173,12 +186,14 @@ connected = "Pasarela conectada"
 connecting = "Conectando pasarela..."
 connecting_named = "Conectando a %{gateway_name}..."
 connecting_remote = "Conectando a la pasarela remota..."
+deleting = "Eliminando pasarela..."
 failed_check = "Error al comprobar el estado de la pasarela: %{error}"
 local_conflict = "Conflicto de la pasarela local: la dirección está ocupada por otro proceso."
 local_conflict_at = "Conflicto de la pasarela local en %{gateway_address}: la dirección está ocupada por otro proceso."
 local_stopped = "La pasarela local está detenida: %{gateway_address}. Inicia la pasarela local o cambia a una remota."
 not_configured = "La pasarela aún no está configurada. Agrega una dirección remota o inicia una pasarela local."
 remote_unavailable = "Pasarela remota no disponible: %{gateway_name} (%{gateway_address})"
+saving = "Guardando pasarela..."
 starting_local = "Iniciando pasarela local..."
 installing = "Instalando pasarela..."
 updating = "Actualizando pasarela..."

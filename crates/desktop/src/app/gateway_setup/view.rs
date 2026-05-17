@@ -4,6 +4,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
+    button::ButtonVariants,
     divider::Divider,
     form::{field, v_form},
     input::{Input, InputState},
@@ -86,6 +87,22 @@ impl GatewaySetupFormState {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.token_input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    pub(crate) fn set_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        name: String,
+        address: String,
+        token: String,
+    ) {
+        self.name_input_state
+            .update(cx, |state, cx| state.set_value(name.clone(), window, cx));
+        self.address_input_state
+            .update(cx, |state, cx| state.set_value(address.clone(), window, cx));
+        self.token_input_state
+            .update(cx, |state, cx| state.set_value(token.clone(), window, cx));
     }
 
     pub(super) fn focus_name_input_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -233,22 +250,29 @@ fn render_gateway_setup_form_actions(
     desktop_entity: Entity<PioneerDesktop>,
     form_state: Entity<GatewaySetupFormState>,
 ) -> AnyElement {
-    let source = mode.operation_source();
+    let primary_action = if matches!(mode, GatewaySetupFormMode::EditGateway { .. }) {
+        GatewaySetupAction::SaveGateway
+    } else {
+        GatewaySetupAction::ConnectRemote
+    };
+    let primary_label = if matches!(mode, GatewaySetupFormMode::EditGateway { .. }) {
+        t!("buttons.save").to_string()
+    } else {
+        t!("gateway.action.connect_remote").to_string()
+    };
     let name_input_state = snapshot.name_input_state.clone();
     let address_input_state = snapshot.address_input_state.clone();
     let token_input_state = snapshot.token_input_state.clone();
 
     let mut actions = v_flex().w_full().min_w_0().pt_4().gap_3().child(
         default_primary_button(mode.remote_button_id())
-            .label(t!("gateway.action.connect_remote").to_string())
-            .loading(
-                snapshot.connecting
-                    && snapshot.setup_action == Some(GatewaySetupAction::ConnectRemote),
-            )
+            .label(primary_label)
+            .loading(snapshot.connecting && snapshot.setup_action == Some(primary_action))
             .disabled(snapshot.connecting)
             .on_click({
                 let desktop_entity = desktop_entity.clone();
                 let form_state = form_state.clone();
+                let mode = mode.clone();
                 let name_input_state = name_input_state.clone();
                 let address_input_state = address_input_state.clone();
                 let token_input_state = token_input_state.clone();
@@ -257,21 +281,62 @@ fn render_gateway_setup_form_actions(
                     let address = address_input_state.read(cx).value().to_string();
                     let token = token_input_state.read(cx).value().to_string();
                     let _ = desktop_entity.update(cx, |view, cx| {
-                        view.connect_remote_gateway_from_values(
-                            window,
-                            cx,
-                            source,
-                            name.clone(),
-                            address.clone(),
-                            token.clone(),
-                            Some(form_state.clone()),
-                        );
+                        if let GatewaySetupFormMode::EditGateway { endpoint_id } = &mode {
+                            view.save_gateway_from_edit_dialog(
+                                window,
+                                cx,
+                                endpoint_id.clone(),
+                                name.clone(),
+                                address.clone(),
+                                token.clone(),
+                                Some(form_state.clone()),
+                            );
+                        } else if let Some(source) = mode.operation_source() {
+                            view.connect_remote_gateway_from_values(
+                                window,
+                                cx,
+                                source,
+                                name.clone(),
+                                address.clone(),
+                                token.clone(),
+                                Some(form_state.clone()),
+                            );
+                        }
                     });
                 }
             }),
     );
 
-    if mode.allow_local() {
+    if let GatewaySetupFormMode::EditGateway { endpoint_id } = &mode {
+        actions = actions.child(
+            default_outline_button(mode.local_button_id())
+                .label(t!("gateway.action.delete").to_string())
+                .danger()
+                .loading(
+                    snapshot.connecting
+                        && snapshot.setup_action == Some(GatewaySetupAction::DeleteGateway),
+                )
+                .disabled(snapshot.connecting)
+                .on_click({
+                    let desktop_entity = desktop_entity.clone();
+                    let form_state = form_state.clone();
+                    let endpoint_id = endpoint_id.clone();
+                    move |_, window, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.confirm_delete_gateway_from_edit_dialog(
+                                endpoint_id.clone(),
+                                Some(form_state.clone()),
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }),
+        );
+    } else if mode.allow_local() {
+        let source = mode
+            .operation_source()
+            .expect("local gateway action should only render for setup modes");
         actions = actions
             .child(Divider::horizontal().label(t!("common.or").to_string()))
             .child(

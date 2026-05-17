@@ -118,8 +118,11 @@ startup_timeout_positive = "desktop.gateway.startup_timeout_ms must be greater t
 [errors.gateway]
 address_conflict_inactive_service = "address `%{listen_addr}` is already occupied, but configured service `%{service_name}` is not active; stop the conflicting process/service or change gateway.listen_addr"
 address_empty = "gateway address must not be empty"
+address_already_exists = "gateway `%{address}` is already in the gateway list"
 id_not_found = "gateway id `%{id}` not found"
 invalid_address = "invalid gateway address `%{normalized}`; expected host:port"
+local_delete_unsupported = "local gateway cannot be deleted from the gateway list"
+remote_edit_only = "only remote gateways can be edited"
 resolve_empty = "gateway address `%{listen_addr}` resolved to no socket addresses"
 resolve_failed = "failed to resolve gateway address `%{listen_addr}`"
 start_command_failed_manual_help = "failed to install or start local gateway automatically; retry and verify local gateway configuration"
@@ -145,12 +148,22 @@ open_failed = "failed to open desktop window"
 [gateway.action]
 add = "Add gateway"
 connect_remote = "Connect remote"
+delete = "Delete"
+edit = "Edit gateway"
 start_local = "Start local gateway"
 
 [gateway.add]
 description = "Connect a remote gateway or start the local gateway."
 description_remote_only = "Connect a remote gateway."
 title = "Add gateway"
+
+[gateway.delete]
+confirm_description = "This removes the gateway from this desktop. Gateway data on the server is not deleted."
+confirm_title = "Delete %{name}?"
+
+[gateway.edit]
+description = "Update the gateway connection details."
+title = "Edit %{name}"
 
 [gateway.endpoint]
 local_name = "Local Gateway"
@@ -173,12 +186,14 @@ connected = "Gateway connected"
 connecting = "Gateway connecting..."
 connecting_named = "Connecting to %{gateway_name}..."
 connecting_remote = "Connecting to remote gateway..."
+deleting = "Deleting gateway..."
 failed_check = "Failed to check gateway status: %{error}"
 local_conflict = "Local gateway conflict: address is occupied by another process."
 local_conflict_at = "Local gateway conflict at %{gateway_address}: address is occupied by another process."
 local_stopped = "Local gateway is stopped: %{gateway_address}. Start local gateway or switch to remote."
 not_configured = "Gateway is not configured yet. Add remote address or start local gateway."
 remote_unavailable = "Remote gateway unavailable: %{gateway_name} (%{gateway_address})"
+saving = "Saving gateway..."
 starting_local = "Starting local gateway..."
 installing = "Installing gateway..."
 updating = "Updating gateway..."

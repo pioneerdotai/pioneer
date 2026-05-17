@@ -37,6 +37,8 @@ use std::{
 pub(super) enum GatewaySetupAction {
     ConnectRemote,
     StartLocal,
+    SaveGateway,
+    DeleteGateway,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,37 +53,42 @@ impl GatewayOperationSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum GatewaySetupFormMode {
     Initial { allow_local: bool },
     AddGateway { allow_local: bool },
+    EditGateway { endpoint_id: String },
 }
 
 impl GatewaySetupFormMode {
-    pub(super) fn allow_local(self) -> bool {
+    pub(super) fn allow_local(&self) -> bool {
         match self {
-            Self::Initial { allow_local } | Self::AddGateway { allow_local } => allow_local,
+            Self::Initial { allow_local } | Self::AddGateway { allow_local } => *allow_local,
+            Self::EditGateway { .. } => false,
         }
     }
 
-    pub(super) fn operation_source(self) -> GatewayOperationSource {
+    pub(super) fn operation_source(&self) -> Option<GatewayOperationSource> {
         match self {
-            Self::Initial { .. } => GatewayOperationSource::InitialSetup,
-            Self::AddGateway { .. } => GatewayOperationSource::AddGatewayDialog,
+            Self::Initial { .. } => Some(GatewayOperationSource::InitialSetup),
+            Self::AddGateway { .. } => Some(GatewayOperationSource::AddGatewayDialog),
+            Self::EditGateway { .. } => None,
         }
     }
 
-    pub(super) fn remote_button_id(self) -> &'static str {
+    pub(super) fn remote_button_id(&self) -> &'static str {
         match self {
             Self::Initial { .. } => "connect-remote-gateway",
             Self::AddGateway { .. } => "add-connect-remote-gateway",
+            Self::EditGateway { .. } => "save-gateway",
         }
     }
 
-    pub(super) fn local_button_id(self) -> &'static str {
+    pub(super) fn local_button_id(&self) -> &'static str {
         match self {
             Self::Initial { .. } => "start-local-gateway",
             Self::AddGateway { .. } => "add-start-local-gateway",
+            Self::EditGateway { .. } => "delete-gateway",
         }
     }
 }

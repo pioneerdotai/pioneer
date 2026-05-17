@@ -1,4 +1,5 @@
 use super::*;
+use crate::assets::PioneerIconName;
 
 impl PioneerDesktop {
     pub(crate) fn render_gateways_popover(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -269,12 +270,15 @@ impl PioneerDesktop {
             gateway_option_style
         };
 
-        Button::new(("gateway-option", index))
+        let select_button = Button::new(("gateway-option", index))
             .custom(button_style)
             .with_size(px(14.))
             .w_full()
             .justify_start()
             .p_2()
+            .when(endpoint.kind == GatewayEndpointKind::Remote, |this| {
+                this.pr(px(36.))
+            })
             .disabled(gateway_selection_locked)
             .on_click({
                 let desktop_entity = desktop_entity.clone();
@@ -316,25 +320,80 @@ impl PioneerDesktop {
                     .child(
                         v_flex()
                             .w_full()
+                            .min_w_0()
                             .gap_1()
                             .child(
                                 div()
                                     .w_full()
+                                    .min_w_0()
                                     .text_sm()
                                     .line_height(relative(1.0))
                                     .font_semibold()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .child(endpoint_name),
                             )
                             .child(
                                 div()
                                     .w_full()
+                                    .min_w_0()
                                     .text_xs()
                                     .line_height(relative(1.05))
                                     .opacity(0.6)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .child(subtitle),
                             ),
                     ),
-            )
+            );
+
+        div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(select_button)
+            .when(endpoint.kind == GatewayEndpointKind::Remote, |this| {
+                let endpoint_id_for_edit = endpoint_id.clone();
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .pr_1()
+                        .child(
+                            Button::new(("gateway-option-edit", index))
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .disabled(gateway_selection_locked)
+                                .icon(PioneerIconName::Bolt)
+                                .tooltip(t!("gateway.action.edit").to_string())
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    let popover_entity = popover_entity.clone();
+
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = popover_entity.update(cx, |state, cx| {
+                                            state.dismiss(window, cx);
+                                        });
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.open_edit_gateway_dialog(
+                                                endpoint_id_for_edit.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+            })
             .into_any_element()
     }
 }

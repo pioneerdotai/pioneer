@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` doit être sup�
 [errors.gateway]
 address_conflict_inactive_service = "l'adresse `%{listen_addr}` est déjà utilisée, mais le service configuré `%{service_name}` n'est pas actif ; arrêtez le processus/service en conflit ou changez gateway.listen_addr"
 address_empty = "l'adresse de la passerelle ne doit pas être vide"
+address_already_exists = "la passerelle `%{address}` est déjà dans la liste"
 id_not_found = "id de passerelle `%{id}` introuvable"
 invalid_address = "adresse de passerelle invalide `%{normalized}` ; attendu host:port"
+local_delete_unsupported = "la passerelle locale ne peut pas être supprimée de la liste"
+remote_edit_only = "seules les passerelles distantes peuvent être modifiées"
 resolve_empty = "l'adresse de passerelle `%{listen_addr}` n'a été résolue vers aucune adresse socket"
 resolve_failed = "impossible de résoudre l'adresse de passerelle `%{listen_addr}`"
 start_command_failed_manual_help = "impossible d'installer ou de démarrer automatiquement la passerelle locale ; réessayez et vérifiez la configuration locale de la passerelle"
@@ -145,12 +148,22 @@ open_failed = "impossible d'ouvrir la fenêtre de l'application de bureau"
 [gateway.action]
 add = "Ajouter une passerelle"
 connect_remote = "Connecter une passerelle distante"
+delete = "Supprimer"
+edit = "Modifier la passerelle"
 start_local = "Démarrer la passerelle locale"
 
 [gateway.add]
 description = "Connectez une passerelle distante ou démarrez la passerelle locale."
 description_remote_only = "Connectez une passerelle distante."
 title = "Ajouter une passerelle"
+
+[gateway.delete]
+confirm_description = "Cela supprime la passerelle de cette application de bureau. Les données sur le serveur ne sont pas supprimées."
+confirm_title = "Supprimer %{name} ?"
+
+[gateway.edit]
+description = "Mettez à jour les détails de connexion de la passerelle."
+title = "Modifier %{name}"
 
 [gateway.endpoint]
 local_name = "Passerelle locale"
@@ -173,12 +186,14 @@ connected = "Passerelle connectée"
 connecting = "Connexion de la passerelle..."
 connecting_named = "Connexion à %{gateway_name}..."
 connecting_remote = "Connexion à la passerelle distante..."
+deleting = "Suppression de la passerelle..."
 failed_check = "Échec de la vérification de l'état de la passerelle : %{error}"
 local_conflict = "Conflit de la passerelle locale : l'adresse est occupée par un autre processus."
 local_conflict_at = "Conflit de la passerelle locale à %{gateway_address} : l'adresse est occupée par un autre processus."
 local_stopped = "La passerelle locale est arrêtée : %{gateway_address}. Démarrez la passerelle locale ou basculez vers une distante."
 not_configured = "La passerelle n'est pas encore configurée. Ajoutez une adresse distante ou démarrez une passerelle locale."
 remote_unavailable = "Passerelle distante indisponible : %{gateway_name} (%{gateway_address})"
+saving = "Enregistrement de la passerelle..."
 starting_local = "Démarrage de la passerelle locale..."
 installing = "Installation de la passerelle..."
 updating = "Mise à jour de la passerelle..."

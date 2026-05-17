@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 0 से बड
 [errors.gateway]
 address_conflict_inactive_service = "पता `%{listen_addr}` पहले से उपयोग में है, लेकिन कॉन्फ़िगर की गई सेवा `%{service_name}` सक्रिय नहीं है; टकराने वाली प्रक्रिया/सेवा रोकें या gateway.listen_addr बदलें"
 address_empty = "गेटवे पता खाली नहीं होना चाहिए"
+address_already_exists = "गेटवे `%{address}` पहले से सूची में है"
 id_not_found = "गेटवे आईडी `%{id}` नहीं मिली"
 invalid_address = "अमान्य गेटवे पता `%{normalized}`; अपेक्षित host:port"
+local_delete_unsupported = "स्थानीय गेटवे को सूची से हटाया नहीं जा सकता"
+remote_edit_only = "केवल दूरस्थ गेटवे संपादित किए जा सकते हैं"
 resolve_empty = "गेटवे पता `%{listen_addr}` किसी socket address में resolve नहीं हुआ"
 resolve_failed = "गेटवे पता `%{listen_addr}` resolve करने में विफल"
 start_command_failed_manual_help = "लोकल गेटवे को अपने-आप इंस्टॉल या शुरू नहीं किया जा सका; फिर से कोशिश करें और लोकल गेटवे कॉन्फ़िगरेशन जांचें"
@@ -145,12 +148,22 @@ open_failed = "डेस्कटॉप विंडो खोलने मे�
 [gateway.action]
 add = "गेटवे जोड़ें"
 connect_remote = "दूरस्थ गेटवे से कनेक्ट करें"
+delete = "हटाएँ"
+edit = "गेटवे संपादित करें"
 start_local = "स्थानीय गेटवे शुरू करें"
 
 [gateway.add]
 description = "दूरस्थ गेटवे से कनेक्ट करें या स्थानीय गेटवे शुरू करें।"
 description_remote_only = "दूरस्थ गेटवे से कनेक्ट करें।"
 title = "गेटवे जोड़ें"
+
+[gateway.delete]
+confirm_description = "यह गेटवे को केवल इस desktop से हटाता है। सर्वर पर गेटवे डेटा नहीं हटता।"
+confirm_title = "%{name} हटाएँ?"
+
+[gateway.edit]
+description = "गेटवे कनेक्शन विवरण अपडेट करें।"
+title = "%{name} संपादित करें"
 
 [gateway.endpoint]
 local_name = "स्थानीय गेटवे"
@@ -173,12 +186,14 @@ connected = "गेटवे कनेक्ट हो गया"
 connecting = "गेटवे कनेक्ट हो रहा है..."
 connecting_named = "%{gateway_name} से कनेक्ट किया जा रहा है..."
 connecting_remote = "दूरस्थ गेटवे से कनेक्ट किया जा रहा है..."
+deleting = "गेटवे हटाया जा रहा है..."
 failed_check = "गेटवे स्थिति जांचने में विफल: %{error}"
 local_conflict = "स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
 local_conflict_at = "%{gateway_address} पर स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
 local_stopped = "स्थानीय गेटवे रुका हुआ है: %{gateway_address}। स्थानीय गेटवे शुरू करें या दूरस्थ पर स्विच करें।"
 not_configured = "गेटवे अभी कॉन्फ़िगर नहीं है। दूरस्थ पता जोड़ें या स्थानीय गेटवे शुरू करें।"
 remote_unavailable = "दूरस्थ गेटवे उपलब्ध नहीं है: %{gateway_name} (%{gateway_address})"
+saving = "गेटवे सहेजा जा रहा है..."
 starting_local = "स्थानीय गेटवे शुरू किया जा रहा है..."
 installing = "गेटवे इंस्टॉल किया जा रहा है..."
 updating = "गेटवे अपडेट किया जा रहा है..."

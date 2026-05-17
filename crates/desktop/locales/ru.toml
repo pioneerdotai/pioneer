@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` должен б
 [errors.gateway]
 address_conflict_inactive_service = "адрес `%{listen_addr}` уже занят, но настроенная служба `%{service_name}` не активна; остановите конфликтующий процесс/службу или измените gateway.listen_addr"
 address_empty = "адрес шлюза не должен быть пустым"
+address_already_exists = "шлюз `%{address}` уже есть в списке"
 id_not_found = "шлюз с id `%{id}` не найден"
 invalid_address = "некорректный адрес шлюза `%{normalized}`; ожидается host:port"
+local_delete_unsupported = "локальный шлюз нельзя удалить из списка шлюзов"
+remote_edit_only = "редактировать можно только удалённые шлюзы"
 resolve_empty = "адрес шлюза `%{listen_addr}` не разрешился ни в один сокет-адрес"
 resolve_failed = "не удалось разрешить адрес шлюза `%{listen_addr}`"
 start_command_failed_manual_help = "не удалось автоматически установить или запустить локальный шлюз; повторите попытку и проверьте локальную конфигурацию шлюза"
@@ -145,12 +148,22 @@ open_failed = "не удалось открыть окно настольног�
 [gateway.action]
 add = "Добавить шлюз"
 connect_remote = "Подключить удалённый шлюз"
+delete = "Удалить"
+edit = "Редактировать шлюз"
 start_local = "Запустить локальный шлюз"
 
 [gateway.add]
 description = "Подключите удалённый шлюз или запустите локальный."
 description_remote_only = "Подключите удалённый шлюз."
 title = "Добавление шлюза"
+
+[gateway.delete]
+confirm_description = "Шлюз будет удалён только из этого desktop-клиента. Данные на сервере не удаляются."
+confirm_title = "Удалить %{name}?"
+
+[gateway.edit]
+description = "Измените параметры подключения к шлюзу."
+title = "Редактирование %{name}"
 
 [gateway.endpoint]
 local_name = "Локальный шлюз"
@@ -173,12 +186,14 @@ connected = "Шлюз подключён"
 connecting = "Подключение шлюза..."
 connecting_named = "Подключение к %{gateway_name}..."
 connecting_remote = "Подключение к удалённому шлюзу..."
+deleting = "Удаление шлюза..."
 failed_check = "Не удалось проверить состояние шлюза: %{error}"
 local_conflict = "Конфликт локального шлюза: адрес занят другим процессом."
 local_conflict_at = "Конфликт локального шлюза на %{gateway_address}: адрес занят другим процессом."
 local_stopped = "Локальный шлюз остановлен: %{gateway_address}. Запустите локальный шлюз или переключитесь на удалённый."
 not_configured = "Шлюз ещё не настроен. Добавьте удалённый адрес или запустите локальный шлюз."
 remote_unavailable = "Удалённый шлюз недоступен: %{gateway_name} (%{gateway_address})"
+saving = "Сохранение шлюза..."
 starting_local = "Запуск локального шлюза..."
 installing = "Установка шлюза..."
 updating = "Обновление шлюза..."

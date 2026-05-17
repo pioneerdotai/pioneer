@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 必须大于 0"
 [errors.gateway]
 address_conflict_inactive_service = "地址 `%{listen_addr}` 已被占用，但配置的服务 `%{service_name}` 未激活；请停止冲突进程/服务或修改 gateway.listen_addr"
 address_empty = "网关地址不能为空"
+address_already_exists = "网关 `%{address}` 已在网关列表中"
 id_not_found = "未找到网关 id `%{id}`"
 invalid_address = "网关地址 `%{normalized}` 无效；应为 host:port"
+local_delete_unsupported = "无法从网关列表中删除本地网关"
+remote_edit_only = "只能编辑远程网关"
 resolve_empty = "网关地址 `%{listen_addr}` 未解析到任何套接字地址"
 resolve_failed = "无法解析网关地址 `%{listen_addr}`"
 start_command_failed_manual_help = "无法自动安装或启动本地网关；请重试并检查本地网关配置"
@@ -145,12 +148,22 @@ open_failed = "无法打开桌面窗口"
 [gateway.action]
 add = "添加网关"
 connect_remote = "连接远程网关"
+delete = "删除"
+edit = "编辑网关"
 start_local = "启动本地网关"
 
 [gateway.add]
 description = "连接远程网关或启动本地网关。"
 description_remote_only = "连接远程网关。"
 title = "添加网关"
+
+[gateway.delete]
+confirm_description = "这只会从此桌面客户端移除网关，不会删除服务器上的网关数据。"
+confirm_title = "删除 %{name}？"
+
+[gateway.edit]
+description = "更新网关连接详情。"
+title = "编辑 %{name}"
 
 [gateway.endpoint]
 local_name = "本地网关"
@@ -173,12 +186,14 @@ connected = "网关已连接"
 connecting = "正在连接网关..."
 connecting_named = "正在连接到 %{gateway_name}..."
 connecting_remote = "正在连接远程网关..."
+deleting = "正在删除网关..."
 failed_check = "检查网关状态失败：%{error}"
 local_conflict = "本地网关冲突：地址被其他进程占用。"
 local_conflict_at = "本地网关在 %{gateway_address} 冲突：地址被其他进程占用。"
 local_stopped = "本地网关已停止：%{gateway_address}。请启动本地网关或切换到远程。"
 not_configured = "网关尚未配置。请添加远程地址或启动本地网关。"
 remote_unavailable = "远程网关不可用：%{gateway_name} (%{gateway_address})"
+saving = "正在保存网关..."
 starting_local = "正在启动本地网关..."
 installing = "正在安装网关..."
 updating = "正在更新网关..."

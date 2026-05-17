@@ -41,6 +41,11 @@ pub struct LocalGatewayStartOutcome {
     pub warnings: Vec<GatewayInstallWarning>,
 }
 
+pub struct GatewayDeleteOutcome {
+    pub deleted_active: bool,
+    pub fallback_endpoint: Option<GatewayEndpoint>,
+}
+
 pub struct GatewayRuntime {
     config: AppConfig,
     timings: GatewayTimings,
@@ -309,6 +314,160 @@ impl GatewayRuntime {
             return Err(error);
         }
         Ok(endpoint)
+    }
+
+    pub fn update_remote_gateway(
+        &mut self,
+        id: &str,
+        name: &str,
+        address: &str,
+        auth_token: Option<&str>,
+    ) -> Result<GatewayEndpoint> {
+        let address = normalize_address(address)?;
+        let Some(existing_index) = self
+            .registry
+            .remotes
+            .iter()
+            .position(|remote| remote.id == id)
+        else {
+            bail!("{}", t!("errors.gateway.id_not_found", id = id));
+        };
+
+        if self
+            .registry
+            .remotes
+            .iter()
+            .enumerate()
+            .any(|(index, remote)| index != existing_index && remote.address == address)
+        {
+            bail!(
+                "{}",
+                t!(
+                    "errors.gateway.address_already_exists",
+                    address = address.as_str()
+                )
+            );
+        }
+
+        let old_endpoint = self.registry.remotes[existing_index].clone();
+        let old_token = self.gateway_auth_token_for_endpoint(&old_endpoint)?;
+        let endpoint_name = if name.trim().is_empty() {
+            t!("gateway.endpoint.remote_name", index = existing_index + 1).to_string()
+        } else {
+            name.trim().to_owned()
+        };
+        let auth_token = auth_token.and_then(|token| {
+            let token = token.trim();
+            (!token.is_empty()).then_some(token.to_owned())
+        });
+        let next_token_ref = if auth_token.is_some() {
+            Some(gateway_auth_token_ref(id)?)
+        } else {
+            None
+        };
+
+        if let Some(token) = auth_token.as_deref() {
+            let token_ref = next_token_ref.as_deref().expect("token ref exists");
+            self.secrets.put_gateway_auth_token(
+                token_ref,
+                token,
+                Some(gateway_token_label(
+                    endpoint_name.as_str(),
+                    address.as_str(),
+                )),
+            )?;
+        }
+
+        let existing = self
+            .registry
+            .remotes
+            .get_mut(existing_index)
+            .expect("remote index should exist");
+        existing.name = endpoint_name;
+        existing.address = address;
+        existing.auth_token_ref = next_token_ref.clone();
+
+        let endpoint = existing.clone();
+        if let Err(error) = save_registry(&self.registry_path, &self.registry) {
+            self.registry.remotes[existing_index] = old_endpoint.clone();
+            if let Some(old_token) = old_token.as_deref() {
+                if let Some(token_ref) = old_endpoint.auth_token_ref.as_deref() {
+                    let _ = self.secrets.put_gateway_auth_token(
+                        token_ref,
+                        old_token,
+                        Some(gateway_token_label(
+                            old_endpoint.name.as_str(),
+                            old_endpoint.address.as_str(),
+                        )),
+                    );
+                }
+            } else if let Some(token_ref) = next_token_ref.as_deref() {
+                let _ = self.secrets.delete_gateway_auth_token(token_ref);
+            }
+            return Err(error);
+        }
+
+        if auth_token.is_none()
+            && let Some(token_ref) = old_endpoint.auth_token_ref.as_deref()
+            && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
+        {
+            warn!(
+                error = %format!("{error:#}"),
+                token_ref,
+                "failed to delete cleared gateway auth token"
+            );
+        }
+
+        Ok(endpoint)
+    }
+
+    pub fn delete_gateway(&mut self, id: &str) -> Result<GatewayDeleteOutcome> {
+        if self.registry.local.id == id {
+            bail!("{}", t!("errors.gateway.local_delete_unsupported"));
+        }
+
+        let Some(existing_index) = self
+            .registry
+            .remotes
+            .iter()
+            .position(|remote| remote.id == id)
+        else {
+            bail!("{}", t!("errors.gateway.id_not_found", id = id));
+        };
+
+        let deleted_endpoint = self.registry.remotes.remove(existing_index);
+        let deleted_active = self.registry.active_gateway_id.as_deref() == Some(id);
+        let previous_active_gateway_id = self.registry.active_gateway_id.clone();
+        let fallback_endpoint = if deleted_active {
+            let fallback = self.endpoints().into_iter().next();
+            self.registry.active_gateway_id = fallback.as_ref().map(|endpoint| endpoint.id.clone());
+            fallback
+        } else {
+            None
+        };
+
+        if let Err(error) = save_registry(&self.registry_path, &self.registry) {
+            self.registry
+                .remotes
+                .insert(existing_index, deleted_endpoint.clone());
+            self.registry.active_gateway_id = previous_active_gateway_id;
+            return Err(error);
+        }
+
+        if let Some(token_ref) = deleted_endpoint.auth_token_ref.as_deref()
+            && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
+        {
+            warn!(
+                error = %format!("{error:#}"),
+                token_ref,
+                "failed to delete removed gateway auth token"
+            );
+        }
+
+        Ok(GatewayDeleteOutcome {
+            deleted_active,
+            fallback_endpoint,
+        })
     }
 
     fn sync_local_auth_token_from_gateway_request(&mut self, force_refresh: bool) -> Result<bool> {
@@ -720,6 +879,145 @@ mod tests {
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].id, runtime.local_gateway_id());
         assert_eq!(endpoints[0].kind, GatewayEndpointKind::Local);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn update_remote_gateway_rewrites_secret_and_can_clear_token() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path.clone(), secrets.clone());
+        let remote = test_remote_endpoint("remote-main");
+        runtime.registry.remotes.push(remote.clone());
+        runtime
+            .store_gateway_auth_token_for_tests(remote.id.as_str(), "old-token")
+            .expect("store old token");
+
+        let updated = runtime
+            .update_remote_gateway(
+                remote.id.as_str(),
+                "Renamed",
+                "127.0.0.1:23000",
+                Some("new-token"),
+            )
+            .expect("update remote");
+
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.address, "127.0.0.1:23000");
+        assert_eq!(updated.auth_token_ref.as_deref(), Some(remote.id.as_str()));
+        assert_eq!(
+            secrets
+                .get_gateway_auth_token(remote.id.as_str())
+                .expect("read updated token"),
+            Some("new-token".to_owned())
+        );
+        let content = fs::read_to_string(&registry_path).expect("read registry");
+        assert!(!content.contains("new-token"));
+        assert!(!content.contains("old-token"));
+
+        let cleared = runtime
+            .update_remote_gateway(remote.id.as_str(), "Renamed", "127.0.0.1:23000", Some(""))
+            .expect("clear token");
+
+        assert!(cleared.auth_token_ref.is_none());
+        assert_eq!(
+            secrets
+                .get_gateway_auth_token(remote.id.as_str())
+                .expect("read cleared token"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn update_remote_gateway_rejects_duplicate_address() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path, secrets);
+        let mut first = test_remote_endpoint("remote-one");
+        first.address = "127.0.0.1:23000".to_owned();
+        let mut second = test_remote_endpoint("remote-two");
+        second.address = "127.0.0.1:24000".to_owned();
+        runtime.registry.remotes.push(first.clone());
+        runtime.registry.remotes.push(second.clone());
+
+        let error = runtime
+            .update_remote_gateway(
+                first.id.as_str(),
+                "First",
+                second.address.as_str(),
+                Some("token"),
+            )
+            .expect_err("duplicate address should fail");
+
+        assert!(
+            format!("{error:#}").contains("already"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn delete_gateway_removes_remote_secret_and_selects_fallback() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let registry_path = temp_dir.join("gateway_registry.toml");
+        let secrets = test_desktop_secrets();
+        let mut runtime = test_runtime(registry_path.clone(), secrets.clone());
+        let first = test_remote_endpoint("remote-one");
+        let second = test_remote_endpoint("remote-two");
+        runtime.registry.active_gateway_id = Some(first.id.clone());
+        runtime.registry.remotes.push(first.clone());
+        runtime.registry.remotes.push(second.clone());
+        runtime
+            .store_gateway_auth_token_for_tests(first.id.as_str(), "first-token")
+            .expect("store first token");
+        runtime
+            .store_gateway_auth_token_for_tests(second.id.as_str(), "second-token")
+            .expect("store second token");
+
+        let outcome = runtime
+            .delete_gateway(first.id.as_str())
+            .expect("delete active remote");
+
+        assert!(outcome.deleted_active);
+        assert_eq!(
+            outcome
+                .fallback_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.id.as_str()),
+            Some(second.id.as_str())
+        );
+        assert_eq!(runtime.active_gateway_id(), Some(second.id.as_str()));
+        assert!(
+            runtime
+                .registry
+                .remotes
+                .iter()
+                .all(|endpoint| endpoint.id != first.id)
+        );
+        assert_eq!(
+            secrets
+                .get_gateway_auth_token(first.id.as_str())
+                .expect("read removed token"),
+            None
+        );
+        assert_eq!(
+            secrets
+                .get_gateway_auth_token(second.id.as_str())
+                .expect("read fallback token"),
+            Some("second-token".to_owned())
+        );
+        let content = fs::read_to_string(&registry_path).expect("read registry");
+        assert!(!content.contains(first.id.as_str()));
+        assert!(content.contains(second.id.as_str()));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

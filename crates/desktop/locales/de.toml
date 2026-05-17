@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` muss größer a
 [errors.gateway]
 address_conflict_inactive_service = "Adresse `%{listen_addr}` ist bereits belegt, aber der konfigurierte Dienst `%{service_name}` ist nicht aktiv; stoppe den konfliktierenden Prozess/Dienst oder ändere gateway.listen_addr"
 address_empty = "Gateway-Adresse darf nicht leer sein"
+address_already_exists = "Gateway `%{address}` ist bereits in der Gateway-Liste"
 id_not_found = "Gateway-ID `%{id}` nicht gefunden"
 invalid_address = "ungültige Gateway-Adresse `%{normalized}`; erwartet host:port"
+local_delete_unsupported = "Lokales Gateway kann nicht aus der Gateway-Liste gelöscht werden"
+remote_edit_only = "Nur entfernte Gateways können bearbeitet werden"
 resolve_empty = "Gateway-Adresse `%{listen_addr}` wurde zu keiner Socket-Adresse aufgelöst"
 resolve_failed = "Gateway-Adresse `%{listen_addr}` konnte nicht aufgelöst werden"
 start_command_failed_manual_help = "lokales Gateway konnte nicht automatisch installiert oder gestartet werden; erneut versuchen und lokale Gateway-Konfiguration prüfen"
@@ -145,12 +148,22 @@ open_failed = "Desktop-Fenster konnte nicht geöffnet werden"
 [gateway.action]
 add = "Gateway hinzufügen"
 connect_remote = "Entferntes Gateway verbinden"
+delete = "Löschen"
+edit = "Gateway bearbeiten"
 start_local = "Lokales Gateway starten"
 
 [gateway.add]
 description = "Verbinde ein entferntes Gateway oder starte das lokale Gateway."
 description_remote_only = "Verbinde ein entferntes Gateway."
 title = "Gateway hinzufügen"
+
+[gateway.delete]
+confirm_description = "Dadurch wird das Gateway nur von diesem Desktop entfernt. Gateway-Daten auf dem Server werden nicht gelöscht."
+confirm_title = "%{name} löschen?"
+
+[gateway.edit]
+description = "Aktualisiere die Verbindungsdaten des Gateways."
+title = "%{name} bearbeiten"
 
 [gateway.endpoint]
 local_name = "Lokales Gateway"
@@ -173,12 +186,14 @@ connected = "Gateway verbunden"
 connecting = "Gateway wird verbunden..."
 connecting_named = "Verbinde mit %{gateway_name}..."
 connecting_remote = "Verbinde mit entferntem Gateway..."
+deleting = "Gateway wird gelöscht..."
 failed_check = "Gateway-Status konnte nicht geprüft werden: %{error}"
 local_conflict = "Lokaler Gateway-Konflikt: Adresse ist durch einen anderen Prozess belegt."
 local_conflict_at = "Lokaler Gateway-Konflikt bei %{gateway_address}: Adresse ist durch einen anderen Prozess belegt."
 local_stopped = "Lokales Gateway ist gestoppt: %{gateway_address}. Starte das lokale Gateway oder wechsle zu einem entfernten."
 not_configured = "Gateway ist noch nicht konfiguriert. Füge eine entfernte Adresse hinzu oder starte ein lokales Gateway."
 remote_unavailable = "Entferntes Gateway nicht verfügbar: %{gateway_name} (%{gateway_address})"
+saving = "Gateway wird gespeichert..."
 starting_local = "Lokales Gateway wird gestartet..."
 installing = "Gateway wird installiert..."
 updating = "Gateway wird aktualisiert..."

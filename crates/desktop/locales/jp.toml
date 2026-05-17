@@ -118,8 +118,11 @@ startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` は 0 より大
 [errors.gateway]
 address_conflict_inactive_service = "アドレス `%{listen_addr}` はすでに使用中ですが、設定されたサービス `%{service_name}` は稼働していません。競合プロセス/サービスを停止するか gateway.listen_addr を変更してください"
 address_empty = "ゲートウェイのアドレスは空にできません"
+address_already_exists = "ゲートウェイ `%{address}` はすでに一覧にあります"
 id_not_found = "ゲートウェイ id `%{id}` が見つかりません"
 invalid_address = "無効なゲートウェイアドレス `%{normalized}` です。host:port 形式を指定してください"
+local_delete_unsupported = "ローカルゲートウェイは一覧から削除できません"
+remote_edit_only = "編集できるのはリモートゲートウェイのみです"
 resolve_empty = "ゲートウェイアドレス `%{listen_addr}` はソケットアドレスに解決されませんでした"
 resolve_failed = "ゲートウェイアドレス `%{listen_addr}` の解決に失敗しました"
 start_command_failed_manual_help = "ローカルゲートウェイを自動でインストールまたは起動できませんでした。再試行し、ローカルのゲートウェイ設定を確認してください"
@@ -145,12 +148,22 @@ open_failed = "デスクトップウィンドウを開けませんでした"
 [gateway.action]
 add = "ゲートウェイを追加"
 connect_remote = "リモートに接続"
+delete = "削除"
+edit = "ゲートウェイを編集"
 start_local = "ローカルゲートウェイを起動"
 
 [gateway.add]
 description = "リモートゲートウェイに接続するか、ローカルゲートウェイを起動します。"
 description_remote_only = "リモートゲートウェイに接続します。"
 title = "ゲートウェイを追加"
+
+[gateway.delete]
+confirm_description = "このデスクトップからゲートウェイを削除します。サーバー上のゲートウェイデータは削除されません。"
+confirm_title = "%{name} を削除しますか?"
+
+[gateway.edit]
+description = "ゲートウェイ接続情報を更新します。"
+title = "%{name} を編集"
 
 [gateway.endpoint]
 local_name = "ローカルゲートウェイ"
@@ -173,12 +186,14 @@ connected = "ゲートウェイ接続済み"
 connecting = "ゲートウェイ接続中..."
 connecting_named = "%{gateway_name} に接続中..."
 connecting_remote = "リモートゲートウェイに接続中..."
+deleting = "ゲートウェイを削除中..."
 failed_check = "ゲートウェイの状態確認に失敗しました: %{error}"
 local_conflict = "ローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
 local_conflict_at = "%{gateway_address} でローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
 local_stopped = "ローカルゲートウェイは停止しています: %{gateway_address}。ローカルゲートウェイを起動するか、リモートに切り替えてください。"
 not_configured = "ゲートウェイはまだ設定されていません。リモートアドレスを追加するか、ローカルゲートウェイを起動してください。"
 remote_unavailable = "リモートゲートウェイは利用できません: %{gateway_name} (%{gateway_address})"
+saving = "ゲートウェイを保存中..."
 starting_local = "ローカルゲートウェイを起動中..."
 installing = "ゲートウェイをインストール中..."
 updating = "ゲートウェイを更新中..."

@@ -307,6 +307,325 @@ impl PioneerDesktop {
         .detach();
     }
 
+    pub(in crate::app) fn save_gateway_from_edit_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        endpoint_id: String,
+        name: String,
+        address: String,
+        token: String,
+        form_state: Option<Entity<GatewaySetupFormState>>,
+    ) {
+        let ws_sender = self.gateway.ws_command_sender.clone();
+
+        let Some(operation_epoch) = self.begin_gateway_operation(
+            t!("gateway.status.saving").to_string(),
+            Some(GatewaySetupAction::SaveGateway),
+            cx,
+        ) else {
+            return;
+        };
+        self.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+
+        cx.spawn_in(
+            window,
+            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+                let mut cx = cx.clone();
+                let ws_sender = ws_sender.clone();
+
+                async move {
+                    let staged_result = cx
+                        .background_spawn(async move {
+                            let mut runtime = GatewayRuntime::load()?;
+                            let current =
+                                runtime.endpoint(endpoint_id.as_str()).ok_or_else(|| {
+                                    anyhow!(
+                                        "{}",
+                                        t!(
+                                            "errors.gateway.id_not_found",
+                                            id = endpoint_id.as_str()
+                                        )
+                                    )
+                                })?;
+                            if current.kind != GatewayEndpointKind::Remote {
+                                anyhow::bail!("{}", t!("errors.gateway.remote_edit_only"));
+                            }
+
+                            validate_remote_candidate_gateway_connection(
+                                &runtime,
+                                name.as_str(),
+                                address.as_str(),
+                                token.as_str(),
+                            )?;
+                            let endpoint = runtime.update_remote_gateway(
+                                endpoint_id.as_str(),
+                                name.as_str(),
+                                address.as_str(),
+                                Some(token.as_str()),
+                            )?;
+                            let was_active =
+                                runtime.active_gateway_id() == Some(endpoint.id.as_str());
+                            let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+
+                            Ok::<
+                                (GatewayRuntime, GatewayEndpoint, GatewayWsConnectSpec, bool),
+                                anyhow::Error,
+                            >((runtime, endpoint, spec, was_active))
+                        })
+                        .await;
+
+                    let (mut runtime, endpoint, spec, was_active) = match staged_result {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            let _ = this.update_in(&mut cx, |view, _window, cx| {
+                                view.finish_add_gateway_form_error_without_switch(
+                                    operation_epoch,
+                                    error,
+                                    form_state.as_ref(),
+                                    cx,
+                                );
+                            });
+                            return;
+                        }
+                    };
+
+                    if !was_active {
+                        let _ = this.update_in(&mut cx, |view, window, cx| {
+                            let ws_connection_id = view.gateway.ws_connection_id;
+                            view.finish_gateway_operation(
+                                operation_epoch,
+                                Ok(GatewayOperationSuccess {
+                                    runtime,
+                                    ws_connection_id,
+                                    ws_connected_ready: true,
+                                    install_warnings: Vec::new(),
+                                }),
+                                cx,
+                            );
+                            window.close_dialog(cx);
+                        });
+                        return;
+                    }
+
+                    let mut threads_to_unsubscribe = None;
+                    let _ = this.update_in(&mut cx, |view, _window, cx| {
+                        if should_apply_gateway_operation_result(
+                            view.gateway.connection_epoch,
+                            operation_epoch,
+                        ) {
+                            threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                        }
+                    });
+
+                    let Some(threads_to_unsubscribe) = threads_to_unsubscribe else {
+                        return;
+                    };
+
+                    let result = cx
+                        .background_spawn(async move {
+                            for thread_id in threads_to_unsubscribe {
+                                let _ = ws_sender.thread_unsubscribe(thread_id);
+                            }
+
+                            let ws_connection_id = match ws_sender.connect_and_wait(spec) {
+                                Ok(connection_id) => Some(connection_id),
+                                Err(error) => {
+                                    warn!(
+                                        error = %format!("{error:#}"),
+                                        gateway_id = endpoint.id.as_str(),
+                                        "saved active gateway but failed to reconnect"
+                                    );
+                                    None
+                                }
+                            };
+                            runtime.activate_gateway(endpoint.id.as_str())?;
+
+                            Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
+                                runtime,
+                                ws_connection_id,
+                                ws_connected_ready: true,
+                                install_warnings: Vec::new(),
+                            })
+                        })
+                        .await;
+
+                    let _ = this.update_in(&mut cx, |view, window, cx| match result {
+                        Ok(success) => {
+                            view.finish_gateway_operation(operation_epoch, Ok(success), cx);
+                            window.close_dialog(cx);
+                        }
+                        Err(error) => {
+                            view.finish_gateway_operation(operation_epoch, Err(error), cx);
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    pub(in crate::app) fn delete_gateway_from_edit_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        endpoint_id: String,
+        form_state: Option<Entity<GatewaySetupFormState>>,
+    ) {
+        let ws_sender = self.gateway.ws_command_sender.clone();
+
+        let Some(operation_epoch) = self.begin_gateway_operation(
+            t!("gateway.status.deleting").to_string(),
+            Some(GatewaySetupAction::DeleteGateway),
+            cx,
+        ) else {
+            return;
+        };
+        self.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+
+        cx.spawn_in(
+            window,
+            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+                let mut cx = cx.clone();
+                let ws_sender = ws_sender.clone();
+
+                async move {
+                    let staged_result = cx
+                        .background_spawn(async move {
+                            let mut runtime = GatewayRuntime::load()?;
+                            let outcome = runtime.delete_gateway(endpoint_id.as_str())?;
+
+                            Ok::<_, anyhow::Error>((runtime, outcome))
+                        })
+                        .await;
+
+                    let (runtime, outcome) = match staged_result {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            let _ = this.update_in(&mut cx, |view, _window, cx| {
+                                view.finish_add_gateway_form_error_without_switch(
+                                    operation_epoch,
+                                    error,
+                                    form_state.as_ref(),
+                                    cx,
+                                );
+                            });
+                            return;
+                        }
+                    };
+
+                    if !outcome.deleted_active {
+                        let _ = this.update_in(&mut cx, |view, window, cx| {
+                            let ws_connection_id = view.gateway.ws_connection_id;
+                            view.finish_gateway_operation(
+                                operation_epoch,
+                                Ok(GatewayOperationSuccess {
+                                    runtime,
+                                    ws_connection_id,
+                                    ws_connected_ready: true,
+                                    install_warnings: Vec::new(),
+                                }),
+                                cx,
+                            );
+                            window.close_dialog(cx);
+                        });
+                        return;
+                    }
+
+                    let mut threads_to_unsubscribe = None;
+                    let _ = this.update_in(&mut cx, |view, _window, cx| {
+                        if should_apply_gateway_operation_result(
+                            view.gateway.connection_epoch,
+                            operation_epoch,
+                        ) {
+                            threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                        }
+                    });
+
+                    let Some(threads_to_unsubscribe) = threads_to_unsubscribe else {
+                        return;
+                    };
+
+                    let result = cx
+                        .background_spawn(async move {
+                            for thread_id in threads_to_unsubscribe {
+                                let _ = ws_sender.thread_unsubscribe(thread_id);
+                            }
+
+                            let mut runtime = runtime;
+                            let mut install_warnings = Vec::new();
+                            let mut ws_connection_id = None;
+                            let mut ws_connected_ready = true;
+
+                            if let Some(mut endpoint) = outcome.fallback_endpoint {
+                                let connect_result = (|| -> anyhow::Result<(Option<u64>, bool)> {
+                                    if endpoint.kind == GatewayEndpointKind::Local {
+                                        let local_start = runtime.ensure_local_gateway_started()?;
+                                        endpoint = local_start.endpoint;
+                                        install_warnings = local_start.warnings;
+                                    }
+
+                                    let spec = build_ws_connect_spec(&runtime, &endpoint)?;
+                                    let connection_id = if endpoint.kind == GatewayEndpointKind::Remote {
+                                        ws_connected_ready = false;
+                                        ws_sender.connect_with_retry(spec)?
+                                    } else {
+                                        ws_sender.connect_and_wait(spec)?
+                                    };
+                                    runtime.activate_gateway(endpoint.id.as_str())?;
+                                    Ok((Some(connection_id), ws_connected_ready))
+                                })();
+
+                                match connect_result {
+                                    Ok((connection_id, connected_ready)) => {
+                                        ws_connection_id = connection_id;
+                                        ws_connected_ready = connected_ready;
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            error = %format!("{error:#}"),
+                                            "deleted active gateway but failed to connect fallback gateway"
+                                        );
+                                    }
+                                }
+                            } else {
+                                let _ = ws_sender.disconnect();
+                            }
+
+                            Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
+                                runtime,
+                                ws_connection_id,
+                                ws_connected_ready,
+                                install_warnings,
+                            })
+                        })
+                        .await;
+
+                    let _ = this.update_in(&mut cx, |view, window, cx| match result {
+                        Ok(success) => {
+                            let install_warnings = success.install_warnings.clone();
+                            view.finish_gateway_operation(operation_epoch, Ok(success), cx);
+                            view.push_install_warnings_notification(
+                                install_warnings.as_slice(),
+                                window,
+                                cx,
+                            );
+                            window.close_dialog(cx);
+                        }
+                        Err(error) => {
+                            view.finish_gateway_operation(operation_epoch, Err(error), cx);
+                            view.sync_gateway_setup_form_state(form_state.as_ref(), cx);
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     pub(crate) fn activate_gateway(
         &mut self,
         gateway_id: String,
