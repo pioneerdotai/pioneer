@@ -204,6 +204,31 @@ unavailable = "Gateway is unavailable"
 [gateway.notification]
 path_update_skipped = "Gateway started. For the `pioneer` command, you may need to add %{bin_dir} to PATH in a new terminal session."
 
+[workspace]
+selector_label = "Workspace"
+switch_tooltip = "Switch workspace"
+no_available = "No active workspaces"
+unnamed = "Untitled workspace"
+loading = "Loading workspaces..."
+
+[workspace.action]
+new = "New workspace"
+create = "Create"
+rename = "Rename workspace"
+
+[workspace.dialog]
+create_title = "New workspace"
+create_description = "Name the workspace."
+rename_title = "Rename workspace"
+rename_description = "Update the visible name."
+name_label = "Workspace name"
+empty_name = "Enter a workspace name."
+
+[workspace.error]
+gateway_not_connected = "Gateway is not connected."
+create_failed = "Failed to create workspace."
+rename_failed = "Failed to rename workspace."
+
 [logs.gateway]
 launcher_did_not_reach_service = "launcher did not make configured gateway service reachable"
 launcher_failed = "launcher failed"
@@ -296,6 +321,7 @@ replace_hint = "A key is already configured for %{provider}. Saving will replace
 
 [providers.error]
 gateway_not_connected = "Gateway is not connected."
+workspace_not_selected = "Workspace is not selected."
 load_failed = "Failed to load provider configuration"
 save_failed = "Failed to save API key"
 delete_failed = "Failed to remove API key"

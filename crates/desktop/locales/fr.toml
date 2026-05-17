@@ -78,15 +78,15 @@ all = "Tous"
 documents = "Docs"
 generated = "Generes"
 images = "Images"
-task_output = "Taches"
-uploaded = "Televerses"
+task_output = "Tâches"
+uploaded = "Téléversés"
 
 [artifacts.source]
 agent = "Agent"
 external_agent = "Agent externe"
 import = "Import"
-system = "Systeme"
-task = "Tache"
+system = "Système"
+task = "Tâche"
 tool = "Outil"
 user = "Utilisateur"
 
@@ -204,6 +204,31 @@ unavailable = "Passerelle indisponible"
 [gateway.notification]
 path_update_skipped = "La passerelle est démarrée. Pour la commande `pioneer`, vous devrez peut-être ajouter %{bin_dir} au PATH dans une nouvelle session de terminal."
 
+[workspace]
+selector_label = "Espace de travail"
+switch_tooltip = "Changer d'espace de travail"
+no_available = "Aucun espace de travail actif"
+unnamed = "Espace de travail sans nom"
+loading = "Chargement des espaces de travail..."
+
+[workspace.action]
+new = "Nouvel espace de travail"
+create = "Créer"
+rename = "Renommer l'espace de travail"
+
+[workspace.dialog]
+create_title = "Nouvel espace de travail"
+create_description = "Nommez l'espace de travail."
+rename_title = "Renommer l'espace de travail"
+rename_description = "Modifiez le nom visible."
+name_label = "Nom de l'espace de travail"
+empty_name = "Saisissez un nom d'espace de travail."
+
+[workspace.error]
+gateway_not_connected = "La passerelle n'est pas connectée."
+create_failed = "Impossible de créer l'espace de travail."
+rename_failed = "Impossible de renommer l'espace de travail."
+
 [logs.gateway]
 launcher_did_not_reach_service = "le programme n'a pas rendu le service de passerelle configuré joignable"
 launcher_failed = "le programme a échoué"
@@ -296,6 +321,7 @@ replace_hint = "Une clé est déjà configurée pour %{provider}. L'enregistreme
 
 [providers.error]
 gateway_not_connected = "La passerelle n'est pas connectée."
+workspace_not_selected = "Aucun espace de travail sélectionné."
 load_failed = "Échec du chargement de la configuration des fournisseurs"
 save_failed = "Échec de l'enregistrement de la clé API"
 delete_failed = "Échec de la suppression de la clé API"
@@ -338,7 +364,7 @@ description = "Proxy et passerelle LiteLLM"
 
 [providers.catalog.mistral]
 title = "Mistral AI"
-description = "API Mistral via endpoint compatible OpenAI"
+description = "API Mistral via un point de terminaison compatible OpenAI"
 
 [providers.catalog.ollama]
 title = "Ollama"
@@ -354,7 +380,7 @@ description = "Routeur pour de nombreux fournisseurs de modèles"
 
 [providers.catalog.telnyx]
 title = "Telnyx"
-description = "Endpoint d’inférence Telnyx"
+description = "Point de terminaison d’inférence Telnyx"
 
 [providers.catalog.xai]
 title = "xAI"
@@ -370,7 +396,7 @@ description = "APIs de modèles hébergés par Fireworks"
 
 [providers.catalog.novita]
 title = "Novita"
-description = "Endpoint Novita compatible OpenAI"
+description = "Point de terminaison Novita compatible OpenAI"
 
 [providers.catalog.perplexity]
 title = "Perplexity"
@@ -378,7 +404,7 @@ description = "Modèles API Perplexity"
 
 [providers.catalog.cohere]
 title = "Cohere"
-description = "Endpoint de compatibilité Cohere"
+description = "Point de terminaison de compatibilité Cohere"
 
 [providers.catalog.venice]
 title = "Venice"
@@ -398,43 +424,43 @@ description = "Modèles hébergés par Hyperbolic"
 
 [providers.catalog.deepinfra]
 title = "DeepInfra"
-description = "Endpoint DeepInfra compatible OpenAI"
+description = "Point de terminaison DeepInfra compatible OpenAI"
 
 [providers.catalog.huggingface]
 title = "Hugging Face"
-description = "Endpoint de routeur HF"
+description = "Point de terminaison du routeur HF"
 
 [providers.catalog.ai21]
 title = "AI21"
-description = "Endpoint AI21 Studio"
+description = "Point de terminaison AI21 Studio"
 
 [providers.catalog.reka]
 title = "Reka"
-description = "Endpoint de modèles Reka"
+description = "Point de terminaison de modèles Reka"
 
 [providers.catalog.baseten]
 title = "Baseten"
-description = "Endpoint d’inférence Baseten"
+description = "Point de terminaison d’inférence Baseten"
 
 [providers.catalog.nscale]
 title = "Nscale"
-description = "Endpoint d’inférence Nscale"
+description = "Point de terminaison d’inférence Nscale"
 
 [providers.catalog.anyscale]
 title = "Anyscale"
-description = "Endpoints de modèles hébergés par Anyscale"
+description = "Points de terminaison de modèles hébergés par Anyscale"
 
 [providers.catalog.nebius]
 title = "Nebius"
-description = "Endpoint Nebius AI Studio"
+description = "Point de terminaison Nebius AI Studio"
 
 [providers.catalog.friendli]
 title = "Friendli"
-description = "Endpoint serverless Friendli"
+description = "Point de terminaison sans serveur Friendli"
 
 [providers.catalog.lepton]
 title = "Lepton"
-description = "Endpoint Lepton AI"
+description = "Point de terminaison Lepton AI"
 
 [providers.catalog.siliconflow]
 title = "SiliconFlow"
@@ -442,7 +468,7 @@ description = "API de modèles SiliconFlow"
 
 [providers.catalog.aihubmix]
 title = "AIHubMix"
-description = "Endpoint API AIHubMix"
+description = "Point de terminaison API AIHubMix"
 
 [providers.catalog.astrai]
 title = "ASTRAI"
@@ -450,7 +476,7 @@ description = "API de modèles ASTRAI"
 
 [providers.catalog.stepfun]
 title = "StepFun"
-description = "Endpoint de modèles StepFun"
+description = "Point de terminaison de modèles StepFun"
 
 [providers.catalog.baichuan]
 title = "Baichuan"
@@ -466,19 +492,19 @@ description = "API de modèles Tencent Hunyuan"
 
 [providers.catalog.ovhcloud]
 title = "OVHcloud"
-description = "Endpoint IA OVHcloud"
+description = "Point de terminaison IA OVHcloud"
 
 [providers.catalog.nvidia]
 title = "NVIDIA"
-description = "Endpoint NVIDIA NIM"
+description = "Point de terminaison NVIDIA NIM"
 
 [providers.catalog.synthetic]
 title = "Synthetic"
-description = "Endpoint Synthetic compatible OpenAI"
+description = "Point de terminaison Synthetic compatible OpenAI"
 
 [providers.catalog.doubao]
 title = "Doubao"
-description = "Endpoint Volcengine Ark"
+description = "Point de terminaison Volcengine Ark"
 
 [providers.catalog.qianfan]
 title = "Qianfan"
@@ -510,7 +536,7 @@ description = "Gérez les préférences de l'application."
 
 [settings.sidebar]
 back = "Retour"
-general = "General"
+general = "Général"
 
 [settings.option.language]
 label = "Langue de l'application"
@@ -685,16 +711,16 @@ title = "Aucune compétence installée"
 description = "Installez de nouvelles compétences et étendez les capacités des agents."
 
 [skills.error]
-gateway_not_connected = "Gateway is not connected."
-workspace_not_selected = "No active workspace selected."
-load_failed = "Failed to load installed skills"
-path_required = "Path is required."
-invalid_skill_target = "Invalid skill target."
-install_failed = "Failed to install skill"
-update_failed = "Failed to update skill"
-uninstall_failed = "Failed to uninstall skill"
-policy_failed = "Failed to update skill policy"
-path_picker_failed = "Failed to open source picker"
+gateway_not_connected = "La passerelle n'est pas connectée."
+workspace_not_selected = "Aucun espace de travail actif sélectionné."
+load_failed = "Impossible de charger les compétences installées"
+path_required = "Le chemin est requis."
+invalid_skill_target = "Cible de compétence invalide."
+install_failed = "Impossible d'installer la compétence"
+update_failed = "Impossible de mettre à jour la compétence"
+uninstall_failed = "Impossible de désinstaller la compétence"
+policy_failed = "Impossible de mettre à jour la politique de compétence"
+path_picker_failed = "Impossible d'ouvrir le sélecteur de source"
 
 [skills.card]
 version = "Version"
@@ -702,114 +728,114 @@ fingerprint = "Empreinte"
 
 [skills.status]
 active = "Active"
-blocked = "Blocked"
-disabled = "Disabled"
+blocked = "Bloquée"
+disabled = "Désactivée"
 
 [skills.source]
-system = "System"
-user = "User"
-registry = "Registry"
+system = "Système"
+user = "Utilisateur"
+registry = "Registre"
 
 [skills.trust]
-internal = "Internal"
-verified = "Verified"
-community = "Community"
-untrusted = "Untrusted"
+internal = "Interne"
+verified = "Vérifiée"
+community = "Communauté"
+untrusted = "Non approuvée"
 
 [skills.button]
-install = "Install"
-update = "Update"
-uninstall = "Uninstall"
-enabled = "Enabled"
-implicit = "Implicit"
+install = "Installer"
+update = "Mettre à jour"
+uninstall = "Désinstaller"
+enabled = "Activée"
+implicit = "Implicite"
 
 [skills.upload]
-preparing = "Preparing skill upload"
-installing = "Uploading skill"
-updating = "Uploading update"
-cancelling = "Cancelling upload"
+preparing = "Préparation de l'envoi de la compétence"
+installing = "Envoi de la compétence"
+updating = "Envoi de la mise à jour"
+cancelling = "Annulation de l'envoi"
 
 [skills.diagnostics]
-reason = "Reason:"
+reason = "Motif :"
 validation = "Validation"
-dependencies = "Dependencies"
-dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
-dependencies_column_action = "What to do"
-dependencies_hint_requirement = "What this skill expects to find on your machine."
-dependencies_hint_status = "Current result of the dependency check."
-dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
-dependencies_kind_bin = "Command"
-dependencies_kind_env = "Environment variable"
-dependencies_kind_api_key = "API key"
-dependencies_kind_command = "Command"
-dependencies_kind_mcp = "MCP server"
-dependencies_kind_tool = "Dependency"
-dependencies_status_ready = "Ready"
-dependencies_status_missing = "Missing"
-dependencies_status_blocked = "Blocked"
-dependencies_status_warning = "Warning"
-dependencies_status_unknown = "Unknown"
-security = "Security"
-security_intro = "Potential risks found while scanning skill files."
-security_column_rule = "Rule"
-security_column_finding = "Finding"
-security_column_location = "Location"
-security_hint_level = "Severity of the security finding."
-security_hint_rule = "Identifier of the rule that triggered this finding."
-security_hint_finding = "What exactly was detected and why it matters."
-security_hint_location = "File path where the finding was detected."
-security_location_unknown = "Path not specified"
-security_severity_critical = "Critical"
-security_severity_high = "High"
-security_severity_medium = "Medium"
-security_severity_low = "Low"
+dependencies = "Dépendances"
+dependencies_intro = "Vérifications rapides des dépendances requises pour que la compétence s'exécute correctement."
+dependencies_column_action = "Action à effectuer"
+dependencies_hint_requirement = "Ce que cette compétence s'attend à trouver sur votre machine."
+dependencies_hint_status = "Résultat actuel de la vérification de dépendance."
+dependencies_hint_action = "Action suggérée lorsque la dépendance est manquante ou bloquée."
+dependencies_kind_bin = "Commande"
+dependencies_kind_env = "Variable d'environnement"
+dependencies_kind_api_key = "Clé API"
+dependencies_kind_command = "Commande"
+dependencies_kind_mcp = "Serveur MCP"
+dependencies_kind_tool = "Dépendance"
+dependencies_status_ready = "Prête"
+dependencies_status_missing = "Manquante"
+dependencies_status_blocked = "Bloquée"
+dependencies_status_warning = "Avertissement"
+dependencies_status_unknown = "Inconnue"
+security = "Sécurité"
+security_intro = "Risques potentiels trouvés lors de l'analyse des fichiers de compétence."
+security_column_rule = "Règle"
+security_column_finding = "Constat"
+security_column_location = "Emplacement"
+security_hint_level = "Gravité du constat de sécurité."
+security_hint_rule = "Identifiant de la règle ayant déclenché ce constat."
+security_hint_finding = "Ce qui a été détecté précisément et pourquoi c'est important."
+security_hint_location = "Chemin du fichier où le constat a été détecté."
+security_location_unknown = "Chemin non spécifié"
+security_severity_critical = "Critique"
+security_severity_high = "Élevée"
+security_severity_medium = "Moyenne"
+security_severity_low = "Faible"
 security_severity_info = "Info"
-trust_gate = "Trust gates"
-trust_gate_intro = "Permission decisions based on required trust level."
-trust_column_tool = "Tool type"
-trust_column_min_trust = "Required trust"
-trust_column_explanation = "Explanation"
-trust_hint_tool = "Which tool category this gate controls."
-trust_hint_min_trust = "Minimum trust level required to use this tool."
-trust_hint_decision = "Whether the tool use is currently allowed."
-trust_hint_explanation = "Simple reason for the current decision."
+trust_gate = "Règles de confiance"
+trust_gate_intro = "Décisions d'autorisation basées sur le niveau de confiance requis."
+trust_column_tool = "Type d'outil"
+trust_column_min_trust = "Confiance requise"
+trust_column_explanation = "Explication"
+trust_hint_tool = "Catégorie d'outil contrôlée par cette règle."
+trust_hint_min_trust = "Niveau de confiance minimal requis pour utiliser cet outil."
+trust_hint_decision = "Indique si l'utilisation de l'outil est actuellement autorisée."
+trust_hint_explanation = "Motif simple de la décision actuelle."
 trust_tool_shell = "Shell"
 trust_tool_http = "HTTP"
-trust_tool_function_proxy = "Function proxy"
+trust_tool_function_proxy = "Proxy de fonction"
 trust_tool_mcp = "MCP"
-trust_decision_allowed = "Allowed"
-trust_decision_blocked = "Blocked"
-trust_explanation_allowed = "Current trust level is enough."
-trust_explanation_blocked = "Blocked until trust level reaches"
-audit = "Recent audit"
-audit_intro = "Recent actions and checks related to this skill."
-audit_column_time = "When"
-audit_column_event = "Event"
-audit_column_result = "Result"
-audit_column_details = "Details"
-audit_hint_time = "When this event was recorded."
-audit_hint_event = "What happened with the skill."
-audit_hint_result = "Whether the action was allowed, blocked, or warned."
-audit_hint_details = "Reason and technical details behind the decision."
-audit_action_install = "Installed"
-audit_action_update = "Updated"
-audit_action_uninstall = "Removed"
-audit_action_resolve_allowed = "Resolved for prompt"
-audit_action_resolve_blocked = "Blocked on resolve"
-audit_action_runtime_allowed = "Allowed on runtime"
-audit_action_runtime_blocked = "Blocked on runtime"
-audit_action_security_warn = "Security warning"
-audit_decision_allowed = "Allowed"
-audit_decision_blocked = "Blocked"
-audit_decision_warning = "Warning"
-audit_reason_none = "No explicit reason"
-audit_details_empty = "No extra details"
-none = "none"
-empty_validation = "No validation issues found."
-empty_dependencies = "No dependency issues found."
-empty_security = "No security findings."
-empty_trust_gate = "No trust gate decisions."
-empty_audit = "No audit events yet."
+trust_decision_allowed = "Autorisée"
+trust_decision_blocked = "Bloquée"
+trust_explanation_allowed = "Le niveau de confiance actuel est suffisant."
+trust_explanation_blocked = "Bloquée jusqu'à ce que le niveau de confiance atteigne"
+audit = "Audit récent"
+audit_intro = "Actions et vérifications récentes liées à cette compétence."
+audit_column_time = "Quand"
+audit_column_event = "Événement"
+audit_column_result = "Résultat"
+audit_column_details = "Détails"
+audit_hint_time = "Quand cet événement a été enregistré."
+audit_hint_event = "Ce qui est arrivé à la compétence."
+audit_hint_result = "Indique si l'action a été autorisée, bloquée ou signalée."
+audit_hint_details = "Motif et détails techniques de la décision."
+audit_action_install = "Installée"
+audit_action_update = "Mise à jour"
+audit_action_uninstall = "Supprimée"
+audit_action_resolve_allowed = "Résolue pour le prompt"
+audit_action_resolve_blocked = "Bloquée lors de la résolution"
+audit_action_runtime_allowed = "Autorisée à l'exécution"
+audit_action_runtime_blocked = "Bloquée à l'exécution"
+audit_action_security_warn = "Avertissement de sécurité"
+audit_decision_allowed = "Autorisée"
+audit_decision_blocked = "Bloquée"
+audit_decision_warning = "Avertissement"
+audit_reason_none = "Aucun motif explicite"
+audit_details_empty = "Aucun détail supplémentaire"
+none = "aucun"
+empty_validation = "Aucun problème de validation trouvé."
+empty_dependencies = "Aucun problème de dépendance trouvé."
+empty_security = "Aucun constat de sécurité."
+empty_trust_gate = "Aucune décision de confiance."
+empty_audit = "Aucun événement d'audit pour le moment."
 
 [skills.catalog]
 source = "Source"

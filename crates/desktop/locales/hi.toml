@@ -2,7 +2,7 @@ _version = 1
 
 [chat.composer]
 placeholder = "सहायक को संदेश भेजें"
-stop_reason = "उपयोगकर्ता ने turn रद्द किया"
+stop_reason = "उपयोगकर्ता ने टर्न रद्द किया"
 
 [chat.composer.mode]
 agent_label = "एजेंट"
@@ -24,7 +24,7 @@ no_models = "कोई मॉडल उपलब्ध नहीं है"
 load_error = "लोड करने में त्रुटि: %{error}"
 
 [chat.composer.preview]
-skill = "स्किल: %{name}"
+skill = "कौशल: %{name}"
 mention = "उल्लेख: %{name}"
 
 [common]
@@ -55,14 +55,14 @@ version = "संस्करण"
 version_latest = "नवीनतम"
 
 [artifacts.action]
-attach_tooltip = "इस आर्टिफैक्ट को composer में इनपुट के रूप में उपयोग करें"
+attach_tooltip = "इस आर्टिफैक्ट को कंपोज़र में इनपुट के रूप में उपयोग करें"
 download_tooltip = "इस आर्टिफैक्ट को इस कंप्यूटर पर डाउनलोड करें"
 open_tooltip = "सत्यापित लोकल कॉपी खोलें"
 reveal_tooltip = "लोकल कॉपी दिखाएं"
 
 [artifacts.action.error]
 no_gateway = "कोई सक्रिय गेटवे नहीं"
-no_workspace = "आर्टिफैक्ट workspace मौजूद नहीं है"
+no_workspace = "आर्टिफैक्ट का कार्यक्षेत्र मौजूद नहीं है"
 not_connected = "गेटवे कनेक्ट नहीं है"
 
 [artifacts.action.status]
@@ -158,7 +158,7 @@ description_remote_only = "दूरस्थ गेटवे से कने�
 title = "गेटवे जोड़ें"
 
 [gateway.delete]
-confirm_description = "यह गेटवे को केवल इस desktop से हटाता है। सर्वर पर गेटवे डेटा नहीं हटता।"
+confirm_description = "यह गेटवे को केवल इस डेस्कटॉप क्लाइंट से हटाता है। सर्वर पर गेटवे डेटा नहीं हटता।"
 confirm_title = "%{name} हटाएँ?"
 
 [gateway.edit]
@@ -203,6 +203,31 @@ unavailable = "गेटवे उपलब्ध नहीं है"
 
 [gateway.notification]
 path_update_skipped = "गेटवे शुरू हो गया है। `pioneer` कमांड के लिए नई टर्मिनल सत्र में %{bin_dir} को PATH में जोड़ना पड़ सकता है।"
+
+[workspace]
+selector_label = "कार्यक्षेत्र"
+switch_tooltip = "कार्यक्षेत्र बदलें"
+no_available = "कोई सक्रिय कार्यक्षेत्र नहीं"
+unnamed = "बेनाम कार्यक्षेत्र"
+loading = "कार्यक्षेत्र लोड हो रहे हैं..."
+
+[workspace.action]
+new = "नया कार्यक्षेत्र"
+create = "बनाएँ"
+rename = "कार्यक्षेत्र का नाम बदलें"
+
+[workspace.dialog]
+create_title = "नया कार्यक्षेत्र"
+create_description = "कार्यक्षेत्र का नाम दें."
+rename_title = "कार्यक्षेत्र का नाम बदलें"
+rename_description = "दिखने वाला नाम अपडेट करें."
+name_label = "कार्यक्षेत्र नाम"
+empty_name = "कार्यक्षेत्र नाम दर्ज करें."
+
+[workspace.error]
+gateway_not_connected = "गेटवे कनेक्ट नहीं है."
+create_failed = "कार्यक्षेत्र नहीं बनाया जा सका."
+rename_failed = "कार्यक्षेत्र का नाम नहीं बदला जा सका."
 
 [logs.gateway]
 launcher_did_not_reach_service = "प्रोग्राम कॉन्फ़िगर किए गए गेटवे सेवा को पहुंच योग्य नहीं बना सका"
@@ -255,17 +280,17 @@ title = "AGENTS.md"
 loading = "AGENTS.md लोड हो रहा है..."
 load_error = "AGENTS.md लोड नहीं हुआ"
 retry = "फिर कोशिश करें"
-retry_save = "सेव फिर कोशिश करें"
-save_conflict = "AGENTS.md कहीं और बदल गया है। conflict हल करने के बाद reload या retry करें।"
-save_conflict_missing_remote = "AGENTS.md कहीं और बदल गया है, लेकिन remote दस्तावेज़ लोड नहीं हुआ।"
+retry_save = "सहेजना फिर कोशिश करें"
+save_conflict = "AGENTS.md कहीं और बदल गया है। विवाद हल करने के बाद फिर लोड करें या फिर कोशिश करें।"
+save_conflict_missing_remote = "AGENTS.md कहीं और बदल गया है, लेकिन दूरस्थ दस्तावेज़ लोड नहीं हुआ।"
 
 [editor.agents_doc.conflict]
-title = "AGENTS.md conflict"
-description = "यह edit save होने से पहले remote दस्तावेज़ बदल गया।"
-reload_remote = "Remote reload करें"
-overwrite_remote = "Remote overwrite करें"
-local = "Local"
-remote = "Remote"
+title = "AGENTS.md विवाद"
+description = "यह संपादन सहेजे जाने से पहले दूरस्थ दस्तावेज़ बदल गया।"
+reload_remote = "दूरस्थ फिर लोड करें"
+overwrite_remote = "दूरस्थ को बदलें"
+local = "स्थानीय"
+remote = "दूरस्थ"
 
 [editor.agents_doc.save_state]
 clean = "कोई असहेजे बदलाव नहीं"
@@ -273,7 +298,7 @@ dirty = "असहेजे बदलाव"
 saving = "सेव हो रहा है..."
 saved = "सेव हो गया"
 error = "सेव विफल: %{message}"
-conflict = "सेव करने से पहले conflict हल करें"
+conflict = "सहेजने से पहले विवाद हल करें"
 
 [providers.screen]
 title = "प्रोवाइडर"
@@ -296,6 +321,7 @@ replace_hint = "%{provider} के लिए पहले से एक कु�
 
 [providers.error]
 gateway_not_connected = "गेटवे कनेक्ट नहीं है।"
+workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है."
 load_failed = "प्रोवाइडर कॉन्फ़िगरेशन लोड करने में विफल"
 save_failed = "API कुंजी सहेजने में विफल"
 delete_failed = "API कुंजी हटाने में विफल"
@@ -314,11 +340,11 @@ description = "Azure OpenAI Service के जरिए मॉडल"
 
 [providers.catalog.copilot]
 title = "GitHub Copilot"
-description = "Copilot-compatible API के जरिए मॉडल चलाएं"
+description = "Copilot-संगत API के जरिए मॉडल चलाएं"
 
 [providers.catalog.deepseek]
 title = "DeepSeek"
-description = "OpenAI-compatible DeepSeek प्रदाता"
+description = "OpenAI-संगत DeepSeek प्रदाता"
 
 [providers.catalog.gemini]
 title = "Google Gemini"
@@ -326,19 +352,19 @@ description = "Google AI के Gemini मॉडल"
 
 [providers.catalog.glm]
 title = "GLM"
-description = "GLM और Zhipu-compatible मॉडल"
+description = "GLM और Zhipu-संगत मॉडल"
 
 [providers.catalog.groq]
 title = "Groq"
-description = "Groq हार्डवेयर पर तेज inference"
+description = "Groq हार्डवेयर पर तेज अनुमान"
 
 [providers.catalog.litellm]
 title = "LiteLLM"
-description = "LiteLLM proxy और gateway"
+description = "LiteLLM प्रॉक्सी और गेटवे"
 
 [providers.catalog.mistral]
 title = "Mistral AI"
-description = "OpenAI-compatible endpoint के जरिए Mistral API"
+description = "OpenAI-संगत एंडपॉइंट के जरिए Mistral API"
 
 [providers.catalog.ollama]
 title = "Ollama"
@@ -350,11 +376,11 @@ description = "GPT और अन्य OpenAI मॉडल"
 
 [providers.catalog.openrouter]
 title = "OpenRouter"
-description = "कई मॉडल प्रदाताओं के लिए router"
+description = "कई मॉडल प्रदाताओं के लिए राउटर"
 
 [providers.catalog.telnyx]
 title = "Telnyx"
-description = "Telnyx inference endpoint"
+description = "Telnyx अनुमान एंडपॉइंट"
 
 [providers.catalog.xai]
 title = "xAI"
@@ -362,15 +388,15 @@ description = "xAI Grok मॉडल"
 
 [providers.catalog.together]
 title = "Together AI"
-description = "Together पर hosted मॉडल"
+description = "Together पर होस्टेड मॉडल"
 
 [providers.catalog.fireworks]
 title = "Fireworks AI"
-description = "Fireworks hosted model APIs"
+description = "Fireworks होस्टेड मॉडल API"
 
 [providers.catalog.novita]
 title = "Novita"
-description = "Novita OpenAI-compatible endpoint"
+description = "Novita OpenAI-संगत एंडपॉइंट"
 
 [providers.catalog.perplexity]
 title = "Perplexity"
@@ -378,131 +404,131 @@ description = "Perplexity API मॉडल"
 
 [providers.catalog.cohere]
 title = "Cohere"
-description = "Cohere compatibility endpoint"
+description = "Cohere संगतता एंडपॉइंट"
 
 [providers.catalog.venice]
 title = "Venice"
-description = "Venice model API"
+description = "Venice मॉडल API"
 
 [providers.catalog.cerebras]
 title = "Cerebras"
-description = "Cerebras model API"
+description = "Cerebras मॉडल API"
 
 [providers.catalog.sambanova]
 title = "SambaNova"
-description = "SambaNova model API"
+description = "SambaNova मॉडल API"
 
 [providers.catalog.hyperbolic]
 title = "Hyperbolic"
-description = "Hyperbolic hosted मॉडल"
+description = "Hyperbolic होस्टेड मॉडल"
 
 [providers.catalog.deepinfra]
 title = "DeepInfra"
-description = "DeepInfra OpenAI-compatible endpoint"
+description = "DeepInfra OpenAI-संगत एंडपॉइंट"
 
 [providers.catalog.huggingface]
 title = "Hugging Face"
-description = "HF router endpoint"
+description = "HF राउटर एंडपॉइंट"
 
 [providers.catalog.ai21]
 title = "AI21"
-description = "AI21 Studio endpoint"
+description = "AI21 Studio एंडपॉइंट"
 
 [providers.catalog.reka]
 title = "Reka"
-description = "Reka model endpoint"
+description = "Reka मॉडल एंडपॉइंट"
 
 [providers.catalog.baseten]
 title = "Baseten"
-description = "Baseten inference endpoint"
+description = "Baseten अनुमान एंडपॉइंट"
 
 [providers.catalog.nscale]
 title = "Nscale"
-description = "Nscale inference endpoint"
+description = "Nscale अनुमान एंडपॉइंट"
 
 [providers.catalog.anyscale]
 title = "Anyscale"
-description = "Anyscale hosted model endpoints"
+description = "Anyscale होस्टेड मॉडल एंडपॉइंट"
 
 [providers.catalog.nebius]
 title = "Nebius"
-description = "Nebius AI Studio endpoint"
+description = "Nebius AI Studio एंडपॉइंट"
 
 [providers.catalog.friendli]
 title = "Friendli"
-description = "Friendli serverless endpoint"
+description = "Friendli सर्वरलेस एंडपॉइंट"
 
 [providers.catalog.lepton]
 title = "Lepton"
-description = "Lepton AI endpoint"
+description = "Lepton AI एंडपॉइंट"
 
 [providers.catalog.siliconflow]
 title = "SiliconFlow"
-description = "SiliconFlow model API"
+description = "SiliconFlow मॉडल API"
 
 [providers.catalog.aihubmix]
 title = "AIHubMix"
-description = "AIHubMix API endpoint"
+description = "AIHubMix API एंडपॉइंट"
 
 [providers.catalog.astrai]
 title = "ASTRAI"
-description = "ASTRAI model API"
+description = "ASTRAI मॉडल API"
 
 [providers.catalog.stepfun]
 title = "StepFun"
-description = "StepFun model endpoint"
+description = "StepFun मॉडल एंडपॉइंट"
 
 [providers.catalog.baichuan]
 title = "Baichuan"
-description = "Baichuan model API"
+description = "Baichuan मॉडल API"
 
 [providers.catalog.yi]
 title = "Yi"
-description = "Lingyiwanwu / Yi model API"
+description = "Lingyiwanwu / Yi मॉडल API"
 
 [providers.catalog.hunyuan]
 title = "Hunyuan"
-description = "Tencent Hunyuan model API"
+description = "Tencent Hunyuan मॉडल API"
 
 [providers.catalog.ovhcloud]
 title = "OVHcloud"
-description = "OVHcloud AI endpoint"
+description = "OVHcloud AI एंडपॉइंट"
 
 [providers.catalog.nvidia]
 title = "NVIDIA"
-description = "NVIDIA NIM endpoint"
+description = "NVIDIA NIM एंडपॉइंट"
 
 [providers.catalog.synthetic]
 title = "Synthetic"
-description = "Synthetic OpenAI-compatible endpoint"
+description = "Synthetic OpenAI-संगत एंडपॉइंट"
 
 [providers.catalog.doubao]
 title = "Doubao"
-description = "Volcengine Ark endpoint"
+description = "Volcengine Ark एंडपॉइंट"
 
 [providers.catalog.qianfan]
 title = "Qianfan"
-description = "Baidu Qianfan model API"
+description = "Baidu Qianfan मॉडल API"
 
 [providers.catalog.lmstudio]
 title = "LM Studio"
-description = "स्थानीय LM Studio OpenAI-compatible API"
+description = "स्थानीय LM Studio OpenAI-संगत API"
 
 [providers.catalog.llamacpp]
 title = "llama.cpp"
-description = "स्थानीय llama.cpp OpenAI-compatible API"
+description = "स्थानीय llama.cpp OpenAI-संगत API"
 
 [providers.catalog.sglang]
 title = "SGLang"
-description = "स्थानीय SGLang OpenAI-compatible API"
+description = "स्थानीय SGLang OpenAI-संगत API"
 
 [providers.catalog.vllm]
 title = "vLLM"
-description = "स्थानीय vLLM OpenAI-compatible API"
+description = "स्थानीय vLLM OpenAI-संगत API"
 
 [providers.catalog.osaurus]
 title = "OSaurus"
-description = "स्थानीय OSaurus OpenAI-compatible API"
+description = "स्थानीय OSaurus OpenAI-संगत API"
 
 [settings.screen]
 title = "सेटिंग्स"
@@ -510,7 +536,7 @@ description = "एप्लिकेशन प्राथमिकताओं 
 
 [settings.sidebar]
 back = "वापस"
-general = "General"
+general = "सामान्य"
 
 [settings.option.language]
 label = "ऐप भाषा"
@@ -564,7 +590,7 @@ server_config_object = "%{name}: सर्वर कॉन्फिग एक �
 command_or_url_required = "%{name}: command या url आवश्यक है"
 command_url_exclusive = "%{name}: command और url दोनों साथ में सेट नहीं किए जा सकते"
 gateway_not_connected = "गेटवे कनेक्ट नहीं है"
-workspace_not_selected = "वर्कस्पेस चयनित नहीं है"
+workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है"
 install_failed = "MCP सर्वर इंस्टॉल नहीं हो सका: %{error}"
 server_validation_error = "%{name}: वैलिडेशन त्रुटि"
 validation_failed = "MCP कॉन्फिग वैलिडेशन विफल हुआ"
@@ -625,7 +651,7 @@ prompts_count = "प्रॉम्प्ट: %{count}"
 audit = "ऑडिट"
 audit_count = "ऑडिट इवेंट: %{count}"
 source_config = "कॉन्फिग"
-scope_workspace = "वर्कस्पेस"
+scope_workspace = "कार्यक्षेत्र"
 scope_user = "यूज़र"
 
 [mcp.audit]
@@ -667,7 +693,7 @@ keys_count = "कुंजियां: %{count}"
 [mcp.error]
 server_name_required = "MCP सर्वर नाम आवश्यक है"
 gateway_not_connected = "गेटवे कनेक्ट नहीं है"
-workspace_not_selected = "वर्कस्पेस चयनित नहीं है"
+workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है"
 server_not_available = "MCP सर्वर वर्तमान वर्कस्पेस में उपलब्ध नहीं है"
 load_servers_failed = "MCP सर्वर लोड नहीं हो सके: %{error}"
 load_details_failed = "MCP सर्वर विवरण लोड नहीं हो सके: %{error}"
@@ -685,131 +711,131 @@ title = "कोई इंस्टॉल किए गए कौशल नही
 description = "नए कौशल इंस्टॉल करें और एजेंटों की क्षमताओं का विस्तार करें।"
 
 [skills.error]
-gateway_not_connected = "Gateway is not connected."
-workspace_not_selected = "No active workspace selected."
-load_failed = "Failed to load installed skills"
-path_required = "Path is required."
-invalid_skill_target = "Invalid skill target."
-install_failed = "Failed to install skill"
-update_failed = "Failed to update skill"
-uninstall_failed = "Failed to uninstall skill"
-policy_failed = "Failed to update skill policy"
-path_picker_failed = "Failed to open source picker"
+gateway_not_connected = "गेटवे कनेक्ट नहीं है."
+workspace_not_selected = "कोई सक्रिय कार्यक्षेत्र चयनित नहीं है."
+load_failed = "इंस्टॉल किए गए कौशल लोड नहीं हो सके"
+path_required = "पथ आवश्यक है."
+invalid_skill_target = "अमान्य कौशल लक्ष्य."
+install_failed = "कौशल इंस्टॉल नहीं किया जा सका"
+update_failed = "कौशल अपडेट नहीं किया जा सका"
+uninstall_failed = "कौशल अनइंस्टॉल नहीं किया जा सका"
+policy_failed = "कौशल नीति अपडेट नहीं की जा सकी"
+path_picker_failed = "स्रोत चयनकर्ता नहीं खोला जा सका"
 
 [skills.card]
 version = "संस्करण"
 fingerprint = "फिंगरप्रिंट"
 
 [skills.status]
-active = "Active"
-blocked = "Blocked"
-disabled = "Disabled"
+active = "सक्रिय"
+blocked = "ब्लॉक किया गया"
+disabled = "अक्षम"
 
 [skills.source]
-system = "System"
-user = "User"
-registry = "Registry"
+system = "सिस्टम"
+user = "उपयोगकर्ता"
+registry = "रजिस्ट्री"
 
 [skills.trust]
-internal = "Internal"
-verified = "Verified"
-community = "Community"
-untrusted = "Untrusted"
+internal = "आंतरिक"
+verified = "सत्यापित"
+community = "समुदाय"
+untrusted = "अविश्वसनीय"
 
 [skills.button]
-install = "Install"
-update = "Update"
-uninstall = "Uninstall"
-enabled = "Enabled"
-implicit = "Implicit"
+install = "इंस्टॉल"
+update = "अपडेट"
+uninstall = "अनइंस्टॉल"
+enabled = "सक्षम"
+implicit = "अंतर्निहित"
 
 [skills.upload]
-preparing = "Preparing skill upload"
-installing = "Uploading skill"
-updating = "Uploading update"
-cancelling = "Cancelling upload"
+preparing = "कौशल अपलोड की तैयारी"
+installing = "कौशल अपलोड हो रहा है"
+updating = "अपडेट अपलोड हो रहा है"
+cancelling = "अपलोड रद्द हो रहा है"
 
 [skills.diagnostics]
-reason = "Reason:"
-validation = "Validation"
-dependencies = "Dependencies"
-dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
-dependencies_column_action = "What to do"
-dependencies_hint_requirement = "What this skill expects to find on your machine."
-dependencies_hint_status = "Current result of the dependency check."
-dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
-dependencies_kind_bin = "Command"
-dependencies_kind_env = "Environment variable"
-dependencies_kind_api_key = "API key"
-dependencies_kind_command = "Command"
-dependencies_kind_mcp = "MCP server"
-dependencies_kind_tool = "Dependency"
-dependencies_status_ready = "Ready"
-dependencies_status_missing = "Missing"
-dependencies_status_blocked = "Blocked"
-dependencies_status_warning = "Warning"
-dependencies_status_unknown = "Unknown"
-security = "Security"
-security_intro = "Potential risks found while scanning skill files."
-security_column_rule = "Rule"
-security_column_finding = "Finding"
-security_column_location = "Location"
-security_hint_level = "Severity of the security finding."
-security_hint_rule = "Identifier of the rule that triggered this finding."
-security_hint_finding = "What exactly was detected and why it matters."
-security_hint_location = "File path where the finding was detected."
-security_location_unknown = "Path not specified"
-security_severity_critical = "Critical"
-security_severity_high = "High"
-security_severity_medium = "Medium"
-security_severity_low = "Low"
-security_severity_info = "Info"
-trust_gate = "Trust gates"
-trust_gate_intro = "Permission decisions based on required trust level."
-trust_column_tool = "Tool type"
-trust_column_min_trust = "Required trust"
-trust_column_explanation = "Explanation"
-trust_hint_tool = "Which tool category this gate controls."
-trust_hint_min_trust = "Minimum trust level required to use this tool."
-trust_hint_decision = "Whether the tool use is currently allowed."
-trust_hint_explanation = "Simple reason for the current decision."
+reason = "कारण:"
+validation = "सत्यापन"
+dependencies = "निर्भरताएं"
+dependencies_intro = "आवश्यक निर्भरताओं की त्वरित जांच, ताकि कौशल सही ढंग से चल सके."
+dependencies_column_action = "क्या करें"
+dependencies_hint_requirement = "यह कौशल आपकी मशीन पर क्या खोजने की अपेक्षा करता है."
+dependencies_hint_status = "निर्भरता जांच का वर्तमान परिणाम."
+dependencies_hint_action = "निर्भरता गायब या ब्लॉक होने पर सुझाई गई कार्रवाई."
+dependencies_kind_bin = "कमांड"
+dependencies_kind_env = "पर्यावरण चर"
+dependencies_kind_api_key = "API कुंजी"
+dependencies_kind_command = "कमांड"
+dependencies_kind_mcp = "MCP सर्वर"
+dependencies_kind_tool = "निर्भरता"
+dependencies_status_ready = "तैयार"
+dependencies_status_missing = "गायब"
+dependencies_status_blocked = "ब्लॉक किया गया"
+dependencies_status_warning = "चेतावनी"
+dependencies_status_unknown = "अज्ञात"
+security = "सुरक्षा"
+security_intro = "कौशल फ़ाइलों को स्कैन करते समय मिले संभावित जोखिम."
+security_column_rule = "नियम"
+security_column_finding = "निष्कर्ष"
+security_column_location = "स्थान"
+security_hint_level = "सुरक्षा निष्कर्ष की गंभीरता."
+security_hint_rule = "वह नियम पहचानकर्ता जिसने यह निष्कर्ष ट्रिगर किया."
+security_hint_finding = "ठीक क्या मिला और यह क्यों महत्वपूर्ण है."
+security_hint_location = "वह फ़ाइल पथ जहां निष्कर्ष मिला."
+security_location_unknown = "पथ निर्दिष्ट नहीं है"
+security_severity_critical = "गंभीर"
+security_severity_high = "उच्च"
+security_severity_medium = "मध्यम"
+security_severity_low = "निम्न"
+security_severity_info = "जानकारी"
+trust_gate = "विश्वास नियम"
+trust_gate_intro = "आवश्यक विश्वास स्तर के आधार पर अनुमति निर्णय."
+trust_column_tool = "टूल प्रकार"
+trust_column_min_trust = "आवश्यक विश्वास"
+trust_column_explanation = "व्याख्या"
+trust_hint_tool = "यह नियम किस टूल श्रेणी को नियंत्रित करता है."
+trust_hint_min_trust = "इस टूल का उपयोग करने के लिए आवश्यक न्यूनतम विश्वास स्तर."
+trust_hint_decision = "क्या टूल उपयोग वर्तमान में अनुमत है."
+trust_hint_explanation = "वर्तमान निर्णय का सरल कारण."
 trust_tool_shell = "Shell"
 trust_tool_http = "HTTP"
-trust_tool_function_proxy = "Function proxy"
+trust_tool_function_proxy = "फ़ंक्शन प्रॉक्सी"
 trust_tool_mcp = "MCP"
-trust_decision_allowed = "Allowed"
-trust_decision_blocked = "Blocked"
-trust_explanation_allowed = "Current trust level is enough."
-trust_explanation_blocked = "Blocked until trust level reaches"
-audit = "Recent audit"
-audit_intro = "Recent actions and checks related to this skill."
-audit_column_time = "When"
-audit_column_event = "Event"
-audit_column_result = "Result"
-audit_column_details = "Details"
-audit_hint_time = "When this event was recorded."
-audit_hint_event = "What happened with the skill."
-audit_hint_result = "Whether the action was allowed, blocked, or warned."
-audit_hint_details = "Reason and technical details behind the decision."
-audit_action_install = "Installed"
-audit_action_update = "Updated"
-audit_action_uninstall = "Removed"
-audit_action_resolve_allowed = "Resolved for prompt"
-audit_action_resolve_blocked = "Blocked on resolve"
-audit_action_runtime_allowed = "Allowed on runtime"
-audit_action_runtime_blocked = "Blocked on runtime"
-audit_action_security_warn = "Security warning"
-audit_decision_allowed = "Allowed"
-audit_decision_blocked = "Blocked"
-audit_decision_warning = "Warning"
-audit_reason_none = "No explicit reason"
-audit_details_empty = "No extra details"
-none = "none"
-empty_validation = "No validation issues found."
-empty_dependencies = "No dependency issues found."
-empty_security = "No security findings."
-empty_trust_gate = "No trust gate decisions."
-empty_audit = "No audit events yet."
+trust_decision_allowed = "अनुमत"
+trust_decision_blocked = "ब्लॉक किया गया"
+trust_explanation_allowed = "वर्तमान विश्वास स्तर पर्याप्त है."
+trust_explanation_blocked = "विश्वास स्तर पहुंचने तक ब्लॉक किया गया"
+audit = "हालिया ऑडिट"
+audit_intro = "इस कौशल से संबंधित हाल की कार्रवाइयां और जांच."
+audit_column_time = "समय"
+audit_column_event = "इवेंट"
+audit_column_result = "परिणाम"
+audit_column_details = "विवरण"
+audit_hint_time = "यह इवेंट कब रिकॉर्ड किया गया."
+audit_hint_event = "कौशल के साथ क्या हुआ."
+audit_hint_result = "कार्रवाई अनुमत, ब्लॉक या चेतावनी वाली थी या नहीं."
+audit_hint_details = "निर्णय के पीछे कारण और तकनीकी विवरण."
+audit_action_install = "इंस्टॉल किया गया"
+audit_action_update = "अपडेट किया गया"
+audit_action_uninstall = "हटाया गया"
+audit_action_resolve_allowed = "प्रॉम्प्ट के लिए रिज़ॉल्व किया गया"
+audit_action_resolve_blocked = "रिज़ॉल्व करते समय ब्लॉक"
+audit_action_runtime_allowed = "रनटाइम पर अनुमत"
+audit_action_runtime_blocked = "रनटाइम पर ब्लॉक"
+audit_action_security_warn = "सुरक्षा चेतावनी"
+audit_decision_allowed = "अनुमत"
+audit_decision_blocked = "ब्लॉक किया गया"
+audit_decision_warning = "चेतावनी"
+audit_reason_none = "कोई स्पष्ट कारण नहीं"
+audit_details_empty = "कोई अतिरिक्त विवरण नहीं"
+none = "कोई नहीं"
+empty_validation = "कोई सत्यापन समस्या नहीं मिली."
+empty_dependencies = "कोई निर्भरता समस्या नहीं मिली."
+empty_security = "कोई सुरक्षा निष्कर्ष नहीं."
+empty_trust_gate = "कोई विश्वास निर्णय नहीं."
+empty_audit = "अभी कोई ऑडिट इवेंट नहीं."
 
 [skills.catalog]
 source = "स्रोत"
@@ -825,7 +851,7 @@ turn_cancelled = "टर्न रद्द हुआ। आप नया सं
 turn_completed = "टर्न पूरा हुआ। अगला संदेश भेजने के लिए तैयार।"
 ready = "तैयार"
 starting_turn = "टर्न शुरू हो रहा है..."
-agent_processing = "Agent प्रोसेस कर रहा है..."
+agent_processing = "एजेंट संसाधित कर रहा है..."
 
 [timeline.empty]
 start_thread = "यह थ्रेड शुरू करने के लिए संदेश भेजें"

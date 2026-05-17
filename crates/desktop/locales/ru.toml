@@ -55,15 +55,15 @@ version = "Версия"
 version_latest = "последняя"
 
 [artifacts.action]
-attach_tooltip = "Использовать этот артефакт как вход в composer"
+attach_tooltip = "Использовать этот артефакт как вход для редактора"
 download_tooltip = "Скачать этот артефакт на этот компьютер"
 open_tooltip = "Открыть проверенную локальную копию"
 reveal_tooltip = "Показать локальную копию"
 
 [artifacts.action.error]
-no_gateway = "Нет активного gateway"
-no_workspace = "Не указан workspace артефакта"
-not_connected = "Gateway не подключен"
+no_gateway = "Нет активного шлюза"
+no_workspace = "У артефакта не указано пространство"
+not_connected = "Шлюз не подключен"
 
 [artifacts.action.status]
 downloading = "Скачивание на этот компьютер..."
@@ -158,7 +158,7 @@ description_remote_only = "Подключите удалённый шлюз."
 title = "Добавление шлюза"
 
 [gateway.delete]
-confirm_description = "Шлюз будет удалён только из этого desktop-клиента. Данные на сервере не удаляются."
+confirm_description = "Шлюз будет удалён только из этого настольного клиента. Данные на сервере не удаляются."
 confirm_title = "Удалить %{name}?"
 
 [gateway.edit]
@@ -203,6 +203,31 @@ unavailable = "Шлюз недоступен"
 
 [gateway.notification]
 path_update_skipped = "Шлюз запущен. Для команды `pioneer` в новом терминале может потребоваться добавить %{bin_dir} в PATH."
+
+[workspace]
+selector_label = "Пространство"
+switch_tooltip = "Переключить пространство"
+no_available = "Нет активных пространств"
+unnamed = "Безымянное пространство"
+loading = "Загрузка пространств..."
+
+[workspace.action]
+new = "Новое пространство"
+create = "Создать"
+rename = "Переименовать пространство"
+
+[workspace.dialog]
+create_title = "Новое пространство"
+create_description = "Введите название пространства."
+rename_title = "Переименовать пространство"
+rename_description = "Измените отображаемое название."
+name_label = "Название пространства"
+empty_name = "Введите название пространства."
+
+[workspace.error]
+gateway_not_connected = "Шлюз не подключён."
+create_failed = "Не удалось создать пространство."
+rename_failed = "Не удалось переименовать пространство."
 
 [logs.gateway]
 launcher_did_not_reach_service = "программа не смогла сделать настроенную службу шлюза доступной"
@@ -257,15 +282,15 @@ load_error = "Не удалось загрузить AGENTS.md"
 retry = "Повторить"
 retry_save = "Повторить сохранение"
 save_conflict = "AGENTS.md изменился в другом месте. Перезагрузите или повторите после разрешения конфликта."
-save_conflict_missing_remote = "AGENTS.md изменился в другом месте, но удаленный документ не удалось загрузить."
+save_conflict_missing_remote = "AGENTS.md изменился в другом месте, но удалённый документ не удалось загрузить."
 
 [editor.agents_doc.conflict]
 title = "Конфликт AGENTS.md"
 description = "Удаленный документ изменился до сохранения этой правки."
-reload_remote = "Загрузить удаленный"
-overwrite_remote = "Перезаписать удаленный"
+reload_remote = "Загрузить удалённый"
+overwrite_remote = "Перезаписать удалённый"
 local = "Локально"
-remote = "Удаленно"
+remote = "Удалённо"
 
 [editor.agents_doc.save_state]
 clean = "Несохраненных изменений нет"
@@ -295,7 +320,8 @@ api_key_placeholder = "Введите API ключ"
 replace_hint = "Для %{provider} уже настроен ключ. Сохранение заменит его."
 
 [providers.error]
-gateway_not_connected = "Gateway не подключен."
+gateway_not_connected = "Шлюз не подключён."
+workspace_not_selected = "Пространство не выбрано."
 load_failed = "Не удалось загрузить конфигурацию провайдеров"
 save_failed = "Не удалось сохранить API ключ"
 delete_failed = "Не удалось удалить API ключ"
@@ -330,15 +356,15 @@ description = "GLM и Zhipu-совместимые модели"
 
 [providers.catalog.groq]
 title = "Groq"
-description = "Быстрый inference на оборудовании Groq"
+description = "Быстрый вывод на оборудовании Groq"
 
 [providers.catalog.litellm]
 title = "LiteLLM"
-description = "LiteLLM proxy и gateway"
+description = "Прокси и шлюз LiteLLM"
 
 [providers.catalog.mistral]
 title = "Mistral AI"
-description = "Mistral API через OpenAI-совместимый endpoint"
+description = "Mistral API через OpenAI-совместимую конечную точку"
 
 [providers.catalog.ollama]
 title = "Ollama"
@@ -354,7 +380,7 @@ description = "Маршрутизатор для множества провай
 
 [providers.catalog.telnyx]
 title = "Telnyx"
-description = "Inference endpoint Telnyx"
+description = "Конечная точка вывода Telnyx"
 
 [providers.catalog.xai]
 title = "xAI"
@@ -366,11 +392,11 @@ description = "Модели, размещённые в Together"
 
 [providers.catalog.fireworks]
 title = "Fireworks AI"
-description = "Hosted model APIs Fireworks"
+description = "Хостинговые API моделей Fireworks"
 
 [providers.catalog.novita]
 title = "Novita"
-description = "OpenAI-совместимый endpoint Novita"
+description = "OpenAI-совместимая конечная точка Novita"
 
 [providers.catalog.perplexity]
 title = "Perplexity"
@@ -378,7 +404,7 @@ description = "API моделей Perplexity"
 
 [providers.catalog.cohere]
 title = "Cohere"
-description = "Endpoint совместимости Cohere"
+description = "Конечная точка совместимости Cohere"
 
 [providers.catalog.venice]
 title = "Venice"
@@ -398,43 +424,43 @@ description = "Модели, размещённые в Hyperbolic"
 
 [providers.catalog.deepinfra]
 title = "DeepInfra"
-description = "OpenAI-совместимый endpoint DeepInfra"
+description = "OpenAI-совместимая конечная точка DeepInfra"
 
 [providers.catalog.huggingface]
 title = "Hugging Face"
-description = "Endpoint роутера HF"
+description = "Конечная точка маршрутизатора HF"
 
 [providers.catalog.ai21]
 title = "AI21"
-description = "Endpoint AI21 Studio"
+description = "Конечная точка AI21 Studio"
 
 [providers.catalog.reka]
 title = "Reka"
-description = "Endpoint моделей Reka"
+description = "Конечная точка моделей Reka"
 
 [providers.catalog.baseten]
 title = "Baseten"
-description = "Inference endpoint Baseten"
+description = "Конечная точка вывода Baseten"
 
 [providers.catalog.nscale]
 title = "Nscale"
-description = "Inference endpoint Nscale"
+description = "Конечная точка вывода Nscale"
 
 [providers.catalog.anyscale]
 title = "Anyscale"
-description = "Hosted model endpoints Anyscale"
+description = "Хостинговые конечные точки моделей Anyscale"
 
 [providers.catalog.nebius]
 title = "Nebius"
-description = "Endpoint Nebius AI Studio"
+description = "Конечная точка Nebius AI Studio"
 
 [providers.catalog.friendli]
 title = "Friendli"
-description = "Serverless endpoint Friendli"
+description = "Бессерверная конечная точка Friendli"
 
 [providers.catalog.lepton]
 title = "Lepton"
-description = "Endpoint Lepton AI"
+description = "Конечная точка Lepton AI"
 
 [providers.catalog.siliconflow]
 title = "SiliconFlow"
@@ -442,7 +468,7 @@ description = "API моделей SiliconFlow"
 
 [providers.catalog.aihubmix]
 title = "AIHubMix"
-description = "API endpoint AIHubMix"
+description = "Конечная точка API AIHubMix"
 
 [providers.catalog.astrai]
 title = "ASTRAI"
@@ -450,7 +476,7 @@ description = "API моделей ASTRAI"
 
 [providers.catalog.stepfun]
 title = "StepFun"
-description = "Endpoint моделей StepFun"
+description = "Конечная точка моделей StepFun"
 
 [providers.catalog.baichuan]
 title = "Baichuan"
@@ -466,19 +492,19 @@ description = "API моделей Tencent Hunyuan"
 
 [providers.catalog.ovhcloud]
 title = "OVHcloud"
-description = "AI endpoint OVHcloud"
+description = "Конечная точка AI OVHcloud"
 
 [providers.catalog.nvidia]
 title = "NVIDIA"
-description = "Endpoint NVIDIA NIM"
+description = "Конечная точка NVIDIA NIM"
 
 [providers.catalog.synthetic]
 title = "Synthetic"
-description = "OpenAI-совместимый endpoint Synthetic"
+description = "OpenAI-совместимая конечная точка Synthetic"
 
 [providers.catalog.doubao]
 title = "Doubao"
-description = "Endpoint Volcengine Ark"
+description = "Конечная точка Volcengine Ark"
 
 [providers.catalog.qianfan]
 title = "Qianfan"
@@ -532,7 +558,7 @@ server_config_object = "%{name}: конфиг сервера должен быт
 command_or_url_required = "%{name}: нужно указать command или url"
 command_url_exclusive = "%{name}: command и url нельзя указывать одновременно"
 gateway_not_connected = "Шлюз не подключен"
-workspace_not_selected = "Рабочее пространство не выбрано"
+workspace_not_selected = "Пространство не выбрано"
 install_failed = "Не удалось установить MCP сервер: %{error}"
 server_validation_error = "%{name}: ошибка валидации"
 validation_failed = "Валидация JSON конфига MCP не прошла"
@@ -635,8 +661,8 @@ keys_count = "Ключей: %{count}"
 [mcp.error]
 server_name_required = "Имя MCP сервера обязательно"
 gateway_not_connected = "Шлюз не подключен"
-workspace_not_selected = "Рабочее пространство не выбрано"
-server_not_available = "MCP сервер недоступен в текущем рабочем пространстве"
+workspace_not_selected = "Пространство не выбрано"
+server_not_available = "MCP сервер недоступен в текущем пространстве"
 load_servers_failed = "Не удалось загрузить MCP серверы: %{error}"
 load_details_failed = "Не удалось загрузить детали MCP сервера: %{error}"
 policy_update_failed = "Не удалось обновить политику MCP: %{error}"
@@ -653,15 +679,15 @@ title = "Нет установленных навыков"
 description = "Установите новые навыки и расширьте возможности агентов."
 
 [skills.error]
-gateway_not_connected = "Gateway не подключен."
-workspace_not_selected = "Активный workspace не выбран."
-load_failed = "Не удалось загрузить установленные скиллы"
+gateway_not_connected = "Шлюз не подключен."
+workspace_not_selected = "Активное пространство не выбрано."
+load_failed = "Не удалось загрузить установленные навыки"
 path_required = "Нужно указать путь."
-invalid_skill_target = "Некорректный target скилла."
-install_failed = "Не удалось установить скилл"
-update_failed = "Не удалось обновить скилл"
-uninstall_failed = "Не удалось удалить скилл"
-policy_failed = "Не удалось обновить политику скилла"
+invalid_skill_target = "Некорректная цель навыка."
+install_failed = "Не удалось установить навык"
+update_failed = "Не удалось обновить навык"
+uninstall_failed = "Не удалось удалить навык"
+policy_failed = "Не удалось обновить политику навыка"
 path_picker_failed = "Не удалось открыть выбор источника."
 
 [skills.card]
@@ -672,12 +698,12 @@ fingerprint = "Отпечаток"
 install = "Установить"
 update = "Обновить"
 uninstall = "Удалить"
-enabled = "Enabled"
-implicit = "Implicit"
+enabled = "Включен"
+implicit = "Неявно"
 
 [skills.upload]
-preparing = "Подготовка загрузки скилла"
-installing = "Загрузка скилла"
+preparing = "Подготовка загрузки навыка"
+installing = "Загрузка навыка"
 updating = "Загрузка обновления"
 cancelling = "Отмена загрузки"
 
@@ -716,10 +742,10 @@ security_severity_high = "Высокий"
 security_severity_medium = "Средний"
 security_severity_low = "Низкий"
 security_severity_info = "Инфо"
-trust_gate = "Trust gates"
+trust_gate = "Правила доверия"
 trust_gate_intro = "Решения по доступу к инструментам на основе уровня доверия."
 trust_column_tool = "Тип инструмента"
-trust_column_min_trust = "Требуемый trust"
+trust_column_min_trust = "Требуемый уровень доверия"
 trust_column_explanation = "Пояснение"
 trust_hint_tool = "Какой класс инструментов контролирует это правило."
 trust_hint_min_trust = "Минимальный уровень доверия для использования этого инструмента."
@@ -727,13 +753,13 @@ trust_hint_decision = "Разрешено ли использование сей
 trust_hint_explanation = "Простая причина текущего решения."
 trust_tool_shell = "Shell"
 trust_tool_http = "HTTP"
-trust_tool_function_proxy = "Function proxy"
+trust_tool_function_proxy = "Прокси функций"
 trust_tool_mcp = "MCP"
 trust_decision_allowed = "Разрешено"
 trust_decision_blocked = "Заблокировано"
 trust_explanation_allowed = "Текущий уровень доверия достаточен."
-trust_explanation_blocked = "Заблокировано, пока trust не достигнет уровня"
-audit = "Последние audit-события"
+trust_explanation_blocked = "Заблокировано, пока уровень доверия не достигнет"
+audit = "Последние события аудита"
 audit_intro = "Последние действия и проверки, связанные с этим навыком."
 audit_column_time = "Когда"
 audit_column_event = "Событие"
@@ -756,11 +782,11 @@ audit_decision_blocked = "Заблокировано"
 audit_decision_warning = "Предупреждение"
 audit_reason_none = "Причина не указана"
 audit_details_empty = "Нет дополнительных деталей"
-none = "none"
+none = "нет"
 empty_validation = "Проблем валидации не обнаружено."
 empty_dependencies = "Проблем зависимостей не обнаружено."
 empty_security = "Проблем безопасности не обнаружено."
-empty_trust_gate = "Ограничения trust gates отсутствуют."
+empty_trust_gate = "Ограничения доверия отсутствуют."
 empty_audit = "Аудит-события отсутствуют."
 
 [skills.catalog]
@@ -773,15 +799,15 @@ blocked = "Заблокирован"
 disabled = "Выключен"
 
 [skills.source]
-system = "System"
-user = "User"
-registry = "Registry"
+system = "Система"
+user = "Пользователь"
+registry = "Реестр"
 
 [skills.trust]
-internal = "Internal"
-verified = "Verified"
-community = "Community"
-untrusted = "Untrusted"
+internal = "Внутренний"
+verified = "Проверенный"
+community = "Сообщество"
+untrusted = "Недоверенный"
 
 [settings.screen]
 title = "Настройки"
@@ -789,7 +815,7 @@ description = "Управляйте параметрами приложения.
 
 [settings.sidebar]
 back = "Назад"
-general = "General"
+general = "Общие"
 
 [settings.option.language]
 label = "Язык приложения"

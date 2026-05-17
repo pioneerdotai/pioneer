@@ -62,7 +62,7 @@ reveal_tooltip = "Mostrar la copia local"
 
 [artifacts.action.error]
 no_gateway = "No hay una pasarela activa"
-no_workspace = "Falta el workspace del artefacto"
+no_workspace = "Falta el espacio de trabajo del artefacto"
 not_connected = "La pasarela no esta conectada"
 
 [artifacts.action.status]
@@ -125,7 +125,7 @@ local_delete_unsupported = "la pasarela local no se puede eliminar de la lista"
 remote_edit_only = "solo se pueden editar pasarelas remotas"
 resolve_empty = "la dirección de pasarela `%{listen_addr}` no resolvió a ninguna dirección de socket"
 resolve_failed = "no se pudo resolver la dirección de pasarela `%{listen_addr}`"
-start_command_failed_manual_help = "no se pudo instalar o iniciar automáticamente la pasarela local; vuelve a intentarlo y verifica la configuración local del gateway"
+start_command_failed_manual_help = "no se pudo instalar o iniciar automáticamente la pasarela local; vuelve a intentarlo y verifica la configuración local de la pasarela"
 startup_timeout = "el servicio de la pasarela no estuvo disponible en `%{listen_addr}` dentro de %{startup_timeout_ms}ms"
 unreachable_verify = "la pasarela `%{address}` no es accesible; verifica la dirección y que la pasarela esté en ejecución"
 
@@ -203,6 +203,31 @@ unavailable = "Pasarela no disponible"
 
 [gateway.notification]
 path_update_skipped = "La pasarela se inició. Para el comando `pioneer`, puede que necesites agregar %{bin_dir} al PATH en una nueva sesión de terminal."
+
+[workspace]
+selector_label = "Espacio de trabajo"
+switch_tooltip = "Cambiar de espacio de trabajo"
+no_available = "No hay espacios de trabajo activos"
+unnamed = "Espacio de trabajo sin nombre"
+loading = "Cargando espacios de trabajo..."
+
+[workspace.action]
+new = "Nuevo espacio de trabajo"
+create = "Crear"
+rename = "Renombrar espacio de trabajo"
+
+[workspace.dialog]
+create_title = "Nuevo espacio de trabajo"
+create_description = "Asigna un nombre al espacio de trabajo."
+rename_title = "Renombrar espacio de trabajo"
+rename_description = "Actualiza el nombre visible."
+name_label = "Nombre del espacio de trabajo"
+empty_name = "Introduce un nombre de espacio de trabajo."
+
+[workspace.error]
+gateway_not_connected = "La pasarela no está conectada."
+create_failed = "No se pudo crear el espacio de trabajo."
+rename_failed = "No se pudo renombrar el espacio de trabajo."
 
 [logs.gateway]
 launcher_did_not_reach_service = "el programa no logró que el servicio de pasarela configurado fuera accesible"
@@ -295,7 +320,8 @@ api_key_placeholder = "Introduce la clave API"
 replace_hint = "Ya hay una clave configurada para %{provider}. Al guardar se reemplazará."
 
 [providers.error]
-gateway_not_connected = "El gateway no está conectado."
+gateway_not_connected = "La pasarela no está conectada."
+workspace_not_selected = "No se ha seleccionado un espacio de trabajo."
 load_failed = "No se pudo cargar la configuración de proveedores"
 save_failed = "No se pudo guardar la clave API"
 delete_failed = "No se pudo eliminar la clave API"
@@ -334,11 +360,11 @@ description = "Inferencia rápida con hardware Groq"
 
 [providers.catalog.litellm]
 title = "LiteLLM"
-description = "Proxy y gateway LiteLLM"
+description = "Proxy y pasarela LiteLLM"
 
 [providers.catalog.mistral]
 title = "Mistral AI"
-description = "API de Mistral mediante endpoint compatible con OpenAI"
+description = "API de Mistral mediante un punto de conexión compatible con OpenAI"
 
 [providers.catalog.ollama]
 title = "Ollama"
@@ -354,7 +380,7 @@ description = "Enrutador para muchos proveedores de modelos"
 
 [providers.catalog.telnyx]
 title = "Telnyx"
-description = "Endpoint de inferencia de Telnyx"
+description = "Punto de conexión de inferencia de Telnyx"
 
 [providers.catalog.xai]
 title = "xAI"
@@ -370,7 +396,7 @@ description = "APIs de modelos alojados por Fireworks"
 
 [providers.catalog.novita]
 title = "Novita"
-description = "Endpoint Novita compatible con OpenAI"
+description = "Punto de conexión Novita compatible con OpenAI"
 
 [providers.catalog.perplexity]
 title = "Perplexity"
@@ -378,7 +404,7 @@ description = "Modelos de la API de Perplexity"
 
 [providers.catalog.cohere]
 title = "Cohere"
-description = "Endpoint de compatibilidad de Cohere"
+description = "Punto de conexión de compatibilidad de Cohere"
 
 [providers.catalog.venice]
 title = "Venice"
@@ -398,43 +424,43 @@ description = "Modelos alojados por Hyperbolic"
 
 [providers.catalog.deepinfra]
 title = "DeepInfra"
-description = "Endpoint DeepInfra compatible con OpenAI"
+description = "Punto de conexión DeepInfra compatible con OpenAI"
 
 [providers.catalog.huggingface]
 title = "Hugging Face"
-description = "Endpoint del enrutador HF"
+description = "Punto de conexión del enrutador HF"
 
 [providers.catalog.ai21]
 title = "AI21"
-description = "Endpoint de AI21 Studio"
+description = "Punto de conexión de AI21 Studio"
 
 [providers.catalog.reka]
 title = "Reka"
-description = "Endpoint de modelos de Reka"
+description = "Punto de conexión de modelos de Reka"
 
 [providers.catalog.baseten]
 title = "Baseten"
-description = "Endpoint de inferencia de Baseten"
+description = "Punto de conexión de inferencia de Baseten"
 
 [providers.catalog.nscale]
 title = "Nscale"
-description = "Endpoint de inferencia de Nscale"
+description = "Punto de conexión de inferencia de Nscale"
 
 [providers.catalog.anyscale]
 title = "Anyscale"
-description = "Endpoints de modelos alojados por Anyscale"
+description = "Puntos de conexión de modelos alojados por Anyscale"
 
 [providers.catalog.nebius]
 title = "Nebius"
-description = "Endpoint de Nebius AI Studio"
+description = "Punto de conexión de Nebius AI Studio"
 
 [providers.catalog.friendli]
 title = "Friendli"
-description = "Endpoint serverless de Friendli"
+description = "Punto de conexión sin servidor de Friendli"
 
 [providers.catalog.lepton]
 title = "Lepton"
-description = "Endpoint de Lepton AI"
+description = "Punto de conexión de Lepton AI"
 
 [providers.catalog.siliconflow]
 title = "SiliconFlow"
@@ -442,7 +468,7 @@ description = "API de modelos de SiliconFlow"
 
 [providers.catalog.aihubmix]
 title = "AIHubMix"
-description = "Endpoint API de AIHubMix"
+description = "Punto de conexión de API de AIHubMix"
 
 [providers.catalog.astrai]
 title = "ASTRAI"
@@ -450,7 +476,7 @@ description = "API de modelos de ASTRAI"
 
 [providers.catalog.stepfun]
 title = "StepFun"
-description = "Endpoint de modelos de StepFun"
+description = "Punto de conexión de modelos de StepFun"
 
 [providers.catalog.baichuan]
 title = "Baichuan"
@@ -466,19 +492,19 @@ description = "API de modelos Tencent Hunyuan"
 
 [providers.catalog.ovhcloud]
 title = "OVHcloud"
-description = "Endpoint de IA de OVHcloud"
+description = "Punto de conexión de IA de OVHcloud"
 
 [providers.catalog.nvidia]
 title = "NVIDIA"
-description = "Endpoint NVIDIA NIM"
+description = "Punto de conexión NVIDIA NIM"
 
 [providers.catalog.synthetic]
 title = "Synthetic"
-description = "Endpoint Synthetic compatible con OpenAI"
+description = "Punto de conexión Synthetic compatible con OpenAI"
 
 [providers.catalog.doubao]
 title = "Doubao"
-description = "Endpoint Volcengine Ark"
+description = "Punto de conexión Volcengine Ark"
 
 [providers.catalog.qianfan]
 title = "Qianfan"
@@ -685,138 +711,138 @@ title = "No hay habilidades instaladas"
 description = "Instala nuevas habilidades y amplía las capacidades de los agentes."
 
 [skills.error]
-gateway_not_connected = "Gateway is not connected."
-workspace_not_selected = "No active workspace selected."
-load_failed = "Failed to load installed skills"
-path_required = "Path is required."
-invalid_skill_target = "Invalid skill target."
-install_failed = "Failed to install skill"
-update_failed = "Failed to update skill"
-uninstall_failed = "Failed to uninstall skill"
-policy_failed = "Failed to update skill policy"
-path_picker_failed = "Failed to open source picker"
+gateway_not_connected = "La pasarela no está conectada."
+workspace_not_selected = "No se ha seleccionado un espacio de trabajo activo."
+load_failed = "No se pudieron cargar las habilidades instaladas"
+path_required = "La ruta es obligatoria."
+invalid_skill_target = "Destino de habilidad no válido."
+install_failed = "No se pudo instalar la habilidad"
+update_failed = "No se pudo actualizar la habilidad"
+uninstall_failed = "No se pudo desinstalar la habilidad"
+policy_failed = "No se pudo actualizar la política de la habilidad"
+path_picker_failed = "No se pudo abrir el selector de origen"
 
 [skills.card]
 version = "Versión"
 fingerprint = "Huella"
 
 [skills.status]
-active = "Active"
-blocked = "Blocked"
-disabled = "Disabled"
+active = "Activa"
+blocked = "Bloqueada"
+disabled = "Desactivada"
 
 [skills.source]
-system = "System"
-user = "User"
-registry = "Registry"
+system = "Sistema"
+user = "Usuario"
+registry = "Registro"
 
 [skills.trust]
-internal = "Internal"
-verified = "Verified"
-community = "Community"
-untrusted = "Untrusted"
+internal = "Interna"
+verified = "Verificada"
+community = "Comunidad"
+untrusted = "No confiable"
 
 [skills.button]
-install = "Install"
-update = "Update"
-uninstall = "Uninstall"
-enabled = "Enabled"
-implicit = "Implicit"
+install = "Instalar"
+update = "Actualizar"
+uninstall = "Desinstalar"
+enabled = "Activada"
+implicit = "Implícita"
 
 [skills.upload]
-preparing = "Preparing skill upload"
-installing = "Uploading skill"
-updating = "Uploading update"
-cancelling = "Cancelling upload"
+preparing = "Preparando subida de habilidad"
+installing = "Subiendo habilidad"
+updating = "Subiendo actualización"
+cancelling = "Cancelando subida"
 
 [skills.diagnostics]
-reason = "Reason:"
-validation = "Validation"
-dependencies = "Dependencies"
-dependencies_intro = "Quick checks for required dependencies so the skill can run correctly."
-dependencies_column_action = "What to do"
-dependencies_hint_requirement = "What this skill expects to find on your machine."
-dependencies_hint_status = "Current result of the dependency check."
-dependencies_hint_action = "Suggested action when the dependency is missing or blocked."
-dependencies_kind_bin = "Command"
-dependencies_kind_env = "Environment variable"
-dependencies_kind_api_key = "API key"
-dependencies_kind_command = "Command"
-dependencies_kind_mcp = "MCP server"
-dependencies_kind_tool = "Dependency"
-dependencies_status_ready = "Ready"
-dependencies_status_missing = "Missing"
-dependencies_status_blocked = "Blocked"
-dependencies_status_warning = "Warning"
-dependencies_status_unknown = "Unknown"
-security = "Security"
-security_intro = "Potential risks found while scanning skill files."
-security_column_rule = "Rule"
-security_column_finding = "Finding"
-security_column_location = "Location"
-security_hint_level = "Severity of the security finding."
-security_hint_rule = "Identifier of the rule that triggered this finding."
-security_hint_finding = "What exactly was detected and why it matters."
-security_hint_location = "File path where the finding was detected."
-security_location_unknown = "Path not specified"
-security_severity_critical = "Critical"
-security_severity_high = "High"
-security_severity_medium = "Medium"
-security_severity_low = "Low"
-security_severity_info = "Info"
-trust_gate = "Trust gates"
-trust_gate_intro = "Permission decisions based on required trust level."
-trust_column_tool = "Tool type"
-trust_column_min_trust = "Required trust"
-trust_column_explanation = "Explanation"
-trust_hint_tool = "Which tool category this gate controls."
-trust_hint_min_trust = "Minimum trust level required to use this tool."
-trust_hint_decision = "Whether the tool use is currently allowed."
-trust_hint_explanation = "Simple reason for the current decision."
+reason = "Motivo:"
+validation = "Validación"
+dependencies = "Dependencias"
+dependencies_intro = "Comprobaciones rápidas de dependencias necesarias para que la habilidad se ejecute correctamente."
+dependencies_column_action = "Qué hacer"
+dependencies_hint_requirement = "Qué espera encontrar esta habilidad en tu equipo."
+dependencies_hint_status = "Resultado actual de la comprobación de dependencia."
+dependencies_hint_action = "Acción sugerida cuando la dependencia falta o está bloqueada."
+dependencies_kind_bin = "Comando"
+dependencies_kind_env = "Variable de entorno"
+dependencies_kind_api_key = "Clave de API"
+dependencies_kind_command = "Comando"
+dependencies_kind_mcp = "Servidor MCP"
+dependencies_kind_tool = "Dependencia"
+dependencies_status_ready = "Lista"
+dependencies_status_missing = "Falta"
+dependencies_status_blocked = "Bloqueada"
+dependencies_status_warning = "Advertencia"
+dependencies_status_unknown = "Desconocida"
+security = "Seguridad"
+security_intro = "Riesgos potenciales encontrados al analizar los archivos de la habilidad."
+security_column_rule = "Regla"
+security_column_finding = "Hallazgo"
+security_column_location = "Ubicación"
+security_hint_level = "Gravedad del hallazgo de seguridad."
+security_hint_rule = "Identificador de la regla que activó este hallazgo."
+security_hint_finding = "Qué se detectó exactamente y por qué importa."
+security_hint_location = "Ruta del archivo donde se detectó el hallazgo."
+security_location_unknown = "Ruta no especificada"
+security_severity_critical = "Crítica"
+security_severity_high = "Alta"
+security_severity_medium = "Media"
+security_severity_low = "Baja"
+security_severity_info = "Información"
+trust_gate = "Reglas de confianza"
+trust_gate_intro = "Decisiones de permiso basadas en el nivel de confianza requerido."
+trust_column_tool = "Tipo de herramienta"
+trust_column_min_trust = "Confianza requerida"
+trust_column_explanation = "Explicación"
+trust_hint_tool = "Qué categoría de herramienta controla esta regla."
+trust_hint_min_trust = "Nivel mínimo de confianza requerido para usar esta herramienta."
+trust_hint_decision = "Si el uso de la herramienta está permitido actualmente."
+trust_hint_explanation = "Motivo simple de la decisión actual."
 trust_tool_shell = "Shell"
 trust_tool_http = "HTTP"
-trust_tool_function_proxy = "Function proxy"
+trust_tool_function_proxy = "Proxy de función"
 trust_tool_mcp = "MCP"
-trust_decision_allowed = "Allowed"
-trust_decision_blocked = "Blocked"
-trust_explanation_allowed = "Current trust level is enough."
-trust_explanation_blocked = "Blocked until trust level reaches"
-audit = "Recent audit"
-audit_intro = "Recent actions and checks related to this skill."
-audit_column_time = "When"
-audit_column_event = "Event"
-audit_column_result = "Result"
-audit_column_details = "Details"
-audit_hint_time = "When this event was recorded."
-audit_hint_event = "What happened with the skill."
-audit_hint_result = "Whether the action was allowed, blocked, or warned."
-audit_hint_details = "Reason and technical details behind the decision."
-audit_action_install = "Installed"
-audit_action_update = "Updated"
-audit_action_uninstall = "Removed"
-audit_action_resolve_allowed = "Resolved for prompt"
-audit_action_resolve_blocked = "Blocked on resolve"
-audit_action_runtime_allowed = "Allowed on runtime"
-audit_action_runtime_blocked = "Blocked on runtime"
-audit_action_security_warn = "Security warning"
-audit_decision_allowed = "Allowed"
-audit_decision_blocked = "Blocked"
-audit_decision_warning = "Warning"
-audit_reason_none = "No explicit reason"
-audit_details_empty = "No extra details"
-none = "none"
-empty_validation = "No validation issues found."
-empty_dependencies = "No dependency issues found."
-empty_security = "No security findings."
-empty_trust_gate = "No trust gate decisions."
-empty_audit = "No audit events yet."
+trust_decision_allowed = "Permitida"
+trust_decision_blocked = "Bloqueada"
+trust_explanation_allowed = "El nivel de confianza actual es suficiente."
+trust_explanation_blocked = "Bloqueada hasta que el nivel de confianza alcance"
+audit = "Auditoría reciente"
+audit_intro = "Acciones y comprobaciones recientes relacionadas con esta habilidad."
+audit_column_time = "Cuándo"
+audit_column_event = "Evento"
+audit_column_result = "Resultado"
+audit_column_details = "Detalles"
+audit_hint_time = "Cuándo se registró este evento."
+audit_hint_event = "Qué ocurrió con la habilidad."
+audit_hint_result = "Si la acción fue permitida, bloqueada o marcada con advertencia."
+audit_hint_details = "Motivo y detalles técnicos de la decisión."
+audit_action_install = "Instalada"
+audit_action_update = "Actualizada"
+audit_action_uninstall = "Eliminada"
+audit_action_resolve_allowed = "Resuelta para el prompt"
+audit_action_resolve_blocked = "Bloqueada al resolver"
+audit_action_runtime_allowed = "Permitida en tiempo de ejecución"
+audit_action_runtime_blocked = "Bloqueada en tiempo de ejecución"
+audit_action_security_warn = "Advertencia de seguridad"
+audit_decision_allowed = "Permitida"
+audit_decision_blocked = "Bloqueada"
+audit_decision_warning = "Advertencia"
+audit_reason_none = "Sin motivo explícito"
+audit_details_empty = "Sin detalles adicionales"
+none = "ninguno"
+empty_validation = "No se encontraron problemas de validación."
+empty_dependencies = "No se encontraron problemas de dependencias."
+empty_security = "No se encontraron hallazgos de seguridad."
+empty_trust_gate = "No hay decisiones de confianza."
+empty_audit = "Aún no hay eventos de auditoría."
 
 [skills.catalog]
 source = "Fuente"
 trust = "Confianza"
 
 [bottom_bar]
-gateway_disconnected = "Gateway desconectado"
+gateway_disconnected = "Pasarela desconectada"
 starting_thread = "Iniciando hilo..."
 finishing_turn = "Finalizando turno..."
 turn_running = "El turno `%{turn_id}` está en ejecución"
