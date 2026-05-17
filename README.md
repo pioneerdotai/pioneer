@@ -46,6 +46,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Gateway-centered design** - all important work happens in the gateway: workspaces, threads, turns, tools, MCP, skills, tasks, provider settings, auth, and durable storage.
 - **Local or remote deployment** - run a gateway on your personal computer for a local assistant, or host gateways on separate servers for work, study, home, or other isolated environments.
 - **One desktop, many gateways** - connect the desktop app to any number of gateways and switch between them from one native client.
+- **Workspace management** - create, switch, and rename workspaces inside a gateway; each workspace keeps its own threads, provider keys, MCP servers, skills, tasks, and artifacts.
 - **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads.
 - **Durable agent memory** - agent mode can recall and write stable facts, preferences, recurring instructions, project decisions, and communication style through prompt policy, memory tools, proactive post-turn extraction, service-owned dedupe, and memvid-backed search capsules.
 - **Typed hook runtime** - lifecycle hooks attach policy, context, prompt sections, tool bundles, diagnostics, and post-turn work without turning the agent loop into a domain-specific container.
@@ -73,7 +74,7 @@ That keeps the core memory-safe, fast, and small. The desktop app is native GPUI
 Pioneer is split into two parts:
 
 - **Gateway** - the main runtime and control plane. It runs as a service, stores the data, talks to model providers, executes tools, manages MCP servers and skills, schedules tasks, and exposes the JSON-RPC WebSocket API.
-- **Desktop app** - the primary native client. It connects to gateways, starts and manages a local gateway when needed, and gives you the UI for conversations, provider setup, MCP, skills, settings, and thread history.
+- **Desktop app** - the primary native client. It connects to gateways, starts and manages a local gateway when needed, and gives you the UI for workspaces, conversations, provider setup, MCP, skills, settings, and thread history.
 - **Protocol clients** - any client can be built on top of the Pioneer JSON-RPC protocol. Native mobile apps for iOS and Android are planned next.
 
 For a single-machine setup, install the desktop app and let it start the local gateway for you. On macOS, that means downloading the `.dmg`, moving Pioneer to Applications, launching it, and pressing `Start local gateway` when prompted.
