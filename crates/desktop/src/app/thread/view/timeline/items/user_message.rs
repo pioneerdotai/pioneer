@@ -63,7 +63,6 @@ impl PioneerDesktop {
                 .w(content_width)
                 .px_6()
                 .items_end()
-                .max_w_3_4()
                 .group(format!("user-message-{}", item_view.id))
                 .when(!attachments.is_empty(), |this| {
                     this.child(self.render_user_message_attachment_badges(
@@ -75,6 +74,7 @@ impl PioneerDesktop {
                 })
                 .child(
                     div()
+                        .max_w_3_4()
                         .min_w_0()
                         .overflow_hidden()
                         .bg(cx.theme().muted)
@@ -118,8 +118,8 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let item_id = item_id.to_owned();
         h_flex()
+            .w_full()
             .min_w_0()
-            .max_w_3_4()
             .justify_end()
             .items_center()
             .flex_wrap()
