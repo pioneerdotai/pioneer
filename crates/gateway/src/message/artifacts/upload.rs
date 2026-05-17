@@ -9,7 +9,7 @@ use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactRole,
     ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadChunkAckNotification,
     ArtifactUploadChunkHeader, ArtifactUploadFinishParams, ArtifactUploadFinishResponse,
-    ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    ArtifactUploadSourceKind, ArtifactUploadStartParams, ArtifactUploadStartResponse,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -36,6 +36,23 @@ pub(in crate::message) struct ArtifactUploadSession {
     pub received_bytes: u64,
     pub temp_path: PathBuf,
     pub expires_at: i64,
+    pub source_kind: ArtifactUploadSourceKind,
+    pub status: ArtifactUploadStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::message) enum ArtifactUploadStatus {
+    Receiving,
+    Finalizing,
+    Completed {
+        artifact: pioneer_protocol::ArtifactRef,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::message) enum ArtifactUploadFinishState {
+    Ready(ArtifactUploadSession),
+    Completed(pioneer_protocol::ArtifactRef),
 }
 
 #[derive(Debug)]
@@ -89,6 +106,8 @@ impl ArtifactUploadSessionManager {
             received_bytes: 0,
             temp_path,
             expires_at: now.saturating_add(ARTIFACT_UPLOAD_TTL_SECS),
+            source_kind: params.source_kind,
+            status: ArtifactUploadStatus::Receiving,
         };
         self.sessions
             .lock()
@@ -110,6 +129,9 @@ impl ArtifactUploadSessionManager {
             .get_mut(header.upload_id.as_str())
             .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?;
         validate_session_owner(session, connection_id, header.workspace_id.as_str(), now)?;
+        if session.status != ArtifactUploadStatus::Receiving {
+            bail!("artifact upload is not receiving chunks");
+        }
         if chunk.is_empty() {
             bail!("artifact upload chunk is empty");
         }
@@ -134,29 +156,62 @@ impl ArtifactUploadSessionManager {
         workspace_id: &str,
         upload_id: &str,
         now: i64,
-    ) -> Result<ArtifactUploadSession> {
+    ) -> Result<ArtifactUploadFinishState> {
         self.prune_expired(now).await;
         let session = {
-            let guard = self.sessions.lock().await;
-            guard
-                .get(upload_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?
+            let mut guard = self.sessions.lock().await;
+            let session = guard
+                .get_mut(upload_id)
+                .ok_or_else(|| anyhow::anyhow!("artifact upload not found"))?;
+            validate_session_owner(session, connection_id, workspace_id, now)?;
+            match &session.status {
+                ArtifactUploadStatus::Completed { artifact } => {
+                    return Ok(ArtifactUploadFinishState::Completed(artifact.clone()));
+                }
+                ArtifactUploadStatus::Finalizing => {
+                    bail!("artifact upload is already finalizing");
+                }
+                ArtifactUploadStatus::Receiving => {}
+            }
+            if session.received_bytes != session.expected_size_bytes {
+                bail!("artifact upload is incomplete");
+            }
+            session.status = ArtifactUploadStatus::Finalizing;
+            session.clone()
         };
-        validate_session_owner(&session, connection_id, workspace_id, now)?;
-        if session.received_bytes != session.expected_size_bytes {
-            bail!("artifact upload is incomplete");
-        }
-        let actual_sha256 = sha256_file(session.temp_path.as_path())?;
+        let actual_sha256 = match sha256_file(session.temp_path.as_path()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail_finalizing(upload_id).await;
+                return Err(error);
+            }
+        };
         if actual_sha256 != session.expected_sha256 {
             self.abort_upload(upload_id).await;
             bail!("artifact upload final sha256 mismatch");
         }
-        Ok(session)
+        Ok(ArtifactUploadFinishState::Ready(session))
     }
 
-    pub async fn complete_success(&self, upload_id: &str) {
-        self.abort_upload(upload_id).await;
+    pub async fn complete_success(&self, upload_id: &str, artifact: pioneer_protocol::ArtifactRef) {
+        let temp_path = {
+            let mut guard = self.sessions.lock().await;
+            let Some(session) = guard.get_mut(upload_id) else {
+                return;
+            };
+            session.status = ArtifactUploadStatus::Completed { artifact };
+            session.temp_path.clone()
+        };
+        remove_upload_temp(temp_path).await;
+    }
+
+    pub async fn fail_finalizing(&self, upload_id: &str) {
+        let mut guard = self.sessions.lock().await;
+        if let Some(session) = guard.get_mut(upload_id)
+            && session.status == ArtifactUploadStatus::Finalizing
+        {
+            session.status = ArtifactUploadStatus::Receiving;
+        }
     }
 
     pub async fn abort(
@@ -329,7 +384,7 @@ impl MessageProcessor {
             }
         };
         let now = now_timestamp_secs();
-        let session = match self
+        let finish_state = match self
             .artifact_uploads
             .finish(
                 connection_id,
@@ -339,7 +394,7 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(session) => session,
+            Ok(state) => state,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -352,6 +407,23 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+        };
+        let session = match finish_state {
+            ArtifactUploadFinishState::Completed(artifact) => {
+                let payload = ArtifactUploadFinishResponse {
+                    upload_id: params.upload_id,
+                    artifact,
+                };
+                self.send_artifact_result(
+                    connection_id,
+                    request_id,
+                    &payload,
+                    methods::ARTIFACT_UPLOAD_FINISH,
+                )
+                .await;
+                return;
+            }
+            ArtifactUploadFinishState::Ready(session) => session,
         };
 
         let binding =
@@ -376,9 +448,13 @@ impl MessageProcessor {
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert(
             "client_attachment_id".to_owned(),
-            json!(session.client_attachment_id),
+            json!(session.client_attachment_id.clone()),
         );
-        metadata.insert("source_kind".to_owned(), json!("remote_upload"));
+        metadata.insert("upload_id".to_owned(), json!(session.upload_id.clone()));
+        metadata.insert(
+            "source_kind".to_owned(),
+            json!(artifact_upload_source_kind_label(session.source_kind)),
+        );
 
         let summary = match self
             .artifact_service
@@ -398,6 +474,9 @@ impl MessageProcessor {
         {
             Ok(summary) => summary,
             Err(error) => {
+                self.artifact_uploads
+                    .fail_finalizing(params.upload_id.as_str())
+                    .await;
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -410,11 +489,11 @@ impl MessageProcessor {
                 return;
             }
         };
-        self.artifact_uploads
-            .complete_success(params.upload_id.as_str())
-            .await;
 
         let artifact = summary.artifact.clone();
+        self.artifact_uploads
+            .complete_success(params.upload_id.as_str(), artifact.clone())
+            .await;
         if let Some(thread_id) = session.thread_id.as_deref() {
             self.send_notification_to_thread_subscribers(
                 thread_id,
@@ -766,6 +845,15 @@ fn sanitize_file_name(value: &str) -> String {
     }
 }
 
+fn artifact_upload_source_kind_label(value: ArtifactUploadSourceKind) -> &'static str {
+    match value {
+        ArtifactUploadSourceKind::UserComposer => "user_composer",
+        ArtifactUploadSourceKind::DragDrop => "drag_drop",
+        ArtifactUploadSourceKind::Paste => "paste",
+        ArtifactUploadSourceKind::Api => "api",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1027,73 @@ mod tests {
         assert!(manager.finish(7, "ws_a", &upload_id, 12).await.is_err());
         assert!(!temp_path.exists());
         assert!(!manager.sessions.lock().await.contains_key(&upload_id));
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_finish_is_idempotent_after_completion() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = ArtifactUploadSessionManager::new(temp.path().join("uploads"));
+        let chunk = b"hello";
+        let session = manager
+            .start(
+                7,
+                start_params("ws_a", sha256_bytes(chunk), chunk.len() as u64),
+                10,
+            )
+            .await
+            .expect("start upload");
+        let upload_id = session.upload_id.clone();
+        let temp_path = session.temp_path.clone();
+        let header = ArtifactUploadChunkHeader {
+            workspace_id: "ws_a".to_owned(),
+            upload_id: upload_id.clone(),
+            offset: 0,
+            len: chunk.len() as u64,
+            chunk_sha256: Some(sha256_bytes(chunk)),
+        };
+        manager
+            .append_chunk(7, &header, chunk, 11)
+            .await
+            .expect("append chunk");
+
+        let first = manager
+            .finish(7, "ws_a", upload_id.as_str(), 12)
+            .await
+            .expect("finish upload");
+        assert!(matches!(first, ArtifactUploadFinishState::Ready(_)));
+        assert!(
+            manager
+                .finish(7, "ws_a", upload_id.as_str(), 13)
+                .await
+                .is_err(),
+            "concurrent finish must not create a second ingestion"
+        );
+
+        let artifact = pioneer_protocol::ArtifactRef {
+            artifact_id: "art_upload".to_owned(),
+            version_id: Some("ver_upload".to_owned()),
+            display_name: "upload.txt".to_owned(),
+            kind: pioneer_protocol::ArtifactKind::Text,
+            mime_type: Some("text/plain".to_owned()),
+            size_bytes: Some(chunk.len() as u64),
+            sha256: Some(sha256_bytes(chunk)),
+            status: pioneer_protocol::ArtifactStatus::Ready,
+            preview: None,
+        };
+        manager
+            .complete_success(upload_id.as_str(), artifact.clone())
+            .await;
+        assert!(!temp_path.exists());
+
+        let retry = manager
+            .finish(7, "ws_a", upload_id.as_str(), 14)
+            .await
+            .expect("completed finish retry");
+        assert!(matches!(
+            retry,
+            ArtifactUploadFinishState::Completed(ref completed)
+                if completed.artifact_id == artifact.artifact_id
+        ));
     }
 
     #[tokio::test]

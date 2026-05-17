@@ -66,6 +66,10 @@ impl LocalArtifactBlobStore {
 
 #[async_trait]
 impl ArtifactBlobStore for LocalArtifactBlobStore {
+    fn local_artifact_root(&self) -> Option<PathBuf> {
+        Some(self.artifact_root())
+    }
+
     async fn put_bytes(
         &self,
         workspace_id: &str,

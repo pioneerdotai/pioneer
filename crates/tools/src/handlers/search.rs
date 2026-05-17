@@ -270,6 +270,7 @@ mod tests {
                 include_hidden: Some(false),
             },
             workdir: PathBuf::from("."),
+            environment: Default::default(),
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),

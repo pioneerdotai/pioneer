@@ -1,9 +1,10 @@
 mod agent_runtime;
-mod artifact_capture;
+mod artifact_finalization_diagnostics;
+mod artifact_registration;
+mod artifact_tools;
 mod artifacts;
 mod binary;
 mod dispatch;
-mod file_capture_session;
 mod hooks;
 mod markdown;
 mod mcp;
@@ -13,6 +14,7 @@ mod provider_handlers;
 mod skills;
 mod summary;
 mod task_agent_executor;
+mod task_artifacts;
 mod task_delivery;
 mod task_handlers;
 mod tasks;
@@ -31,8 +33,8 @@ use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
 use pioneer_artifacts::{
-    ArtifactBindingTarget, ArtifactCaptureCandidate, ArtifactCaptureContext, ArtifactCapturePolicy,
-    ArtifactCaptureSource, ArtifactGcPolicy, ArtifactQuotaPolicy, ArtifactService,
+    ArtifactBindingTarget, ArtifactGcPolicy, ArtifactQuotaPolicy, ArtifactRegistrationCandidate,
+    ArtifactRegistrationContext, ArtifactRegistrationSource, ArtifactService, ArtifactToolState,
     BindArtifactRequest, LocalArtifactBlobStore,
 };
 use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
@@ -40,30 +42,31 @@ use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
-    ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ContextCompressedNotification,
-    ContextCompressingNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, ItemDeltaStream,
-    ItemTimeoutDetectedNotification, JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE,
-    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
-    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
-    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
-    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
-    McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpSourceKind, McpToolAnnotationSummary, McpToolCatalogItem,
-    McpTransportSummary, McpTurnBindingSummary, McpUninstallParams, McpUninstallResponse,
-    McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
-    ProviderModelPricing, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    RequestId, SkillsUploadAbortParams, SkillsUploadFinishParams, SkillsUploadStartParams,
-    SystemEventLevel, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
-    TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams,
-    TaskGetParams, TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
-    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
+    ContextCompressedNotification, ContextCompressingNotification, INVALID_PARAMS_CODE,
+    INVALID_REQUEST_CODE, ItemDeltaStream, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE, McpAuditEventSummary, McpChangedAction,
+    McpChangedItem, McpChangedNotification, McpDiagnosticLevel, McpInstallParams,
+    McpInstallResponse, McpInstallResult, McpInstallResultStatus, McpInstallStatus,
+    McpLifecycleAuditSummary, McpListItem, McpListParams, McpListResponse, McpPolicySetParams,
+    McpPolicySetResponse, McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem,
+    McpResourceTemplateCatalogItem, McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
+    McpServerRestartParams, McpServerRestartResponse, McpServerStatus, McpSourceKind,
+    McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
+    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits, ProviderModelPricing, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, RequestId, SkillsUploadAbortParams, SkillsUploadFinishParams,
+    SkillsUploadStartParams, SystemEventLevel, TaskAgendaParams, TaskCancelParams,
+    TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode,
+    TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
+    TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadArtifactsChangedNotification,
@@ -85,7 +88,7 @@ use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_tasks::TaskRuntime;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -160,6 +163,10 @@ pub struct MessageProcessor {
     agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
+    artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
+    artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
+    turn_final_assistant_texts: Arc<Mutex<HashMap<String, String>>>,
+    artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
@@ -178,12 +185,10 @@ pub struct MessageProcessor {
     memory_runtime: Arc<GatewayMemoryRuntime>,
     hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
-    artifact_service: Arc<ArtifactService>,
-    artifact_capture_policy: Arc<ArtifactCapturePolicy>,
+    artifact_runtime_home: PathBuf,
+    pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
-    file_capture_sessions:
-        Arc<Mutex<HashMap<String, file_capture_session::TurnFileCaptureSession>>>,
 }
 
 impl MessageProcessor {
@@ -236,10 +241,9 @@ impl MessageProcessor {
             artifact_quota_policy_from_config(&artifacts_config),
             ArtifactGcPolicy {
                 grace_secs: artifacts_config.gc_grace_secs,
+                output_dir_ttl_secs: artifacts_config.output_dir_ttl_secs,
             },
         ));
-        let artifact_capture_policy =
-            Arc::new(artifact_capture_policy_from_config(&artifacts_config));
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
@@ -260,6 +264,10 @@ impl MessageProcessor {
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
+            artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
+            turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
             recovery_coordinator,
@@ -278,11 +286,10 @@ impl MessageProcessor {
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            artifact_runtime_home: runtime_home,
             artifact_service,
-            artifact_capture_policy,
             artifact_uploads,
             artifact_downloads,
-            file_capture_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -335,6 +342,11 @@ impl MessageProcessor {
                 crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(self)),
             )))
             .await;
+    }
+
+    pub async fn bind_agent_tool_bridges(self: &Arc<Self>) {
+        self.bind_task_bridge().await;
+        self.bind_artifact_tool_bridge().await;
     }
 
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
@@ -402,7 +414,7 @@ impl MessageProcessor {
     }
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
-        self.bind_task_bridge().await;
+        self.bind_agent_tool_bridges().await;
         match self
             .crud_store
             .repair_deterministic_read_model_violations()
@@ -877,6 +889,7 @@ impl MessageProcessor {
     ) -> anyhow::Result<Option<(String, Vec<pioneer_protocol::UserMessageAttachment>)>> {
         let mut text_parts = Vec::new();
         let mut attachments = Vec::new();
+        let mut bound_artifact_ids = Vec::new();
 
         for (index, value) in input.iter().enumerate() {
             match value {
@@ -967,8 +980,24 @@ impl MessageProcessor {
                         .with_context(|| {
                             format!("failed to bind artifact `{artifact_id}` to user message")
                         })?;
+                    bound_artifact_ids.push(artifact_id.clone());
                 }
             }
+        }
+
+        if !bound_artifact_ids.is_empty() {
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_ARTIFACTS_CHANGED,
+                &ThreadArtifactsChangedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    artifact_ids: bound_artifact_ids,
+                    reason: "user_input_binding".to_owned(),
+                    generated_at: now_timestamp_secs(),
+                },
+            )
+            .await;
         }
 
         let text = text_parts.join("\n");
@@ -1003,22 +1032,6 @@ fn artifact_quota_policy_from_config(config: &GatewayArtifactsConfig) -> Artifac
         max_workspace_bytes: config.max_workspace_bytes,
         max_files_per_workspace: config.max_files_per_workspace,
         warn_at_percent: config.quota_warn_at_percent,
-    }
-}
-
-fn artifact_capture_policy_from_config(config: &GatewayArtifactsConfig) -> ArtifactCapturePolicy {
-    ArtifactCapturePolicy {
-        capture_user_uploads: config.capture_user_uploads,
-        capture_new_workspace_files: config.capture_new_workspace_files,
-        capture_modified_workspace_files: config.capture_modified_workspace_files,
-        capture_generated_media: config.capture_generated_media,
-        capture_tool_outputs: config.capture_tool_outputs,
-        capture_task_results: config.capture_task_results,
-        output_roots: config.output_roots.iter().map(PathBuf::from).collect(),
-        ignored_globs: config.ignored_globs.clone(),
-        max_files_per_turn: config.max_files_per_turn,
-        max_bytes_per_file: config.max_bytes_per_file,
-        max_total_bytes_per_turn: config.max_total_bytes_per_turn,
     }
 }
 
@@ -1104,7 +1117,6 @@ impl MessageProcessor {
             crud_store.clone(),
             Arc::new(LocalArtifactBlobStore::new(artifact_runtime_home.clone())),
         ));
-        let artifact_capture_policy = Arc::new(ArtifactCapturePolicy::default());
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             artifact_runtime_home
                 .join("artifacts")
@@ -1134,6 +1146,10 @@ impl MessageProcessor {
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
+            artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
+            turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
+            artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
             recovery_coordinator,
@@ -1233,11 +1249,10 @@ impl MessageProcessor {
             memory_runtime,
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            artifact_runtime_home,
             artifact_service,
-            artifact_capture_policy,
             artifact_uploads,
             artifact_downloads,
-            file_capture_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

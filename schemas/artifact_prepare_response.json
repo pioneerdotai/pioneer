@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactPrepareResponse",
+  "type": "object",
+  "properties": {
+    "displayName": {
+      "type": "string"
+    },
+    "expiresAt": {
+      "type": "string"
+    },
+    "outputDir": {
+      "type": "string"
+    },
+    "outputPath": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "outputPath",
+    "outputDir",
+    "expiresAt",
+    "displayName"
+  ]
+}

@@ -9,7 +9,7 @@ use crate::shell_format::{
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -305,8 +305,14 @@ impl UnifiedExecHandler {
         let cancellation = invocation.cancellation.clone();
         let use_tty = args.tty.unwrap_or(false);
         if !use_tty {
-            let result =
-                run_one_shot(args, invocation.workdir.as_path(), &trace, cancellation).await?;
+            let result = run_one_shot(
+                args,
+                invocation.workdir.as_path(),
+                &invocation.environment,
+                &trace,
+                cancellation,
+            )
+            .await?;
             return Ok(Box::new(result.into_tool_output()));
         }
 
@@ -318,6 +324,7 @@ impl UnifiedExecHandler {
 
         let cwd = resolve_workdir(invocation.workdir.as_path(), args.workdir.as_deref());
         let (command_preview, mut command) = build_command(&args, cwd.as_path())?;
+        command.envs(invocation.environment.iter());
         let session_started_at = Instant::now();
 
         command.stdin(Stdio::piped());
@@ -641,12 +648,14 @@ impl ProcessState {
 async fn run_one_shot(
     args: ExecCommandArgs,
     base_dir: &Path,
+    environment: &BTreeMap<String, String>,
     trace: &crate::events::ToolEventTrace,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
     let cwd = resolve_workdir(base_dir, args.workdir.as_deref());
     let (command_preview, mut command) = build_command(&args, cwd.as_path())?;
+    command.envs(environment.iter());
 
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     command.stdout(Stdio::piped());
@@ -1079,6 +1088,7 @@ mod tests {
             source: ToolCallSource::Model,
             payload,
             workdir: std::env::current_dir().expect("cwd must be available"),
+            environment: Default::default(),
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
@@ -1096,6 +1106,41 @@ mod tests {
 
     fn trace(tool_name: &str) -> crate::events::ToolEventTrace {
         ToolEventBus::default().start_trace("turn_test", "call_1", tool_name)
+    }
+
+    #[tokio::test]
+    async fn exec_command_receives_invocation_environment() {
+        let handler = UnifiedExecHandler::default();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf %s \"$PIONEER_TEST_OUTPUT_DIR\"".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(false),
+            })),
+        );
+        tool_invocation.environment.insert(
+            "PIONEER_TEST_OUTPUT_DIR".to_owned(),
+            "/tmp/pioneer-output-test".to_owned(),
+        );
+
+        let output = handler
+            .handle(tool_invocation, trace("exec_command"))
+            .await
+            .expect("exec command should execute");
+
+        assert!(
+            output.raw_text().contains("/tmp/pioneer-output-test"),
+            "expected invocation env in command output: {}",
+            output.raw_text()
+        );
     }
 
     #[tokio::test]

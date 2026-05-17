@@ -1125,8 +1125,10 @@ impl ToolOutputPolicySnapshot {
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
-            "read_file" | "read_skill" | "list_dir" | "grep_files" | "apply_patch"
-            | "tool_search" | "tool_suggest" => model_only_metadata_policy_snapshot(),
+            "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
+            | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
+                model_only_metadata_policy_snapshot()
+            }
             _ => dynamic_unknown_output_policy_snapshot(),
         }
     }

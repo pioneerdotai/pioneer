@@ -57,28 +57,6 @@ pub struct GatewayConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GatewayArtifactsConfig {
-    #[serde(default = "default_gateway_artifacts_capture_user_uploads")]
-    pub capture_user_uploads: bool,
-    #[serde(default = "default_gateway_artifacts_capture_new_workspace_files")]
-    pub capture_new_workspace_files: bool,
-    #[serde(default = "default_gateway_artifacts_capture_modified_workspace_files")]
-    pub capture_modified_workspace_files: bool,
-    #[serde(default = "default_gateway_artifacts_capture_generated_media")]
-    pub capture_generated_media: bool,
-    #[serde(default = "default_gateway_artifacts_capture_tool_outputs")]
-    pub capture_tool_outputs: bool,
-    #[serde(default = "default_gateway_artifacts_capture_task_results")]
-    pub capture_task_results: bool,
-    #[serde(default)]
-    pub output_roots: Vec<String>,
-    #[serde(default = "default_gateway_artifacts_ignored_globs")]
-    pub ignored_globs: Vec<String>,
-    #[serde(default = "default_gateway_artifacts_max_files_per_turn")]
-    pub max_files_per_turn: usize,
-    #[serde(default = "default_gateway_artifacts_max_bytes_per_file")]
-    pub max_bytes_per_file: u64,
-    #[serde(default = "default_gateway_artifacts_max_total_bytes_per_turn")]
-    pub max_total_bytes_per_turn: u64,
     #[serde(default = "default_gateway_artifacts_max_file_bytes")]
     pub max_file_bytes: u64,
     #[serde(default = "default_gateway_artifacts_max_workspace_bytes")]
@@ -91,6 +69,8 @@ pub struct GatewayArtifactsConfig {
     pub download_session_ttl_secs: u64,
     #[serde(default = "default_gateway_artifacts_gc_grace_secs")]
     pub gc_grace_secs: u64,
+    #[serde(default = "default_gateway_artifacts_output_dir_ttl_secs")]
+    pub output_dir_ttl_secs: u64,
     #[serde(default = "default_gateway_artifacts_quota_warn_at_percent")]
     pub quota_warn_at_percent: u8,
 }
@@ -98,24 +78,13 @@ pub struct GatewayArtifactsConfig {
 impl Default for GatewayArtifactsConfig {
     fn default() -> Self {
         Self {
-            capture_user_uploads: default_gateway_artifacts_capture_user_uploads(),
-            capture_new_workspace_files: default_gateway_artifacts_capture_new_workspace_files(),
-            capture_modified_workspace_files:
-                default_gateway_artifacts_capture_modified_workspace_files(),
-            capture_generated_media: default_gateway_artifacts_capture_generated_media(),
-            capture_tool_outputs: default_gateway_artifacts_capture_tool_outputs(),
-            capture_task_results: default_gateway_artifacts_capture_task_results(),
-            output_roots: Vec::new(),
-            ignored_globs: default_gateway_artifacts_ignored_globs(),
-            max_files_per_turn: default_gateway_artifacts_max_files_per_turn(),
-            max_bytes_per_file: default_gateway_artifacts_max_bytes_per_file(),
-            max_total_bytes_per_turn: default_gateway_artifacts_max_total_bytes_per_turn(),
             max_file_bytes: default_gateway_artifacts_max_file_bytes(),
             max_workspace_bytes: default_gateway_artifacts_max_workspace_bytes(),
             max_files_per_workspace: default_gateway_artifacts_max_files_per_workspace(),
             upload_session_ttl_secs: default_gateway_artifacts_upload_session_ttl_secs(),
             download_session_ttl_secs: default_gateway_artifacts_download_session_ttl_secs(),
             gc_grace_secs: default_gateway_artifacts_gc_grace_secs(),
+            output_dir_ttl_secs: default_gateway_artifacts_output_dir_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
         }
     }
@@ -926,58 +895,6 @@ const fn default_provider_attachments_circuit_breaker_open_ms() -> u64 {
     30_000
 }
 
-const fn default_gateway_artifacts_capture_user_uploads() -> bool {
-    true
-}
-
-const fn default_gateway_artifacts_capture_new_workspace_files() -> bool {
-    true
-}
-
-const fn default_gateway_artifacts_capture_modified_workspace_files() -> bool {
-    false
-}
-
-const fn default_gateway_artifacts_capture_generated_media() -> bool {
-    true
-}
-
-const fn default_gateway_artifacts_capture_tool_outputs() -> bool {
-    true
-}
-
-const fn default_gateway_artifacts_capture_task_results() -> bool {
-    true
-}
-
-fn default_gateway_artifacts_ignored_globs() -> Vec<String> {
-    vec![
-        ".git".to_owned(),
-        "target".to_owned(),
-        "node_modules".to_owned(),
-        "dist".to_owned(),
-        "build".to_owned(),
-        ".next".to_owned(),
-        ".cache".to_owned(),
-        ".DS_Store".to_owned(),
-        "*.tmp".to_owned(),
-        "*.swp".to_owned(),
-        "*~".to_owned(),
-    ]
-}
-
-const fn default_gateway_artifacts_max_files_per_turn() -> usize {
-    32
-}
-
-const fn default_gateway_artifacts_max_bytes_per_file() -> u64 {
-    50 * 1024 * 1024
-}
-
-const fn default_gateway_artifacts_max_total_bytes_per_turn() -> u64 {
-    128 * 1024 * 1024
-}
-
 const fn default_gateway_artifacts_max_file_bytes() -> u64 {
     512 * 1024 * 1024
 }
@@ -999,6 +916,10 @@ const fn default_gateway_artifacts_download_session_ttl_secs() -> u64 {
 }
 
 const fn default_gateway_artifacts_gc_grace_secs() -> u64 {
+    24 * 60 * 60
+}
+
+const fn default_gateway_artifacts_output_dir_ttl_secs() -> u64 {
     24 * 60 * 60
 }
 

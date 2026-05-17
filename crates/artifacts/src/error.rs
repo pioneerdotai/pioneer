@@ -7,6 +7,52 @@ use sea_orm::DbErr;
 
 pub type ArtifactResult<T> = Result<T, ArtifactError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactLocalPathRejectionKind {
+    InvalidPath,
+    OutsideAllowedRoots,
+    SymlinkNotAllowed,
+    NotRegularFile,
+    FileNotFound,
+    InvalidAllowedRoot,
+    FileTooLarge,
+    ContentMismatch,
+}
+
+impl ArtifactLocalPathRejectionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "invalid_path",
+            Self::OutsideAllowedRoots => "outside_allowed_roots",
+            Self::SymlinkNotAllowed => "symlink_not_allowed",
+            Self::NotRegularFile => "not_regular_file",
+            Self::FileNotFound => "file_not_found",
+            Self::InvalidAllowedRoot => "invalid_allowed_root",
+            Self::FileTooLarge => "file_too_large",
+            Self::ContentMismatch => "content_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactQuotaRejectionKind {
+    FileTooLarge,
+    WorkspaceBytesExceeded,
+    WorkspaceFileCountExceeded,
+    TurnArtifactBudgetExceeded,
+}
+
+impl ArtifactQuotaRejectionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FileTooLarge => "file_too_large",
+            Self::WorkspaceBytesExceeded => "quota_exceeded",
+            Self::WorkspaceFileCountExceeded => "quota_exceeded",
+            Self::TurnArtifactBudgetExceeded => "turn_artifact_budget_exceeded",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ArtifactError {
     EmptyWorkspaceId,
@@ -61,6 +107,7 @@ pub enum ArtifactError {
         source: serde_json::Error,
     },
     LocalPathRejected {
+        kind: ArtifactLocalPathRejectionKind,
         message: String,
     },
     LocalPathReadFailed {
@@ -68,14 +115,32 @@ pub enum ArtifactError {
         source: io::Error,
     },
     QuotaExceeded {
+        kind: ArtifactQuotaRejectionKind,
         message: String,
         current_bytes: u64,
         limit_bytes: u64,
+    },
+    BlobCleanupFailed {
+        storage_key: String,
+        registration_error: String,
+        cleanup_error: String,
     },
     Io {
         message: String,
         source: io::Error,
     },
+}
+
+impl ArtifactError {
+    pub fn local_path_rejected(
+        kind: ArtifactLocalPathRejectionKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::LocalPathRejected {
+            kind,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for ArtifactError {
@@ -162,8 +227,12 @@ impl fmt::Display for ArtifactError {
             ArtifactError::Database { message, source } => write!(f, "{message}: {source}"),
             ArtifactError::CrudStore { message, source } => write!(f, "{message}: {source}"),
             ArtifactError::Json { message, source } => write!(f, "{message}: {source}"),
-            ArtifactError::LocalPathRejected { message } => {
-                write!(f, "local artifact path rejected: {message}")
+            ArtifactError::LocalPathRejected { kind, message } => {
+                write!(
+                    f,
+                    "local artifact path rejected ({}): {message}",
+                    kind.as_str()
+                )
             }
             ArtifactError::LocalPathReadFailed { path, source } => {
                 write!(
@@ -173,12 +242,22 @@ impl fmt::Display for ArtifactError {
                 )
             }
             ArtifactError::QuotaExceeded {
+                kind,
                 message,
                 current_bytes,
                 limit_bytes,
             } => write!(
                 f,
-                "artifact quota exceeded: {message} (current_bytes={current_bytes}, limit_bytes={limit_bytes})"
+                "artifact quota exceeded ({}): {message} (current_bytes={current_bytes}, limit_bytes={limit_bytes})",
+                kind.as_str()
+            ),
+            ArtifactError::BlobCleanupFailed {
+                storage_key,
+                registration_error,
+                cleanup_error,
+            } => write!(
+                f,
+                "artifact blob cleanup failed for {storage_key}: registration_error={registration_error}; cleanup_error={cleanup_error}"
             ),
             ArtifactError::Io { message, source } => write!(f, "{message}: {source}"),
         }

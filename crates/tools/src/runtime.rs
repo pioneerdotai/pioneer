@@ -8,7 +8,7 @@ use crate::output_projection::{ToolProjectionInput, project_tool_result};
 use crate::router::{ToolCall, ToolRouter};
 use crate::spec::ExecutionClass;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +24,7 @@ pub struct ToolCallRuntime {
     event_bus: ToolEventBus,
     turn_id: String,
     workdir: PathBuf,
+    environment: BTreeMap<String, String>,
     global_lock: Arc<RwLock<()>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -42,9 +43,15 @@ impl ToolCallRuntime {
             event_bus,
             turn_id: turn_id.into(),
             workdir,
+            environment: BTreeMap::new(),
             global_lock: Arc::new(RwLock::new(())),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.environment = environment;
+        self
     }
 
     pub fn router(&self) -> Arc<ToolRouter> {
@@ -312,6 +319,7 @@ impl ToolCallRuntime {
             call,
             source,
             workdir.clone(),
+            self.environment.clone(),
             trace,
             cancellation.clone(),
         );
@@ -341,6 +349,7 @@ fn classify_call_error(
         source,
         payload: call.payload.clone(),
         workdir: workdir.clone(),
+        environment: BTreeMap::new(),
         attempt_id: 1,
         idempotency_key: call.idempotency_key.clone(),
         recovery: call.recovery,

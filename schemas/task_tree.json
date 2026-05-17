@@ -1345,6 +1345,33 @@
         "updatedAt"
       ]
     },
+    "TaskTriggerCatchUpMode": {
+      "type": "string",
+      "enum": [
+        "run_once_for_latest_missed",
+        "skip_missed",
+        "run_all_missed"
+      ]
+    },
+    "TaskTriggerCatchUpPolicy": {
+      "type": "object",
+      "properties": {
+        "maxCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskTriggerCatchUpMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
     "TaskTriggerSpec": {
       "oneOf": [
         {
@@ -1362,6 +1389,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "scheduled_at"
@@ -1385,6 +1422,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "interval_anchor_at": {
               "type": [
                 "integer",
@@ -1409,6 +1456,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "cron_expr": {
               "type": "string"
             },

@@ -1,14 +1,14 @@
 use super::*;
 
 const APPLY_PATCH_ADD_FILE: &str = "*** Add File: ";
-const CAPTURE_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const REGISTRATION_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 impl MessageProcessor {
-    pub(super) async fn capture_artifacts_for_completed_item(
+    pub(super) async fn register_artifacts_for_completed_item(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) {
-        let candidates = artifact_capture_candidates_from_completed_item(&notification.item);
+        let candidates = artifact_registration_candidates_from_completed_item(&notification.item);
         if candidates.is_empty() {
             return;
         }
@@ -21,7 +21,7 @@ impl MessageProcessor {
                     turn_id = notification.turn_id,
                     item_id = notification.item.item_id(),
                     error = %error,
-                    "failed to resolve artifact capture workspace root"
+                    "failed to resolve artifact registration workspace root"
                 );
                 return;
             }
@@ -29,22 +29,27 @@ impl MessageProcessor {
 
         let mut artifact_ids = Vec::new();
         for candidate in candidates {
-            let context = ArtifactCaptureContext {
+            let context = ArtifactRegistrationContext {
                 workspace_id: notification.workspace_id.clone(),
                 thread_id: notification.thread_id.clone(),
                 turn_id: notification.turn_id.clone(),
                 message_id: None,
                 turn_item_id: Some(notification.item.item_id().to_owned()),
                 tool_call_id: Some(notification.item.item_id().to_owned()),
+                created_by_kind: ArtifactCreatedByKind::Tool,
                 created_by_actor_id: item_tool_name(&notification.item).map(str::to_owned),
                 item_index: None,
+                binding_kind: ArtifactBindingKind::ToolOutput,
+                binding_direction: ArtifactBindingDirection::Output,
+                binding_role: Some(ArtifactRole::Tool),
                 allowed_roots: vec![allowed_root.clone()],
-                max_file_bytes: Some(CAPTURE_MAX_FILE_BYTES),
+                max_file_bytes: Some(REGISTRATION_MAX_FILE_BYTES),
+                cleanup_source_after_success: false,
             };
 
             match self
                 .artifact_service
-                .capture_candidate(context, candidate)
+                .register_candidate(context, candidate)
                 .await
             {
                 Ok(summary) => {
@@ -65,7 +70,7 @@ impl MessageProcessor {
                         turn_id = notification.turn_id,
                         item_id = notification.item.item_id(),
                         error = %error,
-                        "failed to capture tool output artifact"
+                        "failed to register tool output artifact"
                     );
                 }
             }
@@ -79,7 +84,7 @@ impl MessageProcessor {
                     workspace_id: notification.workspace_id.clone(),
                     thread_id: notification.thread_id.clone(),
                     artifact_ids,
-                    reason: "tool_output_capture".to_owned(),
+                    reason: "tool_output_registration".to_owned(),
                     generated_at: now_timestamp_secs(),
                 },
             )
@@ -88,9 +93,9 @@ impl MessageProcessor {
     }
 }
 
-fn artifact_capture_candidates_from_completed_item(
+fn artifact_registration_candidates_from_completed_item(
     item: &TurnItem,
-) -> Vec<ArtifactCaptureCandidate> {
+) -> Vec<ArtifactRegistrationCandidate> {
     match item {
         TurnItem::Download {
             status,
@@ -108,14 +113,15 @@ fn artifact_capture_candidates_from_completed_item(
             let Some(path) = path.as_deref().filter(|value| !value.trim().is_empty()) else {
                 return Vec::new();
             };
-            vec![ArtifactCaptureCandidate {
+            vec![ArtifactRegistrationCandidate {
                 path: PathBuf::from(path),
                 display_name: display_name_from_path(path),
                 mime_type: content_type.clone(),
                 kind_hint: None,
+                description: None,
                 sha256: sha256.clone(),
                 size_bytes: *bytes_written,
-                source: ArtifactCaptureSource::DownloadTool,
+                source: ArtifactRegistrationSource::DownloadTool,
             }]
         }
         TurnItem::FileChange {
@@ -130,14 +136,15 @@ fn artifact_capture_candidates_from_completed_item(
         {
             extract_apply_patch_add_file_paths(arguments)
                 .into_iter()
-                .map(|path| ArtifactCaptureCandidate {
+                .map(|path| ArtifactRegistrationCandidate {
                     display_name: display_name_from_path(path.as_str()),
                     path: PathBuf::from(path),
                     mime_type: None,
                     kind_hint: Some(ArtifactKind::WorkspaceFile),
+                    description: None,
                     sha256: None,
                     size_bytes: None,
-                    source: ArtifactCaptureSource::ApplyPatchAddFile,
+                    source: ArtifactRegistrationSource::ApplyPatchAddFile,
                 })
                 .collect()
         }
@@ -148,7 +155,7 @@ fn artifact_capture_candidates_from_completed_item(
             storage,
             ..
         } if *status == ToolCallStatus::Completed && *success == Some(true) => {
-            dynamic_tool_capture_candidate(tool_name.as_str(), storage)
+            dynamic_tool_registration_candidate(tool_name.as_str(), storage)
                 .into_iter()
                 .collect()
         }
@@ -156,10 +163,10 @@ fn artifact_capture_candidates_from_completed_item(
     }
 }
 
-fn dynamic_tool_capture_candidate(
+fn dynamic_tool_registration_candidate(
     tool_name: &str,
     storage: &ToolStoragePayload,
-) -> Option<ArtifactCaptureCandidate> {
+) -> Option<ArtifactRegistrationCandidate> {
     let metadata = storage_metadata_json(storage)?;
     if tool_name == "computer_use" {
         let path = metadata
@@ -167,14 +174,15 @@ fn dynamic_tool_capture_candidate(
             .and_then(|value| value.get("path"))
             .and_then(JsonValue::as_str)
             .or_else(|| metadata.get("path").and_then(JsonValue::as_str))?;
-        return Some(ArtifactCaptureCandidate {
+        return Some(ArtifactRegistrationCandidate {
             path: PathBuf::from(path),
             display_name: display_name_from_path(path),
             mime_type: Some("image/png".to_owned()),
             kind_hint: Some(ArtifactKind::Screenshot),
+            description: None,
             sha256: None,
             size_bytes: None,
-            source: ArtifactCaptureSource::ComputerUseSnapshot,
+            source: ArtifactRegistrationSource::ComputerUseSnapshot,
         });
     }
 
@@ -188,17 +196,18 @@ fn dynamic_tool_capture_candidate(
             .as_deref()
             .is_some_and(|value| value.starts_with("image/"))
     {
-        return Some(ArtifactCaptureCandidate {
+        return Some(ArtifactRegistrationCandidate {
             path: PathBuf::from(path),
             display_name: display_name_from_path(path),
             mime_type: content_type,
             kind_hint: Some(ArtifactKind::GeneratedImage),
+            description: None,
             sha256: metadata
                 .get("sha256")
                 .and_then(JsonValue::as_str)
                 .map(str::to_owned),
             size_bytes: metadata.get("bytesWritten").and_then(JsonValue::as_u64),
-            source: ArtifactCaptureSource::GeneratedImage,
+            source: ArtifactRegistrationSource::GeneratedImage,
         });
     }
 
@@ -270,7 +279,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn artifact_capture_download_url_success_produces_candidate() {
+    fn artifact_registration_download_url_success_produces_candidate() {
         let item = TurnItem::Download {
             id: "call_download".to_owned(),
             tool_name: "download_url".to_owned(),
@@ -295,26 +304,29 @@ mod tests {
             observation: None,
         };
 
-        let candidates = artifact_capture_candidates_from_completed_item(&item);
+        let candidates = artifact_registration_candidates_from_completed_item(&item);
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].source, ArtifactCaptureSource::DownloadTool);
+        assert_eq!(
+            candidates[0].source,
+            ArtifactRegistrationSource::DownloadTool
+        );
         assert_eq!(candidates[0].path, PathBuf::from("/workspace/report.txt"));
         assert_eq!(candidates[0].sha256.as_deref(), Some("abc"));
         assert_eq!(candidates[0].size_bytes, Some(12));
     }
 
     #[test]
-    fn artifact_capture_failed_or_truncated_download_does_not_capture() {
+    fn artifact_registration_failed_or_truncated_download_does_not_capture() {
         let mut item = download_item(false, false);
-        assert!(artifact_capture_candidates_from_completed_item(&item).is_empty());
+        assert!(artifact_registration_candidates_from_completed_item(&item).is_empty());
 
         item = download_item(true, true);
-        assert!(artifact_capture_candidates_from_completed_item(&item).is_empty());
+        assert!(artifact_registration_candidates_from_completed_item(&item).is_empty());
     }
 
     #[test]
-    fn artifact_capture_apply_patch_add_file_only() {
+    fn artifact_registration_apply_patch_add_file_only() {
         let item = TurnItem::FileChange {
             id: "call_patch".to_owned(),
             tool_name: "apply_patch".to_owned(),
@@ -336,7 +348,7 @@ mod tests {
             observation: None,
         };
 
-        let candidates = artifact_capture_candidates_from_completed_item(&item);
+        let candidates = artifact_registration_candidates_from_completed_item(&item);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, PathBuf::from("created.txt"));
@@ -344,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_capture_computer_use_snapshot_candidate() {
+    fn artifact_registration_computer_use_snapshot_candidate() {
         let item = TurnItem::DynamicToolCall {
             id: "call_cu".to_owned(),
             tool_name: "computer_use".to_owned(),
@@ -364,12 +376,12 @@ mod tests {
             observation: None,
         };
 
-        let candidates = artifact_capture_candidates_from_completed_item(&item);
+        let candidates = artifact_registration_candidates_from_completed_item(&item);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             candidates[0].source,
-            ArtifactCaptureSource::ComputerUseSnapshot
+            ArtifactRegistrationSource::ComputerUseSnapshot
         );
         assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::Screenshot));
     }

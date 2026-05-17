@@ -100,12 +100,6 @@ impl MessageProcessor {
             .await;
             return;
         }
-        self.start_file_capture_session(
-            outcome.started_notification.workspace_id.as_str(),
-            outcome.started_notification.thread_id.as_str(),
-            outcome.started_notification.turn.id.as_str(),
-        )
-        .await;
         self.ensure_hook_runtime_with_run_store().await;
         if let Err(error) = self
             .agent_manager
@@ -193,14 +187,37 @@ impl MessageProcessor {
                 return;
             }
         };
-        self.skip_resolved_artifact_inputs_for_file_capture(
-            outcome.started_notification.turn.id.as_str(),
-            resolved_artifacts.as_slice(),
-        )
-        .await;
+        let runtime_environment = match self
+            .create_artifact_output_environment(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await
+        {
+            Ok(runtime_environment) => runtime_environment.into_iter().collect(),
+            Err(error) => {
+                self.mark_turn_failed(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to prepare artifact output directory: {error:#}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to prepare artifact output directory: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         if let Err(error) = self
             .agent_manager
-            .start_turn_with_resolved_artifacts(
+            .start_turn_with_resolved_artifacts_and_environment(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.thread.mode,
@@ -209,6 +226,7 @@ impl MessageProcessor {
                 workspace_skill_policies,
                 outcome.materialization.input.clone(),
                 resolved_artifacts,
+                runtime_environment,
                 history,
             )
             .await

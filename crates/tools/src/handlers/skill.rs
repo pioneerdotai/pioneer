@@ -820,6 +820,7 @@ mod tests {
                 arguments: json!({ "slug": slug }),
             },
             workdir: PathBuf::from("."),
+            environment: Default::default(),
             attempt_id: 1,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),

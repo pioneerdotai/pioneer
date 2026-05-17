@@ -23,7 +23,7 @@ use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
     AgentMcpToolProvider, ResolvedArtifactInput, RetainedToolLlmContext, TaskToolMaterialization,
     TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
-    TurnExecutionControl,
+    TurnExecutionControl, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -57,7 +57,7 @@ use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
     RawToolCall, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
     ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools, build_tools, classify_tool_error,
+    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -75,6 +75,7 @@ const PROVIDER_INTER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
 const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
 const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
+const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 
 #[derive(Debug, Default, Clone)]
@@ -843,12 +844,14 @@ pub(super) async fn execute_chat_turn_flow(
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
+    runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -886,11 +889,13 @@ pub(super) async fn execute_chat_turn_flow(
             user_message.clone(),
             &input,
             &workspace_skill_policies,
+            runtime_environment,
             retained_llm_context,
             force_non_stream,
             continue_generation_hint,
             tool_loop_config,
             mcp_tool_provider,
+            turn_tool_provider,
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,
@@ -1097,6 +1102,36 @@ async fn materialize_task_tooling(
     }
 }
 
+async fn materialize_turn_tooling(
+    provider: Option<&Arc<dyn TurnToolProvider>>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> TurnToolMaterialization {
+    let Some(provider) = provider else {
+        return TurnToolMaterialization::default();
+    };
+    match provider
+        .materialize_turn_tools(TurnToolContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        })
+        .await
+    {
+        Ok(materialization) => materialization,
+        Err(error) => {
+            warn!(
+                thread_id,
+                turn_id,
+                error = error.as_str(),
+                "failed to materialize turn tools"
+            );
+            TurnToolMaterialization::default()
+        }
+    }
+}
+
 async fn pending_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -1283,11 +1318,13 @@ async fn execute_agent_provider_response(
     user_message: ChatMessage,
     input: &[UserInput],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    runtime_environment: HashMap<String, String>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -1427,6 +1464,26 @@ async fn execute_agent_provider_response(
         );
     }
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
+
+    let turn_tool_materialization = if provider_tool_calling {
+        materialize_turn_tooling(
+            turn_tool_provider.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await
+    } else {
+        TurnToolMaterialization::default()
+    };
+    for diagnostic in &turn_tool_materialization.diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            diagnostic = diagnostic.as_str(),
+            "turn tool materialization reported diagnostic"
+        );
+    }
 
     if !provider_tool_calling {
         let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
@@ -1605,6 +1662,12 @@ async fn execute_agent_provider_response(
         mcp_materialization.bundles.clone(),
     ));
     tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "turn",
+        "turn.runtime",
+        TURN_TOOL_BUNDLE_PRIORITY,
+        turn_tool_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
         "task",
         "task.runtime",
         TASK_TOOL_BUNDLE_PRIORITY,
@@ -1632,12 +1695,14 @@ async fn execute_agent_provider_response(
 
     let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
 
-    let tools = match build_tools(
+    let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
+    let tools = match build_tools_with_environment(
         workdir.clone(),
         turn_id.to_owned(),
         tool_loop_config.web.clone(),
         tool_loop_config.computer_use.clone(),
         extension_bundles,
+        runtime_environment.clone(),
     ) {
         Ok(tools) => tools,
         Err(error) => {
@@ -1647,12 +1712,22 @@ async fn execute_agent_provider_response(
                 error = %error,
                 "failed to build tool runtime with extensions; continuing with built-ins only"
             );
-            build_builtin_tools(
+            build_tools_with_environment(
                 workdir.clone(),
                 turn_id.to_owned(),
                 tool_loop_config.web.clone(),
                 tool_loop_config.computer_use.clone(),
+                Vec::new(),
+                runtime_environment,
             )
+            .unwrap_or_else(|_| {
+                build_builtin_tools(
+                    workdir.clone(),
+                    turn_id.to_owned(),
+                    tool_loop_config.web.clone(),
+                    tool_loop_config.computer_use.clone(),
+                )
+            })
         }
     };
 

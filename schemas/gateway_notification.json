@@ -1079,7 +1079,6 @@
         "context_attachment",
         "derived_from",
         "preview",
-        "system_capture",
         "manual_attach",
         "draft_upload"
       ]
@@ -5265,11 +5264,25 @@
         "recoveredAt"
       ]
     },
+    "TaskRescheduleReason": {
+      "type": "string",
+      "enum": [
+        "unknown",
+        "user_requested",
+        "trigger_fired",
+        "missed_fire_skipped",
+        "run_terminal_status_refresh",
+        "task_cancelled"
+      ]
+    },
     "TaskRescheduledNotification": {
       "type": "object",
       "properties": {
         "context": {
           "$ref": "#/$defs/TaskNotificationContext"
+        },
+        "reason": {
+          "$ref": "#/$defs/TaskRescheduleReason"
         },
         "trigger": {
           "$ref": "#/$defs/TaskTrigger"
@@ -5277,7 +5290,8 @@
       },
       "required": [
         "context",
-        "trigger"
+        "trigger",
+        "reason"
       ]
     },
     "TaskResult": {
@@ -5723,6 +5737,33 @@
         "updatedAt"
       ]
     },
+    "TaskTriggerCatchUpMode": {
+      "type": "string",
+      "enum": [
+        "run_once_for_latest_missed",
+        "skip_missed",
+        "run_all_missed"
+      ]
+    },
+    "TaskTriggerCatchUpPolicy": {
+      "type": "object",
+      "properties": {
+        "maxCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskTriggerCatchUpMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
     "TaskTriggerKind": {
       "type": "string",
       "enum": [
@@ -5752,6 +5793,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "scheduled_at"
@@ -5775,6 +5826,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "interval_anchor_at": {
               "type": [
                 "integer",
@@ -5799,6 +5860,16 @@
         {
           "type": "object",
           "properties": {
+            "catch_up_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "cron_expr": {
               "type": "string"
             },
@@ -7200,6 +7271,10 @@
         "id": {
           "type": "string"
         },
+        "origin": {
+          "$ref": "#/$defs/TurnOrigin",
+          "default": "user"
+        },
         "prompt_manifest": {
           "anyOf": [
             {
@@ -7212,6 +7287,10 @@
         },
         "status": {
           "$ref": "#/$defs/TurnStatus"
+        },
+        "turn_kind": {
+          "$ref": "#/$defs/TurnKind",
+          "default": "conversation"
         }
       },
       "required": [
@@ -8237,6 +8316,22 @@
         "web_fetch",
         "download",
         "dynamic_tool_call"
+      ]
+    },
+    "TurnKind": {
+      "type": "string",
+      "enum": [
+        "conversation",
+        "task_run"
+      ]
+    },
+    "TurnOrigin": {
+      "type": "string",
+      "enum": [
+        "user",
+        "scheduled_task",
+        "detached_task",
+        "attached_task"
       ]
     },
     "TurnStartedNotification": {

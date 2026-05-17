@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
@@ -325,6 +325,7 @@ impl ToolHandler for GrepHandler {
             && let Some(file_count) = count_rg_search_files(
                 search_path.as_path(),
                 invocation.workdir.as_path(),
+                &invocation.environment,
                 timeout_ms.min(3_000),
             )
             .await?
@@ -347,6 +348,7 @@ impl ToolHandler for GrepHandler {
             max_results,
             search_path.as_path(),
             invocation.workdir.as_path(),
+            &invocation.environment,
             timeout_ms,
         )
         .await;
@@ -369,6 +371,7 @@ impl ToolHandler for GrepHandler {
                     case_sensitive,
                     search_path.as_path(),
                     invocation.workdir.as_path(),
+                    &invocation.environment,
                     timeout_ms,
                 )
                 .await;
@@ -520,6 +523,7 @@ async fn run_rg_search(
     max_results: usize,
     search_path: &Path,
     workdir: &Path,
+    environment: &BTreeMap<String, String>,
     timeout_ms: u64,
 ) -> Result<Option<Output>, ToolError> {
     let mut command = Command::new("rg");
@@ -537,6 +541,7 @@ async fn run_rg_search(
     command.arg(pattern);
     command.arg(search_path.as_os_str());
     command.current_dir(workdir);
+    command.envs(environment.iter());
 
     let output = timeout(Duration::from_millis(timeout_ms), command.output())
         .await
@@ -556,6 +561,7 @@ async fn run_grep_fallback(
     case_sensitive: bool,
     search_path: &Path,
     workdir: &Path,
+    environment: &BTreeMap<String, String>,
     timeout_ms: u64,
 ) -> Result<Output, ToolError> {
     let mut command = Command::new("grep");
@@ -571,6 +577,7 @@ async fn run_grep_fallback(
     command.arg(pattern);
     command.arg(search_path.as_os_str());
     command.current_dir(workdir);
+    command.envs(environment.iter());
 
     timeout(Duration::from_millis(timeout_ms), command.output())
         .await
@@ -581,6 +588,7 @@ async fn run_grep_fallback(
 async fn count_rg_search_files(
     search_path: &Path,
     workdir: &Path,
+    environment: &BTreeMap<String, String>,
     timeout_ms: u64,
 ) -> Result<Option<usize>, ToolError> {
     let mut command = Command::new("rg");
@@ -588,6 +596,7 @@ async fn count_rg_search_files(
     append_default_rg_excludes(&mut command);
     command.arg(search_path.as_os_str());
     command.current_dir(workdir);
+    command.envs(environment.iter());
 
     let output = timeout(Duration::from_millis(timeout_ms), command.output())
         .await
@@ -747,6 +756,7 @@ mod tests {
             source: ToolCallSource::Model,
             payload: ToolPayload::Function { arguments },
             workdir,
+            environment: Default::default(),
             attempt_id: 1,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),

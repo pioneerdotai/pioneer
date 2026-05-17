@@ -125,6 +125,7 @@ impl PromptRuntimeSectionId {
 pub enum PromptSectionId {
     IdentityBase,
     AssistantSafety,
+    ArtifactOutputContract,
     SoulCore,
     IdentityCore,
     UserPersona,
@@ -145,6 +146,7 @@ impl PromptSectionId {
         let id = match self {
             Self::IdentityBase => "identity_base",
             Self::AssistantSafety => "assistant_safety",
+            Self::ArtifactOutputContract => "artifact_output_contract",
             Self::SoulCore => "soul_core",
             Self::IdentityCore => "identity_core",
             Self::UserPersona => "user_persona",
@@ -167,6 +169,7 @@ impl PromptSectionId {
             value,
             "identity_base"
                 | "assistant_safety"
+                | "artifact_output_contract"
                 | "soul_core"
                 | "identity_core"
                 | "user_persona"

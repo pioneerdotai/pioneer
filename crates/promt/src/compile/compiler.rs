@@ -42,6 +42,16 @@ fn build_safety_section() -> PromptSection {
     }
 }
 
+fn build_artifact_output_contract_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::ArtifactOutputContract,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_ARTIFACT_OUTPUT_CONTRACT.to_owned(),
+        content: content::ARTIFACT_OUTPUT_CONTRACT_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 fn build_tool_recovery_policy_section() -> PromptSection {
     PromptSection {
         id: PromptSectionId::ToolRecoveryPolicy,
@@ -459,6 +469,10 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         sections.push(build_safety_section());
     }
 
+    if policy::include_artifact_output_contract(profile) {
+        sections.push(build_artifact_output_contract_section());
+    }
+
     if policy::include_workspace_context(profile) {
         let (loaded_files, mut file_diagnostics) =
             load_bootstrap_files(input.workspace_root.as_path(), profile);
@@ -720,6 +734,7 @@ mod tests {
             vec![
                 PromptSectionId::IdentityBase,
                 PromptSectionId::AssistantSafety,
+                PromptSectionId::ArtifactOutputContract,
                 PromptSectionId::SoulCore,
                 PromptSectionId::IdentityCore,
                 PromptSectionId::UserPersona,

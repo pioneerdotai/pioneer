@@ -8,6 +8,10 @@ pub fn include_safety(profile: PromptProfile) -> bool {
     !matches!(profile, PromptProfile::AssistantNone)
 }
 
+pub fn include_artifact_output_contract(profile: PromptProfile) -> bool {
+    !matches!(profile, PromptProfile::AssistantNone)
+}
+
 pub fn include_tool_recovery_policy(
     profile: PromptProfile,
     include_tool_recovery_policy: bool,

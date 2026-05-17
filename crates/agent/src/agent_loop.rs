@@ -1,7 +1,7 @@
 use super::{
     ActiveTurnRequest, AgentCommand, AgentEventHub, AgentMcpToolProvider, AgentStartError,
     TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl, TurnTaskCompletion,
-    TurnTaskFailure,
+    TurnTaskFailure, TurnToolProvider,
 };
 use crate::chat;
 use crate::hooks::{
@@ -38,6 +38,7 @@ pub(super) async fn run_agent_loop(
     provider_registry: Arc<ProviderRegistry>,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -65,6 +66,7 @@ pub(super) async fn run_agent_loop(
                 workspace_skill_policies,
                 input,
                 resolved_artifacts,
+                runtime_environment,
                 history,
                 ack,
             } => {
@@ -81,6 +83,7 @@ pub(super) async fn run_agent_loop(
                     workspace_skill_policies,
                     input,
                     resolved_artifacts,
+                    runtime_environment,
                     history,
                     retained_llm_context: Vec::new(),
                     execution_options: super::TurnExecutionOptions::default(),
@@ -117,6 +120,7 @@ pub(super) async fn run_agent_loop(
                     workspace_id.clone(),
                     tool_loop_config.clone(),
                     mcp_tool_provider.clone(),
+                    turn_tool_provider.clone(),
                     task_tool_provider.clone(),
                     hook_runtime.clone(),
                     tool_bundle_artifacts.clone(),
@@ -375,6 +379,76 @@ pub(super) async fn run_agent_loop(
                     interrupted_dispatch,
                 );
             }
+            AgentCommand::StartPostTurnFollowupRun {
+                turn_id,
+                instruction,
+                ack,
+            } => {
+                if active_turn_id.is_some() {
+                    let _ = ack.send(Err(super::AgentControlError::TurnAlreadyRunning));
+                    continue;
+                }
+
+                let Some(mut turn_request) = last_turn_request.clone() else {
+                    let _ = ack.send(Err(super::AgentControlError::NoActiveTurn));
+                    continue;
+                };
+                if turn_request.turn_id != turn_id {
+                    let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
+                    continue;
+                }
+
+                turn_request.input.push(UserInput::Text {
+                    text: instruction,
+                    text_elements: Vec::new(),
+                });
+
+                let provider = match provider_registry
+                    .get_or_create(turn_request.provider_name.as_str())
+                {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                            "failed to recreate provider `{}` for post-turn follow-up run: {error}",
+                            turn_request.provider_name
+                        ))));
+                        continue;
+                    }
+                };
+
+                let run_id = next_turn_run_id;
+                next_turn_run_id = next_turn_run_id.saturating_add(1);
+
+                active_turn_run_id = Some(run_id);
+                active_turn_id = Some(turn_id.clone());
+
+                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                active_turn_control = Some(turn_control.clone());
+
+                active_turn_request = Some(turn_request.clone());
+                last_turn_request = Some(turn_request.clone());
+                active_recovery = None;
+
+                active_turn_task = Some(spawn_turn_task(
+                    command_tx.clone(),
+                    event_hub.clone(),
+                    thread_id.clone(),
+                    workspace_id.clone(),
+                    tool_loop_config.clone(),
+                    mcp_tool_provider.clone(),
+                    turn_tool_provider.clone(),
+                    task_tool_provider.clone(),
+                    hook_runtime.clone(),
+                    tool_bundle_artifacts.clone(),
+                    provider,
+                    turn_request,
+                    turn_control,
+                    None,
+                    run_id,
+                ));
+
+                let _ = ack.send(Ok(()));
+            }
             AgentCommand::StartRecoveryAttempt { request, ack } => {
                 if active_turn_id.is_none()
                     && !request.item_type.is_tool_item()
@@ -423,6 +497,7 @@ pub(super) async fn run_agent_loop(
                         workspace_id.clone(),
                         tool_loop_config.clone(),
                         mcp_tool_provider.clone(),
+                        turn_tool_provider.clone(),
                         task_tool_provider.clone(),
                         hook_runtime.clone(),
                         tool_bundle_artifacts.clone(),
@@ -512,6 +587,7 @@ pub(super) async fn run_agent_loop(
                     workspace_id.clone(),
                     tool_loop_config.clone(),
                     mcp_tool_provider.clone(),
+                    turn_tool_provider.clone(),
                     task_tool_provider.clone(),
                     hook_runtime.clone(),
                     tool_bundle_artifacts.clone(),
@@ -541,6 +617,7 @@ fn spawn_turn_task(
     workspace_id: String,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -561,12 +638,14 @@ fn spawn_turn_task(
             turn_request.workspace_skill_policies,
             turn_request.input,
             turn_request.resolved_artifacts,
+            turn_request.runtime_environment,
             turn_request.history,
             turn_request.retained_llm_context,
             turn_request.execution_options.force_non_stream,
             turn_request.execution_options.continue_generation_hint,
             tool_loop_config,
             mcp_tool_provider,
+            turn_tool_provider,
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,
@@ -606,12 +685,14 @@ async fn execute_turn_flow(
     >,
     input: Vec<UserInput>,
     resolved_artifacts: Vec<super::ResolvedArtifactInput>,
+    runtime_environment: std::collections::HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<super::RetainedToolLlmContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -630,12 +711,14 @@ async fn execute_turn_flow(
             workspace_skill_policies,
             input,
             resolved_artifacts,
+            runtime_environment,
             history,
             retained_llm_context,
             force_non_stream,
             continue_generation_hint,
             tool_loop_config,
             mcp_tool_provider,
+            turn_tool_provider,
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,

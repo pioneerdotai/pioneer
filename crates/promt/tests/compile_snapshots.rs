@@ -36,6 +36,24 @@ fn assistant_full_snapshot() {
     .expect("compile full");
 
     insta::assert_snapshot!("assistant_full", compiled.full_system_text);
+    assert!(
+        compiled
+            .full_system_text
+            .contains("## Artifact output contract")
+    );
+    assert!(compiled.full_system_text.contains("artifact_prepare"));
+    assert!(compiled.full_system_text.contains("artifact_register"));
+    assert!(
+        compiled
+            .full_system_text
+            .contains("$PIONEER_ARTIFACT_OUTPUT_DIR")
+    );
+    assert!(
+        !compiled
+            .full_system_text
+            .to_ascii_lowercase()
+            .contains("scan")
+    );
 }
 
 #[test]

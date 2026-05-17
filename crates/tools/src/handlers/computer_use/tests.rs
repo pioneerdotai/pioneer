@@ -100,6 +100,7 @@ fn invocation(payload: JsonValue) -> ToolInvocation {
         source: ToolCallSource::Model,
         payload: ToolPayload::Function { arguments: payload },
         workdir: PathBuf::from("."),
+        environment: Default::default(),
         attempt_id: 1,
         idempotency_key: None,
         recovery: ToolRecoveryMetadata::default(),

@@ -20,6 +20,7 @@ enum Turn {
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         deduplicate_existing_thread_lineage_runs(manager).await?;
+        normalize_artifact_binding_kinds(manager).await?;
 
         manager
             .create_index(
@@ -83,6 +84,19 @@ async fn deduplicate_existing_thread_lineage_runs(
     };
 
     manager.get_connection().execute_unprepared(sql).await?;
+
+    Ok(())
+}
+
+async fn normalize_artifact_binding_kinds(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .get_connection()
+        .execute_unprepared(
+            "UPDATE artifact_binding \
+             SET binding_kind = 'tool_output' \
+             WHERE binding_kind = 'system_capture'",
+        )
+        .await?;
 
     Ok(())
 }

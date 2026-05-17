@@ -64,6 +64,10 @@ impl AsyncRead for ArtifactReadHandle {
 
 #[async_trait]
 pub trait ArtifactBlobStore: Send + Sync {
+    fn local_artifact_root(&self) -> Option<PathBuf> {
+        None
+    }
+
     async fn put_bytes(
         &self,
         workspace_id: &str,

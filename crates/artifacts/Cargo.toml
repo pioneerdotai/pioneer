@@ -16,7 +16,9 @@ mime_guess.workspace = true
 pioneer-crud.workspace = true
 pioneer-provider.workspace = true
 pioneer-protocol.workspace = true
+pioneer-tools.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,3 +28,4 @@ tokio.workspace = true
 pioneer-migration.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+tokio-util.workspace = true

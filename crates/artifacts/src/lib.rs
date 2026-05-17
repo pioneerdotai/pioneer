@@ -1,34 +1,49 @@
 pub mod blob_store;
-pub mod capture;
-pub mod capture_policy;
 pub mod error;
 pub mod gc;
 pub mod ids;
 pub mod local_blob_store;
 pub mod mime;
 pub mod models;
+pub mod output_dir;
 pub mod projection;
 pub mod provider_resolver;
 pub mod quota;
+pub mod registration;
 pub mod security;
 pub mod service;
 pub mod source;
+pub mod tools;
 
 pub use blob_store::{
     ArtifactBlobInput, ArtifactBlobStore, ArtifactReadHandle, StoredArtifactBlob,
 };
-pub use capture::{ArtifactCaptureCandidate, ArtifactCaptureContext, ArtifactCaptureSource};
-pub use capture_policy::ArtifactCapturePolicy;
-pub use error::{ArtifactError, ArtifactResult};
+pub use error::{
+    ArtifactError, ArtifactLocalPathRejectionKind, ArtifactQuotaRejectionKind, ArtifactResult,
+};
 pub use gc::{ArtifactGcBlobCandidate, ArtifactGcPlan, ArtifactGcPolicy, ArtifactGcReport};
 pub use local_blob_store::LocalArtifactBlobStore;
 pub use models::{
     ArtifactBindingTarget, ArtifactListFilter, ArtifactListPage, BindArtifactRequest,
     IngestArtifactBytesRequest, IngestArtifactTempFileRequest,
 };
+pub use output_dir::{
+    ARTIFACT_OUTPUT_DIR_NAME, ArtifactOutputDir, ArtifactOutputDirGcCandidate,
+    ArtifactOutputDirGcPlan, ArtifactOutputDirGcReport, PIONEER_ARTIFACT_OUTPUT_DIR_ENV,
+    artifact_output_dir_path, artifact_output_workspace_root, cleanup_artifact_output_file,
+    create_artifact_output_dir, execute_output_dir_gc, plan_output_dir_gc,
+};
 pub use projection::ArtifactProjectionRecord;
 pub use provider_resolver::ResolvedProviderArtifact;
 pub use quota::{ArtifactQuotaPolicy, ArtifactQuotaWarning, ArtifactWorkspaceUsage};
+pub use registration::{
+    ArtifactRegistrationCandidate, ArtifactRegistrationContext, ArtifactRegistrationSource,
+};
 pub use security::{ArtifactLocalPathPolicy, ValidatedLocalFile};
 pub use service::{ArtifactDownloadSnapshot, ArtifactService};
 pub use source::{ArtifactSource, IngestArtifactSourceRequest};
+pub use tools::{
+    ARTIFACT_OUTPUT_DIR_ENV, ARTIFACT_PREPARE_TOOL, ARTIFACT_REGISTER_TOOL, ArtifactToolContext,
+    ArtifactToolHandler, ArtifactToolNotification, ArtifactToolNotificationSink, ArtifactToolState,
+    NoopArtifactToolNotificationSink, PreparedArtifactOutput, artifact_tool_specs,
+};

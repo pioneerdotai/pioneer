@@ -65,6 +65,7 @@ mod tests {
                 text_elements: Vec::new(),
             }],
             resolved_artifacts: Vec::<ResolvedArtifactInput>::new(),
+            runtime_environment: HashMap::new(),
             history: vec![ChatMessage::user("retry")],
             retained_llm_context: Vec::new(),
             execution_options: TurnExecutionOptions::default(),

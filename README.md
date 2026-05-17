@@ -58,7 +58,7 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 - **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
 - **Thread tree AGENTS.md** - define persistent instructions at the workspace root or any thread folder; child threads inherit the nearest active file and Pioneer injects it into the prompt through the hook runtime.
 - **Protocol-first architecture** - `pioneer-protocol` defines the public JSON-RPC surface and generated schemas under `schemas/`.
-- **Workspace-scoped artifacts** - files uploaded by users or produced by agents are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.
+- **Explicit workspace-scoped artifacts** - user uploads and agent-created result files are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.
 - **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
 - **Multi-language desktop** - desktop UI locales are available for English, German, Spanish, French, Hindi, Japanese, Russian, and Chinese.
 

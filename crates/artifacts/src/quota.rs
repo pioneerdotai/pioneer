@@ -1,7 +1,7 @@
 use pioneer_crud::CrudStore;
 use serde::Serialize;
 
-use crate::error::{ArtifactError, ArtifactResult};
+use crate::error::{ArtifactError, ArtifactQuotaRejectionKind, ArtifactResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArtifactQuotaPolicy {
@@ -50,6 +50,7 @@ impl ArtifactQuotaPolicy {
     pub fn check_file_size(&self, size_bytes: u64) -> ArtifactResult<()> {
         if size_bytes > self.max_file_bytes {
             return Err(ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::FileTooLarge,
                 message: format!(
                     "artifact file size {size_bytes} exceeds max_file_bytes={}",
                     self.max_file_bytes
@@ -68,6 +69,7 @@ impl ArtifactQuotaPolicy {
     ) -> ArtifactResult<()> {
         if usage.files.saturating_add(1) > self.max_files_per_workspace {
             return Err(ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::WorkspaceFileCountExceeded,
                 message: format!(
                     "workspace `{}` exceeds max_files_per_workspace={}",
                     usage.workspace_id, self.max_files_per_workspace
@@ -79,6 +81,7 @@ impl ArtifactQuotaPolicy {
         let projected = usage.bytes.saturating_add(incoming_bytes);
         if projected > self.max_workspace_bytes {
             return Err(ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::WorkspaceBytesExceeded,
                 message: format!(
                     "workspace `{}` storage would exceed max_workspace_bytes={}",
                     usage.workspace_id, self.max_workspace_bytes
@@ -134,7 +137,16 @@ mod tests {
             ..ArtifactQuotaPolicy::default()
         };
 
-        assert!(policy.check_file_size(5).is_err());
+        let error = policy
+            .check_file_size(5)
+            .expect_err("file over limit should fail");
+        assert!(matches!(
+            error,
+            ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::FileTooLarge,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -150,7 +162,16 @@ mod tests {
             warning: None,
         };
 
-        assert!(policy.check_workspace_headroom(&usage, 3).is_err());
+        let error = policy
+            .check_workspace_headroom(&usage, 3)
+            .expect_err("workspace over limit should fail");
+        assert!(matches!(
+            error,
+            ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::WorkspaceBytesExceeded,
+                ..
+            }
+        ));
     }
 
     #[test]

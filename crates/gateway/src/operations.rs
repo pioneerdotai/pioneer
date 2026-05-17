@@ -235,6 +235,7 @@ async fn open_artifact_service_for_operations(
         },
         pioneer_artifacts::ArtifactGcPolicy {
             grace_secs: config.gateway.artifacts.gc_grace_secs,
+            output_dir_ttl_secs: config.gateway.artifacts.output_dir_ttl_secs,
         },
     ))
 }

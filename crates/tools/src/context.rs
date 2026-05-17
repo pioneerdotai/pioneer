@@ -3,6 +3,7 @@ use crate::spec::ToolRecoveryMetadata;
 use pioneer_provider::ModelInputItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -96,6 +97,7 @@ pub struct ToolInvocation {
     pub source: ToolCallSource,
     pub payload: ToolPayload,
     pub workdir: PathBuf,
+    pub environment: BTreeMap<String, String>,
     pub attempt_id: u32,
     pub idempotency_key: Option<String>,
     pub recovery: ToolRecoveryMetadata,

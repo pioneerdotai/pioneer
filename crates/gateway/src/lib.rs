@@ -363,7 +363,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor
         .set_hook_recovery_config(config.gateway.hooks.recovery.clone())
         .await;
-    message_processor.bind_task_bridge().await;
+    message_processor.bind_agent_tool_bridges().await;
     message_processor.bind_memory_bridge_if_enabled().await;
     message_processor
         .cleanup_stale_skill_uploads(now_timestamp_secs())

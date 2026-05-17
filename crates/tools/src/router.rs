@@ -13,7 +13,7 @@ use crate::spec::{
 };
 use crate::visibility::ToolVisibilitySnapshot;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -193,6 +193,7 @@ impl ToolRouter {
         call: ToolCall,
         source: ToolCallSource,
         workdir: PathBuf,
+        environment: BTreeMap<String, String>,
         trace: &ToolEventTrace,
         cancellation: CancellationToken,
     ) -> Result<crate::context::AnyToolResult, ToolError> {
@@ -202,6 +203,7 @@ impl ToolRouter {
             source,
             payload: call.payload,
             workdir,
+            environment,
             attempt_id: 1,
             idempotency_key: call.idempotency_key,
             recovery: call.recovery,

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactRegisterParams",
+  "type": "object",
+  "properties": {
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "displayName": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactPrepareKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "mimeType": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path": {
+      "type": "string"
+    },
+    "preparedOutputPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "$defs": {
+    "ArtifactPrepareKind": {
+      "type": "string",
+      "enum": [
+        "image",
+        "document",
+        "data",
+        "archive",
+        "code",
+        "log",
+        "other"
+      ]
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactPrepareParams",
+  "type": "object",
+  "properties": {
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/ArtifactPrepareKind"
+    },
+    "mimeType": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "displayName",
+    "kind"
+  ],
+  "$defs": {
+    "ArtifactPrepareKind": {
+      "type": "string",
+      "enum": [
+        "image",
+        "document",
+        "data",
+        "archive",
+        "code",
+        "log",
+        "other"
+      ]
+    }
+  }
+}

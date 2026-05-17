@@ -22,6 +22,25 @@ pub fn workspace_segment(workspace_id: &str) -> ArtifactResult<String> {
     })
 }
 
+pub fn path_segment(label: &str, value: &str) -> ArtifactResult<String> {
+    if value.is_empty() {
+        return Err(ArtifactError::InvalidRequest {
+            message: format!("{label} must not be empty"),
+        });
+    }
+
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Ok(value.to_owned());
+    }
+
+    Err(ArtifactError::InvalidRequest {
+        message: format!("{label} contains characters that are unsafe for filesystem paths"),
+    })
+}
+
 pub fn new_operation_id(prefix: &str) -> String {
     let counter = OPERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()

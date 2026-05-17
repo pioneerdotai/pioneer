@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -16,11 +17,15 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::blob_store::{ArtifactBlobInput, ArtifactBlobStore};
-use crate::error::{ArtifactError, ArtifactResult};
+use crate::error::{ArtifactError, ArtifactLocalPathRejectionKind, ArtifactResult};
 use crate::gc::{
     ArtifactGcPlan, ArtifactGcPolicy, ArtifactGcReport, execute_gc_with_policy, plan_gc_with_policy,
 };
-use crate::mime::{OCTET_STREAM, classify_kind, sanitize_display_name};
+use crate::mime::{
+    MAX_MIME_SNIFF_BYTES, classify_kind, detect_mime_from_bytes,
+    effective_mime_type as choose_effective_mime_type, normalize_mime_type, record_mime_metadata,
+    sanitize_display_name,
+};
 use crate::models::{
     ArtifactListFilter, ArtifactListPage, BindArtifactRequest, IngestArtifactBytesRequest,
     IngestArtifactTempFileRequest,
@@ -103,6 +108,7 @@ impl ArtifactService {
         request: IngestArtifactBytesRequest,
     ) -> ArtifactResult<ArtifactSummary> {
         validate_ingest_request(&request)?;
+        let request = normalize_ingest_mime(request);
         self.enforce_quota(&request.workspace_id, request.bytes.len() as u64)
             .await?;
         let needs_plain_text_projection = supports_inline_plain_text_projection(
@@ -146,11 +152,30 @@ impl ArtifactService {
             });
         }
         self.enforce_quota(&request.workspace_id, file_size).await?;
+        let detected_mime_type = detect_mime_from_temp_file(&request.temp_path).await?;
+        let declared_mime_type = request
+            .mime_type
+            .as_deref()
+            .map(normalize_mime_type)
+            .filter(|value| !value.is_empty());
+        let effective_mime_type =
+            choose_effective_mime_type(declared_mime_type.as_deref(), detected_mime_type.as_str());
+        let mut metadata = request.metadata;
+        record_mime_metadata(
+            &mut metadata,
+            declared_mime_type.as_deref(),
+            detected_mime_type.as_str(),
+            effective_mime_type.as_str(),
+        );
         let needs_plain_text_projection = usize::try_from(file_size).ok().is_some_and(|size| {
-            supports_inline_plain_text_projection(request.kind, request.mime_type.as_deref(), size)
+            supports_inline_plain_text_projection(
+                request.kind,
+                Some(effective_mime_type.as_str()),
+                size,
+            )
         });
         let needs_thumbnail_projection =
-            supports_thumbnail_projection(request.kind, request.mime_type.as_deref())
+            supports_thumbnail_projection(request.kind, Some(effective_mime_type.as_str()))
                 && file_size <= MAX_THUMBNAIL_SOURCE_BYTES;
         let projection_bytes =
             if file_size > 0 && (needs_plain_text_projection || needs_thumbnail_projection) {
@@ -174,11 +199,11 @@ impl ArtifactService {
             bytes: Vec::new(),
             display_name: request.display_name,
             kind: request.kind,
-            mime_type: request.mime_type,
+            mime_type: Some(effective_mime_type),
             created_by_kind: request.created_by_kind,
             created_by_actor_id: request.created_by_actor_id,
             binding: request.binding,
-            metadata: request.metadata,
+            metadata,
         };
         self.ingest_blob_input(
             metadata_request,
@@ -201,16 +226,16 @@ impl ArtifactService {
             .put_bytes(&request.workspace_id, input)
             .await?;
 
-        let ingested = self
+        let ingested = match self
             .store
             .ingest_artifact_metadata(
                 NewArtifactBlobRecord {
                     workspace_id: request.workspace_id.clone(),
-                    sha256: stored_blob.sha256,
+                    sha256: stored_blob.sha256.clone(),
                     size_bytes: stored_blob.size_bytes,
                     mime_type: request.mime_type.clone(),
-                    storage_backend: stored_blob.storage_backend,
-                    storage_key: stored_blob.storage_key,
+                    storage_backend: stored_blob.storage_backend.clone(),
+                    storage_key: stored_blob.storage_key.clone(),
                     metadata: Default::default(),
                 },
                 metadata_record_from_ingest(&request),
@@ -220,7 +245,21 @@ impl ArtifactService {
                     .map(binding_target_record_from_model),
                 request.metadata.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(ingested) => ingested,
+            Err(error) => {
+                let registration_error = ArtifactError::from(error);
+                cleanup_stored_blob_after_failed_registration(
+                    self.blob_store.as_ref(),
+                    request.workspace_id.as_str(),
+                    &stored_blob,
+                    &registration_error,
+                )
+                .await?;
+                return Err(registration_error);
+            }
+        };
 
         if projection_bytes.is_some() {
             let bytes = projection_bytes.as_deref().unwrap_or(&[]);
@@ -249,10 +288,22 @@ impl ArtifactService {
     ) -> ArtifactResult<ArtifactSummary> {
         match request.source {
             ArtifactSource::Bytes(bytes) => {
-                let mime_type = request.mime_type;
+                let detected_mime_type = detect_mime_from_bytes(
+                    bytes.as_slice(),
+                    request.display_name.as_deref().map(Path::new),
+                );
+                let declared_mime_type = request
+                    .mime_type
+                    .as_deref()
+                    .map(normalize_mime_type)
+                    .filter(|value| !value.is_empty());
+                let effective_mime_type = choose_effective_mime_type(
+                    declared_mime_type.as_deref(),
+                    detected_mime_type.as_str(),
+                );
                 let kind = request
                     .kind
-                    .unwrap_or_else(|| classify_kind(mime_type.as_deref(), None));
+                    .unwrap_or_else(|| classify_kind(Some(effective_mime_type.as_str()), None));
                 self.ingest_bytes(IngestArtifactBytesRequest {
                     workspace_id: request.workspace_id,
                     primary_thread_id: request.primary_thread_id,
@@ -263,7 +314,7 @@ impl ArtifactService {
                         .map(sanitize_display_name)
                         .unwrap_or_else(|| "artifact".to_owned()),
                     kind,
-                    mime_type: Some(mime_type.unwrap_or_else(|| OCTET_STREAM.to_owned())),
+                    mime_type: request.mime_type,
                     created_by_kind: request.created_by_kind,
                     created_by_actor_id: request.created_by_actor_id,
                     binding: request.binding,
@@ -272,18 +323,28 @@ impl ArtifactService {
                 .await
             }
             ArtifactSource::LocalPath(path) => {
-                let policy =
-                    request
-                        .local_path_policy
-                        .ok_or_else(|| ArtifactError::LocalPathRejected {
-                            message: "local path policy is required".to_owned(),
-                        })?;
+                let policy = request.local_path_policy.ok_or_else(|| {
+                    ArtifactError::local_path_rejected(
+                        ArtifactLocalPathRejectionKind::InvalidPath,
+                        "local path policy is required",
+                    )
+                })?;
                 let local_file = read_validated_local_file(&path, &policy).await?;
-                let mime_type = request
+                let declared_mime_type = request
                     .mime_type
-                    .unwrap_or_else(|| local_file.mime_type.clone());
+                    .as_deref()
+                    .map(normalize_mime_type)
+                    .filter(|value| !value.is_empty());
+                let effective_mime_type = choose_effective_mime_type(
+                    declared_mime_type.as_deref(),
+                    local_file.mime_type.as_str(),
+                );
+                let mime_type = request.mime_type;
                 let kind = request.kind.unwrap_or_else(|| {
-                    classify_kind(Some(&mime_type), Some(local_file.canonical_path.as_path()))
+                    classify_kind(
+                        Some(effective_mime_type.as_str()),
+                        Some(local_file.canonical_path.as_path()),
+                    )
                 });
                 let display_name = request
                     .display_name
@@ -299,7 +360,7 @@ impl ArtifactService {
                     bytes: local_file.bytes,
                     display_name,
                     kind,
-                    mime_type: Some(mime_type),
+                    mime_type,
                     created_by_kind: request.created_by_kind,
                     created_by_actor_id: request.created_by_actor_id,
                     binding: request.binding,
@@ -413,6 +474,7 @@ impl ArtifactService {
     ) -> ArtifactResult<ArtifactGcPlan> {
         plan_gc_with_policy(
             self.store.as_ref(),
+            Some(self.blob_store.as_ref()),
             workspace_id,
             now_unix_ms,
             self.gc_policy,
@@ -673,6 +735,70 @@ fn validate_ingest_request(request: &IngestArtifactBytesRequest) -> ArtifactResu
     Ok(())
 }
 
+fn normalize_ingest_mime(mut request: IngestArtifactBytesRequest) -> IngestArtifactBytesRequest {
+    let declared_mime_type = request
+        .mime_type
+        .as_deref()
+        .map(normalize_mime_type)
+        .filter(|value| !value.is_empty());
+    let detected_mime_type = detect_mime_from_bytes(
+        request.bytes.as_slice(),
+        Some(Path::new(request.display_name.as_str())),
+    );
+    let effective_mime_type =
+        choose_effective_mime_type(declared_mime_type.as_deref(), detected_mime_type.as_str());
+
+    record_mime_metadata(
+        &mut request.metadata,
+        declared_mime_type.as_deref(),
+        detected_mime_type.as_str(),
+        effective_mime_type.as_str(),
+    );
+    request.mime_type = Some(effective_mime_type);
+    request
+}
+
+async fn detect_mime_from_temp_file(path: &Path) -> ArtifactResult<String> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| ArtifactError::Io {
+            message: format!("failed to open temp artifact input {}", path.display()),
+            source,
+        })?;
+    let mut bytes = Vec::with_capacity(MAX_MIME_SNIFF_BYTES);
+    file.take(MAX_MIME_SNIFF_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| ArtifactError::Io {
+            message: format!(
+                "failed to read temp artifact input {} for MIME detection",
+                path.display()
+            ),
+            source,
+        })?;
+    Ok(detect_mime_from_bytes(bytes.as_slice(), Some(path)))
+}
+
+async fn cleanup_stored_blob_after_failed_registration(
+    blob_store: &dyn ArtifactBlobStore,
+    workspace_id: &str,
+    stored_blob: &crate::blob_store::StoredArtifactBlob,
+    registration_error: &ArtifactError,
+) -> ArtifactResult<()> {
+    if stored_blob.deduplicated {
+        return Ok(());
+    }
+
+    blob_store
+        .delete_unreferenced(workspace_id, stored_blob.storage_key.as_str())
+        .await
+        .map_err(|cleanup_error| ArtifactError::BlobCleanupFailed {
+            storage_key: stored_blob.storage_key.clone(),
+            registration_error: registration_error.to_string(),
+            cleanup_error: cleanup_error.to_string(),
+        })
+}
+
 fn validate_workspace_id(workspace_id: &str) -> ArtifactResult<()> {
     validate_non_empty("workspace_id", workspace_id)
 }
@@ -751,6 +877,7 @@ fn list_filter_record(filter: ArtifactListFilter) -> ArtifactListFilterRecord {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::Cursor;
+    use std::io::ErrorKind;
     use std::sync::Arc;
 
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -766,10 +893,14 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database};
 
     use super::*;
+    use crate::blob_store::{ArtifactReadHandle, StoredArtifactBlob};
+    use crate::error::ArtifactQuotaRejectionKind;
+    use crate::ids::sha256_storage_key;
     use crate::local_blob_store::LocalArtifactBlobStore;
     use crate::models::{ArtifactBindingTarget, ArtifactListFilter};
     use crate::security::ArtifactLocalPathPolicy;
     use crate::source::{ArtifactSource, IngestArtifactSourceRequest};
+    use sha2::{Digest, Sha256};
 
     struct TestHarness {
         service: ArtifactService,
@@ -1112,7 +1243,13 @@ mod tests {
     #[tokio::test]
     async fn failed_and_pending_thumbnail_projections_are_not_exposed_as_preview() {
         let harness = setup().await;
-        let mut request = ingest_request("ws_a", "thr_a", "turn_a", b"not-a-real-png", "image.png");
+        let mut request = ingest_request(
+            "ws_a",
+            "thr_a",
+            "turn_a",
+            b"\xff\x00not-a-real-png",
+            "image.png",
+        );
         request.kind = ArtifactKind::Image;
         request.mime_type = Some("image/png".to_owned());
 
@@ -1161,6 +1298,48 @@ mod tests {
         assert!(refreshed.artifact.preview.is_none());
     }
 
+    #[tokio::test]
+    async fn mime_detection_overrides_declared_mime_and_records_metadata() {
+        let harness = setup().await;
+        let image_bytes = test_png_bytes(16, 16);
+        let mut request = ingest_request(
+            "ws_a",
+            "thr_a",
+            "turn_a",
+            image_bytes.as_slice(),
+            "mismatch.txt",
+        );
+        request.kind = ArtifactKind::Image;
+        request.mime_type = Some("text/plain; charset=utf-8".to_owned());
+
+        let summary = harness
+            .service
+            .ingest_bytes(request)
+            .await
+            .expect("ingest bytes");
+
+        assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            metadata_str(&summary, "declared_mime_type"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            metadata_str(&summary, "detected_mime_type"),
+            Some("image/png")
+        );
+        assert_eq!(
+            metadata_str(&summary, "effective_mime_type"),
+            Some("image/png")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("declared_detected_mime_mismatch")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
     fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
         let image = RgbaImage::from_fn(width, height, |x, y| {
             Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8, 255])
@@ -1193,12 +1372,57 @@ mod tests {
             .await
             .expect_err("workspace quota should reject");
 
-        assert!(matches!(error, ArtifactError::QuotaExceeded { .. }));
+        assert!(matches!(
+            error,
+            ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::WorkspaceBytesExceeded,
+                ..
+            }
+        ));
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
+        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
+        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
         harness
             .service
             .ingest_bytes(ingest_request("ws_b", "thr_b", "turn_b", b"1234", "b.txt"))
             .await
             .expect("other workspace has separate quota");
+    }
+
+    #[tokio::test]
+    async fn quota_rejects_file_over_limit_before_blob_write() {
+        let harness = setup_with_quota(ArtifactQuotaPolicy {
+            max_workspace_bytes: 64,
+            max_file_bytes: 3,
+            max_files_per_workspace: 10,
+            warn_at_percent: 80,
+        })
+        .await;
+
+        let error = harness
+            .service
+            .ingest_bytes(ingest_request(
+                "ws_a",
+                "thr_a",
+                "turn_a",
+                b"1234",
+                "too-large.txt",
+            ))
+            .await
+            .expect_err("file quota should reject");
+
+        assert!(matches!(
+            error,
+            ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::FileTooLarge,
+                ..
+            }
+        ));
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
     }
 
     #[tokio::test]
@@ -1232,7 +1456,157 @@ mod tests {
             .await
             .expect_err("temp file quota should reject");
 
-        assert!(matches!(error, ArtifactError::QuotaExceeded { .. }));
+        assert!(matches!(
+            error,
+            ArtifactError::QuotaExceeded {
+                kind: ArtifactQuotaRejectionKind::FileTooLarge,
+                ..
+            }
+        ));
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+    }
+
+    #[tokio::test]
+    async fn registration_db_failure_after_blob_write_cleans_up_blob_and_rows() {
+        let harness = setup().await;
+        harness
+            .store
+            .database_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER fail_artifact_insert BEFORE INSERT ON artifact BEGIN SELECT RAISE(FAIL, 'forced artifact failure'); END;",
+            )
+            .await
+            .expect("create failure trigger");
+        let bytes = b"blob already written";
+        let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, "cleanup.txt");
+        let storage_key = storage_key_for(bytes);
+        let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
+            .blob_path("ws_a", storage_key.as_str())
+            .expect("blob path");
+
+        let error = harness
+            .service
+            .ingest_bytes(request)
+            .await
+            .expect_err("DB failure should fail registration");
+
+        assert!(matches!(error, ArtifactError::Database { .. }));
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+        assert!(
+            !blob_path.exists(),
+            "blob should be cleaned up after DB failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_blob_write_failure_leaves_no_db_rows() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("migrations apply");
+        db.execute_unprepared(
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+        )
+        .await
+        .expect("insert workspace A");
+        let store = Arc::new(CrudStore::new(db));
+        let service = ArtifactService::new(store.clone(), Arc::new(FailingPutBlobStore));
+
+        let error = service
+            .ingest_bytes(ingest_request(
+                "ws_a", "thr_a", "turn_a", b"fail", "fail.txt",
+            ))
+            .await
+            .expect_err("blob store failure should fail registration");
+
+        assert!(matches!(error, ArtifactError::Io { .. }));
+        assert_eq!(count_blobs(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(store.as_ref(), "ws_a").await, 0);
+    }
+
+    #[tokio::test]
+    async fn registration_binding_failure_rolls_back_artifact_graph_and_cleans_blob() {
+        let harness = setup().await;
+        harness
+            .store
+            .database_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER fail_artifact_binding_insert BEFORE INSERT ON artifact_binding BEGIN SELECT RAISE(FAIL, 'forced binding failure'); END;",
+            )
+            .await
+            .expect("create failure trigger");
+        let bytes = b"binding failure";
+        let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, "binding.txt");
+        let storage_key = storage_key_for(bytes);
+        let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
+            .blob_path("ws_a", storage_key.as_str())
+            .expect("blob path");
+
+        let error = harness
+            .service
+            .ingest_bytes(request)
+            .await
+            .expect_err("binding failure should fail registration");
+
+        assert!(matches!(error, ArtifactError::Database { .. }));
+        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+        assert!(
+            !blob_path.exists(),
+            "blob should be cleaned up after binding rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_cleanup_failure_reports_failure_without_visible_rows() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite memory");
+        Migrator::up(&db, None).await.expect("migrations apply");
+        db.execute_unprepared(
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+        )
+        .await
+        .expect("insert workspace A");
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_artifact_blob_insert BEFORE INSERT ON artifact_blob BEGIN SELECT RAISE(FAIL, 'forced blob metadata failure'); END;",
+        )
+        .await
+        .expect("create failure trigger");
+        let store = Arc::new(CrudStore::new(db));
+        let service = ArtifactService::new(
+            store.clone(),
+            Arc::new(CleanupFailingBlobStore {
+                stored: stored_blob_for(b"cleanup fails"),
+            }),
+        );
+
+        let error = service
+            .ingest_bytes(ingest_request(
+                "ws_a",
+                "thr_a",
+                "turn_a",
+                b"cleanup fails",
+                "cleanup-fails.txt",
+            ))
+            .await
+            .expect_err("cleanup failure should fail registration");
+
+        assert!(matches!(error, ArtifactError::BlobCleanupFailed { .. }));
+        assert_eq!(count_blobs(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_artifacts(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_versions(store.as_ref(), "ws_a").await, 0);
+        assert_eq!(count_bindings(store.as_ref(), "ws_a").await, 0);
     }
 
     #[tokio::test]
@@ -1948,6 +2322,125 @@ mod tests {
             .count_artifact_bindings_by_workspace(workspace_id)
             .await
             .expect("count bindings")
+    }
+
+    fn metadata_str<'a>(summary: &'a ArtifactSummary, key: &str) -> Option<&'a str> {
+        summary.metadata.get(key).and_then(|value| value.as_str())
+    }
+
+    fn stored_blob_for(bytes: &[u8]) -> StoredArtifactBlob {
+        let sha256 = sha256_hex(bytes);
+        StoredArtifactBlob {
+            sha256: sha256.clone(),
+            size_bytes: bytes.len() as u64,
+            storage_backend: "local".to_owned(),
+            storage_key: sha256_storage_key(sha256.as_str()),
+            deduplicated: false,
+        }
+    }
+
+    fn storage_key_for(bytes: &[u8]) -> String {
+        sha256_storage_key(sha256_hex(bytes).as_str())
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    #[derive(Debug)]
+    struct FailingPutBlobStore;
+
+    #[async_trait::async_trait]
+    impl ArtifactBlobStore for FailingPutBlobStore {
+        async fn put_bytes(
+            &self,
+            _workspace_id: &str,
+            _input: ArtifactBlobInput,
+        ) -> ArtifactResult<StoredArtifactBlob> {
+            Err(ArtifactError::Io {
+                message: "forced blob write failure".to_owned(),
+                source: ErrorKind::Other.into(),
+            })
+        }
+
+        async fn open_read(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<ArtifactReadHandle> {
+            Err(ArtifactError::ReadMissingBlob {
+                storage_key: "missing".to_owned(),
+            })
+        }
+
+        async fn delete_unreferenced(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<()> {
+            Ok(())
+        }
+
+        async fn materialize_temp(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+            _safe_name: &str,
+        ) -> ArtifactResult<std::path::PathBuf> {
+            Err(ArtifactError::ReadMissingBlob {
+                storage_key: "missing".to_owned(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CleanupFailingBlobStore {
+        stored: StoredArtifactBlob,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactBlobStore for CleanupFailingBlobStore {
+        async fn put_bytes(
+            &self,
+            _workspace_id: &str,
+            _input: ArtifactBlobInput,
+        ) -> ArtifactResult<StoredArtifactBlob> {
+            Ok(self.stored.clone())
+        }
+
+        async fn open_read(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<ArtifactReadHandle> {
+            Err(ArtifactError::ReadMissingBlob {
+                storage_key: self.stored.storage_key.clone(),
+            })
+        }
+
+        async fn delete_unreferenced(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+        ) -> ArtifactResult<()> {
+            Err(ArtifactError::Io {
+                message: "forced cleanup failure".to_owned(),
+                source: ErrorKind::Other.into(),
+            })
+        }
+
+        async fn materialize_temp(
+            &self,
+            _workspace_id: &str,
+            _storage_key: &str,
+            _safe_name: &str,
+        ) -> ArtifactResult<std::path::PathBuf> {
+            Err(ArtifactError::ReadMissingBlob {
+                storage_key: self.stored.storage_key.clone(),
+            })
+        }
     }
 
     async fn update_artifact_status(store: &CrudStore, artifact_id: &str, status: &str) {

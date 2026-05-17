@@ -768,6 +768,8 @@ impl MessageProcessor {
             AgentDurableEvent::ItemCompleted { notification } => {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
+                self.record_final_assistant_text_for_item(&notification)
+                    .await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
@@ -785,7 +787,7 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-                self.capture_artifacts_for_completed_item(&notification)
+                self.register_artifacts_for_completed_item(&notification)
                     .await;
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
@@ -988,6 +990,18 @@ impl MessageProcessor {
             | AgentDurableEvent::ThreadLineageCreated { .. } => return false,
         }
         true
+    }
+
+    async fn record_final_assistant_text_for_item(
+        &self,
+        notification: &pioneer_protocol::ItemCompletedNotification,
+    ) {
+        if let TurnItem::AgentMessage { text, .. } = &notification.item {
+            self.turn_final_assistant_texts
+                .lock()
+                .await
+                .insert(notification.turn_id.clone(), text.clone());
+        }
     }
 
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
@@ -2063,6 +2077,13 @@ impl MessageProcessor {
             }
         }
 
+        if self
+            .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            return false;
+        }
+
         let finish_outcome = match self
             .thread_manager
             .turn_finish(
@@ -2110,13 +2131,6 @@ impl MessageProcessor {
             return false;
         }
 
-        self.finish_file_capture_session(
-            turn_completed.workspace_id.as_str(),
-            turn_completed.thread_id.as_str(),
-            turn_completed.turn.id.as_str(),
-        )
-        .await;
-
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_completed(thread_id.as_str(), turn_id.as_str())
@@ -2143,6 +2157,8 @@ impl MessageProcessor {
             );
         }
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
+        self.clear_artifact_finalization_state(turn_id.as_str())
+            .await;
 
         match self
             .recovery_coordinator
@@ -2297,13 +2313,6 @@ impl MessageProcessor {
             return false;
         }
 
-        self.finish_file_capture_session(
-            turn_failed.workspace_id.as_str(),
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-        )
-        .await;
-
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_failed(
@@ -2338,6 +2347,8 @@ impl MessageProcessor {
             );
         }
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
+        self.clear_artifact_finalization_state(turn_id.as_str())
+            .await;
 
         match self
             .recovery_coordinator
@@ -2473,13 +2484,6 @@ impl MessageProcessor {
             return false;
         }
 
-        self.finish_file_capture_session(
-            turn_failed.workspace_id.as_str(),
-            turn_failed.thread_id.as_str(),
-            turn_failed.turn.id.as_str(),
-        )
-        .await;
-
         if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_failed(
@@ -2510,6 +2514,8 @@ impl MessageProcessor {
             );
         }
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
+        self.clear_artifact_finalization_state(turn_id.as_str())
+            .await;
 
         match self
             .recovery_coordinator

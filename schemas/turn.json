@@ -12,6 +12,10 @@
     "id": {
       "type": "string"
     },
+    "origin": {
+      "$ref": "#/$defs/TurnOrigin",
+      "default": "user"
+    },
     "prompt_manifest": {
       "anyOf": [
         {
@@ -24,6 +28,10 @@
     },
     "status": {
       "$ref": "#/$defs/TurnStatus"
+    },
+    "turn_kind": {
+      "$ref": "#/$defs/TurnKind",
+      "default": "conversation"
     }
   },
   "required": [
@@ -233,6 +241,22 @@
         "assistant_full",
         "assistant_minimal",
         "assistant_none"
+      ]
+    },
+    "TurnKind": {
+      "type": "string",
+      "enum": [
+        "conversation",
+        "task_run"
+      ]
+    },
+    "TurnOrigin": {
+      "type": "string",
+      "enum": [
+        "user",
+        "scheduled_task",
+        "detached_task",
+        "attached_task"
       ]
     },
     "TurnStatus": {

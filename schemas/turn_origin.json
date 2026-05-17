@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnOrigin",
+  "type": "string",
+  "enum": [
+    "user",
+    "scheduled_task",
+    "detached_task",
+    "attached_task"
+  ]
+}

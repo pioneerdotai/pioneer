@@ -3106,6 +3106,7 @@ mod tests {
             source: pioneer_tools::ToolCallSource::Model,
             payload: ToolPayload::Function { arguments },
             workdir: PathBuf::new(),
+            environment: Default::default(),
             attempt_id: 0,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),

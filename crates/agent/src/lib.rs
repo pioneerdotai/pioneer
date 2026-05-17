@@ -265,6 +265,27 @@ pub struct TaskToolMaterialization {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnToolContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Clone, Default)]
+pub struct TurnToolMaterialization {
+    pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
+    pub diagnostics: Vec<String>,
+}
+
+#[async_trait::async_trait]
+pub trait TurnToolProvider: Send + Sync {
+    async fn materialize_turn_tools(
+        &self,
+        context: TurnToolContext,
+    ) -> Result<TurnToolMaterialization, String>;
+}
+
 #[async_trait::async_trait]
 pub trait TaskToolProvider: Send + Sync {
     async fn materialize_task_tools(
@@ -1117,6 +1138,7 @@ pub enum AgentControlError {
     ThreadNotFound,
     NoActiveTurn,
     TurnMismatch,
+    TurnAlreadyRunning,
     AttemptNotRunning,
     Internal(String),
 }
@@ -1127,6 +1149,7 @@ impl Display for AgentControlError {
             Self::ThreadNotFound => write!(f, "thread is not registered in agent manager"),
             Self::NoActiveTurn => write!(f, "thread has no active turn"),
             Self::TurnMismatch => write!(f, "active turn does not match the requested turn"),
+            Self::TurnAlreadyRunning => write!(f, "thread already has an active turn"),
             Self::AttemptNotRunning => write!(f, "turn item attempt is not running"),
             Self::Internal(error) => write!(f, "internal agent control error: {error}"),
         }
@@ -1174,6 +1197,7 @@ struct ActiveTurnRequest {
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
+    runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_options: TurnExecutionOptions,
@@ -1205,6 +1229,7 @@ enum AgentCommand {
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
         ack: oneshot::Sender<Result<(), AgentStartError>>,
     },
@@ -1225,6 +1250,11 @@ enum AgentCommand {
     },
     StartRecoveryAttempt {
         request: RecoveryAttemptRequest,
+        ack: oneshot::Sender<Result<(), AgentControlError>>,
+    },
+    StartPostTurnFollowupRun {
+        turn_id: String,
+        instruction: String,
         ack: oneshot::Sender<Result<(), AgentControlError>>,
     },
     RecoveryAttemptSucceeded {
@@ -1362,6 +1392,7 @@ pub struct AgentManager {
     provider_registry: Arc<ProviderRegistry>,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: RwLock<Option<Arc<dyn TurnToolProvider>>>,
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
     memory_write_provider: RwLock<Option<Arc<dyn AgentMemoryWriteProvider>>>,
@@ -1397,6 +1428,7 @@ impl AgentManager {
             provider_registry,
             tool_loop_config: tool_loop_config.normalized(),
             mcp_tool_provider,
+            turn_tool_provider: RwLock::new(None),
             task_tool_provider: RwLock::new(None),
             memory_provider: RwLock::new(memory_provider),
             memory_write_provider: RwLock::new(None),
@@ -1410,6 +1442,10 @@ impl AgentManager {
 
     pub async fn set_task_tool_provider(&self, provider: Option<Arc<dyn TaskToolProvider>>) {
         *self.task_tool_provider.write().await = provider;
+    }
+
+    pub async fn set_turn_tool_provider(&self, provider: Option<Arc<dyn TurnToolProvider>>) {
+        *self.turn_tool_provider.write().await = provider;
     }
 
     pub async fn set_memory_provider(&self, provider: Option<Arc<dyn AgentMemoryProvider>>) {
@@ -1509,6 +1545,7 @@ impl AgentManager {
             self.provider_registry.clone(),
             self.tool_loop_config.clone(),
             self.mcp_tool_provider.clone(),
+            self.turn_tool_provider.read().await.clone(),
             self.task_tool_provider.read().await.clone(),
             hook_runtime,
             tool_bundle_artifacts,
@@ -1569,6 +1606,35 @@ impl AgentManager {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts_and_environment(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            resolved_artifacts,
+            HashMap::new(),
+            history,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_resolved_artifacts_and_environment(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
@@ -1588,6 +1654,7 @@ impl AgentManager {
                 workspace_skill_policies,
                 input,
                 resolved_artifacts,
+                runtime_environment,
                 history,
                 ack: ack_tx,
             })
@@ -1779,6 +1846,38 @@ impl AgentManager {
         ack_rx.await.unwrap_or_else(|_| {
             Err(AgentControlError::Internal(
                 "agent loop dropped recovery ack".to_owned(),
+            ))
+        })
+    }
+
+    pub async fn start_post_turn_followup_run(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        instruction: String,
+    ) -> Result<(), AgentControlError> {
+        let command_tx = {
+            let state = self.state.read().await;
+            let Some(thread) = state.threads.get(thread_id) else {
+                return Err(AgentControlError::ThreadNotFound);
+            };
+            thread.command_tx.clone()
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        command_tx
+            .send(AgentCommand::StartPostTurnFollowupRun {
+                turn_id: turn_id.to_owned(),
+                instruction,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| AgentControlError::ThreadNotFound)?;
+
+        ack_rx.await.unwrap_or_else(|_| {
+            Err(AgentControlError::Internal(
+                "agent loop dropped post-turn follow-up run ack".to_owned(),
             ))
         })
     }

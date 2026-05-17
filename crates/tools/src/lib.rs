@@ -94,7 +94,7 @@ use handlers::{
     ToolDiscoveryPolicy, ToolSearchHandler, ToolSuggestHandler, UnifiedExecHandler,
     WebFetchHandler, WebSearchHandler,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -293,6 +293,24 @@ pub fn build_tools(
     computer_use_tools_config: ComputerUseToolsConfig,
     extensions: Vec<ToolExtensionBundle>,
 ) -> Result<BuiltinTools, BuildToolsError> {
+    build_tools_with_environment(
+        workdir,
+        turn_id,
+        web_tools_config,
+        computer_use_tools_config,
+        extensions,
+        BTreeMap::new(),
+    )
+}
+
+pub fn build_tools_with_environment(
+    workdir: impl Into<PathBuf>,
+    turn_id: impl Into<String>,
+    web_tools_config: WebToolsConfig,
+    computer_use_tools_config: ComputerUseToolsConfig,
+    extensions: Vec<ToolExtensionBundle>,
+    environment: BTreeMap<String, String>,
+) -> Result<BuiltinTools, BuildToolsError> {
     let turn_id = turn_id.into();
     let web_tools_config = web_tools_config.normalized();
 
@@ -417,7 +435,8 @@ pub fn build_tools(
         event_bus.clone(),
         turn_id,
         workdir.into(),
-    );
+    )
+    .with_environment(environment);
 
     Ok(BuiltinTools {
         router,
@@ -433,12 +452,13 @@ pub fn build_builtin_tools(
     web_tools_config: WebToolsConfig,
     computer_use_tools_config: ComputerUseToolsConfig,
 ) -> BuiltinTools {
-    build_tools(
+    build_tools_with_environment(
         workdir,
         turn_id,
         web_tools_config,
         computer_use_tools_config,
         Vec::new(),
+        BTreeMap::new(),
     )
     .expect("build builtin tools")
 }
