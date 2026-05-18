@@ -7,7 +7,7 @@ use pioneer_crud::{
 };
 use pioneer_protocol::{
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryScope, MemoryScopeKind,
-    MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
@@ -90,6 +90,7 @@ fn new_memory(
         frame_uri: Some(format!("frame://{id}")),
         frame_version: 1,
         source_kind: MemorySourceKind::ExplicitUserRequest,
+        source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         source_thread_id: Some("thread_memory_a".to_owned()),
         source_turn_id: Some("turn_memory_a".to_owned()),
         source_item_id: None,
@@ -162,6 +163,10 @@ async fn agent_memory_active_delete_and_get_roundtrip() {
         .expect("insert memory");
     assert_eq!(memory.status, MemoryStatus::Active);
     assert_eq!(memory.workspace_id.as_deref(), Some("ws_memory_a"));
+    assert_eq!(
+        memory.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
 
     let active = store
         .list_agent_memory_records(AgentMemoryListFilter {
@@ -503,6 +508,7 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         confidence: 0.9,
         reason: "Repeated explicit project instruction.".to_owned(),
         source_kind: MemorySourceKind::BackgroundExtractor,
+        source_context_kind: Some(MemorySourceContextKind::ToolResult),
         source_thread_id: Some("thread_memory_a".to_owned()),
         source_turn_id: Some("turn_candidate".to_owned()),
         source_item_id: None,
@@ -515,6 +521,10 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         .insert_agent_memory_candidate(candidate.clone(), 400)
         .await
         .expect("insert candidate");
+    assert_eq!(
+        first.source_context_kind,
+        Some(MemorySourceContextKind::ToolResult)
+    );
     let second = store
         .insert_agent_memory_candidate(candidate, 401)
         .await

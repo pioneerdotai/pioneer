@@ -2,13 +2,13 @@ use anyhow::{Result, bail};
 use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryScopeKind, MemorySensitivity,
-    MemorySourceKind, MemoryStatus, PromptManifestProfile, ProviderFailureClass,
-    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-    TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus,
-    TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus, TaskStatus,
-    TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus,
-    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, PromptManifestProfile,
+    ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+    SandboxMode, TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode,
+    TaskDeliveryStatus, TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus,
+    TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus,
+    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnItem,
+    TurnItemAttemptStatus, TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
 };
 
 pub const DB_ID_LEN: usize = 21;
@@ -210,6 +210,37 @@ pub fn memory_source_kind_from_db(value: &str) -> Result<MemorySourceKind> {
         "import" => Ok(MemorySourceKind::Import),
         "system" => Ok(MemorySourceKind::System),
         _ => bail!("unknown memory source kind `{value}`"),
+    }
+}
+
+pub fn memory_source_context_kind_to_db(kind: MemorySourceContextKind) -> &'static str {
+    match kind {
+        MemorySourceContextKind::DirectUserConversation => "direct_user_conversation",
+        MemorySourceContextKind::AssistantResponse => "assistant_response",
+        MemorySourceContextKind::ToolResult => "tool_result",
+        MemorySourceContextKind::TaskRuntime => "task_runtime",
+        MemorySourceContextKind::SystemRuntime => "system_runtime",
+        MemorySourceContextKind::DeveloperInstruction => "developer_instruction",
+        MemorySourceContextKind::ConnectorContent => "connector_content",
+        MemorySourceContextKind::ImportedDocument => "imported_document",
+        MemorySourceContextKind::GeneratedSummary => "generated_summary",
+        MemorySourceContextKind::Unknown => "unknown",
+    }
+}
+
+pub fn memory_source_context_kind_from_db(value: &str) -> MemorySourceContextKind {
+    match value {
+        "direct_user_conversation" => MemorySourceContextKind::DirectUserConversation,
+        "assistant_response" => MemorySourceContextKind::AssistantResponse,
+        "tool_result" => MemorySourceContextKind::ToolResult,
+        "task_runtime" => MemorySourceContextKind::TaskRuntime,
+        "system_runtime" => MemorySourceContextKind::SystemRuntime,
+        "developer_instruction" => MemorySourceContextKind::DeveloperInstruction,
+        "connector_content" => MemorySourceContextKind::ConnectorContent,
+        "imported_document" => MemorySourceContextKind::ImportedDocument,
+        "generated_summary" => MemorySourceContextKind::GeneratedSummary,
+        "unknown" => MemorySourceContextKind::Unknown,
+        _ => MemorySourceContextKind::Unknown,
     }
 }
 

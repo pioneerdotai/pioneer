@@ -13917,6 +13917,7 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
                     confidence: 0.82,
                     reason: "test candidate".to_owned(),
                     source_kind: MemorySourceKind::ExplicitUserRequest,
+                    source_context_kind: None,
                     source_thread_id: None,
                     source_turn_id: None,
                     source_item_id: None,

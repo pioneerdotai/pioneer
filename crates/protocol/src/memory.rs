@@ -382,6 +382,8 @@ pub struct MemorySemanticWriteParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<MemoryProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_kind: Option<MemorySourceContextKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<MemorySemanticWriteDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_provided_key: Option<String>,
@@ -425,6 +427,8 @@ pub struct MemoryRecord {
     pub importance: f32,
     pub sensitivity: MemorySensitivity,
     pub provenance: MemoryProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -680,6 +684,8 @@ pub struct MemoryCandidate {
     pub confidence: f32,
     pub reason: String,
     pub provenance: MemoryProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub status: MemoryCandidateStatus,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1096,6 +1102,7 @@ mod tests {
                 extractor_reason: None,
             }),
             provenance: None,
+            source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: Some("llm/freeform/key".to_owned()),
             confidence: Some(0.95),
@@ -1107,6 +1114,10 @@ mod tests {
         assert_eq!(encoded["semantic"]["intent"], json!("explicit_store"));
         assert_eq!(encoded["semantic"]["subject"], json!("current_user"));
         assert_eq!(encoded["semantic"]["attribute"], json!("name"));
+        assert_eq!(
+            encoded["source_context_kind"],
+            json!("direct_user_conversation")
+        );
         assert_eq!(encoded["disposition"], json!("accept_active"));
         assert_eq!(encoded["client_provided_key"], json!("llm/freeform/key"));
     }

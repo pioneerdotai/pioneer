@@ -127,6 +127,7 @@ fn post_turn_parser_forces_personal_sensitivity_for_user_identity() {
         &test_memory_turn_context(),
         &MemoryTurnPolicy::normal_default_allow(),
         &MemoryPostTurnExtractorConfig::default(),
+        MemorySourceContextKind::DirectUserConversation,
         Some("test-model"),
         Some("test-provider"),
     )
@@ -290,6 +291,10 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
     );
     assert_eq!(params.client_provided_key, None);
     assert_eq!(params.semantic.intent, MemoryIntent::ExplicitStore);
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
     assert_eq!(params.scope.kind, MemoryScopeKind::User);
     assert_eq!(params.scope.key, MEMORY_DEFAULT_USER_SCOPE_KEY);
     assert!(params.confidence.expect("computed confidence") > 0.95);
@@ -516,6 +521,13 @@ async fn post_turn_extractor_runs_for_direct_user_turns_with_runtime_events() {
     assert_eq!(write_provider.manifest_call_count(), 1);
     assert_eq!(extractor_provider.call_count(), 1);
     assert_eq!(write_provider.write_call_count(), 1);
+    assert_eq!(
+        write_provider
+            .write_params()
+            .first()
+            .and_then(|params| params.source_context_kind),
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
             && diagnostic.message.as_str().contains("write_attempts=1")
@@ -780,6 +792,10 @@ async fn post_turn_extractor_runs_under_permissive_classifier_fallback() {
     assert_eq!(
         params.metadata.get("policy_reason_code"),
         Some(&serde_json::json!("classifier_unavailable"))
+    );
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
     );
 }
 

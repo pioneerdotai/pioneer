@@ -369,6 +369,7 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
     context: &MemoryTurnContext,
     policy: &MemoryTurnPolicy,
     config: &MemoryPostTurnExtractorConfig,
+    source_context_kind: MemorySourceContextKind,
     model: Option<&str>,
     model_provider: Option<&str>,
 ) -> Option<MemorySemanticWriteParams> {
@@ -455,6 +456,7 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         value: fact.value,
         evidence: Some(evidence),
         provenance: Some(provenance),
+        source_context_kind: Some(source_context_kind),
         disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         client_provided_key: None,
         confidence: fact.confidence,

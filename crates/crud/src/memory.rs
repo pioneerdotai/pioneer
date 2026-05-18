@@ -1,15 +1,15 @@
 use anyhow::{Result, bail};
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryScope,
-    MemoryScopeKind, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
 };
 use sha2::{Digest, Sha256};
 
 use crate::convention::{
     MEMORY_NAMESPACE_DEFAULT, memory_actor_kind_from_db, memory_actor_kind_to_db,
     memory_candidate_status_from_db, memory_category_from_db, memory_scope_kind_from_db,
-    memory_scope_kind_to_db, memory_sensitivity_from_db, memory_source_kind_from_db,
-    memory_status_from_db,
+    memory_scope_kind_to_db, memory_sensitivity_from_db, memory_source_context_kind_from_db,
+    memory_source_kind_from_db, memory_status_from_db,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,7 @@ pub struct AgentMemoryControlRecord {
     pub frame_uri: Option<String>,
     pub frame_version: i64,
     pub source_kind: MemorySourceKind,
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
@@ -88,6 +89,7 @@ pub struct NewAgentMemoryControlRecord {
     pub frame_uri: Option<String>,
     pub frame_version: i64,
     pub source_kind: MemorySourceKind,
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
@@ -151,6 +153,7 @@ pub struct NewAgentMemoryCandidate {
     pub confidence: f64,
     pub reason: String,
     pub source_kind: MemorySourceKind,
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
@@ -202,6 +205,7 @@ pub struct AgentMemoryCandidateRecord {
     pub confidence: f64,
     pub reason: String,
     pub source_kind: MemorySourceKind,
+    pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
@@ -450,6 +454,10 @@ pub(crate) fn agent_memory_control_record_from_model(
         frame_uri: model.frame_uri,
         frame_version: model.frame_version,
         source_kind: memory_source_kind_from_db(model.source_kind.as_str())?,
+        source_context_kind: model
+            .source_context_kind
+            .as_deref()
+            .map(memory_source_context_kind_from_db),
         source_thread_id: model.source_thread_id,
         source_turn_id: model.source_turn_id,
         source_item_id: model.source_item_id,
@@ -508,6 +516,10 @@ pub(crate) fn agent_memory_candidate_record_from_model(
         confidence: model.confidence,
         reason: model.reason,
         source_kind: memory_source_kind_from_db(model.source_kind.as_str())?,
+        source_context_kind: model
+            .source_context_kind
+            .as_deref()
+            .map(memory_source_context_kind_from_db),
         source_thread_id: model.source_thread_id,
         source_turn_id: model.source_turn_id,
         source_item_id: model.source_item_id,

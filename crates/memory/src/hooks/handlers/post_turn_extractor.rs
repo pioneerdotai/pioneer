@@ -58,6 +58,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         let MemoryPostTurnEligibilityPolicy::Available(policy) = eligibility_input.policy else {
             unreachable!("eligible post-turn extraction requires a decoded policy");
         };
+        let source_context_kind = eligibility_input.source_context_kind;
 
         if !config.provider_enabled {
             response
@@ -158,6 +159,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 &context,
                 &policy,
                 &config,
+                source_context_kind,
                 input.model.as_deref(),
                 input.model_provider.as_deref(),
             ) else {

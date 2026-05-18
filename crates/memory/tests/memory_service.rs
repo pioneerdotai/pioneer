@@ -16,7 +16,8 @@ use pioneer_protocol::{
     MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryRememberParams,
     MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
     MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySensitivity,
-    MemorySensitivityHint, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -184,6 +185,7 @@ fn semantic_write_params(
         value: Some(value.to_owned()),
         evidence: Some(semantic_evidence(turn_id)),
         provenance: None,
+        source_context_kind: None,
         disposition: Some(disposition),
         client_provided_key: None,
         confidence: Some(0.95),
@@ -198,6 +200,97 @@ fn metadata_evidence_count(metadata: &BTreeMap<String, serde_json::Value>) -> u6
         .and_then(|value| value.get("count"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn semantic_active_writes_persist_source_context_classes() {
+    let (store, _backend, service) = setup_service().await;
+    let cases = [
+        MemorySourceContextKind::DirectUserConversation,
+        MemorySourceContextKind::AssistantResponse,
+        MemorySourceContextKind::ToolResult,
+        MemorySourceContextKind::TaskRuntime,
+        MemorySourceContextKind::SystemRuntime,
+        MemorySourceContextKind::Unknown,
+    ];
+
+    for (index, source_context_kind) in cases.into_iter().enumerate() {
+        let mut semantic = relationship_semantic(format!("person-{index}").as_str());
+        semantic.intent = MemoryIntent::ExplicitStore;
+        semantic.explicitness = MemoryExplicitness::Explicit;
+        let mut params = semantic_write_params(
+            semantic,
+            format!("Relationship fact {index}.").as_str(),
+            format!("relationship-value-{index}").as_str(),
+            MemorySemanticWriteDisposition::AcceptActive,
+            format!("turn_source_context_{index}").as_str(),
+        );
+        params.source_context_kind = Some(source_context_kind);
+
+        let response = service
+            .write_semantic_memory(user_context(90 + index as i64), params)
+            .await
+            .expect("semantic active write succeeds");
+        let record = response.record.expect("active record");
+
+        assert_eq!(record.source_context_kind, Some(source_context_kind));
+        let stored = store
+            .get_agent_memory_record(record.id.as_str(), false)
+            .await
+            .expect("load stored memory")
+            .expect("stored memory exists");
+        assert_eq!(stored.source_context_kind, Some(source_context_kind));
+    }
+}
+
+#[tokio::test]
+async fn candidate_approval_preserves_source_context() {
+    let (store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        relationship_semantic("candidate-source-context"),
+        "Candidate source context fact.",
+        "candidate-source-context-value",
+        MemorySemanticWriteDisposition::CreatePendingCandidate,
+        "turn_candidate_source_context",
+    );
+    params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+
+    let candidate = service
+        .write_semantic_memory(user_context(96), params)
+        .await
+        .expect("candidate write")
+        .candidate
+        .expect("candidate");
+    assert_eq!(
+        candidate.source_context_kind,
+        Some(MemorySourceContextKind::ToolResult)
+    );
+
+    let approved = service
+        .approve_candidate(
+            user_context(97),
+            MemoryCandidatesApproveParams {
+                candidate_id: candidate.id.clone(),
+                reason: Some("approved in source context test".to_owned()),
+                actor: None,
+            },
+        )
+        .await
+        .expect("approve candidate");
+
+    assert_eq!(
+        approved.record.source_context_kind,
+        Some(MemorySourceContextKind::ToolResult)
+    );
+    let stored = store
+        .get_agent_memory_record(approved.record.id.as_str(), false)
+        .await
+        .expect("load approved memory")
+        .expect("approved memory exists");
+    assert_eq!(
+        stored.source_context_kind,
+        Some(MemorySourceContextKind::ToolResult)
+    );
 }
 
 #[tokio::test]
@@ -1080,17 +1173,17 @@ async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
         .record
         .expect("record");
 
+    let mut candidate_params = semantic_write_params(
+        identity_name_semantic(MemoryExplicitness::Implicit),
+        "The user's name may be Alexey.",
+        "Alexey",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_candidate_edit_candidate",
+    );
+    candidate_params.source_context_kind = Some(MemorySourceContextKind::AssistantResponse);
+
     let candidate = service
-        .write_semantic_memory(
-            user_context(393),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name may be Alexey.",
-                "Alexey",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_candidate_edit_candidate",
-            ),
-        )
+        .write_semantic_memory(user_context(393), candidate_params)
         .await
         .expect("candidate")
         .candidate
@@ -1112,6 +1205,10 @@ async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
         .expect("edit and approve");
     assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
     assert_eq!(approved.record.content, "The user's name is Alex.");
+    assert_eq!(
+        approved.record.source_context_kind,
+        Some(MemorySourceContextKind::AssistantResponse)
+    );
 
     let old = store
         .get_agent_memory_record(first.id.as_str(), true)

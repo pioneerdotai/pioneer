@@ -698,6 +698,7 @@ fn test_memory_record(id: &str) -> MemoryRecord {
                 id: Some(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID.to_owned()),
             }),
         },
+        source_context_kind: None,
         created_at: 1,
         updated_at: 1,
         expires_at: None,

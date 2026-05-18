@@ -3,8 +3,8 @@ use pioneer_protocol::{
     MemoryAttribute, MemoryCandidate, MemoryCandidateScore, MemoryCandidateStatus, MemoryCategory,
     MemoryDurability, MemoryEvidenceActorRole, MemoryEvidenceClass, MemoryFactClass,
     MemoryLifetimeClass, MemoryOwnershipClass, MemoryRecord, MemoryScope, MemoryScopeHint,
-    MemoryScopeKind, MemorySemanticFields, MemorySensitivityHint, MemorySourceContextKind,
-    MemorySourceKind, MemoryStatus, MemorySubject, MemoryWriteEvidence,
+    MemoryScopeKind, MemorySemanticFields, MemorySemanticWriteParams, MemorySensitivityHint,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemorySubject, MemoryWriteEvidence,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -213,21 +213,91 @@ pub fn classify_memory_source_context(
     classification
 }
 
+pub fn resolve_semantic_write_source_context(
+    params: &MemorySemanticWriteParams,
+) -> MemorySourceContextClassification {
+    let provenance = params.provenance.as_ref();
+    let evidence = params.evidence.as_ref();
+    let source_thread_id = evidence
+        .and_then(|evidence| evidence.source_thread_id.as_deref())
+        .or_else(|| provenance.and_then(|provenance| provenance.source_thread_id.as_deref()));
+    let source_turn_id = evidence
+        .and_then(|evidence| evidence.source_turn_id.as_deref())
+        .or_else(|| provenance.and_then(|provenance| provenance.source_turn_id.as_deref()));
+    let source_item_id = evidence
+        .and_then(|evidence| evidence.source_item_id.as_deref())
+        .or_else(|| provenance.and_then(|provenance| provenance.source_item_id.as_deref()));
+
+    if let Some(source_context_kind) = params.source_context_kind {
+        let mut classification = classify_source_context_kind(source_context_kind);
+        classification.thread_id = source_thread_id.map(str::to_owned);
+        classification.turn_id = source_turn_id.map(str::to_owned);
+        classification.item_id = source_item_id.map(str::to_owned);
+        return classification;
+    }
+
+    classify_memory_source_context(MemorySourceContextInput {
+        thread_id: provenance.and_then(|provenance| provenance.source_thread_id.as_deref()),
+        turn_id: provenance.and_then(|provenance| provenance.source_turn_id.as_deref()),
+        source_kind: provenance.map(|provenance| provenance.source_kind),
+        evidence,
+        ..MemorySourceContextInput::default()
+    })
+}
+
+pub fn legacy_source_kind_for_source_context(
+    source_context_kind: MemorySourceContextKind,
+    semantic: &MemorySemanticFields,
+) -> MemorySourceKind {
+    match source_context_kind {
+        MemorySourceContextKind::DirectUserConversation => {
+            if semantic.explicitness == pioneer_protocol::MemoryExplicitness::Explicit {
+                MemorySourceKind::ExplicitUserRequest
+            } else {
+                MemorySourceKind::BackgroundExtractor
+            }
+        }
+        MemorySourceContextKind::AssistantResponse => MemorySourceKind::AssistantInference,
+        MemorySourceContextKind::ToolResult => MemorySourceKind::ToolObservation,
+        MemorySourceContextKind::TaskRuntime
+        | MemorySourceContextKind::SystemRuntime
+        | MemorySourceContextKind::DeveloperInstruction
+        | MemorySourceContextKind::GeneratedSummary
+        | MemorySourceContextKind::Unknown => MemorySourceKind::System,
+        MemorySourceContextKind::ConnectorContent | MemorySourceContextKind::ImportedDocument => {
+            MemorySourceKind::Import
+        }
+    }
+}
+
 pub fn audit_memory_record_quality(record: &MemoryRecord) -> MemoryQualityAuditRecord {
     let semantic = semantic_fields_from_metadata(&record.metadata);
     let ontology = semantic
         .as_ref()
         .map(|semantic| classify_semantic_memory_fact(semantic, Some(&record.scope)));
     let evidence = latest_evidence_from_metadata(&record.metadata);
-    let source_context = classify_memory_source_context(MemorySourceContextInput {
-        workspace_id: workspace_id_from_scope(&record.scope),
-        thread_id: record.provenance.source_thread_id.as_deref(),
-        turn_id: record.provenance.source_turn_id.as_deref(),
-        task_id: None,
-        source_kind: Some(record.provenance.source_kind),
-        evidence: evidence.as_ref(),
-        ..MemorySourceContextInput::default()
-    });
+    let source_context = record
+        .source_context_kind
+        .map(|source_context_kind| {
+            persisted_source_context(
+                source_context_kind,
+                workspace_id_from_scope(&record.scope),
+                record.provenance.source_thread_id.as_deref(),
+                record.provenance.source_turn_id.as_deref(),
+                record.provenance.source_item_id.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| {
+            classify_memory_source_context(MemorySourceContextInput {
+                workspace_id: workspace_id_from_scope(&record.scope),
+                thread_id: record.provenance.source_thread_id.as_deref(),
+                turn_id: record.provenance.source_turn_id.as_deref(),
+                task_id: None,
+                source_kind: Some(record.provenance.source_kind),
+                evidence: evidence.as_ref(),
+                ..MemorySourceContextInput::default()
+            })
+        });
 
     MemoryQualityAuditRecord {
         item_kind: MemoryQualityAuditItemKind::Record,
@@ -264,15 +334,28 @@ pub fn audit_memory_candidate_quality(candidate: &MemoryCandidate) -> MemoryQual
         .as_ref()
         .map(|semantic| classify_semantic_memory_fact(semantic, Some(&candidate.scope)));
     let evidence = latest_evidence_from_metadata(&candidate.metadata);
-    let source_context = classify_memory_source_context(MemorySourceContextInput {
-        workspace_id: workspace_id_from_scope(&candidate.scope),
-        thread_id: candidate.provenance.source_thread_id.as_deref(),
-        turn_id: candidate.provenance.source_turn_id.as_deref(),
-        task_id: None,
-        source_kind: Some(candidate.provenance.source_kind),
-        evidence: evidence.as_ref(),
-        ..MemorySourceContextInput::default()
-    });
+    let source_context = candidate
+        .source_context_kind
+        .map(|source_context_kind| {
+            persisted_source_context(
+                source_context_kind,
+                workspace_id_from_scope(&candidate.scope),
+                candidate.provenance.source_thread_id.as_deref(),
+                candidate.provenance.source_turn_id.as_deref(),
+                candidate.provenance.source_item_id.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| {
+            classify_memory_source_context(MemorySourceContextInput {
+                workspace_id: workspace_id_from_scope(&candidate.scope),
+                thread_id: candidate.provenance.source_thread_id.as_deref(),
+                turn_id: candidate.provenance.source_turn_id.as_deref(),
+                task_id: None,
+                source_kind: Some(candidate.provenance.source_kind),
+                evidence: evidence.as_ref(),
+                ..MemorySourceContextInput::default()
+            })
+        });
 
     MemoryQualityAuditRecord {
         item_kind: MemoryQualityAuditItemKind::Candidate,
@@ -322,6 +405,98 @@ fn source_context(
         task_id: None,
         workspace_id: None,
     }
+}
+
+fn classify_source_context_kind(
+    source_context_kind: MemorySourceContextKind,
+) -> MemorySourceContextClassification {
+    match source_context_kind {
+        MemorySourceContextKind::DirectUserConversation => source_context(
+            MemorySourceContextKind::DirectUserConversation,
+            MemoryEvidenceActorRole::User,
+            MemoryEvidenceClass::DirectUserAssertion,
+            true,
+            false,
+        ),
+        MemorySourceContextKind::AssistantResponse => source_context(
+            MemorySourceContextKind::AssistantResponse,
+            MemoryEvidenceActorRole::Assistant,
+            MemoryEvidenceClass::AssistantInference,
+            false,
+            false,
+        ),
+        MemorySourceContextKind::ToolResult => source_context(
+            MemorySourceContextKind::ToolResult,
+            MemoryEvidenceActorRole::Tool,
+            MemoryEvidenceClass::ToolObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::TaskRuntime => source_context(
+            MemorySourceContextKind::TaskRuntime,
+            MemoryEvidenceActorRole::Task,
+            MemoryEvidenceClass::TaskRuntimeObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::SystemRuntime => source_context(
+            MemorySourceContextKind::SystemRuntime,
+            MemoryEvidenceActorRole::System,
+            MemoryEvidenceClass::SystemObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::DeveloperInstruction => source_context(
+            MemorySourceContextKind::DeveloperInstruction,
+            MemoryEvidenceActorRole::Developer,
+            MemoryEvidenceClass::SystemObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::ConnectorContent => source_context(
+            MemorySourceContextKind::ConnectorContent,
+            MemoryEvidenceActorRole::Connector,
+            MemoryEvidenceClass::SystemObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::ImportedDocument => source_context(
+            MemorySourceContextKind::ImportedDocument,
+            MemoryEvidenceActorRole::Connector,
+            MemoryEvidenceClass::SystemObservation,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::GeneratedSummary => source_context(
+            MemorySourceContextKind::GeneratedSummary,
+            MemoryEvidenceActorRole::System,
+            MemoryEvidenceClass::GeneratedSummary,
+            false,
+            true,
+        ),
+        MemorySourceContextKind::Unknown => source_context(
+            MemorySourceContextKind::Unknown,
+            MemoryEvidenceActorRole::Unknown,
+            MemoryEvidenceClass::MissingOrWeak,
+            false,
+            false,
+        ),
+    }
+}
+
+fn persisted_source_context(
+    source_context_kind: MemorySourceContextKind,
+    workspace_id: Option<&str>,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> MemorySourceContextClassification {
+    let mut classification = classify_source_context_kind(source_context_kind);
+    classification.workspace_id = workspace_id.map(str::to_owned);
+    classification.thread_id = thread_id.map(str::to_owned);
+    classification.turn_id = turn_id.map(str::to_owned);
+    classification.item_id = item_id.map(str::to_owned);
+    classification
 }
 
 fn classify_source_kind(source_kind: MemorySourceKind) -> MemorySourceContextClassification {
@@ -625,7 +800,8 @@ fn has_workspace_or_project_context(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        MemoryExplicitness, MemoryExtractorCertainty, MemoryIntent, MemoryScopeKind,
+        MemoryExplicitness, MemoryExtractorCertainty, MemoryIntent, MemoryProvenance,
+        MemoryScopeKind, MemorySemanticWriteDisposition,
     };
 
     fn semantic(
@@ -1012,6 +1188,97 @@ mod tests {
     }
 
     #[test]
+    fn semantic_write_source_context_prefers_explicit_typed_context() {
+        let mut params = semantic_write_params_for_source_context();
+        params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+        params.provenance = Some(MemoryProvenance {
+            source_kind: MemorySourceKind::ExplicitUserRequest,
+            source_thread_id: Some("thread-provenance".to_owned()),
+            source_turn_id: Some("turn-provenance".to_owned()),
+            source_item_id: Some("item-provenance".to_owned()),
+            created_by: None,
+        });
+        params.evidence = Some(MemoryWriteEvidence {
+            source_thread_id: Some("thread-evidence".to_owned()),
+            source_turn_id: Some("turn-evidence".to_owned()),
+            source_item_id: Some("item-evidence".to_owned()),
+            source_ref: Some("turn.post_turn:user".to_owned()),
+            quote_or_span: Some("structured evidence".to_owned()),
+            extractor_reason: None,
+        });
+
+        let classification = resolve_semantic_write_source_context(&params);
+
+        assert_eq!(
+            classification.context_kind,
+            MemorySourceContextKind::ToolResult
+        );
+        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::Tool);
+        assert!(classification.source_is_system_owned_state);
+        assert_eq!(classification.thread_id.as_deref(), Some("thread-evidence"));
+        assert_eq!(classification.turn_id.as_deref(), Some("turn-evidence"));
+        assert_eq!(classification.item_id.as_deref(), Some("item-evidence"));
+    }
+
+    #[test]
+    fn semantic_write_source_context_falls_back_to_structured_provenance_and_evidence() {
+        let mut params = semantic_write_params_for_source_context();
+        params.source_context_kind = None;
+        params.provenance = Some(MemoryProvenance {
+            source_kind: MemorySourceKind::ToolObservation,
+            source_thread_id: Some("thread-provenance".to_owned()),
+            source_turn_id: Some("turn-provenance".to_owned()),
+            source_item_id: Some("item-provenance".to_owned()),
+            created_by: None,
+        });
+
+        let classification = resolve_semantic_write_source_context(&params);
+
+        assert_eq!(
+            classification.context_kind,
+            MemorySourceContextKind::ToolResult
+        );
+        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::Tool);
+        assert_eq!(
+            classification.thread_id.as_deref(),
+            Some("thread-provenance")
+        );
+        assert_eq!(classification.turn_id.as_deref(), Some("turn-provenance"));
+    }
+
+    #[test]
+    fn source_context_to_legacy_source_kind_mapping_is_structural() {
+        let mut semantic = semantic(
+            MemoryCategory::Identity,
+            MemorySubject::CurrentUser,
+            MemoryAttribute::Name,
+            MemoryScopeHint::UserGlobal,
+            MemoryDurability::LongLived,
+        );
+        semantic.explicitness = MemoryExplicitness::Explicit;
+
+        assert_eq!(
+            legacy_source_kind_for_source_context(
+                MemorySourceContextKind::DirectUserConversation,
+                &semantic
+            ),
+            MemorySourceKind::ExplicitUserRequest
+        );
+        assert_eq!(
+            legacy_source_kind_for_source_context(MemorySourceContextKind::ToolResult, &semantic),
+            MemorySourceKind::ToolObservation
+        );
+        assert_eq!(
+            legacy_source_kind_for_source_context(MemorySourceContextKind::TaskRuntime, &semantic),
+            MemorySourceKind::System
+        );
+        assert_eq!(
+            legacy_source_kind_for_source_context(MemorySourceContextKind::Unknown, &semantic),
+            MemorySourceKind::System
+        );
+    }
+
+    #[test]
     fn source_context_does_not_mark_user_text_as_assertion_without_evidence_ref() {
         let classification = classify_memory_source_context(MemorySourceContextInput {
             has_user_text: true,
@@ -1060,6 +1327,32 @@ mod tests {
         }
     }
 
+    fn semantic_write_params_for_source_context() -> MemorySemanticWriteParams {
+        MemorySemanticWriteParams {
+            scope: MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".to_owned(),
+            },
+            semantic: semantic(
+                MemoryCategory::Identity,
+                MemorySubject::CurrentUser,
+                MemoryAttribute::Name,
+                MemoryScopeHint::UserGlobal,
+                MemoryDurability::LongLived,
+            ),
+            content: "Имя пользователя: Александр".to_owned(),
+            value: Some("Александр".to_owned()),
+            evidence: None,
+            provenance: None,
+            source_context_kind: None,
+            disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
+            client_provided_key: None,
+            confidence: Some(0.95),
+            importance: Some(0.7),
+            metadata: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn quality_audit_record_decodes_typed_dimensions_without_mutating_record() {
         let record = memory_record_with_metadata(semantic_metadata_value(
@@ -1100,6 +1393,28 @@ mod tests {
     }
 
     #[test]
+    fn quality_audit_record_prefers_persisted_source_context() {
+        let mut record = memory_record_with_metadata(semantic_metadata_value(
+            MemoryCategory::Identity,
+            MemorySubject::CurrentUser,
+            MemoryAttribute::Name,
+            MemoryScopeHint::UserGlobal,
+            MemoryDurability::LongLived,
+        ));
+        record.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+
+        let audit = audit_memory_record_quality(&record);
+
+        assert_eq!(
+            audit.source_context_kind,
+            MemorySourceContextKind::ToolResult
+        );
+        assert_eq!(audit.evidence_class, MemoryEvidenceClass::ToolObservation);
+        assert_eq!(audit.source_thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(audit.source_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
     fn quality_audit_candidate_includes_candidate_policy_score() {
         let candidate = memory_candidate_with_metadata(candidate_metadata_with_score(0.91));
         let before = candidate.clone();
@@ -1118,6 +1433,25 @@ mod tests {
             audit.ownership_class,
             MemoryOwnershipClass::DurableWorkspaceMemory
         );
+    }
+
+    #[test]
+    fn quality_audit_candidate_prefers_persisted_source_context() {
+        let mut candidate = memory_candidate_with_metadata(candidate_metadata_with_score(0.91));
+        candidate.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
+
+        let audit = audit_memory_candidate_quality(&candidate);
+
+        assert_eq!(
+            audit.source_context_kind,
+            MemorySourceContextKind::TaskRuntime
+        );
+        assert_eq!(
+            audit.evidence_class,
+            MemoryEvidenceClass::TaskRuntimeObservation
+        );
+        assert_eq!(audit.source_thread_id.as_deref(), Some("thread-2"));
+        assert_eq!(audit.source_turn_id.as_deref(), Some("turn-2"));
     }
 
     #[test]
@@ -1154,6 +1488,7 @@ mod tests {
                 source_item_id: Some("item-1".to_owned()),
                 created_by: None,
             },
+            source_context_kind: None,
             created_at: 1,
             updated_at: 1,
             expires_at: None,
@@ -1185,6 +1520,7 @@ mod tests {
                 source_item_id: None,
                 created_by: None,
             },
+            source_context_kind: None,
             status: MemoryCandidateStatus::PendingSilent,
             created_at: 2,
             decided_at: None,

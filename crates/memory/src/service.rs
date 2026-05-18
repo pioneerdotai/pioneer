@@ -14,6 +14,7 @@ use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
     POLICY_DECISION_ERROR,
 };
+use crate::quality::legacy_source_kind_for_source_context;
 use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
 use crate::recall::{
     MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse, compact_recall_content,
@@ -44,8 +45,8 @@ use pioneer_protocol::{
     MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
     MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
     MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
-    MemoryWriteRelation, generate_id,
+    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -101,6 +102,16 @@ impl MemoryService {
         &self,
         context: MemoryOperationContext,
         params: MemoryRememberParams,
+    ) -> Result<MemoryRememberResponse> {
+        self.remember_with_source_context(context, params, None)
+            .await
+    }
+
+    async fn remember_with_source_context(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryRememberParams,
+        source_context_kind: Option<MemorySourceContextKind>,
     ) -> Result<MemoryRememberResponse> {
         let now = context.now_or(current_unix());
         let prepared = self.policy.prepare_remember(&context, &params)?;
@@ -208,6 +219,7 @@ impl MemoryService {
             frame_uri: backend_result.frame_uri,
             frame_version: backend_result.frame_version,
             source_kind: provenance.source_kind,
+            source_context_kind,
             source_thread_id: provenance.source_thread_id.clone(),
             source_turn_id: provenance.source_turn_id.clone(),
             source_item_id: provenance.source_item_id.clone(),
@@ -281,6 +293,7 @@ impl MemoryService {
             .unwrap_or(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
         let provenance = semantic_write_provenance(&params, &context);
+        let source_context_kind = params.source_context_kind;
         let mut base_metadata = params.metadata.clone();
         for (key, value) in semantic_metadata(
             &params.semantic,
@@ -358,7 +371,7 @@ impl MemoryService {
                 let relation_context = context.clone();
                 let superseded_memory_id = existing.id.clone();
                 let response = self
-                    .remember(
+                    .remember_with_source_context(
                         context,
                         MemoryRememberParams {
                             scope: params.scope,
@@ -375,6 +388,7 @@ impl MemoryService {
                             metadata: serde_json::from_str(metadata_json.as_str())
                                 .context("semantic metadata must decode")?,
                         },
+                        source_context_kind,
                     )
                     .await?;
                 self.record_semantic_write_relation(
@@ -522,7 +536,7 @@ impl MemoryService {
             MemorySemanticWriteDisposition::AcceptActive => {
                 let relation_context = context.clone();
                 let response = self
-                    .remember(
+                    .remember_with_source_context(
                         context,
                         MemoryRememberParams {
                             scope: params.scope,
@@ -539,6 +553,7 @@ impl MemoryService {
                             metadata: serde_json::from_str(metadata_json.as_str())
                                 .context("semantic metadata must decode")?,
                         },
+                        source_context_kind,
                     )
                     .await?;
                 self.record_semantic_write_relation(
@@ -1688,6 +1703,7 @@ impl MemoryService {
                     confidence: f64::from(params.confidence.unwrap_or(0.5).clamp(0.0, 1.0)),
                     reason: reason.to_owned(),
                     source_kind: provenance.source_kind,
+                    source_context_kind: params.source_context_kind,
                     source_thread_id: provenance.source_thread_id.clone(),
                     source_turn_id: provenance.source_turn_id.clone(),
                     source_item_id: provenance.source_item_id.clone(),
@@ -2148,13 +2164,20 @@ fn semantic_write_provenance(
 
     let evidence = params.evidence.as_ref();
     MemoryProvenance {
-        source_kind: match params.semantic.intent {
-            pioneer_protocol::MemoryIntent::ExplicitStore => MemorySourceKind::ExplicitUserRequest,
-            pioneer_protocol::MemoryIntent::ExplicitForget
-            | pioneer_protocol::MemoryIntent::ExplicitNoMemory => MemorySourceKind::System,
-            pioneer_protocol::MemoryIntent::ImplicitCandidate
-            | pioneer_protocol::MemoryIntent::None => MemorySourceKind::BackgroundExtractor,
-        },
+        source_kind: params
+            .source_context_kind
+            .map(|source_context_kind| {
+                legacy_source_kind_for_source_context(source_context_kind, &params.semantic)
+            })
+            .unwrap_or_else(|| match params.semantic.intent {
+                pioneer_protocol::MemoryIntent::ExplicitStore => {
+                    MemorySourceKind::ExplicitUserRequest
+                }
+                pioneer_protocol::MemoryIntent::ExplicitForget
+                | pioneer_protocol::MemoryIntent::ExplicitNoMemory => MemorySourceKind::System,
+                pioneer_protocol::MemoryIntent::ImplicitCandidate
+                | pioneer_protocol::MemoryIntent::None => MemorySourceKind::BackgroundExtractor,
+            }),
         source_thread_id: evidence
             .and_then(|evidence| evidence.source_thread_id.clone())
             .or_else(|| context.thread_id.clone()),
@@ -2305,6 +2328,7 @@ fn candidate_semantic_write_params(
         value,
         evidence: Some(evidence),
         provenance: Some(provenance),
+        source_context_kind: candidate.source_context_kind,
         disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
         client_provided_key: None,
         confidence: Some(candidate.confidence.clamp(0.0, 1.0) as f32),
@@ -2510,6 +2534,7 @@ mod tests {
                 extractor_reason: Some("explicit self-identification".to_owned()),
             }),
             provenance: None,
+            source_context_kind: None,
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: None,
             confidence: Some(0.99),

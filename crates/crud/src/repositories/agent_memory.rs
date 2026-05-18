@@ -10,7 +10,8 @@ use sea_orm::{
 
 use crate::convention::{
     DB_ID_LEN, MEMORY_REPAIR_STATUS_OK, memory_category_to_db, memory_scope_kind_to_db,
-    memory_sensitivity_to_db, memory_source_kind_to_db, memory_status_to_db,
+    memory_sensitivity_to_db, memory_source_context_kind_to_db, memory_source_kind_to_db,
+    memory_status_to_db,
 };
 use crate::memory::{
     AgentMemoryListFilter, MemoryScopeResolution, MemoryWorkspaceGuard,
@@ -54,6 +55,10 @@ pub async fn insert_memory_record<C: ConnectionTrait>(
         frame_uri: Set(record.frame_uri),
         frame_version: Set(record.frame_version),
         source_kind: Set(memory_source_kind_to_db(record.source_kind).to_owned()),
+        source_context_kind: Set(record
+            .source_context_kind
+            .map(memory_source_context_kind_to_db)
+            .map(str::to_owned)),
         source_thread_id: Set(record.source_thread_id),
         source_turn_id: Set(record.source_turn_id),
         source_item_id: Set(record.source_item_id),
@@ -121,6 +126,10 @@ pub async fn upsert_active_memory_record<C: ConnectionTrait>(
         frame_uri: Set(record.frame_uri),
         frame_version: Set(record.frame_version),
         source_kind: Set(memory_source_kind_to_db(record.source_kind).to_owned()),
+        source_context_kind: Set(record
+            .source_context_kind
+            .map(memory_source_context_kind_to_db)
+            .map(str::to_owned)),
         source_thread_id: Set(record.source_thread_id),
         source_turn_id: Set(record.source_turn_id),
         source_item_id: Set(record.source_item_id),
@@ -162,6 +171,7 @@ pub async fn upsert_active_memory_record<C: ConnectionTrait>(
             agent_memory::Column::FrameUri,
             agent_memory::Column::FrameVersion,
             agent_memory::Column::SourceKind,
+            agent_memory::Column::SourceContextKind,
             agent_memory::Column::SourceThreadId,
             agent_memory::Column::SourceTurnId,
             agent_memory::Column::SourceItemId,

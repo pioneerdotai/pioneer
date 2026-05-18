@@ -27,6 +27,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub reason: String,
     pub source_kind: String,
+    pub source_context_kind: Option<String>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
