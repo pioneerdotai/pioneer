@@ -7,19 +7,20 @@ use pioneer_memory::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
     BackendPutRequest, BackendPutResult, BackendSearchHit, BackendSearchRequest,
     InMemoryMemoryBackend, MemoryBackend, MemoryModeRecallParams, MemoryOperationContext,
-    MemoryReadPolicy, MemoryRecallMode, MemoryRecallParams, MemoryRecallTarget, MemoryService,
-    MemoryServiceConfig,
+    MemoryQuarantineRequest, MemoryReadPolicy, MemoryRecallMode, MemoryRecallParams,
+    MemoryRecallTarget, MemoryRestoreRequest, MemoryService, MemoryServiceConfig,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
     MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
     MemoryDurability, MemoryEvidenceClass, MemoryExplicitness, MemoryExtractorCertainty,
     MemoryFactClass, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryIntent,
-    MemoryLifetimeClass, MemoryListParams, MemoryOwnershipClass, MemoryQualityAction,
-    MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
-    MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteRoute, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryListParams, MemoryOwnershipClass,
+    MemoryQualityAction, MemoryQualityReasonCode, MemoryRememberParams, MemoryScope,
+    MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteRoute,
+    MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -4217,4 +4218,414 @@ async fn backend_delete_failure_keeps_tombstone_and_enqueues_repair() {
             .unwrap_or_default()
             .contains("Delete failure should not restore visibility.")
     );
+}
+
+#[tokio::test]
+async fn quarantine_hides_memory_from_product_recall_and_restore_reenables_it() {
+    let (store, _backend, service) = setup_service().await;
+    let remembered = service
+        .remember(
+            user_context(1300),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("quarantine.identity"),
+                "User name is Александр.",
+            ),
+        )
+        .await
+        .expect("remember");
+
+    let quarantined = service
+        .quarantine_memory(
+            user_context(1301),
+            MemoryQuarantineRequest {
+                memory_id: remembered.record.id.clone(),
+                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                actor: None,
+                details_json: None,
+                schedule_backend_cleanup: true,
+            },
+        )
+        .await
+        .expect("quarantine");
+    assert_eq!(quarantined.quarantine.memory_id, remembered.record.id);
+    assert_eq!(
+        quarantined
+            .repair_job
+            .as_ref()
+            .expect("cleanup repair job")
+            .job_kind,
+        "backend_quarantine_cleanup"
+    );
+
+    let search = service
+        .search(
+            user_context(1302),
+            MemorySearchParams {
+                query: "Александр".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+
+    let prompt = service
+        .recall_for_prompt(
+            user_context(1303),
+            MemoryRecallParams {
+                query: "Александр".to_owned(),
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                categories: vec![MemoryCategory::Identity],
+                top_k: Some(5),
+                max_chars: Some(500),
+            },
+        )
+        .await
+        .expect("prompt recall");
+    assert!(prompt.items.is_empty());
+    assert!(
+        prompt
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("suppress_quarantined"))
+    );
+
+    let exact = service
+        .recall_mode_for_prompt(
+            user_context(1304),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::ExactCanonical,
+                targets: vec![MemoryRecallTarget {
+                    scope_kind: Some(MemoryScopeKind::User),
+                    category: Some(MemoryCategory::Identity),
+                    canonical_key: Some("quarantine.identity".to_owned()),
+                    ..Default::default()
+                }],
+                top_k: Some(5),
+                max_chars: Some(500),
+            },
+        )
+        .await
+        .expect("exact recall");
+    assert!(exact.items.is_empty());
+
+    let repeated = service
+        .quarantine_memory(
+            user_context(1305),
+            MemoryQuarantineRequest {
+                memory_id: remembered.record.id.clone(),
+                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                actor: None,
+                details_json: None,
+                schedule_backend_cleanup: true,
+            },
+        )
+        .await
+        .expect("repeat quarantine");
+    assert_eq!(repeated.quarantine.id, quarantined.quarantine.id);
+    assert_eq!(
+        repeated.repair_job.as_ref().map(|job| job.id.clone()),
+        quarantined.repair_job.as_ref().map(|job| job.id.clone())
+    );
+
+    let restored = service
+        .restore_quarantined_memory(
+            user_context(1306),
+            MemoryRestoreRequest {
+                memory_id: remembered.record.id.clone(),
+                actor: None,
+                schedule_backend_reindex: true,
+            },
+        )
+        .await
+        .expect("restore");
+    assert!(restored.quarantine.is_some());
+    assert_eq!(
+        restored
+            .repair_job
+            .as_ref()
+            .expect("reindex repair job")
+            .job_kind,
+        "backend_restore_reindex"
+    );
+
+    let restored_search = service
+        .search(
+            user_context(1307),
+            MemorySearchParams {
+                query: "Александр".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search after restore");
+    assert_eq!(restored_search.hits.len(), 1);
+
+    let history = store
+        .list_agent_memory_quarantine_history(remembered.record.id.as_str(), 10)
+        .await
+        .expect("quarantine history");
+    assert_eq!(history.len(), 1);
+    assert!(history[0].resolved_at_unix.is_some());
+}
+
+#[tokio::test]
+async fn restore_does_not_resurrect_deleted_quarantined_memory() {
+    let (store, _backend, service) = setup_service().await;
+    let remembered = service
+        .remember(
+            user_context(1400),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("quarantine.deleted"),
+                "Deleted quarantined memory should stay hidden.",
+            ),
+        )
+        .await
+        .expect("remember");
+    service
+        .quarantine_memory(
+            user_context(1401),
+            MemoryQuarantineRequest {
+                memory_id: remembered.record.id.clone(),
+                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                actor: None,
+                details_json: None,
+                schedule_backend_cleanup: false,
+            },
+        )
+        .await
+        .expect("quarantine");
+    store
+        .mark_agent_memory_deleted(
+            remembered.record.id.as_str(),
+            None,
+            Some("deleted during quarantine".to_owned()),
+            1402,
+        )
+        .await
+        .expect("delete");
+
+    let restored = service
+        .restore_quarantined_memory(
+            user_context(1403),
+            MemoryRestoreRequest {
+                memory_id: remembered.record.id.clone(),
+                actor: None,
+                schedule_backend_reindex: true,
+            },
+        )
+        .await
+        .expect("restore");
+    assert!(restored.quarantine.is_some());
+    assert!(restored.repair_job.is_none());
+
+    let search = service
+        .search(
+            user_context(1404),
+            MemorySearchParams {
+                query: "quarantined memory".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+}
+
+#[tokio::test]
+async fn quarantine_workspace_guard_blocks_other_workspace() {
+    let (_store, _backend, service) = setup_service().await;
+    let remembered = service
+        .remember(
+            workspace_context("ws_quarantine_a", 1500),
+            remember_params(
+                scope(MemoryScopeKind::Workspace, "ws_quarantine_a"),
+                Some("workspace.secret"),
+                "Workspace A memory.",
+            ),
+        )
+        .await
+        .expect("remember");
+
+    let result = service
+        .quarantine_memory(
+            workspace_context("ws_quarantine_b", 1501),
+            MemoryQuarantineRequest {
+                memory_id: remembered.record.id,
+                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                actor: None,
+                details_json: None,
+                schedule_backend_cleanup: false,
+            },
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn repair_worker_processes_quarantine_cleanup_and_restore_reindex() {
+    let (_store, _backend, service) = setup_service().await;
+    let remembered = service
+        .remember(
+            user_context(1600),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("repair.quarantine"),
+                "Repair worker quarantine memory.",
+            ),
+        )
+        .await
+        .expect("remember");
+
+    service
+        .quarantine_memory(
+            user_context(1601),
+            MemoryQuarantineRequest {
+                memory_id: remembered.record.id.clone(),
+                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                actor: None,
+                details_json: None,
+                schedule_backend_cleanup: true,
+            },
+        )
+        .await
+        .expect("quarantine");
+    let cleanup = service
+        .claim_due_repair_jobs(1602, 60, "repair_worker", 10)
+        .await
+        .expect("claim cleanup");
+    assert_eq!(cleanup.len(), 1);
+    let completed_cleanup = service
+        .process_repair_job(cleanup[0].id.as_str(), "repair_worker", 1603)
+        .await
+        .expect("process cleanup")
+        .expect("completed cleanup");
+    assert_eq!(completed_cleanup.status, "completed");
+
+    service
+        .restore_quarantined_memory(
+            user_context(1604),
+            MemoryRestoreRequest {
+                memory_id: remembered.record.id.clone(),
+                actor: None,
+                schedule_backend_reindex: true,
+            },
+        )
+        .await
+        .expect("restore");
+    let reindex = service
+        .claim_due_repair_jobs(1605, 60, "repair_worker", 10)
+        .await
+        .expect("claim reindex");
+    assert_eq!(reindex.len(), 1);
+    assert_eq!(reindex[0].job_kind, "backend_restore_reindex");
+    let completed_reindex = service
+        .process_repair_job(reindex[0].id.as_str(), "repair_worker", 1606)
+        .await
+        .expect("process reindex")
+        .expect("completed reindex");
+    assert_eq!(completed_reindex.status, "completed");
+
+    let search = service
+        .search(
+            user_context(1607),
+            MemorySearchParams {
+                query: "quarantine memory".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert_eq!(search.hits.len(), 1);
+}
+
+#[tokio::test]
+async fn candidate_terminal_transitions_are_idempotent_and_do_not_hide_memory() {
+    let (_store, _backend, service) = setup_service().await;
+    let active = service
+        .write_semantic_memory(
+            user_context(1700),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "User's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::AcceptActive,
+                "turn_candidate_terminal_active",
+            ),
+        )
+        .await
+        .expect("active write")
+        .record
+        .expect("active record");
+    let candidate = service
+        .write_semantic_memory(
+            user_context(1701),
+            semantic_write_params(
+                relationship_semantic("terminal-candidate"),
+                "Terminal candidate fact.",
+                "terminal-candidate-value",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_candidate_terminal_pending",
+            ),
+        )
+        .await
+        .expect("candidate write")
+        .candidate
+        .expect("candidate");
+
+    let rejected = service
+        .reject_candidate(
+            user_context(1702),
+            pioneer_protocol::MemoryCandidatesRejectParams {
+                candidate_id: candidate.id.clone(),
+                reason: Some("not useful".to_owned()),
+                actor: None,
+            },
+        )
+        .await
+        .expect("reject");
+    assert_eq!(rejected.candidate.status, MemoryCandidateStatus::Rejected);
+
+    let rejected_again = service
+        .reject_candidate(
+            user_context(1703),
+            pioneer_protocol::MemoryCandidatesRejectParams {
+                candidate_id: candidate.id.clone(),
+                reason: Some("still not useful".to_owned()),
+                actor: None,
+            },
+        )
+        .await
+        .expect("reject again");
+    assert_eq!(
+        rejected_again.candidate.status,
+        MemoryCandidateStatus::Rejected
+    );
+
+    let approve_rejected = service
+        .approve_candidate(
+            user_context(1704),
+            MemoryCandidatesApproveParams {
+                candidate_id: candidate.id,
+                reason: Some("should not approve terminal rejected".to_owned()),
+                actor: None,
+            },
+        )
+        .await;
+    assert!(approve_rejected.is_err());
+
+    let search = service
+        .search(
+            user_context(1705),
+            MemorySearchParams {
+                query: "Alexander".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search active");
+    assert_eq!(search.hits.len(), 1);
+    assert_eq!(search.hits[0].record.id, active.id);
 }

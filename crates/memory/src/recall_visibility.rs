@@ -19,6 +19,7 @@ pub(crate) enum MemoryRecallVisibility {
     SuppressOwnershipMismatch,
     SuppressLowQualitySourceContext,
     SuppressRejectedRelated,
+    SuppressQuarantined,
     SuppressQuarantinedOrAuditOnly,
     SuppressBackendRepairRequired,
 }
@@ -39,6 +40,7 @@ impl MemoryRecallVisibility {
             Self::SuppressOwnershipMismatch => "suppress_ownership_mismatch",
             Self::SuppressLowQualitySourceContext => "suppress_low_quality_source_context",
             Self::SuppressRejectedRelated => "suppress_rejected_related",
+            Self::SuppressQuarantined => "suppress_quarantined",
             Self::SuppressQuarantinedOrAuditOnly => "suppress_quarantined_or_audit_only",
             Self::SuppressBackendRepairRequired => "suppress_backend_repair_required",
         }
@@ -152,6 +154,7 @@ pub(crate) struct MemoryRecallVisibilityInput<'a> {
     pub(crate) allowed_statuses: &'a [MemoryStatus],
     pub(crate) now_unix: i64,
     pub(crate) repair_ok: bool,
+    pub(crate) quarantined: bool,
     pub(crate) sensitivity: MemorySensitivity,
     pub(crate) read_policy: &'a MemoryReadPolicy,
     pub(crate) workspace_visible: bool,
@@ -176,6 +179,9 @@ pub(crate) fn decide_memory_recall_visibility(
         && !input.allowed_statuses.contains(&MemoryStatus::Expired)
     {
         return MemoryRecallVisibility::SuppressExpired;
+    }
+    if input.quarantined {
+        return MemoryRecallVisibility::SuppressQuarantined;
     }
     if !input.repair_ok {
         return MemoryRecallVisibility::SuppressBackendRepairRequired;
@@ -273,6 +279,7 @@ pub(crate) fn memory_recall_visibility_input_for_row<'a>(
     allowed_statuses: &'a [MemoryStatus],
     now_unix: i64,
     repair_ok: bool,
+    quarantined: bool,
     read_policy: &'a MemoryReadPolicy,
     workspace_visible: bool,
     quality: &'a MemoryRecallQualitySignals,
@@ -285,6 +292,7 @@ pub(crate) fn memory_recall_visibility_input_for_row<'a>(
         allowed_statuses,
         now_unix,
         repair_ok,
+        quarantined,
         sensitivity: row.sensitivity,
         read_policy,
         workspace_visible,
@@ -387,6 +395,7 @@ mod tests {
             allowed_statuses: &[],
             now_unix: 100,
             repair_ok: true,
+            quarantined: false,
             sensitivity: MemorySensitivity::Normal,
             read_policy: &TEST_READ_POLICY,
             workspace_visible: true,

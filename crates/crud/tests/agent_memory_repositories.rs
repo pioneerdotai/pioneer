@@ -1,16 +1,18 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCapsuleRecord,
-    AgentMemoryListFilter, CrudStore, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
-    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision,
-    NewAgentMemoryRepairJob, global_agent_memory_scope_key, memory_scope_key_hash,
+    AgentMemoryListFilter, CrudStore, MemoryLifecycleActorRecord, MemoryWorkspaceGuard,
+    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision,
+    NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine, NewAgentMemoryRepairJob,
+    ResolveAgentMemoryQuarantine, global_agent_memory_scope_key, memory_scope_key_hash,
     workspace_agent_memory_scope_key,
 };
 use pioneer_protocol::{
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass,
-    MemoryFactClass, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
-    MemoryQualityReasonCode, MemoryScope, MemoryScopeKind, MemorySensitivity,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteRelation,
+    MemoryFactClass, MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryLifetimeClass,
+    MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode, MemoryScope,
+    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryWriteRelation,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
@@ -214,6 +216,101 @@ async fn agent_memory_active_delete_and_get_roundtrip() {
         .await
         .expect("list events");
     assert!(events.iter().any(|event| event.event_kind == "forgotten"));
+}
+
+#[tokio::test]
+async fn agent_memory_quarantine_marker_is_idempotent_and_preserves_history() {
+    let (_, store) = setup_store().await;
+    let memory = store
+        .insert_agent_memory_record(
+            new_memory(
+                "mem_quarantine_one",
+                scope(MemoryScopeKind::Workspace, "ws_memory_a"),
+                "project.quarantine",
+                "This memory can be quarantined.",
+            ),
+            None,
+            130,
+        )
+        .await
+        .expect("insert memory");
+
+    let first = store
+        .create_agent_memory_quarantine_marker(NewAgentMemoryQuarantine {
+            id: None,
+            memory_id: memory.id.clone(),
+            workspace_id: memory.workspace_id.clone(),
+            reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+            actor: MemoryLifecycleActorRecord {
+                kind: MemoryLifecycleActorKind::Service,
+                id: None,
+            },
+            details_json: Some(serde_json::json!({"safe": true}).to_string()),
+            created_at_unix: 131,
+        })
+        .await
+        .expect("create quarantine");
+    let repeated = store
+        .create_agent_memory_quarantine_marker(NewAgentMemoryQuarantine {
+            id: None,
+            memory_id: memory.id.clone(),
+            workspace_id: memory.workspace_id.clone(),
+            reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+            actor: MemoryLifecycleActorRecord {
+                kind: MemoryLifecycleActorKind::Service,
+                id: None,
+            },
+            details_json: None,
+            created_at_unix: 132,
+        })
+        .await
+        .expect("repeat quarantine");
+    assert_eq!(first.id, repeated.id);
+
+    let active = store
+        .get_active_agent_memory_quarantine(memory.id.as_str())
+        .await
+        .expect("active quarantine")
+        .expect("active marker exists");
+    assert_eq!(active.id, first.id);
+
+    let resolved = store
+        .resolve_agent_memory_quarantine(ResolveAgentMemoryQuarantine {
+            memory_id: memory.id.clone(),
+            reason_code: MemoryLifecycleReasonCode::ExplicitRestore,
+            actor: MemoryLifecycleActorRecord {
+                kind: MemoryLifecycleActorKind::Service,
+                id: None,
+            },
+            resolved_at_unix: 133,
+        })
+        .await
+        .expect("resolve quarantine")
+        .expect("quarantine resolved");
+    assert_eq!(
+        resolved.resolved_reason_code,
+        Some(MemoryLifecycleReasonCode::ExplicitRestore)
+    );
+
+    let active_after_restore = store
+        .get_active_agent_memory_quarantine(memory.id.as_str())
+        .await
+        .expect("active quarantine after restore");
+    assert!(active_after_restore.is_none());
+
+    let history = store
+        .list_agent_memory_quarantine_history(memory.id.as_str(), 10)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 1);
+    assert!(history[0].resolved_at_unix.is_some());
+
+    let events = store
+        .list_agent_memory_events(memory.id.as_str(), 10)
+        .await
+        .expect("events");
+    assert!(events.iter().any(|event| event.event_kind == "quarantined"));
+    assert!(events.iter().any(|event| event.event_kind == "restored"));
 }
 
 #[tokio::test]

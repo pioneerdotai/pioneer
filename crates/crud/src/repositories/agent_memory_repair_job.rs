@@ -18,6 +18,10 @@ pub async fn enqueue_repair_job<C: ConnectionTrait>(
     job: NewAgentMemoryRepairJob,
     now: DateTimeWithTimeZone,
 ) -> Result<agent_memory_repair_job::Model> {
+    if let Some(existing) = find_open_repair_job(db, &job).await? {
+        return Ok(existing);
+    }
+
     let id = pioneer_protocol::generate_id(DB_ID_LEN);
     agent_memory_repair_job::Entity::insert(agent_memory_repair_job::ActiveModel {
         id: Set(id.clone()),
@@ -54,6 +58,33 @@ pub async fn enqueue_repair_job<C: ConnectionTrait>(
         .await
         .context("failed to reload memory repair job")?
         .context("inserted memory repair job missing")
+}
+
+async fn find_open_repair_job<C: ConnectionTrait>(
+    db: &C,
+    job: &NewAgentMemoryRepairJob,
+) -> Result<Option<agent_memory_repair_job::Model>> {
+    let mut query = agent_memory_repair_job::Entity::find()
+        .filter(agent_memory_repair_job::Column::JobKind.eq(job.job_kind.clone()))
+        .filter(agent_memory_repair_job::Column::Status.is_in([
+            MEMORY_REPAIR_JOB_STATUS_PENDING.to_owned(),
+            MEMORY_REPAIR_JOB_STATUS_RUNNING.to_owned(),
+        ]));
+
+    query = match job.memory_id.as_deref() {
+        Some(memory_id) => query.filter(agent_memory_repair_job::Column::MemoryId.eq(memory_id)),
+        None => query.filter(agent_memory_repair_job::Column::MemoryId.is_null()),
+    };
+    query = match job.capsule_id.as_deref() {
+        Some(capsule_id) => query.filter(agent_memory_repair_job::Column::CapsuleId.eq(capsule_id)),
+        None => query.filter(agent_memory_repair_job::Column::CapsuleId.is_null()),
+    };
+
+    query
+        .order_by_desc(agent_memory_repair_job::Column::CreatedAt)
+        .one(db)
+        .await
+        .context("failed to find open memory repair job")
 }
 
 pub async fn claim_due_repair_jobs<C: ConnectionTrait>(

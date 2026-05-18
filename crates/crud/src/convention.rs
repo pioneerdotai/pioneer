@@ -2,15 +2,15 @@ use anyhow::{Result, bail};
 use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass, MemoryFactClass,
-    MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryScopeKind,
-    MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
-    MemoryWriteRelation, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
-    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
-    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
-    TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind,
-    TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
-    TurnItemType, TurnStatus, UserInput,
+    MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass,
+    MemoryQualityAction, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind,
+    MemorySourceKind, MemoryStatus, MemoryWriteRelation, PromptManifestProfile,
+    ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+    SandboxMode, TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode,
+    TaskDeliveryStatus, TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus,
+    TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus,
+    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnItem,
+    TurnItemAttemptStatus, TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -52,6 +52,8 @@ pub const MEMORY_EVENT_EXPIRED: &str = "expired";
 pub const MEMORY_EVENT_ACCESSED: &str = "accessed";
 pub const MEMORY_EVENT_REPAIR_STATUS_CHANGED: &str = "repair_status_changed";
 pub const MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED: &str = "capsule_repair_status_changed";
+pub const MEMORY_EVENT_QUARANTINED: &str = "quarantined";
+pub const MEMORY_EVENT_RESTORED: &str = "restored";
 pub const MEMORY_EVENT_CANDIDATE_CREATED: &str = "candidate_created";
 pub const MEMORY_EVENT_CANDIDATE_APPROVED: &str = "candidate_approved";
 pub const MEMORY_EVENT_CANDIDATE_REJECTED: &str = "candidate_rejected";
@@ -326,6 +328,22 @@ pub fn memory_actor_kind_from_db(value: &str) -> Result<MemoryActorKind> {
         "tool" => Ok(MemoryActorKind::Tool),
         _ => bail!("unknown memory actor kind `{value}`"),
     }
+}
+
+pub fn memory_lifecycle_actor_kind_to_db(kind: MemoryLifecycleActorKind) -> String {
+    enum_to_snake_string(kind)
+}
+
+pub fn memory_lifecycle_actor_kind_from_db(value: &str) -> Result<MemoryLifecycleActorKind> {
+    enum_from_snake_string(value, "memory lifecycle actor kind")
+}
+
+pub fn memory_lifecycle_reason_code_to_db(reason: MemoryLifecycleReasonCode) -> String {
+    enum_to_snake_string(reason)
+}
+
+pub fn memory_lifecycle_reason_code_from_db(value: &str) -> Result<MemoryLifecycleReasonCode> {
+    enum_from_snake_string(value, "memory lifecycle reason code")
 }
 
 pub fn memory_candidate_status_to_db(status: MemoryCandidateStatus) -> &'static str {

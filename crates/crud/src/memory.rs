@@ -1,19 +1,22 @@
 use anyhow::{Result, bail};
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory,
-    MemoryEvidenceClass, MemoryFactClass, MemoryLifetimeClass, MemoryOwnershipClass,
-    MemoryQualityAction, MemoryQualityReasonCode, MemoryScope, MemoryScopeKind, MemorySensitivity,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteRelation,
+    MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
+    MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode,
+    MemoryScope, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind,
+    MemoryStatus, MemoryWriteRelation,
 };
 use sha2::{Digest, Sha256};
 
 use crate::convention::{
     MEMORY_NAMESPACE_DEFAULT, memory_actor_kind_from_db, memory_actor_kind_to_db,
     memory_candidate_status_from_db, memory_category_from_db, memory_evidence_class_from_db,
-    memory_fact_class_from_db, memory_lifetime_class_from_db, memory_ownership_class_from_db,
-    memory_quality_action_from_db, memory_scope_kind_from_db, memory_scope_kind_to_db,
-    memory_sensitivity_from_db, memory_source_context_kind_from_db, memory_source_kind_from_db,
-    memory_status_from_db, memory_write_relation_from_db,
+    memory_fact_class_from_db, memory_lifecycle_actor_kind_from_db,
+    memory_lifecycle_actor_kind_to_db, memory_lifecycle_reason_code_from_db,
+    memory_lifetime_class_from_db, memory_ownership_class_from_db, memory_quality_action_from_db,
+    memory_scope_kind_from_db, memory_scope_kind_to_db, memory_sensitivity_from_db,
+    memory_source_context_kind_from_db, memory_source_kind_from_db, memory_status_from_db,
+    memory_write_relation_from_db,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,12 @@ pub struct MemoryWorkspaceGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryActorRecord {
     pub kind: MemoryActorKind,
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryLifecycleActorRecord {
+    pub kind: MemoryLifecycleActorKind,
     pub id: Option<String>,
 }
 
@@ -144,6 +153,39 @@ pub struct AgentMemoryEventRecord {
     pub item_id: Option<String>,
     pub details_json: Option<String>,
     pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgentMemoryQuarantine {
+    pub id: Option<String>,
+    pub memory_id: String,
+    pub workspace_id: Option<String>,
+    pub reason_code: MemoryLifecycleReasonCode,
+    pub actor: MemoryLifecycleActorRecord,
+    pub details_json: Option<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveAgentMemoryQuarantine {
+    pub memory_id: String,
+    pub reason_code: MemoryLifecycleReasonCode,
+    pub actor: MemoryLifecycleActorRecord,
+    pub resolved_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMemoryQuarantineRecord {
+    pub id: String,
+    pub memory_id: String,
+    pub workspace_id: Option<String>,
+    pub reason_code: MemoryLifecycleReasonCode,
+    pub actor: MemoryLifecycleActorRecord,
+    pub created_at_unix: i64,
+    pub resolved_at_unix: Option<i64>,
+    pub resolved_reason_code: Option<MemoryLifecycleReasonCode>,
+    pub resolved_actor: Option<MemoryLifecycleActorRecord>,
+    pub details_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +508,37 @@ pub(crate) fn actor_from_db(
     })
 }
 
+pub(crate) fn lifecycle_actor_kind_to_db(actor: &MemoryLifecycleActorRecord) -> String {
+    memory_lifecycle_actor_kind_to_db(actor.kind)
+}
+
+pub(crate) fn lifecycle_actor_id_to_db(actor: &MemoryLifecycleActorRecord) -> Option<String> {
+    actor.id.clone()
+}
+
+pub(crate) fn lifecycle_actor_from_db(
+    kind: String,
+    id: Option<String>,
+) -> Result<MemoryLifecycleActorRecord> {
+    Ok(MemoryLifecycleActorRecord {
+        kind: memory_lifecycle_actor_kind_from_db(kind.as_str())?,
+        id,
+    })
+}
+
+pub(crate) fn optional_lifecycle_actor_from_db(
+    kind: Option<String>,
+    id: Option<String>,
+) -> Result<Option<MemoryLifecycleActorRecord>> {
+    Ok(match kind {
+        Some(kind) => Some(MemoryLifecycleActorRecord {
+            kind: memory_lifecycle_actor_kind_from_db(kind.as_str())?,
+            id,
+        }),
+        None => None,
+    })
+}
+
 pub(crate) fn workspace_allowed_by_guard(
     scope_kind: MemoryScopeKind,
     workspace_id: &Option<String>,
@@ -548,6 +621,30 @@ pub(crate) fn agent_memory_event_record_from_model(
         item_id: model.item_id,
         details_json: model.details_json,
         created_at_unix: model.created_at.timestamp(),
+    })
+}
+
+pub(crate) fn agent_memory_quarantine_record_from_model(
+    model: pioneer_entity::agent_memory_quarantine::Model,
+) -> Result<AgentMemoryQuarantineRecord> {
+    Ok(AgentMemoryQuarantineRecord {
+        id: model.id,
+        memory_id: model.memory_id,
+        workspace_id: model.workspace_id,
+        reason_code: memory_lifecycle_reason_code_from_db(model.reason_code.as_str())?,
+        actor: lifecycle_actor_from_db(model.actor_kind, model.actor_id)?,
+        created_at_unix: model.created_at.timestamp(),
+        resolved_at_unix: model.resolved_at.map(|timestamp| timestamp.timestamp()),
+        resolved_reason_code: model
+            .resolved_reason_code
+            .as_deref()
+            .map(memory_lifecycle_reason_code_from_db)
+            .transpose()?,
+        resolved_actor: optional_lifecycle_actor_from_db(
+            model.resolved_actor_kind,
+            model.resolved_actor_id,
+        )?,
+        details_json: model.details_json,
     })
 }
 

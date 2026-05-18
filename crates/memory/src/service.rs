@@ -10,6 +10,9 @@ use crate::convert::{
     content_preview, crud_candidate_to_protocol, crud_record_to_protocol, effective_provenance,
     metadata_with_idempotency, protocol_actor_to_crud,
 };
+use crate::lifecycle::{
+    MemoryQuarantineRequest, MemoryQuarantineResponse, MemoryRestoreRequest, MemoryRestoreResponse,
+};
 use crate::ownership_route::{
     MemoryOwnershipRoute, MemoryOwnershipRouteInput, resolve_memory_ownership_route,
 };
@@ -44,8 +47,9 @@ use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryControlRecord, AgentMemoryListFilter,
     AgentMemoryQualityDecisionRecord, AgentMemoryRepairJobRecord, CrudStore,
-    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision,
-    NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
+    MemoryLifecycleActorRecord, NewAgentMemoryCandidate, NewAgentMemoryControlRecord,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
+    NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
 };
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
@@ -58,7 +62,8 @@ use pioneer_protocol::{
     MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
     MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
     MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryIntent,
-    MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryQualityDecision, MemoryRecord,
+    MemoryLifecycleActor, MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryListParams,
+    MemoryListResponse, MemoryProvenance, MemoryQualityDecision, MemoryRecord,
     MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint,
     MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
@@ -75,6 +80,9 @@ const REPAIR_STATUS_REPAIR_NEEDED: &str = "repair_needed";
 const REPAIR_JOB_BACKEND_PAYLOAD_MISSING: &str = "backend_payload_missing";
 const REPAIR_JOB_BACKEND_DELETE_FAILED: &str = "backend_delete_failed";
 const REPAIR_JOB_BACKEND_STALE_PAYLOAD: &str = "backend_stale_payload";
+const REPAIR_JOB_BACKEND_QUARANTINE_CLEANUP: &str = "backend_quarantine_cleanup";
+const REPAIR_JOB_BACKEND_REINDEX: &str = "backend_restore_reindex";
+const REPAIR_JOB_MEMVID_STALE_VECTOR: &str = "memvid_stale_vector";
 const REPAIR_PRIORITY_DEFAULT: i64 = 10;
 const REPAIR_MAX_ATTEMPTS_DEFAULT: i32 = 3;
 const POLICY_ACTION_SEMANTIC_WRITE: &str = "semantic_write";
@@ -1629,6 +1637,105 @@ impl MemoryService {
         })
     }
 
+    pub async fn quarantine_memory(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryQuarantineRequest,
+    ) -> Result<MemoryQuarantineResponse> {
+        let now = context.now_or(current_unix());
+        let row = self
+            .store
+            .get_agent_memory_record(params.memory_id.as_str(), true)
+            .await?
+            .with_context(|| format!("memory `{}` was not found", params.memory_id))?;
+        if row.status != MemoryStatus::Active {
+            bail!(
+                "memory `{}` cannot be quarantined because it is not active",
+                row.id
+            );
+        }
+        if !workspace_visible(&row, &context) {
+            bail!(
+                "memory `{}` is not visible in this workspace context",
+                row.id
+            );
+        }
+        let actor =
+            lifecycle_actor_to_crud(params.actor.clone(), MemoryLifecycleActorKind::Service);
+        let quarantine = self
+            .store
+            .create_agent_memory_quarantine_marker(NewAgentMemoryQuarantine {
+                id: None,
+                memory_id: row.id.clone(),
+                workspace_id: row.workspace_id.clone(),
+                reason_code: params.reason_code,
+                actor,
+                details_json: params.details_json.clone(),
+                created_at_unix: now,
+            })
+            .await?;
+        let repair_job = if params.schedule_backend_cleanup {
+            Some(
+                self.enqueue_backend_repair(
+                    &row,
+                    REPAIR_JOB_BACKEND_QUARANTINE_CLEANUP,
+                    "quarantine",
+                    None,
+                    now,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok(MemoryQuarantineResponse {
+            quarantine,
+            repair_job,
+        })
+    }
+
+    pub async fn restore_quarantined_memory(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryRestoreRequest,
+    ) -> Result<MemoryRestoreResponse> {
+        let now = context.now_or(current_unix());
+        let row = self
+            .store
+            .get_agent_memory_record(params.memory_id.as_str(), true)
+            .await?
+            .with_context(|| format!("memory `{}` was not found", params.memory_id))?;
+        if !workspace_visible(&row, &context) {
+            bail!(
+                "memory `{}` is not visible in this workspace context",
+                row.id
+            );
+        }
+        let actor =
+            lifecycle_actor_to_crud(params.actor.clone(), MemoryLifecycleActorKind::Service);
+        let quarantine = self
+            .store
+            .resolve_agent_memory_quarantine(ResolveAgentMemoryQuarantine {
+                memory_id: row.id.clone(),
+                reason_code: MemoryLifecycleReasonCode::ExplicitRestore,
+                actor,
+                resolved_at_unix: now,
+            })
+            .await?;
+        let repair_job = if quarantine.is_some()
+            && params.schedule_backend_reindex
+            && row.status == MemoryStatus::Active
+        {
+            Some(self.enqueue_backend_reindex(&row, "restore", now).await?)
+        } else {
+            None
+        };
+        Ok(MemoryRestoreResponse {
+            quarantine,
+            repair_job,
+        })
+    }
+
     pub async fn list_candidates(
         &self,
         context: MemoryOperationContext,
@@ -1678,6 +1785,16 @@ impl MemoryService {
         let candidate = self
             .load_visible_candidate(&context, params.candidate_id.as_str())
             .await?;
+        if candidate.status == MemoryCandidateStatus::Approved {
+            let record = self
+                .load_promoted_candidate_memory(&context, &candidate)
+                .await?;
+            return Ok(MemoryCandidatesApproveResponse {
+                candidate: crud_candidate_to_protocol(candidate)?,
+                record,
+            });
+        }
+        ensure_candidate_pending_for_transition(&candidate, "approve")?;
         let mut action_context = context.clone();
         if params.actor.is_some() {
             action_context.actor = params.actor.clone();
@@ -1721,6 +1838,12 @@ impl MemoryService {
         let candidate = self
             .load_visible_candidate(&context, params.candidate_id.as_str())
             .await?;
+        if candidate_is_rejected(candidate.status) {
+            return Ok(MemoryCandidatesRejectResponse {
+                candidate: crud_candidate_to_protocol(candidate)?,
+            });
+        }
+        ensure_candidate_pending_for_transition(&candidate, "reject")?;
         let mut action_context = context.clone();
         if params.actor.is_some() {
             action_context.actor = params.actor.clone();
@@ -1753,6 +1876,7 @@ impl MemoryService {
         let candidate = self
             .load_visible_candidate(&context, params.candidate_id.as_str())
             .await?;
+        ensure_candidate_pending_for_transition(&candidate, "edit_and_approve")?;
         let mut action_context = context.clone();
         if params.actor.is_some() {
             action_context.actor = params.actor.clone();
@@ -1807,6 +1931,7 @@ impl MemoryService {
         let candidate = self
             .load_visible_candidate(&context, params.candidate_id.as_str())
             .await?;
+        ensure_candidate_pending_for_transition(&candidate, "merge")?;
         self.load_visible_candidate(&context, params.target_candidate_id.as_str())
             .await?;
         let mut action_context = context.clone();
@@ -1845,6 +1970,12 @@ impl MemoryService {
         let candidate = self
             .load_visible_candidate(&context, params.candidate_id.as_str())
             .await?;
+        if candidate_is_rejected(candidate.status) {
+            return Ok(MemoryCandidatesSuppressSimilarResponse {
+                candidate: crud_candidate_to_protocol(candidate)?,
+            });
+        }
+        ensure_candidate_pending_for_transition(&candidate, "suppress_similar")?;
         let mut action_context = context.clone();
         if params.actor.is_some() {
             action_context.actor = params.actor.clone();
@@ -1970,6 +2101,27 @@ impl MemoryService {
             .with_context(|| format!("memory candidate `{candidate_id}` was not found"))
     }
 
+    async fn load_promoted_candidate_memory(
+        &self,
+        context: &MemoryOperationContext,
+        candidate: &AgentMemoryCandidateRecord,
+    ) -> Result<MemoryRecord> {
+        let memory_id = candidate.promoted_memory_id.as_deref().with_context(|| {
+            format!(
+                "approved memory candidate `{}` does not reference promoted memory",
+                candidate.id
+            )
+        })?;
+        let row = self
+            .store
+            .get_agent_memory_record(memory_id, false)
+            .await?
+            .with_context(|| format!("promoted memory `{memory_id}` was not found"))?;
+        self.hydrate_visible_row(row, context, &[], context.now_or(current_unix()), false)
+            .await?
+            .with_context(|| format!("promoted memory `{memory_id}` is not visible"))
+    }
+
     async fn update_candidate_status(
         &self,
         context: &MemoryOperationContext,
@@ -2065,6 +2217,50 @@ impl MemoryService {
                 now_unix,
             )
             .await
+    }
+
+    pub async fn process_repair_job(
+        &self,
+        job_id: &str,
+        locked_by: &str,
+        now_unix: i64,
+    ) -> Result<Option<AgentMemoryRepairJobRecord>> {
+        let Some(job) = self.store.get_agent_memory_repair_job(job_id).await? else {
+            return Ok(None);
+        };
+        if job.status != "running" || job.locked_by.as_deref() != Some(locked_by) {
+            bail!("memory repair job `{job_id}` is not locked by `{locked_by}`");
+        }
+
+        let result = match job.job_kind.as_str() {
+            REPAIR_JOB_BACKEND_STALE_PAYLOAD | REPAIR_JOB_MEMVID_STALE_VECTOR => {
+                self.process_stale_backend_repair(&job).await
+            }
+            REPAIR_JOB_BACKEND_DELETE_FAILED | REPAIR_JOB_BACKEND_QUARANTINE_CLEANUP => {
+                self.process_backend_delete_repair(&job).await
+            }
+            REPAIR_JOB_BACKEND_PAYLOAD_MISSING | REPAIR_JOB_BACKEND_REINDEX => {
+                self.process_backend_reindex_repair(&job, now_unix).await
+            }
+            _ => bail!("unknown memory repair job kind `{}`", job.job_kind),
+        };
+
+        match result {
+            Ok(result_json) => {
+                self.complete_repair_job(job_id, locked_by, Some(result_json), now_unix)
+                    .await
+            }
+            Err(error) => {
+                self.fail_repair_job(
+                    job_id,
+                    locked_by,
+                    bounded_error_message(error.to_string().as_str()),
+                    Some(now_unix.saturating_add(60)),
+                    now_unix,
+                )
+                .await
+            }
+        }
     }
 
     async fn remember_semantic_active(
@@ -2381,8 +2577,9 @@ impl MemoryService {
         diagnostics: Option<&mut MemoryRecallServiceDiagnostics>,
     ) -> Result<Option<(MemoryRecord, MemoryRecallQualitySignals)>> {
         let quality = self.recall_quality_signals_for_row(&row).await?;
-        let visibility =
-            self.row_recall_visibility_with_quality(&row, context, allowed_statuses, now, &quality);
+        let visibility = self
+            .row_recall_visibility_with_quality(&row, context, allowed_statuses, now, &quality)
+            .await?;
         if let Some(diagnostics) = diagnostics {
             diagnostics.record_visibility(visibility);
         }
@@ -2426,28 +2623,31 @@ impl MemoryService {
         now: i64,
     ) -> Result<MemoryRecallVisibility> {
         let quality = self.recall_quality_signals_for_row(row).await?;
-        Ok(self.row_recall_visibility_with_quality(row, context, allowed_statuses, now, &quality))
+        self.row_recall_visibility_with_quality(row, context, allowed_statuses, now, &quality)
+            .await
     }
 
-    fn row_recall_visibility_with_quality(
+    async fn row_recall_visibility_with_quality(
         &self,
         row: &AgentMemoryControlRecord,
         context: &MemoryOperationContext,
         allowed_statuses: &[MemoryStatus],
         now: i64,
         quality: &MemoryRecallQualitySignals,
-    ) -> MemoryRecallVisibility {
+    ) -> Result<MemoryRecallVisibility> {
         let read_policy = self.policy.read_policy(context);
+        let quarantined = self.row_is_quarantined(row.id.as_str()).await?;
         let input = memory_recall_visibility_input_for_row(
             row,
             allowed_statuses,
             now,
             row.repair_status == REPAIR_STATUS_OK,
+            quarantined,
             &read_policy,
             workspace_visible(row, context),
             quality,
         );
-        decide_memory_recall_visibility(&input)
+        Ok(decide_memory_recall_visibility(&input))
     }
 
     async fn recall_quality_signals_for_row(
@@ -2483,6 +2683,14 @@ impl MemoryService {
             .await?;
         }
         Ok(())
+    }
+
+    async fn row_is_quarantined(&self, memory_id: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .get_active_agent_memory_quarantine(memory_id)
+            .await?
+            .is_some())
     }
 
     async fn enqueue_backend_repair(
@@ -2546,6 +2754,132 @@ impl MemoryService {
             now,
         )
         .await
+    }
+
+    async fn enqueue_backend_reindex(
+        &self,
+        row: &AgentMemoryControlRecord,
+        operation: &str,
+        now: i64,
+    ) -> Result<AgentMemoryRepairJobRecord> {
+        let payload_json = serde_json::json!({
+            "memory_id": row.id,
+            "operation": operation,
+            "capsule_ref": row.capsule_ref,
+            "frame_uri": row.frame_uri,
+        })
+        .to_string();
+        self.enqueue_repair_job(
+            NewAgentMemoryRepairJob {
+                job_kind: REPAIR_JOB_BACKEND_REINDEX.to_owned(),
+                workspace_id: row.workspace_id.clone(),
+                scope_kind: Some(row.scope.kind),
+                scope_key_hash: Some(row.scope_key_hash.clone()),
+                memory_id: Some(row.id.clone()),
+                capsule_id: row.capsule_id.clone(),
+                priority: REPAIR_PRIORITY_DEFAULT,
+                max_attempts: REPAIR_MAX_ATTEMPTS_DEFAULT,
+                scheduled_at_unix: now,
+                payload_json: Some(payload_json),
+            },
+            now,
+        )
+        .await
+    }
+
+    async fn process_stale_backend_repair(
+        &self,
+        job: &AgentMemoryRepairJobRecord,
+    ) -> Result<String> {
+        let memory_id = job
+            .memory_id
+            .as_deref()
+            .context("stale backend repair job missing memory id")?;
+        self.backend
+            .delete(backend_delete_request_from_repair_job(job, memory_id))
+            .await?;
+        Ok(serde_json::json!({
+            "kind": job.job_kind,
+            "memory_id": memory_id,
+            "action": "backend_delete_attempted"
+        })
+        .to_string())
+    }
+
+    async fn process_backend_delete_repair(
+        &self,
+        job: &AgentMemoryRepairJobRecord,
+    ) -> Result<String> {
+        let memory_id = job
+            .memory_id
+            .as_deref()
+            .context("backend delete repair job missing memory id")?;
+        let Some(row) = self.store.get_agent_memory_record(memory_id, true).await? else {
+            self.backend
+                .delete(backend_delete_request_from_repair_job(job, memory_id))
+                .await?;
+            return Ok(serde_json::json!({
+                "kind": job.job_kind,
+                "memory_id": memory_id,
+                "action": "backend_delete_attempted_without_control_row"
+            })
+            .to_string());
+        };
+        self.backend.delete(backend_delete_request(&row)).await?;
+        Ok(serde_json::json!({
+            "kind": job.job_kind,
+            "memory_id": memory_id,
+            "action": "backend_delete_attempted"
+        })
+        .to_string())
+    }
+
+    async fn process_backend_reindex_repair(
+        &self,
+        job: &AgentMemoryRepairJobRecord,
+        now: i64,
+    ) -> Result<String> {
+        let memory_id = job
+            .memory_id
+            .as_deref()
+            .context("backend reindex repair job missing memory id")?;
+        let Some(row) = self.store.get_agent_memory_record(memory_id, true).await? else {
+            return Ok(serde_json::json!({
+                "kind": job.job_kind,
+                "memory_id": memory_id,
+                "action": "skipped_missing_control_row"
+            })
+            .to_string());
+        };
+        if row.status != MemoryStatus::Active {
+            return Ok(serde_json::json!({
+                "kind": job.job_kind,
+                "memory_id": memory_id,
+                "action": "skipped_non_active_control_row"
+            })
+            .to_string());
+        }
+        if self.row_is_quarantined(memory_id).await? {
+            return Ok(serde_json::json!({
+                "kind": job.job_kind,
+                "memory_id": memory_id,
+                "action": "skipped_quarantined"
+            })
+            .to_string());
+        }
+
+        self.backend.put(backend_put_request_from_row(&row)).await?;
+        if row.repair_status != REPAIR_STATUS_OK {
+            self.store
+                .mark_agent_memory_repair_status(row.id.as_str(), REPAIR_STATUS_OK, now)
+                .await?;
+        }
+        Ok(serde_json::json!({
+            "kind": job.job_kind,
+            "memory_id": memory_id,
+            "action": "backend_reindex_attempted"
+        })
+        .to_string())
     }
 
     fn semantic_quality_decision(
@@ -2990,6 +3324,39 @@ fn candidate_status_label(status: MemoryCandidateStatus) -> &'static str {
     }
 }
 
+fn ensure_candidate_pending_for_transition(
+    candidate: &AgentMemoryCandidateRecord,
+    operation: &str,
+) -> Result<()> {
+    if candidate_is_pending(candidate.status) {
+        return Ok(());
+    }
+    bail!(
+        "memory candidate `{}` cannot be {operation} because it is `{}`",
+        candidate.id,
+        candidate_status_label(candidate.status)
+    )
+}
+
+fn candidate_is_pending(status: MemoryCandidateStatus) -> bool {
+    matches!(
+        status,
+        MemoryCandidateStatus::Pending
+            | MemoryCandidateStatus::PendingSilent
+            | MemoryCandidateStatus::AskOnUse
+            | MemoryCandidateStatus::NeedsReview
+    )
+}
+
+fn candidate_is_rejected(status: MemoryCandidateStatus) -> bool {
+    matches!(
+        status,
+        MemoryCandidateStatus::Rejected
+            | MemoryCandidateStatus::AutoRejected
+            | MemoryCandidateStatus::ReviewDisabledRejected
+    )
+}
+
 fn metadata_json_with_candidate_policy(
     metadata_json: String,
     output: &MemoryCandidatePolicyOutput,
@@ -3341,6 +3708,28 @@ fn backend_get_request(row: &AgentMemoryControlRecord) -> BackendGetRequest {
     }
 }
 
+fn backend_put_request_from_row(row: &AgentMemoryControlRecord) -> BackendPutRequest {
+    BackendPutRequest {
+        memory_id: row.id.clone(),
+        scope: row.scope.clone(),
+        namespace: Some(row.namespace.clone()),
+        category: row.category,
+        key: row.key.clone(),
+        content: row.content_preview.clone().unwrap_or_default(),
+        sensitivity: row.sensitivity,
+        metadata_json: row.metadata_json.clone(),
+        source_kind: row.source_kind,
+        source_thread_id: row.source_thread_id.clone(),
+        source_turn_id: row.source_turn_id.clone(),
+        source_item_id: row.source_item_id.clone(),
+        created_by_kind: row.created_by.as_ref().map(|actor| actor.kind),
+        created_by_id: row.created_by.as_ref().and_then(|actor| actor.id.clone()),
+        policy_version: row.policy_version.clone().unwrap_or_default(),
+        status: row.status,
+        idempotency_key: None,
+    }
+}
+
 fn backend_delete_request(row: &AgentMemoryControlRecord) -> BackendDeleteRequest {
     BackendDeleteRequest {
         memory_id: row.id.clone(),
@@ -3350,6 +3739,44 @@ fn backend_delete_request(row: &AgentMemoryControlRecord) -> BackendDeleteReques
         capsule_ref: row.capsule_ref.clone(),
         frame_id: row.frame_id,
         frame_uri: row.frame_uri.clone(),
+    }
+}
+
+fn backend_delete_request_from_repair_job(
+    job: &AgentMemoryRepairJobRecord,
+    memory_id: &str,
+) -> BackendDeleteRequest {
+    BackendDeleteRequest {
+        memory_id: memory_id.to_owned(),
+        scope: MemoryScope {
+            kind: job.scope_kind.unwrap_or(MemoryScopeKind::User),
+            key: "repair".to_owned(),
+        },
+        scope_key_hash: job.scope_key_hash.clone(),
+        capsule_id: job.capsule_id.clone(),
+        capsule_ref: None,
+        frame_id: None,
+        frame_uri: None,
+    }
+}
+
+fn bounded_error_message(message: &str) -> String {
+    message.chars().take(512).collect()
+}
+
+fn lifecycle_actor_to_crud(
+    actor: Option<MemoryLifecycleActor>,
+    default_kind: MemoryLifecycleActorKind,
+) -> MemoryLifecycleActorRecord {
+    match actor {
+        Some(actor) => MemoryLifecycleActorRecord {
+            kind: actor.kind,
+            id: actor.id,
+        },
+        None => MemoryLifecycleActorRecord {
+            kind: default_kind,
+            id: None,
+        },
     }
 }
 

@@ -36,20 +36,20 @@ use crate::convention::{
     MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
     MEMORY_EVENT_CANDIDATE_EXPIRED, MEMORY_EVENT_CANDIDATE_REJECTED,
     MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED, MEMORY_EVENT_CREATED, MEMORY_EVENT_EXPIRED,
-    MEMORY_EVENT_FORGOTTEN, MEMORY_EVENT_REPAIR_STATUS_CHANGED, MEMORY_EVENT_SUPERSEDED,
-    MEMORY_EVENT_UPDATED, TURN_ITEM_STATUS_CANCELLED, TURN_ITEM_STATUS_COMPLETED,
-    TURN_ITEM_STATUS_FAILED, TURN_ITEM_STATUS_TIMED_OUT, is_terminal_task_run_status_db,
-    is_terminal_task_status_db, prompt_manifest_profile_to_db, provider_failure_class_from_db,
-    provider_failure_stage_from_db, recovery_action_from_db, recovery_action_to_db,
-    recovery_job_status_from_db, recovery_trigger_from_db,
-    task_concurrency_conflict_policy_from_db, task_delivery_attempt_status_from_db,
-    task_delivery_mode_from_db, task_delivery_status_from_db, task_executor_kind_from_db,
-    task_owner_kind_from_db, task_owner_kind_to_db, task_run_execution_status_from_db,
-    task_run_status_from_db, task_status_from_db, task_status_to_db, task_trigger_kind_from_db,
-    task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
-    task_write_lock_status_from_db, thread_mode_from_db, thread_origin_kind_from_db,
-    thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_type_from_db,
-    turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
+    MEMORY_EVENT_FORGOTTEN, MEMORY_EVENT_QUARANTINED, MEMORY_EVENT_REPAIR_STATUS_CHANGED,
+    MEMORY_EVENT_RESTORED, MEMORY_EVENT_SUPERSEDED, MEMORY_EVENT_UPDATED,
+    TURN_ITEM_STATUS_CANCELLED, TURN_ITEM_STATUS_COMPLETED, TURN_ITEM_STATUS_FAILED,
+    TURN_ITEM_STATUS_TIMED_OUT, is_terminal_task_run_status_db, is_terminal_task_status_db,
+    prompt_manifest_profile_to_db, provider_failure_class_from_db, provider_failure_stage_from_db,
+    recovery_action_from_db, recovery_action_to_db, recovery_job_status_from_db,
+    recovery_trigger_from_db, task_concurrency_conflict_policy_from_db,
+    task_delivery_attempt_status_from_db, task_delivery_mode_from_db, task_delivery_status_from_db,
+    task_executor_kind_from_db, task_owner_kind_from_db, task_owner_kind_to_db,
+    task_run_execution_status_from_db, task_run_status_from_db, task_status_from_db,
+    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
+    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
+    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
+    turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -68,13 +68,14 @@ pub use crate::repositories::thread_agents_doc::{
 };
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
-    agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_repair_job,
-    artifact as artifact_repository, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
-    mcp_server_installation, policy, recovery_job, skill_audit_event, skill_dependency_snapshot,
-    skill_installation, skill_upload_session, skill_workspace_policy, task as task_repository,
-    task_agent_spec, task_delivery, task_dependency, task_event, task_run, task_run_execution,
-    task_trigger, task_write_lock, thread, thread_agents_doc, thread_lineage, thread_tree, turn,
-    turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
+    agent_memory_repair_job, artifact as artifact_repository, hook_run, mcp_audit_event,
+    mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job, skill_audit_event,
+    skill_dependency_snapshot, skill_installation, skill_upload_session, skill_workspace_policy,
+    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event, task_run,
+    task_run_execution, task_trigger, task_write_lock, thread, thread_agents_doc, thread_lineage,
+    thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding,
+    turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -86,10 +87,11 @@ pub use crate::memory::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryCapsuleRecord, AgentMemoryControlRecord,
     AgentMemoryEventRecord, AgentMemoryListFilter, AgentMemoryPolicyDecisionRecord,
-    AgentMemoryQualityDecisionRecord, AgentMemoryRepairJobRecord, MemoryActorRecord,
-    MemoryScopeResolution, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
-    NewAgentMemoryControlRecord, NewAgentMemoryEvent, NewAgentMemoryPolicyDecision,
-    NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob, global_agent_memory_scope_key,
+    AgentMemoryQualityDecisionRecord, AgentMemoryQuarantineRecord, AgentMemoryRepairJobRecord,
+    MemoryActorRecord, MemoryLifecycleActorRecord, MemoryScopeResolution, MemoryWorkspaceGuard,
+    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryEvent,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
+    NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine, global_agent_memory_scope_key,
     memory_scope_key_hash, workspace_agent_memory_scope_key,
 };
 pub use crate::repositories::hook_run::{
@@ -1686,6 +1688,157 @@ impl CrudStore {
             .collect()
     }
 
+    pub async fn create_agent_memory_quarantine_marker(
+        &self,
+        quarantine: NewAgentMemoryQuarantine,
+    ) -> Result<AgentMemoryQuarantineRecord> {
+        self.run_serialized_write(|| {
+            let quarantine = quarantine.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory quarantine transaction")?;
+                let row =
+                    agent_memory_quarantine::create_active_quarantine(&transaction, quarantine)
+                        .await?;
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: Some(row.memory_id.clone()),
+                        candidate_id: None,
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: MEMORY_EVENT_QUARANTINED.to_owned(),
+                        actor: None,
+                        thread_id: None,
+                        turn_id: None,
+                        item_id: None,
+                        details_json: Some(
+                            serde_json::json!({
+                                "quarantine_id": row.id,
+                                "reason_code": row.reason_code,
+                                "actor": {
+                                    "kind": row.actor_kind,
+                                    "id": row.actor_id,
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        created_at_unix: row.created_at.timestamp(),
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory quarantine transaction")?;
+                crate::memory::agent_memory_quarantine_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn get_active_agent_memory_quarantine(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<AgentMemoryQuarantineRecord>> {
+        agent_memory_quarantine::find_active_quarantine_by_memory(&self.connection, memory_id)
+            .await?
+            .map(crate::memory::agent_memory_quarantine_record_from_model)
+            .transpose()
+    }
+
+    pub async fn list_active_agent_memory_quarantines(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<Vec<AgentMemoryQuarantineRecord>> {
+        agent_memory_quarantine::list_active_quarantines_by_memory_ids(&self.connection, memory_ids)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_quarantine_record_from_model)
+            .collect()
+    }
+
+    pub async fn resolve_agent_memory_quarantine(
+        &self,
+        resolution: ResolveAgentMemoryQuarantine,
+    ) -> Result<Option<AgentMemoryQuarantineRecord>> {
+        self.run_serialized_write(|| {
+            let resolution = resolution.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin memory quarantine restore transaction")?;
+                let row =
+                    agent_memory_quarantine::resolve_active_quarantine(&transaction, resolution)
+                        .await?;
+                let Some(row) = row else {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit empty memory quarantine restore transaction")?;
+                    return Ok(None);
+                };
+                agent_memory_event::append_memory_event(
+                    &transaction,
+                    NewAgentMemoryEvent {
+                        memory_id: Some(row.memory_id.clone()),
+                        candidate_id: None,
+                        workspace_id: row.workspace_id.clone(),
+                        event_kind: MEMORY_EVENT_RESTORED.to_owned(),
+                        actor: None,
+                        thread_id: None,
+                        turn_id: None,
+                        item_id: None,
+                        details_json: Some(
+                            serde_json::json!({
+                                "quarantine_id": row.id,
+                                "reason_code": row.resolved_reason_code,
+                                "actor": {
+                                    "kind": row.resolved_actor_kind,
+                                    "id": row.resolved_actor_id,
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        created_at_unix: row
+                            .resolved_at
+                            .map(|timestamp| timestamp.timestamp())
+                            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                    },
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit memory quarantine restore transaction")?;
+                Ok(Some(
+                    crate::memory::agent_memory_quarantine_record_from_model(row)?,
+                ))
+            }
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_quarantine_history(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryQuarantineRecord>> {
+        agent_memory_quarantine::list_quarantine_history_for_memory(
+            &self.connection,
+            memory_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_quarantine_record_from_model)
+        .collect()
+    }
+
     pub async fn insert_agent_memory_candidate(
         &self,
         candidate: NewAgentMemoryCandidate,
@@ -2223,6 +2376,16 @@ impl CrudStore {
             }
         })
         .await
+    }
+
+    pub async fn get_agent_memory_repair_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AgentMemoryRepairJobRecord>> {
+        agent_memory_repair_job::find_repair_job_by_id(&self.connection, job_id)
+            .await?
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .transpose()
     }
 
     pub async fn claim_due_agent_memory_repair_jobs(

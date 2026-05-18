@@ -5,6 +5,7 @@ mod context;
 mod convert;
 mod extractor_ontology;
 pub mod hooks;
+mod lifecycle;
 mod memvid;
 mod ownership_route;
 mod policy;
@@ -27,6 +28,12 @@ pub use config::{
 };
 pub use context::{
     MemoryActiveScopes, MemoryOperationContext, MemoryResolvedScopes, MemoryScopePriority,
+};
+pub use lifecycle::{
+    MemoryLifecycleInvariantError, MemoryLifecycleSubjectKind, MemoryLifecycleTransition,
+    MemoryQuarantineRequest, MemoryQuarantineResponse, MemoryRestoreRequest, MemoryRestoreResponse,
+    candidate_transition_is_candidate_scoped, memory_transition_removes_product_visibility,
+    memory_transition_restores_product_eligibility, validate_lifecycle_transition,
 };
 pub use memvid::{MemvidMemoryBackend, MemvidMemoryBackendConfig, memvid_search_request};
 pub use policy::{MemoryPolicyDecision, MemoryPolicyEngine};

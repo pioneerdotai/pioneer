@@ -247,6 +247,50 @@ pub enum MemoryActorKind {
     Tool,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycleTransitionKind {
+    Quarantined,
+    Restored,
+    Rejected,
+    Approved,
+    RepairScheduled,
+    RepairCompleted,
+    RepairFailed,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycleReasonCode {
+    VisibilityRankingSuppression,
+    QualityTerminalDecision,
+    BackendPayloadStaleOrMissing,
+    MemvidStaleVector,
+    ManualDeveloperAdminQuarantine,
+    RepairReconciliation,
+    ExplicitRestore,
+    CandidateApproved,
+    CandidateRejected,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycleActorKind {
+    Service,
+    RepairJob,
+    User,
+    Admin,
+    Api,
+    HookRuntime,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryLifecycleActor {
+    pub kind: MemoryLifecycleActorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct MemoryActor {
     pub kind: MemoryActorKind,
