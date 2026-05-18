@@ -146,6 +146,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
         let mut stats = MemoryPostTurnExtractorStats {
             raw_fact_count: parsed.raw_fact_count,
+            validation_rejected_count: parsed.validation_rejected_count,
             ..MemoryPostTurnExtractorStats::default()
         };
         response

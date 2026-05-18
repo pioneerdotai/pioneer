@@ -12,11 +12,12 @@ use pioneer_memory::{
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
     MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
-    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
-    MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryQualityAction,
-    MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
-    MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
+    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryFactClass,
+    MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryLifetimeClass,
+    MemoryListParams, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode,
+    MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams,
+    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
+    MemorySemanticWriteRoute, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
     MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
@@ -95,6 +96,19 @@ fn user_context(now: i64) -> MemoryOperationContext {
 fn workspace_context(workspace_id: &str, now: i64) -> MemoryOperationContext {
     MemoryOperationContext {
         workspace_id: Some(workspace_id.to_owned()),
+        now_unix: Some(now),
+        actor: Some(MemoryActor {
+            kind: MemoryActorKind::User,
+            id: Some("user_alexander".to_owned()),
+        }),
+        ..Default::default()
+    }
+}
+
+fn agent_workspace_context(workspace_id: &str, agent_id: &str, now: i64) -> MemoryOperationContext {
+    MemoryOperationContext {
+        workspace_id: Some(workspace_id.to_owned()),
+        agent_id: Some(agent_id.to_owned()),
         now_unix: Some(now),
         actor: Some(MemoryActor {
             kind: MemoryActorKind::User,
@@ -204,6 +218,28 @@ fn workspace_project_decision_semantic(explicitness: MemoryExplicitness) -> Memo
     }
 }
 
+fn agent_self_description_semantic(explicitness: MemoryExplicitness) -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: match explicitness {
+            MemoryExplicitness::Explicit => MemoryIntent::ExplicitStore,
+            MemoryExplicitness::Implicit
+            | MemoryExplicitness::None
+            | MemoryExplicitness::Unclear => MemoryIntent::ImplicitCandidate,
+        },
+        explicitness,
+        category: MemoryCategory::Identity,
+        subject: MemorySubject::CurrentAgent,
+        attribute: MemoryAttribute::Name,
+        subject_key: None,
+        custom_subject: None,
+        custom_attribute: None,
+        scope_hint: MemoryScopeHint::AgentWorkspace,
+        durability: MemoryDurability::LongLived,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
 fn thread_local_todo_semantic() -> MemorySemanticFields {
     MemorySemanticFields {
         intent: MemoryIntent::ImplicitCandidate,
@@ -255,6 +291,23 @@ fn tool_result_semantic() -> MemorySemanticFields {
     }
 }
 
+fn operational_observation_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::ProjectFact,
+        subject: MemorySubject::Project,
+        attribute: MemoryAttribute::Custom,
+        subject_key: Some("project".to_owned()),
+        custom_subject: None,
+        custom_attribute: Some("operational_observation".to_owned()),
+        scope_hint: MemoryScopeHint::ProjectWorkspace,
+        durability: MemoryDurability::Transient,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
 fn unknown_custom_semantic() -> MemorySemanticFields {
     MemorySemanticFields {
         intent: MemoryIntent::ImplicitCandidate,
@@ -269,6 +322,23 @@ fn unknown_custom_semantic() -> MemorySemanticFields {
         durability: MemoryDurability::LongLived,
         sensitivity: MemorySensitivityHint::None,
         certainty: MemoryExtractorCertainty::Medium,
+    }
+}
+
+fn generated_summary_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::Custom,
+        subject: MemorySubject::Custom,
+        attribute: MemoryAttribute::Custom,
+        subject_key: None,
+        custom_subject: Some("thread_summary".to_owned()),
+        custom_attribute: Some("summary".to_owned()),
+        scope_hint: MemoryScopeHint::UserWorkspace,
+        durability: MemoryDurability::Unknown,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
     }
 }
 
@@ -984,6 +1054,16 @@ async fn semantic_route_explicit_durable_fact_auto_approves() {
 
     assert_eq!(response.relation, MemoryWriteRelation::Novel);
     assert!(response.candidate.is_none());
+    let response_route = response.route.as_ref().expect("durable route info");
+    assert_eq!(
+        response_route.route,
+        MemorySemanticWriteRoute::DurableControlPlane
+    );
+    assert_eq!(
+        response_route.quality_action,
+        MemoryQualityAction::CandidatePolicy
+    );
+    assert!(response_route.quality_decision_id.is_some());
     let record = response.record.expect("auto-approved record");
     assert_eq!(
         record
@@ -1078,6 +1158,545 @@ async fn semantic_route_explicit_durable_fact_auto_approves() {
 }
 
 #[tokio::test]
+async fn semantic_write_responses_include_route_for_duplicate_and_candidate_paths() {
+    let (_store, _backend, service) = setup_service().await;
+    let first = service
+        .write_semantic_memory(
+            user_context(400),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_route_response_first",
+            ),
+        )
+        .await
+        .expect("first write");
+    assert_eq!(
+        first.route.as_ref().map(|route| route.route),
+        Some(MemorySemanticWriteRoute::DurableControlPlane)
+    );
+
+    let duplicate = service
+        .write_semantic_memory(
+            user_context(401),
+            semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "The user's name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_route_response_duplicate",
+            ),
+        )
+        .await
+        .expect("duplicate write");
+    assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
+    assert!(duplicate.evidence_merged);
+    let duplicate_route = duplicate.route.expect("duplicate route");
+    assert_eq!(duplicate_route.route, MemorySemanticWriteRoute::Rejected);
+    assert_eq!(
+        duplicate_route.quality_action,
+        MemoryQualityAction::ForceReject
+    );
+    assert!(duplicate_route.quality_decision_id.is_some());
+
+    let pending = service
+        .write_semantic_memory(
+            user_context(402),
+            semantic_write_params(
+                user_preference_semantic(MemoryExplicitness::Unclear),
+                "Maybe the user prefers concise reviews.",
+                "concise reviews",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_route_response_pending",
+            ),
+        )
+        .await
+        .expect("pending write");
+    assert!(pending.candidate.is_some());
+    assert_eq!(
+        pending.route.as_ref().map(|route| route.route),
+        Some(MemorySemanticWriteRoute::DurableControlPlane)
+    );
+
+    let pending_duplicate = service
+        .write_semantic_memory(
+            user_context(403),
+            semantic_write_params(
+                user_preference_semantic(MemoryExplicitness::Unclear),
+                "Maybe the user prefers concise reviews.",
+                "concise reviews",
+                MemorySemanticWriteDisposition::CreatePendingCandidate,
+                "turn_route_response_pending_duplicate",
+            ),
+        )
+        .await
+        .expect("pending duplicate write");
+    assert_eq!(pending_duplicate.relation, MemoryWriteRelation::Duplicate);
+    let pending_duplicate_route = pending_duplicate.route.expect("pending duplicate route");
+    assert_eq!(
+        pending_duplicate_route.route,
+        MemorySemanticWriteRoute::Rejected
+    );
+    assert_eq!(
+        pending_duplicate_route.quality_action,
+        MemoryQualityAction::ForceReject
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_durable_workspace_fact_uses_control_plane_route() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        workspace_project_decision_semantic(MemoryExplicitness::Explicit),
+        "Workspace migration policy is to keep database changes in the existing migration file.",
+        "keep database changes in the existing migration file",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_semantic_route_workspace_durable",
+    );
+    params.scope = scope(MemoryScopeKind::Workspace, "ws_route_workspace");
+
+    let response = service
+        .write_semantic_memory(workspace_context("ws_route_workspace", 381), params)
+        .await
+        .expect("workspace durable write");
+
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
+    assert!(response.candidate.is_none());
+    let record = response.record.expect("workspace durable record");
+    assert_eq!(record.scope.kind, MemoryScopeKind::Workspace);
+    assert_eq!(record.scope.key, "ws_route_workspace");
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_policy_decision")
+            .and_then(serde_json::Value::as_str),
+        Some("auto_approve")
+    );
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_score")
+            .and_then(|score| score.get("ownership_fit_score"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|score| score > 0.0),
+        true
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_durable_agent_fact_uses_control_plane_route() {
+    let (_store, _backend, service) = setup_service().await;
+    let agent_id = "agent_research";
+    let workspace_id = "ws_route_agent";
+    let agent_scope_key = workspace_agent_memory_scope_key(workspace_id, agent_id);
+    let mut params = semantic_write_params(
+        agent_self_description_semantic(MemoryExplicitness::Explicit),
+        "This agent is named Pioneer.",
+        "Pioneer",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_semantic_route_agent_durable",
+    );
+    params.scope = scope(MemoryScopeKind::Agent, agent_scope_key.as_str());
+
+    let response = service
+        .write_semantic_memory(agent_workspace_context(workspace_id, agent_id, 382), params)
+        .await
+        .expect("agent durable write");
+
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
+    assert!(response.candidate.is_none());
+    let record = response.record.expect("agent durable record");
+    assert_eq!(record.scope.kind, MemoryScopeKind::Agent);
+    assert_eq!(record.scope.key, agent_scope_key);
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_policy_decision")
+            .and_then(serde_json::Value::as_str),
+        Some("auto_approve")
+    );
+    assert_eq!(
+        record
+            .metadata
+            .get("candidate_policy")
+            .and_then(|policy| policy.pointer("/input/ownership_class"))
+            .and_then(serde_json::Value::as_str),
+        Some("durable_agent_memory")
+    );
+}
+
+#[tokio::test]
+async fn semantic_route_non_durable_fact_cannot_use_durable_control_plane() {
+    let (store, _backend, service) = setup_service().await;
+    let mut semantic = thread_local_todo_semantic();
+    semantic.explicitness = MemoryExplicitness::Explicit;
+    semantic.intent = MemoryIntent::ExplicitStore;
+    semantic.certainty = MemoryExtractorCertainty::High;
+
+    let response = service
+        .write_semantic_memory(
+            user_context(383),
+            semantic_write_params(
+                semantic,
+                "For this thread, follow up on the current debugging branch.",
+                "follow up on current debugging branch",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_semantic_route_thread_not_durable",
+            ),
+        )
+        .await
+        .expect("thread route write");
+
+    assert_eq!(response.relation, MemoryWriteRelation::Novel);
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    let decision = decisions
+        .iter()
+        .find(|decision| {
+            decision.turn_id.as_deref() == Some("turn_semantic_route_thread_not_durable")
+        })
+        .expect("thread route quality decision");
+    assert_eq!(decision.action, MemoryQualityAction::RouteToThreadEpisodic);
+}
+
+#[tokio::test]
+async fn semantic_write_extractor_ontology_proposal_is_advisory_only() {
+    let (store, _backend, service) = setup_service().await;
+    let turn_id = "turn_extractor_proposal_advisory";
+    let mut params = semantic_write_params(
+        tool_result_semantic(),
+        "Tool observed a transient project state.",
+        "transient project state",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        turn_id,
+    );
+    params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+    params.metadata.insert(
+        "extractor_ontology_proposal".to_owned(),
+        serde_json::json!({
+            "fact_class": "user_identity",
+            "lifetime_class": "long_lived",
+            "evidence_class": "direct_user_assertion",
+            "proposed_ownership_class": "durable_user_memory"
+        }),
+    );
+
+    let response = service
+        .write_semantic_memory(workspace_context("ws_extractor_proposal", 384), params)
+        .await
+        .expect("semantic write succeeds");
+
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    let route = response.route.expect("quality route");
+    assert_eq!(route.route, MemorySemanticWriteRoute::DomainStateDeferred);
+    assert_eq!(
+        route.target_ownership,
+        MemoryOwnershipClass::DomainRuntimeState
+    );
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
+        .expect("quality decision for advisory proposal");
+    assert_eq!(decision.fact_class, MemoryFactClass::ToolResultFact);
+    assert_eq!(
+        decision.lifetime_class,
+        MemoryLifetimeClass::NaturallyExpiring
+    );
+    assert_eq!(
+        decision.ownership_class,
+        MemoryOwnershipClass::DomainRuntimeState
+    );
+    let snapshot: serde_json::Value = serde_json::from_str(
+        decision
+            .input_snapshot_json
+            .as_deref()
+            .expect("quality input snapshot"),
+    )
+    .expect("quality input snapshot json");
+    assert_eq!(
+        snapshot.pointer("/extractor_ontology_proposal/fact_class"),
+        Some(&serde_json::json!("user_identity"))
+    );
+    assert_eq!(
+        snapshot.pointer("/extractor_ontology_proposal_comparison/all_match"),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[tokio::test]
+async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
+    let (_store, _backend, service) = setup_service().await;
+    let turn_id = "turn_thread_episodic_route_info";
+    let response = service
+        .write_semantic_memory(
+            user_context(384),
+            semantic_write_params(
+                thread_local_todo_semantic(),
+                "This thread should remember to revisit the active debugging branch.",
+                "revisit active debugging branch",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                turn_id,
+            ),
+        )
+        .await
+        .expect("thread episodic route write");
+
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    assert!(!response.created);
+    let route = response.route.expect("thread route info");
+    assert_eq!(
+        route.route,
+        MemorySemanticWriteRoute::ThreadEpisodicDeferred
+    );
+    assert_eq!(
+        route.quality_action,
+        MemoryQualityAction::RouteToThreadEpisodic
+    );
+    assert_eq!(
+        route.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::ThreadEpisodicContext
+    );
+    assert!(route.quality_decision_id.is_some());
+    assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
+    assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        route.source_item_id.as_deref(),
+        Some("item_turn_thread_episodic_route_info")
+    );
+    assert_eq!(
+        route.canonical_key.as_deref(),
+        Some("user/default:todo:self:custom_4de127d381235b26")
+    );
+}
+
+#[tokio::test]
+async fn semantic_generated_summary_routes_to_thread_episodic_deferral() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        generated_summary_semantic(),
+        "Summary: the current thread is debugging OpenRouter tool calls.",
+        "debugging OpenRouter tool calls",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_generated_summary_thread_route",
+    );
+    params.source_context_kind = Some(MemorySourceContextKind::GeneratedSummary);
+
+    let response = service
+        .write_semantic_memory(user_context(385), params)
+        .await
+        .expect("generated summary route");
+
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    let route = response.route.expect("generated summary route info");
+    assert_eq!(
+        route.route,
+        MemorySemanticWriteRoute::ThreadEpisodicDeferred
+    );
+    assert_eq!(
+        route.quality_action,
+        MemoryQualityAction::RouteToThreadEpisodic
+    );
+
+    for query in [
+        "debugging OpenRouter tool calls",
+        "current thread is debugging OpenRouter",
+    ] {
+        let search = service
+            .search(
+                user_context(386),
+                MemorySearchParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty(), "{query}");
+
+        let recall = service
+            .recall_for_prompt(
+                user_context(387),
+                MemoryRecallParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recall");
+        assert!(recall.items.is_empty(), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn semantic_task_state_route_response_is_deferred_and_not_memory() {
+    let (store, _backend, service) = setup_service().await;
+    let turn_id = "turn_task_state_route";
+    let mut params = semantic_write_params(
+        task_lifecycle_semantic(),
+        "Task runtime state: child task is waiting for provider output.",
+        "child task waiting for provider output",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        turn_id,
+    );
+    params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
+
+    let response = service
+        .write_semantic_memory(workspace_context("ws_route_task", 388), params)
+        .await
+        .expect("task state route");
+
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    let route = response.route.expect("task route info");
+    assert_eq!(route.route, MemorySemanticWriteRoute::TaskStateDeferred);
+    assert_eq!(route.quality_action, MemoryQualityAction::RouteToTaskState);
+    assert_eq!(
+        route.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
+    );
+    assert!(route.quality_decision_id.is_some());
+    assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
+    assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
+        .expect("task state decision");
+    assert_eq!(decision.action, MemoryQualityAction::RouteToTaskState);
+    assert_eq!(
+        decision.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
+    );
+
+    let search = service
+        .search(
+            workspace_context("ws_route_task", 389),
+            MemorySearchParams {
+                query: "child task waiting for provider output".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+}
+
+#[tokio::test]
+async fn semantic_domain_state_routes_are_deferred_and_not_memory() {
+    let (store, _backend, service) = setup_service().await;
+    let mut tool_params = semantic_write_params(
+        tool_result_semantic(),
+        "Tool observation: the OpenRouter request took 118 seconds.",
+        "OpenRouter request took 118 seconds",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_domain_tool_route",
+    );
+    tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
+    tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+
+    let tool_response = service
+        .write_semantic_memory(workspace_context("ws_route_domain", 390), tool_params)
+        .await
+        .expect("tool domain route");
+    assert!(tool_response.record.is_none());
+    assert!(tool_response.candidate.is_none());
+    let tool_route = tool_response.route.expect("tool route info");
+    assert_eq!(
+        tool_route.route,
+        MemorySemanticWriteRoute::DomainStateDeferred
+    );
+    assert_eq!(
+        tool_route.quality_action,
+        MemoryQualityAction::RouteToDomainState
+    );
+    assert_eq!(
+        tool_route.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::DomainRuntimeState
+    );
+
+    let mut operational_semantic = operational_observation_semantic();
+    operational_semantic.explicitness = MemoryExplicitness::Explicit;
+    operational_semantic.intent = MemoryIntent::ExplicitStore;
+    let mut operational_params = semantic_write_params(
+        operational_semantic,
+        "Operational observation: provider latency is temporarily elevated.",
+        "provider latency temporarily elevated",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_domain_operational_route",
+    );
+    operational_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
+    operational_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+
+    let operational_response = service
+        .write_semantic_memory(
+            workspace_context("ws_route_domain", 391),
+            operational_params,
+        )
+        .await
+        .expect("operational domain route");
+    assert!(operational_response.record.is_none());
+    assert!(operational_response.candidate.is_none());
+    let operational_route = operational_response.route.expect("operational route info");
+    assert_eq!(
+        operational_route.route,
+        MemorySemanticWriteRoute::DomainStateDeferred
+    );
+    assert_eq!(
+        operational_route.quality_action,
+        MemoryQualityAction::RouteToDomainState
+    );
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 30)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_domain_tool_route")
+            && decision.action == MemoryQualityAction::RouteToDomainState
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_domain_operational_route")
+            && decision.action == MemoryQualityAction::RouteToDomainState
+    }));
+
+    for query in [
+        "OpenRouter request took 118 seconds",
+        "provider latency temporarily elevated",
+    ] {
+        let recall = service
+            .recall_for_prompt(
+                workspace_context("ws_route_domain", 392),
+                MemoryRecallParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recall");
+        assert!(recall.items.is_empty(), "{query}");
+    }
+}
+
+#[tokio::test]
 async fn semantic_route_implicit_durable_fact_auto_approves_when_enabled() {
     let mut config = MemoryServiceConfig::default();
     config.candidate_policy.allow_implicit_auto_approve = true;
@@ -1165,6 +1784,165 @@ async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
             .reason_codes
             .contains(&MemoryQualityReasonCode::SecretOrCredential)
     );
+}
+
+#[tokio::test]
+async fn semantic_force_reject_response_is_rejected_terminal_route() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+    secret_semantic.sensitivity = MemorySensitivityHint::Secret;
+
+    let response = service
+        .write_semantic_memory(
+            user_context(393),
+            semantic_write_params(
+                secret_semantic,
+                "User API token is abc123.",
+                "abc123",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_force_reject_route",
+            ),
+        )
+        .await
+        .expect("secret force reject");
+
+    assert!(!response.created);
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    let route = response.route.expect("reject route info");
+    assert_eq!(route.route, MemorySemanticWriteRoute::Rejected);
+    assert_eq!(route.quality_action, MemoryQualityAction::ForceReject);
+    assert_eq!(
+        route.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::Reject
+    );
+    assert!(route.quality_decision_id.is_some());
+
+    let search = service
+        .search(
+            user_context(394),
+            MemorySearchParams {
+                query: "abc123".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+}
+
+#[tokio::test]
+async fn semantic_quarantine_response_is_audit_only_terminal_route() {
+    let (_store, _backend, service) = setup_service().await;
+    let response = service
+        .write_semantic_memory(
+            user_context(395),
+            semantic_write_params(
+                unknown_custom_semantic(),
+                "Unknown custom fact should stay audit-only.",
+                "unknown custom fact",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_quarantine_audit_only_route",
+            ),
+        )
+        .await
+        .expect("quarantine route");
+
+    assert!(!response.created);
+    assert!(response.record.is_none());
+    assert!(response.candidate.is_none());
+    let route = response.route.expect("audit-only route info");
+    assert_eq!(route.route, MemorySemanticWriteRoute::AuditOnly);
+    assert_eq!(route.quality_action, MemoryQualityAction::Quarantine);
+    assert_eq!(
+        route.target_ownership,
+        pioneer_protocol::MemoryOwnershipClass::AuditOnly
+    );
+    assert!(route.quality_decision_id.is_some());
+
+    let recall = service
+        .recall_for_prompt(
+            user_context(396),
+            MemoryRecallParams {
+                query: "unknown custom fact".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recall");
+    assert!(recall.items.is_empty());
+}
+
+#[tokio::test]
+async fn semantic_weak_evidence_and_unknown_lifetime_do_not_create_review_candidates() {
+    let (store, _backend, service) = setup_service().await;
+    let mut weak_params = semantic_write_params(
+        identity_name_semantic(MemoryExplicitness::Explicit),
+        "User name might be Alexander.",
+        "Alexander",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_weak_evidence_terminal",
+    );
+    weak_params.source_context_kind = Some(MemorySourceContextKind::Unknown);
+
+    let weak = service
+        .write_semantic_memory(user_context(397), weak_params)
+        .await
+        .expect("weak evidence write");
+    assert!(weak.record.is_none());
+    assert!(weak.candidate.is_none());
+    let weak_route = weak.route.expect("weak evidence route");
+    assert_eq!(weak_route.route, MemorySemanticWriteRoute::Rejected);
+    assert_eq!(weak_route.quality_action, MemoryQualityAction::ForceReject);
+
+    let mut unknown_lifetime_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+    unknown_lifetime_semantic.durability = MemoryDurability::Unknown;
+    let unknown_lifetime = service
+        .write_semantic_memory(
+            user_context(398),
+            semantic_write_params(
+                unknown_lifetime_semantic,
+                "User name is Alexander.",
+                "Alexander",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_unknown_lifetime_quarantine",
+            ),
+        )
+        .await
+        .expect("unknown lifetime write");
+    assert!(unknown_lifetime.record.is_none());
+    assert!(unknown_lifetime.candidate.is_none());
+    let unknown_lifetime_route = unknown_lifetime.route.expect("unknown lifetime route");
+    assert_eq!(
+        unknown_lifetime_route.route,
+        MemorySemanticWriteRoute::AuditOnly
+    );
+    assert_eq!(
+        unknown_lifetime_route.quality_action,
+        MemoryQualityAction::Quarantine
+    );
+
+    let listed = service
+        .list_candidates(
+            user_context(399),
+            pioneer_protocol::MemoryCandidatesListParams::default(),
+        )
+        .await
+        .expect("list candidates");
+    assert!(listed.candidates.is_empty());
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_weak_evidence_terminal")
+            && decision.action == MemoryQualityAction::ForceReject
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_unknown_lifetime_quarantine")
+            && decision.action == MemoryQualityAction::Quarantine
+    }));
 }
 
 #[tokio::test]

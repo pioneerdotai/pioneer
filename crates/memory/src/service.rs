@@ -10,6 +10,9 @@ use crate::convert::{
     content_preview, crud_candidate_to_protocol, crud_record_to_protocol, effective_provenance,
     metadata_with_idempotency, protocol_actor_to_crud,
 };
+use crate::ownership_route::{
+    MemoryOwnershipRoute, MemoryOwnershipRouteInput, resolve_memory_ownership_route,
+};
 use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
     POLICY_DECISION_ERROR,
@@ -33,8 +36,9 @@ use anyhow::{Context, Result, bail};
 use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryControlRecord, AgentMemoryListFilter,
-    AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryCandidate, NewAgentMemoryControlRecord,
-    NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
+    AgentMemoryQualityDecisionRecord, AgentMemoryRepairJobRecord, CrudStore,
+    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision,
+    NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
@@ -47,12 +51,13 @@ use pioneer_protocol::{
     MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
     MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
-    MemoryProvenance, MemoryQualityAction, MemoryQualityDecision, MemoryRecord,
-    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint,
-    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
-    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
-    MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemorySourceKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, generate_id,
+    MemoryProvenance, MemoryQualityDecision, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
+    MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -354,15 +359,18 @@ impl MemoryService {
                     MemoryWriteRelation::Duplicate,
                     sensitivity,
                 );
-                self.record_quality_decision(
-                    &quality_input,
-                    &quality_decision,
-                    &context,
-                    Some(memory_id.clone()),
-                    None,
-                    now,
-                )
-                .await?;
+                let ownership_route =
+                    Self::quality_ownership_route(&quality_input, &quality_decision);
+                let quality_record = self
+                    .record_quality_decision(
+                        &quality_input,
+                        &quality_decision,
+                        &context,
+                        Some(memory_id.clone()),
+                        None,
+                        now,
+                    )
+                    .await?;
                 self.record_semantic_write_relation(
                     MemoryWriteRelation::Duplicate,
                     "active_duplicate",
@@ -372,7 +380,7 @@ impl MemoryService {
                     now,
                 )
                 .await?;
-                return Ok(MemorySemanticWriteResponse {
+                let response = MemorySemanticWriteResponse {
                     relation: MemoryWriteRelation::Duplicate,
                     canonical_key: prepared.canonical,
                     semantic_fingerprint: prepared.semantic_fingerprint,
@@ -381,7 +389,14 @@ impl MemoryService {
                     created: false,
                     superseded_memory_id: None,
                     evidence_merged: true,
-                });
+                    route: None,
+                };
+                return Ok(Self::with_quality_route(
+                    response,
+                    &quality_decision,
+                    &ownership_route,
+                    Some(quality_record.id),
+                ));
             }
 
             if disposition == MemorySemanticWriteDisposition::AcceptActive
@@ -395,19 +410,28 @@ impl MemoryService {
                     MemoryWriteRelation::CompatibleUpdate,
                     sensitivity,
                 );
-                if quality_decision.action != MemoryQualityAction::CandidatePolicy {
-                    self.record_quality_decision(
-                        &quality_input,
-                        &quality_decision,
-                        &relation_context,
-                        Some(superseded_memory_id),
-                        None,
-                        now,
-                    )
-                    .await?;
-                    return Ok(Self::quality_suppressed_response(
+                let ownership_route =
+                    Self::quality_ownership_route(&quality_input, &quality_decision);
+                if ownership_route.is_terminal_non_memory_route() {
+                    let quality_record = self
+                        .record_quality_decision(
+                            &quality_input,
+                            &quality_decision,
+                            &relation_context,
+                            Some(superseded_memory_id),
+                            None,
+                            now,
+                        )
+                        .await?;
+                    let response = Self::quality_suppressed_response(
                         MemoryWriteRelation::CompatibleUpdate,
                         prepared,
+                    );
+                    return Ok(Self::with_quality_route(
+                        response,
+                        &quality_decision,
+                        &ownership_route,
+                        Some(quality_record.id),
                     ));
                 }
                 let response = self
@@ -431,15 +455,23 @@ impl MemoryService {
                     created: response.created,
                     superseded_memory_id: response.superseded_memory_id,
                     evidence_merged: false,
+                    route: None,
                 };
-                self.record_quality_decision_for_response(
-                    &quality_input,
+                let quality_record = self
+                    .record_quality_decision_for_response(
+                        &quality_input,
+                        &quality_decision,
+                        &relation_context,
+                        &semantic_response,
+                        now,
+                    )
+                    .await?;
+                let semantic_response = Self::with_quality_route(
+                    semantic_response,
                     &quality_decision,
-                    &relation_context,
-                    &semantic_response,
-                    now,
-                )
-                .await?;
+                    &ownership_route,
+                    Some(quality_record.id),
+                );
                 self.record_semantic_write_relation(
                     MemoryWriteRelation::CompatibleUpdate,
                     "active_supersession",
@@ -461,7 +493,8 @@ impl MemoryService {
                 MemoryWriteRelation::Contradiction,
                 sensitivity,
             );
-            let response = if quality_decision.action == MemoryQualityAction::CandidatePolicy {
+            let ownership_route = Self::quality_ownership_route(&quality_input, &quality_decision);
+            let response = if ownership_route.permits_candidate_policy() {
                 let response = self
                     .route_semantic_candidate_policy(
                         context.clone(),
@@ -473,29 +506,44 @@ impl MemoryService {
                         None,
                         &quality_input,
                         &quality_decision,
+                        &ownership_route,
                         now,
                     )
                     .await?;
-                self.record_quality_decision_for_response(
-                    &quality_input,
+                let quality_record = self
+                    .record_quality_decision_for_response(
+                        &quality_input,
+                        &quality_decision,
+                        &context,
+                        &response,
+                        now,
+                    )
+                    .await?;
+                Self::with_quality_route(
+                    response,
                     &quality_decision,
-                    &context,
-                    &response,
-                    now,
+                    &ownership_route,
+                    Some(quality_record.id),
                 )
-                .await?;
-                response
             } else {
-                self.record_quality_decision(
-                    &quality_input,
+                let quality_record = self
+                    .record_quality_decision(
+                        &quality_input,
+                        &quality_decision,
+                        &context,
+                        Some(existing.id.clone()),
+                        None,
+                        now,
+                    )
+                    .await?;
+                let response =
+                    Self::quality_suppressed_response(MemoryWriteRelation::Contradiction, prepared);
+                Self::with_quality_route(
+                    response,
                     &quality_decision,
-                    &context,
-                    Some(existing.id.clone()),
-                    None,
-                    now,
+                    &ownership_route,
+                    Some(quality_record.id),
                 )
-                .await?;
-                Self::quality_suppressed_response(MemoryWriteRelation::Contradiction, prepared)
             };
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Contradiction,
@@ -527,15 +575,17 @@ impl MemoryService {
                 MemoryWriteRelation::SuppressedByRejection,
                 sensitivity,
             );
-            self.record_quality_decision(
-                &quality_input,
-                &quality_decision,
-                &context,
-                None,
-                Some(rejected.id.clone()),
-                now,
-            )
-            .await?;
+            let ownership_route = Self::quality_ownership_route(&quality_input, &quality_decision);
+            let quality_record = self
+                .record_quality_decision(
+                    &quality_input,
+                    &quality_decision,
+                    &context,
+                    None,
+                    Some(rejected.id.clone()),
+                    now,
+                )
+                .await?;
             self.record_semantic_write_relation(
                 MemoryWriteRelation::SuppressedByRejection,
                 "suppressed_duplicate",
@@ -545,9 +595,15 @@ impl MemoryService {
                 now,
             )
             .await?;
-            return Ok(Self::quality_suppressed_response(
+            let response = Self::quality_suppressed_response(
                 MemoryWriteRelation::SuppressedByRejection,
                 prepared,
+            );
+            return Ok(Self::with_quality_route(
+                response,
+                &quality_decision,
+                &ownership_route,
+                Some(quality_record.id),
             ));
         }
 
@@ -592,15 +648,17 @@ impl MemoryService {
                 MemoryWriteRelation::Duplicate,
                 sensitivity,
             );
-            self.record_quality_decision(
-                &quality_input,
-                &quality_decision,
-                &context,
-                None,
-                Some(pending_id),
-                now,
-            )
-            .await?;
+            let ownership_route = Self::quality_ownership_route(&quality_input, &quality_decision);
+            let quality_record = self
+                .record_quality_decision(
+                    &quality_input,
+                    &quality_decision,
+                    &context,
+                    None,
+                    Some(pending_id),
+                    now,
+                )
+                .await?;
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Duplicate,
                 "pending_duplicate",
@@ -610,7 +668,7 @@ impl MemoryService {
                 now,
             )
             .await?;
-            return Ok(MemorySemanticWriteResponse {
+            let response = MemorySemanticWriteResponse {
                 relation: MemoryWriteRelation::Duplicate,
                 canonical_key: prepared.canonical,
                 semantic_fingerprint: prepared.semantic_fingerprint,
@@ -619,7 +677,14 @@ impl MemoryService {
                 created: false,
                 superseded_memory_id: None,
                 evidence_merged: true,
-            });
+                route: None,
+            };
+            return Ok(Self::with_quality_route(
+                response,
+                &quality_decision,
+                &ownership_route,
+                Some(quality_record.id),
+            ));
         }
 
         let relation_context = context.clone();
@@ -629,16 +694,18 @@ impl MemoryService {
             MemoryWriteRelation::Novel,
             sensitivity,
         );
-        if quality_decision.action != MemoryQualityAction::CandidatePolicy {
-            self.record_quality_decision(
-                &quality_input,
-                &quality_decision,
-                &relation_context,
-                None,
-                None,
-                now,
-            )
-            .await?;
+        let ownership_route = Self::quality_ownership_route(&quality_input, &quality_decision);
+        if ownership_route.is_terminal_non_memory_route() {
+            let quality_record = self
+                .record_quality_decision(
+                    &quality_input,
+                    &quality_decision,
+                    &relation_context,
+                    None,
+                    None,
+                    now,
+                )
+                .await?;
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Novel,
                 "quality_gate_suppressed",
@@ -648,9 +715,12 @@ impl MemoryService {
                 now,
             )
             .await?;
-            return Ok(Self::quality_suppressed_response(
-                MemoryWriteRelation::Novel,
-                prepared,
+            let response = Self::quality_suppressed_response(MemoryWriteRelation::Novel, prepared);
+            return Ok(Self::with_quality_route(
+                response,
+                &quality_decision,
+                &ownership_route,
+                Some(quality_record.id),
             ));
         }
 
@@ -676,15 +746,23 @@ impl MemoryService {
                 created: response.created,
                 superseded_memory_id: response.superseded_memory_id,
                 evidence_merged: false,
+                route: None,
             };
-            self.record_quality_decision_for_response(
-                &quality_input,
+            let quality_record = self
+                .record_quality_decision_for_response(
+                    &quality_input,
+                    &quality_decision,
+                    &relation_context,
+                    &semantic_response,
+                    now,
+                )
+                .await?;
+            let semantic_response = Self::with_quality_route(
+                semantic_response,
                 &quality_decision,
-                &relation_context,
-                &semantic_response,
-                now,
-            )
-            .await?;
+                &ownership_route,
+                Some(quality_record.id),
+            );
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Novel,
                 "active_created",
@@ -731,15 +809,23 @@ impl MemoryService {
                 created: true,
                 superseded_memory_id: None,
                 evidence_merged: false,
+                route: None,
             };
-            self.record_quality_decision_for_response(
-                &quality_input,
+            let quality_record = self
+                .record_quality_decision_for_response(
+                    &quality_input,
+                    &quality_decision,
+                    &relation_context,
+                    &semantic_response,
+                    now,
+                )
+                .await?;
+            let semantic_response = Self::with_quality_route(
+                semantic_response,
                 &quality_decision,
-                &relation_context,
-                &semantic_response,
-                now,
-            )
-            .await?;
+                &ownership_route,
+                Some(quality_record.id),
+            );
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Novel,
                 if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
@@ -767,18 +853,25 @@ impl MemoryService {
                 None,
                 &quality_input,
                 &quality_decision,
+                &ownership_route,
                 now,
             )
             .await?;
-        self.record_quality_decision_for_response(
-            &quality_input,
+        let quality_record = self
+            .record_quality_decision_for_response(
+                &quality_input,
+                &quality_decision,
+                &relation_context,
+                &response,
+                now,
+            )
+            .await?;
+        Ok(Self::with_quality_route(
+            response,
             &quality_decision,
-            &relation_context,
-            &response,
-            now,
-        )
-        .await?;
-        Ok(response)
+            &ownership_route,
+            Some(quality_record.id),
+        ))
     }
 
     pub async fn get(
@@ -1639,8 +1732,13 @@ impl MemoryService {
         supersedes: Option<String>,
         quality_input: &MemoryQualityGateInput,
         quality_decision: &MemoryQualityDecision,
+        ownership_route: &MemoryOwnershipRoute,
         now: i64,
     ) -> Result<MemorySemanticWriteResponse> {
+        if !ownership_route.permits_candidate_policy() {
+            return Ok(Self::quality_suppressed_response(relation, prepared));
+        }
+
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
         let provenance = semantic_write_provenance(&params, &context);
         let policy_input = MemoryCandidatePolicyInput {
@@ -1716,6 +1814,7 @@ impl MemoryService {
                 created: response.created,
                 superseded_memory_id: response.superseded_memory_id,
                 evidence_merged: false,
+                route: None,
             });
         }
 
@@ -1769,6 +1868,7 @@ impl MemoryService {
             created: true,
             superseded_memory_id: None,
             evidence_merged: false,
+            route: None,
         })
     }
 
@@ -2047,7 +2147,7 @@ impl MemoryService {
         memory_id: Option<String>,
         candidate_id: Option<String>,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<AgentMemoryQualityDecisionRecord> {
         self.store
             .insert_agent_memory_quality_decision(NewAgentMemoryQualityDecision {
                 workspace_id: context
@@ -2080,8 +2180,7 @@ impl MemoryService {
                 created_at_unix: now,
                 updated_at_unix: now,
             })
-            .await?;
-        Ok(())
+            .await
     }
 
     async fn record_quality_decision_for_response(
@@ -2091,7 +2190,7 @@ impl MemoryService {
         context: &MemoryOperationContext,
         response: &MemorySemanticWriteResponse,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<AgentMemoryQualityDecisionRecord> {
         self.record_quality_decision(
             input,
             decision,
@@ -2119,7 +2218,37 @@ impl MemoryService {
             created: false,
             superseded_memory_id: None,
             evidence_merged: false,
+            route: None,
         }
+    }
+
+    fn quality_ownership_route(
+        quality_input: &MemoryQualityGateInput,
+        quality_decision: &MemoryQualityDecision,
+    ) -> MemoryOwnershipRoute {
+        resolve_memory_ownership_route(MemoryOwnershipRouteInput::from_quality(
+            quality_input,
+            quality_decision,
+        ))
+    }
+
+    fn with_quality_route(
+        mut response: MemorySemanticWriteResponse,
+        quality_decision: &MemoryQualityDecision,
+        ownership_route: &MemoryOwnershipRoute,
+        quality_decision_id: Option<String>,
+    ) -> MemorySemanticWriteResponse {
+        response.route = Some(MemorySemanticWriteRouteInfo {
+            route: ownership_route.semantic_write_route(),
+            quality_action: quality_decision.action,
+            target_ownership: quality_decision.target_ownership,
+            quality_decision_id,
+            thread_id: ownership_route.thread_id.clone(),
+            source_turn_id: ownership_route.source_turn_id.clone(),
+            source_item_id: ownership_route.source_item_id.clone(),
+            canonical_key: ownership_route.canonical_key.clone(),
+        });
+        response
     }
 
     async fn resolve_backend_search_scopes(

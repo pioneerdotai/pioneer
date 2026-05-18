@@ -1,3 +1,7 @@
+use crate::extractor_ontology::{
+    MemoryExtractorOntologyProposal, MemoryExtractorOntologyProposalComparison,
+    extractor_ontology_proposal_from_metadata,
+};
 use crate::quality::{MemoryOntologyClassification, MemorySourceContextClassification};
 use pioneer_protocol::{
     MemoryEvidenceClass, MemoryFactClass, MemoryLifetimeClass, MemoryOwnershipClass,
@@ -25,6 +29,10 @@ pub(crate) struct MemoryQualityGateInput {
     pub source_item_id: Option<String>,
     pub task_id: Option<String>,
     pub workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_ontology_proposal: Option<MemoryExtractorOntologyProposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_ontology_proposal_comparison: Option<MemoryExtractorOntologyProposalComparison>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -582,6 +590,11 @@ pub(crate) fn memory_quality_gate_input_from_semantic_write(
     canonical_key: Option<String>,
     memory_write_disabled_for_turn: bool,
 ) -> MemoryQualityGateInput {
+    let ontology = source_context_adjusted_ontology(source_context, ontology);
+    let extractor_ontology_proposal = extractor_ontology_proposal_from_metadata(&params.metadata);
+    let extractor_ontology_proposal_comparison = extractor_ontology_proposal.map(|proposal| {
+        proposal.compare_to_service_classification(&ontology, source_context.evidence_class)
+    });
     MemoryQualityGateInput {
         source_context_kind: source_context.context_kind,
         fact_class: ontology.fact_class,
@@ -600,12 +613,34 @@ pub(crate) fn memory_quality_gate_input_from_semantic_write(
         source_item_id: source_context.item_id.clone(),
         task_id: source_context.task_id.clone(),
         workspace_id: source_context.workspace_id.clone(),
+        extractor_ontology_proposal,
+        extractor_ontology_proposal_comparison,
     }
+}
+
+fn source_context_adjusted_ontology(
+    source_context: &MemorySourceContextClassification,
+    ontology: MemoryOntologyClassification,
+) -> MemoryOntologyClassification {
+    if source_context.context_kind == MemorySourceContextKind::GeneratedSummary
+        && ontology.fact_class == MemoryFactClass::Unknown
+    {
+        return MemoryOntologyClassification {
+            fact_class: MemoryFactClass::GeneratedSummaryFact,
+            lifetime_class: MemoryLifetimeClass::Unknown,
+            proposed_ownership_class: MemoryOwnershipClass::ThreadEpisodicContext,
+        };
+    }
+
+    ontology
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extractor_ontology::{
+        MemoryExtractorOntologyProposal, insert_extractor_ontology_proposal_metadata,
+    };
     use pioneer_protocol::{
         MemoryAttribute, MemoryCategory, MemoryDurability, MemoryExplicitness,
         MemoryExtractorCertainty, MemoryIntent, MemoryScopeHint, MemoryScopeKind,
@@ -687,6 +722,78 @@ mod tests {
         );
         assert_eq!(input.canonical_key.as_deref(), Some("user:identity:name"));
         assert_eq!(input.source_thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn semantic_write_input_builder_keeps_extractor_proposal_advisory() {
+        let mut params = MemorySemanticWriteParams {
+            scope: MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "user:default".to_owned(),
+            },
+            semantic: user_identity_semantic(),
+            content: "irrelevant test content".to_owned(),
+            value: Some("Alexander".to_owned()),
+            evidence: None,
+            provenance: None,
+            source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
+            disposition: None,
+            client_provided_key: None,
+            confidence: None,
+            importance: None,
+            metadata: Default::default(),
+        };
+        let extractor_proposal = MemoryExtractorOntologyProposal {
+            fact_class: MemoryFactClass::ToolResultFact,
+            lifetime_class: MemoryLifetimeClass::NaturallyExpiring,
+            evidence_class: MemoryEvidenceClass::ToolObservation,
+            proposed_ownership_class: MemoryOwnershipClass::DomainRuntimeState,
+        };
+        insert_extractor_ontology_proposal_metadata(&mut params.metadata, extractor_proposal);
+
+        let source_context = MemorySourceContextClassification {
+            context_kind: MemorySourceContextKind::DirectUserConversation,
+            actor_role: pioneer_protocol::MemoryEvidenceActorRole::User,
+            evidence_class: MemoryEvidenceClass::DirectUserAssertion,
+            source_is_user_assertion: true,
+            source_is_system_owned_state: false,
+            thread_id: None,
+            turn_id: None,
+            item_id: None,
+            task_id: None,
+            workspace_id: None,
+        };
+        let service_ontology = MemoryOntologyClassification {
+            fact_class: MemoryFactClass::UserIdentity,
+            lifetime_class: MemoryLifetimeClass::LongLived,
+            proposed_ownership_class: MemoryOwnershipClass::DurableUserMemory,
+        };
+
+        let input = memory_quality_gate_input_from_semantic_write(
+            &params,
+            MemoryWriteRelation::Novel,
+            &source_context,
+            service_ontology,
+            MemorySensitivity::Personal,
+            Some("user:identity:name".to_owned()),
+            false,
+        );
+
+        assert_eq!(input.extractor_ontology_proposal, Some(extractor_proposal));
+        let comparison = input
+            .extractor_ontology_proposal_comparison
+            .expect("proposal comparison is computed");
+        assert!(!comparison.all_match);
+        assert!(!comparison.fact_class_matches);
+        assert_eq!(input.fact_class, MemoryFactClass::UserIdentity);
+        assert_eq!(
+            input.evidence_class,
+            MemoryEvidenceClass::DirectUserAssertion
+        );
+        assert_eq!(
+            input.ownership_class,
+            MemoryOwnershipClass::DurableUserMemory
+        );
     }
 
     #[test]
@@ -1299,6 +1406,8 @@ mod tests {
             source_item_id: None,
             task_id: None,
             workspace_id: None,
+            extractor_ontology_proposal: None,
+            extractor_ontology_proposal_comparison: None,
         }
     }
 

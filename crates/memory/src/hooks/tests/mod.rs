@@ -356,6 +356,40 @@ fn valid_post_turn_extractor_json() -> String {
     .to_string()
 }
 
+fn valid_post_turn_extractor_json_with_ontology() -> String {
+    serde_json::json!({
+        "facts": [{
+            "semantic": {
+                "intent": "explicit_store",
+                "explicitness": "explicit",
+                "category": "identity",
+                "subject": "current_user",
+                "attribute": "name",
+                "scope_hint": "user_global",
+                "durability": "long_lived",
+                "sensitivity": "personal",
+                "certainty": "high"
+            },
+            "ontology": {
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "durable_user_memory"
+            },
+            "content": "Имя пользователя: Александр",
+            "value": "Александр",
+            "evidence": {
+                "source_ref": "turn.post_turn:user",
+                "quote_or_span": "Меня зовут Александр",
+                "extractor_reason": "The user directly stated their name."
+            },
+            "confidence": 0.98,
+            "importance": 0.7
+        }]
+    })
+    .to_string()
+}
+
 fn implicit_post_turn_extractor_json() -> String {
     serde_json::json!({
         "facts": [{
@@ -673,6 +707,7 @@ fn test_semantic_write_response() -> MemorySemanticWriteResponse {
         created: false,
         superseded_memory_id: None,
         evidence_merged: false,
+        route: None,
     }
 }
 

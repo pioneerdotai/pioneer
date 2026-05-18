@@ -379,6 +379,34 @@ pub enum MemorySemanticWriteDisposition {
     RouteToCandidatePolicy,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySemanticWriteRoute {
+    DurableControlPlane,
+    ThreadEpisodicDeferred,
+    TaskStateDeferred,
+    DomainStateDeferred,
+    AuditOnly,
+    Rejected,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemorySemanticWriteRouteInfo {
+    pub route: MemorySemanticWriteRoute,
+    pub quality_action: MemoryQualityAction,
+    pub target_ownership: MemoryOwnershipClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_key: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct MemoryWriteEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -463,6 +491,8 @@ pub struct MemorySemanticWriteResponse {
     pub superseded_memory_id: Option<String>,
     #[serde(default)]
     pub evidence_merged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<MemorySemanticWriteRouteInfo>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -981,14 +1011,15 @@ pub struct MemoryForgottenNotification {
 mod tests {
     use super::{
         MemoryAttribute, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
-        MemoryCandidateScore, MemoryCandidateScoreBucket, MemoryCandidateStatus, MemoryCategory,
-        MemoryDurability, MemoryEvidenceActorRole, MemoryEvidenceClass, MemoryExplicitness,
-        MemoryExtractorCertainty, MemoryFactClass, MemoryForgetTarget, MemoryIntent,
-        MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityDecision,
-        MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint,
-        MemoryScopeKind, MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
-        MemorySemanticWriteParams, MemorySensitivityHint, MemorySourceContextKind, MemorySubject,
-        MemoryWriteEvidence, MemoryWriteRelation,
+        MemoryCandidateScore, MemoryCandidateScoreBucket, MemoryCandidateStatus,
+        MemoryCanonicalKey, MemoryCategory, MemoryDurability, MemoryEvidenceActorRole,
+        MemoryEvidenceClass, MemoryExplicitness, MemoryExtractorCertainty, MemoryFactClass,
+        MemoryForgetTarget, MemoryIntent, MemoryLifetimeClass, MemoryOwnershipClass,
+        MemoryQualityAction, MemoryQualityDecision, MemoryQualityReasonCode, MemoryRememberParams,
+        MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
+        MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+        MemorySemanticWriteRoute, MemorySemanticWriteRouteInfo, MemorySensitivityHint,
+        MemorySourceContextKind, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
     };
     use crate::constants;
     use serde_json::json;
@@ -1269,6 +1300,67 @@ mod tests {
         );
         assert_eq!(encoded["disposition"], json!("accept_active"));
         assert_eq!(encoded["client_provided_key"], json!("llm/freeform/key"));
+    }
+
+    #[test]
+    fn semantic_write_response_route_is_optional_and_typed() {
+        let decoded: MemorySemanticWriteResponse = serde_json::from_value(json!({
+            "relation": "novel",
+            "canonical_key": {
+                "scope": {"kind": "user", "key": "default"},
+                "namespace": "identity",
+                "category": "identity",
+                "key": "user/global:identity:self:name",
+                "cardinality": "single_value"
+            },
+            "semantic_fingerprint": "fingerprint",
+            "created": false,
+            "evidence_merged": false
+        }))
+        .expect("legacy response without route decodes");
+        assert!(decoded.route.is_none());
+
+        let encoded = serde_json::to_value(MemorySemanticWriteResponse {
+            relation: MemoryWriteRelation::Novel,
+            canonical_key: MemoryCanonicalKey {
+                scope: MemoryScope {
+                    kind: MemoryScopeKind::User,
+                    key: "default".to_owned(),
+                },
+                namespace: "identity".to_owned(),
+                category: MemoryCategory::Identity,
+                key: "user/global:identity:self:name".to_owned(),
+                cardinality: super::MemoryAttributeCardinality::SingleValue,
+            },
+            semantic_fingerprint: "fingerprint".to_owned(),
+            record: None,
+            candidate: None,
+            created: false,
+            superseded_memory_id: None,
+            evidence_merged: false,
+            route: Some(MemorySemanticWriteRouteInfo {
+                route: MemorySemanticWriteRoute::ThreadEpisodicDeferred,
+                quality_action: MemoryQualityAction::RouteToThreadEpisodic,
+                target_ownership: MemoryOwnershipClass::ThreadEpisodicContext,
+                quality_decision_id: Some("quality_1".to_owned()),
+                thread_id: Some("thread_1".to_owned()),
+                source_turn_id: Some("turn_1".to_owned()),
+                source_item_id: None,
+                canonical_key: Some("user/default:todo:self:follow_up".to_owned()),
+            }),
+        })
+        .expect("semantic write response encode");
+
+        assert_eq!(encoded["route"]["route"], json!("thread_episodic_deferred"));
+        assert_eq!(
+            encoded["route"]["quality_action"],
+            json!("route_to_thread_episodic")
+        );
+        assert_eq!(
+            encoded["route"]["target_ownership"],
+            json!("thread_episodic_context")
+        );
+        assert_eq!(encoded["route"]["quality_decision_id"], json!("quality_1"));
     }
 
     #[test]

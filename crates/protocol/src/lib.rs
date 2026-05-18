@@ -85,8 +85,9 @@ pub use memory::{
     MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity,
     MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
-    MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemorySourceKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemorySemanticWriteResponse, MemorySemanticWriteRoute, MemorySemanticWriteRouteInfo,
+    MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use provider::{

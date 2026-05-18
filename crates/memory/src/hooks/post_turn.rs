@@ -1,5 +1,14 @@
 use super::*;
-use pioneer_protocol::{MemoryAttribute, MemoryExtractorCertainty, MemorySubject};
+use crate::extractor_ontology::{
+    MemoryExtractorOntologyProposal, insert_extractor_ontology_proposal_metadata,
+    proposal_has_unknown_class,
+};
+use pioneer_protocol::{
+    MemoryAttribute, MemoryEvidenceClass, MemoryExtractorCertainty, MemoryOwnershipClass,
+    MemorySubject,
+};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 
 pub(super) fn memory_post_turn_extractor_context_from_turn(
     context: &MemoryTurnContext,
@@ -126,12 +135,14 @@ pub(super) fn turn_post_domain_events_summary(
 pub(super) struct MemoryPostTurnParsedFacts {
     pub(super) facts: Vec<MemoryPostTurnExtractedFact>,
     pub(super) raw_fact_count: usize,
+    pub(super) validation_rejected_count: usize,
     pub(super) diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct MemoryPostTurnExtractedFact {
     pub(super) semantic: MemorySemanticFields,
+    pub(super) ontology_proposal: Option<MemoryExtractorOntologyProposal>,
     pub(super) content: String,
     pub(super) value: Option<String>,
     pub(super) evidence: MemoryWriteEvidence,
@@ -148,6 +159,16 @@ pub(super) struct MemoryPostTurnExtractorJson {
 #[derive(Debug, Deserialize)]
 pub(super) struct MemoryPostTurnExtractedFactJson {
     semantic: MemorySemanticFields,
+    #[serde(default)]
+    ontology: Option<Value>,
+    #[serde(default)]
+    fact_class: Option<Value>,
+    #[serde(default)]
+    lifetime_class: Option<Value>,
+    #[serde(default)]
+    evidence_class: Option<Value>,
+    #[serde(default)]
+    proposed_ownership_class: Option<Value>,
     content: String,
     #[serde(default)]
     value: Option<String>,
@@ -161,6 +182,7 @@ pub(super) fn parse_memory_post_turn_extractor_json(
     let parsed = serde_json::from_str::<MemoryPostTurnExtractorJson>(raw.trim())
         .map_err(|error| error.to_string())?;
     let raw_fact_count = parsed.facts.len();
+    let mut validation_rejected_count = 0;
     let mut diagnostics = Vec::new();
     let mut facts = Vec::new();
     for (index, fact) in parsed
@@ -170,10 +192,20 @@ pub(super) fn parse_memory_post_turn_extractor_json(
         .enumerate()
     {
         match validate_memory_post_turn_fact(fact, config) {
-            Ok(fact) => facts.push(fact),
-            Err(error) => diagnostics.push(format!(
-                "memory.post_turn_extractor.fact_rejected: index={index} reason={error}"
-            )),
+            Ok(fact) => {
+                if fact.ontology_proposal.is_none() {
+                    diagnostics.push(format!(
+                        "memory.post_turn_extractor.ontology_proposal_missing: index={index}"
+                    ));
+                }
+                facts.push(fact);
+            }
+            Err(error) => {
+                validation_rejected_count += 1;
+                diagnostics.push(format!(
+                    "memory.post_turn_extractor.fact_rejected: index={index} reason={error}"
+                ));
+            }
         }
     }
     if raw_fact_count > config.max_facts_per_turn {
@@ -185,6 +217,7 @@ pub(super) fn parse_memory_post_turn_extractor_json(
     Ok(MemoryPostTurnParsedFacts {
         facts,
         raw_fact_count,
+        validation_rejected_count,
         diagnostics,
     })
 }
@@ -203,12 +236,6 @@ pub(super) fn validate_memory_post_turn_fact(
         return Err("missing_explicitness");
     }
     if matches!(
-        fact.semantic.durability,
-        MemoryDurability::Transient | MemoryDurability::SessionOnly
-    ) {
-        return Err("transient_or_session_only");
-    }
-    if matches!(
         fact.semantic.sensitivity,
         MemorySensitivityHint::Secret | MemorySensitivityHint::Regulated
     ) {
@@ -223,6 +250,25 @@ pub(super) fn validate_memory_post_turn_fact(
             .unwrap_or(false)
     {
         return Err("assistant_self_description");
+    }
+    if fact.semantic.subject == MemorySubject::CurrentUser
+        && fact
+            .evidence
+            .source_ref
+            .as_deref()
+            .map(is_assistant_post_turn_source_ref)
+            .unwrap_or(false)
+    {
+        return Err("assistant_inference_about_user");
+    }
+    let ontology_proposal = parse_memory_post_turn_ontology_proposal(&fact)?;
+    validate_ontology_proposal_sufficient(ontology_proposal.as_ref(), &fact)?;
+    if matches!(
+        fact.semantic.durability,
+        MemoryDurability::Transient | MemoryDurability::SessionOnly
+    ) && !ontology_proposal_allows_non_durable_route(ontology_proposal.as_ref())
+    {
+        return Err("transient_or_session_only");
     }
     let semantic = normalized_post_turn_fact_semantic(fact.semantic);
     let Some(content) = bounded_nonempty_text(fact.content.as_str(), config.max_fact_content_chars)
@@ -249,6 +295,7 @@ pub(super) fn validate_memory_post_turn_fact(
     let importance = Some(computed_post_turn_fact_importance(&semantic));
     Ok(MemoryPostTurnExtractedFact {
         semantic,
+        ontology_proposal,
         content,
         value: fact
             .value
@@ -258,6 +305,106 @@ pub(super) fn validate_memory_post_turn_fact(
         confidence,
         importance,
     })
+}
+
+fn validate_ontology_proposal_sufficient(
+    proposal: Option<&MemoryExtractorOntologyProposal>,
+    fact: &MemoryPostTurnExtractedFactJson,
+) -> Result<(), &'static str> {
+    let Some(proposal) = proposal else {
+        return Ok(());
+    };
+    if fact
+        .evidence
+        .source_ref
+        .as_deref()
+        .map(|source_ref| source_ref.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err("missing_evidence_source_ref");
+    }
+    if proposal.evidence_class == MemoryEvidenceClass::MissingOrWeak {
+        return Err("weak_evidence_class");
+    }
+    if matches!(
+        proposal.proposed_ownership_class,
+        MemoryOwnershipClass::AuditOnly | MemoryOwnershipClass::Reject
+    ) {
+        return Err("unclear_or_rejected_ownership");
+    }
+    Ok(())
+}
+
+fn ontology_proposal_allows_non_durable_route(
+    proposal: Option<&MemoryExtractorOntologyProposal>,
+) -> bool {
+    proposal
+        .map(|proposal| {
+            matches!(
+                proposal.proposed_ownership_class,
+                MemoryOwnershipClass::ThreadEpisodicContext
+                    | MemoryOwnershipClass::TaskRuntimeState
+                    | MemoryOwnershipClass::DomainRuntimeState
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn parse_memory_post_turn_ontology_proposal(
+    fact: &MemoryPostTurnExtractedFactJson,
+) -> Result<Option<MemoryExtractorOntologyProposal>, &'static str> {
+    let nested = match fact.ontology.as_ref() {
+        Some(Value::Object(map)) => Some(map),
+        Some(_) => return Err("invalid_ontology_proposal"),
+        None => None,
+    };
+    let has_flat = fact.fact_class.is_some()
+        || fact.lifetime_class.is_some()
+        || fact.evidence_class.is_some()
+        || fact.proposed_ownership_class.is_some();
+    if nested.is_none() && !has_flat {
+        return Ok(None);
+    }
+
+    let fact_class = proposal_value(nested, &fact.fact_class, "fact_class")
+        .ok_or("partial_ontology_proposal")?;
+    let lifetime_class = proposal_value(nested, &fact.lifetime_class, "lifetime_class")
+        .ok_or("partial_ontology_proposal")?;
+    let evidence_class = proposal_value(nested, &fact.evidence_class, "evidence_class")
+        .ok_or("partial_ontology_proposal")?;
+    let proposed_ownership_class = proposal_value(
+        nested,
+        &fact.proposed_ownership_class,
+        "proposed_ownership_class",
+    )
+    .ok_or("partial_ontology_proposal")?;
+
+    let proposal = MemoryExtractorOntologyProposal {
+        fact_class: parse_proposal_enum(fact_class)?,
+        lifetime_class: parse_proposal_enum(lifetime_class)?,
+        evidence_class: parse_proposal_enum(evidence_class)?,
+        proposed_ownership_class: parse_proposal_enum(proposed_ownership_class)?,
+    };
+    if proposal_has_unknown_class(&proposal) {
+        return Err("unknown_ontology_proposal");
+    }
+
+    Ok(Some(proposal))
+}
+
+fn proposal_value<'a>(
+    nested: Option<&'a Map<String, Value>>,
+    flat: &'a Option<Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    nested.and_then(|map| map.get(key)).or(flat.as_ref())
+}
+
+fn parse_proposal_enum<T>(value: &Value) -> Result<T, &'static str>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value::<T>(value.clone()).map_err(|_| "invalid_ontology_proposal_enum")
 }
 
 fn normalized_post_turn_fact_semantic(mut semantic: MemorySemanticFields) -> MemorySemanticFields {
@@ -439,6 +586,9 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         "proactive_writes_enabled".to_owned(),
         serde_json::json!(config.proactive_writes_enabled),
     );
+    if let Some(proposal) = fact.ontology_proposal {
+        insert_extractor_ontology_proposal_metadata(&mut metadata, proposal);
+    }
     if let Some(model) = bounded_nonempty_text(model.unwrap_or_default(), 160) {
         metadata.insert("model".to_owned(), serde_json::json!(model));
     }
