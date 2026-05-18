@@ -165,6 +165,17 @@ pub enum MemoryEvidenceClass {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum MemoryQualityAction {
+    CandidatePolicy,
+    ForceReject,
+    Quarantine,
+    RouteToThreadEpisodic,
+    RouteToTaskState,
+    RouteToDomainState,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryQualityReasonCode {
     SourceEligible,
     SourceIneligible,
@@ -180,8 +191,50 @@ pub enum MemoryQualityReasonCode {
     SensitivityRestricted,
     Duplicate,
     Contradiction,
+    MemoryWriteDisabledForTurn,
+    SecretOrCredential,
+    RegulatedSensitiveWithoutUserApproval,
+    SystemOwnedStateNotMemory,
+    SourceNotAuthoritativeForDurableMemory,
+    TaskStateNotUserMemory,
+    ToolResultNotUserMemory,
+    AssistantInferenceNotDurableEvidence,
+    WeakOrMissingEvidence,
+    DuplicateExistingMemory,
+    RouteThreadEpisodic,
+    RouteTaskState,
+    RouteDomainState,
+    TaskLifetime,
+    ToolOwnedState,
+    GeneratedSummaryNotDurableMemory,
+    CandidatePolicyAllowed,
+    DurableUserIdentity,
+    DurableUserProfile,
+    DurableUserPreference,
+    DurableRecurringInstruction,
+    DurableProjectMemory,
+    UserConfirmedAgentMemory,
+    CompatibleUpdate,
+    ContradictsExistingMemory,
+    RequiresResolution,
+    NovelCandidate,
+    UnknownSourceContext,
+    UnknownFactClass,
+    UnknownLifetime,
+    SourcePolicyMissing,
+    NoQualityAllowRule,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct MemoryQualityDecision {
+    pub action: MemoryQualityAction,
+    pub target_ownership: MemoryOwnershipClass,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<MemoryQualityReasonCode>,
+    #[serde(default)]
+    pub candidate_auto_approve_allowed: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,10 +922,11 @@ mod tests {
         MemoryCandidateScore, MemoryCandidateScoreBucket, MemoryCandidateStatus, MemoryCategory,
         MemoryDurability, MemoryEvidenceActorRole, MemoryEvidenceClass, MemoryExplicitness,
         MemoryExtractorCertainty, MemoryFactClass, MemoryForgetTarget, MemoryIntent,
-        MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityReasonCode, MemoryRememberParams,
-        MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
-        MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySensitivityHint,
-        MemorySourceContextKind, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+        MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityDecision,
+        MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint,
+        MemoryScopeKind, MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
+        MemorySemanticWriteParams, MemorySensitivityHint, MemorySourceContextKind, MemorySubject,
+        MemoryWriteEvidence, MemoryWriteRelation,
     };
     use crate::constants;
     use serde_json::json;
@@ -1049,6 +1103,24 @@ mod tests {
             serde_json::to_value(MemoryQualityReasonCode::OwnershipMismatch)
                 .expect("quality reason code encode"),
             json!("ownership_mismatch")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryQualityAction::CandidatePolicy)
+                .expect("quality action encode"),
+            json!("candidate_policy")
+        );
+        let decision = MemoryQualityDecision {
+            action: MemoryQualityAction::Quarantine,
+            target_ownership: MemoryOwnershipClass::AuditOnly,
+            reason_codes: vec![MemoryQualityReasonCode::NoQualityAllowRule],
+            candidate_auto_approve_allowed: false,
+        };
+        let encoded_decision =
+            serde_json::to_value(decision).expect("quality decision should encode");
+        assert_eq!(encoded_decision["action"], json!("quarantine"));
+        assert_eq!(
+            encoded_decision["reason_codes"],
+            json!(["no_quality_allow_rule"])
         );
 
         let decoded: MemoryFactClass =

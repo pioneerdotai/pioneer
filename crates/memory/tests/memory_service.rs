@@ -13,11 +13,11 @@ use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
     MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
     MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
-    MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryRememberParams,
-    MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
-    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
-    MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryListParams, MemoryQualityAction,
+    MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
+    MemorySemanticWriteParams, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -160,6 +160,118 @@ fn relationship_semantic(person_key: &str) -> MemorySemanticFields {
     }
 }
 
+fn user_preference_semantic(explicitness: MemoryExplicitness) -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: match explicitness {
+            MemoryExplicitness::Explicit => MemoryIntent::ExplicitStore,
+            MemoryExplicitness::Implicit
+            | MemoryExplicitness::None
+            | MemoryExplicitness::Unclear => MemoryIntent::ImplicitCandidate,
+        },
+        explicitness,
+        category: MemoryCategory::Preference,
+        subject: MemorySubject::CurrentUser,
+        attribute: MemoryAttribute::ReviewStyle,
+        subject_key: None,
+        custom_subject: None,
+        custom_attribute: None,
+        scope_hint: MemoryScopeHint::UserGlobal,
+        durability: MemoryDurability::LongLived,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn workspace_project_decision_semantic(explicitness: MemoryExplicitness) -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: match explicitness {
+            MemoryExplicitness::Explicit => MemoryIntent::ExplicitStore,
+            MemoryExplicitness::Implicit
+            | MemoryExplicitness::None
+            | MemoryExplicitness::Unclear => MemoryIntent::ImplicitCandidate,
+        },
+        explicitness,
+        category: MemoryCategory::ProjectDecision,
+        subject: MemorySubject::Workspace,
+        attribute: MemoryAttribute::MigrationPolicy,
+        subject_key: None,
+        custom_subject: None,
+        custom_attribute: None,
+        scope_hint: MemoryScopeHint::ProjectWorkspace,
+        durability: MemoryDurability::ProjectLifetime,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn thread_local_todo_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::Todo,
+        subject: MemorySubject::CurrentUser,
+        attribute: MemoryAttribute::Custom,
+        subject_key: None,
+        custom_subject: None,
+        custom_attribute: Some("thread_follow_up".to_owned()),
+        scope_hint: MemoryScopeHint::UserWorkspace,
+        durability: MemoryDurability::SessionOnly,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn task_lifecycle_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::Todo,
+        subject: MemorySubject::Project,
+        attribute: MemoryAttribute::Custom,
+        subject_key: Some("project".to_owned()),
+        custom_subject: None,
+        custom_attribute: Some("task_state".to_owned()),
+        scope_hint: MemoryScopeHint::ProjectWorkspace,
+        durability: MemoryDurability::SessionOnly,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn tool_result_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::ProjectFact,
+        subject: MemorySubject::Artifact,
+        attribute: MemoryAttribute::Custom,
+        subject_key: Some("artifact".to_owned()),
+        custom_subject: None,
+        custom_attribute: Some("tool_observation".to_owned()),
+        scope_hint: MemoryScopeHint::ProjectWorkspace,
+        durability: MemoryDurability::Transient,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::High,
+    }
+}
+
+fn unknown_custom_semantic() -> MemorySemanticFields {
+    MemorySemanticFields {
+        intent: MemoryIntent::ImplicitCandidate,
+        explicitness: MemoryExplicitness::Implicit,
+        category: MemoryCategory::Custom,
+        subject: MemorySubject::Custom,
+        attribute: MemoryAttribute::Custom,
+        subject_key: None,
+        custom_subject: Some("unknown".to_owned()),
+        custom_attribute: Some("unknown".to_owned()),
+        scope_hint: MemoryScopeHint::UserGlobal,
+        durability: MemoryDurability::LongLived,
+        sensitivity: MemorySensitivityHint::None,
+        certainty: MemoryExtractorCertainty::Medium,
+    }
+}
+
 fn semantic_evidence(turn_id: &str) -> MemoryWriteEvidence {
     MemoryWriteEvidence {
         source_thread_id: Some("thread_semantic".to_owned()),
@@ -205,8 +317,38 @@ fn metadata_evidence_count(metadata: &BTreeMap<String, serde_json::Value>) -> u6
 #[tokio::test]
 async fn semantic_active_writes_persist_source_context_classes() {
     let (store, _backend, service) = setup_service().await;
-    let cases = [
-        MemorySourceContextKind::DirectUserConversation,
+    let mut semantic = relationship_semantic("direct-user-source-context");
+    semantic.intent = MemoryIntent::ExplicitStore;
+    semantic.explicitness = MemoryExplicitness::Explicit;
+    let mut params = semantic_write_params(
+        semantic,
+        "Direct user relationship fact.",
+        "direct-user-relationship-value",
+        MemorySemanticWriteDisposition::AcceptActive,
+        "turn_source_context_direct_user",
+    );
+    params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
+
+    let response = service
+        .write_semantic_memory(user_context(90), params)
+        .await
+        .expect("direct user semantic active write succeeds");
+    let record = response.record.expect("active record");
+    assert_eq!(
+        record.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
+    let stored = store
+        .get_agent_memory_record(record.id.as_str(), false)
+        .await
+        .expect("load stored memory")
+        .expect("stored memory exists");
+    assert_eq!(
+        stored.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
+
+    let blocked_cases = [
         MemorySourceContextKind::AssistantResponse,
         MemorySourceContextKind::ToolResult,
         MemorySourceContextKind::TaskRuntime,
@@ -214,32 +356,37 @@ async fn semantic_active_writes_persist_source_context_classes() {
         MemorySourceContextKind::Unknown,
     ];
 
-    for (index, source_context_kind) in cases.into_iter().enumerate() {
+    for (index, source_context_kind) in blocked_cases.into_iter().enumerate() {
         let mut semantic = relationship_semantic(format!("person-{index}").as_str());
         semantic.intent = MemoryIntent::ExplicitStore;
         semantic.explicitness = MemoryExplicitness::Explicit;
+        let turn_id = format!("turn_source_context_blocked_{index}");
         let mut params = semantic_write_params(
             semantic,
             format!("Relationship fact {index}.").as_str(),
             format!("relationship-value-{index}").as_str(),
             MemorySemanticWriteDisposition::AcceptActive,
-            format!("turn_source_context_{index}").as_str(),
+            turn_id.as_str(),
         );
         params.source_context_kind = Some(source_context_kind);
 
         let response = service
-            .write_semantic_memory(user_context(90 + index as i64), params)
+            .write_semantic_memory(user_context(91 + index as i64), params)
             .await
-            .expect("semantic active write succeeds");
-        let record = response.record.expect("active record");
+            .expect("semantic active write is quality-gated");
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
 
-        assert_eq!(record.source_context_kind, Some(source_context_kind));
-        let stored = store
-            .get_agent_memory_record(record.id.as_str(), false)
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
             .await
-            .expect("load stored memory")
-            .expect("stored memory exists");
-        assert_eq!(stored.source_context_kind, Some(source_context_kind));
+            .expect("quality decisions");
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.turn_id.as_deref() == Some(turn_id.as_str()))
+            .expect("quality decision for blocked source context");
+        assert_ne!(decision.action, MemoryQualityAction::CandidatePolicy);
+        assert_eq!(decision.source_context_kind, source_context_kind);
     }
 }
 
@@ -253,7 +400,7 @@ async fn candidate_approval_preserves_source_context() {
         MemorySemanticWriteDisposition::CreatePendingCandidate,
         "turn_candidate_source_context",
     );
-    params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+    params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
 
     let candidate = service
         .write_semantic_memory(user_context(96), params)
@@ -263,7 +410,7 @@ async fn candidate_approval_preserves_source_context() {
         .expect("candidate");
     assert_eq!(
         candidate.source_context_kind,
-        Some(MemorySourceContextKind::ToolResult)
+        Some(MemorySourceContextKind::DirectUserConversation)
     );
 
     let approved = service
@@ -280,7 +427,7 @@ async fn candidate_approval_preserves_source_context() {
 
     assert_eq!(
         approved.record.source_context_kind,
-        Some(MemorySourceContextKind::ToolResult)
+        Some(MemorySourceContextKind::DirectUserConversation)
     );
     let stored = store
         .get_agent_memory_record(approved.record.id.as_str(), false)
@@ -289,7 +436,7 @@ async fn candidate_approval_preserves_source_context() {
         .expect("approved memory exists");
     assert_eq!(
         stored.source_context_kind,
-        Some(MemorySourceContextKind::ToolResult)
+        Some(MemorySourceContextKind::DirectUserConversation)
     );
 }
 
@@ -729,7 +876,7 @@ async fn semantic_implicit_contradiction_does_not_create_active_duplicate() {
             .as_ref()
             .expect("suppressed candidate")
             .status,
-        MemoryCandidateStatus::Rejected
+        MemoryCandidateStatus::ReviewDisabledRejected
     );
 
     let listed = service
@@ -889,7 +1036,7 @@ async fn semantic_route_implicit_durable_fact_auto_approves_when_enabled() {
 
 #[tokio::test]
 async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
-    let (_store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service().await;
     let mut transient_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
     transient_semantic.durability = MemoryDurability::Transient;
     let transient = service
@@ -905,18 +1052,8 @@ async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
         )
         .await
         .expect("transient policy write");
-    let transient_candidate = transient.candidate.expect("transient candidate");
-    assert_eq!(
-        transient_candidate.status,
-        MemoryCandidateStatus::AutoRejected
-    );
-    assert_eq!(
-        transient_candidate
-            .metadata
-            .get("candidate_policy_reason_code")
-            .and_then(serde_json::Value::as_str),
-        Some("transient_or_session_only")
-    );
+    assert!(transient.record.is_none());
+    assert!(transient.candidate.is_none());
 
     let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
     secret_semantic.sensitivity = MemorySensitivityHint::Secret;
@@ -933,25 +1070,163 @@ async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
         )
         .await
         .expect("secret policy write");
-    let secret_candidate = secret.candidate.expect("secret candidate");
-    assert_eq!(secret_candidate.status, MemoryCandidateStatus::AutoRejected);
-    assert_eq!(
-        secret_candidate
-            .metadata
-            .get("candidate_policy_reason_code")
-            .and_then(serde_json::Value::as_str),
-        Some("secret_like_or_regulated")
+    assert!(secret.record.is_none());
+    assert!(secret.candidate.is_none());
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    let transient_decision = decisions
+        .iter()
+        .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_transient"))
+        .expect("transient quality decision");
+    assert_eq!(transient_decision.action, MemoryQualityAction::ForceReject);
+    assert!(
+        transient_decision
+            .reason_codes
+            .contains(&MemoryQualityReasonCode::NonDurableLifetime)
     );
+    let secret_decision = decisions
+        .iter()
+        .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_secret"))
+        .expect("secret quality decision");
+    assert_eq!(secret_decision.action, MemoryQualityAction::ForceReject);
+    assert!(
+        secret_decision
+            .reason_codes
+            .contains(&MemoryQualityReasonCode::SecretOrCredential)
+    );
+}
+
+#[tokio::test]
+async fn semantic_quality_gate_routes_and_quarantines_without_exposing_memory() {
+    let (store, _backend, service) = setup_service().await;
+    let routed_thread = service
+        .write_semantic_memory(
+            user_context(370),
+            semantic_write_params(
+                thread_local_todo_semantic(),
+                "Thread-only follow-up should stay out of durable memory.",
+                "thread-only follow-up",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_quality_route_thread",
+            ),
+        )
+        .await
+        .expect("thread route write");
+    assert!(routed_thread.record.is_none());
+    assert!(routed_thread.candidate.is_none());
+
+    let mut task_params = semantic_write_params(
+        task_lifecycle_semantic(),
+        "Task runtime state should stay out of durable memory.",
+        "task runtime state",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_quality_route_task",
+    );
+    task_params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
+    let routed_task = service
+        .write_semantic_memory(workspace_context("ws_quality", 371), task_params)
+        .await
+        .expect("task route write");
+    assert!(routed_task.record.is_none());
+    assert!(routed_task.candidate.is_none());
+
+    let mut tool_params = semantic_write_params(
+        tool_result_semantic(),
+        "Tool observation should stay out of durable memory.",
+        "tool observation",
+        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+        "turn_quality_route_tool",
+    );
+    tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_quality");
+    tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+    let routed_tool = service
+        .write_semantic_memory(workspace_context("ws_quality", 372), tool_params)
+        .await
+        .expect("tool route write");
+    assert!(routed_tool.record.is_none());
+    assert!(routed_tool.candidate.is_none());
+
+    let quarantined = service
+        .write_semantic_memory(
+            user_context(373),
+            semantic_write_params(
+                unknown_custom_semantic(),
+                "Unknown custom fact should be quarantined.",
+                "unknown custom fact",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "turn_quality_quarantine_unknown",
+            ),
+        )
+        .await
+        .expect("quarantine write");
+    assert!(quarantined.record.is_none());
+    assert!(quarantined.candidate.is_none());
+
+    let decisions = store
+        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+        .await
+        .expect("quality decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quality_route_thread")
+            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quality_route_task")
+            && decision.action == MemoryQualityAction::RouteToTaskState
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quality_route_tool")
+            && decision.action == MemoryQualityAction::RouteToDomainState
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.turn_id.as_deref() == Some("turn_quality_quarantine_unknown")
+            && decision.action == MemoryQualityAction::Quarantine
+            && decision
+                .reason_codes
+                .contains(&MemoryQualityReasonCode::UnknownFactClass)
+    }));
+
+    for query in [
+        "thread-only follow-up",
+        "task runtime state",
+        "tool observation",
+        "unknown custom fact",
+    ] {
+        let search = service
+            .search(
+                workspace_context("ws_quality", 374),
+                MemorySearchParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty(), "{query}");
+
+        let recall = service
+            .recall_for_prompt(
+                workspace_context("ws_quality", 375),
+                MemoryRecallParams {
+                    query: query.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recall");
+        assert!(recall.items.is_empty(), "{query}");
+    }
 }
 
 #[tokio::test]
 async fn semantic_route_middle_fact_rejects_by_default_and_routes_when_review_enabled() {
     let (_store, _backend, service) = setup_service().await;
-    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+    let mut middle_semantic = user_preference_semantic(MemoryExplicitness::Unclear);
     middle_semantic.intent = MemoryIntent::ImplicitCandidate;
-    middle_semantic.durability = MemoryDurability::Unknown;
     middle_semantic.certainty = MemoryExtractorCertainty::Medium;
-    middle_semantic.scope_hint = MemoryScopeHint::Unknown;
 
     let default_response = service
         .write_semantic_memory(
@@ -1105,7 +1380,6 @@ async fn candidate_approval_uses_semantic_canonical_pipeline() {
     let (_store, _backend, service) = setup_service_with_config(config).await;
     let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
     middle_semantic.intent = MemoryIntent::ImplicitCandidate;
-    middle_semantic.durability = MemoryDurability::Unknown;
     middle_semantic.certainty = MemoryExtractorCertainty::Medium;
 
     let candidate = service
@@ -1180,7 +1454,7 @@ async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
         MemorySemanticWriteDisposition::RouteToCandidatePolicy,
         "turn_candidate_edit_candidate",
     );
-    candidate_params.source_context_kind = Some(MemorySourceContextKind::AssistantResponse);
+    candidate_params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
 
     let candidate = service
         .write_semantic_memory(user_context(393), candidate_params)
@@ -1207,7 +1481,7 @@ async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
     assert_eq!(approved.record.content, "The user's name is Alex.");
     assert_eq!(
         approved.record.source_context_kind,
-        Some(MemorySourceContextKind::AssistantResponse)
+        Some(MemorySourceContextKind::DirectUserConversation)
     );
 
     let old = store
@@ -1223,11 +1497,9 @@ async fn candidate_api_preserves_workspace_isolation_and_score_audit() {
     let mut config = MemoryServiceConfig::default();
     config.candidate_policy.review_enabled = true;
     let (store, _backend, service) = setup_service_with_config(config).await;
-    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+    let mut middle_semantic = workspace_project_decision_semantic(MemoryExplicitness::Unclear);
     middle_semantic.intent = MemoryIntent::ImplicitCandidate;
-    middle_semantic.durability = MemoryDurability::Unknown;
     middle_semantic.certainty = MemoryExtractorCertainty::Medium;
-    middle_semantic.scope_hint = MemoryScopeHint::ProjectWorkspace;
     let mut params = semantic_write_params(
         middle_semantic,
         "Maybe this workspace prefers migration changes in one file.",

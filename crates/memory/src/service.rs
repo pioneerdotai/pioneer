@@ -14,7 +14,13 @@ use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
     POLICY_DECISION_ERROR,
 };
-use crate::quality::legacy_source_kind_for_source_context;
+use crate::quality::{
+    classify_semantic_memory_fact, legacy_source_kind_for_source_context,
+    resolve_semantic_write_source_context,
+};
+use crate::quality_gate::{
+    MemoryQualityGate, MemoryQualityGateInput, memory_quality_gate_input_from_semantic_write,
+};
 use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
 use crate::recall::{
     MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse, compact_recall_content,
@@ -28,7 +34,7 @@ use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryControlRecord, AgentMemoryListFilter,
     AgentMemoryRepairJobRecord, CrudStore, NewAgentMemoryCandidate, NewAgentMemoryControlRecord,
-    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
+    NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
@@ -41,12 +47,12 @@ use pioneer_protocol::{
     MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
     MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
-    MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryRememberResponse, MemoryScope,
-    MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams,
-    MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
-    MemoryWriteEvidence, MemoryWriteRelation, generate_id,
+    MemoryProvenance, MemoryQualityAction, MemoryQualityDecision, MemoryRecord,
+    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint,
+    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
+    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
+    MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
+    MemorySourceKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -292,8 +298,6 @@ impl MemoryService {
             .disposition
             .unwrap_or(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
-        let provenance = semantic_write_provenance(&params, &context);
-        let source_context_kind = params.source_context_kind;
         let mut base_metadata = params.metadata.clone();
         for (key, value) in semantic_metadata(
             &params.semantic,
@@ -344,6 +348,21 @@ impl MemoryService {
                 let record = self
                     .hydrate_visible_row(merged, &context, &[], now, false)
                     .await?;
+                let (quality_input, quality_decision) = self.semantic_quality_decision(
+                    &params,
+                    &prepared,
+                    MemoryWriteRelation::Duplicate,
+                    sensitivity,
+                );
+                self.record_quality_decision(
+                    &quality_input,
+                    &quality_decision,
+                    &context,
+                    Some(memory_id.clone()),
+                    None,
+                    now,
+                )
+                .await?;
                 self.record_semantic_write_relation(
                     MemoryWriteRelation::Duplicate,
                     "active_duplicate",
@@ -370,37 +389,40 @@ impl MemoryService {
             {
                 let relation_context = context.clone();
                 let superseded_memory_id = existing.id.clone();
-                let response = self
-                    .remember_with_source_context(
-                        context,
-                        MemoryRememberParams {
-                            scope: params.scope,
-                            category: prepared.canonical.category,
-                            namespace: Some(prepared.canonical.namespace.clone()),
-                            key: Some(prepared.canonical.key.clone()),
-                            content: content.clone(),
-                            sensitivity: Some(sensitivity),
-                            confidence: params.confidence,
-                            importance: params.importance,
-                            provenance: Some(provenance),
-                            idempotency_key: None,
-                            supersedes: Some(superseded_memory_id),
-                            metadata: serde_json::from_str(metadata_json.as_str())
-                                .context("semantic metadata must decode")?,
-                        },
-                        source_context_kind,
+                let (quality_input, quality_decision) = self.semantic_quality_decision(
+                    &params,
+                    &prepared,
+                    MemoryWriteRelation::CompatibleUpdate,
+                    sensitivity,
+                );
+                if quality_decision.action != MemoryQualityAction::CandidatePolicy {
+                    self.record_quality_decision(
+                        &quality_input,
+                        &quality_decision,
+                        &relation_context,
+                        Some(superseded_memory_id),
+                        None,
+                        now,
                     )
                     .await?;
-                self.record_semantic_write_relation(
-                    MemoryWriteRelation::CompatibleUpdate,
-                    "active_supersession",
-                    &relation_context,
-                    Some(response.record.id.clone()),
-                    relation_context.workspace_id.clone(),
-                    now,
-                )
-                .await?;
-                return Ok(MemorySemanticWriteResponse {
+                    return Ok(Self::quality_suppressed_response(
+                        MemoryWriteRelation::CompatibleUpdate,
+                        prepared,
+                    ));
+                }
+                let response = self
+                    .remember_semantic_active(
+                        context,
+                        &params,
+                        &prepared,
+                        content.as_str(),
+                        sensitivity,
+                        semantic_write_provenance(&params, &relation_context),
+                        metadata_json,
+                        Some(superseded_memory_id),
+                    )
+                    .await?;
+                let semantic_response = MemorySemanticWriteResponse {
                     relation: MemoryWriteRelation::CompatibleUpdate,
                     canonical_key: prepared.canonical,
                     semantic_fingerprint: prepared.semantic_fingerprint,
@@ -409,21 +431,71 @@ impl MemoryService {
                     created: response.created,
                     superseded_memory_id: response.superseded_memory_id,
                     evidence_merged: false,
-                });
-            }
-
-            let candidate = self
-                .maybe_route_semantic_candidate(
-                    &context,
-                    &params,
-                    &prepared,
-                    content.as_str(),
-                    metadata_json,
-                    disposition,
+                };
+                self.record_quality_decision_for_response(
+                    &quality_input,
+                    &quality_decision,
+                    &relation_context,
+                    &semantic_response,
                     now,
-                    "semantic_contradiction",
                 )
                 .await?;
+                self.record_semantic_write_relation(
+                    MemoryWriteRelation::CompatibleUpdate,
+                    "active_supersession",
+                    &relation_context,
+                    semantic_response
+                        .record
+                        .as_ref()
+                        .map(|record| record.id.clone()),
+                    relation_context.workspace_id.clone(),
+                    now,
+                )
+                .await?;
+                return Ok(semantic_response);
+            }
+
+            let (quality_input, quality_decision) = self.semantic_quality_decision(
+                &params,
+                &prepared,
+                MemoryWriteRelation::Contradiction,
+                sensitivity,
+            );
+            let response = if quality_decision.action == MemoryQualityAction::CandidatePolicy {
+                let response = self
+                    .route_semantic_candidate_policy(
+                        context.clone(),
+                        params,
+                        prepared,
+                        content.as_str(),
+                        metadata_json,
+                        MemoryWriteRelation::Contradiction,
+                        None,
+                        quality_decision.candidate_auto_approve_allowed,
+                        now,
+                    )
+                    .await?;
+                self.record_quality_decision_for_response(
+                    &quality_input,
+                    &quality_decision,
+                    &context,
+                    &response,
+                    now,
+                )
+                .await?;
+                response
+            } else {
+                self.record_quality_decision(
+                    &quality_input,
+                    &quality_decision,
+                    &context,
+                    Some(existing.id.clone()),
+                    None,
+                    now,
+                )
+                .await?;
+                Self::quality_suppressed_response(MemoryWriteRelation::Contradiction, prepared)
+            };
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Contradiction,
                 "same_key_value_conflict",
@@ -433,16 +505,7 @@ impl MemoryService {
                 now,
             )
             .await?;
-            return Ok(MemorySemanticWriteResponse {
-                relation: MemoryWriteRelation::Contradiction,
-                canonical_key: prepared.canonical,
-                semantic_fingerprint: prepared.semantic_fingerprint,
-                record: None,
-                candidate,
-                created: false,
-                superseded_memory_id: None,
-                evidence_merged: false,
-            });
+            return Ok(response);
         }
 
         if disposition != MemorySemanticWriteDisposition::AcceptActive
@@ -457,6 +520,21 @@ impl MemoryService {
                 )
                 .await?
         {
+            let (quality_input, quality_decision) = self.semantic_quality_decision(
+                &params,
+                &prepared,
+                MemoryWriteRelation::SuppressedByRejection,
+                sensitivity,
+            );
+            self.record_quality_decision(
+                &quality_input,
+                &quality_decision,
+                &context,
+                None,
+                Some(rejected.id.clone()),
+                now,
+            )
+            .await?;
             self.record_semantic_write_relation(
                 MemoryWriteRelation::SuppressedByRejection,
                 "suppressed_duplicate",
@@ -466,16 +544,10 @@ impl MemoryService {
                 now,
             )
             .await?;
-            return Ok(MemorySemanticWriteResponse {
-                relation: MemoryWriteRelation::SuppressedByRejection,
-                canonical_key: prepared.canonical,
-                semantic_fingerprint: prepared.semantic_fingerprint,
-                record: None,
-                candidate: None,
-                created: false,
-                superseded_memory_id: None,
-                evidence_merged: false,
-            });
+            return Ok(Self::quality_suppressed_response(
+                MemoryWriteRelation::SuppressedByRejection,
+                prepared,
+            ));
         }
 
         if disposition != MemorySemanticWriteDisposition::AcceptActive
@@ -511,12 +583,29 @@ impl MemoryService {
                 )
                 .await?
                 .unwrap_or(pending);
+            let pending_id = updated.id.clone();
+            let pending_workspace_id = updated.workspace_id.clone();
+            let (quality_input, quality_decision) = self.semantic_quality_decision(
+                &params,
+                &prepared,
+                MemoryWriteRelation::Duplicate,
+                sensitivity,
+            );
+            self.record_quality_decision(
+                &quality_input,
+                &quality_decision,
+                &context,
+                None,
+                Some(pending_id),
+                now,
+            )
+            .await?;
             self.record_semantic_write_relation(
                 MemoryWriteRelation::Duplicate,
                 "pending_duplicate",
                 &context,
                 None,
-                updated.workspace_id.clone(),
+                pending_workspace_id,
                 now,
             )
             .await?;
@@ -532,107 +621,162 @@ impl MemoryService {
             });
         }
 
-        match disposition {
-            MemorySemanticWriteDisposition::AcceptActive => {
-                let relation_context = context.clone();
-                let response = self
-                    .remember_with_source_context(
-                        context,
-                        MemoryRememberParams {
-                            scope: params.scope,
-                            category: prepared.canonical.category,
-                            namespace: Some(prepared.canonical.namespace.clone()),
-                            key: Some(prepared.canonical.key.clone()),
-                            content: content.clone(),
-                            sensitivity: Some(sensitivity),
-                            confidence: params.confidence,
-                            importance: params.importance,
-                            provenance: Some(provenance),
-                            idempotency_key: None,
-                            supersedes: None,
-                            metadata: serde_json::from_str(metadata_json.as_str())
-                                .context("semantic metadata must decode")?,
-                        },
-                        source_context_kind,
-                    )
-                    .await?;
-                self.record_semantic_write_relation(
-                    MemoryWriteRelation::Novel,
-                    "active_created",
-                    &relation_context,
-                    Some(response.record.id.clone()),
-                    relation_context.workspace_id.clone(),
-                    now,
-                )
-                .await?;
-                Ok(MemorySemanticWriteResponse {
-                    relation: MemoryWriteRelation::Novel,
-                    canonical_key: prepared.canonical,
-                    semantic_fingerprint: prepared.semantic_fingerprint,
-                    record: Some(response.record),
-                    candidate: None,
-                    created: response.created,
-                    superseded_memory_id: response.superseded_memory_id,
-                    evidence_merged: false,
-                })
-            }
-            MemorySemanticWriteDisposition::CreatePendingCandidate
-            | MemorySemanticWriteDisposition::RejectSuppressed => {
-                let candidate = self
-                    .create_semantic_candidate(
-                        &context,
-                        &params,
-                        &prepared,
-                        content.as_str(),
-                        metadata_json,
-                        if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
-                            MemoryCandidateStatus::Rejected
-                        } else {
-                            MemoryCandidateStatus::Pending
-                        },
-                        now,
-                        "semantic_candidate",
-                        None,
-                    )
-                    .await?;
-                self.record_semantic_write_relation(
-                    MemoryWriteRelation::Novel,
-                    if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
-                        "suppressed_created"
-                    } else {
-                        "candidate_created"
-                    },
-                    &context,
-                    None,
-                    context.workspace_id.clone(),
-                    now,
-                )
-                .await?;
-                Ok(MemorySemanticWriteResponse {
-                    relation: MemoryWriteRelation::Novel,
-                    canonical_key: prepared.canonical,
-                    semantic_fingerprint: prepared.semantic_fingerprint,
-                    record: None,
-                    candidate: Some(candidate),
-                    created: true,
-                    superseded_memory_id: None,
-                    evidence_merged: false,
-                })
-            }
-            MemorySemanticWriteDisposition::RouteToCandidatePolicy => {
-                self.route_semantic_candidate_policy(
+        let relation_context = context.clone();
+        let (quality_input, quality_decision) = self.semantic_quality_decision(
+            &params,
+            &prepared,
+            MemoryWriteRelation::Novel,
+            sensitivity,
+        );
+        if quality_decision.action != MemoryQualityAction::CandidatePolicy {
+            self.record_quality_decision(
+                &quality_input,
+                &quality_decision,
+                &relation_context,
+                None,
+                None,
+                now,
+            )
+            .await?;
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::Novel,
+                "quality_gate_suppressed",
+                &relation_context,
+                None,
+                relation_context.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(Self::quality_suppressed_response(
+                MemoryWriteRelation::Novel,
+                prepared,
+            ));
+        }
+
+        if disposition == MemorySemanticWriteDisposition::AcceptActive {
+            let response = self
+                .remember_semantic_active(
                     context,
-                    params,
-                    prepared,
+                    &params,
+                    &prepared,
+                    content.as_str(),
+                    sensitivity,
+                    semantic_write_provenance(&params, &relation_context),
+                    metadata_json,
+                    None,
+                )
+                .await?;
+            let semantic_response = MemorySemanticWriteResponse {
+                relation: MemoryWriteRelation::Novel,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: Some(response.record),
+                candidate: None,
+                created: response.created,
+                superseded_memory_id: response.superseded_memory_id,
+                evidence_merged: false,
+            };
+            self.record_quality_decision_for_response(
+                &quality_input,
+                &quality_decision,
+                &relation_context,
+                &semantic_response,
+                now,
+            )
+            .await?;
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::Novel,
+                "active_created",
+                &relation_context,
+                semantic_response
+                    .record
+                    .as_ref()
+                    .map(|record| record.id.clone()),
+                relation_context.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(semantic_response);
+        }
+
+        if matches!(
+            disposition,
+            MemorySemanticWriteDisposition::CreatePendingCandidate
+                | MemorySemanticWriteDisposition::RejectSuppressed
+        ) {
+            let candidate = self
+                .create_semantic_candidate(
+                    &relation_context,
+                    &params,
+                    &prepared,
                     content.as_str(),
                     metadata_json,
-                    MemoryWriteRelation::Novel,
-                    None,
+                    if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
+                        MemoryCandidateStatus::Rejected
+                    } else {
+                        MemoryCandidateStatus::Pending
+                    },
                     now,
+                    "semantic_candidate",
+                    None,
                 )
-                .await
-            }
+                .await?;
+            let semantic_response = MemorySemanticWriteResponse {
+                relation: MemoryWriteRelation::Novel,
+                canonical_key: prepared.canonical,
+                semantic_fingerprint: prepared.semantic_fingerprint,
+                record: None,
+                candidate: Some(candidate),
+                created: true,
+                superseded_memory_id: None,
+                evidence_merged: false,
+            };
+            self.record_quality_decision_for_response(
+                &quality_input,
+                &quality_decision,
+                &relation_context,
+                &semantic_response,
+                now,
+            )
+            .await?;
+            self.record_semantic_write_relation(
+                MemoryWriteRelation::Novel,
+                if disposition == MemorySemanticWriteDisposition::RejectSuppressed {
+                    "suppressed_created"
+                } else {
+                    "candidate_created"
+                },
+                &relation_context,
+                None,
+                relation_context.workspace_id.clone(),
+                now,
+            )
+            .await?;
+            return Ok(semantic_response);
         }
+
+        let response = self
+            .route_semantic_candidate_policy(
+                context,
+                params,
+                prepared,
+                content.as_str(),
+                metadata_json,
+                MemoryWriteRelation::Novel,
+                None,
+                quality_decision.candidate_auto_approve_allowed,
+                now,
+            )
+            .await?;
+        self.record_quality_decision_for_response(
+            &quality_input,
+            &quality_decision,
+            &relation_context,
+            &response,
+            now,
+        )
+        .await?;
+        Ok(response)
     }
 
     pub async fn get(
@@ -1460,7 +1604,7 @@ impl MemoryService {
         metadata_json: String,
         supersedes: Option<String>,
     ) -> Result<MemoryRememberResponse> {
-        self.remember(
+        self.remember_with_source_context(
             context,
             MemoryRememberParams {
                 scope: params.scope.clone(),
@@ -1477,6 +1621,7 @@ impl MemoryService {
                 metadata: serde_json::from_str(metadata_json.as_str())
                     .context("semantic metadata must decode")?,
             },
+            params.source_context_kind,
         )
         .await
     }
@@ -1490,6 +1635,7 @@ impl MemoryService {
         metadata_json: String,
         relation: MemoryWriteRelation,
         supersedes: Option<String>,
+        candidate_auto_approve_allowed: bool,
         now: i64,
     ) -> Result<MemorySemanticWriteResponse> {
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
@@ -1512,7 +1658,15 @@ impl MemoryService {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
         };
-        let policy_output = self.candidate_policy.decide(policy_input);
+        let mut policy_output = self.candidate_policy.decide(policy_input);
+        if !candidate_auto_approve_allowed
+            && policy_output.decision == MemoryCandidatePolicyDecision::AutoApprove
+        {
+            policy_output = quality_gate_disable_candidate_auto_approve(
+                policy_output,
+                self.config.candidate_policy.review_enabled,
+            );
+        }
         let reason_code = policy_output.reason_code.clone();
         let policy_metadata_json =
             metadata_json_with_candidate_policy(metadata_json, &policy_output)?;
@@ -1612,63 +1766,6 @@ impl MemoryService {
             superseded_memory_id: None,
             evidence_merged: false,
         })
-    }
-
-    async fn maybe_route_semantic_candidate(
-        &self,
-        context: &MemoryOperationContext,
-        params: &MemorySemanticWriteParams,
-        prepared: &SemanticWritePrepared,
-        content: &str,
-        metadata_json: String,
-        disposition: MemorySemanticWriteDisposition,
-        now: i64,
-        reason: &str,
-    ) -> Result<Option<MemoryCandidate>> {
-        match disposition {
-            MemorySemanticWriteDisposition::CreatePendingCandidate => self
-                .create_semantic_candidate(
-                    context,
-                    params,
-                    prepared,
-                    content,
-                    metadata_json,
-                    MemoryCandidateStatus::Pending,
-                    now,
-                    reason,
-                    None,
-                )
-                .await
-                .map(Some),
-            MemorySemanticWriteDisposition::AcceptActive
-            | MemorySemanticWriteDisposition::RejectSuppressed => self
-                .create_semantic_candidate(
-                    context,
-                    params,
-                    prepared,
-                    content,
-                    metadata_json,
-                    MemoryCandidateStatus::Rejected,
-                    now,
-                    reason,
-                    None,
-                )
-                .await
-                .map(Some),
-            MemorySemanticWriteDisposition::RouteToCandidatePolicy => self
-                .route_semantic_candidate_policy(
-                    context.clone(),
-                    params.clone(),
-                    prepared.clone(),
-                    content,
-                    metadata_json,
-                    MemoryWriteRelation::Contradiction,
-                    None,
-                    now,
-                )
-                .await
-                .map(|response| response.candidate),
-        }
     }
 
     async fn create_semantic_candidate(
@@ -1914,6 +2011,111 @@ impl MemoryService {
             now,
         )
         .await
+    }
+
+    fn semantic_quality_decision(
+        &self,
+        params: &MemorySemanticWriteParams,
+        prepared: &SemanticWritePrepared,
+        relation: MemoryWriteRelation,
+        sensitivity: MemorySensitivity,
+    ) -> (MemoryQualityGateInput, MemoryQualityDecision) {
+        let source_context = resolve_semantic_write_source_context(params);
+        let ontology = classify_semantic_memory_fact(&params.semantic, Some(&params.scope));
+        let input = memory_quality_gate_input_from_semantic_write(
+            params,
+            relation,
+            &source_context,
+            ontology,
+            sensitivity,
+            Some(prepared.canonical.key.clone()),
+            params.semantic.intent == MemoryIntent::ExplicitNoMemory,
+        );
+        let decision = MemoryQualityGate::decide(&input);
+        (input, decision)
+    }
+
+    async fn record_quality_decision(
+        &self,
+        input: &MemoryQualityGateInput,
+        decision: &MemoryQualityDecision,
+        context: &MemoryOperationContext,
+        memory_id: Option<String>,
+        candidate_id: Option<String>,
+        now: i64,
+    ) -> Result<()> {
+        self.store
+            .insert_agent_memory_quality_decision(NewAgentMemoryQualityDecision {
+                workspace_id: context
+                    .workspace_id
+                    .clone()
+                    .or_else(|| input.workspace_id.clone()),
+                thread_id: input
+                    .source_thread_id
+                    .clone()
+                    .or_else(|| context.thread_id.clone()),
+                turn_id: input.source_turn_id.clone(),
+                item_id: input.source_item_id.clone(),
+                task_id: input.task_id.clone(),
+                memory_id,
+                candidate_id,
+                canonical_key: input.canonical_key.clone(),
+                action: decision.action,
+                target_ownership: decision.target_ownership,
+                source_context_kind: input.source_context_kind,
+                fact_class: input.fact_class,
+                lifetime_class: input.lifetime_class,
+                ownership_class: input.ownership_class,
+                evidence_class: input.evidence_class,
+                relation: input.relation,
+                reason_codes: decision.reason_codes.clone(),
+                input_snapshot_json: Some(
+                    serde_json::to_string(input)
+                        .context("failed to encode memory quality input snapshot")?,
+                ),
+                created_at_unix: now,
+                updated_at_unix: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn record_quality_decision_for_response(
+        &self,
+        input: &MemoryQualityGateInput,
+        decision: &MemoryQualityDecision,
+        context: &MemoryOperationContext,
+        response: &MemorySemanticWriteResponse,
+        now: i64,
+    ) -> Result<()> {
+        self.record_quality_decision(
+            input,
+            decision,
+            context,
+            response.record.as_ref().map(|record| record.id.clone()),
+            response
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.id.clone()),
+            now,
+        )
+        .await
+    }
+
+    fn quality_suppressed_response(
+        relation: MemoryWriteRelation,
+        prepared: SemanticWritePrepared,
+    ) -> MemorySemanticWriteResponse {
+        MemorySemanticWriteResponse {
+            relation,
+            canonical_key: prepared.canonical,
+            semantic_fingerprint: prepared.semantic_fingerprint,
+            record: None,
+            candidate: None,
+            created: false,
+            superseded_memory_id: None,
+            evidence_merged: false,
+        }
     }
 
     async fn resolve_backend_search_scopes(
@@ -2208,6 +2410,29 @@ fn candidate_policy_decision_label(decision: MemoryCandidatePolicyDecision) -> &
     }
 }
 
+fn quality_gate_disable_candidate_auto_approve(
+    mut output: MemoryCandidatePolicyOutput,
+    review_enabled: bool,
+) -> MemoryCandidatePolicyOutput {
+    if review_enabled {
+        output.decision = MemoryCandidatePolicyDecision::NeedsReview;
+        output.status = MemoryCandidateStatus::NeedsReview;
+        output.reason_code = "quality_gate_auto_approve_disabled".to_owned();
+        output.reason = Some(
+            "quality gate allowed candidate policy but disabled automatic approval".to_owned(),
+        );
+    } else {
+        output.decision = MemoryCandidatePolicyDecision::RejectReviewDisabled;
+        output.status = MemoryCandidateStatus::ReviewDisabledRejected;
+        output.reason_code = "quality_gate_auto_approve_disabled".to_owned();
+        output.reason = Some(
+            "quality gate allowed candidate policy but suppressed automatic approval while review is disabled"
+                .to_owned(),
+        );
+    }
+    output
+}
+
 fn candidate_status_label(status: MemoryCandidateStatus) -> &'static str {
     match status {
         MemoryCandidateStatus::Pending => "pending",
@@ -2328,7 +2553,7 @@ fn candidate_semantic_write_params(
         value,
         evidence: Some(evidence),
         provenance: Some(provenance),
-        source_context_kind: candidate.source_context_kind,
+        source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
         client_provided_key: None,
         confidence: Some(candidate.confidence.clamp(0.0, 1.0) as f32),

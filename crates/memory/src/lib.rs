@@ -7,6 +7,7 @@ pub mod hooks;
 mod memvid;
 mod policy;
 mod quality;
+mod quality_gate;
 mod ranking;
 mod recall;
 mod service;

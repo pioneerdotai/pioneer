@@ -239,10 +239,24 @@ pub fn resolve_semantic_write_source_context(
     classify_memory_source_context(MemorySourceContextInput {
         thread_id: provenance.and_then(|provenance| provenance.source_thread_id.as_deref()),
         turn_id: provenance.and_then(|provenance| provenance.source_turn_id.as_deref()),
-        source_kind: provenance.map(|provenance| provenance.source_kind),
+        source_kind: provenance
+            .map(|provenance| provenance.source_kind)
+            .or_else(|| semantic_intent_source_kind(&params.semantic)),
         evidence,
         ..MemorySourceContextInput::default()
     })
+}
+
+fn semantic_intent_source_kind(semantic: &MemorySemanticFields) -> Option<MemorySourceKind> {
+    match semantic.intent {
+        pioneer_protocol::MemoryIntent::ExplicitStore
+        | pioneer_protocol::MemoryIntent::ImplicitCandidate => {
+            Some(MemorySourceKind::ExplicitUserRequest)
+        }
+        pioneer_protocol::MemoryIntent::ExplicitForget
+        | pioneer_protocol::MemoryIntent::ExplicitNoMemory => Some(MemorySourceKind::System),
+        pioneer_protocol::MemoryIntent::None => Some(MemorySourceKind::BackgroundExtractor),
+    }
 }
 
 pub fn legacy_source_kind_for_source_context(

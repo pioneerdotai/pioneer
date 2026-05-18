@@ -1,15 +1,18 @@
 use anyhow::{Result, bail};
 use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
-    MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryScopeKind, MemorySensitivity,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, PromptManifestProfile,
-    ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    SandboxMode, TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode,
-    TaskDeliveryStatus, TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus,
-    TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus,
-    ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnItem,
-    TurnItemAttemptStatus, TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
+    MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass, MemoryFactClass,
+    MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryScopeKind,
+    MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryWriteRelation, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
+    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
+    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
+    TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind,
+    TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
+    ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
+    TurnItemType, TurnStatus, UserInput,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
 pub const DB_ID_LEN: usize = 21;
 
@@ -242,6 +245,66 @@ pub fn memory_source_context_kind_from_db(value: &str) -> MemorySourceContextKin
         "unknown" => MemorySourceContextKind::Unknown,
         _ => MemorySourceContextKind::Unknown,
     }
+}
+
+pub fn memory_quality_action_to_db(action: MemoryQualityAction) -> String {
+    enum_to_snake_string(action)
+}
+
+pub fn memory_quality_action_from_db(value: &str) -> Result<MemoryQualityAction> {
+    enum_from_snake_string(value, "memory quality action")
+}
+
+pub fn memory_fact_class_to_db(fact_class: MemoryFactClass) -> String {
+    enum_to_snake_string(fact_class)
+}
+
+pub fn memory_fact_class_from_db(value: &str) -> Result<MemoryFactClass> {
+    enum_from_snake_string(value, "memory fact class")
+}
+
+pub fn memory_lifetime_class_to_db(lifetime_class: MemoryLifetimeClass) -> String {
+    enum_to_snake_string(lifetime_class)
+}
+
+pub fn memory_lifetime_class_from_db(value: &str) -> Result<MemoryLifetimeClass> {
+    enum_from_snake_string(value, "memory lifetime class")
+}
+
+pub fn memory_ownership_class_to_db(ownership_class: MemoryOwnershipClass) -> String {
+    enum_to_snake_string(ownership_class)
+}
+
+pub fn memory_ownership_class_from_db(value: &str) -> Result<MemoryOwnershipClass> {
+    enum_from_snake_string(value, "memory ownership class")
+}
+
+pub fn memory_evidence_class_to_db(evidence_class: MemoryEvidenceClass) -> String {
+    enum_to_snake_string(evidence_class)
+}
+
+pub fn memory_evidence_class_from_db(value: &str) -> Result<MemoryEvidenceClass> {
+    enum_from_snake_string(value, "memory evidence class")
+}
+
+pub fn memory_write_relation_to_db(relation: MemoryWriteRelation) -> String {
+    enum_to_snake_string(relation)
+}
+
+pub fn memory_write_relation_from_db(value: &str) -> Result<MemoryWriteRelation> {
+    enum_from_snake_string(value, "memory write relation")
+}
+
+fn enum_to_snake_string<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .expect("protocol enum should serialize as a string")
+}
+
+fn enum_from_snake_string<T: DeserializeOwned>(value: &str, type_name: &str) -> Result<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|err| anyhow::anyhow!("unknown {type_name} `{value}`: {err}"))
 }
 
 pub fn memory_actor_kind_to_db(kind: MemoryActorKind) -> &'static str {

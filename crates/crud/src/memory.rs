@@ -1,15 +1,19 @@
 use anyhow::{Result, bail};
 use pioneer_protocol::{
-    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryScope,
-    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory,
+    MemoryEvidenceClass, MemoryFactClass, MemoryLifetimeClass, MemoryOwnershipClass,
+    MemoryQualityAction, MemoryQualityReasonCode, MemoryScope, MemoryScopeKind, MemorySensitivity,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteRelation,
 };
 use sha2::{Digest, Sha256};
 
 use crate::convention::{
     MEMORY_NAMESPACE_DEFAULT, memory_actor_kind_from_db, memory_actor_kind_to_db,
-    memory_candidate_status_from_db, memory_category_from_db, memory_scope_kind_from_db,
-    memory_scope_kind_to_db, memory_sensitivity_from_db, memory_source_context_kind_from_db,
-    memory_source_kind_from_db, memory_status_from_db,
+    memory_candidate_status_from_db, memory_category_from_db, memory_evidence_class_from_db,
+    memory_fact_class_from_db, memory_lifetime_class_from_db, memory_ownership_class_from_db,
+    memory_quality_action_from_db, memory_scope_kind_from_db, memory_scope_kind_to_db,
+    memory_sensitivity_from_db, memory_source_context_kind_from_db, memory_source_kind_from_db,
+    memory_status_from_db, memory_write_relation_from_db,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +281,55 @@ pub struct AgentMemoryPolicyDecisionRecord {
     pub item_id: Option<String>,
     pub details_json: Option<String>,
     pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgentMemoryQualityDecision {
+    pub workspace_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub item_id: Option<String>,
+    pub task_id: Option<String>,
+    pub memory_id: Option<String>,
+    pub candidate_id: Option<String>,
+    pub canonical_key: Option<String>,
+    pub action: MemoryQualityAction,
+    pub target_ownership: MemoryOwnershipClass,
+    pub source_context_kind: MemorySourceContextKind,
+    pub fact_class: MemoryFactClass,
+    pub lifetime_class: MemoryLifetimeClass,
+    pub ownership_class: MemoryOwnershipClass,
+    pub evidence_class: MemoryEvidenceClass,
+    pub relation: MemoryWriteRelation,
+    pub reason_codes: Vec<MemoryQualityReasonCode>,
+    pub input_snapshot_json: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMemoryQualityDecisionRecord {
+    pub id: String,
+    pub workspace_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub item_id: Option<String>,
+    pub task_id: Option<String>,
+    pub memory_id: Option<String>,
+    pub candidate_id: Option<String>,
+    pub canonical_key: Option<String>,
+    pub action: MemoryQualityAction,
+    pub target_ownership: MemoryOwnershipClass,
+    pub source_context_kind: MemorySourceContextKind,
+    pub fact_class: MemoryFactClass,
+    pub lifetime_class: MemoryLifetimeClass,
+    pub ownership_class: MemoryOwnershipClass,
+    pub evidence_class: MemoryEvidenceClass,
+    pub relation: MemoryWriteRelation,
+    pub reason_codes: Vec<MemoryQualityReasonCode>,
+    pub input_snapshot_json: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +636,34 @@ pub(crate) fn agent_memory_policy_decision_record_from_model(
         item_id: model.item_id,
         details_json: model.details_json,
         created_at_unix: model.created_at.timestamp(),
+    })
+}
+
+pub(crate) fn agent_memory_quality_decision_record_from_model(
+    model: pioneer_entity::agent_memory_quality_decision::Model,
+) -> Result<AgentMemoryQualityDecisionRecord> {
+    Ok(AgentMemoryQualityDecisionRecord {
+        id: model.id,
+        workspace_id: model.workspace_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        item_id: model.item_id,
+        task_id: model.task_id,
+        memory_id: model.memory_id,
+        candidate_id: model.candidate_id,
+        canonical_key: model.canonical_key,
+        action: memory_quality_action_from_db(model.action.as_str())?,
+        target_ownership: memory_ownership_class_from_db(model.target_ownership.as_str())?,
+        source_context_kind: memory_source_context_kind_from_db(model.source_context_kind.as_str()),
+        fact_class: memory_fact_class_from_db(model.fact_class.as_str())?,
+        lifetime_class: memory_lifetime_class_from_db(model.lifetime_class.as_str())?,
+        ownership_class: memory_ownership_class_from_db(model.ownership_class.as_str())?,
+        evidence_class: memory_evidence_class_from_db(model.evidence_class.as_str())?,
+        relation: memory_write_relation_from_db(model.relation.as_str())?,
+        reason_codes: serde_json::from_str(model.reason_codes_json.as_str())?,
+        input_snapshot_json: model.input_snapshot_json,
+        created_at_unix: model.created_at.timestamp(),
+        updated_at_unix: model.updated_at.timestamp(),
     })
 }
 

@@ -17,11 +17,38 @@ enum AgentMemoryCandidate {
     SourceContextKind,
 }
 
+#[derive(DeriveIden)]
+enum AgentMemoryQualityDecision {
+    Table,
+    Id,
+    WorkspaceId,
+    ThreadId,
+    TurnId,
+    ItemId,
+    TaskId,
+    MemoryId,
+    CandidateId,
+    CanonicalKey,
+    Action,
+    TargetOwnership,
+    SourceContextKind,
+    FactClass,
+    LifetimeClass,
+    OwnershipClass,
+    EvidenceClass,
+    Relation,
+    ReasonCodesJson,
+    InputSnapshotJson,
+    CreatedAt,
+    UpdatedAt,
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         normalize_active_current_workspace(manager).await?;
         add_agent_memory_source_context_columns(manager).await?;
+        create_agent_memory_quality_decision_table(manager).await?;
 
         manager
             .get_connection()
@@ -46,6 +73,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        drop_agent_memory_quality_decision_table(manager).await?;
         drop_agent_memory_source_context_columns(manager).await
     }
 }
@@ -163,4 +191,203 @@ async fn drop_agent_memory_source_context_columns(
     }
 
     Ok(())
+}
+
+async fn create_agent_memory_quality_decision_table(
+    manager: &SchemaManager<'_>,
+) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(AgentMemoryQualityDecision::Table)
+                .if_not_exists()
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::Id)
+                        .string_len(21)
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::WorkspaceId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::ThreadId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::TurnId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::ItemId)
+                        .string_len(128)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::TaskId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::MemoryId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::CandidateId)
+                        .string_len(21)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::CanonicalKey)
+                        .string_len(512)
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::Action)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::TargetOwnership)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::SourceContextKind)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::FactClass)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::LifetimeClass)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::OwnershipClass)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::EvidenceClass)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::Relation)
+                        .string_len(64)
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::ReasonCodesJson)
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::InputSnapshotJson)
+                        .text()
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::CreatedAt)
+                        .timestamp_with_time_zone()
+                        .default(Expr::current_timestamp())
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(AgentMemoryQualityDecision::UpdatedAt)
+                        .timestamp_with_time_zone()
+                        .default(Expr::current_timestamp())
+                        .not_null(),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_memory")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::MemoryId)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_candidate")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::CandidateId)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_thread_turn")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::ThreadId)
+                .col(AgentMemoryQualityDecision::TurnId)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_workspace_created")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::WorkspaceId)
+                .col(AgentMemoryQualityDecision::CreatedAt)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_action_created")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::Action)
+                .col(AgentMemoryQualityDecision::CreatedAt)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_agent_memory_quality_canonical_key")
+                .table(AgentMemoryQualityDecision::Table)
+                .col(AgentMemoryQualityDecision::CanonicalKey)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn drop_agent_memory_quality_decision_table(
+    manager: &SchemaManager<'_>,
+) -> Result<(), DbErr> {
+    manager
+        .drop_table(
+            Table::drop()
+                .if_exists()
+                .table(AgentMemoryQualityDecision::Table)
+                .to_owned(),
+        )
+        .await
 }

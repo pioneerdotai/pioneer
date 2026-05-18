@@ -2,12 +2,15 @@ use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCapsuleRecord,
     AgentMemoryListFilter, CrudStore, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
-    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob,
-    global_agent_memory_scope_key, memory_scope_key_hash, workspace_agent_memory_scope_key,
+    NewAgentMemoryControlRecord, NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision,
+    NewAgentMemoryRepairJob, global_agent_memory_scope_key, memory_scope_key_hash,
+    workspace_agent_memory_scope_key,
 };
 use pioneer_protocol::{
-    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryScope, MemoryScopeKind,
-    MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass,
+    MemoryFactClass, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
+    MemoryQualityReasonCode, MemoryScope, MemoryScopeKind, MemorySensitivity,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteRelation,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
@@ -646,6 +649,104 @@ async fn agent_memory_policy_decision_is_append_only_and_queryable() {
         .await
         .expect("list thread decisions");
     assert_eq!(by_thread.len(), 2);
+}
+
+#[tokio::test]
+async fn agent_memory_quality_decision_roundtrips_typed_policy_dimensions() {
+    let (_, store) = setup_store().await;
+    let first = store
+        .insert_agent_memory_quality_decision(NewAgentMemoryQualityDecision {
+            workspace_id: Some("ws_memory_a".to_owned()),
+            thread_id: Some("thread_memory_a".to_owned()),
+            turn_id: Some("turn_quality".to_owned()),
+            item_id: Some("item_quality".to_owned()),
+            task_id: None,
+            memory_id: None,
+            candidate_id: None,
+            canonical_key: Some("auto:identity:name".to_owned()),
+            action: MemoryQualityAction::ForceReject,
+            target_ownership: MemoryOwnershipClass::Reject,
+            source_context_kind: MemorySourceContextKind::AssistantResponse,
+            fact_class: MemoryFactClass::UserIdentity,
+            lifetime_class: MemoryLifetimeClass::LongLived,
+            ownership_class: MemoryOwnershipClass::DurableUserMemory,
+            evidence_class: MemoryEvidenceClass::AssistantInference,
+            relation: MemoryWriteRelation::Novel,
+            reason_codes: vec![
+                MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence,
+                MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
+            ],
+            input_snapshot_json: Some(r#"{"source":"test"}"#.to_owned()),
+            created_at_unix: 510,
+            updated_at_unix: 510,
+        })
+        .await
+        .expect("insert rejected quality decision");
+    assert_eq!(first.action, MemoryQualityAction::ForceReject);
+    assert_eq!(first.memory_id, None);
+    assert_eq!(
+        first.reason_codes,
+        vec![
+            MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence,
+            MemoryQualityReasonCode::SourceNotAuthoritativeForDurableMemory,
+        ]
+    );
+
+    store
+        .insert_agent_memory_quality_decision(NewAgentMemoryQualityDecision {
+            workspace_id: Some("ws_memory_a".to_owned()),
+            thread_id: Some("thread_memory_a".to_owned()),
+            turn_id: Some("turn_quality".to_owned()),
+            item_id: None,
+            task_id: None,
+            memory_id: Some("mem_quality".to_owned()),
+            candidate_id: Some("cand_quality".to_owned()),
+            canonical_key: Some("auto:identity:name".to_owned()),
+            action: MemoryQualityAction::CandidatePolicy,
+            target_ownership: MemoryOwnershipClass::DurableUserMemory,
+            source_context_kind: MemorySourceContextKind::DirectUserConversation,
+            fact_class: MemoryFactClass::UserIdentity,
+            lifetime_class: MemoryLifetimeClass::LongLived,
+            ownership_class: MemoryOwnershipClass::DurableUserMemory,
+            evidence_class: MemoryEvidenceClass::DirectUserAssertion,
+            relation: MemoryWriteRelation::Novel,
+            reason_codes: vec![
+                MemoryQualityReasonCode::CandidatePolicyAllowed,
+                MemoryQualityReasonCode::DurableUserIdentity,
+                MemoryQualityReasonCode::NovelCandidate,
+            ],
+            input_snapshot_json: None,
+            created_at_unix: 511,
+            updated_at_unix: 511,
+        })
+        .await
+        .expect("insert candidate quality decision");
+
+    let by_candidate = store
+        .list_agent_memory_quality_decisions_for_candidate("cand_quality", 10)
+        .await
+        .expect("list by candidate");
+    assert_eq!(by_candidate.len(), 1);
+    assert_eq!(by_candidate[0].action, MemoryQualityAction::CandidatePolicy);
+    assert_eq!(
+        by_candidate[0].target_ownership,
+        MemoryOwnershipClass::DurableUserMemory
+    );
+
+    let by_memory = store
+        .list_agent_memory_quality_decisions_for_memory("mem_quality", 10)
+        .await
+        .expect("list by memory");
+    assert_eq!(by_memory.len(), 1);
+    assert_eq!(by_memory[0].candidate_id.as_deref(), Some("cand_quality"));
+
+    let by_thread = store
+        .list_agent_memory_quality_decisions_for_thread("thread_memory_a", 10)
+        .await
+        .expect("list by thread");
+    assert_eq!(by_thread.len(), 2);
+    assert_eq!(by_thread[0].action, MemoryQualityAction::CandidatePolicy);
+    assert_eq!(by_thread[1].action, MemoryQualityAction::ForceReject);
 }
 
 #[tokio::test]

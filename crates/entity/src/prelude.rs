@@ -5,6 +5,7 @@ pub use super::agent_memory_candidate::Entity as AgentMemoryCandidate;
 pub use super::agent_memory_capsule::Entity as AgentMemoryCapsule;
 pub use super::agent_memory_event::Entity as AgentMemoryEvent;
 pub use super::agent_memory_policy_decision::Entity as AgentMemoryPolicyDecision;
+pub use super::agent_memory_quality_decision::Entity as AgentMemoryQualityDecision;
 pub use super::agent_memory_repair_job::Entity as AgentMemoryRepairJob;
 pub use super::artifact::Entity as Artifact;
 pub use super::artifact_binding::Entity as ArtifactBinding;

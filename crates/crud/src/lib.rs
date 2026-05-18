@@ -68,13 +68,13 @@ pub use crate::repositories::thread_agents_doc::{
 };
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
-    agent_memory_policy_decision, agent_memory_repair_job, artifact as artifact_repository,
-    hook_run, mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy,
-    recovery_job, skill_audit_event, skill_dependency_snapshot, skill_installation,
-    skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
-    task_delivery, task_dependency, task_event, task_run, task_run_execution, task_trigger,
-    task_write_lock, thread, thread_agents_doc, thread_lineage, thread_tree, turn, turn_event,
-    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_repair_job,
+    artifact as artifact_repository, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
+    mcp_server_installation, policy, recovery_job, skill_audit_event, skill_dependency_snapshot,
+    skill_installation, skill_upload_session, skill_workspace_policy, task as task_repository,
+    task_agent_spec, task_delivery, task_dependency, task_event, task_run, task_run_execution,
+    task_trigger, task_write_lock, thread, thread_agents_doc, thread_lineage, thread_tree, turn,
+    turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -86,9 +86,10 @@ pub use crate::memory::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter, AgentMemoryCandidateRecord,
     AgentMemoryCandidateStatusUpdateRecord, AgentMemoryCapsuleRecord, AgentMemoryControlRecord,
     AgentMemoryEventRecord, AgentMemoryListFilter, AgentMemoryPolicyDecisionRecord,
-    AgentMemoryRepairJobRecord, MemoryActorRecord, MemoryScopeResolution, MemoryWorkspaceGuard,
-    NewAgentMemoryCandidate, NewAgentMemoryControlRecord, NewAgentMemoryEvent,
-    NewAgentMemoryPolicyDecision, NewAgentMemoryRepairJob, global_agent_memory_scope_key,
+    AgentMemoryQualityDecisionRecord, AgentMemoryRepairJobRecord, MemoryActorRecord,
+    MemoryScopeResolution, MemoryWorkspaceGuard, NewAgentMemoryCandidate,
+    NewAgentMemoryControlRecord, NewAgentMemoryEvent, NewAgentMemoryPolicyDecision,
+    NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob, global_agent_memory_scope_key,
     memory_scope_key_hash, workspace_agent_memory_scope_key,
 };
 pub use crate::repositories::hook_run::{
@@ -2135,6 +2136,72 @@ impl CrudStore {
         .await?
         .into_iter()
         .map(crate::memory::agent_memory_policy_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn insert_agent_memory_quality_decision(
+        &self,
+        decision: NewAgentMemoryQualityDecision,
+    ) -> Result<AgentMemoryQualityDecisionRecord> {
+        self.run_serialized_write(|| {
+            let decision = decision.clone();
+            async move {
+                let row = agent_memory_quality_decision::insert_quality_decision(
+                    &self.connection,
+                    decision,
+                )
+                .await?;
+                crate::memory::agent_memory_quality_decision_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn list_agent_memory_quality_decisions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryQualityDecisionRecord>> {
+        agent_memory_quality_decision::list_quality_decisions_for_memory(
+            &self.connection,
+            memory_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_quality_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_agent_memory_quality_decisions_for_candidate(
+        &self,
+        candidate_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryQualityDecisionRecord>> {
+        agent_memory_quality_decision::list_quality_decisions_for_candidate(
+            &self.connection,
+            candidate_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_quality_decision_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_agent_memory_quality_decisions_for_thread(
+        &self,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryQualityDecisionRecord>> {
+        agent_memory_quality_decision::list_quality_decisions_for_thread(
+            &self.connection,
+            thread_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_quality_decision_record_from_model)
         .collect()
     }
 
