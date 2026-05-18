@@ -4571,7 +4571,7 @@ async fn identity_recall_prompt_contains_relevant_memory() {
             .full_system_text
             .contains("User's name is Alexander.")
     );
-    assert!(prompt.full_system_text.contains("mem_identity_name"));
+    assert!(!prompt.full_system_text.contains("mem_identity_name"));
     assert!(
         !prompt
             .full_system_text
@@ -4761,7 +4761,11 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert!(prompt.full_system_text.contains("## Memory Recall"));
-    assert!(prompt.full_system_text.contains("Active memory context:"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Additional active memory context for this turn:")
+    );
     assert!(
         prompt
             .full_system_text
@@ -4860,7 +4864,11 @@ async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("Relevant memories:"));
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Relevant memory context for this turn:")
+    );
     assert_eq!(
         prompt
             .full_system_text
@@ -4868,7 +4876,11 @@ async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
             .count(),
         1
     );
-    assert!(!prompt.full_system_text.contains("Active memory context:"));
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("Additional active memory context for this turn:")
+    );
 
     let manifest = observed
         .iter()

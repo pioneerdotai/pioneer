@@ -17,13 +17,13 @@ mod prompt_context;
 mod providers;
 mod recall;
 mod state;
+mod synthesis;
 mod tools;
 
 #[cfg(test)]
 mod tests;
 
 use crate::{MemoryModeRecallParams, MemoryRecallMode, MemoryRecallTarget};
-use chrono::{DateTime, Utc};
 use pioneer_hooks::HookHandler;
 use pioneer_hooks::{
     HookActorKind, HookAwaitPolicy, HookCapabilities, HookCapability, HookContextMode,
@@ -39,11 +39,13 @@ use pioneer_hooks::{
     TurnPostTurnStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
     TurnPrePromptContextHookInput,
 };
+#[cfg(test)]
+use pioneer_promt::MemoryRecallPromptItem;
 use pioneer_promt::{
     MemoryActiveRecallPlannerPromptInput, MemoryPostTurnExtractorPromptInput,
-    MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
+    MemoryRecallPromptContextBlock, MemoryRecallPromptInput, MemoryRecallPromptPolicy,
     render_memory_active_recall_planner_prompt, render_memory_post_turn_extractor_prompt,
-    render_memory_recall_context_block, render_memory_recall_prompt,
+    render_memory_recall_prompt,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus, MemoryCategory,
@@ -79,4 +81,5 @@ use prompt_context::*;
 pub use providers::*;
 use recall::*;
 use state::*;
+use synthesis::*;
 use tools::*;

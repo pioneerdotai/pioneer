@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+use chrono::{DateTime, Utc};
+
+#[cfg(test)]
 pub(super) fn date_label(timestamp: i64) -> String {
     DateTime::<Utc>::from_timestamp(timestamp, 0)
         .map(|dt| dt.format("%Y-%m-%d").to_string())

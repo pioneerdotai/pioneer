@@ -79,7 +79,20 @@ impl HookHandler for MemoryDeterministicRecallHook {
             }
         };
 
-        if let Some(contribution) = memory_recall_prompt_context_contribution(recall_snapshot) {
+        let synthesis_result =
+            memory_recall_prompt_context_contribution_with_synthesis(recall_snapshot);
+        if synthesis_result.synthesis.raw_input_count > 0 {
+            response
+                .diagnostics
+                .push(memory_recall_synthesis_observability_diagnostic(
+                    &synthesis_result.synthesis,
+                ));
+            response.diagnostics.extend(hook_diagnostics_from_strings(
+                synthesis_result.synthesis.diagnostics.as_slice(),
+            ));
+        }
+
+        if let Some(contribution) = synthesis_result.contribution {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.recall_context_contributed",
                 "memory deterministic recall contributed prompt context",

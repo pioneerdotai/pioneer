@@ -140,11 +140,22 @@ impl HookHandler for ActiveMemoryRecallHook {
             return Ok(response);
         }
 
-        if let Some(contribution) = memory_active_recall_prompt_context_contribution(
+        let synthesis_result = memory_active_recall_prompt_context_contribution_with_synthesis(
             active_dedup.items,
             execution.truncated,
+            deterministic.memory_ids.clone(),
+            deterministic.rendered_line_fingerprints.clone(),
             &config,
-        ) {
+        );
+        response
+            .diagnostics
+            .push(memory_recall_synthesis_observability_diagnostic(
+                &synthesis_result.synthesis,
+            ));
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            synthesis_result.synthesis.diagnostics.as_slice(),
+        ));
+        if let Some(contribution) = synthesis_result.contribution {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.active_recall.context_contributed",
                 "memory active recall contributed prompt context",
@@ -152,6 +163,11 @@ impl HookHandler for ActiveMemoryRecallHook {
             response
                 .contributions
                 .push(HookContribution::PromptContext(contribution));
+        } else {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.active_recall.no_hits",
+                "memory active recall synthesis returned no prompt context",
+            ));
         }
         Ok(response)
     }

@@ -242,49 +242,47 @@ fn active_recall_provider_fallback(
     }
 }
 
+#[cfg(test)]
 pub(super) fn memory_recall_prompt_context_contribution(
     recall_snapshot: MemoryRecallSnapshot,
 ) -> Option<PromptContextContribution> {
-    if recall_snapshot.items.is_empty() {
-        return None;
-    }
-    let truncated = recall_snapshot.truncated;
-    let source_refs = memory_recall_source_refs(recall_snapshot.items.as_slice());
-    let prompt_items = recall_snapshot
-        .items
-        .into_iter()
-        .map(memory_recall_prompt_item)
-        .collect::<Vec<_>>();
-    let (content, truncated) =
-        render_memory_recall_context_block(prompt_items.as_slice(), truncated);
-    let content = HookPromptContent::new(content).ok()?;
-    Some(PromptContextContribution {
+    memory_recall_prompt_context_contribution_with_synthesis(recall_snapshot).contribution
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct MemoryRecallPromptContextContributionResult {
+    pub(super) contribution: Option<PromptContextContribution>,
+    pub(super) synthesis: MemoryRecallSynthesis,
+}
+
+pub(super) fn memory_recall_prompt_context_contribution_with_synthesis(
+    recall_snapshot: MemoryRecallSnapshot,
+) -> MemoryRecallPromptContextContributionResult {
+    let snapshot_truncated = recall_snapshot.truncated;
+    let synthesis = MemoryRecallSynthesizer::synthesize(MemoryRecallSynthesisInput::deterministic(
+        recall_snapshot,
+        MemoryRecallSynthesisBudget::default(),
+    ));
+    let content = synthesis.rendered_text();
+    let Some(content) = HookPromptContent::new(content).ok() else {
+        return MemoryRecallPromptContextContributionResult {
+            contribution: None,
+            synthesis,
+        };
+    };
+    let contribution = PromptContextContribution {
         contribution_id: HookContributionId::new(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
             .expect("static contribution id is valid"),
         domain: memory_policy_domain(),
         priority: 500,
         content,
         max_chars: Some(1_500),
-        source_refs,
-        diagnostics: Vec::new(),
-        truncated,
-    })
-}
-
-pub(super) fn memory_recall_source_refs(items: &[MemoryRecallItem]) -> Vec<HookSourceRef> {
-    let mut seen = BTreeSet::new();
-    items
-        .iter()
-        .filter_map(|item| {
-            let memory_id = item.memory_id.trim();
-            if memory_id.is_empty() || !seen.insert(memory_id.to_owned()) {
-                return None;
-            }
-            Some(HookSourceRef {
-                kind: HookSourceKind::Custom("memory".to_owned()),
-                id: HookSourceId::new(memory_id.to_owned()).ok()?,
-                label: None,
-            })
-        })
-        .collect()
+        source_refs: synthesis.source_refs.clone(),
+        diagnostics: hook_diagnostics_from_strings(synthesis.diagnostics.as_slice()),
+        truncated: snapshot_truncated || synthesis.truncated,
+    };
+    MemoryRecallPromptContextContributionResult {
+        contribution: Some(contribution),
+        synthesis,
+    }
 }

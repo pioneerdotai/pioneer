@@ -207,8 +207,18 @@ pub(super) fn memory_recall_prompt_section_contribution_from_context(
         available_tool_names,
         policy,
         recalled_items: Vec::new(),
-        recalled_context: recall_context.deterministic_content,
-        active_context: recall_context.active_content,
+        recalled_context: recall_context
+            .deterministic_content
+            .as_deref()
+            .and_then(|content| {
+                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+            }),
+        active_context: recall_context
+            .active_content
+            .as_deref()
+            .and_then(|content| {
+                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+            }),
         truncated: truncated || recall_context.truncated,
     })
 }
@@ -233,6 +243,7 @@ pub(super) fn memory_recall_prompt_section_contribution_from_input(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn memory_recall_prompt_item(item: MemoryRecallItem) -> MemoryRecallPromptItem {
     MemoryRecallPromptItem {
         memory_id: item.memory_id,

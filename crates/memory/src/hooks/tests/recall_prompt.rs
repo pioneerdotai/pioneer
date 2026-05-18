@@ -1127,7 +1127,7 @@ async fn memory_prompt_contract_consumes_active_context_allowlist() {
         .expect("prompt contract hook executes");
 
     let content = prompt_section_content(response).expect("prompt section is rendered");
-    assert!(content.contains("Active memory context:"));
+    assert!(content.contains("Additional active memory context for this turn:"));
     assert!(content.contains("Use hooks for memory domains."));
     assert!(!content.contains("Unrelated memory-domain context"));
 }
@@ -1153,9 +1153,9 @@ async fn deterministic_only_recall_omits_active_heading() {
         .expect("prompt contract hook executes");
 
     let content = prompt_section_content(response).expect("prompt section is rendered");
-    assert!(content.contains("Relevant memories:"));
+    assert!(content.contains("Relevant memory context for this turn:"));
     assert!(content.contains("User likes Porto."));
-    assert!(!content.contains("Active memory context:"));
+    assert!(!content.contains("Additional active memory context for this turn:"));
 }
 
 #[tokio::test]
@@ -1201,7 +1201,7 @@ async fn duplicate_active_memory_id_is_suppressed() {
     }));
     let content = prompt_section_content(response).expect("prompt section is rendered");
     assert_eq!(content.matches("User likes Porto.").count(), 1);
-    assert!(!content.contains("Active memory context:"));
+    assert!(!content.contains("Additional active memory context for this turn:"));
 }
 
 #[tokio::test]
@@ -1234,10 +1234,10 @@ async fn mixed_active_duplicates_keep_only_unique_context() {
     let content = prompt_section_content(response).expect("prompt section is rendered");
 
     assert_eq!(content.matches("User likes Porto.").count(), 1);
-    assert!(content.contains("Active memory context:"));
+    assert!(content.contains("Additional active memory context for this turn:"));
     assert!(content.contains("Use hooks for memory domains."));
     let active_section = content
-        .split("Active memory context:")
+        .split("Additional active memory context for this turn:")
         .nth(1)
         .expect("active section should render");
     assert!(!active_section.contains("mem_city"));
@@ -1285,7 +1285,7 @@ async fn exact_active_line_duplicate_is_suppressed() {
     let content = prompt_section_content(response).expect("prompt section is rendered");
 
     assert_eq!(content.matches("Shared synthesized line.").count(), 1);
-    assert!(!content.contains("Active memory context:"));
+    assert!(!content.contains("Additional active memory context for this turn:"));
 }
 
 #[tokio::test]
@@ -1328,8 +1328,8 @@ async fn active_synthesis_context_is_kept_when_unique() {
     }));
     let content = prompt_section_content(response).expect("prompt section is rendered");
 
-    assert!(content.contains("Relevant memories:"));
-    assert!(content.contains("Active memory context:"));
+    assert!(content.contains("Relevant memory context for this turn:"));
+    assert!(content.contains("Additional active memory context for this turn:"));
     assert!(content.contains("User is continuing Pioneer memory architecture work."));
 }
 

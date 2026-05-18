@@ -1395,9 +1395,15 @@ pub(super) fn dedup_active_recall_items_with_lines(
 pub(super) fn memory_recall_item_rendered_line_fingerprint(
     item: &MemoryRecallItem,
 ) -> Option<String> {
-    let prompt_item = memory_recall_prompt_item(item.clone());
-    let (line, _) = render_memory_recall_context_block(&[prompt_item], false);
-    rendered_line_fingerprint(line.as_str())
+    let synthesis = MemoryRecallSynthesizer::synthesize(MemoryRecallSynthesisInput {
+        source: MemoryRecallSynthesisSource::Deterministic,
+        items: vec![item.clone()],
+        deterministic_memory_ids: BTreeSet::new(),
+        deterministic_line_fingerprints: BTreeSet::new(),
+        input_text_preview: None,
+        budget: MemoryRecallSynthesisBudget::default(),
+    });
+    rendered_line_fingerprint(synthesis.rendered_text().as_str())
 }
 
 pub(super) fn rendered_line_fingerprints(content: &str) -> BTreeSet<String> {
@@ -1438,42 +1444,63 @@ pub(super) fn rendered_line_fingerprint(line: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn memory_active_recall_prompt_context_contribution(
     items: Vec<MemoryRecallItem>,
     snapshot_truncated: bool,
     config: &MemoryActiveRecallConfig,
 ) -> Option<PromptContextContribution> {
-    if items.is_empty() {
-        return None;
-    }
-    let source_refs = memory_recall_source_refs(items.as_slice());
-    let prompt_items = items
-        .into_iter()
-        .map(memory_recall_prompt_item)
-        .collect::<Vec<_>>();
-    let (content, rendered_truncated) =
-        render_memory_recall_context_block(prompt_items.as_slice(), snapshot_truncated);
-    if content.trim().is_empty() {
-        return None;
-    }
-    let mut content = content;
-    let mut truncated = rendered_truncated;
-    let content_chars = content.chars().count();
-    if content_chars > config.max_prompt_chars {
-        content = truncate_chars(content.as_str(), config.max_prompt_chars);
-        truncated = true;
-    }
-    Some(PromptContextContribution {
+    memory_active_recall_prompt_context_contribution_with_synthesis(
+        items,
+        snapshot_truncated,
+        BTreeSet::new(),
+        BTreeSet::new(),
+        config,
+    )
+    .contribution
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ActiveMemoryRecallPromptContextContributionResult {
+    pub(super) contribution: Option<PromptContextContribution>,
+    pub(super) synthesis: MemoryRecallSynthesis,
+}
+
+pub(super) fn memory_active_recall_prompt_context_contribution_with_synthesis(
+    items: Vec<MemoryRecallItem>,
+    snapshot_truncated: bool,
+    deterministic_memory_ids: BTreeSet<String>,
+    deterministic_line_fingerprints: BTreeSet<String>,
+    config: &MemoryActiveRecallConfig,
+) -> ActiveMemoryRecallPromptContextContributionResult {
+    let synthesis = MemoryRecallSynthesizer::synthesize(MemoryRecallSynthesisInput::active(
+        items,
+        deterministic_memory_ids,
+        deterministic_line_fingerprints,
+        MemoryRecallSynthesisBudget::for_active_config(config),
+    ));
+    let content = synthesis.rendered_text();
+    let Some(content) = HookPromptContent::new(content).ok() else {
+        return ActiveMemoryRecallPromptContextContributionResult {
+            contribution: None,
+            synthesis,
+        };
+    };
+    let contribution = PromptContextContribution {
         contribution_id: HookContributionId::new(MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID)
             .expect("static contribution id is valid"),
         domain: memory_policy_domain(),
         priority: 490,
-        content: HookPromptContent::new(content).ok()?,
+        content,
         max_chars: Some(config.max_prompt_chars),
-        source_refs,
-        diagnostics: Vec::new(),
-        truncated,
-    })
+        source_refs: synthesis.source_refs.clone(),
+        diagnostics: hook_diagnostics_from_strings(synthesis.diagnostics.as_slice()),
+        truncated: snapshot_truncated || synthesis.truncated,
+    };
+    ActiveMemoryRecallPromptContextContributionResult {
+        contribution: Some(contribution),
+        synthesis,
+    }
 }
 
 pub(super) fn bounded_nonempty_text(value: &str, max_chars: usize) -> Option<String> {

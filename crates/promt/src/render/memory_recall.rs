@@ -9,8 +9,8 @@ pub struct MemoryRecallPromptInput {
     pub available_tool_names: Vec<String>,
     pub policy: MemoryRecallPromptPolicy,
     pub recalled_items: Vec<MemoryRecallPromptItem>,
-    pub recalled_context: Option<String>,
-    pub active_context: Option<String>,
+    pub recalled_context: Option<MemoryRecallPromptContextBlock>,
+    pub active_context: Option<MemoryRecallPromptContextBlock>,
     pub truncated: bool,
 }
 
@@ -31,6 +31,34 @@ pub struct MemoryRecallPromptItem {
     pub content: String,
     pub score: Option<f32>,
     pub updated_at_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryRecallPromptContextBlock {
+    pub lines: Vec<String>,
+    pub truncated: bool,
+}
+
+impl MemoryRecallPromptContextBlock {
+    pub fn from_text(value: impl AsRef<str>, truncated: bool) -> Option<Self> {
+        let lines = value
+            .as_ref()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        (!lines.is_empty()).then_some(Self { lines, truncated })
+    }
+
+    pub fn from_lines(lines: Vec<String>, truncated: bool) -> Option<Self> {
+        let lines = lines
+            .into_iter()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        (!lines.is_empty()).then_some(Self { lines, truncated })
+    }
 }
 
 pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<String> {
@@ -108,34 +136,25 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
 
     let (recall_block, truncated) = if input.policy == MemoryRecallPromptPolicy::ForgetOnly {
         (String::new(), input.truncated)
-    } else if let Some(context) = input
-        .recalled_context
-        .as_deref()
-        .map(str::trim)
-        .filter(|context| !context.is_empty())
-    {
-        truncate_recall_context(context, input.truncated)
+    } else if let Some(context) = input.recalled_context.as_ref() {
+        render_synthesized_context_block(context, input.truncated)
     } else {
         render_recalled_memories(&input.recalled_items, input.truncated)
     };
     if !recall_block.is_empty() {
-        prompt.push_str("\n\nRelevant memories:\n");
+        prompt.push_str("\n\nRelevant memory context for this turn:\n");
         prompt.push_str(recall_block.as_str());
         if truncated {
             prompt.push_str("\nAdditional recalled memories were omitted for prompt budget.");
         }
     }
     if input.policy != MemoryRecallPromptPolicy::ForgetOnly
-        && let Some(active_context) = input
-            .active_context
-            .as_deref()
-            .map(str::trim)
-            .filter(|context| !context.is_empty())
+        && let Some(active_context) = input.active_context.as_ref()
     {
         let (active_context, active_truncated) =
-            truncate_recall_context(active_context, input.truncated);
+            render_synthesized_context_block(active_context, input.truncated);
         if !active_context.is_empty() {
-            prompt.push_str("\n\nActive memory context:\n");
+            prompt.push_str("\n\nAdditional active memory context for this turn:\n");
             prompt.push_str(active_context.as_str());
             if active_truncated {
                 prompt
@@ -152,6 +171,44 @@ pub fn render_memory_recall_context_block(
     snapshot_truncated: bool,
 ) -> (String, bool) {
     render_recalled_memories(items, snapshot_truncated)
+}
+
+fn render_synthesized_context_block(
+    context: &MemoryRecallPromptContextBlock,
+    already_truncated: bool,
+) -> (String, bool) {
+    if context.lines.is_empty() {
+        return (String::new(), already_truncated || context.truncated);
+    }
+
+    let mut block = String::new();
+    let mut used_chars = 0usize;
+    let mut truncated = already_truncated || context.truncated;
+
+    for (index, line) in context.lines.iter().enumerate() {
+        if index >= MEMORY_PROMPT_MAX_ITEMS {
+            truncated = true;
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line_chars = line.chars().count();
+        let separator_chars = usize::from(!block.is_empty());
+        if used_chars + separator_chars + line_chars > MEMORY_PROMPT_MAX_RECALL_CHARS {
+            truncated = true;
+            break;
+        }
+        if !block.is_empty() {
+            block.push('\n');
+            used_chars += 1;
+        }
+        block.push_str(line);
+        used_chars += line_chars;
+    }
+
+    (block, truncated)
 }
 
 fn render_recalled_memories(
@@ -191,43 +248,23 @@ fn render_recalled_memories(
     (block, truncated)
 }
 
-fn truncate_recall_context(context: &str, already_truncated: bool) -> (String, bool) {
-    let content_chars = context.chars().count();
-    if content_chars <= MEMORY_PROMPT_MAX_RECALL_CHARS {
-        return (context.to_owned(), already_truncated);
-    }
-    (
-        context
-            .chars()
-            .take(MEMORY_PROMPT_MAX_RECALL_CHARS)
-            .collect(),
-        true,
+fn render_recalled_memory_line(item: &MemoryRecallPromptItem) -> String {
+    format!(
+        "- {} {}: {}",
+        display_scope_label(item.scope_label.trim()),
+        item.category_label.trim().replace('_', " "),
+        truncate_chars(item.content.trim(), MEMORY_PROMPT_MAX_CONTENT_CHARS)
     )
 }
 
-fn render_recalled_memory_line(item: &MemoryRecallPromptItem) -> String {
-    let mut metadata = vec![
-        item.memory_id.clone(),
-        format!("{}/{}", item.scope_label.trim(), item.category_label.trim()),
-    ];
-    if let Some(key) = item.key.as_deref().map(str::trim)
-        && !key.is_empty()
-    {
-        metadata.push(format!("key={}", truncate_chars(key, 80)));
-    }
-    let updated_at_label = item.updated_at_label.trim();
-    if !updated_at_label.is_empty() {
-        metadata.push(format!("updated={updated_at_label}"));
-    }
-    if let Some(score) = item.score {
-        metadata.push(format!("score={score:.2}"));
-    }
-
-    format!(
-        "- [{}] {}",
-        metadata.join(", "),
-        truncate_chars(item.content.trim(), MEMORY_PROMPT_MAX_CONTENT_CHARS)
-    )
+fn display_scope_label(scope: &str) -> String {
+    scope
+        .split(':')
+        .next()
+        .unwrap_or(scope)
+        .replace('_', " ")
+        .trim()
+        .to_owned()
 }
 
 fn normalized_tool_names(names: &[String]) -> Vec<String> {
@@ -303,7 +340,10 @@ mod tests {
         assert!(prompt.contains("Call memory_remember proactively"));
         assert!(prompt.contains("If the user asks you to forget"));
         assert!(prompt.contains("Do not store one-off commands"));
-        assert!(prompt.contains("[mem_123, user/identity, key=name, updated=2024-05-05, score=1.00] User's name is Alexander."));
+        assert!(prompt.contains("Relevant memory context for this turn:"));
+        assert!(prompt.contains("- user identity: User's name is Alexander."));
+        assert!(!prompt.contains("mem_123"));
+        assert!(!prompt.contains("score="));
     }
 
     #[test]
@@ -346,7 +386,8 @@ mod tests {
         .expect("memory prompt");
 
         assert!(prompt.contains("Additional recalled memories were omitted"));
-        assert!(prompt.contains("mem_0"));
+        assert!(prompt.contains("- user preference:"));
+        assert!(!prompt.contains("mem_0"));
         assert!(!prompt.contains("mem_7"));
     }
 
@@ -382,15 +423,18 @@ mod tests {
             policy: MemoryRecallPromptPolicy::ForgetOnly,
             recalled_items: vec![memory_prompt_item("mem_123", "User's birthday is May 5.")],
             recalled_context: None,
-            active_context: Some("- [mem_active] Active should also be omitted.".to_owned()),
+            active_context: MemoryRecallPromptContextBlock::from_text(
+                "- active identity: Active should also be omitted.",
+                false,
+            ),
             truncated: false,
         })
         .expect("memory prompt");
 
         assert!(prompt.contains("only to identify and forget"));
         assert!(!prompt.contains("Before non-trivial tasks"));
-        assert!(!prompt.contains("Relevant memories:"));
-        assert!(!prompt.contains("Active memory context:"));
+        assert!(!prompt.contains("Relevant memory context for this turn:"));
+        assert!(!prompt.contains("Additional active memory context for this turn:"));
         assert!(!prompt.contains("User's birthday is May 5."));
     }
 
@@ -401,18 +445,47 @@ mod tests {
             policy: MemoryRecallPromptPolicy::Full,
             recalled_items: vec![memory_prompt_item("mem_123", "User's name is Alexander.")],
             recalled_context: None,
-            active_context: Some("User is working on Pioneer memory architecture.".to_owned()),
+            active_context: MemoryRecallPromptContextBlock::from_text(
+                "- workspace project decision: User is working on Pioneer memory architecture.",
+                false,
+            ),
             truncated: false,
         })
         .expect("memory prompt");
 
         let relevant_index = prompt
-            .find("Relevant memories:")
+            .find("Relevant memory context for this turn:")
             .expect("relevant section should render");
         let active_index = prompt
-            .find("Active memory context:")
+            .find("Additional active memory context for this turn:")
             .expect("active section should render");
         assert!(relevant_index < active_index);
         assert!(prompt.contains("User is working on Pioneer memory architecture."));
+    }
+
+    #[test]
+    fn memory_prompt_renders_synthesized_context_without_raw_metadata() {
+        let prompt = render_memory_recall_prompt(&MemoryRecallPromptInput {
+            available_tool_names: vec!["memory_search".to_owned()],
+            policy: MemoryRecallPromptPolicy::Full,
+            recalled_items: Vec::new(),
+            recalled_context: MemoryRecallPromptContextBlock::from_text(
+                "- user identity: Пользователя зовут Александр.",
+                false,
+            ),
+            active_context: MemoryRecallPromptContextBlock::from_text(
+                "- workspace project decision: Use hook runtime for memory domains.",
+                false,
+            ),
+            truncated: false,
+        })
+        .expect("memory prompt");
+
+        assert!(prompt.contains("Relevant memory context for this turn:"));
+        assert!(prompt.contains("Additional active memory context for this turn:"));
+        assert!(prompt.contains("- user identity: Пользователя зовут Александр."));
+        assert!(!prompt.contains("score="));
+        assert!(!prompt.contains("hook_id"));
+        assert!(!prompt.contains("memory.active_recall"));
     }
 }

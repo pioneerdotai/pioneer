@@ -31,8 +31,8 @@ pub use render::{
         MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_prompt,
     },
     memory_recall::{
-        MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
-        render_memory_recall_context_block, render_memory_recall_prompt,
+        MemoryRecallPromptContextBlock, MemoryRecallPromptInput, MemoryRecallPromptItem,
+        MemoryRecallPromptPolicy, render_memory_recall_context_block, render_memory_recall_prompt,
     },
     memory_turn_policy::{
         MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,
