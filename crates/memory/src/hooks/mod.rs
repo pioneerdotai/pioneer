@@ -12,6 +12,7 @@ mod package;
 mod policy;
 mod policy_codec;
 mod post_turn;
+mod post_turn_eligibility;
 mod prompt_context;
 mod providers;
 mod recall;
@@ -24,17 +25,18 @@ mod tests;
 use chrono::{DateTime, Utc};
 use pioneer_hooks::HookHandler;
 use pioneer_hooks::{
-    HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookContributionId,
-    HookDefinition, HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage,
-    HookDiagnosticSeverity, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
-    HookHandlerRequest, HookHandlerResponse, HookId, HookInputPayload, HookKind, HookMetadata,
-    HookMetadataKey, HookPackage, HookPhase, HookPolicyKey, HookPolicySet, HookPromptContent,
-    HookRegistryError, HookResult, HookRetryBackoff, HookRetryPolicy, HookSectionId, HookSourceId,
-    HookSourceKind, HookSourceRef, HookSubscription, HookSubscriptionDependencies,
-    HookSubscriptionId, HookSubscriptionVisibility, HookToolBundleId, HookToolName, HookValue,
-    PolicyContribution, PromptContextContribution, PromptSectionContribution,
-    ToolBundleContribution, TurnPostTurnHookInput, TurnPostTurnStatus, TurnPrePolicyHookInput,
-    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    HookActorKind, HookAwaitPolicy, HookCapabilities, HookCapability, HookContextMode,
+    HookContribution, HookContributionId, HookDefinition, HookDiagnostic, HookDiagnosticCode,
+    HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain, HookError, HookExecutionPolicy,
+    HookFailurePolicy, HookHandlerRequest, HookHandlerResponse, HookId, HookInputPayload, HookKind,
+    HookMetadata, HookMetadataKey, HookPackage, HookPhase, HookPolicyKey, HookPolicySet,
+    HookPromptContent, HookRegistryError, HookResult, HookRetryBackoff, HookRetryPolicy,
+    HookSectionId, HookSourceId, HookSourceKind, HookSourceRef, HookSubscription,
+    HookSubscriptionDependencies, HookSubscriptionId, HookSubscriptionVisibility, HookToolBundleId,
+    HookToolName, HookValue, PolicyContribution, PromptContextContribution,
+    PromptSectionContribution, ToolBundleContribution, TurnPostTurnDomain, TurnPostTurnHookInput,
+    TurnPostTurnStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
     MemoryPostTurnExtractorPromptInput, MemoryRecallPromptInput, MemoryRecallPromptItem,
@@ -46,7 +48,8 @@ use pioneer_protocol::{
     MemoryExplicitness, MemoryIntent, MemoryProvenance, MemoryScope, MemoryScopeHint,
     MemoryScopeKind, MemorySemanticFields, MemorySemanticWriteDisposition,
     MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivityHint,
-    MemorySourceKind, MemoryStatus, MemoryWriteEvidence, MemoryWriteRelation, ThreadMode,
+    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
+    MemoryWriteRelation, ThreadMode,
 };
 use pioneer_tools::ToolExtensionBundle;
 use serde::Deserialize;
@@ -69,6 +72,7 @@ pub use policy::*;
 pub use policy_codec::memory_turn_policy_from_hook_policy_set;
 use policy_codec::*;
 use post_turn::*;
+use post_turn_eligibility::*;
 use prompt_context::*;
 pub use providers::*;
 use recall::*;

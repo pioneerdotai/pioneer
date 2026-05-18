@@ -1,5 +1,6 @@
 mod classifier_fallback;
 mod descriptors;
+mod eligibility;
 mod policy_basics;
 mod policy_classifier;
 mod post_turn;
@@ -217,6 +218,22 @@ fn test_post_turn_hook_request(
     user_text: &str,
     assistant_text: &str,
 ) -> HookHandlerRequest {
+    test_post_turn_hook_request_with_events(
+        policy_set,
+        Some(user_text),
+        Some(assistant_text),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn test_post_turn_hook_request_with_events(
+    policy_set: HookPolicySet,
+    user_text: Option<&str>,
+    assistant_text: Option<&str>,
+    tool_events: Vec<pioneer_hooks::TurnPostTurnToolEventSummary>,
+    domain_events: Vec<pioneer_hooks::TurnPostTurnDomainEventSummary>,
+) -> HookHandlerRequest {
     HookHandlerRequest {
         hook_id: HookId::new(MEMORY_POST_TURN_EXTRACTOR_HOOK_ID).expect("static hook id is valid"),
         phase: HookPhase::TurnPostTurn,
@@ -230,15 +247,38 @@ fn test_post_turn_hook_request(
             TurnPostTurnStatus::Succeeded,
             Some("test-model"),
             Some("test-provider"),
-            Some(user_text),
-            Some(assistant_text),
+            user_text,
+            assistant_text,
             None::<&str>,
-            Vec::new(),
-            Vec::new(),
+            tool_events,
+            domain_events,
             pioneer_hooks::TurnPostTurnHookInputLimits::default(),
         )),
         policy_set,
         prompt_context_set: HookPromptContextSet::default(),
+    }
+}
+
+fn test_post_turn_tool_event() -> pioneer_hooks::TurnPostTurnToolEventSummary {
+    pioneer_hooks::TurnPostTurnToolEventSummary {
+        item_id: "tool-item".to_owned(),
+        item_type: "dynamic_tool_call".to_owned(),
+        tool_name: "exec".to_owned(),
+        attempt_number: 1,
+        status: pioneer_hooks::TurnPostTurnToolStatus::Succeeded,
+        outcome_status: Some(pioneer_hooks::TurnPostTurnToolOutcomeStatus::Ok),
+        error_class: None,
+    }
+}
+
+fn test_post_turn_domain_event(
+    domain: pioneer_hooks::TurnPostTurnDomain,
+) -> pioneer_hooks::TurnPostTurnDomainEventSummary {
+    pioneer_hooks::TurnPostTurnDomainEventSummary {
+        domain,
+        code: Some("completed".to_owned()),
+        item_id: Some("domain-item".to_owned()),
+        message: None,
     }
 }
 

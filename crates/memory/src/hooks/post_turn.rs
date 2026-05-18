@@ -636,6 +636,33 @@ pub(super) fn memory_post_turn_stats_metadata(
 }
 
 pub(super) fn memory_post_turn_skip_diagnostic(
+    reason: MemoryPostTurnEligibilitySkipReason,
+    status: TurnPostTurnStatus,
+    policy: Option<&MemoryTurnPolicy>,
+) -> HookDiagnostic {
+    let mut diagnostic = memory_safe_info_diagnostic(reason.diagnostic_code(), reason.message());
+    diagnostic.metadata.insert(
+        hook_metadata_key("skip_reason"),
+        HookValue::Text(reason.as_str().to_owned()),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("turn_status"),
+        HookValue::Text(turn_post_turn_status_label(status).to_owned()),
+    );
+    if let Some(policy) = policy {
+        diagnostic.metadata.insert(
+            hook_metadata_key("policy_source"),
+            HookValue::Text(policy.source.as_str().to_owned()),
+        );
+        diagnostic.metadata.insert(
+            hook_metadata_key("policy_reason_code"),
+            HookValue::Text(policy.reason_code.as_str().to_owned()),
+        );
+    }
+    diagnostic
+}
+
+pub(super) fn memory_post_turn_provider_skip_diagnostic(
     reason: &'static str,
     message: impl Into<String>,
 ) -> HookDiagnostic {

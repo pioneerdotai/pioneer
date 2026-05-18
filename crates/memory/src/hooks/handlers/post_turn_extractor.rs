@@ -29,90 +29,66 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         let config = self.config.normalized();
         let mut response = HookHandlerResponse::default();
 
-        if !config.enabled {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "config_disabled",
-                "memory post-turn extractor skipped: config disabled",
-            ));
-            return Ok(response);
-        }
-
-        if input.status != TurnPostTurnStatus::Succeeded {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "non_success_status",
-                format!(
-                    "memory post-turn extractor skipped: status={}",
-                    turn_post_turn_status_label(input.status)
-                ),
-            ));
-            return Ok(response);
-        }
-
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
-            Some(Ok(policy)) => policy,
+            Some(Ok(policy)) => MemoryPostTurnEligibilityPolicy::Available(policy),
             Some(Err(error)) => {
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.policy_decode_failed",
-                    format!("memory post-turn extractor skipped: policy_decode_failed {error}"),
+                    format!("memory post-turn extractor policy decode failed: {error}"),
                 ));
-                return Ok(response);
+                MemoryPostTurnEligibilityPolicy::Malformed
             }
-            None => {
-                return Ok(memory_missing_policy_response(
-                    MEMORY_POST_TURN_EXTRACTOR_HOOK_ID,
-                ));
-            }
+            None => MemoryPostTurnEligibilityPolicy::Missing,
         };
 
-        if !post_turn_policy_allows_any_extraction(&policy) {
+        let eligibility_input =
+            memory_post_turn_eligibility_input_from_request(&request, input, &config, policy);
+        let eligibility_decision = MemoryPostTurnEligibilityGate::evaluate(&eligibility_input);
+        if !eligibility_decision.is_eligible() {
+            let MemoryPostTurnEligibilityDecision::Skipped(reason) = eligibility_decision else {
+                unreachable!("non-eligible decision must carry a skip reason");
+            };
             response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "policy_disabled",
-                format!(
-                    "memory post-turn extractor skipped: source={} reason={}",
-                    policy.source.as_str(),
-                    policy.reason_code.as_str()
-                ),
+                reason,
+                input.status,
+                eligibility_input.policy.as_available_policy(),
             ));
             return Ok(response);
         }
+        let MemoryPostTurnEligibilityPolicy::Available(policy) = eligibility_input.policy else {
+            unreachable!("eligible post-turn extraction requires a decoded policy");
+        };
 
         if !config.provider_enabled {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "provider_disabled",
-                "memory post-turn extractor skipped: provider disabled",
-            ));
+            response
+                .diagnostics
+                .push(memory_post_turn_provider_skip_diagnostic(
+                    "provider_disabled",
+                    "memory post-turn extractor skipped: provider disabled",
+                ));
             return Ok(response);
         }
 
         let Some(write_provider) = self.write_provider.as_ref() else {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "write_provider_unavailable",
-                "memory post-turn extractor skipped: write provider unavailable",
-            ));
+            response
+                .diagnostics
+                .push(memory_post_turn_provider_skip_diagnostic(
+                    "write_provider_unavailable",
+                    "memory post-turn extractor skipped: write provider unavailable",
+                ));
             return Ok(response);
         };
         let Some(extractor_provider) = self.extractor_provider.as_ref() else {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "provider_unavailable",
-                "memory post-turn extractor skipped: extractor provider unavailable",
-            ));
+            response
+                .diagnostics
+                .push(memory_post_turn_provider_skip_diagnostic(
+                    "provider_unavailable",
+                    "memory post-turn extractor skipped: extractor provider unavailable",
+                ));
             return Ok(response);
         };
 
         let context = memory_turn_context_from_post_turn_request(&request, input, &config)?;
-        if context.input_text.trim().is_empty()
-            && input
-                .assistant_text
-                .as_ref()
-                .map(|text| text.text.trim().is_empty())
-                .unwrap_or(true)
-        {
-            response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                "empty_transcript",
-                "memory post-turn extractor skipped: empty transcript",
-            ));
-            return Ok(response);
-        }
 
         let manifest = match write_provider
             .load_memory_manifest(
@@ -126,10 +102,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         {
             Ok(manifest) => manifest,
             Err(_) => {
-                response.diagnostics.push(memory_post_turn_skip_diagnostic(
-                    "manifest_failed",
-                    "memory post-turn extractor skipped: manifest loading failed",
-                ));
+                response
+                    .diagnostics
+                    .push(memory_post_turn_provider_skip_diagnostic(
+                        "manifest_failed",
+                        "memory post-turn extractor skipped: manifest loading failed",
+                    ));
                 return Ok(response);
             }
         };

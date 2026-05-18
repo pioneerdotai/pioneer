@@ -170,9 +170,12 @@ async fn explicit_no_use_policy_remains_stronger_than_fallback_defaults() {
     assert_eq!(extractor_provider.call_count(), 0);
     assert_eq!(write_provider.write_call_count(), 0);
     assert!(post_turn_response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
+        diagnostic.code.as_str() == "memory.post_turn_eligibility.policy_disabled"
             && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
                 == Some(&HookValue::Text("policy_disabled".to_owned()))
-            && diagnostic.message.as_str().contains("reason=memory_no_use")
+            && diagnostic
+                .metadata
+                .get(&hook_metadata_key("policy_reason_code"))
+                == Some(&HookValue::Text("memory_no_use".to_owned()))
     }));
 }

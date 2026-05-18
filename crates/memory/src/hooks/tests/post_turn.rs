@@ -1,5 +1,25 @@
 use super::*;
 
+fn assert_post_turn_eligibility_skip(
+    response: &HookHandlerResponse,
+    reason: MemoryPostTurnEligibilitySkipReason,
+) {
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == reason.diagnostic_code()
+            && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
+                == Some(&HookValue::Text(reason.as_str().to_owned()))
+    }));
+    for diagnostic in &response.diagnostics {
+        assert!(
+            !diagnostic
+                .message
+                .as_str()
+                .contains("direct user transcript")
+        );
+        assert!(!diagnostic.message.as_str().contains("assistant response"));
+    }
+}
+
 #[test]
 fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
@@ -400,8 +420,11 @@ async fn post_turn_extractor_skips_non_success_turns() {
     assert_eq!(extractor_provider.call_count(), 0);
     assert_eq!(write_provider.write_call_count(), 0);
     assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
-            && diagnostic.message.as_str().contains("provider_failure")
+        diagnostic.code.as_str() == "memory.post_turn_eligibility.non_success_status"
+            && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
+                == Some(&HookValue::Text("non_success_status".to_owned()))
+            && diagnostic.metadata.get(&hook_metadata_key("turn_status"))
+                == Some(&HookValue::Text("provider_failure".to_owned()))
     }));
 }
 
@@ -429,11 +452,15 @@ async fn post_turn_extractor_respects_policy_and_provider_availability() {
     assert_eq!(extractor_provider.call_count(), 0);
     assert_eq!(write_provider.write_call_count(), 0);
     assert!(no_save.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.post_turn_extractor.skipped"
+        diagnostic.code.as_str() == "memory.post_turn_eligibility.policy_disabled"
+            && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
+                == Some(&HookValue::Text("policy_disabled".to_owned()))
+            && diagnostic.metadata.get(&hook_metadata_key("policy_source"))
+                == Some(&HookValue::Text("pre_memory_classifier".to_owned()))
             && diagnostic
-                .message
-                .as_str()
-                .contains("source=pre_memory_classifier")
+                .metadata
+                .get(&hook_metadata_key("policy_reason_code"))
+                == Some(&HookValue::Text("memory_no_save".to_owned()))
     }));
 
     let provider_disabled = MemoryPostTurnExtractorHook {
@@ -456,6 +483,251 @@ async fn post_turn_extractor_respects_policy_and_provider_availability() {
             && diagnostic.metadata.get(&hook_metadata_key("skip_reason"))
                 == Some(&HookValue::Text("provider_disabled".to_owned()))
     }));
+}
+
+#[tokio::test]
+async fn post_turn_extractor_runs_for_direct_user_turns_with_runtime_events() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider.clone()),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+
+    let response = hook
+        .execute(test_post_turn_hook_request_with_events(
+            memory_policy_set(&MemoryTurnPolicy::permissive_classifier_fallback(
+                MemoryPolicyReasonCode::ClassifierUnavailable,
+            )),
+            Some("direct user transcript"),
+            Some("assistant response"),
+            vec![test_post_turn_tool_event()],
+            vec![test_post_turn_domain_event(
+                pioneer_hooks::TurnPostTurnDomain::Custom("runtime".to_owned()),
+            )],
+        ))
+        .await
+        .expect("direct user turn with runtime events remains eligible");
+
+    assert!(response.contributions.is_empty());
+    assert_eq!(write_provider.manifest_call_count(), 1);
+    assert_eq!(extractor_provider.call_count(), 1);
+    assert_eq!(write_provider.write_call_count(), 1);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
+            && diagnostic.message.as_str().contains("write_attempts=1")
+    }));
+}
+
+#[tokio::test]
+async fn post_turn_extractor_skips_ineligible_source_classes_before_provider_calls() {
+    let mut task_owned = test_post_turn_hook_request_with_events(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        Some("direct user transcript"),
+        Some("assistant response"),
+        Vec::new(),
+        Vec::new(),
+    );
+    task_owned.context.task_id =
+        Some(pioneer_hooks::HookTaskId::new("task-1").expect("valid task id"));
+
+    let mut system_owned = test_post_turn_hook_request_with_events(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        Some("direct user transcript"),
+        Some("assistant response"),
+        Vec::new(),
+        Vec::new(),
+    );
+    system_owned.context.mode = Some(pioneer_hooks::HookContextMode::System);
+
+    let cases = vec![
+        (
+            "missing_policy",
+            test_post_turn_hook_request_with_events(
+                HookPolicySet::empty(),
+                Some("direct user transcript"),
+                Some("assistant response"),
+                Vec::new(),
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::MissingPolicy,
+        ),
+        (
+            "no_use_policy",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::no_use()),
+                Some("direct user transcript"),
+                Some("assistant response"),
+                Vec::new(),
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::PolicyDisabledExtraction,
+        ),
+        (
+            "no_save_policy",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::no_save()),
+                Some("direct user transcript"),
+                Some("assistant response"),
+                Vec::new(),
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::PolicyDisabledExtraction,
+        ),
+        (
+            "empty_transcript",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::NoTranscript,
+        ),
+        (
+            "assistant_only",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                None,
+                Some("assistant response"),
+                Vec::new(),
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::NoDirectUserSource,
+        ),
+        (
+            "tool_only",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                None,
+                None,
+                vec![test_post_turn_tool_event()],
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
+        ),
+        (
+            "domain_only",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                None,
+                None,
+                Vec::new(),
+                vec![test_post_turn_domain_event(
+                    pioneer_hooks::TurnPostTurnDomain::Memory,
+                )],
+            ),
+            MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
+        ),
+        (
+            "task_owned",
+            task_owned,
+            MemoryPostTurnEligibilitySkipReason::TaskRuntimeOwnedSource,
+        ),
+        (
+            "system_owned",
+            system_owned,
+            MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
+        ),
+    ];
+
+    for (label, request, reason) in cases {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let response = hook
+            .execute(request)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: hook should skip cleanly: {error}"));
+
+        assert!(response.contributions.is_empty(), "{label}");
+        assert_eq!(write_provider.manifest_call_count(), 0, "{label}");
+        assert_eq!(extractor_provider.call_count(), 0, "{label}");
+        assert_eq!(write_provider.write_call_count(), 0, "{label}");
+        assert_post_turn_eligibility_skip(&response, reason);
+    }
+}
+
+#[tokio::test]
+async fn permissive_fallback_does_not_override_typed_source_ineligibility() {
+    let fallback_policy = MemoryTurnPolicy::permissive_classifier_fallback(
+        MemoryPolicyReasonCode::ClassifierUnavailable,
+    );
+    let mut task_owned = test_post_turn_hook_request_with_events(
+        memory_policy_set(&fallback_policy),
+        Some("direct user transcript"),
+        Some("assistant response"),
+        Vec::new(),
+        Vec::new(),
+    );
+    task_owned.context.task_id =
+        Some(pioneer_hooks::HookTaskId::new("task-1").expect("valid task id"));
+
+    let cases = vec![
+        (
+            "tool_only",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&fallback_policy),
+                None,
+                None,
+                vec![test_post_turn_tool_event()],
+                Vec::new(),
+            ),
+            MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
+        ),
+        (
+            "domain_only",
+            test_post_turn_hook_request_with_events(
+                memory_policy_set(&fallback_policy),
+                None,
+                None,
+                Vec::new(),
+                vec![test_post_turn_domain_event(
+                    pioneer_hooks::TurnPostTurnDomain::Memory,
+                )],
+            ),
+            MemoryPostTurnEligibilitySkipReason::SystemOrToolOnlySource,
+        ),
+        (
+            "task_owned",
+            task_owned,
+            MemoryPostTurnEligibilitySkipReason::TaskRuntimeOwnedSource,
+        ),
+    ];
+
+    for (label, request, reason) in cases {
+        let write_provider = Arc::new(TestMemoryWriteProvider::default());
+        let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+            valid_post_turn_extractor_json(),
+        ));
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(write_provider.clone()),
+            extractor_provider: Some(extractor_provider.clone()),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+
+        let response = hook
+            .execute(request)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: hook should skip cleanly: {error}"));
+
+        assert!(response.contributions.is_empty(), "{label}");
+        assert_eq!(write_provider.manifest_call_count(), 0, "{label}");
+        assert_eq!(extractor_provider.call_count(), 0, "{label}");
+        assert_eq!(write_provider.write_call_count(), 0, "{label}");
+        assert_post_turn_eligibility_skip(&response, reason);
+    }
 }
 
 #[tokio::test]
