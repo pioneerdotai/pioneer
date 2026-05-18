@@ -44,12 +44,12 @@ use pioneer_promt::{
     render_memory_recall_context_block, render_memory_recall_prompt,
 };
 use pioneer_protocol::{
-    MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryDurability,
-    MemoryExplicitness, MemoryIntent, MemoryProvenance, MemoryScope, MemoryScopeHint,
-    MemoryScopeKind, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySensitivityHint,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
-    MemoryWriteRelation, ThreadMode,
+    MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus, MemoryCategory,
+    MemoryDurability, MemoryExplicitness, MemoryFactClass, MemoryIntent, MemoryProvenance,
+    MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation, ThreadMode,
 };
 use pioneer_tools::ToolExtensionBundle;
 use serde::Deserialize;

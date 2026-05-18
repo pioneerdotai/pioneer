@@ -134,6 +134,15 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
         .into_iter()
         .next()
         .expect("active recall request recorded");
+    assert_eq!(
+        request.query,
+        "active recall workspace project decisions policies constraints procedures"
+    );
+    assert!(
+        request
+            .categories
+            .contains(&MemoryCategory::ProjectDecision)
+    );
     assert_eq!(request.top_k, Some(5));
     assert_eq!(request.max_chars, Some(1_500));
     assert!(response.diagnostics.iter().any(|diagnostic| {
@@ -212,14 +221,14 @@ async fn active_memory_hook_runs_for_memory_sensitive_turns() {
 }
 
 #[tokio::test]
-async fn active_memory_hook_uses_valid_strict_json_query_hints() {
+async fn active_memory_hook_uses_valid_strict_json_plan() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
-            r#"{"status":"run","confidence":0.92,"queryHints":["project hook runtime constraints"],"diagnostics":["provider ok"]}"#,
+            r#"{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["provider ok"]}"#,
         ))),
         config: MemoryActiveRecallConfig {
             max_queries: 1,
@@ -241,8 +250,12 @@ async fn active_memory_hook_uses_valid_strict_json_query_hints() {
         .recall_requests()
         .into_iter()
         .next()
-        .expect("strict JSON query hint should drive recall");
-    assert_eq!(request.query, "project hook runtime constraints");
+        .expect("strict JSON plan should drive recall");
+    assert_eq!(
+        request.query,
+        "active recall profile identity preferences communication style"
+    );
+    assert!(request.categories.contains(&MemoryCategory::Identity));
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.decision"
             && diagnostic.message.as_str().contains("reason=provider_run")
@@ -309,7 +322,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
 }
 
 #[tokio::test]
-async fn active_memory_hook_runs_bounded_generic_recall_for_short_turns() {
+async fn active_memory_hook_uses_mode_derived_recall_for_short_turns() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -337,8 +350,17 @@ async fn active_memory_hook_runs_bounded_generic_recall_for_short_turns() {
         .into_iter()
         .next()
         .expect("active recall request recorded");
-    assert_eq!(request.query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
-    assert!(request.categories.is_empty());
+    assert_ne!(request.query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
+    assert_ne!(request.query, "как меня зовут?");
+    assert_eq!(
+        request.query,
+        "active recall workspace project decisions policies constraints procedures"
+    );
+    assert!(
+        request
+            .categories
+            .contains(&MemoryCategory::ProjectDecision)
+    );
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.decision"
             && diagnostic.message.as_str().contains("status=run")
@@ -435,14 +457,201 @@ async fn active_memory_hook_ignores_malformed_internal_json() {
         .await
         .expect("malformed provider json is best-effort");
 
-    assert!(response.contributions.is_empty());
-    assert_eq!(provider.recall_call_count(), 0);
+    assert_eq!(provider.recall_call_count(), 2);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic
             .message
             .as_str()
             .contains("memory.active_recall.invalid_json")
     }));
+}
+
+#[test]
+fn active_recall_plan_normalizes_modes_targets_and_diagnostics() {
+    let plan = ActiveRecallPlan::run(
+        ActiveMemoryDecisionReasonCode::MemoryLikely,
+        9.0,
+        vec![
+            ActiveRecallMode::Durable,
+            ActiveRecallMode::Project,
+            ActiveRecallMode::Project,
+            ActiveRecallMode::Profile,
+            ActiveRecallMode::TaskContext,
+            ActiveRecallMode::ThreadEpisodic,
+        ],
+        vec![
+            ActiveRecallTarget::exact_canonical("key:1"),
+            ActiveRecallTarget::exact_canonical("key:2"),
+            ActiveRecallTarget::exact_canonical("key:3"),
+            ActiveRecallTarget::exact_canonical("key:4"),
+            ActiveRecallTarget::exact_canonical("key:5"),
+            ActiveRecallTarget::exact_canonical("key:6"),
+            ActiveRecallTarget::exact_canonical("key:7"),
+        ],
+        vec![
+            "one".to_owned(),
+            "two".to_owned(),
+            "three".to_owned(),
+            "four".to_owned(),
+            "five".to_owned(),
+            "six".to_owned(),
+            "seven".to_owned(),
+        ],
+    );
+
+    assert_eq!(plan.confidence, 1.0);
+    assert_eq!(
+        plan.modes,
+        vec![
+            ActiveRecallMode::Profile,
+            ActiveRecallMode::Project,
+            ActiveRecallMode::TaskContext,
+            ActiveRecallMode::ThreadEpisodic
+        ]
+    );
+    assert_eq!(plan.targets.len(), 6);
+    assert_eq!(plan.diagnostics.len(), 6);
+}
+
+#[test]
+fn active_recall_provider_plan_parses_typed_modes_and_targets() {
+    let plan = parse_active_memory_decision_json(
+        r#"{"status":"run","reasonCode":"provider_run","confidence":0.91,"modes":["exact_canonical","profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name","canonicalKey":"user/global:identity:self:name"}],"diagnostics":["provider ok"],"ignoredExtraKey":true}"#,
+    )
+    .expect("typed provider plan parses");
+
+    assert_eq!(plan.status, ActiveMemoryDecisionStatus::Run);
+    assert_eq!(
+        plan.reason_code,
+        ActiveMemoryDecisionReasonCode::ProviderRun
+    );
+    assert!(plan.provider_used);
+    assert_eq!(
+        plan.modes,
+        vec![ActiveRecallMode::ExactCanonical, ActiveRecallMode::Profile]
+    );
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(
+        plan.targets[0].canonical_key.as_deref(),
+        Some("user/global:identity:self:name")
+    );
+}
+
+#[test]
+fn active_recall_provider_plan_rejects_invalid_enum_values() {
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"status":"run","confidence":0.7,"modes":["anything"],"targets":[]}"#,
+        )
+        .is_err()
+    );
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"status":"run","confidence":0.7,"modes":["profile"],"targets":[{"factClass":"future_fact"}]}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn active_recall_planner_input_is_structured_from_hook_context() {
+    let policy = MemoryTurnPolicy::normal_default_allow();
+    let config = MemoryActiveRecallConfig::default().normalized();
+    let deterministic_context = prompt_context_set_from_prompt_context_contribution(
+        memory_recall_prompt_context_contribution(recalled_city_snapshot())
+            .expect("deterministic context contribution"),
+    );
+    let request = test_active_prompt_context_hook_request(
+        memory_policy_set(&policy),
+        deterministic_context,
+        "short input",
+    );
+    let input = turn_pre_prompt_context_input(&request).expect("prompt context input decodes");
+    let context = memory_turn_context_from_prompt_context_request(&request, input)
+        .expect("memory turn context builds");
+    let deterministic = deterministic_recall_context_summary(&request.prompt_context_set, &config);
+
+    let planner_input =
+        active_recall_planner_input(&context, input, &policy, &config, &deterministic);
+
+    assert_eq!(planner_input.workspace_id, "ws");
+    assert_eq!(planner_input.thread_id, "thr");
+    assert_eq!(planner_input.turn_id, "turn");
+    assert!(planner_input.read_allowed);
+    assert!(planner_input.active_memory_allowed);
+    assert!(!planner_input.explicit_no_memory);
+    assert_eq!(
+        planner_input.input_length_bucket,
+        ActiveRecallInputLengthBucket::VeryShort
+    );
+    assert_eq!(planner_input.deterministic_context_count, 1);
+    assert_eq!(
+        planner_input.deterministic_memory_ids,
+        vec!["mem_city".to_owned()]
+    );
+    assert!(planner_input.deterministic_sufficient);
+    assert!(!planner_input.has_task_context);
+}
+
+#[test]
+fn active_recall_query_plan_uses_debug_fallback_only_when_explicit() {
+    let config = MemoryActiveRecallConfig {
+        max_queries: 2,
+        ..MemoryActiveRecallConfig::default()
+    };
+    let normal_plan = ActiveRecallPlan::run(
+        ActiveMemoryDecisionReasonCode::MemoryLikely,
+        0.8,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(active_memory_query_plan("как меня зовут?", &normal_plan, &config).is_empty());
+
+    let debug_plan = ActiveRecallPlan::run(
+        ActiveMemoryDecisionReasonCode::StrictDebug,
+        1.0,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .with_debug_fallback();
+    let queries = active_memory_query_plan("как меня зовут?", &debug_plan, &config);
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
+    assert_eq!(queries[1].query, "как меня зовут?");
+}
+
+#[test]
+fn deterministic_active_recall_plan_uses_only_structural_context() {
+    let mut input = active_recall_planner_input_for_test();
+    input.has_workspace_context = false;
+    input.input_text_preview = "continue like yesterday".to_owned();
+    let english = deterministic_active_recall_plan(&input);
+
+    input.input_text_preview = "продолжай как вчера".to_owned();
+    let russian = deterministic_active_recall_plan(&input);
+
+    assert_eq!(english.status, ActiveMemoryDecisionStatus::Uncertain);
+    assert_eq!(russian.status, ActiveMemoryDecisionStatus::Uncertain);
+    assert_eq!(english.modes, russian.modes);
+
+    input.has_task_context = true;
+    let task_plan = deterministic_active_recall_plan(&input);
+    assert_eq!(task_plan.status, ActiveMemoryDecisionStatus::Run);
+    assert_eq!(task_plan.modes, vec![ActiveRecallMode::TaskContext]);
+
+    input.typed_targets = vec![ActiveRecallTarget::exact_canonical(
+        "user/global:identity:self:name",
+    )];
+    let exact_plan = deterministic_active_recall_plan(&input);
+    assert_eq!(exact_plan.modes, vec![ActiveRecallMode::ExactCanonical]);
 }
 
 #[tokio::test]
@@ -813,4 +1022,31 @@ async fn memory_prompt_contract_hook_renders_no_save_and_forget_contracts() {
     );
     assert!(forget_content.contains("only to identify and forget"));
     assert!(!forget_content.contains("memory_remember"));
+}
+
+fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
+    ActiveRecallPlannerInput {
+        workspace_id: "ws".to_owned(),
+        thread_id: "thr".to_owned(),
+        turn_id: "turn".to_owned(),
+        task_id: None,
+        agent_id: None,
+        mode: ThreadMode::Agent,
+        input_text_preview: "test input".to_owned(),
+        input_text_char_count: 10,
+        input_length_bucket: ActiveRecallInputLengthBucket::VeryShort,
+        read_allowed: true,
+        active_memory_allowed: true,
+        explicit_no_memory: false,
+        config_mode: MemoryActiveRecallMode::Hybrid,
+        deterministic_context_count: 0,
+        deterministic_context_chars: 0,
+        deterministic_memory_ids: Vec::new(),
+        deterministic_sufficient: false,
+        deterministic_recall_empty: true,
+        deterministic_categories: Vec::new(),
+        typed_targets: Vec::new(),
+        has_workspace_context: true,
+        has_task_context: false,
+    }
 }

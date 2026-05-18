@@ -89,64 +89,30 @@ pub(super) async fn resolve_active_memory_decision(
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
 ) -> ActiveMemoryDecision {
-    if !policy.allow_pre_turn_recall()
-        || policy.active_memory == MemoryActiveContextPolicy::Disabled
-    {
-        return ActiveMemoryDecision {
-            status: ActiveMemoryDecisionStatus::Skip,
-            reason_code: ActiveMemoryDecisionReasonCode::PolicyDisabled,
-            confidence: policy.confidence,
-            query_hints: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-    }
-    match config.mode {
-        MemoryActiveRecallMode::Disabled => {
-            return ActiveMemoryDecision {
-                status: ActiveMemoryDecisionStatus::Skip,
-                reason_code: ActiveMemoryDecisionReasonCode::ConfigDisabled,
-                confidence: 1.0,
-                query_hints: Vec::new(),
-                diagnostics: Vec::new(),
-            };
-        }
-        MemoryActiveRecallMode::DeterministicOnly => {
-            return ActiveMemoryDecision {
-                status: ActiveMemoryDecisionStatus::Skip,
-                reason_code: ActiveMemoryDecisionReasonCode::DeterministicOnly,
-                confidence: 1.0,
-                query_hints: Vec::new(),
-                diagnostics: Vec::new(),
-            };
-        }
-        MemoryActiveRecallMode::StrictDebug => {
-            return ActiveMemoryDecision {
-                status: ActiveMemoryDecisionStatus::Run,
-                reason_code: ActiveMemoryDecisionReasonCode::StrictDebug,
-                confidence: 1.0,
-                query_hints: Vec::new(),
-                diagnostics: Vec::new(),
-            };
-        }
-        MemoryActiveRecallMode::Hybrid => {}
-    }
-
-    if deterministic.sufficient {
-        return ActiveMemoryDecision {
-            status: ActiveMemoryDecisionStatus::Skip,
-            reason_code: ActiveMemoryDecisionReasonCode::DeterministicSufficient,
-            confidence: 0.9,
-            query_hints: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+    let planner_input = active_recall_planner_input(context, input, policy, config, deterministic);
+    let local_plan = local_active_memory_decision(&planner_input, "");
+    if matches!(
+        local_plan.reason_code,
+        ActiveMemoryDecisionReasonCode::PolicyDisabled
+            | ActiveMemoryDecisionReasonCode::ConfigDisabled
+            | ActiveMemoryDecisionReasonCode::DeterministicOnly
+            | ActiveMemoryDecisionReasonCode::DeterministicSufficient
+            | ActiveMemoryDecisionReasonCode::StrictDebug
+    ) {
+        return normalize_active_recall_plan_for_input(local_plan, &planner_input);
     }
 
     if let Some(provider) = provider {
         let request = MemoryActiveRecallDecisionRequest {
-            deterministic_context_count: deterministic.context_count,
-            deterministic_context_chars: deterministic.context_chars,
-            deterministic_memory_ids: deterministic.memory_ids.iter().cloned().collect(),
-            config_mode: config.mode,
+            deterministic_context_count: planner_input.deterministic_context_count,
+            deterministic_context_chars: planner_input.deterministic_context_chars,
+            deterministic_memory_ids: planner_input.deterministic_memory_ids.clone(),
+            deterministic_sufficient: planner_input.deterministic_sufficient,
+            deterministic_recall_empty: planner_input.deterministic_recall_empty,
+            has_workspace_context: planner_input.has_workspace_context,
+            has_task_context: planner_input.has_task_context,
+            input_length_bucket: planner_input.input_length_bucket.as_str().to_owned(),
+            config_mode: planner_input.config_mode,
         };
         match provider
             .resolve_active_memory_decision_json(
@@ -155,7 +121,7 @@ pub(super) async fn resolve_active_memory_decision(
                     thread_id: context.thread_id.clone(),
                     turn_id: context.turn_id.clone(),
                     mode: context.mode,
-                    input_text_preview: truncate_chars(input.input_text.as_str(), 1_000),
+                    input_text_preview: planner_input.input_text_preview.clone(),
                 },
                 request,
             )
@@ -163,31 +129,27 @@ pub(super) async fn resolve_active_memory_decision(
         {
             Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
                 Ok(decision) => {
-                    return decision;
+                    return normalize_active_recall_plan_for_input(decision, &planner_input);
                 }
                 Err(_) => {
-                    return ActiveMemoryDecision {
-                        status: ActiveMemoryDecisionStatus::Skip,
-                        reason_code: ActiveMemoryDecisionReasonCode::ProviderUncertain,
-                        confidence: 0.0,
-                        query_hints: Vec::new(),
-                        diagnostics: vec!["memory.active_recall.invalid_json".to_owned()],
-                    };
+                    let mut fallback = local_plan;
+                    fallback
+                        .diagnostics
+                        .push("memory.active_recall.invalid_json".to_owned());
+                    return normalize_active_recall_plan_for_input(fallback, &planner_input);
                 }
             },
             Err(_) => {
-                return ActiveMemoryDecision {
-                    status: ActiveMemoryDecisionStatus::Skip,
-                    reason_code: ActiveMemoryDecisionReasonCode::ProviderUncertain,
-                    confidence: 0.0,
-                    query_hints: Vec::new(),
-                    diagnostics: vec!["memory.active_recall.provider_failed".to_owned()],
-                };
+                let mut fallback = local_plan;
+                fallback
+                    .diagnostics
+                    .push("memory.active_recall.provider_failed".to_owned());
+                return normalize_active_recall_plan_for_input(fallback, &planner_input);
             }
         }
     }
 
-    local_active_memory_decision(input.input_text.as_str(), "")
+    normalize_active_recall_plan_for_input(local_plan, &planner_input)
 }
 pub(super) fn memory_recall_prompt_context_contribution(
     recall_snapshot: MemoryRecallSnapshot,

@@ -169,7 +169,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
             MemoryRecallSnapshot::empty(),
         )),
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
-            r#"{"status":"skip","confidence":1.0}"#,
+            r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[]}"#,
         ))),
         config: MemoryActiveRecallConfig::default(),
     };

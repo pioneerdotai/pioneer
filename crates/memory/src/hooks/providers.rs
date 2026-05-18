@@ -130,6 +130,11 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub deterministic_context_count: usize,
     pub deterministic_context_chars: usize,
     pub deterministic_memory_ids: Vec<String>,
+    pub deterministic_sufficient: bool,
+    pub deterministic_recall_empty: bool,
+    pub has_workspace_context: bool,
+    pub has_task_context: bool,
+    pub input_length_bucket: String,
     pub config_mode: MemoryActiveRecallMode,
 }
 

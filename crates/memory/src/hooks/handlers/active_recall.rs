@@ -90,8 +90,8 @@ impl HookHandler for ActiveMemoryRecallHook {
                 .recall_memory(
                     context.clone(),
                     MemoryRecallRequest {
-                        query,
-                        categories: Vec::new(),
+                        query: query.query,
+                        categories: query.categories,
                         top_k: Some(config.top_k_per_query),
                         max_chars: Some(config.max_prompt_chars),
                     },
