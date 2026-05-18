@@ -6,6 +6,7 @@ mod convert;
 pub mod hooks;
 mod memvid;
 mod policy;
+mod quality;
 mod ranking;
 mod recall;
 mod service;
@@ -25,6 +26,12 @@ pub use context::{
 };
 pub use memvid::{MemvidMemoryBackend, MemvidMemoryBackendConfig, memvid_search_request};
 pub use policy::{MemoryPolicyDecision, MemoryPolicyEngine};
+pub use quality::{
+    MemoryOntologyClassification, MemoryQualityAuditItemKind, MemoryQualityAuditRecord,
+    MemoryQualityAuditStatus, MemorySourceContextClassification, MemorySourceContextInput,
+    audit_memory_candidate_quality, audit_memory_record_quality, classify_memory_source_context,
+    classify_semantic_memory_fact,
+};
 pub use recall::{MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse};
 pub use service::MemoryService;
 pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

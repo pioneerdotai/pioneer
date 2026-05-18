@@ -68,6 +68,124 @@ pub enum MemorySourceKind {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum MemorySourceContextKind {
+    DirectUserConversation,
+    AssistantResponse,
+    ToolResult,
+    TaskRuntime,
+    SystemRuntime,
+    DeveloperInstruction,
+    ConnectorContent,
+    ImportedDocument,
+    GeneratedSummary,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEvidenceActorRole {
+    User,
+    Assistant,
+    Tool,
+    Task,
+    System,
+    Developer,
+    Connector,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFactClass {
+    UserIdentity,
+    UserBiography,
+    UserRelationship,
+    StableUserPreference,
+    CommunicationPreference,
+    RecurringUserInstruction,
+    ProjectPolicy,
+    ProjectDecision,
+    ProjectProcedure,
+    ProjectConstraint,
+    TaskLifecycleState,
+    OperationalObservation,
+    ThreadLocalState,
+    ToolResultFact,
+    AssistantSelfDescription,
+    GeneratedSummaryFact,
+    DomainOwnedState,
+    SecretOrCredential,
+    RegulatedSensitiveFact,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifetimeClass {
+    LongLived,
+    ProjectLifetime,
+    TaskLifetime,
+    ThreadLifetime,
+    SessionOnly,
+    NaturallyExpiring,
+    Instantaneous,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOwnershipClass {
+    DurableUserMemory,
+    DurableWorkspaceMemory,
+    DurableAgentMemory,
+    ThreadEpisodicContext,
+    TaskRuntimeState,
+    DomainRuntimeState,
+    AuditOnly,
+    Reject,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEvidenceClass {
+    DirectUserAssertion,
+    UserCorrection,
+    UserApproval,
+    AssistantInference,
+    ToolObservation,
+    TaskRuntimeObservation,
+    SystemObservation,
+    GeneratedSummary,
+    MissingOrWeak,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryQualityReasonCode {
+    SourceEligible,
+    SourceIneligible,
+    DirectUserEvidence,
+    WeakEvidence,
+    DurableLifetime,
+    NonDurableLifetime,
+    OwnershipFit,
+    OwnershipMismatch,
+    CategoryEligible,
+    CategoryRestricted,
+    SensitivityAllowed,
+    SensitivityRestricted,
+    Duplicate,
+    Contradiction,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryActorKind {
     User,
     Assistant,
@@ -743,11 +861,12 @@ mod tests {
     use super::{
         MemoryAttribute, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
         MemoryCandidateScore, MemoryCandidateScoreBucket, MemoryCandidateStatus, MemoryCategory,
-        MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetTarget,
-        MemoryIntent, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
-        MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
-        MemorySemanticWriteParams, MemorySensitivityHint, MemorySubject, MemoryWriteEvidence,
-        MemoryWriteRelation,
+        MemoryDurability, MemoryEvidenceActorRole, MemoryEvidenceClass, MemoryExplicitness,
+        MemoryExtractorCertainty, MemoryFactClass, MemoryForgetTarget, MemoryIntent,
+        MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityReasonCode, MemoryRememberParams,
+        MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
+        MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySensitivityHint,
+        MemorySourceContextKind, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
     };
     use crate::constants;
     use serde_json::json;
@@ -890,6 +1009,52 @@ mod tests {
     }
 
     #[test]
+    fn memory_quality_ontology_uses_typed_snake_case_fields() {
+        assert_eq!(
+            serde_json::to_value(MemorySourceContextKind::DirectUserConversation)
+                .expect("source context kind encode"),
+            json!("direct_user_conversation")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryEvidenceActorRole::Developer)
+                .expect("evidence actor role encode"),
+            json!("developer")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryFactClass::StableUserPreference).expect("fact class encode"),
+            json!("stable_user_preference")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryLifetimeClass::NaturallyExpiring)
+                .expect("lifetime class encode"),
+            json!("naturally_expiring")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryOwnershipClass::ThreadEpisodicContext)
+                .expect("ownership class encode"),
+            json!("thread_episodic_context")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryEvidenceClass::DirectUserAssertion)
+                .expect("evidence class encode"),
+            json!("direct_user_assertion")
+        );
+        assert_eq!(
+            serde_json::to_value(MemoryQualityReasonCode::OwnershipMismatch)
+                .expect("quality reason code encode"),
+            json!("ownership_mismatch")
+        );
+
+        let decoded: MemoryFactClass =
+            serde_json::from_value(json!("assistant_self_description")).expect("fact class decode");
+        assert_eq!(decoded, MemoryFactClass::AssistantSelfDescription);
+
+        let unknown: MemorySourceContextKind =
+            serde_json::from_value(json!("future_source_context")).expect("unknown decode");
+        assert_eq!(unknown, MemorySourceContextKind::Unknown);
+    }
+
+    #[test]
     fn semantic_write_contract_uses_typed_snake_case_fields() {
         assert_eq!(
             serde_json::to_value(MemoryIntent::ExplicitStore).expect("intent encode"),
@@ -978,6 +1143,13 @@ mod tests {
             "memory_semantic_write_response.json",
             "memory_candidate.json",
             "memory_candidate_score.json",
+            "memory_source_context_kind.json",
+            "memory_evidence_actor_role.json",
+            "memory_fact_class.json",
+            "memory_lifetime_class.json",
+            "memory_ownership_class.json",
+            "memory_evidence_class.json",
+            "memory_quality_reason_code.json",
             "memory_candidate_policy_decision.json",
             "memory_candidates_decide_params.json",
             "memory_candidates_approve_params.json",
