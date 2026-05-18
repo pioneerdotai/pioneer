@@ -18,7 +18,8 @@ async fn permissive_classifier_fallback_keeps_memory_surfaces_available() {
 
     assert_eq!(recall_provider.recall_call_count(), 1);
     assert_eq!(recall_provider.materialize_call_count(), 0);
-    assert_eq!(recall_response.contributions.len(), 1);
+    assert_eq!(prompt_context_contributions(&recall_response).len(), 1);
+    assert_has_memory_recall_audit(&recall_response, "memory.recall.deterministic");
     let prompt_context_set = prompt_context_set_from_response(recall_response);
 
     let prompt_response = MemoryPromptContractHook

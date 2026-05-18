@@ -347,6 +347,28 @@ pub async fn find_hook_run_by_idempotency_key<C: ConnectionTrait>(
     Ok(Some(hook_run_record_from_model(model)?))
 }
 
+pub async fn list_hook_runs_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    phase: Option<HookPhase>,
+    limit: u64,
+) -> Result<Vec<HookRunRecord>> {
+    let mut query = hook_run::Entity::find()
+        .filter(hook_run::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by_desc(hook_run::Column::CreatedAt)
+        .limit(limit);
+    if let Some(phase) = phase {
+        query = query.filter(hook_run::Column::Phase.eq(phase.as_str().to_owned()));
+    }
+    query
+        .all(db)
+        .await
+        .with_context(|| format!("failed to list hook runs for turn `{turn_id}`"))?
+        .into_iter()
+        .map(hook_run_record_from_model)
+        .collect()
+}
+
 pub async fn mark_hook_run_running<C: ConnectionTrait>(
     db: &C,
     run_id: &HookRunId,

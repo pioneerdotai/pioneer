@@ -18,11 +18,10 @@ async fn memory_deterministic_recall_hook_contributes_prompt_context_from_policy
 
     assert_eq!(provider.recall_call_count(), 1);
     assert_eq!(provider.materialize_call_count(), 0);
-    let contributions = response.contributions;
+    assert_has_memory_recall_audit(&response, "memory.recall.deterministic");
+    let contributions = prompt_context_contributions(&response);
     assert_eq!(contributions.len(), 1);
-    let HookContribution::PromptContext(context) = &contributions[0] else {
-        panic!("recall hook should contribute prompt context only");
-    };
+    let context = contributions[0];
     assert_eq!(
         context.contribution_id.as_str(),
         MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID
@@ -147,11 +146,10 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.context_contributed"
     }));
-    let contributions = response.contributions;
+    assert_has_memory_recall_audit(&response, "memory.recall.active");
+    let contributions = prompt_context_contributions(&response);
     assert_eq!(contributions.len(), 1);
-    let HookContribution::PromptContext(context) = &contributions[0] else {
-        panic!("active recall should contribute prompt context only");
-    };
+    let context = contributions[0];
     assert_eq!(
         context.contribution_id.as_str(),
         MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID
@@ -286,7 +284,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
         ))
         .await
         .expect("no-use policy is best-effort");
-    assert!(no_use.contributions.is_empty());
+    assert_no_prompt_context_contributions(&no_use);
 
     let mut active_disabled_policy = MemoryTurnPolicy::normal_default_allow();
     active_disabled_policy.active_memory = MemoryActiveContextPolicy::Disabled;
@@ -298,7 +296,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
         ))
         .await
         .expect("disabled active policy is best-effort");
-    assert!(disabled_policy.contributions.is_empty());
+    assert_no_prompt_context_contributions(&disabled_policy);
 
     let deterministic_only = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
@@ -315,7 +313,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
     ))
     .await
     .expect("deterministic-only config is best-effort");
-    assert!(deterministic_only.contributions.is_empty());
+    assert_no_prompt_context_contributions(&deterministic_only);
 
     assert_eq!(provider.recall_call_count(), 0);
 }
@@ -418,7 +416,7 @@ async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
         .await
         .expect("active recall hook executes");
 
-    assert!(response.contributions.is_empty());
+    assert_no_prompt_context_contributions(&response);
     assert_eq!(provider.recall_call_count(), 0);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
@@ -449,7 +447,7 @@ async fn active_memory_hook_does_not_call_provider_when_deterministic_is_suffici
         .await
         .expect("active recall hook executes");
 
-    assert!(response.contributions.is_empty());
+    assert_no_prompt_context_contributions(&response);
     assert_eq!(provider.recall_call_count(), 0);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
@@ -522,7 +520,7 @@ async fn active_memory_hook_deduplicates_deterministic_ids() {
         .expect("active recall hook executes");
 
     assert_eq!(provider.recall_call_count(), 1);
-    assert!(response.contributions.is_empty());
+    assert_no_prompt_context_contributions(&response);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.no_hits"
             && diagnostic.message.as_str().contains("non-duplicate")

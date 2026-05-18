@@ -502,6 +502,213 @@ pub(super) fn active_recall_execution_observability_diagnostic(
     diagnostic
 }
 
+pub(super) fn deterministic_recall_debug_audit_contribution(
+    synthesis: &MemoryRecallSynthesis,
+) -> HookContribution {
+    let mut details = BTreeMap::new();
+    details.insert(
+        metadata_key("planner_kind"),
+        HookValue::Text("deterministic".to_owned()),
+    );
+    details.insert(
+        metadata_key("planner_status"),
+        HookValue::Text("run".to_owned()),
+    );
+    details.insert(
+        metadata_key("planner_reason"),
+        HookValue::Text("deterministic_recall".to_owned()),
+    );
+    details.insert(
+        metadata_key("deterministic_sufficient"),
+        HookValue::Bool(!synthesis.items.is_empty()),
+    );
+    details.insert(
+        metadata_key("selected_modes"),
+        hook_value_string_list(vec!["deterministic".to_owned()]),
+    );
+    details.insert(
+        metadata_key("modes"),
+        HookValue::List(vec![hook_value_object([
+            ("mode", HookValue::Text("deterministic".to_owned())),
+            (
+                "hit_count",
+                HookValue::I64(i64::try_from(synthesis.items.len()).unwrap_or(i64::MAX)),
+            ),
+            ("truncated", HookValue::Bool(synthesis.truncated)),
+        ])]),
+    );
+    details.insert(
+        metadata_key("suppression_counts"),
+        hook_value_suppression_counts([
+            ("duplicate", synthesis.duplicate_count()),
+            (
+                "empty_content",
+                usize::from(
+                    synthesis
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.contains("empty_content")),
+                ),
+            ),
+        ]),
+    );
+    details.insert(
+        metadata_key("synthesized_count"),
+        HookValue::I64(i64::try_from(synthesis.items.len()).unwrap_or(i64::MAX)),
+    );
+    details.insert(
+        metadata_key("prompt_contribution_chars"),
+        HookValue::I64(
+            i64::try_from(synthesis.rendered_text().chars().count()).unwrap_or(i64::MAX),
+        ),
+    );
+    recall_debug_audit("memory.recall.deterministic", details)
+}
+
+pub(super) fn active_recall_debug_audit_contribution(
+    decision: &ActiveMemoryDecision,
+    deterministic: &DeterministicRecallContextSummary,
+    execution: &ActiveRecallExecutionResult,
+    dedup: Option<&ActiveRecallDedupResult>,
+    synthesis: Option<&MemoryRecallSynthesis>,
+) -> HookContribution {
+    let mut details = BTreeMap::new();
+    details.insert(
+        metadata_key("planner_kind"),
+        HookValue::Text(if decision.provider_used {
+            "provider".to_owned()
+        } else if decision.provider_fallback_used {
+            "fallback".to_owned()
+        } else if decision.status == ActiveMemoryDecisionStatus::Skip {
+            "skipped".to_owned()
+        } else {
+            "deterministic".to_owned()
+        }),
+    );
+    details.insert(
+        metadata_key("planner_status"),
+        HookValue::Text(active_memory_decision_status_name(decision.status).to_owned()),
+    );
+    details.insert(
+        metadata_key("planner_reason"),
+        HookValue::Text(decision.reason_code.as_str().to_owned()),
+    );
+    details.insert(
+        metadata_key("provider_used"),
+        HookValue::Bool(decision.provider_used),
+    );
+    details.insert(
+        metadata_key("provider_fallback_used"),
+        HookValue::Bool(decision.provider_fallback_used),
+    );
+    details.insert(
+        metadata_key("deterministic_sufficient"),
+        HookValue::Bool(deterministic.sufficient),
+    );
+    details.insert(
+        metadata_key("selected_modes"),
+        hook_value_string_list(
+            decision
+                .modes
+                .iter()
+                .map(|mode| mode.as_str().to_owned())
+                .collect(),
+        ),
+    );
+    let dropped_modes = execution
+        .mode_results
+        .iter()
+        .filter_map(|mode_result| {
+            mode_result
+                .skipped_reason
+                .as_ref()
+                .map(|reason| format!("{}:{reason}", mode_result.mode.as_str()))
+        })
+        .collect::<Vec<_>>();
+    details.insert(
+        metadata_key("dropped_modes"),
+        hook_value_string_list(dropped_modes),
+    );
+    details.insert(
+        metadata_key("modes"),
+        HookValue::List(
+            execution
+                .mode_results
+                .iter()
+                .map(|mode_result| {
+                    hook_value_object([
+                        (
+                            "mode",
+                            HookValue::Text(mode_result.mode.as_str().to_owned()),
+                        ),
+                        (
+                            "hit_count",
+                            HookValue::I64(
+                                i64::try_from(mode_result.items.len()).unwrap_or(i64::MAX),
+                            ),
+                        ),
+                        ("truncated", HookValue::Bool(mode_result.truncated)),
+                        (
+                            "skipped_reason",
+                            mode_result
+                                .skipped_reason
+                                .as_ref()
+                                .map(|reason| HookValue::Text(reason.clone()))
+                                .unwrap_or(HookValue::Null),
+                        ),
+                    ])
+                })
+                .collect(),
+        ),
+    );
+    let duplicate_count = dedup
+        .map(ActiveRecallDedupResult::duplicate_count)
+        .unwrap_or(execution.duplicate_count);
+    details.insert(
+        metadata_key("suppression_counts"),
+        hook_value_suppression_counts([
+            ("duplicate", duplicate_count),
+            (
+                "stale_backend",
+                diagnostic_count(execution, "backend_stale_ids"),
+            ),
+            (
+                "quality_penalty",
+                diagnostic_count(execution, "quality_penalty_applied_count"),
+            ),
+            (
+                "low_source_context",
+                diagnostic_count(execution, "low_source_context_penalty_count"),
+            ),
+            (
+                "rejected_related",
+                diagnostic_count(execution, "rejected_related_penalty_count"),
+            ),
+        ]),
+    );
+    details.insert(
+        metadata_key("suppressed_ids"),
+        hook_value_string_list(
+            dedup
+                .map(|dedup| dedup.duplicate_ids.clone())
+                .unwrap_or_default(),
+        ),
+    );
+    if let Some(synthesis) = synthesis {
+        details.insert(
+            metadata_key("synthesized_count"),
+            HookValue::I64(i64::try_from(synthesis.items.len()).unwrap_or(i64::MAX)),
+        );
+        details.insert(
+            metadata_key("prompt_contribution_chars"),
+            HookValue::I64(
+                i64::try_from(synthesis.rendered_text().chars().count()).unwrap_or(i64::MAX),
+            ),
+        );
+    }
+    recall_debug_audit("memory.recall.active", details)
+}
+
 fn active_recall_mode_requests(input: &ActiveRecallExecutionInput) -> Vec<ActiveRecallModeRequest> {
     let max_modes = input.config.max_queries.max(1);
     let mode_count = input.plan.modes.len().min(max_modes).max(1);
@@ -1246,6 +1453,63 @@ pub(super) fn active_memory_decision_status_name(
     }
 }
 
+fn recall_debug_audit(
+    event_kind: &'static str,
+    details: BTreeMap<HookMetadataKey, HookValue>,
+) -> HookContribution {
+    HookContribution::Audit(AuditContribution {
+        event_kind: HookAuditEventKind::new(event_kind).expect("static event kind is valid"),
+        details: HookValue::Object(details),
+        safe_for_user: false,
+    })
+}
+
+fn hook_value_object<const N: usize>(entries: [(&'static str, HookValue); N]) -> HookValue {
+    HookValue::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (metadata_key(key), value))
+            .collect(),
+    )
+}
+
+fn hook_value_string_list(values: Vec<String>) -> HookValue {
+    HookValue::List(values.into_iter().map(HookValue::Text).collect())
+}
+
+fn hook_value_suppression_counts<const N: usize>(entries: [(&'static str, usize); N]) -> HookValue {
+    HookValue::Object(
+        entries
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(key, count)| {
+                (
+                    metadata_key(key),
+                    HookValue::I64(i64::try_from(count).unwrap_or(i64::MAX)),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn metadata_key(key: &str) -> HookMetadataKey {
+    HookMetadataKey::new(key).expect("static memory debug metadata key is valid")
+}
+
+fn diagnostic_count(result: &ActiveRecallExecutionResult, needle: &str) -> usize {
+    result
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| {
+            let (_, value) = diagnostic.rsplit_once(':')?;
+            diagnostic
+                .contains(needle)
+                .then(|| value.parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActiveRecallBridgeQuery {
     pub(super) query: String,
@@ -1346,6 +1610,7 @@ pub(super) struct ActiveRecallDedupResult {
     pub(super) raw_count: usize,
     pub(super) duplicate_id_count: usize,
     pub(super) duplicate_line_count: usize,
+    pub(super) duplicate_ids: Vec<String>,
 }
 
 impl ActiveRecallDedupResult {
@@ -1378,12 +1643,16 @@ pub(super) fn dedup_active_recall_items_with_lines(
         let memory_id = item.memory_id.trim();
         if memory_id.is_empty() || !seen.insert(memory_id.to_owned()) {
             result.duplicate_id_count += 1;
+            if !memory_id.is_empty() {
+                result.duplicate_ids.push(memory_id.to_owned());
+            }
             continue;
         }
         if let Some(fingerprint) = memory_recall_item_rendered_line_fingerprint(&item)
             && !seen_lines.insert(fingerprint)
         {
             result.duplicate_line_count += 1;
+            result.duplicate_ids.push(memory_id.to_owned());
             continue;
         }
         deduped.push(item);

@@ -427,6 +427,38 @@ fn prompt_context_set_from_response(response: HookHandlerResponse) -> HookPrompt
     )
 }
 
+fn prompt_context_contributions(response: &HookHandlerResponse) -> Vec<&PromptContextContribution> {
+    response
+        .contributions
+        .iter()
+        .filter_map(|contribution| match contribution {
+            HookContribution::PromptContext(context) => Some(context),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_no_prompt_context_contributions(response: &HookHandlerResponse) {
+    assert!(
+        prompt_context_contributions(response).is_empty(),
+        "expected no prompt context contributions, got {:?}",
+        response.contributions
+    );
+}
+
+fn assert_has_memory_recall_audit(response: &HookHandlerResponse, event_kind: &str) {
+    assert!(
+        response.contributions.iter().any(|contribution| {
+            matches!(
+                contribution,
+                HookContribution::Audit(audit) if audit.event_kind.as_str() == event_kind
+            )
+        }),
+        "expected memory recall audit contribution `{event_kind}`, got {:?}",
+        response.contributions
+    );
+}
+
 fn prompt_context_set_from_prompt_context_contribution(
     contribution: PromptContextContribution,
 ) -> HookPromptContextSet {

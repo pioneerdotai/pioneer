@@ -295,3 +295,17 @@ pub async fn find_repair_job_by_id<C: ConnectionTrait>(
         .await
         .with_context(|| format!("failed to find memory repair job `{job_id}`"))
 }
+
+pub async fn list_repair_jobs_for_memory<C: ConnectionTrait>(
+    db: &C,
+    memory_id: &str,
+    limit: u64,
+) -> Result<Vec<agent_memory_repair_job::Model>> {
+    agent_memory_repair_job::Entity::find()
+        .filter(agent_memory_repair_job::Column::MemoryId.eq(memory_id.to_owned()))
+        .order_by_desc(agent_memory_repair_job::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| format!("failed to list memory repair jobs for `{memory_id}`"))
+}

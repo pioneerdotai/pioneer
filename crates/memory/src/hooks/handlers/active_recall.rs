@@ -74,6 +74,15 @@ impl HookHandler for ActiveMemoryRecallHook {
                     decision.reason_code, decision.confidence
                 ),
             ));
+            response
+                .contributions
+                .push(active_recall_debug_audit_contribution(
+                    &decision,
+                    &deterministic,
+                    &ActiveRecallExecutionResult::default(),
+                    None,
+                    None,
+                ));
             return Ok(response);
         }
 
@@ -118,11 +127,20 @@ impl HookHandler for ActiveMemoryRecallHook {
                 "memory.active_recall.no_hits",
                 "memory active recall returned no memory context",
             ));
+            response
+                .contributions
+                .push(active_recall_debug_audit_contribution(
+                    &decision,
+                    &deterministic,
+                    &execution,
+                    None,
+                    None,
+                ));
             return Ok(response);
         }
 
         let active_dedup = dedup_active_recall_items_with_lines(
-            execution.items,
+            execution.items.clone(),
             &deterministic.memory_ids,
             &deterministic.rendered_line_fingerprints,
         );
@@ -137,11 +155,20 @@ impl HookHandler for ActiveMemoryRecallHook {
                 "memory.active_recall.no_hits",
                 "memory active recall returned no non-duplicate memory context",
             ));
+            response
+                .contributions
+                .push(active_recall_debug_audit_contribution(
+                    &decision,
+                    &deterministic,
+                    &execution,
+                    Some(&active_dedup),
+                    None,
+                ));
             return Ok(response);
         }
 
         let synthesis_result = memory_active_recall_prompt_context_contribution_with_synthesis(
-            active_dedup.items,
+            active_dedup.items.clone(),
             execution.truncated,
             deterministic.memory_ids.clone(),
             deterministic.rendered_line_fingerprints.clone(),
@@ -162,12 +189,30 @@ impl HookHandler for ActiveMemoryRecallHook {
             ));
             response
                 .contributions
+                .push(active_recall_debug_audit_contribution(
+                    &decision,
+                    &deterministic,
+                    &execution,
+                    Some(&active_dedup),
+                    Some(&synthesis_result.synthesis),
+                ));
+            response
+                .contributions
                 .push(HookContribution::PromptContext(contribution));
         } else {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.active_recall.no_hits",
                 "memory active recall synthesis returned no prompt context",
             ));
+            response
+                .contributions
+                .push(active_recall_debug_audit_contribution(
+                    &decision,
+                    &deterministic,
+                    &execution,
+                    Some(&active_dedup),
+                    Some(&synthesis_result.synthesis),
+                ));
         }
         Ok(response)
     }

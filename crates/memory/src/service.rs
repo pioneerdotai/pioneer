@@ -10,6 +10,19 @@ use crate::convert::{
     content_preview, crud_candidate_to_protocol, crud_record_to_protocol, effective_provenance,
     metadata_with_idempotency, protocol_actor_to_crud,
 };
+use crate::debug::{
+    MEMORY_DEBUG_TRACE_MAX_EVENTS, MEMORY_DEBUG_TRACE_MAX_HOOK_RUNS,
+    MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS, MEMORY_DEBUG_TRACE_MAX_QUARANTINE_HISTORY,
+    MEMORY_DEBUG_TRACE_MAX_REPAIR_JOBS, MemoryDebugMissingData, MemoryDebugMissingDataKind,
+    MemoryDebugRecallTrace, MemoryDebugSourceContextTrace, MemoryDebugTrace,
+    MemoryDebugTraceTarget, MemoryDebugWriteTrace, memory_debug_event_trace,
+    memory_debug_item_from_candidate, memory_debug_item_from_record, memory_debug_quality_trace,
+    memory_debug_quarantine_trace, memory_debug_recall_trace_from_hook_run,
+    memory_debug_recall_trace_from_hook_runs, memory_debug_repair_trace,
+    memory_debug_score_from_metadata, memory_debug_source_context_from_candidate,
+    memory_debug_source_context_from_record, semantic_route_from_quality,
+    write_outcome_for_candidate, write_outcome_for_memory, write_outcome_for_quality_decision,
+};
 use crate::lifecycle::{
     MemoryQuarantineRequest, MemoryQuarantineResponse, MemoryRestoreRequest, MemoryRestoreResponse,
 };
@@ -51,6 +64,7 @@ use pioneer_crud::{
     NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
     NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
 };
+use pioneer_hooks::{HookPhase, HookRunId};
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
     MemoryCandidatePolicyInput, MemoryCandidatePolicyOutput, MemoryCandidateStatus,
@@ -1109,6 +1123,356 @@ impl MemoryService {
         self.search_with_diagnostics(context, params)
             .await
             .map(|result| result.response)
+    }
+
+    pub async fn inspect_memory_debug(
+        &self,
+        context: MemoryOperationContext,
+        memory_id: &str,
+    ) -> Result<MemoryDebugTrace> {
+        let target = MemoryDebugTraceTarget::memory(memory_id);
+        let Some(row) = self.store.get_agent_memory_record(memory_id, true).await? else {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::MemoryRecord,
+            ));
+        };
+        if !workspace_visible(&row, &context) {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::MemoryRecord,
+            ));
+        }
+
+        let events = self
+            .store
+            .list_agent_memory_events(memory_id, MEMORY_DEBUG_TRACE_MAX_EVENTS)
+            .await?;
+        let quality_decisions = self
+            .store
+            .list_agent_memory_quality_decisions_for_memory(
+                memory_id,
+                MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS,
+            )
+            .await?;
+        let quarantine_history = self
+            .store
+            .list_agent_memory_quarantine_history(
+                memory_id,
+                MEMORY_DEBUG_TRACE_MAX_QUARANTINE_HISTORY,
+            )
+            .await?;
+        let active_quarantine = quarantine_history
+            .iter()
+            .any(|quarantine| quarantine.resolved_at_unix.is_none());
+        let repair_jobs = self
+            .store
+            .list_agent_memory_repair_jobs_for_memory(memory_id, MEMORY_DEBUG_TRACE_MAX_REPAIR_JOBS)
+            .await?;
+        let latest_quality = quality_decisions.first();
+        let score = memory_debug_score_from_metadata(row.metadata_json.as_deref());
+        let write = MemoryDebugWriteTrace {
+            outcome: write_outcome_for_memory(&row, latest_quality, active_quarantine, &events),
+            relation: latest_quality.map(|quality| quality.relation),
+            semantic_route: semantic_route_from_quality(latest_quality),
+            latest_quality: latest_quality.map(memory_debug_quality_trace),
+            score,
+            source_context: Some(memory_debug_source_context_from_record(&row)),
+            events: events.iter().map(memory_debug_event_trace).collect(),
+            reason: latest_quality.map(|quality| {
+                format!(
+                    "quality_action={:?} target_ownership={:?}",
+                    quality.action, quality.target_ownership
+                )
+            }),
+        };
+        let mut missing = Vec::new();
+        if latest_quality.is_none() {
+            missing.push(MemoryDebugMissingData::new(
+                MemoryDebugMissingDataKind::QualityDecision,
+                "no quality decision found for memory",
+            ));
+        }
+        if row.source_context_kind.is_none() {
+            missing.push(MemoryDebugMissingData::new(
+                MemoryDebugMissingDataKind::SourceContext,
+                "memory has no source_context_kind",
+            ));
+        }
+        Ok(MemoryDebugTrace {
+            target,
+            found: true,
+            lifecycle_state: memory_debug_item_from_record(&row, active_quarantine).lifecycle_state,
+            item: Some(memory_debug_item_from_record(&row, active_quarantine)),
+            write: Some(write),
+            recall: None,
+            quarantine_history: quarantine_history
+                .iter()
+                .map(memory_debug_quarantine_trace)
+                .collect(),
+            repair_jobs: repair_jobs.iter().map(memory_debug_repair_trace).collect(),
+            missing,
+        })
+    }
+
+    pub async fn inspect_candidate_debug(
+        &self,
+        context: MemoryOperationContext,
+        candidate_id: &str,
+    ) -> Result<MemoryDebugTrace> {
+        let target = MemoryDebugTraceTarget::candidate(candidate_id);
+        let Some(candidate) = self
+            .store
+            .get_agent_memory_candidate(candidate_id, context.workspace_guard())
+            .await?
+        else {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::CandidateRecord,
+            ));
+        };
+        if !candidate_workspace_visible(&candidate, &context) {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::CandidateRecord,
+            ));
+        }
+
+        let events = self
+            .store
+            .list_agent_memory_candidate_events(candidate_id, MEMORY_DEBUG_TRACE_MAX_EVENTS)
+            .await?;
+        let quality_decisions = self
+            .store
+            .list_agent_memory_quality_decisions_for_candidate(
+                candidate_id,
+                MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS,
+            )
+            .await?;
+        let latest_quality = quality_decisions.first();
+        let score = memory_debug_score_from_metadata(candidate.metadata_json.as_deref());
+        let mut missing = Vec::new();
+        if latest_quality.is_none() {
+            missing.push(MemoryDebugMissingData::new(
+                MemoryDebugMissingDataKind::QualityDecision,
+                "no quality decision found for candidate",
+            ));
+        }
+        if score.is_none() {
+            missing.push(MemoryDebugMissingData::new(
+                MemoryDebugMissingDataKind::CandidateScore,
+                "candidate has no score metadata",
+            ));
+        }
+        if candidate.source_context_kind.is_none() {
+            missing.push(MemoryDebugMissingData::new(
+                MemoryDebugMissingDataKind::SourceContext,
+                "candidate has no source_context_kind",
+            ));
+        }
+        let item = memory_debug_item_from_candidate(&candidate);
+        Ok(MemoryDebugTrace {
+            target,
+            found: true,
+            lifecycle_state: item.lifecycle_state,
+            item: Some(item),
+            write: Some(MemoryDebugWriteTrace {
+                outcome: write_outcome_for_candidate(&candidate, latest_quality),
+                relation: latest_quality.map(|quality| quality.relation),
+                semantic_route: semantic_route_from_quality(latest_quality),
+                latest_quality: latest_quality.map(memory_debug_quality_trace),
+                score: score.or_else(|| Some(crate::debug::MemoryDebugScoreTrace::missing())),
+                source_context: Some(memory_debug_source_context_from_candidate(&candidate)),
+                events: events.iter().map(memory_debug_event_trace).collect(),
+                reason: latest_quality.map(|quality| {
+                    format!(
+                        "quality_action={:?} target_ownership={:?}",
+                        quality.action, quality.target_ownership
+                    )
+                }),
+            }),
+            recall: None,
+            quarantine_history: Vec::new(),
+            repair_jobs: Vec::new(),
+            missing,
+        })
+    }
+
+    pub async fn inspect_hook_run_memory_debug(
+        &self,
+        context: MemoryOperationContext,
+        hook_run_id: &str,
+    ) -> Result<MemoryDebugTrace> {
+        let target = MemoryDebugTraceTarget::hook_run(hook_run_id);
+        let hook_run_id = HookRunId::new(hook_run_id.to_owned())
+            .with_context(|| format!("invalid hook run id `{hook_run_id}`"))?;
+        let Some(run) = self.store.find_hook_run(&hook_run_id).await? else {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::HookRun,
+            ));
+        };
+        if !hook_run_visible(&run, &context) {
+            return Ok(MemoryDebugTrace::missing(
+                target,
+                MemoryDebugMissingDataKind::HookRun,
+            ));
+        }
+        let audit_events = self
+            .store
+            .list_hook_audit_events_for_run(&hook_run_id)
+            .await?;
+        Ok(MemoryDebugTrace {
+            target,
+            found: true,
+            lifecycle_state: crate::debug::MemoryDebugLifecycleState::Active,
+            item: None,
+            write: None,
+            recall: Some(memory_debug_recall_trace_from_hook_run(&run, &audit_events)),
+            quarantine_history: Vec::new(),
+            repair_jobs: Vec::new(),
+            missing: Vec::new(),
+        })
+    }
+
+    pub async fn inspect_turn_memory_debug(
+        &self,
+        context: MemoryOperationContext,
+        turn_id: &str,
+        limit: Option<u64>,
+    ) -> Result<MemoryDebugTrace> {
+        let target = MemoryDebugTraceTarget::turn(turn_id, context.workspace_id.clone());
+        let limit = limit
+            .unwrap_or(MEMORY_DEBUG_TRACE_MAX_HOOK_RUNS)
+            .min(MEMORY_DEBUG_TRACE_MAX_HOOK_RUNS);
+        let runs = self
+            .store
+            .list_hook_runs_for_turn(turn_id, Some(HookPhase::TurnPrePromptContext), limit)
+            .await?
+            .into_iter()
+            .filter(|run| hook_run_visible(run, &context))
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return Ok(MemoryDebugTrace {
+                target,
+                found: false,
+                lifecycle_state: crate::debug::MemoryDebugLifecycleState::Missing,
+                item: None,
+                write: None,
+                recall: Some(MemoryDebugRecallTrace::default()),
+                quarantine_history: Vec::new(),
+                repair_jobs: Vec::new(),
+                missing: vec![MemoryDebugMissingData::new(
+                    MemoryDebugMissingDataKind::HookRun,
+                    "no memory hook runs found for turn",
+                )],
+            });
+        }
+        let mut audit_events_by_run = BTreeMap::new();
+        for run in &runs {
+            audit_events_by_run.insert(
+                run.id.as_str().to_owned(),
+                self.store.list_hook_audit_events_for_run(&run.id).await?,
+            );
+        }
+        Ok(MemoryDebugTrace {
+            target,
+            found: true,
+            lifecycle_state: crate::debug::MemoryDebugLifecycleState::Active,
+            item: None,
+            write: None,
+            recall: Some(memory_debug_recall_trace_from_hook_runs(
+                &runs,
+                &audit_events_by_run,
+            )),
+            quarantine_history: Vec::new(),
+            repair_jobs: Vec::new(),
+            missing: Vec::new(),
+        })
+    }
+
+    pub async fn inspect_turn_memory_write_debug(
+        &self,
+        context: MemoryOperationContext,
+        thread_id: &str,
+        turn_id: &str,
+        limit: Option<u64>,
+    ) -> Result<MemoryDebugTrace> {
+        let mut target = MemoryDebugTraceTarget::turn(turn_id, context.workspace_id.clone());
+        target.thread_id = Some(thread_id.to_owned());
+        let limit = limit
+            .unwrap_or(MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS)
+            .min(MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS);
+        let decisions = self
+            .store
+            .list_agent_memory_quality_decisions_for_thread(thread_id, limit)
+            .await?
+            .into_iter()
+            .filter(|decision| decision.turn_id.as_deref() == Some(turn_id))
+            .filter(|decision| quality_decision_visible(decision, &context))
+            .collect::<Vec<_>>();
+        let Some(latest_quality) = decisions.first() else {
+            return Ok(MemoryDebugTrace {
+                target,
+                found: false,
+                lifecycle_state: crate::debug::MemoryDebugLifecycleState::Missing,
+                item: None,
+                write: Some(MemoryDebugWriteTrace::default()),
+                recall: None,
+                quarantine_history: Vec::new(),
+                repair_jobs: Vec::new(),
+                missing: vec![MemoryDebugMissingData::new(
+                    MemoryDebugMissingDataKind::QualityDecision,
+                    "no memory quality decisions found for turn",
+                )],
+            });
+        };
+
+        let write = MemoryDebugWriteTrace {
+            outcome: write_outcome_for_quality_decision(latest_quality),
+            relation: Some(latest_quality.relation),
+            semantic_route: semantic_route_from_quality(Some(latest_quality)),
+            latest_quality: Some(memory_debug_quality_trace(latest_quality)),
+            score: None,
+            source_context: Some(MemoryDebugSourceContextTrace {
+                source_context_kind: Some(latest_quality.source_context_kind),
+                source_thread_id: latest_quality.thread_id.clone(),
+                source_turn_id: latest_quality.turn_id.clone(),
+                source_item_id: latest_quality.item_id.clone(),
+                workspace_id: latest_quality.workspace_id.clone(),
+            }),
+            events: Vec::new(),
+            reason: Some(format!(
+                "quality_action={:?} target_ownership={:?}",
+                latest_quality.action, latest_quality.target_ownership
+            )),
+        };
+
+        Ok(MemoryDebugTrace {
+            target,
+            found: true,
+            lifecycle_state: crate::debug::MemoryDebugLifecycleState::Active,
+            item: None,
+            write: Some(write),
+            recall: None,
+            quarantine_history: Vec::new(),
+            repair_jobs: Vec::new(),
+            missing: Vec::new(),
+        })
+    }
+
+    pub async fn list_workspace_memory_debug_events(
+        &self,
+        workspace_id: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::debug::MemoryDebugEventTrace>> {
+        let limit = limit
+            .unwrap_or(MEMORY_DEBUG_TRACE_MAX_EVENTS)
+            .min(MEMORY_DEBUG_TRACE_MAX_EVENTS);
+        self.store
+            .list_workspace_agent_memory_events(workspace_id, limit)
+            .await
+            .map(|events| events.iter().map(memory_debug_event_trace).collect())
     }
 
     async fn search_with_diagnostics(
@@ -3791,6 +4155,51 @@ fn workspace_visible(row: &AgentMemoryControlRecord, context: &MemoryOperationCo
             MemoryScopeKind::Agent => context.allow_global_agent,
             _ => false,
         },
+    }
+}
+
+fn candidate_workspace_visible(
+    candidate: &AgentMemoryCandidateRecord,
+    context: &MemoryOperationContext,
+) -> bool {
+    match candidate.workspace_id.as_deref() {
+        Some(candidate_workspace_id) => context
+            .workspace_id
+            .as_deref()
+            .is_some_and(|context_workspace_id| context_workspace_id == candidate_workspace_id),
+        None => match candidate.scope.kind {
+            MemoryScopeKind::User => context.workspace_id.is_none() || context.allow_global_user,
+            MemoryScopeKind::Agent => context.allow_global_agent,
+            _ => false,
+        },
+    }
+}
+
+fn hook_run_visible(run: &pioneer_crud::HookRunRecord, context: &MemoryOperationContext) -> bool {
+    match run
+        .context
+        .workspace_id
+        .as_ref()
+        .map(|workspace_id| workspace_id.as_str())
+    {
+        Some(run_workspace_id) => context
+            .workspace_id
+            .as_deref()
+            .is_some_and(|context_workspace_id| context_workspace_id == run_workspace_id),
+        None => context.workspace_id.is_none(),
+    }
+}
+
+fn quality_decision_visible(
+    decision: &AgentMemoryQualityDecisionRecord,
+    context: &MemoryOperationContext,
+) -> bool {
+    match decision.workspace_id.as_deref() {
+        Some(decision_workspace_id) => context
+            .workspace_id
+            .as_deref()
+            .is_some_and(|context_workspace_id| context_workspace_id == decision_workspace_id),
+        None => context.workspace_id.is_none() || context.allow_global_user,
     }
 }
 

@@ -81,6 +81,11 @@ impl HookHandler for MemoryDeterministicRecallHook {
 
         let synthesis_result =
             memory_recall_prompt_context_contribution_with_synthesis(recall_snapshot);
+        response
+            .contributions
+            .push(deterministic_recall_debug_audit_contribution(
+                &synthesis_result.synthesis,
+            ));
         if synthesis_result.synthesis.raw_input_count > 0 {
             response
                 .diagnostics

@@ -996,6 +996,15 @@ impl CrudStore {
         hook_run::find_hook_run_by_idempotency_key(&self.connection, idempotency_key).await
     }
 
+    pub async fn list_hook_runs_for_turn(
+        &self,
+        turn_id: &str,
+        phase: Option<pioneer_hooks::HookPhase>,
+        limit: u64,
+    ) -> Result<Vec<HookRunRecord>> {
+        hook_run::list_hook_runs_for_turn(&self.connection, turn_id, phase, limit).await
+    }
+
     pub async fn mark_hook_run_running(
         &self,
         run_id: &pioneer_hooks::HookRunId,
@@ -2386,6 +2395,18 @@ impl CrudStore {
             .await?
             .map(crate::memory::agent_memory_repair_job_record_from_model)
             .transpose()
+    }
+
+    pub async fn list_agent_memory_repair_jobs_for_memory(
+        &self,
+        memory_id: &str,
+        limit: u64,
+    ) -> Result<Vec<AgentMemoryRepairJobRecord>> {
+        agent_memory_repair_job::list_repair_jobs_for_memory(&self.connection, memory_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::memory::agent_memory_repair_job_record_from_model)
+            .collect()
     }
 
     pub async fn claim_due_agent_memory_repair_jobs(

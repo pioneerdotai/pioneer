@@ -3,6 +3,7 @@ mod candidate_policy;
 mod config;
 mod context;
 mod convert;
+mod debug;
 mod extractor_ontology;
 pub mod hooks;
 mod lifecycle;
@@ -28,6 +29,19 @@ pub use config::{
 };
 pub use context::{
     MemoryActiveScopes, MemoryOperationContext, MemoryResolvedScopes, MemoryScopePriority,
+};
+pub use debug::{
+    MEMORY_DEBUG_TEXT_PREVIEW_MAX_CHARS, MEMORY_DEBUG_TRACE_MAX_EVENTS,
+    MEMORY_DEBUG_TRACE_MAX_HOOK_RUNS, MEMORY_DEBUG_TRACE_MAX_QUALITY_DECISIONS,
+    MEMORY_DEBUG_TRACE_MAX_QUARANTINE_HISTORY, MEMORY_DEBUG_TRACE_MAX_REPAIR_JOBS,
+    MemoryDebugDecisionOutcome, MemoryDebugDiagnosticPreview, MemoryDebugEntityKind,
+    MemoryDebugEventTrace, MemoryDebugItemSummary, MemoryDebugLifecycleState,
+    MemoryDebugMissingData, MemoryDebugMissingDataKind, MemoryDebugQualityTrace,
+    MemoryDebugQuarantineTrace, MemoryDebugRecallModeTrace, MemoryDebugRecallPlannerKind,
+    MemoryDebugRecallTrace, MemoryDebugRepairTrace, MemoryDebugScoreTrace,
+    MemoryDebugSourceContextTrace, MemoryDebugSuppressionReason, MemoryDebugTrace,
+    MemoryDebugTraceTarget, MemoryDebugWriteTrace, format_memory_debug_trace,
+    memory_debug_inventory,
 };
 pub use lifecycle::{
     MemoryLifecycleInvariantError, MemoryLifecycleSubjectKind, MemoryLifecycleTransition,
