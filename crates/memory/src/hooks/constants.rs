@@ -36,6 +36,6 @@ pub(super) const MEMORY_PROMPT_CONTRACT_SECTION_ID: &str = "memory_recall";
 pub(super) const MEMORY_POST_TURN_EXTRACTOR_HOOK_ID: &str = "memory.post_turn_extractor";
 pub(super) const MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID: &str =
     "memory.post_turn_extractor.default";
-pub(super) const MEMORY_POST_TURN_EXTRACTOR_VERSION: &str = "phase_19_v1";
+pub(super) const MEMORY_POST_TURN_EXTRACTOR_VERSION: &str = "post_turn_semantic_v1";
 pub(super) const MEMORY_ACTIVE_RECALL_GENERIC_QUERY: &str = "durable user identity preferences biography communication style recurring instructions project facts project decisions procedures constraints todos ongoing tasks";
 pub(super) const MEMORY_DEFAULT_USER_SCOPE_KEY: &str = "default";

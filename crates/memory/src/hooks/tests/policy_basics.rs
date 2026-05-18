@@ -58,6 +58,34 @@ fn memory_turn_policy_constructors_have_separate_controls() {
 }
 
 #[test]
+fn permissive_classifier_fallback_contract_keeps_explicit_memory_available() {
+    let policy = MemoryTurnPolicy::permissive_classifier_fallback(
+        MemoryPolicyReasonCode::ClassifierUnavailable,
+    );
+
+    assert_eq!(policy.source, MemoryPolicySource::DefaultFallback);
+    assert_eq!(
+        policy.reason_code,
+        MemoryPolicyReasonCode::ClassifierUnavailable
+    );
+    assert_eq!(policy.confidence, 0.0);
+    assert!(policy.allow_pre_turn_recall());
+    assert_eq!(policy.prompt, MemoryPromptPolicy::Full);
+    assert!(policy.allow_memory_prompt());
+    assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
+    assert!(policy.allows_memory_tool(MEMORY_SEARCH_TOOL));
+    assert!(policy.allows_memory_tool(MEMORY_GET_TOOL));
+    assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
+    assert!(policy.allows_memory_tool(MEMORY_REMEMBER_TOOL));
+    assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+    assert!(policy.allows_memory_tool(MEMORY_FORGET_TOOL));
+    assert_eq!(policy.post_turn_extraction, MemoryExtractionPolicy::Allow);
+    assert_eq!(policy.active_memory, MemoryActiveContextPolicy::Allow);
+    assert!(!policy.explicit_remember);
+    assert!(!policy.explicit_forget);
+}
+
+#[test]
 fn memory_turn_policy_hook_value_roundtrips_full_policy() {
     let policy = MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned()))
         .with_detected_language(Some("ru".to_owned()))

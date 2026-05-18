@@ -2519,8 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_21_duplicate_semantic_retry_merges_active_memory_instead_of_creating_duplicate()
-    {
+    async fn duplicate_semantic_retry_merges_active_memory_instead_of_creating_duplicate() {
         let (service, store) = test_service().await;
         let context = duplicate_safe_context();
         let params = user_name_semantic_params();

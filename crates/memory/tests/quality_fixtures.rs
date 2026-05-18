@@ -165,7 +165,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
             expected_fact_class: MemoryFactClass::TaskLifecycleState,
             expected_lifetime_class: MemoryLifetimeClass::TaskLifetime,
             expected_ownership_class: MemoryOwnershipClass::TaskRuntimeState,
-            text_variants: vec!["Phase 03 is running.", "La fase 03 esta en curso."],
+            text_variants: vec!["The task is running.", "La tarea esta en curso."],
         },
         MemoryQualityFixture {
             name: "operational_observation_naturally_expiring",

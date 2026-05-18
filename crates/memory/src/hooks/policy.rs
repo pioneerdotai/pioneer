@@ -406,6 +406,26 @@ impl MemoryTurnPolicy {
         )
     }
 
+    pub fn permissive_classifier_fallback(reason_code: MemoryPolicyReasonCode) -> Self {
+        Self {
+            recall: MemoryRecallPolicy::Allow,
+            prompt: MemoryPromptPolicy::Full,
+            read_tools: MemoryReadToolPolicy::Allow,
+            remember_tool: MemoryMutationToolPolicy::Allow,
+            forget_tool: MemoryMutationToolPolicy::Allow,
+            post_turn_extraction: MemoryExtractionPolicy::Allow,
+            active_memory: MemoryActiveContextPolicy::Allow,
+            explicit_remember: false,
+            explicit_forget: false,
+            forget_target_hint: None,
+            reason_code,
+            confidence: 0.0,
+            source: MemoryPolicySource::DefaultFallback,
+            detected_language: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
     pub fn strict_deny_fallback(reason_code: MemoryPolicyReasonCode) -> Self {
         Self::no_use().with_source(MemoryPolicySource::DefaultFallback, reason_code, 0.0)
     }

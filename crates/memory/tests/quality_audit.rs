@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[test]
-fn phase_01_quality_audit_is_read_only_for_records_and_candidates() {
+fn quality_audit_is_read_only_for_records_and_candidates() {
     let record = representative_memory_record();
     let candidate = representative_memory_candidate();
     let record_before = record.clone();

@@ -1,3 +1,4 @@
+mod classifier_fallback;
 mod descriptors;
 mod policy_basics;
 mod policy_classifier;

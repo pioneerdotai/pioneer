@@ -181,7 +181,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
 }
 
 #[test]
-fn phase_15_memory_hook_package_registers_active_recall_with_deadline_dependency() {
+fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
     let runtime = Arc::new(HookRuntime::new(
         Arc::new(HookRegistry::new()),
         Arc::new(HookSubscriptionRegistry::new()),
@@ -262,7 +262,7 @@ fn phase_15_memory_hook_package_registers_active_recall_with_deadline_dependency
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_timeout_falls_back_without_prompt_context() {
+async fn active_memory_timeout_falls_back_without_prompt_context() {
     let runtime = Arc::new(HookRuntime::new(
         Arc::new(HookRegistry::new()),
         Arc::new(HookSubscriptionRegistry::new()),
@@ -369,7 +369,7 @@ fn memory_prompt_contract_hook_descriptor_is_stable_and_narrow() {
 }
 
 #[test]
-fn phase_19_post_turn_extractor_hook_descriptor_is_stable_and_narrow() {
+fn post_turn_extractor_hook_descriptor_is_stable_and_narrow() {
     let hook = MemoryPostTurnExtractorHook {
         write_provider: Some(Arc::new(TestMemoryWriteProvider::default())),
         extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
@@ -413,7 +413,7 @@ fn phase_19_post_turn_extractor_hook_descriptor_is_stable_and_narrow() {
 }
 
 #[test]
-fn phase_21_post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
+fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
     let runtime = Arc::new(HookRuntime::new(
         Arc::new(HookRegistry::new()),
         Arc::new(HookSubscriptionRegistry::new()),

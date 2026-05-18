@@ -139,7 +139,7 @@ async fn structured_override_wins_over_classifier() {
 }
 
 #[tokio::test]
-async fn classifier_error_uses_default_allow_fallback() {
+async fn classifier_error_uses_permissive_default_allow_fallback() {
     struct FailingProvider;
 
     #[async_trait::async_trait]
@@ -175,11 +175,56 @@ async fn classifier_error_uses_default_allow_fallback() {
         MemoryPolicyReasonCode::ClassifierInvalidJson
     );
     assert!(policy.allows_memory_tool(MEMORY_REMEMBER_TOOL));
+    assert!(policy.allows_memory_tool(MEMORY_FORGET_TOOL));
     assert!(policy.allow_pre_turn_recall());
+    assert!(policy.allow_memory_prompt());
+    assert_eq!(policy.post_turn_extraction, MemoryExtractionPolicy::Allow);
+    assert_eq!(policy.active_memory, MemoryActiveContextPolicy::Allow);
     assert!(
         policy
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("classifier_failed"))
+    );
+}
+
+#[tokio::test]
+async fn classifier_disabled_uses_permissive_default_allow_fallback() {
+    let policy = resolve_memory_turn_policy(
+        None,
+        MemoryTurnPolicyContext {
+            workspace_id: "ws".to_owned(),
+            thread_id: "thr".to_owned(),
+            turn_id: "turn".to_owned(),
+            mode: ThreadMode::Agent,
+            input_text: "anything".to_owned(),
+            model: None,
+            model_provider: None,
+        },
+        MemoryTurnPolicyRequest {
+            classifier_enabled: false,
+            ..MemoryTurnPolicyRequest::default()
+        },
+    )
+    .await;
+
+    assert_eq!(policy.source, MemoryPolicySource::DefaultFallback);
+    assert_eq!(
+        policy.reason_code,
+        MemoryPolicyReasonCode::ClassifierUnavailable
+    );
+    assert!(policy.allow_pre_turn_recall());
+    assert!(policy.allow_memory_prompt());
+    assert!(policy.allows_memory_tool(MEMORY_SEARCH_TOOL));
+    assert!(policy.allows_memory_tool(MEMORY_GET_TOOL));
+    assert!(policy.allows_memory_tool(MEMORY_REMEMBER_TOOL));
+    assert!(policy.allows_memory_tool(MEMORY_FORGET_TOOL));
+    assert_eq!(policy.post_turn_extraction, MemoryExtractionPolicy::Allow);
+    assert_eq!(policy.active_memory, MemoryActiveContextPolicy::Allow);
+    assert!(
+        policy
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("classifier disabled"))
     );
 }

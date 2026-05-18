@@ -105,7 +105,7 @@ async fn memory_deterministic_recall_hook_failure_is_safe_best_effort() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_contributes_read_only_prompt_context() {
+async fn active_memory_hook_contributes_read_only_prompt_context() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -168,7 +168,7 @@ async fn phase_15_active_memory_hook_contributes_read_only_prompt_context() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_runs_for_memory_sensitive_turns() {
+async fn active_memory_hook_runs_for_memory_sensitive_turns() {
     for input_text in [
         "continue the previous architecture implementation with the same constraints",
         "use my durable preferences and identity details when answering this",
@@ -212,7 +212,7 @@ async fn phase_15_active_memory_hook_runs_for_memory_sensitive_turns() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_uses_valid_strict_json_query_hints() {
+async fn active_memory_hook_uses_valid_strict_json_query_hints() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -256,7 +256,7 @@ async fn phase_15_active_memory_hook_uses_valid_strict_json_query_hints() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_respects_policy_and_config_skips() {
+async fn active_memory_hook_respects_policy_and_config_skips() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -309,7 +309,7 @@ async fn phase_15_active_memory_hook_respects_policy_and_config_skips() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_runs_bounded_generic_recall_for_short_turns() {
+async fn active_memory_hook_runs_bounded_generic_recall_for_short_turns() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -346,7 +346,7 @@ async fn phase_15_active_memory_hook_runs_bounded_generic_recall_for_short_turns
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_skips_when_deterministic_is_sufficient() {
+async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -377,7 +377,7 @@ async fn phase_15_active_memory_hook_skips_when_deterministic_is_sufficient() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_deduplicates_deterministic_ids() {
+async fn active_memory_hook_deduplicates_deterministic_ids() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         recalled_city_snapshot(),
     ));
@@ -414,7 +414,7 @@ async fn phase_15_active_memory_hook_deduplicates_deterministic_ids() {
 }
 
 #[tokio::test]
-async fn phase_15_active_memory_hook_ignores_malformed_internal_json() {
+async fn active_memory_hook_ignores_malformed_internal_json() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -486,7 +486,7 @@ async fn memory_prompt_contract_hook_renders_from_prompt_context_and_compile_inp
 }
 
 #[tokio::test]
-async fn phase_15_memory_prompt_contract_consumes_active_context_allowlist() {
+async fn memory_prompt_contract_consumes_active_context_allowlist() {
     let hook = MemoryPromptContractHook;
     let active_context = memory_active_recall_prompt_context_contribution(
         active_project_snapshot().items,
@@ -528,7 +528,7 @@ async fn phase_15_memory_prompt_contract_consumes_active_context_allowlist() {
 }
 
 #[tokio::test]
-async fn phase_16_deterministic_only_recall_omits_active_heading() {
+async fn deterministic_only_recall_omits_active_heading() {
     let hook = MemoryPromptContractHook;
     let deterministic_context = memory_recall_prompt_context_contribution(recalled_city_snapshot())
         .expect("deterministic prompt context");
@@ -554,7 +554,7 @@ async fn phase_16_deterministic_only_recall_omits_active_heading() {
 }
 
 #[tokio::test]
-async fn phase_16_duplicate_active_memory_id_is_suppressed() {
+async fn duplicate_active_memory_id_is_suppressed() {
     let hook = MemoryPromptContractHook;
     let deterministic_context = memory_recall_prompt_context_contribution(recalled_city_snapshot())
         .expect("deterministic prompt context");
@@ -600,7 +600,7 @@ async fn phase_16_duplicate_active_memory_id_is_suppressed() {
 }
 
 #[tokio::test]
-async fn phase_16_mixed_active_duplicates_keep_only_unique_context() {
+async fn mixed_active_duplicates_keep_only_unique_context() {
     let hook = MemoryPromptContractHook;
     let deterministic_context = memory_recall_prompt_context_contribution(recalled_city_snapshot())
         .expect("deterministic prompt context");
@@ -639,7 +639,7 @@ async fn phase_16_mixed_active_duplicates_keep_only_unique_context() {
 }
 
 #[tokio::test]
-async fn phase_16_exact_active_line_duplicate_is_suppressed() {
+async fn exact_active_line_duplicate_is_suppressed() {
     let hook = MemoryPromptContractHook;
     let deterministic_context = PromptContextContribution {
         contribution_id: HookContributionId::new(MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID)
@@ -684,7 +684,7 @@ async fn phase_16_exact_active_line_duplicate_is_suppressed() {
 }
 
 #[tokio::test]
-async fn phase_16_active_synthesis_context_is_kept_when_unique() {
+async fn active_synthesis_context_is_kept_when_unique() {
     let hook = MemoryPromptContractHook;
     let deterministic_context = memory_recall_prompt_context_contribution(recalled_city_snapshot())
         .expect("deterministic prompt context");

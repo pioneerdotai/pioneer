@@ -69,12 +69,7 @@ impl GatewayMemoryTurnPolicyProvider {
     }
 
     fn default_allow_policy_without_classifier() -> MemoryTurnPolicy {
-        MemoryTurnPolicy::normal_default_allow()
-            .with_source(
-                MemoryPolicySource::DefaultFallback,
-                MemoryPolicyReasonCode::DefaultAllowRead,
-                1.0,
-            )
+        MemoryTurnPolicy::permissive_classifier_fallback(MemoryPolicyReasonCode::DefaultAllowRead)
             .with_diagnostic("memory.policy.classifier_disabled: using local default allow policy")
     }
 }
@@ -392,6 +387,7 @@ mod tests {
         assert_eq!(policy.read_tools, MemoryReadToolPolicy::Allow);
         assert_eq!(policy.remember_tool, MemoryMutationToolPolicy::Allow);
         assert_eq!(policy.forget_tool, MemoryMutationToolPolicy::Allow);
+        assert_eq!(policy.post_turn_extraction, MemoryExtractionPolicy::Allow);
         assert_eq!(policy.active_memory, MemoryActiveContextPolicy::Allow);
         assert_eq!(policy.reason_code, MemoryPolicyReasonCode::DefaultAllowRead);
         assert_eq!(policy.source, MemoryPolicySource::DefaultFallback);

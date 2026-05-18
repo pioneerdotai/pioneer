@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn phase_19_strict_json_parser_accepts_typed_semantic_fact() {
+fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
         valid_post_turn_extractor_json().as_str(),
         &MemoryPostTurnExtractorConfig::default(),
@@ -183,7 +183,7 @@ fn post_turn_parser_rejects_assistant_self_description_from_assistant_text() {
 }
 
 #[test]
-fn phase_19_parser_rejects_unknown_enums_and_ignores_unknown_keys() {
+fn parser_rejects_unknown_enums_and_ignores_unknown_keys() {
     let unknown_enum = r#"{"facts":[{"semantic":{"intent":"write_now","explicitness":"explicit","category":"identity","subject":"current_user","attribute":"name","scope_hint":"user_global","durability":"long_lived","sensitivity":"personal","certainty":"high"},"content":"User name is Alexander","evidence":{"quote_or_span":"My name is Alexander"}}]}"#;
     assert!(
         parse_memory_post_turn_extractor_json(
@@ -206,7 +206,7 @@ fn phase_19_parser_rejects_unknown_enums_and_ignores_unknown_keys() {
 }
 
 #[test]
-fn phase_19_parser_rejects_secrets_transient_and_missing_evidence() {
+fn parser_rejects_secrets_transient_and_missing_evidence() {
     let secret = r#"{"facts":[{"semantic":{"intent":"implicit_candidate","explicitness":"implicit","category":"custom","subject":"current_user","attribute":"custom","custom_attribute":"api_key","scope_hint":"user_global","durability":"long_lived","sensitivity":"secret","certainty":"high"},"content":"User API key is sk-test","evidence":{"quote_or_span":"sk-test"}}]}"#;
     let parsed =
         parse_memory_post_turn_extractor_json(secret, &MemoryPostTurnExtractorConfig::default())
@@ -235,7 +235,7 @@ fn phase_19_parser_rejects_secrets_transient_and_missing_evidence() {
 }
 
 #[tokio::test]
-async fn phase_19_post_turn_extractor_writes_semantic_fact_through_provider() {
+async fn post_turn_extractor_writes_semantic_fact_through_provider() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
         valid_post_turn_extractor_json(),
@@ -297,7 +297,7 @@ async fn phase_19_post_turn_extractor_writes_semantic_fact_through_provider() {
 }
 
 #[tokio::test]
-async fn phase_21_post_turn_extractor_provider_failure_is_retryable_hook_failure() {
+async fn post_turn_extractor_provider_failure_is_retryable_hook_failure() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestFailingPostTurnExtractorProvider::default());
     let hook = MemoryPostTurnExtractorHook {
@@ -326,7 +326,7 @@ async fn phase_21_post_turn_extractor_provider_failure_is_retryable_hook_failure
 }
 
 #[tokio::test]
-async fn phase_19_post_turn_extractor_preserves_manifest_and_observes_auto_approve() {
+async fn post_turn_extractor_preserves_manifest_and_observes_auto_approve() {
     let mut auto_response = test_semantic_write_response();
     auto_response.record = Some(test_memory_record("mem_auto"));
     auto_response.created = true;
@@ -366,7 +366,7 @@ async fn phase_19_post_turn_extractor_preserves_manifest_and_observes_auto_appro
 }
 
 #[tokio::test]
-async fn phase_19_post_turn_extractor_skips_non_success_turns() {
+async fn post_turn_extractor_skips_non_success_turns() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
         valid_post_turn_extractor_json(),
@@ -406,7 +406,7 @@ async fn phase_19_post_turn_extractor_skips_non_success_turns() {
 }
 
 #[tokio::test]
-async fn phase_19_post_turn_extractor_respects_policy_and_provider_availability() {
+async fn post_turn_extractor_respects_policy_and_provider_availability() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
         valid_post_turn_extractor_json(),
@@ -459,7 +459,60 @@ async fn phase_19_post_turn_extractor_respects_policy_and_provider_availability(
 }
 
 #[tokio::test]
-async fn phase_19_post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
+async fn post_turn_extractor_runs_under_permissive_classifier_fallback() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider.clone()),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let policy = MemoryTurnPolicy::permissive_classifier_fallback(
+        MemoryPolicyReasonCode::ClassifierUnavailable,
+    );
+
+    let response = hook
+        .execute(test_post_turn_hook_request(
+            memory_policy_set(&policy),
+            "Меня зовут Александр",
+            "Понял.",
+        ))
+        .await
+        .expect("classifier fallback extraction executes");
+
+    assert!(response.contributions.is_empty());
+    assert_eq!(write_provider.manifest_call_count(), 1);
+    assert_eq!(extractor_provider.call_count(), 1);
+    assert_eq!(write_provider.write_call_count(), 1);
+    assert_eq!(write_provider.write_params().len(), 1);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
+            && diagnostic.message.as_str().contains("write_attempts=1")
+            && diagnostic.message.as_str().contains("write_successes=1")
+    }));
+    let params = write_provider
+        .write_params()
+        .into_iter()
+        .next()
+        .expect("write params recorded");
+    assert_eq!(
+        params.disposition,
+        Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy)
+    );
+    assert_eq!(
+        params.metadata.get("policy_source"),
+        Some(&serde_json::json!("default_fallback"))
+    );
+    assert_eq!(
+        params.metadata.get("policy_reason_code"),
+        Some(&serde_json::json!("classifier_unavailable"))
+    );
+}
+
+#[tokio::test]
+async fn post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
         implicit_post_turn_extractor_json(),

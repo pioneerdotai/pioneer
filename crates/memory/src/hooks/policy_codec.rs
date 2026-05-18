@@ -374,14 +374,18 @@ pub(super) fn fallback_reason_for_classifier_error(error: &str) -> MemoryPolicyR
 }
 
 pub(super) fn fallback_policy(
-    default_policy: MemoryTurnPolicy,
+    _default_policy: MemoryTurnPolicy,
     fallback: MemoryClassifierFallbackPolicy,
     reason_code: MemoryPolicyReasonCode,
     diagnostic: Option<impl Into<String>>,
 ) -> MemoryTurnPolicy {
+    // Fallback contract: classifier failures must not disable memory.
+    // Recall, prompt context, tools, active recall, and post-turn extraction
+    // stay available; downstream quality gates decide whether extracted facts
+    // become memory.
     let mut policy = match fallback {
         MemoryClassifierFallbackPolicy::DefaultAllow => {
-            default_policy.with_source(MemoryPolicySource::DefaultFallback, reason_code, 0.0)
+            MemoryTurnPolicy::permissive_classifier_fallback(reason_code)
         }
         MemoryClassifierFallbackPolicy::StrictDeny => {
             MemoryTurnPolicy::strict_deny_fallback(reason_code)
