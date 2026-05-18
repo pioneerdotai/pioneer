@@ -108,6 +108,7 @@ pub struct AgentMemoryListFilter {
     pub scopes: Vec<MemoryScope>,
     pub workspace_guard: Option<MemoryWorkspaceGuard>,
     pub namespace: Option<String>,
+    pub key: Option<String>,
     pub categories: Vec<MemoryCategory>,
     pub statuses: Vec<MemoryStatus>,
     pub include_expired: bool,

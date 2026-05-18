@@ -149,6 +149,9 @@ pub(super) struct ActiveRecallPlan {
     pub(super) targets: Vec<ActiveRecallTarget>,
     pub(super) debug_fallback: bool,
     pub(super) provider_used: bool,
+    pub(super) provider_fallback_used: bool,
+    pub(super) provider_input_chars: Option<usize>,
+    pub(super) provider_output_chars: Option<usize>,
     pub(super) diagnostics: Vec<String>,
 }
 
@@ -166,6 +169,9 @@ impl ActiveRecallPlan {
             targets: Vec::new(),
             debug_fallback: false,
             provider_used: false,
+            provider_fallback_used: false,
+            provider_input_chars: None,
+            provider_output_chars: None,
             diagnostics: normalize_active_recall_diagnostics(diagnostics),
         }
     }
@@ -185,6 +191,9 @@ impl ActiveRecallPlan {
             targets,
             debug_fallback: false,
             provider_used: false,
+            provider_fallback_used: false,
+            provider_input_chars: None,
+            provider_output_chars: None,
             diagnostics,
         })
     }
@@ -202,6 +211,9 @@ impl ActiveRecallPlan {
             targets: Vec::new(),
             debug_fallback: false,
             provider_used: false,
+            provider_fallback_used: false,
+            provider_input_chars: None,
+            provider_output_chars: None,
             diagnostics: normalize_active_recall_diagnostics(diagnostics),
         }
     }
@@ -213,6 +225,408 @@ impl ActiveRecallPlan {
 }
 
 pub(super) type ActiveMemoryDecision = ActiveRecallPlan;
+
+impl From<ActiveRecallMode> for MemoryRecallMode {
+    fn from(mode: ActiveRecallMode) -> Self {
+        match mode {
+            ActiveRecallMode::Profile => Self::Profile,
+            ActiveRecallMode::Project => Self::Project,
+            ActiveRecallMode::Durable => Self::Durable,
+            ActiveRecallMode::ThreadEpisodic => Self::ThreadEpisodic,
+            ActiveRecallMode::TaskContext => Self::TaskContext,
+            ActiveRecallMode::ExactCanonical => Self::ExactCanonical,
+        }
+    }
+}
+
+impl From<&ActiveRecallTarget> for MemoryRecallTarget {
+    fn from(target: &ActiveRecallTarget) -> Self {
+        Self {
+            scope_kind: target.scope_kind,
+            fact_class: target.fact_class,
+            category: target.category,
+            subject: target.subject,
+            attribute: target.attribute,
+            canonical_key: target.canonical_key.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ActiveRecallExecutionInput {
+    pub(super) context: MemoryTurnContext,
+    pub(super) plan: ActiveRecallPlan,
+    pub(super) deterministic: DeterministicRecallContextSummary,
+    pub(super) config: MemoryActiveRecallConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ActiveRecallModeBudget {
+    pub(super) top_k: u32,
+    pub(super) max_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ActiveRecallModeRequest {
+    pub(super) mode: ActiveRecallMode,
+    pub(super) targets: Vec<ActiveRecallTarget>,
+    pub(super) budget: ActiveRecallModeBudget,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ActiveRecallModeResult {
+    pub(super) mode: ActiveRecallMode,
+    pub(super) items: Vec<MemoryRecallItem>,
+    pub(super) diagnostics: Vec<String>,
+    pub(super) truncated: bool,
+    pub(super) skipped_reason: Option<String>,
+}
+
+impl ActiveRecallModeResult {
+    pub(super) fn skipped(mode: ActiveRecallMode, reason: impl Into<String>) -> Self {
+        Self {
+            mode,
+            items: Vec::new(),
+            diagnostics: Vec::new(),
+            truncated: false,
+            skipped_reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct ActiveRecallExecutionResult {
+    pub(super) items: Vec<MemoryRecallItem>,
+    pub(super) mode_results: Vec<ActiveRecallModeResult>,
+    pub(super) diagnostics: Vec<String>,
+    pub(super) truncated: bool,
+    pub(super) raw_item_count: usize,
+    pub(super) duplicate_count: usize,
+}
+
+impl ActiveRecallExecutionResult {
+    pub(super) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+pub(super) async fn execute_active_recall_plan(
+    provider: &dyn AgentMemoryProvider,
+    input: ActiveRecallExecutionInput,
+) -> ActiveRecallExecutionResult {
+    let deterministic_recall_count = input.deterministic.memory_ids.len();
+    let requests = active_recall_mode_requests(&input);
+    if requests.is_empty() {
+        return ActiveRecallExecutionResult {
+            diagnostics: vec!["memory.active_recall.no_executable_modes".to_owned()],
+            ..ActiveRecallExecutionResult::default()
+        };
+    }
+
+    let mut mode_results = Vec::new();
+    for request in requests {
+        if let Some(skip_reason) = active_recall_mode_skip_reason(&request, &input.context) {
+            mode_results.push(ActiveRecallModeResult::skipped(request.mode, skip_reason));
+            continue;
+        }
+        let mode = request.mode;
+        match provider
+            .recall_memory_mode(
+                input.context.clone(),
+                MemoryModeRecallParams {
+                    mode: mode.into(),
+                    targets: request
+                        .targets
+                        .iter()
+                        .map(MemoryRecallTarget::from)
+                        .collect(),
+                    top_k: Some(request.budget.top_k),
+                    max_chars: Some(request.budget.max_chars),
+                },
+            )
+            .await
+        {
+            Ok(snapshot) => {
+                let skipped_reason = snapshot.items.is_empty().then_some("no_hits".to_owned());
+                mode_results.push(ActiveRecallModeResult {
+                    mode,
+                    items: snapshot.items,
+                    diagnostics: snapshot.diagnostics,
+                    truncated: snapshot.truncated,
+                    skipped_reason,
+                });
+            }
+            Err(_) => {
+                mode_results.push(ActiveRecallModeResult {
+                    mode,
+                    items: Vec::new(),
+                    diagnostics: vec![format!(
+                        "memory.active_recall.mode_failed:{}",
+                        mode.as_str()
+                    )],
+                    truncated: false,
+                    skipped_reason: Some("provider_error".to_owned()),
+                });
+            }
+        }
+    }
+
+    let mut result = merge_active_recall_mode_results(mode_results, &input.config);
+    result.diagnostics.push(format!(
+        "memory.active_recall.deterministic_recall_count:{deterministic_recall_count}"
+    ));
+    result
+}
+
+pub(super) async fn execute_active_recall_debug_fallback(
+    provider: &dyn AgentMemoryProvider,
+    context: MemoryTurnContext,
+    input_text: &str,
+    decision: &ActiveMemoryDecision,
+    config: &MemoryActiveRecallConfig,
+) -> ActiveRecallExecutionResult {
+    if !decision.debug_fallback {
+        return ActiveRecallExecutionResult::default();
+    }
+    let queries = active_memory_query_plan(input_text, decision, config);
+    let mut mode_result = ActiveRecallModeResult {
+        mode: ActiveRecallMode::Durable,
+        items: Vec::new(),
+        diagnostics: vec!["memory.active_recall.debug_fallback_started".to_owned()],
+        truncated: false,
+        skipped_reason: None,
+    };
+    for query in queries {
+        match provider
+            .recall_memory(
+                context.clone(),
+                MemoryRecallRequest {
+                    query: query.query,
+                    categories: query.categories,
+                    top_k: Some(config.top_k_per_query),
+                    max_chars: Some(config.max_prompt_chars),
+                },
+            )
+            .await
+        {
+            Ok(snapshot) => {
+                mode_result.truncated |= snapshot.truncated;
+                mode_result.diagnostics.extend(snapshot.diagnostics);
+                mode_result.items.extend(snapshot.items);
+            }
+            Err(_) => {
+                mode_result
+                    .diagnostics
+                    .push("memory.active_recall.debug_fallback_failed".to_owned());
+                mode_result.skipped_reason = Some("provider_error".to_owned());
+                break;
+            }
+        }
+    }
+    merge_active_recall_mode_results(vec![mode_result], config)
+}
+
+pub(super) fn active_recall_execution_observability_diagnostic(
+    result: &ActiveRecallExecutionResult,
+) -> HookDiagnostic {
+    let executed_modes = result
+        .mode_results
+        .iter()
+        .filter(|mode_result| mode_result.skipped_reason.is_none())
+        .map(|mode_result| mode_result.mode.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let skipped_modes = result
+        .mode_results
+        .iter()
+        .filter(|mode_result| mode_result.skipped_reason.is_some())
+        .map(|mode_result| mode_result.mode.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut diagnostic = memory_safe_info_diagnostic(
+        "memory.active_recall.execution",
+        format!(
+            "memory active recall execution: executed_modes={} skipped_modes={} mode_count={} rendered_count={} truncated={}",
+            executed_modes,
+            skipped_modes,
+            result.mode_results.len(),
+            result.items.len(),
+            result.truncated
+        ),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("executed_modes"),
+        HookValue::Text(executed_modes),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("skipped_modes"),
+        HookValue::Text(skipped_modes),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "mode_count",
+        result.mode_results.len(),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "rendered_count",
+        result.items.len(),
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "raw_item_count",
+        result.raw_item_count,
+    );
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "duplicate_count",
+        result.duplicate_count,
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("mode_hit_counts"),
+        HookValue::Text(
+            result
+                .mode_results
+                .iter()
+                .map(|mode_result| {
+                    format!("{}={}", mode_result.mode.as_str(), mode_result.items.len())
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+    diagnostic.metadata.insert(
+        hook_metadata_key("truncated"),
+        HookValue::Bool(result.truncated),
+    );
+    diagnostic
+}
+
+fn active_recall_mode_requests(input: &ActiveRecallExecutionInput) -> Vec<ActiveRecallModeRequest> {
+    let max_modes = input.config.max_queries.max(1);
+    let mode_count = input.plan.modes.len().min(max_modes).max(1);
+    let max_chars_per_mode = (input.config.max_prompt_chars / mode_count).max(1);
+    input
+        .plan
+        .modes
+        .iter()
+        .copied()
+        .take(max_modes)
+        .map(|mode| ActiveRecallModeRequest {
+            mode,
+            targets: active_recall_targets_for_mode(mode, input.plan.targets.as_slice()),
+            budget: ActiveRecallModeBudget {
+                top_k: input.config.top_k_per_query,
+                max_chars: max_chars_per_mode,
+            },
+        })
+        .collect()
+}
+
+fn active_recall_targets_for_mode(
+    mode: ActiveRecallMode,
+    targets: &[ActiveRecallTarget],
+) -> Vec<ActiveRecallTarget> {
+    match mode {
+        ActiveRecallMode::ExactCanonical => targets
+            .iter()
+            .filter(|target| target.canonical_key.is_some())
+            .cloned()
+            .collect(),
+        _ => targets.to_vec(),
+    }
+}
+
+fn active_recall_mode_skip_reason(
+    request: &ActiveRecallModeRequest,
+    context: &MemoryTurnContext,
+) -> Option<String> {
+    match request.mode {
+        ActiveRecallMode::ExactCanonical if request.targets.is_empty() => {
+            Some("missing_canonical_target".to_owned())
+        }
+        ActiveRecallMode::TaskContext
+            if context
+                .task_id
+                .as_ref()
+                .is_none_or(|task_id| task_id.trim().is_empty()) =>
+        {
+            Some("missing_task_context".to_owned())
+        }
+        ActiveRecallMode::ThreadEpisodic if context.thread_id.trim().is_empty() => {
+            Some("missing_thread_context".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn merge_active_recall_mode_results(
+    mode_results: Vec<ActiveRecallModeResult>,
+    config: &MemoryActiveRecallConfig,
+) -> ActiveRecallExecutionResult {
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_lines = BTreeSet::new();
+    let mut items = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut truncated = false;
+    let mut remaining_chars = config.max_prompt_chars;
+    let mut duplicate_count = 0usize;
+    let raw_item_count = mode_results
+        .iter()
+        .map(|mode_result| mode_result.items.len())
+        .sum::<usize>();
+
+    for mode_result in &mode_results {
+        truncated |= mode_result.truncated;
+        diagnostics.extend(mode_result.diagnostics.iter().cloned());
+        if let Some(skipped_reason) = &mode_result.skipped_reason {
+            diagnostics.push(format!(
+                "memory.active_recall.mode_skipped:{}:{}",
+                mode_result.mode.as_str(),
+                skipped_reason
+            ));
+        }
+        for item in &mode_result.items {
+            if items.len() >= config.top_k_per_query as usize * config.max_queries {
+                truncated = true;
+                break;
+            }
+            let memory_id = item.memory_id.trim();
+            if memory_id.is_empty() || !seen_ids.insert(memory_id.to_owned()) {
+                duplicate_count += 1;
+                continue;
+            }
+            if let Some(fingerprint) = memory_recall_item_rendered_line_fingerprint(item)
+                && !seen_lines.insert(fingerprint)
+            {
+                duplicate_count += 1;
+                continue;
+            }
+            let item_chars = item.content.chars().count();
+            if item_chars > remaining_chars {
+                truncated = true;
+                break;
+            }
+            remaining_chars = remaining_chars.saturating_sub(item_chars);
+            items.push(item.clone());
+        }
+    }
+
+    if duplicate_count > 0 {
+        diagnostics.push(format!(
+            "memory.active_recall.executor_duplicates_suppressed:{duplicate_count}"
+        ));
+    }
+
+    ActiveRecallExecutionResult {
+        items,
+        mode_results,
+        diagnostics: normalize_active_recall_diagnostics(diagnostics),
+        truncated,
+        raw_item_count,
+        duplicate_count,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActiveRecallInputLengthBucket {
@@ -277,7 +691,11 @@ pub(super) fn active_recall_planner_input(
         mode: context.mode,
         input_text_preview: truncate_chars(
             input.input_text.as_str(),
-            ACTIVE_RECALL_INPUT_PREVIEW_MAX_CHARS,
+            config
+                .planner
+                .max_input_chars
+                .min(ACTIVE_RECALL_INPUT_PREVIEW_MAX_CHARS)
+                .max(1),
         ),
         input_text_char_count,
         input_length_bucket: active_recall_input_length_bucket(input_text_char_count),
@@ -426,6 +844,9 @@ pub(super) fn normalize_active_recall_plan_for_input(
             ActiveRecallMode::TaskContext if !input.has_task_context => {
                 Some("dropped_mode=task_context:no_task_context")
             }
+            ActiveRecallMode::ThreadEpisodic if input.thread_id.trim().is_empty() => {
+                Some("dropped_mode=thread_episodic:no_thread_context")
+            }
             ActiveRecallMode::ExactCanonical
                 if !plan
                     .targets
@@ -489,6 +910,61 @@ pub(super) fn active_recall_mode_names(modes: &[ActiveRecallMode]) -> String {
         .join(",")
 }
 
+pub(super) fn active_recall_available_mode_names(input: &ActiveRecallPlannerInput) -> Vec<String> {
+    let mut modes = vec![
+        ActiveRecallMode::Profile,
+        ActiveRecallMode::Project,
+        ActiveRecallMode::Durable,
+        ActiveRecallMode::ThreadEpisodic,
+    ];
+    if input.has_task_context {
+        modes.push(ActiveRecallMode::TaskContext);
+    }
+    if input
+        .typed_targets
+        .iter()
+        .any(|target| target.canonical_key.is_some())
+    {
+        modes.push(ActiveRecallMode::ExactCanonical);
+    }
+    let mut deduped = Vec::new();
+    for mode in modes {
+        if !deduped.contains(&mode) {
+            deduped.push(mode);
+        }
+    }
+    deduped.sort_by_key(|mode| mode.rank());
+    deduped
+        .into_iter()
+        .map(|mode| mode.as_str().to_owned())
+        .collect()
+}
+
+pub(super) fn active_recall_available_scoped_contexts(
+    input: &ActiveRecallPlannerInput,
+) -> Vec<String> {
+    let mut contexts = Vec::new();
+    if input.has_workspace_context {
+        contexts.push("workspace".to_owned());
+    }
+    if input.has_task_context {
+        contexts.push("task".to_owned());
+    }
+    if !input.thread_id.trim().is_empty() {
+        contexts.push("thread".to_owned());
+    }
+    if !input
+        .agent_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        contexts.push("agent".to_owned());
+    }
+    contexts
+}
+
 pub(super) fn active_memory_decision_observability_diagnostic(
     decision: &ActiveMemoryDecision,
     deterministic: &DeterministicRecallContextSummary,
@@ -497,7 +973,7 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     let mut diagnostic = memory_safe_info_diagnostic(
         "memory.active_recall.decision",
         format!(
-            "memory active recall decision: status={} reason={} confidence={:.2} deterministic_sufficient={} deterministic_contexts={} deterministic_chars={} modes={} targets={} provider_used={} debug_fallback={}",
+            "memory active recall decision: status={} reason={} confidence={:.2} deterministic_sufficient={} deterministic_contexts={} deterministic_chars={} modes={} targets={} provider_used={} provider_fallback_used={} debug_fallback={}",
             active_memory_decision_status_name(decision.status),
             decision.reason_code.as_str(),
             decision.confidence,
@@ -507,6 +983,7 @@ pub(super) fn active_memory_decision_observability_diagnostic(
             selected_modes,
             decision.targets.len(),
             decision.provider_used,
+            decision.provider_fallback_used,
             decision.debug_fallback
         ),
     );
@@ -532,6 +1009,16 @@ pub(super) fn active_memory_decision_observability_diagnostic(
         HookValue::Bool(decision.provider_used),
     );
     diagnostic.metadata.insert(
+        hook_metadata_key("provider_fallback_used"),
+        HookValue::Bool(decision.provider_fallback_used),
+    );
+    if let Some(chars) = decision.provider_input_chars {
+        insert_usize_metadata(&mut diagnostic.metadata, "provider_input_chars", chars);
+    }
+    if let Some(chars) = decision.provider_output_chars {
+        insert_usize_metadata(&mut diagnostic.metadata, "provider_output_chars", chars);
+    }
+    diagnostic.metadata.insert(
         hook_metadata_key("debug_fallback"),
         HookValue::Bool(decision.debug_fallback),
     );
@@ -542,14 +1029,11 @@ pub(super) fn active_memory_decision_observability_diagnostic(
 #[serde(rename_all = "camelCase")]
 pub(super) struct ActiveRecallPlanJson {
     status: ActiveRecallPlanJsonStatus,
-    #[serde(default)]
-    reason_code: Option<ActiveMemoryDecisionReasonCodeJson>,
+    reason_code: ActiveMemoryDecisionReasonCodeJson,
     confidence: f32,
     modes: Vec<ActiveRecallMode>,
     #[serde(default)]
     targets: Vec<ActiveRecallTarget>,
-    #[serde(default)]
-    debug_fallback: bool,
     #[serde(default)]
     diagnostics: Vec<String>,
 }
@@ -577,6 +1061,17 @@ pub(super) enum ActiveMemoryDecisionReasonCodeJson {
 }
 
 impl ActiveMemoryDecisionReasonCodeJson {
+    fn is_provider_allowed(&self) -> bool {
+        matches!(
+            self,
+            Self::MemoryLikely
+                | Self::DeterministicSufficient
+                | Self::ProviderRun
+                | Self::ProviderSkip
+                | Self::ProviderUncertain
+        )
+    }
+
     fn into_reason_code(self) -> ActiveMemoryDecisionReasonCode {
         match self {
             Self::PolicyDisabled => ActiveMemoryDecisionReasonCode::PolicyDisabled,
@@ -612,22 +1107,32 @@ pub(super) fn parse_active_memory_decision_json(
         ActiveRecallPlanJsonStatus::Run => ActiveMemoryDecisionStatus::Run,
         ActiveRecallPlanJsonStatus::Uncertain => ActiveMemoryDecisionStatus::Uncertain,
     };
-    let default_reason_code = match status {
-        ActiveMemoryDecisionStatus::Skip => ActiveMemoryDecisionReasonCode::ProviderSkip,
-        ActiveMemoryDecisionStatus::Run => ActiveMemoryDecisionReasonCode::ProviderRun,
-        ActiveMemoryDecisionStatus::Uncertain => ActiveMemoryDecisionReasonCode::ProviderUncertain,
-    };
+    if !parsed.reason_code.is_provider_allowed() {
+        return Err(serde_json::Error::custom(
+            "active recall provider reasonCode is not allowed",
+        ));
+    }
+    if status == ActiveMemoryDecisionStatus::Run && parsed.modes.is_empty() {
+        return Err(serde_json::Error::custom(
+            "active recall run plan requires at least one mode",
+        ));
+    }
+    if status != ActiveMemoryDecisionStatus::Run && !parsed.modes.is_empty() {
+        return Err(serde_json::Error::custom(
+            "active recall non-run plan must not include modes",
+        ));
+    }
     let plan = normalize_active_recall_plan(ActiveRecallPlan {
         status,
-        reason_code: parsed
-            .reason_code
-            .map(ActiveMemoryDecisionReasonCodeJson::into_reason_code)
-            .unwrap_or(default_reason_code),
+        reason_code: parsed.reason_code.into_reason_code(),
         confidence: parsed.confidence.clamp(0.0, 1.0),
         modes: parsed.modes,
         targets: parsed.targets,
-        debug_fallback: parsed.debug_fallback,
+        debug_fallback: false,
         provider_used: true,
+        provider_fallback_used: false,
+        provider_input_chars: None,
+        provider_output_chars: None,
         diagnostics: parsed.diagnostics,
     });
     Ok(plan)
@@ -755,15 +1260,6 @@ pub(super) fn active_memory_query_plan(
     let mut seen = BTreeSet::new();
     let mut queries = Vec::new();
 
-    for mode in &decision.modes {
-        for query in active_recall_bridge_queries_for_mode(*mode, decision.targets.as_slice()) {
-            push_active_recall_bridge_query(&mut queries, &mut seen, query, config.max_queries);
-            if queries.len() >= config.max_queries {
-                return queries;
-            }
-        }
-    }
-
     if decision.debug_fallback {
         for query in [
             bounded_active_recall_bridge_query(MEMORY_ACTIVE_RECALL_GENERIC_QUERY, Vec::new()),
@@ -780,94 +1276,6 @@ pub(super) fn active_memory_query_plan(
     }
 
     queries
-}
-
-fn active_recall_bridge_queries_for_mode(
-    mode: ActiveRecallMode,
-    targets: &[ActiveRecallTarget],
-) -> Vec<ActiveRecallBridgeQuery> {
-    match mode {
-        ActiveRecallMode::Profile => vec![ActiveRecallBridgeQuery {
-            query: "active recall profile identity preferences communication style".to_owned(),
-            categories: vec![
-                MemoryCategory::Identity,
-                MemoryCategory::Preference,
-                MemoryCategory::Biography,
-                MemoryCategory::Relationship,
-                MemoryCategory::CommunicationStyle,
-                MemoryCategory::RecurringInstruction,
-            ],
-        }],
-        ActiveRecallMode::Project => vec![ActiveRecallBridgeQuery {
-            query: "active recall workspace project decisions policies constraints procedures"
-                .to_owned(),
-            categories: vec![
-                MemoryCategory::ProjectDecision,
-                MemoryCategory::ProjectPolicy,
-                MemoryCategory::ProjectFact,
-                MemoryCategory::Procedure,
-                MemoryCategory::Constraint,
-            ],
-        }],
-        ActiveRecallMode::Durable => vec![ActiveRecallBridgeQuery {
-            query: "active recall durable memories in current scope".to_owned(),
-            categories: Vec::new(),
-        }],
-        ActiveRecallMode::ThreadEpisodic => vec![ActiveRecallBridgeQuery {
-            query: "active recall thread episodic context".to_owned(),
-            categories: vec![MemoryCategory::Todo, MemoryCategory::Constraint],
-        }],
-        ActiveRecallMode::TaskContext => vec![ActiveRecallBridgeQuery {
-            query: "active recall task context runtime state".to_owned(),
-            categories: vec![MemoryCategory::Todo, MemoryCategory::Procedure],
-        }],
-        ActiveRecallMode::ExactCanonical => targets
-            .iter()
-            .filter_map(active_recall_target_bridge_query)
-            .collect(),
-    }
-}
-
-fn active_recall_target_bridge_query(
-    target: &ActiveRecallTarget,
-) -> Option<ActiveRecallBridgeQuery> {
-    if let Some(canonical_key) = &target.canonical_key {
-        return bounded_active_recall_bridge_query(
-            canonical_key.as_str(),
-            target_categories(target),
-        );
-    }
-
-    let mut parts = Vec::new();
-    if let Some(scope_kind) = target.scope_kind {
-        parts.push(format!("scope={}", memory_scope_kind_label(scope_kind)));
-    }
-    if let Some(fact_class) = target.fact_class {
-        parts.push(format!(
-            "fact_class={}",
-            memory_fact_class_label(fact_class)
-        ));
-    }
-    if let Some(category) = target.category {
-        parts.push(format!("category={}", memory_category_label(category)));
-    }
-    if let Some(subject) = target.subject {
-        parts.push(format!("subject={}", memory_subject_label(subject)));
-    }
-    if let Some(attribute) = target.attribute {
-        parts.push(format!("attribute={}", memory_attribute_label(attribute)));
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    bounded_active_recall_bridge_query(
-        format!("active recall exact canonical {}", parts.join(" ")).as_str(),
-        target_categories(target),
-    )
-}
-
-fn target_categories(target: &ActiveRecallTarget) -> Vec<MemoryCategory> {
-    target.category.into_iter().collect()
 }
 
 fn bounded_active_recall_bridge_query(
@@ -914,16 +1322,6 @@ fn dedup_memory_categories(categories: Vec<MemoryCategory>) -> Vec<MemoryCategor
     deduped
 }
 
-fn memory_scope_kind_label(scope_kind: MemoryScopeKind) -> &'static str {
-    match scope_kind {
-        MemoryScopeKind::User => "user",
-        MemoryScopeKind::Workspace => "workspace",
-        MemoryScopeKind::Thread => "thread",
-        MemoryScopeKind::Agent => "agent",
-        MemoryScopeKind::Task => "task",
-    }
-}
-
 fn memory_category_label(category: MemoryCategory) -> &'static str {
     match category {
         MemoryCategory::Identity => "identity",
@@ -939,57 +1337,6 @@ fn memory_category_label(category: MemoryCategory) -> &'static str {
         MemoryCategory::Constraint => "constraint",
         MemoryCategory::CommunicationStyle => "communication_style",
         MemoryCategory::Custom => "custom",
-    }
-}
-
-fn memory_fact_class_label(fact_class: MemoryFactClass) -> &'static str {
-    match fact_class {
-        MemoryFactClass::UserIdentity => "user_identity",
-        MemoryFactClass::UserBiography => "user_biography",
-        MemoryFactClass::UserRelationship => "user_relationship",
-        MemoryFactClass::StableUserPreference => "stable_user_preference",
-        MemoryFactClass::CommunicationPreference => "communication_preference",
-        MemoryFactClass::RecurringUserInstruction => "recurring_user_instruction",
-        MemoryFactClass::ProjectPolicy => "project_policy",
-        MemoryFactClass::ProjectDecision => "project_decision",
-        MemoryFactClass::ProjectProcedure => "project_procedure",
-        MemoryFactClass::ProjectConstraint => "project_constraint",
-        MemoryFactClass::TaskLifecycleState => "task_lifecycle_state",
-        MemoryFactClass::OperationalObservation => "operational_observation",
-        MemoryFactClass::ThreadLocalState => "thread_local_state",
-        MemoryFactClass::ToolResultFact => "tool_result_fact",
-        MemoryFactClass::AssistantSelfDescription => "assistant_self_description",
-        MemoryFactClass::GeneratedSummaryFact => "generated_summary_fact",
-        MemoryFactClass::DomainOwnedState => "domain_owned_state",
-        MemoryFactClass::SecretOrCredential => "secret_or_credential",
-        MemoryFactClass::RegulatedSensitiveFact => "regulated_sensitive_fact",
-        MemoryFactClass::Unknown => "unknown",
-    }
-}
-
-fn memory_subject_label(subject: MemorySubject) -> &'static str {
-    match subject {
-        MemorySubject::CurrentUser => "current_user",
-        MemorySubject::CurrentAgent => "current_agent",
-        MemorySubject::Workspace => "workspace",
-        MemorySubject::Project => "project",
-        MemorySubject::Person => "person",
-        MemorySubject::Organization => "organization",
-        MemorySubject::Artifact => "artifact",
-        MemorySubject::Custom => "custom",
-    }
-}
-
-fn memory_attribute_label(attribute: MemoryAttribute) -> &'static str {
-    match attribute {
-        MemoryAttribute::Name => "name",
-        MemoryAttribute::Birthday => "birthday",
-        MemoryAttribute::PreferredLanguage => "preferred_language",
-        MemoryAttribute::CommunicationStyle => "communication_style",
-        MemoryAttribute::MigrationPolicy => "migration_policy",
-        MemoryAttribute::ReviewStyle => "review_style",
-        MemoryAttribute::PhaseNaming => "phase_naming",
-        MemoryAttribute::Custom => "custom",
     }
 }
 

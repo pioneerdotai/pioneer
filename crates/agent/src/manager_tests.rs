@@ -18,6 +18,7 @@ use pioneer_hooks::{
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
     TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
+use pioneer_memory::MemoryModeRecallParams;
 use pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set;
 use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
@@ -332,6 +333,11 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
         .await
         .clone();
     let policy_provider = manager.memory_turn_policy_provider.read().await.clone();
+    let active_recall_decision_provider = manager
+        .memory_active_recall_decision_provider
+        .read()
+        .await
+        .clone();
     let current_runtime = manager.hook_runtime.read().await.clone();
     let builder = current_runtime
         .as_ref()
@@ -343,6 +349,7 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
             memory_write_provider,
             post_turn_extractor_provider,
             policy_provider,
+            active_recall_decision_provider,
             manager.memory_tool_bundle_artifact_store(),
             manager.tool_loop_config.memory.clone(),
         ))
@@ -944,6 +951,7 @@ impl ProviderRecoveryBoundaryProvider {
 struct RecordingMemoryProvider {
     recall_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
     recall_requests: std::sync::Mutex<Vec<MemoryRecallRequest>>,
+    mode_recall_requests: std::sync::Mutex<Vec<MemoryModeRecallParams>>,
     tool_contexts: std::sync::Mutex<Vec<MemoryTurnContext>>,
     recall_results: std::sync::Mutex<VecDeque<Result<MemoryRecallSnapshot, String>>>,
     tool_result: Result<MemoryToolMaterialization, String>,
@@ -964,6 +972,7 @@ impl RecordingMemoryProvider {
         Self {
             recall_contexts: std::sync::Mutex::new(Vec::new()),
             recall_requests: std::sync::Mutex::new(Vec::new()),
+            mode_recall_requests: std::sync::Mutex::new(Vec::new()),
             tool_contexts: std::sync::Mutex::new(Vec::new()),
             recall_results: std::sync::Mutex::new(VecDeque::from(recall_results)),
             tool_result,
@@ -991,6 +1000,13 @@ impl RecordingMemoryProvider {
             .clone()
     }
 
+    fn mode_recall_requests(&self) -> Vec<MemoryModeRecallParams> {
+        self.mode_recall_requests
+            .lock()
+            .expect("memory mode recall requests lock poisoned")
+            .clone()
+    }
+
     fn tool_contexts(&self) -> Vec<MemoryTurnContext> {
         self.tool_contexts
             .lock()
@@ -1013,6 +1029,33 @@ impl AgentMemoryProvider for RecordingMemoryProvider {
         self.recall_requests
             .lock()
             .expect("memory recall requests lock poisoned")
+            .push(request);
+        let mut results = self
+            .recall_results
+            .lock()
+            .expect("memory recall results lock poisoned");
+        if results.len() > 1 {
+            results.pop_front().expect("result exists")
+        } else {
+            results
+                .front()
+                .cloned()
+                .unwrap_or_else(|| Ok(MemoryRecallSnapshot::empty()))
+        }
+    }
+
+    async fn recall_memory_mode(
+        &self,
+        context: MemoryTurnContext,
+        request: MemoryModeRecallParams,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        self.recall_contexts
+            .lock()
+            .expect("memory recall contexts lock poisoned")
+            .push(context);
+        self.mode_recall_requests
+            .lock()
+            .expect("memory mode recall requests lock poisoned")
             .push(request);
         let mut results = self
             .recall_results
@@ -1226,6 +1269,32 @@ impl AgentMemoryProvider for StatefulMemoryProvider {
         &self,
         _context: MemoryTurnContext,
         _request: MemoryRecallRequest,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        let Some(content) = self
+            .stored_content
+            .lock()
+            .expect("stateful memory lock poisoned")
+            .clone()
+        else {
+            return Ok(MemoryRecallSnapshot::empty());
+        };
+
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_stateful_name",
+                MemoryCategory::Identity,
+                Some("name"),
+                content.as_str(),
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    async fn recall_memory_mode(
+        &self,
+        _context: MemoryTurnContext,
+        _request: MemoryModeRecallParams,
     ) -> Result<MemoryRecallSnapshot, String> {
         let Some(content) = self
             .stored_content
@@ -4679,6 +4748,7 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
 
     assert_eq!(memory_provider.recall_contexts().len(), 2);
     assert_eq!(memory_provider.tool_contexts().len(), 1);
+    assert!(memory_provider.mode_recall_requests().is_empty());
     let recall_requests = memory_provider.recall_requests();
     assert_eq!(recall_requests.len(), 2);
     assert_eq!(recall_requests[1].top_k, Some(5));

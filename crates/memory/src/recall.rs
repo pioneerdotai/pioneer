@@ -1,4 +1,6 @@
-use pioneer_protocol::{MemoryCategory, MemoryScope};
+use pioneer_protocol::{
+    MemoryAttribute, MemoryCategory, MemoryFactClass, MemoryScope, MemoryScopeKind, MemorySubject,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryRecallParams {
@@ -23,6 +25,55 @@ pub struct MemoryRecallItem {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MemoryRecallResponse {
     pub items: Vec<MemoryRecallItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryRecallMode {
+    Profile,
+    Project,
+    Durable,
+    ThreadEpisodic,
+    TaskContext,
+    ExactCanonical,
+}
+
+impl MemoryRecallMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Project => "project",
+            Self::Durable => "durable",
+            Self::ThreadEpisodic => "thread_episodic",
+            Self::TaskContext => "task_context",
+            Self::ExactCanonical => "exact_canonical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryRecallTarget {
+    pub scope_kind: Option<MemoryScopeKind>,
+    pub fact_class: Option<MemoryFactClass>,
+    pub category: Option<MemoryCategory>,
+    pub subject: Option<MemorySubject>,
+    pub attribute: Option<MemoryAttribute>,
+    pub canonical_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryModeRecallParams {
+    pub mode: MemoryRecallMode,
+    pub targets: Vec<MemoryRecallTarget>,
+    pub top_k: Option<u32>,
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoryModeRecallResponse {
+    pub items: Vec<MemoryRecallItem>,
+    pub diagnostics: Vec<String>,
+    pub truncated: bool,
+    pub skipped_reason: Option<String>,
 }
 
 pub(crate) fn compact_recall_content(content: &str, max_chars: usize) -> String {

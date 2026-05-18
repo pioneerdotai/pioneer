@@ -24,6 +24,9 @@ pub use hooks::{
 };
 pub use profile::PromptProfile;
 pub use render::{
+    memory_active_recall_planner::{
+        MemoryActiveRecallPlannerPromptInput, render_memory_active_recall_planner_prompt,
+    },
     memory_post_turn_extractor::{
         MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_prompt,
     },

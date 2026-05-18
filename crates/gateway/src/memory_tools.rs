@@ -3,13 +3,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use pioneer_crud::workspace_agent_memory_scope_key;
 use pioneer_memory::hooks::{
-    AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
+    AgentActiveMemoryDecisionProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
+    AgentMemoryWriteProvider, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
     MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
     MemoryToolMaterialization, MemoryTurnContext,
 };
-use pioneer_memory::{MemoryOperationContext, MemoryRecallParams};
+use pioneer_memory::{MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
     MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
@@ -131,6 +132,53 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             diagnostics: Vec::new(),
         })
     }
+
+    async fn recall_memory_mode(
+        &self,
+        context: MemoryTurnContext,
+        request: MemoryModeRecallParams,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        let processor = self.processor()?;
+        let runtime = processor.memory_runtime();
+        if let Err(error) = runtime.ensure_enabled() {
+            return Ok(MemoryRecallSnapshot {
+                items: Vec::new(),
+                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
+                truncated: false,
+            });
+        }
+
+        let response = runtime
+            .service()
+            .recall_mode_for_prompt(runtime.operation_context_for_turn(&context, None), request)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+
+        let mut diagnostics = response.diagnostics;
+        if let Some(skipped_reason) = response.skipped_reason {
+            diagnostics.push(format!(
+                "memory.active_recall.mode_skipped:{skipped_reason}"
+            ));
+        }
+
+        Ok(MemoryRecallSnapshot {
+            items: response
+                .items
+                .into_iter()
+                .map(|item| AgentMemoryRecallItem {
+                    memory_id: item.memory_id,
+                    scope: item.scope,
+                    category: item.category,
+                    key: item.key,
+                    content: item.content,
+                    score: item.score,
+                    updated_at: item.updated_at,
+                })
+                .collect(),
+            diagnostics,
+            truncated: response.truncated,
+        })
+    }
 }
 
 #[async_trait]
@@ -157,6 +205,116 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             })?;
         request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt()).await
     }
+}
+
+#[async_trait]
+impl AgentActiveMemoryDecisionProvider for GatewayMemoryProvider {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        context: MemoryActiveRecallDecisionContext,
+        request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String> {
+        let processor = self.processor()?;
+        let provider_name = context
+            .model_provider
+            .as_deref()
+            .ok_or_else(|| "missing model provider for active memory planner".to_owned())?;
+        let model = context
+            .model
+            .as_deref()
+            .ok_or_else(|| "missing model for active memory planner".to_owned())?;
+        let provider = processor
+            .provider_registry()
+            .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
+            .map_err(|error| format!("failed to create active memory planner provider: {error}"))?;
+        request_active_memory_decision_json(
+            provider.as_ref(),
+            model,
+            request.render_prompt(&context),
+            request.max_output_chars,
+        )
+        .await
+    }
+}
+
+async fn request_active_memory_decision_json(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+    max_output_chars: usize,
+) -> Result<String, String> {
+    match request_active_memory_decision_json_once(provider, model, prompt.clone(), Some(0.0)).await
+    {
+        Ok(json) => bounded_active_memory_decision_json(json, max_output_chars),
+        Err(primary_error) => {
+            if !should_retry_post_turn_extractor_without_optional_params(primary_error.as_str()) {
+                return Err(format!(
+                    "active memory planner request failed: {primary_error}"
+                ));
+            }
+
+            let json = request_active_memory_decision_json_once(provider, model, prompt, None)
+                .await
+                .map_err(|fallback_error| {
+                    format!(
+                        "active memory planner request failed: {primary_error}; compatibility fallback failed: {fallback_error}"
+                    )
+                })?;
+            bounded_active_memory_decision_json(json, max_output_chars)
+        }
+    }
+}
+
+async fn request_active_memory_decision_json_once(
+    provider: &dyn Provider,
+    model: &str,
+    prompt: String,
+    temperature: Option<f32>,
+) -> Result<String, String> {
+    let request = active_memory_decision_chat_request(model, prompt, temperature);
+    if provider.capabilities().streaming {
+        let stream = provider
+            .stream_chat(request)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        return collect_post_turn_extractor_stream(stream).await;
+    }
+
+    provider
+        .chat(request)
+        .await
+        .map(|response| response.text)
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn active_memory_decision_chat_request(
+    model: &str,
+    prompt: String,
+    temperature: Option<f32>,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_owned(),
+        messages: vec![ChatMessage::user(prompt)],
+        temperature,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        compiled_prompt: None,
+    }
+}
+
+fn bounded_active_memory_decision_json(
+    json: String,
+    max_output_chars: usize,
+) -> Result<String, String> {
+    let max_output_chars = max_output_chars.max(1);
+    if json.chars().count() > max_output_chars {
+        return Err(format!(
+            "active memory planner response exceeded max_output_chars={max_output_chars}"
+        ));
+    }
+    Ok(json)
 }
 
 async fn request_post_turn_extractor_json(

@@ -44,6 +44,7 @@ fn install_memory_hook_package_for_test(
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> Result<(), HookRegistryError> {
@@ -53,6 +54,7 @@ fn install_memory_hook_package_for_test(
             memory_write_provider,
             post_turn_extractor_provider,
             policy_provider,
+            active_recall_decision_provider,
             tool_bundle_artifacts,
             memory_config,
         ))?
@@ -778,6 +780,7 @@ struct TestRecallMemoryProvider {
     recall_result: Result<MemoryRecallSnapshot, String>,
     recall_calls: Arc<Mutex<usize>>,
     recall_requests: Arc<Mutex<Vec<MemoryRecallRequest>>>,
+    mode_recall_requests: Arc<Mutex<Vec<MemoryModeRecallParams>>>,
     materialize_calls: Arc<Mutex<usize>>,
 }
 
@@ -787,6 +790,7 @@ impl TestRecallMemoryProvider {
             recall_result: Ok(recall_result),
             recall_calls: Arc::new(Mutex::new(0)),
             recall_requests: Arc::new(Mutex::new(Vec::new())),
+            mode_recall_requests: Arc::new(Mutex::new(Vec::new())),
             materialize_calls: Arc::new(Mutex::new(0)),
         }
     }
@@ -796,6 +800,7 @@ impl TestRecallMemoryProvider {
             recall_result: Err(error.into()),
             recall_calls: Arc::new(Mutex::new(0)),
             recall_requests: Arc::new(Mutex::new(Vec::new())),
+            mode_recall_requests: Arc::new(Mutex::new(Vec::new())),
             materialize_calls: Arc::new(Mutex::new(0)),
         }
     }
@@ -817,6 +822,13 @@ impl TestRecallMemoryProvider {
             .expect("recall request lock poisoned")
             .clone()
     }
+
+    fn mode_recall_requests(&self) -> Vec<MemoryModeRecallParams> {
+        self.mode_recall_requests
+            .lock()
+            .expect("mode recall request lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -830,6 +842,19 @@ impl AgentMemoryProvider for TestRecallMemoryProvider {
         self.recall_requests
             .lock()
             .expect("recall request lock poisoned")
+            .push(request);
+        self.recall_result.clone()
+    }
+
+    async fn recall_memory_mode(
+        &self,
+        _context: MemoryTurnContext,
+        request: MemoryModeRecallParams,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        *self.recall_calls.lock().expect("recall lock poisoned") += 1;
+        self.mode_recall_requests
+            .lock()
+            .expect("mode recall request lock poisoned")
             .push(request);
         self.recall_result.clone()
     }
@@ -881,6 +906,15 @@ impl AgentMemoryProvider for SlowRecallMemoryProvider {
         Ok(active_project_snapshot())
     }
 
+    async fn recall_memory_mode(
+        &self,
+        _context: MemoryTurnContext,
+        _request: MemoryModeRecallParams,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok(active_project_snapshot())
+    }
+
     async fn materialize_memory_tools(
         &self,
         _context: MemoryTurnContext,
@@ -907,6 +941,49 @@ impl AgentActiveMemoryDecisionProvider for TestActiveMemoryDecisionProvider {
         _request: MemoryActiveRecallDecisionRequest,
     ) -> Result<String, String> {
         Ok(self.json.clone())
+    }
+}
+
+struct TestFailingActiveMemoryDecisionProvider;
+
+#[async_trait::async_trait]
+impl AgentActiveMemoryDecisionProvider for TestFailingActiveMemoryDecisionProvider {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        _context: MemoryActiveRecallDecisionContext,
+        _request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String> {
+        Err("provider failed".to_owned())
+    }
+}
+
+struct TestSlowActiveMemoryDecisionProvider;
+
+#[async_trait::async_trait]
+impl AgentActiveMemoryDecisionProvider for TestSlowActiveMemoryDecisionProvider {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        _context: MemoryActiveRecallDecisionContext,
+        _request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String> {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok(
+            r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["profile"]}"#
+                .to_owned(),
+        )
+    }
+}
+
+struct PanickingActiveMemoryDecisionProvider;
+
+#[async_trait::async_trait]
+impl AgentActiveMemoryDecisionProvider for PanickingActiveMemoryDecisionProvider {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        _context: MemoryActiveRecallDecisionContext,
+        _request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String> {
+        panic!("active recall decision provider must not be called")
     }
 }
 

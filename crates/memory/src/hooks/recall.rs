@@ -44,7 +44,7 @@ pub(super) fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DeterministicRecallContextSummary {
     pub(super) memory_ids: BTreeSet<String>,
     pub(super) rendered_line_fingerprints: BTreeSet<String>,
@@ -101,8 +101,13 @@ pub(super) async fn resolve_active_memory_decision(
     ) {
         return normalize_active_recall_plan_for_input(local_plan, &planner_input);
     }
+    if local_plan.status == ActiveMemoryDecisionStatus::Run && local_plan.confidence >= 0.7 {
+        return normalize_active_recall_plan_for_input(local_plan, &planner_input);
+    }
 
-    if let Some(provider) = provider {
+    if config.planner.enabled
+        && let Some(provider) = provider
+    {
         let request = MemoryActiveRecallDecisionRequest {
             deterministic_context_count: planner_input.deterministic_context_count,
             deterministic_context_chars: planner_input.deterministic_context_chars,
@@ -113,44 +118,130 @@ pub(super) async fn resolve_active_memory_decision(
             has_task_context: planner_input.has_task_context,
             input_length_bucket: planner_input.input_length_bucket.as_str().to_owned(),
             config_mode: planner_input.config_mode,
+            read_allowed: planner_input.read_allowed,
+            active_memory_allowed: planner_input.active_memory_allowed,
+            explicit_no_memory: planner_input.explicit_no_memory,
+            input_text_char_count: planner_input.input_text_char_count,
+            available_modes: active_recall_available_mode_names(&planner_input),
+            available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
+            max_queries: config.max_queries,
+            top_k_per_query: config.top_k_per_query,
+            max_prompt_chars: config.max_prompt_chars,
+            max_input_chars: config.planner.max_input_chars,
+            max_output_chars: config.planner.max_output_chars,
+            fallback_policy: config.planner.fallback,
         };
-        match provider
-            .resolve_active_memory_decision_json(
-                MemoryActiveRecallDecisionContext {
-                    workspace_id: context.workspace_id.clone(),
-                    thread_id: context.thread_id.clone(),
-                    turn_id: context.turn_id.clone(),
-                    mode: context.mode,
-                    input_text_preview: planner_input.input_text_preview.clone(),
-                },
-                request,
-            )
-            .await
+        let provider_context = MemoryActiveRecallDecisionContext {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+            mode: context.mode,
+            input_text_preview: planner_input.input_text_preview.clone(),
+            model: config.planner.model.clone().or_else(|| input.model.clone()),
+            model_provider: config
+                .planner
+                .provider_name
+                .clone()
+                .or_else(|| input.model_provider.clone()),
+        };
+        let provider_input_chars = request
+            .sanitized_input_json(&provider_context)
+            .chars()
+            .count();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(config.planner.timeout_ms),
+            provider.resolve_active_memory_decision_json(provider_context, request),
+        )
+        .await
         {
-            Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
-                Ok(decision) => {
-                    return normalize_active_recall_plan_for_input(decision, &planner_input);
-                }
+            Err(_) => {
+                return active_recall_provider_fallback(
+                    local_plan,
+                    "memory.active_recall.provider_timeout",
+                    &planner_input,
+                    config,
+                    Some(provider_input_chars),
+                    None,
+                );
+            }
+            Ok(provider_result) => match provider_result {
+                Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
+                    Ok(mut decision) => {
+                        decision.provider_input_chars = Some(provider_input_chars);
+                        decision.provider_output_chars = Some(json.chars().count());
+                        decision
+                            .diagnostics
+                            .insert(0, "memory.active_recall.provider_called".to_owned());
+                        return normalize_active_recall_plan_for_input(decision, &planner_input);
+                    }
+                    Err(_) => {
+                        return active_recall_provider_fallback(
+                            local_plan,
+                            "memory.active_recall.invalid_json",
+                            &planner_input,
+                            config,
+                            Some(provider_input_chars),
+                            Some(json.chars().count()),
+                        );
+                    }
+                },
                 Err(_) => {
-                    let mut fallback = local_plan;
-                    fallback
-                        .diagnostics
-                        .push("memory.active_recall.invalid_json".to_owned());
-                    return normalize_active_recall_plan_for_input(fallback, &planner_input);
+                    return active_recall_provider_fallback(
+                        local_plan,
+                        "memory.active_recall.provider_failed",
+                        &planner_input,
+                        config,
+                        Some(provider_input_chars),
+                        None,
+                    );
                 }
             },
-            Err(_) => {
-                let mut fallback = local_plan;
-                fallback
-                    .diagnostics
-                    .push("memory.active_recall.provider_failed".to_owned());
-                return normalize_active_recall_plan_for_input(fallback, &planner_input);
-            }
         }
     }
 
-    normalize_active_recall_plan_for_input(local_plan, &planner_input)
+    let mut fallback = local_plan;
+    if !config.planner.enabled {
+        fallback
+            .diagnostics
+            .push("memory.active_recall.provider_disabled".to_owned());
+    } else if provider.is_none() {
+        fallback
+            .diagnostics
+            .push("memory.active_recall.provider_unavailable".to_owned());
+    }
+    normalize_active_recall_plan_for_input(fallback, &planner_input)
 }
+
+fn active_recall_provider_fallback(
+    mut local_plan: ActiveRecallPlan,
+    reason: &str,
+    planner_input: &ActiveRecallPlannerInput,
+    config: &MemoryActiveRecallConfig,
+    provider_input_chars: Option<usize>,
+    provider_output_chars: Option<usize>,
+) -> ActiveMemoryDecision {
+    match config.planner.fallback {
+        MemoryActiveRecallPlannerFallbackPolicy::Deterministic => {
+            local_plan.diagnostics.push(reason.to_owned());
+            local_plan.provider_fallback_used = true;
+            local_plan.provider_input_chars = provider_input_chars;
+            local_plan.provider_output_chars = provider_output_chars;
+            normalize_active_recall_plan_for_input(local_plan, planner_input)
+        }
+        MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall => {
+            let mut plan = ActiveRecallPlan::skip(
+                ActiveMemoryDecisionReasonCode::ProviderSkip,
+                0.0,
+                vec![reason.to_owned(), "planner_fallback_skip".to_owned()],
+            );
+            plan.provider_fallback_used = true;
+            plan.provider_input_chars = provider_input_chars;
+            plan.provider_output_chars = provider_output_chars;
+            plan
+        }
+    }
+}
+
 pub(super) fn memory_recall_prompt_context_contribution(
     recall_snapshot: MemoryRecallSnapshot,
 ) -> Option<PromptContextContribution> {

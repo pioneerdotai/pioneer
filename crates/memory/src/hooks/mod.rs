@@ -22,6 +22,7 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
+use crate::{MemoryModeRecallParams, MemoryRecallMode, MemoryRecallTarget};
 use chrono::{DateTime, Utc};
 use pioneer_hooks::HookHandler;
 use pioneer_hooks::{
@@ -39,8 +40,9 @@ use pioneer_hooks::{
     TurnPrePromptContextHookInput,
 };
 use pioneer_promt::{
-    MemoryPostTurnExtractorPromptInput, MemoryRecallPromptInput, MemoryRecallPromptItem,
-    MemoryRecallPromptPolicy, render_memory_post_turn_extractor_prompt,
+    MemoryActiveRecallPlannerPromptInput, MemoryPostTurnExtractorPromptInput,
+    MemoryRecallPromptInput, MemoryRecallPromptItem, MemoryRecallPromptPolicy,
+    render_memory_active_recall_planner_prompt, render_memory_post_turn_extractor_prompt,
     render_memory_recall_context_block, render_memory_recall_prompt,
 };
 use pioneer_protocol::{

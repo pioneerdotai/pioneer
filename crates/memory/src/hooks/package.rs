@@ -7,6 +7,7 @@ pub fn package(
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> MemoryHookPackage {
@@ -15,6 +16,7 @@ pub fn package(
         memory_write_provider,
         post_turn_extractor_provider,
         policy_provider,
+        active_recall_decision_provider,
         tool_bundle_artifacts,
         memory_config,
     }
@@ -25,6 +27,7 @@ pub struct MemoryHookPackage {
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
+    active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 }
@@ -61,7 +64,7 @@ impl HookPackage for MemoryHookPackage {
             memory_hook_definition_with_options(
                 Arc::new(ActiveMemoryRecallHook {
                     memory_provider: self.memory_provider.clone(),
-                    decision_provider: None,
+                    decision_provider: self.active_recall_decision_provider.clone(),
                     config: active_recall_config.clone(),
                 }),
                 MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID,

@@ -195,6 +195,7 @@ fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
         None,
         None,
         None,
+        None,
         artifacts,
         MemoryLoopConfig {
             active_recall: MemoryActiveRecallConfig {
@@ -427,6 +428,7 @@ fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
         Some(Arc::new(TestPostTurnExtractorProvider::json(
             r#"{"facts":[]}"#,
         ))),
+        None,
         None,
         Arc::new(TestToolBundleArtifactStore::new()),
         MemoryLoopConfig::default(),

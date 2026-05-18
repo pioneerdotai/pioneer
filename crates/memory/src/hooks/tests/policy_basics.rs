@@ -9,6 +9,14 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
     assert!(config.active_recall.max_queries > 0);
     assert!(config.active_recall.top_k_per_query > 0);
     assert!(config.active_recall.max_prompt_chars > 0);
+    assert!(config.active_recall.planner.enabled);
+    assert!(config.active_recall.planner.timeout_ms > 0);
+    assert!(config.active_recall.planner.max_input_chars > 0);
+    assert!(config.active_recall.planner.max_output_chars > 0);
+    assert_eq!(
+        config.active_recall.planner.fallback,
+        MemoryActiveRecallPlannerFallbackPolicy::Deterministic
+    );
 
     let zero = MemoryActiveRecallConfig {
         timeout_ms: 0,
@@ -24,6 +32,47 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
     assert_eq!(zero.max_queries, 1);
     assert_eq!(zero.top_k_per_query, 1);
     assert_eq!(zero.max_prompt_chars, 1);
+    assert!(zero.planner.enabled);
+    assert_eq!(zero.planner.timeout_ms, 8_000);
+    assert_eq!(zero.planner.max_input_chars, 4_000);
+    assert_eq!(zero.planner.max_output_chars, 2_000);
+}
+
+#[test]
+fn memory_active_recall_planner_config_normalizes_bounds_and_names() {
+    let config = MemoryActiveRecallConfig {
+        planner: MemoryActiveRecallPlannerConfig {
+            enabled: true,
+            provider_name: Some("  provider-name-that-is-kept  ".to_owned()),
+            model: Some("  model-name-that-is-kept  ".to_owned()),
+            timeout_ms: 0,
+            max_input_chars: 0,
+            max_output_chars: 0,
+            fallback: MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall,
+        },
+        ..MemoryActiveRecallConfig::default()
+    }
+    .normalized();
+
+    assert_eq!(
+        config.mode.as_str(),
+        MemoryActiveRecallMode::Hybrid.as_str()
+    );
+    assert_eq!(
+        config.planner.provider_name.as_deref(),
+        Some("provider-name-that-is-kept")
+    );
+    assert_eq!(
+        config.planner.model.as_deref(),
+        Some("model-name-that-is-kept")
+    );
+    assert_eq!(config.planner.timeout_ms, 1);
+    assert_eq!(config.planner.max_input_chars, 1);
+    assert_eq!(config.planner.max_output_chars, 1);
+    assert_eq!(
+        config.planner.fallback,
+        MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall
+    );
 }
 
 #[test]

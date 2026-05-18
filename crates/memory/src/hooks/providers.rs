@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 
 #[async_trait::async_trait]
 pub trait AgentMemoryProvider: Send + Sync {
@@ -7,6 +8,18 @@ pub trait AgentMemoryProvider: Send + Sync {
         context: MemoryTurnContext,
         request: MemoryRecallRequest,
     ) -> Result<MemoryRecallSnapshot, String>;
+
+    async fn recall_memory_mode(
+        &self,
+        _context: MemoryTurnContext,
+        _request: MemoryModeRecallParams,
+    ) -> Result<MemoryRecallSnapshot, String> {
+        Ok(MemoryRecallSnapshot {
+            items: Vec::new(),
+            diagnostics: vec!["memory.active_recall.mode_provider_unavailable".to_owned()],
+            truncated: false,
+        })
+    }
 
     async fn materialize_memory_tools(
         &self,
@@ -123,6 +136,8 @@ pub struct MemoryActiveRecallDecisionContext {
     pub turn_id: String,
     pub mode: ThreadMode,
     pub input_text_preview: String,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +151,111 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub has_task_context: bool,
     pub input_length_bucket: String,
     pub config_mode: MemoryActiveRecallMode,
+    pub read_allowed: bool,
+    pub active_memory_allowed: bool,
+    pub explicit_no_memory: bool,
+    pub input_text_char_count: usize,
+    pub available_modes: Vec<String>,
+    pub available_scoped_contexts: Vec<String>,
+    pub max_queries: usize,
+    pub top_k_per_query: u32,
+    pub max_prompt_chars: usize,
+    pub max_input_chars: usize,
+    pub max_output_chars: usize,
+    pub fallback_policy: MemoryActiveRecallPlannerFallbackPolicy,
+}
+
+impl MemoryActiveRecallDecisionRequest {
+    pub fn render_prompt(&self, context: &MemoryActiveRecallDecisionContext) -> String {
+        render_memory_active_recall_planner_prompt(&MemoryActiveRecallPlannerPromptInput {
+            sanitized_input_json: self.sanitized_input_json(context),
+            max_output_chars: self.max_output_chars,
+        })
+    }
+
+    pub fn sanitized_input_json(&self, context: &MemoryActiveRecallDecisionContext) -> String {
+        let payload = MemoryActiveRecallPlannerSanitizedInput {
+            workspace_id_present: !context.workspace_id.trim().is_empty(),
+            thread_id_present: !context.thread_id.trim().is_empty(),
+            turn_id_present: !context.turn_id.trim().is_empty(),
+            model_present: context
+                .model
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty()),
+            model_provider_present: context
+                .model_provider
+                .as_deref()
+                .is_some_and(|provider| !provider.trim().is_empty()),
+            thread_mode: match context.mode {
+                ThreadMode::Agent => "agent".to_owned(),
+                ThreadMode::Chat => "chat".to_owned(),
+            },
+            input_text_preview: context.input_text_preview.clone(),
+            input_text_char_count: self.input_text_char_count,
+            deterministic_context_count: self.deterministic_context_count,
+            deterministic_context_chars: self.deterministic_context_chars,
+            deterministic_memory_ids: self.deterministic_memory_ids.clone(),
+            deterministic_sufficient: self.deterministic_sufficient,
+            deterministic_recall_empty: self.deterministic_recall_empty,
+            has_workspace_context: self.has_workspace_context,
+            has_task_context: self.has_task_context,
+            input_length_bucket: self.input_length_bucket.clone(),
+            config_mode: self.config_mode.as_str().to_owned(),
+            read_allowed: self.read_allowed,
+            active_memory_allowed: self.active_memory_allowed,
+            explicit_no_memory: self.explicit_no_memory,
+            available_modes: self.available_modes.clone(),
+            available_scoped_contexts: self.available_scoped_contexts.clone(),
+            budgets: MemoryActiveRecallPlannerBudgetInput {
+                max_queries: self.max_queries,
+                top_k_per_query: self.top_k_per_query,
+                max_prompt_chars: self.max_prompt_chars,
+                max_input_chars: self.max_input_chars,
+                max_output_chars: self.max_output_chars,
+            },
+            fallback_policy: self.fallback_policy.as_str().to_owned(),
+        };
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryActiveRecallPlannerSanitizedInput {
+    workspace_id_present: bool,
+    thread_id_present: bool,
+    turn_id_present: bool,
+    model_present: bool,
+    model_provider_present: bool,
+    thread_mode: String,
+    input_text_preview: String,
+    input_text_char_count: usize,
+    deterministic_context_count: usize,
+    deterministic_context_chars: usize,
+    deterministic_memory_ids: Vec<String>,
+    deterministic_sufficient: bool,
+    deterministic_recall_empty: bool,
+    has_workspace_context: bool,
+    has_task_context: bool,
+    input_length_bucket: String,
+    config_mode: String,
+    read_allowed: bool,
+    active_memory_allowed: bool,
+    explicit_no_memory: bool,
+    available_modes: Vec<String>,
+    available_scoped_contexts: Vec<String>,
+    budgets: MemoryActiveRecallPlannerBudgetInput,
+    fallback_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryActiveRecallPlannerBudgetInput {
+    max_queries: usize,
+    top_k_per_query: u32,
+    max_prompt_chars: usize,
+    max_input_chars: usize,
+    max_output_chars: usize,
 }
 
 #[async_trait::async_trait]

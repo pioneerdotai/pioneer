@@ -21,7 +21,11 @@ impl HookHandler for ActiveMemoryRecallHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_active_recall_capabilities(self.decision_provider.is_some())
+        let config = self.config.normalized();
+        let provider_enabled = self.decision_provider.is_some()
+            && config.planner.enabled
+            && config.mode == MemoryActiveRecallMode::Hybrid;
+        memory_active_recall_capabilities(provider_enabled)
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -73,51 +77,52 @@ impl HookHandler for ActiveMemoryRecallHook {
             return Ok(response);
         }
 
-        let queries = active_memory_query_plan(input.input_text.as_str(), &decision, &config);
-        if queries.is_empty() {
+        let mut execution = execute_active_recall_plan(
+            self.memory_provider.as_ref(),
+            ActiveRecallExecutionInput {
+                context: context.clone(),
+                plan: decision.clone(),
+                deterministic: deterministic.clone(),
+                config: config.clone(),
+            },
+        )
+        .await;
+        response
+            .diagnostics
+            .push(active_recall_execution_observability_diagnostic(&execution));
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            execution.diagnostics.as_slice(),
+        ));
+
+        if execution.is_empty() && decision.debug_fallback {
+            let debug_execution = execute_active_recall_debug_fallback(
+                self.memory_provider.as_ref(),
+                context.clone(),
+                input.input_text.as_str(),
+                &decision,
+                &config,
+            )
+            .await;
             response.diagnostics.push(memory_safe_info_diagnostic(
-                "memory.active_recall.no_query",
-                "memory active recall skipped: no bounded query available",
+                "memory.active_recall.debug_fallback",
+                "memory active recall used explicit debug fallback",
+            ));
+            response.diagnostics.extend(hook_diagnostics_from_strings(
+                debug_execution.diagnostics.as_slice(),
+            ));
+            execution = debug_execution;
+        }
+
+        if execution.is_empty() {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.active_recall.no_hits",
+                "memory active recall returned no memory context",
             ));
             return Ok(response);
         }
 
-        let mut active_items = Vec::new();
-        let mut active_truncated = false;
-        for query in queries {
-            match self
-                .memory_provider
-                .recall_memory(
-                    context.clone(),
-                    MemoryRecallRequest {
-                        query: query.query,
-                        categories: query.categories,
-                        top_k: Some(config.top_k_per_query),
-                        max_chars: Some(config.max_prompt_chars),
-                    },
-                )
-                .await
-            {
-                Ok(snapshot) => {
-                    response.diagnostics.extend(hook_diagnostics_from_strings(
-                        snapshot.diagnostics.as_slice(),
-                    ));
-                    active_truncated |= snapshot.truncated;
-                    active_items.extend(snapshot.items);
-                }
-                Err(error) => {
-                    let _ = error;
-                    response.diagnostics.push(memory_safe_warning_diagnostic(
-                        "memory.active_recall.failed",
-                        "memory active recall failed",
-                    ));
-                    return Ok(response);
-                }
-            }
-        }
-
         let active_dedup = dedup_active_recall_items_with_lines(
-            active_items,
+            execution.items,
             &deterministic.memory_ids,
             &deterministic.rendered_line_fingerprints,
         );
@@ -137,7 +142,7 @@ impl HookHandler for ActiveMemoryRecallHook {
 
         if let Some(contribution) = memory_active_recall_prompt_context_contribution(
             active_dedup.items,
-            active_truncated,
+            execution.truncated,
             &config,
         ) {
             response.diagnostics.push(memory_safe_info_diagnostic(

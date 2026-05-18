@@ -36,6 +36,9 @@ pub use quality::{
     classify_semantic_memory_fact, legacy_source_kind_for_source_context,
     resolve_semantic_write_source_context,
 };
-pub use recall::{MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse};
+pub use recall::{
+    MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
+    MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget,
+};
 pub use service::MemoryService;
 pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

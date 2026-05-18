@@ -130,19 +130,11 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
     assert_eq!(provider.recall_call_count(), 1);
     assert_eq!(provider.materialize_call_count(), 0);
     let request = provider
-        .recall_requests()
+        .mode_recall_requests()
         .into_iter()
         .next()
         .expect("active recall request recorded");
-    assert_eq!(
-        request.query,
-        "active recall workspace project decisions policies constraints procedures"
-    );
-    assert!(
-        request
-            .categories
-            .contains(&MemoryCategory::ProjectDecision)
-    );
+    assert_eq!(request.mode, MemoryRecallMode::Project);
     assert_eq!(request.top_k, Some(5));
     assert_eq!(request.max_chars, Some(1_500));
     assert!(response.diagnostics.iter().any(|diagnostic| {
@@ -247,15 +239,13 @@ async fn active_memory_hook_uses_valid_strict_json_plan() {
 
     assert_eq!(provider.recall_call_count(), 1);
     let request = provider
-        .recall_requests()
+        .mode_recall_requests()
         .into_iter()
         .next()
         .expect("strict JSON plan should drive recall");
-    assert_eq!(
-        request.query,
-        "active recall profile identity preferences communication style"
-    );
-    assert!(request.categories.contains(&MemoryCategory::Identity));
+    assert_eq!(request.mode, MemoryRecallMode::Profile);
+    assert_eq!(request.targets.len(), 1);
+    assert_eq!(request.targets[0].category, Some(MemoryCategory::Identity));
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.decision"
             && diagnostic.message.as_str().contains("reason=provider_run")
@@ -266,6 +256,15 @@ async fn active_memory_hook_uses_valid_strict_json_plan() {
             .iter()
             .any(|diagnostic| { diagnostic.message.as_str().contains("provider ok") })
     );
+    let HookContribution::PromptContext(context) = response
+        .contributions
+        .iter()
+        .find(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+        .expect("provider plan should still produce memory prompt context")
+    else {
+        panic!("expected prompt context contribution");
+    };
+    assert!(!context.content.as_str().contains("provider ok"));
 }
 
 #[tokio::test]
@@ -275,7 +274,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
     ));
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
-        decision_provider: None,
+        decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
         config: MemoryActiveRecallConfig::default(),
     };
 
@@ -303,7 +302,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
 
     let deterministic_only = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
-        decision_provider: None,
+        decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::DeterministicOnly,
             ..MemoryActiveRecallConfig::default()
@@ -322,7 +321,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
 }
 
 #[tokio::test]
-async fn active_memory_hook_uses_mode_derived_recall_for_short_turns() {
+async fn active_memory_hook_uses_mode_native_recall_for_short_turns() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -346,24 +345,52 @@ async fn active_memory_hook_uses_mode_derived_recall_for_short_turns() {
 
     assert_eq!(provider.recall_call_count(), 1);
     let request = provider
-        .recall_requests()
+        .mode_recall_requests()
         .into_iter()
         .next()
         .expect("active recall request recorded");
-    assert_ne!(request.query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
-    assert_ne!(request.query, "как меня зовут?");
-    assert_eq!(
-        request.query,
-        "active recall workspace project decisions policies constraints procedures"
-    );
-    assert!(
-        request
-            .categories
-            .contains(&MemoryCategory::ProjectDecision)
-    );
+    assert_eq!(request.mode, MemoryRecallMode::Project);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.decision"
             && diagnostic.message.as_str().contains("status=run")
+    }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_empty_provider_response_falls_back_to_deterministic_plan() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(""))),
+        config: MemoryActiveRecallConfig {
+            max_queries: 1,
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue the architecture work using prior project decisions",
+        ))
+        .await
+        .expect("empty provider response is best-effort");
+
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.invalid_json")
     }));
 }
 
@@ -395,6 +422,73 @@ async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
     assert_eq!(provider.recall_call_count(), 0);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
+    }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_does_not_call_provider_when_deterministic_is_sufficient() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        config: MemoryActiveRecallConfig::default(),
+    };
+    let deterministic_context = prompt_context_set_from_prompt_context_contribution(
+        memory_recall_prompt_context_contribution(recalled_city_snapshot())
+            .expect("deterministic context contribution"),
+    );
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            deterministic_context,
+            "continue the previous work with the same constraints",
+        ))
+        .await
+        .expect("active recall hook executes");
+
+    assert!(response.contributions.is_empty());
+    assert_eq!(provider.recall_call_count(), 0);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
+    }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_does_not_call_disabled_planner_provider() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        config: MemoryActiveRecallConfig {
+            planner: MemoryActiveRecallPlannerConfig {
+                enabled: false,
+                ..MemoryActiveRecallPlannerConfig::default()
+            },
+            max_queries: 1,
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue the architecture work using prior project decisions",
+        ))
+        .await
+        .expect("active recall hook executes");
+
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.provider_disabled")
     }));
 }
 
@@ -470,6 +564,204 @@ async fn active_memory_hook_ignores_malformed_internal_json() {
             .as_str()
             .contains("memory.active_recall.invalid_json")
     }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_provider_error_falls_back_to_deterministic_plan() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(Arc::new(TestFailingActiveMemoryDecisionProvider)),
+        config: MemoryActiveRecallConfig {
+            max_queries: 1,
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue the architecture work using prior project decisions",
+        ))
+        .await
+        .expect("provider failure is best-effort");
+
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.provider_failed")
+    }));
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .metadata
+            .get(&hook_metadata_key("provider_fallback_used"))
+            == Some(&HookValue::Bool(true))
+    }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_provider_timeout_falls_back_to_deterministic_plan() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(Arc::new(TestSlowActiveMemoryDecisionProvider)),
+        config: MemoryActiveRecallConfig {
+            max_queries: 1,
+            planner: MemoryActiveRecallPlannerConfig {
+                timeout_ms: 1,
+                ..MemoryActiveRecallPlannerConfig::default()
+            },
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue the architecture work using prior project decisions",
+        ))
+        .await
+        .expect("provider timeout is best-effort");
+
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.provider_timeout")
+    }));
+}
+
+#[tokio::test]
+async fn active_recall_executor_runs_mode_native_requests_and_deduplicates() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let result = execute_active_recall_plan(
+        provider.as_ref(),
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan: ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.8,
+                vec![ActiveRecallMode::Project, ActiveRecallMode::Durable],
+                Vec::new(),
+                Vec::new(),
+            ),
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig {
+                max_queries: 2,
+                ..MemoryActiveRecallConfig::default()
+            },
+        },
+    )
+    .await;
+
+    assert_eq!(provider.recall_call_count(), 2);
+    assert!(
+        provider.recall_requests().is_empty(),
+        "normal executor path must not use broad query recall"
+    );
+    let mode_requests = provider.mode_recall_requests();
+    assert_eq!(mode_requests.len(), 2);
+    assert_eq!(mode_requests[0].mode, MemoryRecallMode::Project);
+    assert_eq!(mode_requests[1].mode, MemoryRecallMode::Durable);
+    assert_eq!(result.raw_item_count, 2);
+    assert_eq!(result.duplicate_count, 1);
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].memory_id, "mem_active_project");
+}
+
+#[tokio::test]
+async fn active_recall_executor_skips_missing_structured_modes() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let result = execute_active_recall_plan(
+        provider.as_ref(),
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan: ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.8,
+                vec![
+                    ActiveRecallMode::ExactCanonical,
+                    ActiveRecallMode::TaskContext,
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig::default(),
+        },
+    )
+    .await;
+
+    assert_eq!(provider.recall_call_count(), 0);
+    assert!(result.items.is_empty());
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .contains("memory.active_recall.mode_skipped:exact_canonical:missing_canonical_target")
+    }));
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("memory.active_recall.mode_skipped:task_context:missing_task_context")
+    }));
+}
+
+#[tokio::test]
+async fn active_memory_hook_keeps_broad_query_recall_in_debug_fallback_only() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: None,
+        config: MemoryActiveRecallConfig {
+            mode: MemoryActiveRecallMode::StrictDebug,
+            max_queries: 2,
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "как меня зовут?",
+        ))
+        .await
+        .expect("active recall hook executes");
+
+    assert_eq!(provider.mode_recall_requests().len(), 0);
+    let recall_requests = provider.recall_requests();
+    assert_eq!(recall_requests.len(), 2);
+    assert_eq!(recall_requests[0].query, MEMORY_ACTIVE_RECALL_GENERIC_QUERY);
+    assert_eq!(recall_requests[1].query, "как меня зовут?");
+    assert!(
+        response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "memory.active_recall.debug_fallback"
+        })
+    );
 }
 
 #[test]
@@ -560,6 +852,61 @@ fn active_recall_provider_plan_rejects_invalid_enum_values() {
 }
 
 #[test]
+fn active_recall_provider_plan_requires_reason_and_run_modes() {
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"status":"run","confidence":0.7,"modes":["profile"],"targets":[]}"#,
+        )
+        .is_err()
+    );
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"status":"run","reasonCode":"provider_run","confidence":0.7,"modes":[],"targets":[]}"#,
+        )
+        .is_err()
+    );
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":["profile"],"targets":[]}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn active_recall_provider_plan_ignores_debug_fallback_and_drops_impossible_modes() {
+    let plan = parse_active_memory_decision_json(
+        r#"{"status":"run","reasonCode":"provider_run","confidence":0.8,"modes":["exact_canonical","task_context","thread_episodic","profile"],"targets":[],"debugFallback":true}"#,
+    )
+    .expect("provider plan parses");
+    assert!(!plan.debug_fallback);
+
+    let mut input = active_recall_planner_input_for_test();
+    input.task_id = None;
+    input.thread_id.clear();
+    let normalized = normalize_active_recall_plan_for_input(plan, &input);
+    assert_eq!(normalized.modes, vec![ActiveRecallMode::Profile]);
+    assert!(
+        normalized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic == "dropped_mode=exact_canonical:no_canonical_target" })
+    );
+    assert!(
+        normalized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic == "dropped_mode=task_context:no_task_context" })
+    );
+    assert!(
+        normalized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic == "dropped_mode=thread_episodic:no_thread_context" })
+    );
+}
+
+#[test]
 fn active_recall_planner_input_is_structured_from_hook_context() {
     let policy = MemoryTurnPolicy::normal_default_allow();
     let config = MemoryActiveRecallConfig::default().normalized();
@@ -597,6 +944,55 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
     );
     assert!(planner_input.deterministic_sufficient);
     assert!(!planner_input.has_task_context);
+}
+
+#[test]
+fn active_recall_decision_request_renders_sanitized_planner_prompt() {
+    let context = MemoryActiveRecallDecisionContext {
+        workspace_id: "workspace-secret-id".to_owned(),
+        thread_id: "thread-secret-id".to_owned(),
+        turn_id: "turn-secret-id".to_owned(),
+        mode: ThreadMode::Agent,
+        input_text_preview: "current bounded input".to_owned(),
+        model: Some("test-model".to_owned()),
+        model_provider: Some("test-provider".to_owned()),
+    };
+    let request = MemoryActiveRecallDecisionRequest {
+        deterministic_context_count: 0,
+        deterministic_context_chars: 0,
+        deterministic_memory_ids: Vec::new(),
+        deterministic_sufficient: false,
+        deterministic_recall_empty: true,
+        has_workspace_context: true,
+        has_task_context: false,
+        input_length_bucket: ActiveRecallInputLengthBucket::Short.as_str().to_owned(),
+        config_mode: MemoryActiveRecallMode::Hybrid,
+        read_allowed: true,
+        active_memory_allowed: true,
+        explicit_no_memory: false,
+        input_text_char_count: 21,
+        available_modes: vec!["profile".to_owned(), "project".to_owned()],
+        available_scoped_contexts: vec!["workspace".to_owned(), "thread".to_owned()],
+        max_queries: 3,
+        top_k_per_query: 5,
+        max_prompt_chars: 1_500,
+        max_input_chars: 4_000,
+        max_output_chars: 2_000,
+        fallback_policy: MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
+    };
+
+    let json = request.sanitized_input_json(&context);
+    assert!(json.contains(r#""workspaceIdPresent": true"#));
+    assert!(json.contains(r#""inputTextPreview": "current bounded input""#));
+    assert!(!json.contains("workspace-secret-id"));
+    assert!(!json.contains("thread-secret-id"));
+    assert!(!json.contains("turn-secret-id"));
+
+    let prompt = request.render_prompt(&context);
+    assert!(prompt.contains("Return a single strict JSON object only."));
+    assert!(prompt.contains("current bounded input"));
+    assert!(!prompt.contains("tool schema"));
+    assert!(!prompt.contains("hidden system prompt content"));
 }
 
 #[test]

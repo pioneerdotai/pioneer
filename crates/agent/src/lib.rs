@@ -38,13 +38,15 @@ pub use pioneer_memory::hooks::{
     AgentActiveMemoryDecisionProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentMemoryWriteProvider, MemoryActiveContextPolicy,
     MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    MemoryActiveRecallMode, MemoryClassifierFallbackPolicy, MemoryExtractionPolicy,
-    MemoryLoopConfig, MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem,
-    MemoryManifestRequest, MemoryMutationToolPolicy, MemoryPolicyReasonCode, MemoryPolicySource,
-    MemoryPostTurnExtractorConfig, MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryPromptPolicy, MemoryReadToolPolicy, MemoryRecallItem, MemoryRecallPolicy,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
-    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
+    MemoryActiveRecallMode, MemoryActiveRecallPlannerConfig,
+    MemoryActiveRecallPlannerFallbackPolicy, MemoryClassifierFallbackPolicy,
+    MemoryExtractionPolicy, MemoryLoopConfig, MemoryManifest, MemoryManifestActiveItem,
+    MemoryManifestCandidateItem, MemoryManifestRequest, MemoryMutationToolPolicy,
+    MemoryPolicyReasonCode, MemoryPolicySource, MemoryPostTurnExtractorConfig,
+    MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest, MemoryPromptPolicy,
+    MemoryReadToolPolicy, MemoryRecallItem, MemoryRecallPolicy, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
+    MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
@@ -1399,6 +1401,8 @@ pub struct AgentManager {
     memory_post_turn_extractor_provider:
         RwLock<Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>>,
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
+    memory_active_recall_decision_provider:
+        RwLock<Option<Arc<dyn AgentActiveMemoryDecisionProvider>>>,
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
@@ -1434,6 +1438,7 @@ impl AgentManager {
             memory_write_provider: RwLock::new(None),
             memory_post_turn_extractor_provider: RwLock::new(None),
             memory_turn_policy_provider: RwLock::new(None),
+            memory_active_recall_decision_provider: RwLock::new(None),
             hook_runtime: RwLock::new(None),
             tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
@@ -1471,6 +1476,13 @@ impl AgentManager {
         provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     ) {
         *self.memory_turn_policy_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_active_recall_decision_provider(
+        &self,
+        provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    ) {
+        *self.memory_active_recall_decision_provider.write().await = provider;
     }
 
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {

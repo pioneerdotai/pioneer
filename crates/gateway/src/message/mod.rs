@@ -372,6 +372,9 @@ impl MessageProcessor {
         self.agent_manager
             .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
             .await;
+        self.agent_manager
+            .set_memory_active_recall_decision_provider(Some(memory_provider.clone()))
+            .await;
 
         let Some(runtime) = self.hook_runtime.read().await.clone() else {
             warn!("failed to install memory hook package: hook runtime is not initialized");
@@ -382,8 +385,9 @@ impl MessageProcessor {
             .install(pioneer_memory::hooks::package(
                 memory_provider.clone(),
                 Some(memory_provider.clone()),
-                Some(memory_provider),
+                Some(memory_provider.clone()),
                 Some(memory_policy_provider),
+                Some(memory_provider),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.tool_loop_config.memory.clone(),
             ))

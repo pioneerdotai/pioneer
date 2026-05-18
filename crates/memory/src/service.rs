@@ -26,11 +26,12 @@ use crate::quality_gate::{
 };
 use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
 use crate::recall::{
-    MemoryRecallItem, MemoryRecallParams, MemoryRecallResponse, compact_recall_content,
+    MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
+    MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget, compact_recall_content,
 };
 use crate::write::{
-    SemanticWritePrepared, merge_metadata, metadata_normalized_value, normalize_semantic_text,
-    prepare_semantic_write, semantic_metadata,
+    SemanticWritePrepared, build_memory_canonical_key, merge_metadata, metadata_normalized_value,
+    normalize_semantic_text, prepare_semantic_write, semantic_metadata,
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
@@ -49,15 +50,15 @@ use pioneer_protocol::{
     MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCandidatesMergeParams,
     MemoryCandidatesMergeResponse, MemoryCandidatesRejectParams, MemoryCandidatesRejectResponse,
     MemoryCandidatesSuppressSimilarParams, MemoryCandidatesSuppressSimilarResponse, MemoryCategory,
-    MemoryExplicitness, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
-    MemoryGetParams, MemoryGetResponse, MemoryIntent, MemoryListParams, MemoryListResponse,
-    MemoryProvenance, MemoryQualityDecision, MemoryRecord, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
-    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
-    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
-    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemoryWriteEvidence,
-    MemoryWriteRelation, generate_id,
+    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryGetParams, MemoryGetResponse, MemoryIntent,
+    MemoryListParams, MemoryListResponse, MemoryProvenance, MemoryQualityDecision, MemoryRecord,
+    MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint,
+    MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
+    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
+    MemorySemanticWriteResponse, MemorySemanticWriteRouteInfo, MemorySensitivity,
+    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
+    MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -974,6 +975,7 @@ impl MemoryService {
                 scopes,
                 workspace_guard: context.workspace_guard(),
                 namespace: None,
+                key: None,
                 categories: params.categories.clone(),
                 statuses: params.statuses.clone(),
                 include_expired,
@@ -1073,6 +1075,7 @@ impl MemoryService {
                     scopes: active_scopes.scopes.clone(),
                     workspace_guard: context.workspace_guard(),
                     namespace: None,
+                    key: None,
                     categories: params.categories.clone(),
                     statuses: params.statuses.clone(),
                     include_expired: params.statuses.contains(&MemoryStatus::Expired),
@@ -1176,6 +1179,199 @@ impl MemoryService {
         }
 
         Ok(MemoryRecallResponse { items })
+    }
+
+    pub async fn recall_mode_for_prompt(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryModeRecallParams,
+    ) -> Result<MemoryModeRecallResponse> {
+        let top_k = self.normalized_prompt_top_k(params.top_k);
+        let max_chars = params
+            .max_chars
+            .unwrap_or(self.config.recall.max_prompt_chars)
+            .min(self.config.recall.max_prompt_chars);
+        if params.mode == MemoryRecallMode::ExactCanonical {
+            return self
+                .recall_exact_canonical_for_prompt(context, params, top_k, max_chars)
+                .await;
+        }
+
+        let scopes = memory_recall_mode_scopes(&context, params.mode);
+        if scopes.is_empty() {
+            return Ok(MemoryModeRecallResponse {
+                skipped_reason: Some(format!("{}_scope_unavailable", params.mode.as_str())),
+                ..MemoryModeRecallResponse::default()
+            });
+        }
+        let categories = memory_recall_mode_categories(params.mode);
+        let rows = match self
+            .store
+            .list_agent_memory_records(AgentMemoryListFilter {
+                scopes,
+                workspace_guard: context.workspace_guard(),
+                namespace: None,
+                key: None,
+                categories,
+                statuses: Vec::new(),
+                include_expired: false,
+                include_deleted: false,
+                include_superseded: false,
+                limit: Some(u64::from(top_k)),
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_)
+                if matches!(
+                    params.mode,
+                    MemoryRecallMode::ThreadEpisodic | MemoryRecallMode::TaskContext
+                ) =>
+            {
+                return Ok(MemoryModeRecallResponse {
+                    diagnostics: vec![format!(
+                        "memory.active_recall.mode_scope_unavailable:{}",
+                        params.mode.as_str()
+                    )],
+                    skipped_reason: Some(format!("{}_scope_unavailable", params.mode.as_str())),
+                    ..MemoryModeRecallResponse::default()
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mode = params.mode;
+        self.recall_items_from_control_rows(context, rows, top_k, max_chars)
+            .await
+            .map(|mut response| {
+                response.diagnostics.push(format!(
+                    "memory.active_recall.mode_executed:{}",
+                    mode.as_str()
+                ));
+                response
+            })
+    }
+
+    async fn recall_exact_canonical_for_prompt(
+        &self,
+        context: MemoryOperationContext,
+        params: MemoryModeRecallParams,
+        top_k: u32,
+        max_chars: usize,
+    ) -> Result<MemoryModeRecallResponse> {
+        let targets = params
+            .targets
+            .iter()
+            .filter(|target| exact_target_has_lookup_key(&context, target))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(MemoryModeRecallResponse {
+                skipped_reason: Some("missing_canonical_target".to_owned()),
+                ..MemoryModeRecallResponse::default()
+            });
+        }
+
+        let mut rows = Vec::new();
+        let mut seen = BTreeSet::new();
+        for target in targets {
+            if rows.len() >= top_k as usize {
+                break;
+            }
+            let scopes = exact_target_scopes(&context, target);
+            if scopes.is_empty() {
+                continue;
+            }
+            let categories = target.category.into_iter().collect::<Vec<_>>();
+            for key in exact_target_lookup_keys(&context, target) {
+                let target_rows = self
+                    .store
+                    .list_agent_memory_records(AgentMemoryListFilter {
+                        scopes: scopes.clone(),
+                        workspace_guard: context.workspace_guard(),
+                        namespace: None,
+                        key: Some(key),
+                        categories: categories.clone(),
+                        statuses: Vec::new(),
+                        include_expired: false,
+                        include_deleted: false,
+                        include_superseded: false,
+                        limit: Some(u64::from(top_k)),
+                    })
+                    .await?;
+                for row in target_rows {
+                    if seen.insert(row.id.clone()) {
+                        rows.push(row);
+                    }
+                    if rows.len() >= top_k as usize {
+                        break;
+                    }
+                }
+                if rows.len() >= top_k as usize {
+                    break;
+                }
+            }
+        }
+
+        self.recall_items_from_control_rows(context, rows, top_k, max_chars)
+            .await
+            .map(|mut response| {
+                response
+                    .diagnostics
+                    .push("memory.active_recall.mode_executed:exact_canonical".to_owned());
+                response
+            })
+    }
+
+    async fn recall_items_from_control_rows(
+        &self,
+        context: MemoryOperationContext,
+        rows: Vec<AgentMemoryControlRecord>,
+        top_k: u32,
+        max_chars: usize,
+    ) -> Result<MemoryModeRecallResponse> {
+        let now = context.now_or(current_unix());
+        let mut remaining_chars = max_chars;
+        let item_max_chars = self.config.recall.max_item_chars.max(1);
+        let raw_count = rows.len();
+        let mut items = Vec::new();
+        let mut truncated = false;
+        for row in rows {
+            if items.len() >= top_k as usize || remaining_chars == 0 {
+                truncated = true;
+                break;
+            }
+            let Some(record) = self
+                .hydrate_visible_row(row, &context, &[], now, true)
+                .await?
+            else {
+                continue;
+            };
+            let content =
+                compact_recall_content(&record.content, item_max_chars.min(remaining_chars));
+            if content.is_empty() {
+                continue;
+            }
+            remaining_chars = remaining_chars.saturating_sub(content.chars().count());
+            items.push(MemoryRecallItem {
+                memory_id: record.id,
+                scope: record.scope,
+                category: record.category,
+                key: record.key,
+                content,
+                score: None,
+                updated_at: record.updated_at,
+            });
+        }
+        if raw_count > items.len() && items.len() >= top_k as usize {
+            truncated = true;
+        }
+
+        Ok(MemoryModeRecallResponse {
+            items,
+            diagnostics: Vec::new(),
+            truncated,
+            skipped_reason: None,
+        })
     }
 
     pub async fn forget(
@@ -2756,6 +2952,139 @@ fn category_matches(
     categories: &[pioneer_protocol::MemoryCategory],
 ) -> bool {
     categories.is_empty() || categories.contains(&category)
+}
+
+fn memory_recall_mode_scopes(
+    context: &MemoryOperationContext,
+    mode: MemoryRecallMode,
+) -> Vec<MemoryScope> {
+    let active_scopes = context.effective_scopes(&[]);
+    let allowed_kinds: &[MemoryScopeKind] = match mode {
+        MemoryRecallMode::Profile => &[MemoryScopeKind::User],
+        MemoryRecallMode::Project => &[MemoryScopeKind::Workspace],
+        MemoryRecallMode::Durable => &[
+            MemoryScopeKind::User,
+            MemoryScopeKind::Workspace,
+            MemoryScopeKind::Agent,
+        ],
+        MemoryRecallMode::ThreadEpisodic => &[MemoryScopeKind::Thread],
+        MemoryRecallMode::TaskContext => &[MemoryScopeKind::Task],
+        MemoryRecallMode::ExactCanonical => &[],
+    };
+    active_scopes
+        .into_iter()
+        .filter(|scope| allowed_kinds.contains(&scope.kind))
+        .collect()
+}
+
+fn exact_target_scopes(
+    context: &MemoryOperationContext,
+    target: &MemoryRecallTarget,
+) -> Vec<MemoryScope> {
+    let active_scopes = context.effective_scopes(&[]);
+    match target.scope_kind {
+        Some(scope_kind) => active_scopes
+            .into_iter()
+            .filter(|scope| scope.kind == scope_kind)
+            .collect(),
+        None => active_scopes,
+    }
+}
+
+fn exact_target_has_lookup_key(
+    context: &MemoryOperationContext,
+    target: &MemoryRecallTarget,
+) -> bool {
+    target
+        .canonical_key
+        .as_ref()
+        .is_some_and(|key| !key.trim().is_empty())
+        || !exact_target_lookup_keys(context, target).is_empty()
+}
+
+fn exact_target_lookup_keys(
+    context: &MemoryOperationContext,
+    target: &MemoryRecallTarget,
+) -> Vec<String> {
+    if let Some(key) = target
+        .canonical_key
+        .as_ref()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+    {
+        return vec![key.to_owned()];
+    }
+    let Some(category) = target.category else {
+        return Vec::new();
+    };
+    let Some(subject) = target.subject else {
+        return Vec::new();
+    };
+    let Some(attribute) = target.attribute else {
+        return Vec::new();
+    };
+
+    exact_target_scopes(context, target)
+        .into_iter()
+        .filter_map(|scope| {
+            let semantic = MemorySemanticFields {
+                intent: MemoryIntent::ImplicitCandidate,
+                explicitness: MemoryExplicitness::Unclear,
+                category,
+                subject,
+                attribute,
+                subject_key: None,
+                custom_subject: None,
+                custom_attribute: None,
+                scope_hint: canonical_scope_hint_for_scope(&scope),
+                durability: MemoryDurability::Unknown,
+                sensitivity: MemorySensitivityHint::Unknown,
+                certainty: MemoryExtractorCertainty::Medium,
+            };
+            build_memory_canonical_key(&scope, &semantic)
+                .ok()
+                .map(|canonical| canonical.key)
+        })
+        .collect()
+}
+
+fn canonical_scope_hint_for_scope(scope: &MemoryScope) -> MemoryScopeHint {
+    match scope.kind {
+        MemoryScopeKind::User => MemoryScopeHint::UserGlobal,
+        MemoryScopeKind::Workspace => MemoryScopeHint::ProjectWorkspace,
+        MemoryScopeKind::Agent => {
+            if scope.key.starts_with("global:agent:") {
+                MemoryScopeHint::AgentGlobal
+            } else {
+                MemoryScopeHint::AgentWorkspace
+            }
+        }
+        MemoryScopeKind::Thread | MemoryScopeKind::Task => MemoryScopeHint::Unknown,
+    }
+}
+
+fn memory_recall_mode_categories(mode: MemoryRecallMode) -> Vec<MemoryCategory> {
+    match mode {
+        MemoryRecallMode::Profile => vec![
+            MemoryCategory::Identity,
+            MemoryCategory::Preference,
+            MemoryCategory::Biography,
+            MemoryCategory::Relationship,
+            MemoryCategory::CommunicationStyle,
+            MemoryCategory::RecurringInstruction,
+        ],
+        MemoryRecallMode::Project => vec![
+            MemoryCategory::ProjectDecision,
+            MemoryCategory::ProjectPolicy,
+            MemoryCategory::ProjectFact,
+            MemoryCategory::Procedure,
+            MemoryCategory::Constraint,
+        ],
+        MemoryRecallMode::Durable
+        | MemoryRecallMode::ThreadEpisodic
+        | MemoryRecallMode::TaskContext
+        | MemoryRecallMode::ExactCanonical => Vec::new(),
+    }
 }
 
 fn recency_anchor_unix(row: &AgentMemoryControlRecord) -> i64 {

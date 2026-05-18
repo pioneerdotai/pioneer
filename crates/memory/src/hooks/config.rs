@@ -2,9 +2,13 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryActiveRecallMode {
+    /// Do not run active recall.
     Disabled,
+    /// Use deterministic pre-turn recall only. Never call the internal planner provider.
     DeterministicOnly,
+    /// Use deterministic planning first and call the internal planner provider only when needed.
     Hybrid,
+    /// Explicit diagnostic mode for broad fallback/debug behavior.
     StrictDebug,
 }
 
@@ -25,6 +29,66 @@ impl MemoryActiveRecallMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryActiveRecallPlannerFallbackPolicy {
+    Deterministic,
+    SkipActiveRecall,
+}
+
+impl Default for MemoryActiveRecallPlannerFallbackPolicy {
+    fn default() -> Self {
+        Self::Deterministic
+    }
+}
+
+impl MemoryActiveRecallPlannerFallbackPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::SkipActiveRecall => "skip_active_recall",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryActiveRecallPlannerConfig {
+    pub enabled: bool,
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
+    pub timeout_ms: u64,
+    pub max_input_chars: usize,
+    pub max_output_chars: usize,
+    pub fallback: MemoryActiveRecallPlannerFallbackPolicy,
+}
+
+impl Default for MemoryActiveRecallPlannerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider_name: None,
+            model: None,
+            timeout_ms: 8_000,
+            max_input_chars: 4_000,
+            max_output_chars: 2_000,
+            fallback: MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
+        }
+    }
+}
+
+impl MemoryActiveRecallPlannerConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            provider_name: normalized_optional_config_text(self.provider_name.as_deref(), 80),
+            model: normalized_optional_config_text(self.model.as_deref(), 160),
+            timeout_ms: self.timeout_ms.max(1),
+            max_input_chars: self.max_input_chars.max(1),
+            max_output_chars: self.max_output_chars.max(1),
+            fallback: self.fallback,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryActiveRecallConfig {
     pub mode: MemoryActiveRecallMode,
@@ -34,18 +98,20 @@ pub struct MemoryActiveRecallConfig {
     pub max_prompt_chars: usize,
     pub deterministic_sufficient_min_items: usize,
     pub deterministic_sufficient_min_chars: usize,
+    pub planner: MemoryActiveRecallPlannerConfig,
 }
 
 impl Default for MemoryActiveRecallConfig {
     fn default() -> Self {
         Self {
             mode: MemoryActiveRecallMode::Hybrid,
-            timeout_ms: 800,
+            timeout_ms: 10_000,
             max_queries: 3,
             top_k_per_query: 5,
             max_prompt_chars: 1_500,
             deterministic_sufficient_min_items: 1,
             deterministic_sufficient_min_chars: 600,
+            planner: MemoryActiveRecallPlannerConfig::default(),
         }
     }
 }
@@ -60,6 +126,7 @@ impl MemoryActiveRecallConfig {
             max_prompt_chars: self.max_prompt_chars.max(1),
             deterministic_sufficient_min_items: self.deterministic_sufficient_min_items.max(1),
             deterministic_sufficient_min_chars: self.deterministic_sufficient_min_chars.max(1),
+            planner: self.planner.normalized(),
         }
     }
 }
@@ -133,4 +200,12 @@ impl MemoryLoopConfig {
             post_turn_extractor: self.post_turn_extractor.normalized(),
         }
     }
+}
+
+fn normalized_optional_config_text(value: Option<&str>, max_chars: usize) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(max_chars).collect())
 }

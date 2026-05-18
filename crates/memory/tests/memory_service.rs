@@ -6,8 +6,9 @@ use pioneer_crud::{
 use pioneer_memory::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
     BackendPutRequest, BackendPutResult, BackendSearchHit, BackendSearchRequest,
-    InMemoryMemoryBackend, MemoryBackend, MemoryOperationContext, MemoryReadPolicy,
-    MemoryRecallParams, MemoryService, MemoryServiceConfig,
+    InMemoryMemoryBackend, MemoryBackend, MemoryModeRecallParams, MemoryOperationContext,
+    MemoryReadPolicy, MemoryRecallMode, MemoryRecallParams, MemoryRecallTarget, MemoryService,
+    MemoryServiceConfig,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
@@ -72,6 +73,23 @@ async fn setup_service_with_config(
     let backend = Arc::new(InMemoryMemoryBackend::default());
     let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
     let service = MemoryService::new(store.clone(), backend_for_service, config);
+    (store, backend, service)
+}
+
+async fn setup_service_with_recording_backend()
+-> (Arc<CrudStore>, Arc<RecordingMemoryBackend>, MemoryService) {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect sqlite");
+    Migrator::up(&connection, None).await.expect("migrate");
+    let store = Arc::new(CrudStore::new(connection));
+    let backend = Arc::new(RecordingMemoryBackend::default());
+    let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
+    let service = MemoryService::new(
+        store.clone(),
+        backend_for_service,
+        MemoryServiceConfig::default(),
+    );
     (store, backend, service)
 }
 
@@ -3157,6 +3175,230 @@ async fn recall_for_prompt_generic_active_query_can_find_profile_identity_memory
             .iter()
             .any(|item| item.content.contains("Александр")),
         "generic active recall query should be able to surface stable identity memory"
+    );
+}
+
+#[tokio::test]
+async fn recall_mode_for_prompt_profile_project_and_durable_are_scoped() {
+    let (_store, _backend, service) = setup_service().await;
+    service
+        .remember(
+            user_context(730),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("user/global:identity:self:name"),
+                "Имя пользователя — Александр.",
+            ),
+        )
+        .await
+        .expect("remember profile");
+
+    let mut project_params = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_mode_a"),
+        Some("workspace/ws_mode_a:project_decision:self:phase_naming"),
+        "Project decision: phases keep the `phase` name.",
+    );
+    project_params.category = MemoryCategory::ProjectDecision;
+    service
+        .remember(workspace_context("ws_mode_a", 731), project_params)
+        .await
+        .expect("remember project");
+
+    let mut other_workspace_params = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_mode_b"),
+        Some("workspace/ws_mode_b:project_decision:self:phase_naming"),
+        "Other workspace decision must stay isolated.",
+    );
+    other_workspace_params.category = MemoryCategory::ProjectDecision;
+    service
+        .remember(workspace_context("ws_mode_b", 732), other_workspace_params)
+        .await
+        .expect("remember other workspace");
+
+    let context = MemoryOperationContext {
+        allow_global_user: true,
+        ..workspace_context("ws_mode_a", 733)
+    };
+
+    let profile = service
+        .recall_mode_for_prompt(
+            context.clone(),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::Profile,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("profile recall");
+    assert_eq!(profile.items.len(), 1);
+    assert!(profile.items[0].content.contains("Александр"));
+
+    let project = service
+        .recall_mode_for_prompt(
+            context.clone(),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::Project,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("project recall");
+    assert_eq!(project.items.len(), 1);
+    assert!(project.items[0].content.contains("phase"));
+    assert!(!project.items[0].content.contains("Other workspace"));
+
+    let durable = service
+        .recall_mode_for_prompt(
+            context,
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::Durable,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("durable recall");
+    assert_eq!(durable.items.len(), 2);
+    assert!(
+        durable
+            .items
+            .iter()
+            .any(|item| item.content.contains("Александр"))
+    );
+    assert!(
+        durable
+            .items
+            .iter()
+            .any(|item| item.content.contains("phase"))
+    );
+}
+
+#[tokio::test]
+async fn recall_mode_for_prompt_exact_canonical_uses_key_lookup_without_search() {
+    let (_store, backend, service) = setup_service_with_recording_backend().await;
+    service
+        .remember(
+            user_context(740),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("user/global:identity:self:name"),
+                "Имя пользователя — Александр.",
+            ),
+        )
+        .await
+        .expect("remember identity");
+
+    let by_key = service
+        .recall_mode_for_prompt(
+            user_context(741),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::ExactCanonical,
+                targets: vec![MemoryRecallTarget {
+                    scope_kind: Some(MemoryScopeKind::User),
+                    category: Some(MemoryCategory::Identity),
+                    canonical_key: Some("user/global:identity:self:name".to_owned()),
+                    ..MemoryRecallTarget::default()
+                }],
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("exact by key recall");
+    assert_eq!(by_key.items.len(), 1);
+    assert!(by_key.items[0].content.contains("Александр"));
+
+    let by_typed_target = service
+        .recall_mode_for_prompt(
+            user_context(742),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::ExactCanonical,
+                targets: vec![MemoryRecallTarget {
+                    scope_kind: Some(MemoryScopeKind::User),
+                    category: Some(MemoryCategory::Identity),
+                    subject: Some(MemorySubject::CurrentUser),
+                    attribute: Some(MemoryAttribute::Name),
+                    ..MemoryRecallTarget::default()
+                }],
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("exact by typed target recall");
+    assert_eq!(by_typed_target.items.len(), 1);
+    assert!(by_typed_target.items[0].content.contains("Александр"));
+    assert!(
+        backend.search_limits().await.is_empty(),
+        "exact canonical recall must not call broad backend search"
+    );
+}
+
+#[tokio::test]
+async fn recall_mode_for_prompt_thread_and_task_context_are_scope_bound() {
+    let (_store, _backend, service) = setup_service().await;
+    let thread = service
+        .recall_mode_for_prompt(
+            MemoryOperationContext {
+                thread_id: Some("thr_mode_a".to_owned()),
+                now_unix: Some(752),
+                ..MemoryOperationContext::default()
+            },
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::ThreadEpisodic,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("thread recall");
+    assert_eq!(
+        thread.skipped_reason.as_deref(),
+        Some("thread_episodic_scope_unavailable")
+    );
+
+    let task = service
+        .recall_mode_for_prompt(
+            MemoryOperationContext {
+                task_id: Some("task_mode_a".to_owned()),
+                now_unix: Some(753),
+                ..MemoryOperationContext::default()
+            },
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::TaskContext,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("task recall");
+    assert_eq!(
+        task.skipped_reason.as_deref(),
+        Some("task_context_scope_unavailable")
+    );
+
+    let missing_task = service
+        .recall_mode_for_prompt(
+            user_context(754),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::TaskContext,
+                targets: Vec::new(),
+                top_k: Some(5),
+                max_chars: Some(1_500),
+            },
+        )
+        .await
+        .expect("missing task recall");
+    assert_eq!(
+        missing_task.skipped_reason.as_deref(),
+        Some("task_context_scope_unavailable")
     );
 }
 

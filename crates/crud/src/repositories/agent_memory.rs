@@ -305,6 +305,11 @@ pub async fn list_memory_records<C: ConnectionTrait>(
         query = query.filter(agent_memory::Column::Namespace.eq(namespace));
     }
 
+    if let Some(key) = filter.key {
+        let key = normalized_memory_key(key.as_str())?;
+        query = query.filter(agent_memory::Column::ActiveKey.eq(key));
+    }
+
     if !filter.categories.is_empty() {
         query = query.filter(
             agent_memory::Column::Category.is_in(
