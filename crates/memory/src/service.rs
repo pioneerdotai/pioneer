@@ -471,7 +471,8 @@ impl MemoryService {
                         metadata_json,
                         MemoryWriteRelation::Contradiction,
                         None,
-                        quality_decision.candidate_auto_approve_allowed,
+                        &quality_input,
+                        &quality_decision,
                         now,
                     )
                     .await?;
@@ -764,7 +765,8 @@ impl MemoryService {
                 metadata_json,
                 MemoryWriteRelation::Novel,
                 None,
-                quality_decision.candidate_auto_approve_allowed,
+                &quality_input,
+                &quality_decision,
                 now,
             )
             .await?;
@@ -1635,7 +1637,8 @@ impl MemoryService {
         metadata_json: String,
         relation: MemoryWriteRelation,
         supersedes: Option<String>,
-        candidate_auto_approve_allowed: bool,
+        quality_input: &MemoryQualityGateInput,
+        quality_decision: &MemoryQualityDecision,
         now: i64,
     ) -> Result<MemorySemanticWriteResponse> {
         let sensitivity = sensitivity_from_hint(params.semantic.sensitivity);
@@ -1652,21 +1655,22 @@ impl MemoryService {
             sensitivity,
             active_no_memory_policy: false,
             source_kind: provenance.source_kind,
+            quality_action: quality_decision.action,
+            quality_target_ownership: quality_decision.target_ownership,
+            quality_reason_codes: quality_decision.reason_codes.clone(),
+            quality_candidate_auto_approve_allowed: quality_decision.candidate_auto_approve_allowed,
+            source_context_kind: quality_input.source_context_kind,
+            fact_class: quality_input.fact_class,
+            lifetime_class: quality_input.lifetime_class,
+            ownership_class: quality_input.ownership_class,
+            evidence_class: quality_input.evidence_class,
             hook_run_id: params
                 .metadata
                 .get("hook_run_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
         };
-        let mut policy_output = self.candidate_policy.decide(policy_input);
-        if !candidate_auto_approve_allowed
-            && policy_output.decision == MemoryCandidatePolicyDecision::AutoApprove
-        {
-            policy_output = quality_gate_disable_candidate_auto_approve(
-                policy_output,
-                self.config.candidate_policy.review_enabled,
-            );
-        }
+        let policy_output = self.candidate_policy.decide(policy_input);
         let reason_code = policy_output.reason_code.clone();
         let policy_metadata_json =
             metadata_json_with_candidate_policy(metadata_json, &policy_output)?;
@@ -2408,29 +2412,6 @@ fn candidate_policy_decision_label(decision: MemoryCandidatePolicyDecision) -> &
         MemoryCandidatePolicyDecision::AutoReject => "auto_reject",
         MemoryCandidatePolicyDecision::RejectReviewDisabled => "reject_review_disabled",
     }
-}
-
-fn quality_gate_disable_candidate_auto_approve(
-    mut output: MemoryCandidatePolicyOutput,
-    review_enabled: bool,
-) -> MemoryCandidatePolicyOutput {
-    if review_enabled {
-        output.decision = MemoryCandidatePolicyDecision::NeedsReview;
-        output.status = MemoryCandidateStatus::NeedsReview;
-        output.reason_code = "quality_gate_auto_approve_disabled".to_owned();
-        output.reason = Some(
-            "quality gate allowed candidate policy but disabled automatic approval".to_owned(),
-        );
-    } else {
-        output.decision = MemoryCandidatePolicyDecision::RejectReviewDisabled;
-        output.status = MemoryCandidateStatus::ReviewDisabledRejected;
-        output.reason_code = "quality_gate_auto_approve_disabled".to_owned();
-        output.reason = Some(
-            "quality gate allowed candidate policy but suppressed automatic approval while review is disabled"
-                .to_owned(),
-        );
-    }
-    output
 }
 
 fn candidate_status_label(status: MemoryCandidateStatus) -> &'static str {

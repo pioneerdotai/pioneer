@@ -992,6 +992,52 @@ async fn semantic_route_explicit_durable_fact_auto_approves() {
             .and_then(serde_json::Value::as_str),
         Some("high")
     );
+    let score = record
+        .metadata
+        .get("candidate_score")
+        .expect("candidate score metadata");
+    assert_eq!(
+        score
+            .get("score_version")
+            .and_then(serde_json::Value::as_str),
+        Some("quality_v1")
+    );
+    assert!(
+        score
+            .get("source_trust_score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+            > 0.0
+    );
+    assert!(
+        score
+            .get("ownership_fit_score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+            > 0.0
+    );
+    let policy = record
+        .metadata
+        .get("candidate_policy")
+        .expect("candidate policy metadata");
+    assert_eq!(
+        policy
+            .pointer("/input/quality_action")
+            .and_then(serde_json::Value::as_str),
+        Some("candidate_policy")
+    );
+    assert_eq!(
+        policy
+            .pointer("/input/fact_class")
+            .and_then(serde_json::Value::as_str),
+        Some("user_identity")
+    );
+    assert_eq!(
+        policy
+            .pointer("/input/evidence_class")
+            .and_then(serde_json::Value::as_str),
+        Some("direct_user_assertion")
+    );
     assert_eq!(
         record
             .metadata
@@ -1004,9 +1050,31 @@ async fn semantic_route_explicit_durable_fact_auto_approves() {
         .list_agent_memory_policy_decisions_for_memory(record.id.as_str(), 20)
         .await
         .expect("policy decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.action == "candidate_policy" && decision.decision == "auto_approve"
-    }));
+    let decision = decisions
+        .iter()
+        .find(|decision| {
+            decision.action == "candidate_policy" && decision.decision == "auto_approve"
+        })
+        .expect("candidate policy decision");
+    let details: serde_json::Value = serde_json::from_str(
+        decision
+            .details_json
+            .as_deref()
+            .expect("policy decision details"),
+    )
+    .expect("policy decision details json");
+    assert_eq!(
+        details
+            .pointer("/score/score_version")
+            .and_then(serde_json::Value::as_str),
+        Some("quality_v1")
+    );
+    assert_eq!(
+        details
+            .pointer("/input/quality_reason_codes/0")
+            .and_then(serde_json::Value::as_str),
+        Some("candidate_policy_allowed")
+    );
 }
 
 #[tokio::test]
@@ -1253,6 +1321,23 @@ async fn semantic_route_middle_fact_rejects_by_default_and_routes_when_review_en
             .and_then(serde_json::Value::as_str),
         Some("review_disabled_middle_confidence")
     );
+    assert_eq!(
+        default_candidate
+            .metadata
+            .get("candidate_score")
+            .and_then(|score| score.get("score_version"))
+            .and_then(serde_json::Value::as_str),
+        Some("quality_v1")
+    );
+    assert!(
+        default_candidate
+            .metadata
+            .get("candidate_score")
+            .and_then(|score| score.get("penalty_score"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+            > 0.0
+    );
 
     let listed = service
         .list_candidates(
@@ -1284,9 +1369,25 @@ async fn semantic_route_middle_fact_rejects_by_default_and_routes_when_review_en
         )
         .await
         .expect("review policy write");
+    let review_candidate = review_response.candidate.expect("review candidate");
     assert_eq!(
-        review_response.candidate.expect("review candidate").status,
+        review_candidate.status,
         MemoryCandidateStatus::PendingSilent
+    );
+    assert_eq!(
+        review_candidate
+            .metadata
+            .get("candidate_score")
+            .and_then(|score| score.get("score_version"))
+            .and_then(serde_json::Value::as_str),
+        Some("quality_v1")
+    );
+    assert_eq!(
+        review_candidate
+            .metadata
+            .get("candidate_policy_decision")
+            .and_then(serde_json::Value::as_str),
+        Some("pending_silent")
     );
 }
 
@@ -1323,12 +1424,25 @@ async fn semantic_route_contradiction_routes_to_dormant_review_only_when_enabled
         .await
         .expect("contradiction");
     assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
+    let contradiction_candidate = contradiction.candidate.expect("ask-on-use candidate");
     assert_eq!(
-        contradiction
-            .candidate
-            .expect("ask-on-use candidate")
-            .status,
+        contradiction_candidate.status,
         MemoryCandidateStatus::AskOnUse
+    );
+    assert_eq!(
+        contradiction_candidate
+            .metadata
+            .get("candidate_policy_reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some("review_enabled_contradiction")
+    );
+    assert_eq!(
+        contradiction_candidate
+            .metadata
+            .get("candidate_score")
+            .and_then(|score| score.get("score_version"))
+            .and_then(serde_json::Value::as_str),
+        Some("quality_v1")
     );
     assert!(contradiction.record.is_none());
 }

@@ -677,15 +677,27 @@ pub enum MemoryCandidateScoreBucket {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct MemoryCandidateScore {
+    #[serde(default = "default_memory_candidate_score_version")]
+    pub score_version: String,
     pub total_score: f32,
     pub bucket: MemoryCandidateScoreBucket,
     pub explicitness_score: f32,
     pub durability_score: f32,
+    #[serde(default)]
+    pub source_trust_score: f32,
+    #[serde(default)]
+    pub fact_class_score: f32,
+    #[serde(default)]
+    pub lifetime_fit_score: f32,
     pub scope_score: f32,
+    #[serde(default)]
+    pub ownership_fit_score: f32,
     pub evidence_score: f32,
     pub certainty_score: f32,
     pub sensitivity_score: f32,
     pub relation_score: f32,
+    #[serde(default)]
+    pub penalty_score: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
 }
@@ -711,8 +723,58 @@ pub struct MemoryCandidatePolicyInput {
     pub sensitivity: MemorySensitivity,
     pub active_no_memory_policy: bool,
     pub source_kind: MemorySourceKind,
+    #[serde(default = "default_memory_quality_action")]
+    pub quality_action: MemoryQualityAction,
+    #[serde(default = "default_memory_quality_target_ownership")]
+    pub quality_target_ownership: MemoryOwnershipClass,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_reason_codes: Vec<MemoryQualityReasonCode>,
+    #[serde(default)]
+    pub quality_candidate_auto_approve_allowed: bool,
+    #[serde(default = "default_memory_source_context_kind")]
+    pub source_context_kind: MemorySourceContextKind,
+    #[serde(default = "default_memory_fact_class")]
+    pub fact_class: MemoryFactClass,
+    #[serde(default = "default_memory_lifetime_class")]
+    pub lifetime_class: MemoryLifetimeClass,
+    #[serde(default = "default_memory_ownership_class")]
+    pub ownership_class: MemoryOwnershipClass,
+    #[serde(default = "default_memory_evidence_class")]
+    pub evidence_class: MemoryEvidenceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_run_id: Option<String>,
+}
+
+fn default_memory_candidate_score_version() -> String {
+    "semantic_v1".to_owned()
+}
+
+fn default_memory_quality_action() -> MemoryQualityAction {
+    MemoryQualityAction::CandidatePolicy
+}
+
+fn default_memory_quality_target_ownership() -> MemoryOwnershipClass {
+    MemoryOwnershipClass::AuditOnly
+}
+
+fn default_memory_source_context_kind() -> MemorySourceContextKind {
+    MemorySourceContextKind::Unknown
+}
+
+fn default_memory_fact_class() -> MemoryFactClass {
+    MemoryFactClass::Unknown
+}
+
+fn default_memory_lifetime_class() -> MemoryLifetimeClass {
+    MemoryLifetimeClass::Unknown
+}
+
+fn default_memory_ownership_class() -> MemoryOwnershipClass {
+    MemoryOwnershipClass::AuditOnly
+}
+
+fn default_memory_evidence_class() -> MemoryEvidenceClass {
+    MemoryEvidenceClass::MissingOrWeak
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -1052,19 +1114,34 @@ mod tests {
         );
 
         let score = MemoryCandidateScore {
+            score_version: "quality_v1".to_owned(),
             total_score: 0.92,
             bucket: MemoryCandidateScoreBucket::High,
             explicitness_score: 0.25,
             durability_score: 0.2,
+            source_trust_score: 0.18,
+            fact_class_score: 0.14,
+            lifetime_fit_score: 0.12,
             scope_score: 0.15,
+            ownership_fit_score: 0.16,
             evidence_score: 0.1,
             certainty_score: 0.15,
             sensitivity_score: 0.1,
             relation_score: 0.05,
+            penalty_score: 0.0,
             reasons: vec!["explicit".to_owned()],
         };
         let encoded = serde_json::to_value(score).expect("score encode");
         assert_eq!(encoded["bucket"], json!("high"));
+        assert_eq!(encoded["score_version"], json!("quality_v1"));
+        assert!(
+            (encoded["source_trust_score"]
+                .as_f64()
+                .expect("source trust score")
+                - 0.18)
+                .abs()
+                < 0.0001
+        );
         assert_eq!(encoded["reasons"], json!(["explicit"]));
     }
 
