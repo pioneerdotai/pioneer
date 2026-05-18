@@ -12,6 +12,7 @@ mod quality;
 mod quality_gate;
 mod ranking;
 mod recall;
+mod recall_visibility;
 mod service;
 mod write;
 

@@ -1,7 +1,7 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
-    AgentMemoryListFilter, CrudStore, NewAgentMemoryRepairJob, global_agent_memory_scope_key,
-    workspace_agent_memory_scope_key,
+    AgentMemoryListFilter, CrudStore, NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
+    global_agent_memory_scope_key, workspace_agent_memory_scope_key,
 };
 use pioneer_memory::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
@@ -13,13 +13,13 @@ use pioneer_memory::{
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
     MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
-    MemoryDurability, MemoryExplicitness, MemoryExtractorCertainty, MemoryFactClass,
-    MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryIntent, MemoryLifetimeClass,
-    MemoryListParams, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode,
-    MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams,
-    MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
-    MemorySemanticWriteRoute, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryDurability, MemoryEvidenceClass, MemoryExplicitness, MemoryExtractorCertainty,
+    MemoryFactClass, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryIntent,
+    MemoryLifetimeClass, MemoryListParams, MemoryOwnershipClass, MemoryQualityAction,
+    MemoryQualityReasonCode, MemoryRememberParams, MemoryScope, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchParams, MemorySemanticFields, MemorySemanticWriteDisposition,
+    MemorySemanticWriteParams, MemorySemanticWriteRoute, MemorySensitivity, MemorySensitivityHint,
+    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -400,6 +400,47 @@ fn metadata_evidence_count(metadata: &BTreeMap<String, serde_json::Value>) -> u6
         .and_then(|value| value.get("count"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+}
+
+async fn attach_quality_decision(
+    store: &CrudStore,
+    memory_id: &str,
+    action: MemoryQualityAction,
+    target_ownership: MemoryOwnershipClass,
+    source_context_kind: MemorySourceContextKind,
+    fact_class: MemoryFactClass,
+    lifetime_class: MemoryLifetimeClass,
+    ownership_class: MemoryOwnershipClass,
+    evidence_class: MemoryEvidenceClass,
+    relation: MemoryWriteRelation,
+    reason_codes: Vec<MemoryQualityReasonCode>,
+    now: i64,
+) {
+    store
+        .insert_agent_memory_quality_decision(NewAgentMemoryQualityDecision {
+            workspace_id: None,
+            thread_id: Some("thread_quality_fixture".to_owned()),
+            turn_id: Some(format!("turn_quality_fixture_{now}")),
+            item_id: None,
+            task_id: None,
+            memory_id: Some(memory_id.to_owned()),
+            candidate_id: None,
+            canonical_key: None,
+            action,
+            target_ownership,
+            source_context_kind,
+            fact_class,
+            lifetime_class,
+            ownership_class,
+            evidence_class,
+            relation,
+            reason_codes,
+            input_snapshot_json: None,
+            created_at_unix: now,
+            updated_at_unix: now,
+        })
+        .await
+        .expect("insert quality decision fixture");
 }
 
 #[tokio::test]
@@ -2617,6 +2658,303 @@ async fn forget_tombstone_suppresses_stale_backend_search_hit() {
         .await
         .expect("service get");
     assert!(service_get.record.is_none());
+}
+
+#[tokio::test]
+async fn recall_visibility_suppresses_polluted_search_and_prompt_records() {
+    let (store, _backend, service) = setup_service().await;
+    let clean = service
+        .remember(
+            user_context(430),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("phase13.clean"),
+                "phase13 clean durable user profile memory",
+            ),
+        )
+        .await
+        .expect("clean remember");
+    let deleted = service
+        .remember(
+            user_context(431),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("phase13.deleted"),
+                "phase13 deleted polluted memory",
+            ),
+        )
+        .await
+        .expect("deleted remember");
+    store
+        .mark_agent_memory_deleted(
+            deleted.record.id.as_str(),
+            None,
+            Some("fixture".to_owned()),
+            432,
+        )
+        .await
+        .expect("mark deleted");
+    let superseded = service
+        .remember(
+            user_context(433),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("phase13.superseded"),
+                "phase13 superseded polluted memory",
+            ),
+        )
+        .await
+        .expect("superseded remember");
+    store
+        .mark_agent_memory_superseded(superseded.record.id.as_str(), clean.record.id.as_str(), 434)
+        .await
+        .expect("mark superseded");
+    let expired = service
+        .remember(
+            user_context(435),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("phase13.expired"),
+                "phase13 expired polluted memory",
+            ),
+        )
+        .await
+        .expect("expired remember");
+    store
+        .mark_agent_memory_expired(expired.record.id.as_str(), 436)
+        .await
+        .expect("mark expired");
+    let mut secret_params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("phase13.secret"),
+        "phase13 secret polluted memory",
+    );
+    secret_params.sensitivity = Some(MemorySensitivity::SecretLike);
+    service
+        .remember(user_context(437), secret_params)
+        .await
+        .expect("secret remember");
+
+    for (
+        index,
+        (
+            key,
+            action,
+            target_ownership,
+            source_context_kind,
+            evidence_class,
+            relation,
+            reason_codes,
+        ),
+    ) in [
+        (
+            "phase13.low_source",
+            MemoryQualityAction::ForceReject,
+            MemoryOwnershipClass::Reject,
+            MemorySourceContextKind::Unknown,
+            MemoryEvidenceClass::MissingOrWeak,
+            MemoryWriteRelation::Novel,
+            vec![MemoryQualityReasonCode::WeakOrMissingEvidence],
+        ),
+        (
+            "phase13.rejected_related",
+            MemoryQualityAction::ForceReject,
+            MemoryOwnershipClass::AuditOnly,
+            MemorySourceContextKind::DirectUserConversation,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryWriteRelation::SuppressedByRejection,
+            vec![MemoryQualityReasonCode::DuplicateExistingMemory],
+        ),
+        (
+            "phase13.quarantine",
+            MemoryQualityAction::Quarantine,
+            MemoryOwnershipClass::AuditOnly,
+            MemorySourceContextKind::DirectUserConversation,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryWriteRelation::Novel,
+            vec![MemoryQualityReasonCode::NoQualityAllowRule],
+        ),
+        (
+            "phase13.ownership_mismatch",
+            MemoryQualityAction::ForceReject,
+            MemoryOwnershipClass::AuditOnly,
+            MemorySourceContextKind::DirectUserConversation,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryWriteRelation::Novel,
+            vec![MemoryQualityReasonCode::OwnershipMismatch],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let remembered = service
+            .remember(
+                user_context(440 + index as i64),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some(key),
+                    format!("{key} polluted memory phase13").as_str(),
+                ),
+            )
+            .await
+            .expect("polluted remember");
+        attach_quality_decision(
+            &store,
+            remembered.record.id.as_str(),
+            action,
+            target_ownership,
+            source_context_kind,
+            MemoryFactClass::UserIdentity,
+            MemoryLifetimeClass::LongLived,
+            MemoryOwnershipClass::DurableWorkspaceMemory,
+            evidence_class,
+            relation,
+            reason_codes,
+            450 + index as i64,
+        )
+        .await;
+    }
+
+    let search = service
+        .search(
+            user_context(460),
+            MemorySearchParams {
+                query: "phase13".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    let search_ids = search
+        .hits
+        .iter()
+        .map(|hit| hit.record.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(search_ids, vec![clean.record.id.as_str()]);
+
+    let prompt_recall = service
+        .recall_for_prompt(
+            user_context(461),
+            MemoryRecallParams {
+                query: "phase13".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prompt recall");
+    assert_eq!(prompt_recall.items.len(), 1);
+    assert_eq!(prompt_recall.items[0].memory_id, clean.record.id);
+    assert!(prompt_recall.diagnostics.iter().any(|diagnostic| {
+        diagnostic.starts_with("memory.recall_visibility.suppressed_count:")
+    }));
+    assert!(prompt_recall.diagnostics.iter().all(|diagnostic| {
+        !diagnostic.contains("polluted memory") && !diagnostic.contains("clean durable")
+    }));
+}
+
+#[tokio::test]
+async fn recall_visibility_suppresses_mode_and_exact_canonical_records() {
+    let (store, _backend, service) = setup_service().await;
+    let mut clean_project_params = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_phase13"),
+        Some("phase13.project.clean"),
+        "phase13 clean project decision",
+    );
+    clean_project_params.category = MemoryCategory::ProjectDecision;
+    let clean_project = service
+        .remember(workspace_context("ws_phase13", 470), clean_project_params)
+        .await
+        .expect("clean project remember");
+    let mut bad_project_params = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_phase13"),
+        Some("phase13.project.bad"),
+        "phase13 bad project decision",
+    );
+    bad_project_params.category = MemoryCategory::ProjectDecision;
+    let bad_project = service
+        .remember(workspace_context("ws_phase13", 471), bad_project_params)
+        .await
+        .expect("bad project remember");
+    attach_quality_decision(
+        &store,
+        bad_project.record.id.as_str(),
+        MemoryQualityAction::Quarantine,
+        MemoryOwnershipClass::AuditOnly,
+        MemorySourceContextKind::DirectUserConversation,
+        MemoryFactClass::ProjectDecision,
+        MemoryLifetimeClass::ProjectLifetime,
+        MemoryOwnershipClass::DurableWorkspaceMemory,
+        MemoryEvidenceClass::DirectUserAssertion,
+        MemoryWriteRelation::Novel,
+        vec![MemoryQualityReasonCode::NoQualityAllowRule],
+        472,
+    )
+    .await;
+
+    let project_recall = service
+        .recall_mode_for_prompt(
+            workspace_context("ws_phase13", 473),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::Project,
+                targets: Vec::new(),
+                top_k: Some(10),
+                max_chars: None,
+            },
+        )
+        .await
+        .expect("project mode recall");
+    assert_eq!(project_recall.items.len(), 1);
+    assert_eq!(project_recall.items[0].memory_id, clean_project.record.id);
+    assert!(project_recall.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .contains("memory.recall_visibility.suppressed:suppress_quarantined_or_audit_only")
+    }));
+
+    let exact_bad = service
+        .recall_mode_for_prompt(
+            workspace_context("ws_phase13", 474),
+            MemoryModeRecallParams {
+                mode: MemoryRecallMode::ExactCanonical,
+                targets: vec![MemoryRecallTarget {
+                    scope_kind: Some(MemoryScopeKind::Workspace),
+                    canonical_key: Some("phase13.project.bad".to_owned()),
+                    ..Default::default()
+                }],
+                top_k: Some(10),
+                max_chars: None,
+            },
+        )
+        .await
+        .expect("exact bad recall");
+    assert!(exact_bad.items.is_empty());
+}
+
+#[tokio::test]
+async fn recall_visibility_suppresses_workspace_mismatch_backend_hits() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = remember_params(
+        scope(MemoryScopeKind::Workspace, "ws_phase13_other"),
+        Some("phase13.workspace.other"),
+        "phase13 workspace mismatch memory",
+    );
+    params.category = MemoryCategory::ProjectDecision;
+    service
+        .remember(workspace_context("ws_phase13_other", 480), params)
+        .await
+        .expect("other workspace remember");
+
+    let search = service
+        .search(
+            workspace_context("ws_phase13_target", 481),
+            MemorySearchParams {
+                query: "phase13 workspace mismatch".to_owned(),
+                scopes: vec![scope(MemoryScopeKind::Workspace, "ws_phase13_other")],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workspace guarded search");
+    assert!(search.hits.is_empty());
 }
 
 #[tokio::test]

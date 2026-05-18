@@ -25,6 +25,7 @@ pub struct MemoryRecallItem {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MemoryRecallResponse {
     pub items: Vec<MemoryRecallItem>,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

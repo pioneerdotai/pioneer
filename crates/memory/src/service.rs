@@ -24,10 +24,16 @@ use crate::quality::{
 use crate::quality_gate::{
     MemoryQualityGate, MemoryQualityGateInput, memory_quality_gate_input_from_semantic_write,
 };
-use crate::ranking::{MemoryRankingCandidate, rank_memory_search_hits};
+use crate::ranking::{
+    MemoryRankingCandidate, MemoryRankingDiagnostics, rank_memory_search_hits_with_diagnostics,
+};
 use crate::recall::{
     MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,
     MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget, compact_recall_content,
+};
+use crate::recall_visibility::{
+    MemoryRecallQualitySignals, MemoryRecallVisibility, decide_memory_recall_visibility,
+    memory_recall_quality_signals_for_row, memory_recall_visibility_input_for_row,
 };
 use crate::write::{
     SemanticWritePrepared, build_memory_canonical_key, merge_metadata, metadata_normalized_value,
@@ -60,7 +66,7 @@ use pioneer_protocol::{
     MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
     MemoryWriteEvidence, MemoryWriteRelation, generate_id,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const ID_LEN: usize = 21;
@@ -72,6 +78,92 @@ const REPAIR_JOB_BACKEND_STALE_PAYLOAD: &str = "backend_stale_payload";
 const REPAIR_PRIORITY_DEFAULT: i64 = 10;
 const REPAIR_MAX_ATTEMPTS_DEFAULT: i32 = 3;
 const POLICY_ACTION_SEMANTIC_WRITE: &str = "semantic_write";
+
+#[derive(Debug, Clone)]
+struct MemorySearchWithDiagnostics {
+    response: MemorySearchResponse,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryRecallServiceDiagnostics {
+    stale_backend_hit_count: usize,
+    visibility_suppression_counts: BTreeMap<&'static str, usize>,
+    ranking: MemoryRankingDiagnostics,
+}
+
+impl MemoryRecallServiceDiagnostics {
+    fn record_stale_backend_hit(&mut self) {
+        self.stale_backend_hit_count += 1;
+    }
+
+    fn record_visibility(&mut self, visibility: MemoryRecallVisibility) {
+        if visibility.is_visible() {
+            return;
+        }
+        *self
+            .visibility_suppression_counts
+            .entry(visibility.as_str())
+            .or_insert(0) += 1;
+    }
+
+    fn extend_ranking(&mut self, ranking: &MemoryRankingDiagnostics) {
+        self.ranking.exact_key_boost_count += ranking.exact_key_boost_count;
+        self.ranking.quality_penalty_applied_count += ranking.quality_penalty_applied_count;
+        self.ranking.low_source_context_penalty_count += ranking.low_source_context_penalty_count;
+        self.ranking.rejected_related_penalty_count += ranking.rejected_related_penalty_count;
+    }
+
+    fn into_safe_strings(self) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        if self.stale_backend_hit_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_visibility.backend_stale_ids:{}",
+                self.stale_backend_hit_count
+            ));
+        }
+        let suppressed_count = self
+            .visibility_suppression_counts
+            .values()
+            .copied()
+            .sum::<usize>();
+        if suppressed_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_visibility.suppressed_count:{suppressed_count}"
+            ));
+            for (reason, count) in self.visibility_suppression_counts {
+                diagnostics.push(format!(
+                    "memory.recall_visibility.suppressed:{reason}:{count}"
+                ));
+            }
+        }
+        if self.ranking.exact_key_boost_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_ranking.exact_key_boost_count:{}",
+                self.ranking.exact_key_boost_count
+            ));
+        }
+        if self.ranking.quality_penalty_applied_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_ranking.quality_penalty_applied_count:{}",
+                self.ranking.quality_penalty_applied_count
+            ));
+        }
+        if self.ranking.low_source_context_penalty_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_ranking.low_source_context_penalty_count:{}",
+                self.ranking.low_source_context_penalty_count
+            ));
+        }
+        if self.ranking.rejected_related_penalty_count > 0 {
+            diagnostics.push(format!(
+                "memory.recall_ranking.rejected_related_penalty_count:{}",
+                self.ranking.rejected_related_penalty_count
+            ));
+        }
+        diagnostics
+    }
+}
 
 pub struct MemoryService {
     store: Arc<CrudStore>,
@@ -1006,6 +1098,16 @@ impl MemoryService {
         context: MemoryOperationContext,
         params: MemorySearchParams,
     ) -> Result<MemorySearchResponse> {
+        self.search_with_diagnostics(context, params)
+            .await
+            .map(|result| result.response)
+    }
+
+    async fn search_with_diagnostics(
+        &self,
+        context: MemoryOperationContext,
+        params: MemorySearchParams,
+    ) -> Result<MemorySearchWithDiagnostics> {
         let query = params.query.trim();
         let backend_query = normalize_backend_search_query(query);
         if backend_query.is_empty() {
@@ -1031,6 +1133,7 @@ impl MemoryService {
             .context("failed to search memory backend")?;
 
         let backend_returned_any = !backend_hits.is_empty();
+        let mut diagnostics = MemoryRecallServiceDiagnostics::default();
         let mut candidates = Vec::new();
         let mut seen_memory_ids = BTreeSet::new();
         for hit in backend_hits {
@@ -1042,6 +1145,7 @@ impl MemoryService {
             else {
                 self.enqueue_stale_backend_repair(hit.memory_id.as_str(), now)
                     .await?;
+                diagnostics.record_stale_backend_hit();
                 continue;
             };
             if !scope_matches(&row.scope, &active_scopes.scopes)
@@ -1050,8 +1154,15 @@ impl MemoryService {
                 continue;
             }
             let recency_anchor_unix = recency_anchor_unix(&row);
-            let Some(record) = self
-                .hydrate_visible_row(row, &context, &params.statuses, now, true)
+            let Some((record, quality)) = self
+                .hydrate_visible_row_with_quality_and_diagnostics(
+                    row,
+                    &context,
+                    &params.statuses,
+                    now,
+                    true,
+                    Some(&mut diagnostics),
+                )
                 .await?
             else {
                 continue;
@@ -1066,6 +1177,7 @@ impl MemoryService {
                 },
                 backend_score,
                 recency_anchor_unix,
+                quality,
             });
         }
         if candidates.is_empty() && !backend_returned_any {
@@ -1094,8 +1206,15 @@ impl MemoryService {
                     continue;
                 };
                 let recency_anchor_unix = recency_anchor_unix(&row);
-                let Some(record) = self
-                    .hydrate_visible_row(row, &context, &params.statuses, now, true)
+                let Some((record, quality)) = self
+                    .hydrate_visible_row_with_quality_and_diagnostics(
+                        row,
+                        &context,
+                        &params.statuses,
+                        now,
+                        true,
+                        Some(&mut diagnostics),
+                    )
                     .await?
                 else {
                     continue;
@@ -1110,10 +1229,11 @@ impl MemoryService {
                     },
                     backend_score,
                     recency_anchor_unix,
+                    quality,
                 });
             }
         }
-        let hits = rank_memory_search_hits(
+        let ranking = rank_memory_search_hits_with_diagnostics(
             candidates,
             query,
             &params.categories,
@@ -1122,10 +1242,14 @@ impl MemoryService {
             now,
             limit,
         );
+        diagnostics.extend_ranking(&ranking.diagnostics);
 
-        Ok(MemorySearchResponse {
-            hits,
-            next_cursor: None,
+        Ok(MemorySearchWithDiagnostics {
+            response: MemorySearchResponse {
+                hits: ranking.hits,
+                next_cursor: None,
+            },
+            diagnostics: diagnostics.into_safe_strings(),
         })
     }
 
@@ -1140,7 +1264,7 @@ impl MemoryService {
             .unwrap_or(self.config.recall.max_prompt_chars)
             .min(self.config.recall.max_prompt_chars);
         let search = self
-            .search(
+            .search_with_diagnostics(
                 context,
                 MemorySearchParams {
                     query: params.query,
@@ -1157,7 +1281,7 @@ impl MemoryService {
         let mut remaining_chars = max_chars;
         let item_max_chars = self.config.recall.max_item_chars.max(1);
         let mut items = Vec::new();
-        for hit in search.hits {
+        for hit in search.response.hits {
             if remaining_chars == 0 {
                 break;
             }
@@ -1178,7 +1302,10 @@ impl MemoryService {
             });
         }
 
-        Ok(MemoryRecallResponse { items })
+        Ok(MemoryRecallResponse {
+            items,
+            diagnostics: search.diagnostics,
+        })
     }
 
     pub async fn recall_mode_for_prompt(
@@ -1212,7 +1339,7 @@ impl MemoryService {
                 workspace_guard: context.workspace_guard(),
                 namespace: None,
                 key: None,
-                categories,
+                categories: categories.clone(),
                 statuses: Vec::new(),
                 include_expired: false,
                 include_deleted: false,
@@ -1241,15 +1368,22 @@ impl MemoryService {
         };
 
         let mode = params.mode;
-        self.recall_items_from_control_rows(context, rows, top_k, max_chars)
-            .await
-            .map(|mut response| {
-                response.diagnostics.push(format!(
-                    "memory.active_recall.mode_executed:{}",
-                    mode.as_str()
-                ));
-                response
-            })
+        self.recall_items_from_control_rows(
+            context,
+            rows,
+            top_k,
+            max_chars,
+            params.mode.as_str(),
+            &categories,
+        )
+        .await
+        .map(|mut response| {
+            response.diagnostics.push(format!(
+                "memory.active_recall.mode_executed:{}",
+                mode.as_str()
+            ));
+            response
+        })
     }
 
     async fn recall_exact_canonical_for_prompt(
@@ -1273,7 +1407,7 @@ impl MemoryService {
 
         let mut rows = Vec::new();
         let mut seen = BTreeSet::new();
-        for target in targets {
+        for target in &targets {
             if rows.len() >= top_k as usize {
                 break;
             }
@@ -1312,14 +1446,26 @@ impl MemoryService {
             }
         }
 
-        self.recall_items_from_control_rows(context, rows, top_k, max_chars)
-            .await
-            .map(|mut response| {
-                response
-                    .diagnostics
-                    .push("memory.active_recall.mode_executed:exact_canonical".to_owned());
-                response
-            })
+        let ranking_query = targets
+            .iter()
+            .flat_map(|target| exact_target_lookup_keys(&context, target))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.recall_items_from_control_rows(
+            context,
+            rows,
+            top_k,
+            max_chars,
+            ranking_query.as_str(),
+            &[],
+        )
+        .await
+        .map(|mut response| {
+            response
+                .diagnostics
+                .push("memory.active_recall.mode_executed:exact_canonical".to_owned());
+            response
+        })
     }
 
     async fn recall_items_from_control_rows(
@@ -1328,38 +1474,75 @@ impl MemoryService {
         rows: Vec<AgentMemoryControlRecord>,
         top_k: u32,
         max_chars: usize,
+        ranking_query: &str,
+        requested_categories: &[MemoryCategory],
     ) -> Result<MemoryModeRecallResponse> {
         let now = context.now_or(current_unix());
         let mut remaining_chars = max_chars;
         let item_max_chars = self.config.recall.max_item_chars.max(1);
         let raw_count = rows.len();
-        let mut items = Vec::new();
+        let mut candidates = Vec::new();
         let mut truncated = false;
+        let mut diagnostics = MemoryRecallServiceDiagnostics::default();
         for row in rows {
-            if items.len() >= top_k as usize || remaining_chars == 0 {
-                truncated = true;
-                break;
-            }
-            let Some(record) = self
-                .hydrate_visible_row(row, &context, &[], now, true)
+            let recency_anchor_unix = recency_anchor_unix(&row);
+            let Some((record, quality)) = self
+                .hydrate_visible_row_with_quality_and_diagnostics(
+                    row,
+                    &context,
+                    &[],
+                    now,
+                    true,
+                    Some(&mut diagnostics),
+                )
                 .await?
             else {
                 continue;
             };
+            candidates.push(MemoryRankingCandidate {
+                hit: MemorySearchHit {
+                    record,
+                    score: None,
+                    snippet: None,
+                    matched_terms: Vec::new(),
+                },
+                backend_score: None,
+                recency_anchor_unix,
+                quality,
+            });
+        }
+        let active_scopes = context.active_scopes(&[]);
+        let ranking = rank_memory_search_hits_with_diagnostics(
+            candidates,
+            ranking_query,
+            requested_categories,
+            &active_scopes,
+            &self.config.ranking,
+            now,
+            top_k,
+        );
+        diagnostics.extend_ranking(&ranking.diagnostics);
+
+        let mut items = Vec::new();
+        for hit in ranking.hits {
+            if items.len() >= top_k as usize || remaining_chars == 0 {
+                truncated = true;
+                break;
+            }
             let content =
-                compact_recall_content(&record.content, item_max_chars.min(remaining_chars));
+                compact_recall_content(&hit.record.content, item_max_chars.min(remaining_chars));
             if content.is_empty() {
                 continue;
             }
             remaining_chars = remaining_chars.saturating_sub(content.chars().count());
             items.push(MemoryRecallItem {
-                memory_id: record.id,
-                scope: record.scope,
-                category: record.category,
-                key: record.key,
+                memory_id: hit.record.id,
+                scope: hit.record.scope,
+                category: hit.record.category,
+                key: hit.record.key,
                 content,
-                score: None,
-                updated_at: record.updated_at,
+                score: hit.score,
+                updated_at: hit.record.updated_at,
             });
         }
         if raw_count > items.len() && items.len() >= top_k as usize {
@@ -1368,7 +1551,7 @@ impl MemoryService {
 
         Ok(MemoryModeRecallResponse {
             items,
-            diagnostics: Vec::new(),
+            diagnostics: diagnostics.into_safe_strings(),
             truncated,
             skipped_reason: None,
         })
@@ -2144,7 +2327,11 @@ impl MemoryService {
         let Some(row) = row else {
             return Ok(Vec::new());
         };
-        if self.row_visible(&row, context, &[], now) {
+        if self
+            .row_recall_visibility(&row, context, &[], now)
+            .await?
+            .is_visible()
+        {
             Ok(vec![row])
         } else {
             Ok(Vec::new())
@@ -2159,10 +2346,49 @@ impl MemoryService {
         now: i64,
         record_access: bool,
     ) -> Result<Option<MemoryRecord>> {
-        if !self.row_visible(&row, context, allowed_statuses, now) {
+        Ok(self
+            .hydrate_visible_row_with_quality(row, context, allowed_statuses, now, record_access)
+            .await?
+            .map(|(record, _quality)| record))
+    }
+
+    async fn hydrate_visible_row_with_quality(
+        &self,
+        row: AgentMemoryControlRecord,
+        context: &MemoryOperationContext,
+        allowed_statuses: &[MemoryStatus],
+        now: i64,
+        record_access: bool,
+    ) -> Result<Option<(MemoryRecord, MemoryRecallQualitySignals)>> {
+        self.hydrate_visible_row_with_quality_and_diagnostics(
+            row,
+            context,
+            allowed_statuses,
+            now,
+            record_access,
+            None,
+        )
+        .await
+    }
+
+    async fn hydrate_visible_row_with_quality_and_diagnostics(
+        &self,
+        row: AgentMemoryControlRecord,
+        context: &MemoryOperationContext,
+        allowed_statuses: &[MemoryStatus],
+        now: i64,
+        record_access: bool,
+        diagnostics: Option<&mut MemoryRecallServiceDiagnostics>,
+    ) -> Result<Option<(MemoryRecord, MemoryRecallQualitySignals)>> {
+        let quality = self.recall_quality_signals_for_row(&row).await?;
+        let visibility =
+            self.row_recall_visibility_with_quality(&row, context, allowed_statuses, now, &quality);
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_visibility(visibility);
+        }
+        if !visibility.is_visible() {
             return Ok(None);
         }
-
         let payload = match self.backend.get(backend_get_request(&row)).await? {
             Some(payload) => payload,
             None if row.status == MemoryStatus::Deleted => BackendPayload {
@@ -2189,44 +2415,53 @@ impl MemoryService {
             row
         };
 
-        Ok(Some(crud_record_to_protocol(row, payload)?))
+        Ok(Some((crud_record_to_protocol(row, payload)?, quality)))
     }
 
-    fn row_visible(
+    async fn row_recall_visibility(
         &self,
         row: &AgentMemoryControlRecord,
         context: &MemoryOperationContext,
         allowed_statuses: &[MemoryStatus],
         now: i64,
-    ) -> bool {
-        let status_allowed = if allowed_statuses.is_empty() {
-            row.status == MemoryStatus::Active
-        } else {
-            allowed_statuses.contains(&row.status)
-        };
-        if !status_allowed {
-            return false;
-        }
-        if row.deleted_at_unix.is_some() && !allowed_statuses.contains(&MemoryStatus::Deleted) {
-            return false;
-        }
-        if row.superseded_by.is_some() && !allowed_statuses.contains(&MemoryStatus::Superseded) {
-            return false;
-        }
-        if row
-            .expires_at_unix
-            .is_some_and(|expires_at| expires_at <= now)
-            && !allowed_statuses.contains(&MemoryStatus::Expired)
-        {
-            return false;
-        }
-        if row.repair_status != REPAIR_STATUS_OK {
-            return false;
-        }
-        if !self.policy.allows_sensitivity(context, row.sensitivity) {
-            return false;
-        }
-        workspace_visible(row, context)
+    ) -> Result<MemoryRecallVisibility> {
+        let quality = self.recall_quality_signals_for_row(row).await?;
+        Ok(self.row_recall_visibility_with_quality(row, context, allowed_statuses, now, &quality))
+    }
+
+    fn row_recall_visibility_with_quality(
+        &self,
+        row: &AgentMemoryControlRecord,
+        context: &MemoryOperationContext,
+        allowed_statuses: &[MemoryStatus],
+        now: i64,
+        quality: &MemoryRecallQualitySignals,
+    ) -> MemoryRecallVisibility {
+        let read_policy = self.policy.read_policy(context);
+        let input = memory_recall_visibility_input_for_row(
+            row,
+            allowed_statuses,
+            now,
+            row.repair_status == REPAIR_STATUS_OK,
+            &read_policy,
+            workspace_visible(row, context),
+            quality,
+        );
+        decide_memory_recall_visibility(&input)
+    }
+
+    async fn recall_quality_signals_for_row(
+        &self,
+        row: &AgentMemoryControlRecord,
+    ) -> Result<MemoryRecallQualitySignals> {
+        let quality_decisions = self
+            .store
+            .list_agent_memory_quality_decisions_for_memory(row.id.as_str(), 1)
+            .await?;
+        Ok(memory_recall_quality_signals_for_row(
+            row,
+            quality_decisions.first(),
+        ))
     }
 
     async fn mark_missing_backend_payload(

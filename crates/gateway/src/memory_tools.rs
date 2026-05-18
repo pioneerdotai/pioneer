@@ -101,7 +101,7 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                     updated_at: item.updated_at,
                 })
                 .collect(),
-            diagnostics: Vec::new(),
+            diagnostics: response.diagnostics,
             truncated: false,
         })
     }
