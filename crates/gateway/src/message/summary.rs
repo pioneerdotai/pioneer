@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_crud::{ConversationEntry, CrudStore};
-use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry};
+use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry, ReasoningConfig};
 use tracing::debug;
 
 pub struct SummaryConfig {
@@ -46,6 +46,7 @@ pub async fn compress_context(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        reasoning: None,
         compiled_prompt: None,
     };
 
@@ -94,16 +95,7 @@ pub async fn generate_thread_title(
     let provider =
         registry.get_or_create_for_workspace(thread.workspace_id.as_str(), model_provider)?;
 
-    let request = ChatRequest {
-        model: model.to_owned(),
-        messages: vec![ChatMessage::user(prompt)],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        compiled_prompt: None,
-    };
+    let request = title_generation_chat_request(model, prompt);
 
     let response = provider.chat(request).await?;
     let title = normalize_generated_title(response.text.as_str());
@@ -119,6 +111,20 @@ pub async fn generate_thread_title(
     );
 
     Ok(Some(title))
+}
+
+fn title_generation_chat_request(model: &str, prompt: String) -> ChatRequest {
+    ChatRequest {
+        model: model.to_owned(),
+        messages: vec![ChatMessage::user(prompt)],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: Some(ReasoningConfig::disabled()),
+        compiled_prompt: None,
+    }
 }
 
 fn build_title_prompt(user_text: &str) -> String {
@@ -223,7 +229,11 @@ fn build_compression_prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_title_prompt, normalize_generated_title, truncate_utf8_bytes};
+    use super::{
+        build_title_prompt, normalize_generated_title, title_generation_chat_request,
+        truncate_utf8_bytes,
+    };
+    use pioneer_provider::ReasoningConfig;
 
     #[test]
     fn title_normalization_trims_quotes_and_whitespace() {
@@ -241,6 +251,13 @@ mod tests {
         assert!(prompt.contains(text.as_str()));
         assert!(!prompt.contains("..."));
         assert!(prompt.ends_with('\n'));
+    }
+
+    #[test]
+    fn title_generation_request_disables_reasoning() {
+        let request = title_generation_chat_request("openrouter/model", "title me".to_owned());
+        assert_eq!(request.reasoning, Some(ReasoningConfig::disabled()));
+        assert!(request.tools.is_none());
     }
 
     #[test]

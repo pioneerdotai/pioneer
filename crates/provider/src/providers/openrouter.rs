@@ -7,7 +7,8 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -315,6 +316,21 @@ impl OpenRouterProvider {
         value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
     }
 
+    fn reasoning_options(
+        request_reasoning: Option<ReasoningConfig>,
+        default_effort: Option<ReasoningEffort>,
+    ) -> Option<ApiReasoningOptions> {
+        let effort = match request_reasoning {
+            Some(ReasoningConfig::Disabled) => ReasoningEffort::None,
+            Some(ReasoningConfig::Effort(effort)) => effort,
+            None => default_effort?,
+        };
+
+        Some(ApiReasoningOptions {
+            effort: effort.as_str().to_owned(),
+        })
+    }
+
     fn media_url_or_data_url(
         attachment: &crate::attachments::PreparedAttachment,
     ) -> Result<String> {
@@ -606,7 +622,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = None;
+        let reasoning = Self::reasoning_options(request.reasoning, None);
 
         let api_request = ApiChatRequest {
             model: request.model,
@@ -693,9 +709,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Some(ApiReasoningOptions {
-            effort: "medium".to_owned(),
-        });
+        let reasoning = Self::reasoning_options(request.reasoning, Some(ReasoningEffort::Medium));
 
         let api_request = ApiChatRequest {
             model: request.model,
@@ -1079,6 +1093,17 @@ mod tests {
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"reasoning\":{\"effort\":\"medium\"}"));
+    }
+
+    #[test]
+    fn disabled_reasoning_overrides_stream_default_effort() {
+        let reasoning = OpenRouterProvider::reasoning_options(
+            Some(ReasoningConfig::disabled()),
+            Some(ReasoningEffort::Medium),
+        )
+        .expect("disabled reasoning should serialize explicit none effort");
+
+        assert_eq!(reasoning.effort, "none");
     }
 
     #[test]

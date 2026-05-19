@@ -536,7 +536,47 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
     pub parallel_tool_calls: Option<bool>,
+    pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningConfig {
+    Disabled,
+    Effort(ReasoningEffort),
+}
+
+impl ReasoningConfig {
+    pub const fn disabled() -> Self {
+        Self::Disabled
+    }
+
+    pub const fn effort(effort: ReasoningEffort) -> Self {
+        Self::Effort(effort)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    XHigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XHigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
 }
 
 impl ChatRequest {
@@ -858,6 +898,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
                 stable_system_text: "Stable".to_owned(),
                 dynamic_system_text: "Dynamic".to_owned(),

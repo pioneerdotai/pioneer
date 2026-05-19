@@ -1108,6 +1108,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning: None,
             compiled_prompt: Some(CompiledPromptPayload {
                 stable_system_text: "Stable rules".to_owned(),
                 dynamic_system_text: "Dynamic runtime".to_owned(),

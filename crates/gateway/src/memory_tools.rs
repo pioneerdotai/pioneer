@@ -18,7 +18,7 @@ use pioneer_protocol::{
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
     MemorySensitivity, MemorySourceContextKind, MemoryStatus,
 };
-use pioneer_provider::{ChatMessage, ChatRequest, Provider, StreamChunk};
+use pioneer_provider::{ChatMessage, ChatRequest, Provider, ReasoningConfig, StreamChunk};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -303,6 +303,7 @@ fn active_memory_decision_chat_request(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        reasoning: Some(ReasoningConfig::disabled()),
         compiled_prompt: None,
     }
 }
@@ -396,6 +397,7 @@ fn post_turn_extractor_chat_request(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        reasoning: None,
         compiled_prompt: None,
     }
 }
@@ -1435,6 +1437,14 @@ mod tests {
                 Ok(StreamChunk::final_chunk()),
             ])))
         }
+    }
+
+    #[test]
+    fn active_memory_decision_request_disables_reasoning() {
+        let request =
+            active_memory_decision_chat_request("openrouter/model", "plan memory".to_owned(), None);
+        assert_eq!(request.reasoning, Some(ReasoningConfig::disabled()));
+        assert!(request.tools.is_none());
     }
 
     #[tokio::test]

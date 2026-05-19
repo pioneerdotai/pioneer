@@ -60,6 +60,7 @@ impl GatewayMemoryTurnPolicyProvider {
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,
+                reasoning: None,
                 compiled_prompt: None,
             })
             .await

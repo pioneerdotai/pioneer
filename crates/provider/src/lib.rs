@@ -23,5 +23,6 @@ pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse,
     CompiledPromptPayload, InputContentType, InputTypeSupport, MessageAttachment,
     MessageContentPart, ModelInputItem, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
+    ToolDefinition,
 };

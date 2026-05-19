@@ -996,6 +996,7 @@ async fn execute_standard_provider_response(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        reasoning: None,
         compiled_prompt,
     };
 
@@ -2081,6 +2082,7 @@ async fn execute_agent_provider_response(
                     tools: tool_definitions,
                     tool_choice: None,
                     parallel_tool_calls: round_plan.tools_enabled.then_some(true),
+                    reasoning: None,
                     compiled_prompt: round_compiled_prompt,
                 },
                 workspace_id,

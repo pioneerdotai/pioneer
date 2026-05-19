@@ -712,6 +712,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning: None,
             compiled_prompt: None,
         };
         assert!(OllamaProvider::build_options(&request).is_none());
@@ -727,6 +728,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning: None,
             compiled_prompt: None,
         };
         let options = OllamaProvider::build_options(&request).unwrap();
