@@ -67,7 +67,7 @@ impl Default for MemoryActiveRecallPlannerConfig {
             enabled: true,
             provider_name: None,
             model: None,
-            timeout_ms: 8_000,
+            timeout_ms: 60_000,
             max_input_chars: 4_000,
             max_output_chars: 2_000,
             fallback: MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
@@ -105,7 +105,7 @@ impl Default for MemoryActiveRecallConfig {
     fn default() -> Self {
         Self {
             mode: MemoryActiveRecallMode::Hybrid,
-            timeout_ms: 10_000,
+            timeout_ms: 70_000,
             max_queries: 3,
             top_k_per_query: 5,
             max_prompt_chars: 1_500,
@@ -137,6 +137,8 @@ pub struct MemoryPostTurnExtractorConfig {
     pub provider_enabled: bool,
     pub proactive_writes_enabled: bool,
     pub await_policy: HookAwaitPolicy,
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
     pub timeout_ms: u64,
     pub max_facts_per_turn: usize,
     pub max_input_chars: usize,
@@ -153,6 +155,8 @@ impl Default for MemoryPostTurnExtractorConfig {
             provider_enabled: true,
             proactive_writes_enabled: true,
             await_policy: HookAwaitPolicy::FireAndRecord,
+            provider_name: None,
+            model: None,
             timeout_ms: 180_000,
             max_facts_per_turn: 8,
             max_input_chars: 8_000,
@@ -176,6 +180,8 @@ impl MemoryPostTurnExtractorConfig {
                     HookAwaitPolicy::FireAndRecord
                 }
             },
+            provider_name: normalized_optional_config_text(self.provider_name.as_deref(), 80),
+            model: normalized_optional_config_text(self.model.as_deref(), 160),
             timeout_ms: self.timeout_ms.max(1),
             max_facts_per_turn: self.max_facts_per_turn.max(1),
             max_input_chars: self.max_input_chars.max(1),

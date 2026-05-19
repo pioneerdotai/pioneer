@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use config::{Config, ConfigError, File, FileFormat};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
@@ -91,6 +91,142 @@ impl Default for GatewayArtifactsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayMemoryModelSelectionSource {
+    Thread,
+    Custom,
+}
+
+impl Default for GatewayMemoryModelSelectionSource {
+    fn default() -> Self {
+        Self::Thread
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayMemoryModelSelectionConfig {
+    pub source: GatewayMemoryModelSelectionSource,
+    pub model_provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl Default for GatewayMemoryModelSelectionConfig {
+    fn default() -> Self {
+        Self {
+            source: GatewayMemoryModelSelectionSource::Thread,
+            model_provider: None,
+            model: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GatewayMemoryModelSelectionConfigWire {
+    Shorthand(String),
+    Detailed {
+        #[serde(default)]
+        source: GatewayMemoryModelSelectionSource,
+        #[serde(default)]
+        model_provider: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    },
+}
+
+impl GatewayMemoryModelSelectionConfig {
+    pub fn thread() -> Self {
+        Self::default()
+    }
+
+    pub fn custom(model_provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            source: GatewayMemoryModelSelectionSource::Custom,
+            model_provider: Some(model_provider.into()),
+            model: Some(model.into()),
+        }
+    }
+
+    pub fn is_thread_model(&self) -> bool {
+        self.source == GatewayMemoryModelSelectionSource::Thread
+    }
+
+    pub fn model_provider_override(&self) -> Option<String> {
+        if self.is_thread_model() {
+            return None;
+        }
+        let model_provider =
+            normalized_optional_model_selection_text(self.model_provider.as_deref(), 80);
+        let model = normalized_optional_model_selection_text(self.model.as_deref(), 160);
+        model_provider.filter(|_| model.is_some())
+    }
+
+    pub fn model_override(&self) -> Option<String> {
+        if self.is_thread_model() {
+            return None;
+        }
+        let model_provider =
+            normalized_optional_model_selection_text(self.model_provider.as_deref(), 80);
+        let model = normalized_optional_model_selection_text(self.model.as_deref(), 160);
+        model.filter(|_| model_provider.is_some())
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayMemoryModelSelectionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match GatewayMemoryModelSelectionConfigWire::deserialize(deserializer)? {
+            GatewayMemoryModelSelectionConfigWire::Shorthand(value) => {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "thread" => Ok(Self::thread()),
+                    "custom" => Ok(Self {
+                        source: GatewayMemoryModelSelectionSource::Custom,
+                        model_provider: None,
+                        model: None,
+                    }),
+                    other => Err(serde::de::Error::custom(format!(
+                        "invalid memory model selection `{other}`; expected thread|custom"
+                    ))),
+                }
+            }
+            GatewayMemoryModelSelectionConfigWire::Detailed {
+                source,
+                model_provider,
+                model,
+            } => Ok(Self {
+                source,
+                model_provider,
+                model,
+            }),
+        }
+    }
+}
+
+impl Serialize for GatewayMemoryModelSelectionConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.is_thread_model() {
+            return serializer.serialize_str("thread");
+        }
+
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("source", &self.source)?;
+        if let Some(model_provider) = self.model_provider.as_deref() {
+            map.serialize_entry("model_provider", model_provider)?;
+        }
+        if let Some(model) = self.model.as_deref() {
+            map.serialize_entry("model", model)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GatewayMemoryConfig {
     /// Enables the durable memory product surface for the gateway.
     #[serde(default = "default_gateway_memory_enabled")]
@@ -119,6 +255,12 @@ pub struct GatewayMemoryConfig {
     /// Runs post-turn extraction as background hook work instead of blocking the user turn.
     #[serde(default = "default_gateway_memory_background_extraction_enabled")]
     pub background_extraction_enabled: bool,
+    /// Provider/model used by active recall planner. Defaults to the thread model.
+    #[serde(default)]
+    pub active_recall_model: GatewayMemoryModelSelectionConfig,
+    /// Provider/model used by proactive memory writes. Defaults to the thread model.
+    #[serde(default)]
+    pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
     /// Enables user/developer-visible memory debug trace surfaces.
     #[serde(default)]
     pub debug_trace_enabled: bool,
@@ -139,6 +281,8 @@ impl Default for GatewayMemoryConfig {
             tools_enabled: default_gateway_memory_tools_enabled(),
             proactive_writes_enabled: default_gateway_memory_proactive_writes_enabled(),
             background_extraction_enabled: default_gateway_memory_background_extraction_enabled(),
+            active_recall_model: GatewayMemoryModelSelectionConfig::default(),
+            proactive_writes_model: GatewayMemoryModelSelectionConfig::default(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
         }
@@ -789,6 +933,17 @@ const fn default_gateway_memory_proactive_writes_enabled() -> bool {
 
 const fn default_gateway_memory_background_extraction_enabled() -> bool {
     true
+}
+
+fn normalized_optional_model_selection_text(
+    value: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(max_chars).collect())
 }
 
 const fn default_gateway_hook_recovery_enabled() -> bool {
@@ -1486,8 +1641,9 @@ fn user_config_directory_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG_TOML, GatewayMemoryConfig, InstallManagedBy, InstallState,
-        load_config_from_sources, load_install_state, save_install_state,
+        DEFAULT_CONFIG_TOML, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+        InstallManagedBy, InstallState, load_config_from_sources, load_install_state,
+        save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1847,6 +2003,14 @@ service_name = "com.pioneer.gateway.env"
         assert!(config.gateway.memory.tools_enabled);
         assert!(config.gateway.memory.proactive_writes_enabled);
         assert!(config.gateway.memory.background_extraction_enabled);
+        assert!(config.gateway.memory.active_recall_model.is_thread_model());
+        assert!(
+            config
+                .gateway
+                .memory
+                .proactive_writes_model
+                .is_thread_model()
+        );
         assert!(!config.gateway.memory.debug_trace_enabled);
         assert!(!config.gateway.memory.strict_diagnostics_enabled);
         assert_eq!(
@@ -1888,6 +2052,8 @@ service_name = "com.pioneer.gateway.env"
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
+        assert!(config.active_recall_model.is_thread_model());
+        assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
     }
@@ -1911,8 +2077,53 @@ capsules_dir = "memory/custom-capsules"
         assert!(config.tools_enabled);
         assert!(config.proactive_writes_enabled);
         assert!(config.background_extraction_enabled);
+        assert!(config.active_recall_model.is_thread_model());
+        assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn gateway_memory_model_selection_uses_complete_custom_override_only() {
+        #[derive(serde::Deserialize)]
+        struct SelectionWrapper {
+            selection: GatewayMemoryModelSelectionConfig,
+        }
+
+        let thread = toml::from_str::<SelectionWrapper>("selection = \"thread\"")
+            .expect("thread shorthand parses");
+        assert!(thread.selection.is_thread_model());
+
+        let complete = GatewayMemoryModelSelectionConfig::custom("provider", "model");
+        assert_eq!(
+            complete.model_provider_override().as_deref(),
+            Some("provider")
+        );
+        assert_eq!(complete.model_override().as_deref(), Some("model"));
+
+        let missing_model = GatewayMemoryModelSelectionConfig {
+            source: super::GatewayMemoryModelSelectionSource::Custom,
+            model_provider: Some("provider".to_owned()),
+            model: None,
+        };
+        assert!(missing_model.model_provider_override().is_none());
+        assert!(missing_model.model_override().is_none());
+    }
+
+    #[test]
+    fn gateway_memory_model_selection_rejects_removed_turn_alias() {
+        #[derive(Debug, serde::Deserialize)]
+        struct SelectionWrapper {
+            #[allow(dead_code)]
+            selection: GatewayMemoryModelSelectionConfig,
+        }
+
+        let error = toml::from_str::<SelectionWrapper>("selection = \"turn\"")
+            .expect_err("turn alias must not parse");
+        assert!(
+            format!("{error:#}").contains("expected thread|custom"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -1927,6 +2138,14 @@ capsules_dir = "memory/custom-capsules"
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
+            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
+                "planner-provider",
+                "planner-model",
+            ),
+            proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
+                "extractor-provider",
+                "extractor-model",
+            ),
             debug_trace_enabled: true,
             strict_diagnostics_enabled: true,
         };
@@ -1941,12 +2160,29 @@ capsules_dir = "memory/custom-capsules"
         assert!(serialized.contains("tools_enabled = false"));
         assert!(serialized.contains("proactive_writes_enabled = false"));
         assert!(serialized.contains("background_extraction_enabled = false"));
+        assert!(serialized.contains("active_recall_model"));
+        assert!(serialized.contains("model_provider = \"planner-provider\""));
+        assert!(serialized.contains("model = \"planner-model\""));
+        assert!(serialized.contains("proactive_writes_model"));
+        assert!(serialized.contains("model_provider = \"extractor-provider\""));
+        assert!(serialized.contains("model = \"extractor-model\""));
         assert!(serialized.contains("debug_trace_enabled = true"));
         assert!(serialized.contains("strict_diagnostics_enabled = true"));
 
         let roundtrip = toml::from_str::<GatewayMemoryConfig>(serialized.as_str())
             .expect("gateway memory config should deserialize");
         assert_eq!(roundtrip, config);
+    }
+
+    #[test]
+    fn gateway_memory_product_config_serializes_thread_model_as_shorthand() {
+        let serialized = toml::to_string(&GatewayMemoryConfig::default())
+            .expect("gateway memory config should serialize");
+
+        assert!(serialized.contains("active_recall_model = \"thread\""));
+        assert!(serialized.contains("proactive_writes_model = \"thread\""));
+        assert!(!serialized.contains("[active_recall_model]"));
+        assert!(!serialized.contains("[proactive_writes_model]"));
     }
 
     fn write_file(path: &PathBuf, content: &str) {

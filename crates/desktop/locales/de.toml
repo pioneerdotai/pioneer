@@ -559,9 +559,17 @@ description = "Pioneer darf gespeicherte Fakten und Projektentscheidungen verwen
 label = "Aktiver Abruf"
 description = "Zusätzliche schreibgeschützte Abrufplanung für kontextreiche Aufgaben ausführen."
 
+[settings.memory.active_recall_model]
+label = "Modell für aktiven Abruf"
+description = "Wähle Anbieter und Modell für die Speicherplanung. Standard verwendet das Modell des aktuellen Threads."
+
 [settings.memory.proactive_writes]
 label = "Proaktives Speichern"
 description = "Dauerhafte Fakten mit hoher Sicherheit nach einem Zug speichern."
+
+[settings.memory.proactive_writes_model]
+label = "Modell für Extraktion nach dem Zug"
+description = "Wähle Anbieter und Modell für die Speicherextraktion nach einem Zug. Standard verwendet das Modell des aktuellen Threads."
 
 [settings.memory.background_extraction]
 label = "Extraktion im Hintergrund"
@@ -570,6 +578,11 @@ description = "Speicherextraktion nach dem Zug im Hintergrund ausführen, statt 
 [settings.memory.debug_trace]
 label = "Diagnosespuren"
 description = "Diagnosen der Speichermechanismen in lokalen Fehlerdiagnoseansichten anzeigen."
+
+[settings.memory.model]
+default = "Standard"
+select_model = "Modell auswählen"
+dialog_title = "Speichermodell auswählen"
 
 [settings.language]
 system = "Systemstandard"

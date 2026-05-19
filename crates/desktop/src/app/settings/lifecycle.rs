@@ -1,7 +1,8 @@
 use crate::{
-    app::root::{MainContentView, PioneerDesktop, SettingsContentView},
+    app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
-        MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
+        MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID,
+        SETTINGS_CONTENT_MEMORY_NODE_ID,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
@@ -11,6 +12,7 @@ use gpui_component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
+use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -22,6 +24,9 @@ impl PioneerDesktop {
         self.settings_content_view = content_view;
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
+        if content_view == SettingsContentView::Memory {
+            self.refresh_gateway_settings(cx);
+        }
     }
 
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
@@ -79,7 +84,10 @@ impl PioneerDesktop {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut memory = settings::memory_settings(cx);
+        let Some(mut memory) = self.current_gateway_memory_settings() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
         match toggle {
             MemorySettingToggle::Enabled => memory.enabled = enabled,
             MemorySettingToggle::ActiveRecall => memory.active_recall_enabled = enabled,
@@ -90,11 +98,139 @@ impl PioneerDesktop {
             MemorySettingToggle::DebugTrace => memory.debug_trace_enabled = enabled,
         }
 
-        if let Err(error) = settings::set_memory_settings(cx, memory) {
-            warn!(
-                error = %format!("{error:#}"),
-                "failed to save memory settings"
-            );
+        self.apply_gateway_memory_settings(memory, cx);
+    }
+
+    pub(super) fn apply_memory_model_setting(
+        &mut self,
+        setting: MemoryModelSetting,
+        model_selection: GatewayMemoryModelSelection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut memory) = self.current_gateway_memory_settings() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        match setting {
+            MemoryModelSetting::ActiveRecallPlanner => memory.active_recall_model = model_selection,
+            MemoryModelSetting::PostTurnExtractor => {
+                memory.proactive_writes_model = model_selection
+            }
         }
+
+        self.apply_gateway_memory_settings(memory, cx);
+    }
+
+    pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
+        if self.gateway.settings_loading {
+            return;
+        }
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            self.gateway.settings_error = Some("Gateway is not connected".to_owned());
+            return;
+        }
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            self.gateway.settings_error = Some("Gateway is not connected".to_owned());
+            return;
+        };
+
+        self.gateway.settings_loading = true;
+        self.gateway.settings_error = None;
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.gateway_settings_get() })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+
+                    view.gateway.settings_loading = false;
+                    match result {
+                        Ok(response) => {
+                            view.gateway.settings = Some(response.settings);
+                            view.gateway.settings_error = None;
+                        }
+                        Err(error) => {
+                            view.gateway.settings_error = Some(format!("{error:#}"));
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "failed to fetch gateway settings"
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn current_gateway_memory_settings(&self) -> Option<GatewayMemorySettings> {
+        self.gateway
+            .settings
+            .as_ref()
+            .map(|settings| settings.memory.clone())
+    }
+
+    fn apply_gateway_memory_settings(
+        &mut self,
+        memory: GatewayMemorySettings,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            warn!("cannot update gateway memory settings without an active gateway connection");
+            return;
+        };
+
+        let mut snapshot = self.gateway.settings.clone().unwrap_or_else(|| {
+            pioneer_protocol::GatewaySettingsSnapshot {
+                memory: GatewayMemorySettings::default(),
+            }
+        });
+        snapshot.memory = memory.clone();
+        self.gateway.settings = Some(snapshot);
+        self.gateway.settings_error = None;
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.gateway_settings_update(GatewaySettingsUpdate {
+                            memory: Some(memory),
+                        })
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            view.gateway.settings = Some(response.settings);
+                            view.gateway.settings_error = None;
+                        }
+                        Err(error) => {
+                            view.gateway.settings_error = Some(format!("{error:#}"));
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "failed to update gateway settings"
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 }

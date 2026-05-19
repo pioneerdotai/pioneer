@@ -85,6 +85,16 @@ impl PioneerDesktop {
             .map(|coordinator| coordinator.workspace_id.as_str())
     }
 
+    pub(in crate::app) fn model_selector_workspace_id(&self) -> String {
+        self.active_workspace_id()
+            .or_else(|| {
+                self.current_active_thread_id()
+                    .and_then(|thread_id| self.thread_workspace_id(thread_id))
+            })
+            .map(str::to_owned)
+            .unwrap_or_default()
+    }
+
     pub(in crate::app) fn thread_folder(&self, folder_id: &str) -> Option<&ThreadFolder> {
         self.thread_folders.get(folder_id)
     }

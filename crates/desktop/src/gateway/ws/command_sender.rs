@@ -301,6 +301,25 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::PROVIDER_LIST, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn gateway_settings_get(&self) -> Result<GatewaySettingsGetResponse> {
+        self.send_request_typed(
+            methods::SETTINGS_GET,
+            &GatewaySettingsGetParams::default(),
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn gateway_settings_update(
+        &self,
+        update: GatewaySettingsUpdate,
+    ) -> Result<GatewaySettingsUpdateResponse> {
+        self.send_request_typed(
+            methods::SETTINGS_UPDATE,
+            &GatewaySettingsUpdateParams { update },
+            RPC_REQUEST_TIMEOUT,
+        )
+    }
+
     pub fn provider_list_models(
         &self,
         params: ProviderListModelsParams,

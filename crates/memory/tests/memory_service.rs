@@ -3798,8 +3798,9 @@ async fn recall_mode_for_prompt_thread_and_task_context_require_native_provider(
         thread.skipped_reason.as_deref(),
         Some("thread_episodic_native_provider_required")
     );
-    assert!(thread.diagnostics.iter().any(|diagnostic| diagnostic
-        .contains("memory.active_recall.mode_native_provider_required:thread_episodic")));
+    assert!(thread.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("memory.active_recall.mode_native_provider_required:thread_episodic")
+    }));
 
     let task = service
         .recall_mode_for_prompt(
@@ -3821,8 +3822,9 @@ async fn recall_mode_for_prompt_thread_and_task_context_require_native_provider(
         task.skipped_reason.as_deref(),
         Some("task_context_native_provider_required")
     );
-    assert!(task.diagnostics.iter().any(|diagnostic| diagnostic
-        .contains("memory.active_recall.mode_native_provider_required:task_context")));
+    assert!(task.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("memory.active_recall.mode_native_provider_required:task_context")
+    }));
 
     let missing_task = service
         .recall_mode_for_prompt(

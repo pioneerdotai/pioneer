@@ -22,9 +22,9 @@ use gpui_component::{
 };
 use gpui_terminal::TerminalView;
 use pioneer_protocol::{
-    ArtifactRef, ArtifactSummary, McpListItem, McpServerDetailsResponse, SkillHealthItem,
-    SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement,
-    Workspace,
+    ArtifactRef, ArtifactSummary, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
+    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
+    ThreadPlacement, Workspace,
 };
 use std::{
     cell::RefCell,
@@ -178,6 +178,9 @@ pub(super) struct GatewayCoordinator {
     pub(super) connecting: bool,
     pub(super) setup_action: Option<GatewaySetupAction>,
     pub(super) bootstrap_complete: bool,
+    pub(super) settings: Option<GatewaySettingsSnapshot>,
+    pub(super) settings_loading: bool,
+    pub(super) settings_error: Option<String>,
 }
 
 #[derive(Default)]

@@ -111,11 +111,13 @@ fn episodic_item(
         title: None,
         provenance: MemoryEpisodicRecallProvenance {
             workspace_id: "ws".to_owned(),
-            thread_id: Some(match source {
-                MemoryEpisodicRecallSourceKind::RelatedThread => "related_thr",
-                _ => "thr",
-            }
-            .to_owned()),
+            thread_id: Some(
+                match source {
+                    MemoryEpisodicRecallSourceKind::RelatedThread => "related_thr",
+                    _ => "thr",
+                }
+                .to_owned(),
+            ),
             turn_id: Some("turn_prev".to_owned()),
             task_id: matches!(
                 source,
@@ -183,7 +185,10 @@ fn episodic_recall_dtos_are_typed_and_serializable() {
 
     let decoded: MemoryEpisodicRecallItem =
         serde_json::from_value(encoded).expect("episodic item deserializes");
-    assert_eq!(decoded.provenance.source, MemoryEpisodicRecallSourceKind::CurrentThread);
+    assert_eq!(
+        decoded.provenance.source,
+        MemoryEpisodicRecallSourceKind::CurrentThread
+    );
     assert_eq!(decoded.visibility, MemoryEpisodicRecallVisibility::Public);
 }
 
@@ -212,10 +217,12 @@ async fn missing_episodic_capability_drops_provider_selected_mode() {
 
     assert_eq!(provider.recall_call_count(), 0);
     assert_no_prompt_context_contributions(&response);
-    assert!(response.diagnostics.iter().any(|diagnostic| diagnostic
-        .message
-        .as_str()
-        .contains("dropped_mode=thread_episodic:capability_unavailable")));
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("dropped_mode=thread_episodic:capability_unavailable")
+    }));
 }
 
 #[test]
@@ -243,14 +250,21 @@ fn active_recall_planner_parses_new_episodic_modes_and_validates_capabilities() 
 
     assert_eq!(
         normalized.modes,
-        vec![ActiveRecallMode::CurrentTask, ActiveRecallMode::CurrentThread]
+        vec![
+            ActiveRecallMode::CurrentTask,
+            ActiveRecallMode::CurrentThread
+        ]
     );
-    assert!(normalized.diagnostics.iter().any(|diagnostic| {
-        diagnostic == "dropped_mode=related_thread:capability_unavailable"
-    }));
-    assert!(normalized.diagnostics.iter().any(|diagnostic| {
-        diagnostic == "dropped_mode=completed_task:capability_unavailable"
-    }));
+    assert!(
+        normalized.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "dropped_mode=related_thread:capability_unavailable"
+        })
+    );
+    assert!(
+        normalized.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "dropped_mode=completed_task:capability_unavailable"
+        })
+    );
 }
 
 #[tokio::test]
@@ -258,12 +272,11 @@ async fn current_thread_recall_uses_native_provider_and_separate_prompt_context(
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),
     ));
-    let mut episodic = FakeEpisodicRecallProvider::with_capabilities(
-        MemoryEpisodicRecallCapabilities {
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
             current_thread_search: true,
             ..MemoryEpisodicRecallCapabilities::default()
-        },
-    );
+        });
     episodic.current_thread = MemoryEpisodicRecallResponse {
         items: vec![episodic_item(
             "thread_snippet_1",
@@ -299,8 +312,16 @@ async fn current_thread_recall_uses_native_provider_and_separate_prompt_context(
         contributions[0].contribution_id.as_str(),
         MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
     );
-    assert!(contributions[0].content.as_str().contains("current thread snippet"));
-    assert_eq!(contributions[0].source_refs[0].kind.as_str(), "thread_context");
+    assert!(
+        contributions[0]
+            .content
+            .as_str()
+            .contains("current thread snippet")
+    );
+    assert_eq!(
+        contributions[0].source_refs[0].kind.as_str(),
+        "thread_context"
+    );
 }
 
 #[tokio::test]
@@ -325,12 +346,11 @@ async fn related_thread_recall_filters_workspace_and_visibility_boundaries() {
         MemoryEpisodicRecallSourceKind::RelatedThread,
         "Related thread decided to keep thread context separate from memory.",
     );
-    let mut episodic = FakeEpisodicRecallProvider::with_capabilities(
-        MemoryEpisodicRecallCapabilities {
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
             related_thread_search: true,
             ..MemoryEpisodicRecallCapabilities::default()
-        },
-    );
+        });
     episodic.related_threads = MemoryEpisodicRecallResponse {
         items: vec![hidden, other_workspace, visible],
         ..MemoryEpisodicRecallResponse::default()
@@ -373,12 +393,11 @@ async fn episodic_recall_applies_source_caps_and_deterministic_truncation() {
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),
     ));
-    let mut episodic = FakeEpisodicRecallProvider::with_capabilities(
-        MemoryEpisodicRecallCapabilities {
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
             related_thread_search: true,
             ..MemoryEpisodicRecallCapabilities::default()
-        },
-    );
+        });
     episodic.related_threads = MemoryEpisodicRecallResponse {
         items: vec![
             episodic_item(
@@ -434,13 +453,12 @@ async fn task_context_and_completed_task_modes_use_native_provider() {
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),
     ));
-    let mut episodic = FakeEpisodicRecallProvider::with_capabilities(
-        MemoryEpisodicRecallCapabilities {
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
             current_task_context: true,
             completed_task_summary: true,
             ..MemoryEpisodicRecallCapabilities::default()
-        },
-    );
+        });
     episodic.current_task = MemoryEpisodicRecallResponse {
         items: vec![episodic_item(
             "current_task_summary",
@@ -466,7 +484,10 @@ async fn task_context_and_completed_task_modes_use_native_provider() {
             plan: ActiveRecallPlan::run(
                 ActiveMemoryDecisionReasonCode::ProviderRun,
                 0.9,
-                vec![ActiveRecallMode::CurrentTask, ActiveRecallMode::CompletedTask],
+                vec![
+                    ActiveRecallMode::CurrentTask,
+                    ActiveRecallMode::CompletedTask,
+                ],
                 Vec::new(),
                 Vec::new(),
             ),
@@ -488,14 +509,18 @@ async fn task_context_and_completed_task_modes_use_native_provider() {
     assert_eq!(durable_provider.recall_call_count(), 0);
     assert_eq!(episodic.calls(), vec!["current_task", "completed_tasks"]);
     assert_eq!(result.episodic_items.len(), 2);
-    assert!(result
-        .episodic_items
-        .iter()
-        .any(|item| item.provenance.source == MemoryEpisodicRecallSourceKind::CurrentTask));
-    assert!(result
-        .episodic_items
-        .iter()
-        .any(|item| item.provenance.source == MemoryEpisodicRecallSourceKind::CompletedTask));
+    assert!(
+        result
+            .episodic_items
+            .iter()
+            .any(|item| item.provenance.source == MemoryEpisodicRecallSourceKind::CurrentTask)
+    );
+    assert!(
+        result
+            .episodic_items
+            .iter()
+            .any(|item| item.provenance.source == MemoryEpisodicRecallSourceKind::CompletedTask)
+    );
 }
 
 #[tokio::test]
@@ -531,8 +556,9 @@ async fn episodic_provider_timeout_skips_mode_without_turn_failure() {
 
     assert!(result.items.is_empty());
     assert!(result.episodic_items.is_empty());
-    assert!(result.diagnostics.iter().any(|diagnostic| diagnostic
-        .contains("memory.episodic_recall.mode_timed_out:current_thread")));
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("memory.episodic_recall.mode_timed_out:current_thread")
+    }));
 }
 
 #[tokio::test]

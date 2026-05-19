@@ -11,6 +11,7 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
     assert!(config.active_recall.max_prompt_chars > 0);
     assert!(config.active_recall.planner.enabled);
     assert!(config.active_recall.planner.timeout_ms > 0);
+    assert!(config.active_recall.timeout_ms > config.active_recall.planner.timeout_ms);
     assert!(config.active_recall.planner.max_input_chars > 0);
     assert!(config.active_recall.planner.max_output_chars > 0);
     assert_eq!(
@@ -33,7 +34,7 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
     assert_eq!(zero.top_k_per_query, 1);
     assert_eq!(zero.max_prompt_chars, 1);
     assert!(zero.planner.enabled);
-    assert_eq!(zero.planner.timeout_ms, 8_000);
+    assert_eq!(zero.planner.timeout_ms, 60_000);
     assert_eq!(zero.planner.max_input_chars, 4_000);
     assert_eq!(zero.planner.max_output_chars, 2_000);
 }

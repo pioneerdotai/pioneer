@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use pioneer_config::{AppConfig, GatewayMemoryConfig};
+use pioneer_config::{
+    AppConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+    GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path};
@@ -27,7 +30,7 @@ pub enum GatewaySecretsBackend {
     Keystore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayMemorySettings {
     pub enabled: bool,
     pub deterministic_recall_enabled: bool,
@@ -35,6 +38,10 @@ pub struct GatewayMemorySettings {
     pub tools_enabled: bool,
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
+    #[serde(default)]
+    pub active_recall_model: GatewayMemoryModelSelectionConfig,
+    #[serde(default)]
+    pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
     pub debug_trace_enabled: bool,
     pub strict_diagnostics_enabled: bool,
 }
@@ -45,7 +52,7 @@ impl Default for GatewayMemorySettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GatewayMemorySettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,6 +67,10 @@ struct GatewayMemorySettingsOverride {
     proactive_writes_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     background_extraction_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_recall_model: Option<GatewayMemoryModelSelectionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proactive_writes_model: Option<GatewayMemoryModelSelectionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     debug_trace_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,13 +96,36 @@ impl GatewaySettings {
 
     pub fn effective_memory_settings(&self, config: &GatewayMemoryConfig) -> GatewayMemorySettings {
         let settings = GatewayMemorySettings::from_gateway_memory_config(config);
-        self.memory
-            .map(|memory| memory.apply_to_memory_settings(settings))
-            .unwrap_or(settings)
+        if let Some(memory) = &self.memory {
+            memory.apply_to_memory_settings(settings)
+        } else {
+            settings
+        }
     }
 
     pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
+    }
+
+    pub fn snapshot(
+        &self,
+        config: &GatewayMemoryConfig,
+    ) -> pioneer_protocol::GatewaySettingsSnapshot {
+        pioneer_protocol::GatewaySettingsSnapshot {
+            memory: self.effective_memory_settings(config).to_protocol(),
+        }
+    }
+
+    pub fn apply_protocol_update(
+        &mut self,
+        update: pioneer_protocol::GatewaySettingsUpdate,
+    ) -> GatewaySettingsChangeSet {
+        let mut changes = GatewaySettingsChangeSet::default();
+        if let Some(memory) = update.memory {
+            self.set_memory_settings(GatewayMemorySettings::from_protocol(memory));
+            changes.memory = true;
+        }
+        changes
     }
 
     pub fn apply_to_gateway_memory_config(
@@ -120,10 +154,47 @@ impl GatewayMemorySettings {
             tools_enabled: config.tools_enabled,
             proactive_writes_enabled: config.proactive_writes_enabled,
             background_extraction_enabled: config.background_extraction_enabled,
+            active_recall_model: config.active_recall_model.clone(),
+            proactive_writes_model: config.proactive_writes_model.clone(),
             debug_trace_enabled: config.debug_trace_enabled,
             strict_diagnostics_enabled: config.strict_diagnostics_enabled,
         }
     }
+
+    pub fn from_protocol(settings: pioneer_protocol::GatewayMemorySettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            deterministic_recall_enabled: settings.deterministic_recall_enabled,
+            active_recall_enabled: settings.active_recall_enabled,
+            tools_enabled: settings.tools_enabled,
+            proactive_writes_enabled: settings.proactive_writes_enabled,
+            background_extraction_enabled: settings.background_extraction_enabled,
+            active_recall_model: model_selection_from_protocol(settings.active_recall_model),
+            proactive_writes_model: model_selection_from_protocol(settings.proactive_writes_model),
+            debug_trace_enabled: settings.debug_trace_enabled,
+            strict_diagnostics_enabled: settings.strict_diagnostics_enabled,
+        }
+    }
+
+    pub fn to_protocol(&self) -> pioneer_protocol::GatewayMemorySettings {
+        pioneer_protocol::GatewayMemorySettings {
+            enabled: self.enabled,
+            deterministic_recall_enabled: self.deterministic_recall_enabled,
+            active_recall_enabled: self.active_recall_enabled,
+            tools_enabled: self.tools_enabled,
+            proactive_writes_enabled: self.proactive_writes_enabled,
+            background_extraction_enabled: self.background_extraction_enabled,
+            active_recall_model: model_selection_to_protocol(&self.active_recall_model),
+            proactive_writes_model: model_selection_to_protocol(&self.proactive_writes_model),
+            debug_trace_enabled: self.debug_trace_enabled,
+            strict_diagnostics_enabled: self.strict_diagnostics_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewaySettingsChangeSet {
+    pub memory: bool,
 }
 
 impl GatewayMemorySettingsOverride {
@@ -135,13 +206,15 @@ impl GatewayMemorySettingsOverride {
             tools_enabled: Some(settings.tools_enabled),
             proactive_writes_enabled: Some(settings.proactive_writes_enabled),
             background_extraction_enabled: Some(settings.background_extraction_enabled),
+            active_recall_model: Some(settings.active_recall_model),
+            proactive_writes_model: Some(settings.proactive_writes_model),
             debug_trace_enabled: Some(settings.debug_trace_enabled),
             strict_diagnostics_enabled: Some(settings.strict_diagnostics_enabled),
         }
     }
 
     fn apply_to_memory_settings(
-        self,
+        &self,
         mut settings: GatewayMemorySettings,
     ) -> GatewayMemorySettings {
         if let Some(enabled) = self.enabled {
@@ -161,6 +234,12 @@ impl GatewayMemorySettingsOverride {
         }
         if let Some(background_extraction_enabled) = self.background_extraction_enabled {
             settings.background_extraction_enabled = background_extraction_enabled;
+        }
+        if let Some(active_recall_model) = &self.active_recall_model {
+            settings.active_recall_model = active_recall_model.clone();
+        }
+        if let Some(proactive_writes_model) = &self.proactive_writes_model {
+            settings.proactive_writes_model = proactive_writes_model.clone();
         }
         if let Some(debug_trace_enabled) = self.debug_trace_enabled {
             settings.debug_trace_enabled = debug_trace_enabled;
@@ -193,6 +272,12 @@ impl GatewayMemorySettingsOverride {
         if let Some(background_extraction_enabled) = self.background_extraction_enabled {
             config.background_extraction_enabled = background_extraction_enabled;
         }
+        if let Some(active_recall_model) = &self.active_recall_model {
+            config.active_recall_model = active_recall_model.clone();
+        }
+        if let Some(proactive_writes_model) = &self.proactive_writes_model {
+            config.proactive_writes_model = proactive_writes_model.clone();
+        }
         if let Some(debug_trace_enabled) = self.debug_trace_enabled {
             config.debug_trace_enabled = debug_trace_enabled;
         }
@@ -200,6 +285,42 @@ impl GatewayMemorySettingsOverride {
             config.strict_diagnostics_enabled = strict_diagnostics_enabled;
         }
         config
+    }
+}
+
+fn model_selection_from_protocol(
+    selection: pioneer_protocol::GatewayMemoryModelSelection,
+) -> GatewayMemoryModelSelectionConfig {
+    let source = match selection.source {
+        pioneer_protocol::GatewayMemoryModelSelectionSource::Thread => {
+            ConfigGatewayMemoryModelSelectionSource::Thread
+        }
+        pioneer_protocol::GatewayMemoryModelSelectionSource::Custom => {
+            ConfigGatewayMemoryModelSelectionSource::Custom
+        }
+    };
+    GatewayMemoryModelSelectionConfig {
+        source,
+        model_provider: selection.model_provider,
+        model: selection.model,
+    }
+}
+
+fn model_selection_to_protocol(
+    selection: &GatewayMemoryModelSelectionConfig,
+) -> pioneer_protocol::GatewayMemoryModelSelection {
+    let source = match &selection.source {
+        ConfigGatewayMemoryModelSelectionSource::Thread => {
+            pioneer_protocol::GatewayMemoryModelSelectionSource::Thread
+        }
+        ConfigGatewayMemoryModelSelectionSource::Custom => {
+            pioneer_protocol::GatewayMemoryModelSelectionSource::Custom
+        }
+    };
+    pioneer_protocol::GatewayMemoryModelSelection {
+        source,
+        model_provider: selection.model_provider.clone(),
+        model: selection.model.clone(),
     }
 }
 
@@ -329,7 +450,7 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{GatewayMemorySettings, load_or_create_gateway_settings, save_gateway_settings};
-    use pioneer_config::GatewayMemoryConfig;
+    use pioneer_config::{GatewayMemoryConfig, GatewayMemoryModelSelectionConfig};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -369,6 +490,8 @@ backend = "keystore"
 [memory]
 enabled = false
 debug_trace_enabled = true
+active_recall_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
+proactive_writes_model = { source = "custom", model_provider = "extractor-provider", model = "extractor-model" }
 "#,
         )
         .expect("gateway settings should parse");
@@ -397,6 +520,14 @@ debug_trace_enabled = true
         assert!(!mapped.tools_enabled);
         assert!(!mapped.proactive_writes_enabled);
         assert!(!mapped.background_extraction_enabled);
+        assert_eq!(
+            mapped.active_recall_model,
+            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
+        );
+        assert_eq!(
+            mapped.proactive_writes_model,
+            GatewayMemoryModelSelectionConfig::custom("extractor-provider", "extractor-model")
+        );
         assert!(mapped.debug_trace_enabled);
         assert!(mapped.strict_diagnostics_enabled);
     }
@@ -416,6 +547,11 @@ debug_trace_enabled = true
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
+            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
+                "planner-provider",
+                "planner-model",
+            ),
+            proactive_writes_model: GatewayMemoryModelSelectionConfig::thread(),
             debug_trace_enabled: true,
             strict_diagnostics_enabled: true,
         });
@@ -429,6 +565,10 @@ debug_trace_enabled = true
         assert!(content.contains("tools_enabled = false"));
         assert!(content.contains("proactive_writes_enabled = false"));
         assert!(content.contains("background_extraction_enabled = false"));
+        assert!(content.contains("active_recall_model"));
+        assert!(content.contains("model_provider = \"planner-provider\""));
+        assert!(content.contains("model = \"planner-model\""));
+        assert!(content.contains("proactive_writes_model = \"thread\""));
         assert!(content.contains("debug_trace_enabled = true"));
         assert!(content.contains("strict_diagnostics_enabled = true"));
         assert!(!content.contains("capsules_dir"));

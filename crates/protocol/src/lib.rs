@@ -10,6 +10,7 @@ mod memory;
 mod notification;
 mod provider;
 mod schema;
+mod settings;
 mod skills;
 mod task;
 mod thread;
@@ -96,6 +97,11 @@ pub use provider::{
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
+};
+pub use settings::{
+    GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource, GatewayMemorySettings,
+    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
+    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

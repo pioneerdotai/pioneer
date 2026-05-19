@@ -113,10 +113,15 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             }
         };
 
+        let extractor_model = config.model.clone().or_else(|| input.model.clone());
+        let extractor_model_provider = config
+            .provider_name
+            .clone()
+            .or_else(|| input.model_provider.clone());
         let extractor_context = memory_post_turn_extractor_context_from_turn(
             &context,
-            input.model.clone(),
-            input.model_provider.clone(),
+            extractor_model.clone(),
+            extractor_model_provider.clone(),
         );
         let extractor_request =
             memory_post_turn_extractor_request_from_input(input, manifest, &config);
@@ -161,8 +166,8 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 &policy,
                 &config,
                 source_context_kind,
-                input.model.as_deref(),
-                input.model_provider.as_deref(),
+                extractor_model.as_deref(),
+                extractor_model_provider.as_deref(),
             ) else {
                 stats.validation_rejected_count += 1;
                 continue;

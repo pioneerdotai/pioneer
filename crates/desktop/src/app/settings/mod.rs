@@ -13,3 +13,9 @@ pub(super) enum MemorySettingToggle {
     BackgroundExtraction,
     DebugTrace,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryModelSetting {
+    ActiveRecallPlanner,
+    PostTurnExtractor,
+}

@@ -41,6 +41,12 @@ const DEFAULT_LIST_LIMIT: u32 = 50;
 const MAX_LIST_LIMIT: u32 = 100;
 const SNIPPET_MAX_CHARS: usize = 280;
 
+#[derive(Debug, Clone, Copy)]
+enum MemoryInternalModelPurpose {
+    ActiveRecallPlanner,
+    PostTurnExtractor,
+}
+
 #[derive(Clone)]
 pub(crate) struct GatewayMemoryProvider {
     processor: Weak<MessageProcessor>,
@@ -56,6 +62,30 @@ impl GatewayMemoryProvider {
             .upgrade()
             .ok_or_else(|| "message processor is no longer available".to_owned())
     }
+
+    fn resolve_internal_model(
+        &self,
+        processor: &MessageProcessor,
+        purpose: MemoryInternalModelPurpose,
+        fallback_provider: Option<&str>,
+        fallback_model: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let config = processor.memory_loop_config();
+        let (configured_provider, configured_model) = match purpose {
+            MemoryInternalModelPurpose::ActiveRecallPlanner => (
+                config.active_recall.planner.provider_name,
+                config.active_recall.planner.model,
+            ),
+            MemoryInternalModelPurpose::PostTurnExtractor => (
+                config.post_turn_extractor.provider_name,
+                config.post_turn_extractor.model,
+            ),
+        };
+        (
+            configured_provider.or_else(|| fallback_provider.map(str::to_owned)),
+            configured_model.or_else(|| fallback_model.map(str::to_owned)),
+        )
+    }
 }
 
 #[async_trait]
@@ -66,6 +96,15 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
         request: MemoryRecallRequest,
     ) -> Result<MemoryRecallSnapshot, String> {
         let processor = self.processor()?;
+        if !processor.memory_loop_config().deterministic_recall_enabled {
+            return Ok(MemoryRecallSnapshot {
+                items: Vec::new(),
+                diagnostics: vec![
+                    "memory deterministic recall disabled by runtime settings".into(),
+                ],
+                truncated: false,
+            });
+        }
         let runtime = processor.memory_runtime();
         if let Err(error) = runtime.ensure_enabled() {
             return Ok(MemoryRecallSnapshot {
@@ -114,6 +153,12 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
         context: MemoryTurnContext,
     ) -> Result<MemoryToolMaterialization, String> {
         let processor = self.processor()?;
+        if !processor.memory_loop_config().tools_enabled {
+            return Ok(MemoryToolMaterialization {
+                bundles: Vec::new(),
+                diagnostics: vec!["memory tools disabled by runtime settings".into()],
+            });
+        }
         let runtime = processor.memory_runtime();
         if let Err(error) = runtime.ensure_enabled() {
             return Ok(MemoryToolMaterialization {
@@ -192,12 +237,20 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         request: MemoryPostTurnExtractorRequest,
     ) -> Result<String, String> {
         let processor = self.processor()?;
-        let provider_name = context
-            .model_provider
+        let config = processor.memory_loop_config().post_turn_extractor;
+        if !config.enabled || !config.provider_enabled || !config.proactive_writes_enabled {
+            return Ok(r#"{"facts":[]}"#.to_owned());
+        }
+        let (provider_name, model) = self.resolve_internal_model(
+            processor.as_ref(),
+            MemoryInternalModelPurpose::PostTurnExtractor,
+            context.model_provider.as_deref(),
+            context.model.as_deref(),
+        );
+        let provider_name = provider_name
             .as_deref()
             .ok_or_else(|| "missing model provider for memory post-turn extractor".to_owned())?;
-        let model = context
-            .model
+        let model = model
             .as_deref()
             .ok_or_else(|| "missing model for memory post-turn extractor".to_owned())?;
         let provider = processor
@@ -218,12 +271,23 @@ impl AgentActiveMemoryDecisionProvider for GatewayMemoryProvider {
         request: MemoryActiveRecallDecisionRequest,
     ) -> Result<String, String> {
         let processor = self.processor()?;
-        let provider_name = context
-            .model_provider
+        let config = processor.memory_loop_config().active_recall;
+        if config.mode == pioneer_memory::hooks::MemoryActiveRecallMode::Disabled {
+            return Ok(
+                r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[]}"#
+                    .to_owned(),
+            );
+        }
+        let (provider_name, model) = self.resolve_internal_model(
+            processor.as_ref(),
+            MemoryInternalModelPurpose::ActiveRecallPlanner,
+            context.model_provider.as_deref(),
+            context.model.as_deref(),
+        );
+        let provider_name = provider_name
             .as_deref()
             .ok_or_else(|| "missing model provider for active memory planner".to_owned())?;
-        let model = context
-            .model
+        let model = model
             .as_deref()
             .ok_or_else(|| "missing model for active memory planner".to_owned())?;
         let provider = processor

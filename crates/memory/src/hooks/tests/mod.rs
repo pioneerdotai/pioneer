@@ -672,6 +672,7 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
 struct TestPostTurnExtractorProvider {
     json: String,
     calls: Arc<Mutex<usize>>,
+    contexts: Arc<Mutex<Vec<MemoryPostTurnExtractorContext>>>,
     prompts: Arc<Mutex<Vec<String>>>,
 }
 
@@ -680,6 +681,7 @@ impl TestPostTurnExtractorProvider {
         Self {
             json: json.into(),
             calls: Arc::new(Mutex::new(0)),
+            contexts: Arc::new(Mutex::new(Vec::new())),
             prompts: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -691,16 +693,24 @@ impl TestPostTurnExtractorProvider {
     fn prompts(&self) -> Vec<String> {
         self.prompts.lock().expect("prompt lock poisoned").clone()
     }
+
+    fn contexts(&self) -> Vec<MemoryPostTurnExtractorContext> {
+        self.contexts.lock().expect("context lock poisoned").clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
     async fn extract_post_turn_memory_json(
         &self,
-        _context: MemoryPostTurnExtractorContext,
+        context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
     ) -> Result<String, String> {
         *self.calls.lock().expect("extractor call lock poisoned") += 1;
+        self.contexts
+            .lock()
+            .expect("context lock poisoned")
+            .push(context);
         self.prompts
             .lock()
             .expect("prompt lock poisoned")

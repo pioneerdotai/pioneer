@@ -152,6 +152,9 @@ impl PioneerDesktop {
                 connecting: true,
                 setup_action: None,
                 bootstrap_complete: false,
+                settings: None,
+                settings_loading: false,
+                settings_error: None,
             },
         };
 

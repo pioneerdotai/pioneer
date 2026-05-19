@@ -559,9 +559,17 @@ description = "役立つ場合に、保存済みの事実やプロジェクト�
 label = "能動的な呼び出し"
 description = "文脈の多いタスク向けに、読み取り専用の追加メモリ呼び出し計画を実行します。"
 
+[settings.memory.active_recall_model]
+label = "能動的呼び出しモデル"
+description = "メモリ読み取り計画に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
+
 [settings.memory.proactive_writes]
 label = "能動的な書き込み"
 description = "ターン後に、信頼度の高い永続的な事実を保存します。"
+
+[settings.memory.proactive_writes_model]
+label = "ターン後抽出モデル"
+description = "ターン後のメモリ抽出に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
 
 [settings.memory.background_extraction]
 label = "バックグラウンド抽出"
@@ -570,6 +578,11 @@ description = "ターンをブロックせず、ターン後のメモリ抽出�
 [settings.memory.debug_trace]
 label = "デバッグトレース"
 description = "ローカルのデバッグ画面にメモリ機構の診断を表示します。"
+
+[settings.memory.model]
+default = "デフォルト"
+select_model = "モデルを選択"
+dialog_title = "メモリモデルを選択"
 
 [settings.language]
 system = "システム既定"

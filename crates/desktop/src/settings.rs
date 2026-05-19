@@ -1,10 +1,6 @@
 use anyhow::{Context as _, Result};
 use gpui::{App, Global};
 use pioneer_config::AppConfig;
-use pioneer_gateway::{
-    GatewayMemorySettings, load_or_create_gateway_settings, normalize_settings_file_name,
-    save_gateway_settings,
-};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
 
@@ -22,7 +18,7 @@ struct DesktopSettingsFile {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct LegacyDesktopSettingsFile {
     #[serde(default)]
-    memory: Option<MemorySettings>,
+    memory: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -65,8 +61,6 @@ struct GeneralSettings {
     theme: WindowThemePreference,
 }
 
-pub(crate) type MemorySettings = GatewayMemorySettings;
-
 struct DesktopSettingsState {
     path: PathBuf,
     settings: DesktopSettingsFile,
@@ -99,10 +93,6 @@ pub(crate) fn app_language(cx: &App) -> AppLanguagePreference {
         .unwrap_or_default()
 }
 
-pub(crate) fn memory_settings(_cx: &App) -> MemorySettings {
-    load_memory_settings().unwrap_or_default()
-}
-
 pub(crate) fn set_app_language(cx: &mut App, language: AppLanguagePreference) -> Result<()> {
     ensure_loaded(cx)?;
 
@@ -131,37 +121,9 @@ pub(crate) fn set_window_theme(cx: &mut App, theme: WindowThemePreference) -> Re
     Ok(())
 }
 
-pub(crate) fn set_memory_settings(_cx: &mut App, memory: MemorySettings) -> Result<()> {
-    let config = AppConfig::load().context("failed to load app config for gateway settings")?;
-    let path = gateway_settings_path(&config)?;
-    let settings_file_name =
-        normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
-    let mut settings = load_or_create_gateway_settings(
-        path.as_path(),
-        config.gateway.settings_version,
-        settings_file_name.as_str(),
-    )?;
-    settings.set_memory_settings(memory);
-    save_gateway_settings(path.as_path(), &settings)?;
-    Ok(())
-}
-
 pub(crate) fn load_app_language_preference() -> Option<AppLanguagePreference> {
     let settings = load_settings_file().ok()?;
     Some(settings.general.language)
-}
-
-pub(crate) fn load_memory_settings() -> Result<MemorySettings> {
-    let config = AppConfig::load().context("failed to load app config for gateway settings")?;
-    let path = gateway_settings_path(&config)?;
-    let settings_file_name =
-        normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
-    let settings = load_or_create_gateway_settings(
-        path.as_path(),
-        config.gateway.settings_version,
-        settings_file_name.as_str(),
-    )?;
-    Ok(settings.effective_memory_settings(&config.gateway.memory))
 }
 
 pub(crate) fn resolve_app_locale() -> String {
@@ -225,15 +187,6 @@ fn settings_path() -> Result<PathBuf> {
     Ok(runtime_home.join(DESKTOP_SETTINGS_FILE_NAME))
 }
 
-fn gateway_settings_path(config: &AppConfig) -> Result<PathBuf> {
-    let runtime_home = config
-        .ensure_runtime_home_dir()
-        .context("failed to ensure runtime home dir for gateway settings")?;
-    let settings_file_name =
-        normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
-    Ok(runtime_home.join(settings_file_name))
-}
-
 fn load_settings_file() -> Result<DesktopSettingsFile> {
     let path = settings_path()?;
     if !path.is_file() {
@@ -271,26 +224,12 @@ fn migrate_legacy_desktop_memory_settings(
     raw: &str,
     settings: &DesktopSettingsFile,
 ) -> Result<()> {
-    let Some(memory) = toml::from_str::<LegacyDesktopSettingsFile>(raw)
+    let Some(_memory) = toml::from_str::<LegacyDesktopSettingsFile>(raw)
         .ok()
         .and_then(|legacy| legacy.memory)
     else {
         return Ok(());
     };
-
-    let config = AppConfig::load().context("failed to load app config for gateway settings")?;
-    let gateway_path = gateway_settings_path(&config)?;
-    let settings_file_name =
-        normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
-    let mut gateway_settings = load_or_create_gateway_settings(
-        gateway_path.as_path(),
-        config.gateway.settings_version,
-        settings_file_name.as_str(),
-    )?;
-    if !gateway_settings.has_memory_settings() {
-        gateway_settings.set_memory_settings(memory);
-        save_gateway_settings(gateway_path.as_path(), &gateway_settings)?;
-    }
 
     write_settings_file(path, serialize_settings(settings)?)?;
     Ok(())

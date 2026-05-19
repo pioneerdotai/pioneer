@@ -1,10 +1,13 @@
 use crate::{
     app::{
         root::{PioneerDesktop, SettingsContentView},
-        settings::MemorySettingToggle,
+        settings::{MemoryModelSetting, MemorySettingToggle},
     },
     assets::PioneerIconName,
-    components::buttonts::small_outline_button,
+    components::{
+        buttonts::small_outline_button,
+        model_selector::{ModelSelectorDialogOptions, ModelSelectorSelection},
+    },
     settings::{self, AppLanguagePreference, WindowThemePreference},
 };
 use gpui::{prelude::*, *};
@@ -15,6 +18,8 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings};
+use std::rc::Rc;
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
 
@@ -86,7 +91,12 @@ impl PioneerDesktop {
     }
 
     fn render_settings_memory(&self, cx: &mut Context<Self>) -> AnyElement {
-        let memory_settings = settings::memory_settings(cx);
+        let memory_settings = self
+            .gateway
+            .settings
+            .as_ref()
+            .map(|settings| settings.memory.clone())
+            .unwrap_or_default();
         let desktop_entity = cx.entity().clone();
 
         v_flex()
@@ -214,7 +224,7 @@ impl PioneerDesktop {
     }
 
     fn render_memory_settings(
-        memory: settings::MemorySettings,
+        memory: GatewayMemorySettings,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -247,6 +257,19 @@ impl PioneerDesktop {
                 cx,
             ))
             .child(Self::render_settings_divider(cx))
+            .when(memory.enabled && memory.active_recall_enabled, |settings| {
+                settings
+                    .child(Self::render_memory_model_row(
+                        "settings-memory-active-recall-model",
+                        MemoryModelSetting::ActiveRecallPlanner,
+                        memory.active_recall_model.clone(),
+                        t!("settings.memory.active_recall_model.label").to_string(),
+                        t!("settings.memory.active_recall_model.description").to_string(),
+                        desktop_entity.clone(),
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
+            })
             .child(Self::render_memory_toggle_row(
                 "settings-memory-proactive-writes",
                 MemorySettingToggle::ProactiveWrites,
@@ -257,6 +280,22 @@ impl PioneerDesktop {
                 cx,
             ))
             .child(Self::render_settings_divider(cx))
+            .when(
+                memory.enabled && memory.proactive_writes_enabled,
+                |settings| {
+                    settings
+                        .child(Self::render_memory_model_row(
+                            "settings-memory-post-turn-extractor-model",
+                            MemoryModelSetting::PostTurnExtractor,
+                            memory.proactive_writes_model.clone(),
+                            t!("settings.memory.proactive_writes_model.label").to_string(),
+                            t!("settings.memory.proactive_writes_model.description").to_string(),
+                            desktop_entity.clone(),
+                            cx,
+                        ))
+                        .child(Self::render_settings_divider(cx))
+                },
+            )
             .child(Self::render_memory_toggle_row(
                 "settings-memory-background-extraction",
                 MemorySettingToggle::BackgroundExtraction,
@@ -316,6 +355,130 @@ impl PioneerDesktop {
                             view.apply_memory_setting(toggle, *enabled, cx);
                             cx.notify();
                         });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_memory_model_row(
+        id: &'static str,
+        setting: MemoryModelSetting,
+        selection: GatewayMemoryModelSelection,
+        label: String,
+        description: String,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_provider = selection.model_provider_override();
+        let selected_model = selection.model_override();
+        let is_custom = selected_provider.is_some() && selected_model.is_some();
+        let selection_label = if let (Some(provider), Some(model)) =
+            (selected_provider.clone(), selected_model.clone())
+        {
+            format!("{provider}/{model}")
+        } else {
+            t!("settings.memory.model.default").to_string()
+        };
+
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_start()
+            .child(
+                v_flex()
+                    .child(div().text_sm().font_semibold().child(label))
+                    .child(div().text_xs().opacity(0.6).child(description)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .mt_0p5()
+                    .child(
+                        div()
+                            .max_w(px(260.))
+                            .text_xs()
+                            .opacity(0.65)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(selection_label),
+                    )
+                    .child(
+                        small_outline_button((id, 0usize))
+                            .label(t!("settings.memory.model.select_model").to_string())
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                let selected_provider = selected_provider.clone();
+                                let selected_model = selected_model.clone();
+                                move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        let workspace_id = view.model_selector_workspace_id();
+                                        view.open_model_selector_dialog(
+                                            ModelSelectorDialogOptions {
+                                                title: t!(
+                                                    "settings.memory.model.dialog_title"
+                                                )
+                                                .to_string(),
+                                                selected_provider: selected_provider.clone(),
+                                                selected_model: selected_model.clone(),
+                                                workspace_id,
+                                                ws_sender: view.gateway.ws_command_sender.clone(),
+                                                on_save: Rc::new(
+                                                    move |view: &mut PioneerDesktop,
+                                                          selection: ModelSelectorSelection,
+                                                          cx| {
+                                                        let model_selection =
+                                                            match (selection.provider, selection.model)
+                                                            {
+                                                                (Some(provider), Some(model))
+                                                                    if !provider.trim().is_empty()
+                                                                        && !model.trim().is_empty() =>
+                                                                {
+                                                                    GatewayMemoryModelSelection::custom(
+                                                                        provider,
+                                                                        model,
+                                                                    )
+                                                                }
+                                                                _ => {
+                                                                    GatewayMemoryModelSelection::thread()
+                                                                }
+                                                            };
+                                                        view.apply_memory_model_setting(
+                                                            setting,
+                                                            model_selection,
+                                                            cx,
+                                                        );
+                                                        true
+                                                    },
+                                                ),
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                    )
+                    .when(is_custom, |row| {
+                        row.child(
+                            small_outline_button((id, 1usize))
+                                .label(t!("settings.memory.model.default").to_string())
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    move |_, _, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.apply_memory_model_setting(
+                                                setting,
+                                                GatewayMemoryModelSelection::thread(),
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
                     }),
             )
             .into_any_element()

@@ -31,6 +31,7 @@ use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
+use pioneer_agent::MemoryLoopConfig;
 use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
 use pioneer_artifacts::{
     ArtifactBindingTarget, ArtifactGcPolicy, ArtifactQuotaPolicy, ArtifactRegistrationCandidate,
@@ -95,6 +96,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinHandle;
@@ -177,6 +179,7 @@ pub struct MessageProcessor {
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     skills_watcher_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     tool_loop_config: ToolLoopConfig,
+    memory_loop_config: Arc<StdRwLock<MemoryLoopConfig>>,
     skills_snapshot_version: Arc<AtomicU64>,
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
@@ -222,9 +225,12 @@ impl MessageProcessor {
             gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
         ));
+        let normalized_tool_loop_config = tool_loop_config.normalized();
+        let memory_loop_config =
+            Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let agent_manager = Arc::new(AgentManager::new_with_mcp(
             provider_registry.clone(),
-            tool_loop_config.clone(),
+            normalized_tool_loop_config.clone(),
             Some(mcp_service.clone()),
         ));
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
@@ -277,7 +283,8 @@ impl MessageProcessor {
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
             skills_watcher_worker: Arc::new(Mutex::new(None)),
-            tool_loop_config,
+            tool_loop_config: normalized_tool_loop_config,
+            memory_loop_config,
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -390,7 +397,7 @@ impl MessageProcessor {
                 Some(memory_provider),
                 None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
-                self.tool_loop_config.memory.clone(),
+                self.memory_loop_config(),
             ))
             .and_then(|builder| {
                 builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
@@ -418,6 +425,20 @@ impl MessageProcessor {
 
     pub(crate) fn provider_registry(&self) -> Arc<ProviderRegistry> {
         self.provider_registry.clone()
+    }
+
+    pub(crate) fn memory_loop_config(&self) -> MemoryLoopConfig {
+        self.memory_loop_config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_else(|_| self.tool_loop_config.memory.clone())
+            .normalized()
+    }
+
+    pub(crate) fn apply_memory_loop_config(&self, config: MemoryLoopConfig) {
+        if let Ok(mut current) = self.memory_loop_config.write() {
+            *current = config.normalized();
+        }
     }
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
@@ -1131,6 +1152,87 @@ impl MessageProcessor {
         ));
         let artifact_downloads =
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
+        let normalized_tool_loop_config = ToolLoopConfig {
+            web: pioneer_tools::WebToolsConfig {
+                default_timeout_ms: web.default_timeout_ms,
+                hard_max_timeout_ms: web.hard_max_timeout_ms,
+                default_fetch_max_bytes: web.default_fetch_max_bytes,
+                hard_fetch_max_bytes: web.hard_fetch_max_bytes,
+                default_download_max_bytes: web.default_download_max_bytes,
+                hard_download_max_bytes: web.hard_download_max_bytes,
+                default_max_results: web.default_max_results,
+                hard_max_results: web.hard_max_results,
+                default_snippet_chars: web.default_snippet_chars,
+                hard_max_snippet_chars: web.hard_max_snippet_chars,
+                default_link_count: web.default_link_count,
+                hard_link_count: web.hard_link_count,
+                default_render_max_chars: web.default_render_max_chars,
+                ddg_html_search_url: web.ddg_html_search_url,
+                ddg_instant_api_url: web.ddg_instant_api_url,
+                default_user_agent: web.default_user_agent,
+            },
+            computer_use: pioneer_tools::ComputerUseToolsConfig {
+                runtime_home_dir: std::env::temp_dir().join("pioneer-message-tests"),
+                artifacts_subdir: "tools/computer_use".to_owned(),
+                ..pioneer_tools::ComputerUseToolsConfig::default()
+            },
+            skills: pioneer_agent::SkillsLoopConfig {
+                enabled: true,
+                max_skills_per_source: 256,
+                max_skill_file_bytes: 1024 * 1024,
+                prompt_max_chars: 24_000,
+                allow_implicit_invocation: false,
+                system_roots: Vec::new(),
+                user_roots: vec!["{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned()],
+                registry_roots: vec![
+                    "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
+                ],
+                validation: pioneer_agent::SkillsValidationLoopConfig {
+                    strict_agentskills: true,
+                    accept_openclaw_profile: true,
+                },
+                security: pioneer_agent::SkillsSecurityLoopConfig {
+                    allow_untrusted_install: false,
+                    min_trust_for_shell_tools: pioneer_skills::SkillTrustLevel::Verified,
+                    min_trust_for_http_tools: pioneer_skills::SkillTrustLevel::Community,
+                    min_trust_for_function_proxy_tools: pioneer_skills::SkillTrustLevel::Community,
+                    max_install_archive_bytes: 10 * 1024 * 1024,
+                    max_install_archive_compressed_bytes: 10 * 1024 * 1024,
+                    max_install_archive_uncompressed_bytes: 50 * 1024 * 1024,
+                    max_install_archive_entries: 2048,
+                    max_install_file_bytes: 1024 * 1024,
+                    upload_ttl_secs: 3600,
+                    upload_recommended_chunk_size_bytes: 256 * 1024,
+                    upload_max_chunk_size_bytes: 1024 * 1024,
+                },
+                dependencies: pioneer_agent::SkillsDependenciesLoopConfig {
+                    preflight_on_resolve: true,
+                    runtime_recheck_on_tool_call: true,
+                },
+                runtime: pioneer_agent::SkillsRuntimeLoopConfig {
+                    enable_dynamic_tools: true,
+                    enable_read_skill: true,
+                    max_dynamic_tools_per_skill: 64,
+                    read_skill_max_chars: 24_000,
+                    compact_mode_threshold: 6,
+                    allow_shell_tools: true,
+                    allow_http_tools: true,
+                    allow_function_proxy_tools: true,
+                },
+            },
+            memory: pioneer_memory::hooks::MemoryLoopConfig {
+                active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
+                    mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
+                    ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
+                },
+                ..pioneer_memory::hooks::MemoryLoopConfig::default()
+            },
+            budget: pioneer_tools::ToolLoopBudgetConfig::default(),
+            retry: pioneer_tools::ToolRetryBudgetConfig::default(),
+        }
+        .normalized();
+        let memory_loop_config =
+            Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         Self {
             thread_manager,
             agent_manager,
@@ -1164,88 +1266,8 @@ impl MessageProcessor {
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
             skills_watcher_worker: Arc::new(Mutex::new(None)),
-            tool_loop_config: ToolLoopConfig {
-                web: pioneer_tools::WebToolsConfig {
-                    default_timeout_ms: web.default_timeout_ms,
-                    hard_max_timeout_ms: web.hard_max_timeout_ms,
-                    default_fetch_max_bytes: web.default_fetch_max_bytes,
-                    hard_fetch_max_bytes: web.hard_fetch_max_bytes,
-                    default_download_max_bytes: web.default_download_max_bytes,
-                    hard_download_max_bytes: web.hard_download_max_bytes,
-                    default_max_results: web.default_max_results,
-                    hard_max_results: web.hard_max_results,
-                    default_snippet_chars: web.default_snippet_chars,
-                    hard_max_snippet_chars: web.hard_max_snippet_chars,
-                    default_link_count: web.default_link_count,
-                    hard_link_count: web.hard_link_count,
-                    default_render_max_chars: web.default_render_max_chars,
-                    ddg_html_search_url: web.ddg_html_search_url,
-                    ddg_instant_api_url: web.ddg_instant_api_url,
-                    default_user_agent: web.default_user_agent,
-                },
-                computer_use: pioneer_tools::ComputerUseToolsConfig {
-                    runtime_home_dir: std::env::temp_dir().join("pioneer-message-tests"),
-                    artifacts_subdir: "tools/computer_use".to_owned(),
-                    ..pioneer_tools::ComputerUseToolsConfig::default()
-                },
-                skills: pioneer_agent::SkillsLoopConfig {
-                    enabled: true,
-                    max_skills_per_source: 256,
-                    max_skill_file_bytes: 1024 * 1024,
-                    prompt_max_chars: 24_000,
-                    allow_implicit_invocation: false,
-                    system_roots: Vec::new(),
-                    user_roots: vec![
-                        "{homeDirectory}/skills/workspace/{workspaceId}/user".to_owned(),
-                    ],
-                    registry_roots: vec![
-                        "{homeDirectory}/skills/workspace/{workspaceId}/registry".to_owned(),
-                    ],
-                    validation: pioneer_agent::SkillsValidationLoopConfig {
-                        strict_agentskills: true,
-                        accept_openclaw_profile: true,
-                    },
-                    security: pioneer_agent::SkillsSecurityLoopConfig {
-                        allow_untrusted_install: false,
-                        min_trust_for_shell_tools: pioneer_skills::SkillTrustLevel::Verified,
-                        min_trust_for_http_tools: pioneer_skills::SkillTrustLevel::Community,
-                        min_trust_for_function_proxy_tools:
-                            pioneer_skills::SkillTrustLevel::Community,
-                        max_install_archive_bytes: 10 * 1024 * 1024,
-                        max_install_archive_compressed_bytes: 10 * 1024 * 1024,
-                        max_install_archive_uncompressed_bytes: 50 * 1024 * 1024,
-                        max_install_archive_entries: 2048,
-                        max_install_file_bytes: 1024 * 1024,
-                        upload_ttl_secs: 3600,
-                        upload_recommended_chunk_size_bytes: 256 * 1024,
-                        upload_max_chunk_size_bytes: 1024 * 1024,
-                    },
-                    dependencies: pioneer_agent::SkillsDependenciesLoopConfig {
-                        preflight_on_resolve: true,
-                        runtime_recheck_on_tool_call: true,
-                    },
-                    runtime: pioneer_agent::SkillsRuntimeLoopConfig {
-                        enable_dynamic_tools: true,
-                        enable_read_skill: true,
-                        max_dynamic_tools_per_skill: 64,
-                        read_skill_max_chars: 24_000,
-                        compact_mode_threshold: 6,
-                        allow_shell_tools: true,
-                        allow_http_tools: true,
-                        allow_function_proxy_tools: true,
-                    },
-                },
-                memory: pioneer_memory::hooks::MemoryLoopConfig {
-                    active_recall: pioneer_memory::hooks::MemoryActiveRecallConfig {
-                        mode: pioneer_memory::hooks::MemoryActiveRecallMode::DeterministicOnly,
-                        ..pioneer_memory::hooks::MemoryActiveRecallConfig::default()
-                    },
-                    ..pioneer_memory::hooks::MemoryLoopConfig::default()
-                },
-                budget: pioneer_tools::ToolLoopBudgetConfig::default(),
-                retry: pioneer_tools::ToolRetryBudgetConfig::default(),
-            }
-            .normalized(),
+            tool_loop_config: normalized_tool_loop_config,
+            memory_loop_config,
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,

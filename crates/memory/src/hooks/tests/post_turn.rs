@@ -927,6 +927,53 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
 }
 
 #[tokio::test]
+async fn post_turn_extractor_uses_configured_model_override() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider.clone()),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig {
+            provider_name: Some("memory-provider".to_owned()),
+            model: Some("memory-model".to_owned()),
+            ..MemoryPostTurnExtractorConfig::default()
+        },
+    };
+
+    hook.execute(test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    ))
+    .await
+    .expect("post-turn extractor executes");
+
+    let context = extractor_provider
+        .contexts()
+        .into_iter()
+        .next()
+        .expect("extractor context recorded");
+    assert_eq!(context.model.as_deref(), Some("memory-model"));
+    assert_eq!(context.model_provider.as_deref(), Some("memory-provider"));
+
+    let params = write_provider
+        .write_params()
+        .into_iter()
+        .next()
+        .expect("write params recorded");
+    assert_eq!(
+        params.metadata.get("model"),
+        Some(&serde_json::json!("memory-model"))
+    );
+    assert_eq!(
+        params.metadata.get("model_provider"),
+        Some(&serde_json::json!("memory-provider"))
+    );
+}
+
+#[tokio::test]
 async fn post_turn_extractor_suppresses_weak_ontology_before_write() {
     let weak_json = serde_json::json!({
         "facts": [{

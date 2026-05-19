@@ -263,12 +263,9 @@ pub(super) fn memory_recall_prompt_section_contribution_from_context(
             .and_then(|content| {
                 MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
             }),
-        task_context: recall_context
-            .task_content
-            .as_deref()
-            .and_then(|content| {
-                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
-            }),
+        task_context: recall_context.task_content.as_deref().and_then(|content| {
+            MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+        }),
         truncated: truncated || recall_context.truncated,
     })
 }

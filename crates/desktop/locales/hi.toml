@@ -559,9 +559,17 @@ description = "ज़रूरत पड़ने पर Pioneer को सह�
 label = "सक्रिय स्मरण"
 description = "संदर्भ-भारी कार्यों के लिए अतिरिक्त केवल-पढ़ने वाली स्मरण योजना चलाएँ."
 
+[settings.memory.active_recall_model]
+label = "सक्रिय स्मरण मॉडल"
+description = "मेमोरी पढ़ने की योजना के लिए प्रदाता और मॉडल चुनें. डिफ़ॉल्ट वर्तमान थ्रेड का मॉडल इस्तेमाल करता है."
+
 [settings.memory.proactive_writes]
 label = "सक्रिय लेखन"
 description = "वार्तालाप चरण के बाद उच्च-विश्वास वाले टिकाऊ तथ्य सहेजें."
+
+[settings.memory.proactive_writes_model]
+label = "चरण-पश्चात निष्कर्षण मॉडल"
+description = "चरण के बाद मेमोरी निष्कर्षण के लिए प्रदाता और मॉडल चुनें. डिफ़ॉल्ट वर्तमान थ्रेड का मॉडल इस्तेमाल करता है."
 
 [settings.memory.background_extraction]
 label = "पृष्ठभूमि निष्कर्षण"
@@ -570,6 +578,11 @@ description = "चरण को ब्लॉक किए बिना, चर�
 [settings.memory.debug_trace]
 label = "डीबग ट्रेस"
 description = "स्थानीय डीबग दृश्यों में मेमोरी तंत्रों की डायग्नोस्टिक्स दिखाएँ."
+
+[settings.memory.model]
+default = "डिफ़ॉल्ट"
+select_model = "मॉडल चुनें"
+dialog_title = "मेमोरी मॉडल चुनें"
 
 [settings.language]
 system = "सिस्टम डिफ़ॉल्ट"

@@ -26,7 +26,10 @@ use crate::artifact::{
 
 use crate::{
     AgentDurableEvent, AgentProgressEvent, ByteRange, ContextCompressedNotification,
-    ContextCompressingNotification, DurableEventCausalityKey, GatewayNotification,
+    ContextCompressingNotification, DurableEventCausalityKey, GatewayMemoryModelSelection,
+    GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewayNotification,
+    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
+    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
     ItemCompletedNotification, ItemDeltaNotification, ItemRecoveryAttachedNotification,
     ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
     ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
@@ -924,6 +927,30 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "provider_list_models_response.json",
             ProviderListModelsResponse
+        ),
+        schema_doc!(
+            "gateway_memory_model_selection_source.json",
+            GatewayMemoryModelSelectionSource
+        ),
+        schema_doc!(
+            "gateway_memory_model_selection.json",
+            GatewayMemoryModelSelection
+        ),
+        schema_doc!("gateway_memory_settings.json", GatewayMemorySettings),
+        schema_doc!("gateway_settings_snapshot.json", GatewaySettingsSnapshot),
+        schema_doc!("gateway_settings_update.json", GatewaySettingsUpdate),
+        schema_doc!("gateway_settings_get_params.json", GatewaySettingsGetParams),
+        schema_doc!(
+            "gateway_settings_get_response.json",
+            GatewaySettingsGetResponse
+        ),
+        schema_doc!(
+            "gateway_settings_update_params.json",
+            GatewaySettingsUpdateParams
+        ),
+        schema_doc!(
+            "gateway_settings_update_response.json",
+            GatewaySettingsUpdateResponse
         ),
         schema_doc!(
             "context_compressing_notification.json",

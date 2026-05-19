@@ -5,10 +5,10 @@ use pioneer_protocol::{
     ArtifactDownloadStartParams, ArtifactGetParams, ArtifactListForMessageParams,
     ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
     ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
-    ArtifactUploadStartParams, McpInstallParams, McpListParams, McpPolicySetParams,
-    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
-    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
-    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    ArtifactUploadStartParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
+    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
+    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
+    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
@@ -735,6 +735,126 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::PROVIDER_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SETTINGS_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<GatewaySettingsGetParams>(params_value) {
+                    Ok(_params) => match self.gateway_settings_snapshot() {
+                        Ok(settings) => {
+                            let result = pioneer_protocol::GatewaySettingsGetResponse { settings };
+                            match JsonRpcResponse::from_result(request.id, &result) {
+                                Ok(response) => {
+                                    if let Err(error) =
+                                        self.send_json(connection_id, &response).await
+                                    {
+                                        warn!(
+                                            error = %format!("{error:#}"),
+                                            "failed to send gateway settings get response"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    self.send_error(
+                                        connection_id,
+                                        JsonRpcErrorResponse::new(
+                                            None,
+                                            INVALID_REQUEST_CODE,
+                                            format!(
+                                                "failed to encode `{}` response: {error}",
+                                                methods::SETTINGS_GET
+                                            ),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_REQUEST_CODE,
+                                    format!("failed to load gateway settings: {error:#}"),
+                                ),
+                            )
+                            .await;
+                        }
+                    },
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::SETTINGS_GET),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::SETTINGS_UPDATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<GatewaySettingsUpdateParams>(params_value) {
+                    Ok(params) => match self.update_gateway_settings(params.update).await {
+                        Ok(settings) => {
+                            let result =
+                                pioneer_protocol::GatewaySettingsUpdateResponse { settings };
+                            match JsonRpcResponse::from_result(request.id, &result) {
+                                Ok(response) => {
+                                    if let Err(error) =
+                                        self.send_json(connection_id, &response).await
+                                    {
+                                        warn!(
+                                            error = %format!("{error:#}"),
+                                            "failed to send gateway settings update response"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    self.send_error(
+                                        connection_id,
+                                        JsonRpcErrorResponse::new(
+                                            None,
+                                            INVALID_REQUEST_CODE,
+                                            format!(
+                                                "failed to encode `{}` response: {error}",
+                                                methods::SETTINGS_UPDATE
+                                            ),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_REQUEST_CODE,
+                                    format!("failed to update gateway settings: {error:#}"),
+                                ),
+                            )
+                            .await;
+                        }
+                    },
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::SETTINGS_UPDATE
+                                ),
                             ),
                         )
                         .await;
@@ -1979,6 +2099,55 @@ impl MessageProcessor {
                 .await;
             }
         }
+    }
+
+    fn gateway_settings_snapshot(
+        &self,
+    ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let config =
+            pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
+        let settings_file_name = crate::settings::normalize_settings_file_name(
+            config.gateway.settings_file_name.as_str(),
+        )?;
+        let settings_path = self.artifact_runtime_home.join(settings_file_name.as_str());
+        let settings = crate::settings::load_or_create_gateway_settings(
+            settings_path.as_path(),
+            config.gateway.settings_version,
+            settings_file_name.as_str(),
+        )?;
+        Ok(settings.snapshot(&config.gateway.memory))
+    }
+
+    async fn update_gateway_settings(
+        &self,
+        update: pioneer_protocol::GatewaySettingsUpdate,
+    ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let config =
+            pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
+        let settings_file_name = crate::settings::normalize_settings_file_name(
+            config.gateway.settings_file_name.as_str(),
+        )?;
+        let settings_path = self.artifact_runtime_home.join(settings_file_name.as_str());
+        let mut settings = crate::settings::load_or_create_gateway_settings(
+            settings_path.as_path(),
+            config.gateway.settings_version,
+            settings_file_name.as_str(),
+        )?;
+
+        let changes = settings.apply_protocol_update(update);
+        crate::settings::save_gateway_settings(settings_path.as_path(), &settings)?;
+
+        let snapshot = settings.snapshot(&config.gateway.memory);
+        if changes.memory {
+            let memory_settings =
+                crate::settings::GatewayMemorySettings::from_protocol(snapshot.memory.clone());
+            let loop_config =
+                crate::memory_loop_config_from_gateway_memory_settings(&memory_settings);
+            self.apply_memory_loop_config(loop_config);
+            self.ensure_hook_runtime_with_run_store().await;
+        }
+
+        Ok(snapshot)
     }
 
     async fn send_invalid_params_error(

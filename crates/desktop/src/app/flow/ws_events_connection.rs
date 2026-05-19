@@ -42,6 +42,7 @@ impl PioneerDesktop {
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
         self.refresh_workspace_list(cx);
+        self.refresh_gateway_settings(cx);
 
         if matches!(
             self.main_content_view,

@@ -26,6 +26,8 @@ pub mod methods {
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
     pub const PROVIDER_DELETE_API_KEY: &str = "provider/delete_api_key";
+    pub const SETTINGS_GET: &str = "settings/get";
+    pub const SETTINGS_UPDATE: &str = "settings/update";
     pub const SKILLS_LIST: &str = "skills/list";
     pub const SKILLS_INSTALL: &str = "skills/install";
     pub const SKILLS_UPDATE: &str = "skills/update";

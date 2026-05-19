@@ -381,10 +381,7 @@ pub(super) async fn execute_active_recall_plan(
         }
 
         let Some(durable_mode) = mode.durable_recall_mode() else {
-            mode_results.push(ActiveRecallModeResult::skipped(
-                mode,
-                "mode_not_supported",
-            ));
+            mode_results.push(ActiveRecallModeResult::skipped(mode, "mode_not_supported"));
             continue;
         };
         match provider
@@ -542,7 +539,10 @@ async fn execute_episodic_active_recall_mode(
             .await
         }
         MemoryEpisodicRecallSourceKind::CurrentTask => {
-            let Some(task_id) = context.task_id.as_ref().filter(|task_id| !task_id.trim().is_empty())
+            let Some(task_id) = context
+                .task_id
+                .as_ref()
+                .filter(|task_id| !task_id.trim().is_empty())
             else {
                 return ActiveRecallModeResult::skipped(request.mode, "missing_task_context");
             };
@@ -613,14 +613,15 @@ async fn execute_episodic_active_recall_mode(
                 request.budget.top_k as usize,
                 request.budget.max_chars,
             );
-            let skipped_reason = filtered
-                .items
-                .is_empty()
-                .then_some(if filtered.suppressed_count > 0 {
-                    "all_hits_filtered".to_owned()
-                } else {
-                    "no_hits".to_owned()
-                });
+            let skipped_reason =
+                filtered
+                    .items
+                    .is_empty()
+                    .then_some(if filtered.suppressed_count > 0 {
+                        "all_hits_filtered".to_owned()
+                    } else {
+                        "no_hits".to_owned()
+                    });
             let mut diagnostics = response.diagnostics;
             diagnostics.push(format!(
                 "memory.episodic_recall.mode_executed:{}:{}",
@@ -698,7 +699,11 @@ pub(super) fn active_recall_execution_observability_diagnostic(
         "rendered_count",
         result.items.len() + result.episodic_items.len(),
     );
-    insert_usize_metadata(&mut diagnostic.metadata, "durable_count", result.items.len());
+    insert_usize_metadata(
+        &mut diagnostic.metadata,
+        "durable_count",
+        result.items.len(),
+    );
     insert_usize_metadata(
         &mut diagnostic.metadata,
         "episodic_count",
@@ -895,8 +900,7 @@ pub(super) fn active_recall_debug_audit_contribution(
                         (
                             "episodic_hit_count",
                             HookValue::I64(
-                                i64::try_from(mode_result.episodic_items.len())
-                                    .unwrap_or(i64::MAX),
+                                i64::try_from(mode_result.episodic_items.len()).unwrap_or(i64::MAX),
                             ),
                         ),
                         ("truncated", HookValue::Bool(mode_result.truncated)),
@@ -1155,7 +1159,8 @@ fn filter_rank_and_bound_episodic_items(
             .partial_cmp(&episodic_rank_score(left, mode, context))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                right.updated_at_unix
+                right
+                    .updated_at_unix
                     .unwrap_or_default()
                     .cmp(&left.updated_at_unix.unwrap_or_default())
             })
@@ -2251,15 +2256,14 @@ pub(super) fn memory_episodic_recall_prompt_context_contributions(
     snapshot_truncated: bool,
     config: &MemoryActiveRecallConfig,
 ) -> Vec<PromptContextContribution> {
-    let (thread_items, task_items): (Vec<_>, Vec<_>) =
-        items.into_iter().partition(|item| {
-            matches!(
-                item.provenance.source,
-                MemoryEpisodicRecallSourceKind::CurrentThread
-                    | MemoryEpisodicRecallSourceKind::RelatedThread
-                    | MemoryEpisodicRecallSourceKind::TranscriptSummary
-            )
-        });
+    let (thread_items, task_items): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
+        matches!(
+            item.provenance.source,
+            MemoryEpisodicRecallSourceKind::CurrentThread
+                | MemoryEpisodicRecallSourceKind::RelatedThread
+                | MemoryEpisodicRecallSourceKind::TranscriptSummary
+        )
+    });
     [
         episodic_prompt_context_contribution(
             MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID,

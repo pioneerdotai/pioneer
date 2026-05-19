@@ -559,9 +559,17 @@ description = "Permitir que Pioneer use hechos guardados y decisiones del proyec
 label = "Recuperación activa"
 description = "Ejecutar planificación adicional de recuperación de solo lectura para tareas con mucho contexto."
 
+[settings.memory.active_recall_model]
+label = "Modelo de recuperación activa"
+description = "Elige el proveedor y el modelo para planificar la lectura de memoria. Predeterminado usa el modelo del hilo actual."
+
 [settings.memory.proactive_writes]
 label = "Escritura proactiva"
 description = "Guardar hechos duraderos de alta confianza después de un turno."
+
+[settings.memory.proactive_writes_model]
+label = "Modelo de extracción posterior al turno"
+description = "Elige el proveedor y el modelo para extraer memoria después de un turno. Predeterminado usa el modelo del hilo actual."
 
 [settings.memory.background_extraction]
 label = "Extracción en segundo plano"
@@ -570,6 +578,11 @@ description = "Ejecutar la extracción de memoria después del turno en segundo 
 [settings.memory.debug_trace]
 label = "Trazas de depuración"
 description = "Mostrar diagnósticos de los mecanismos de memoria en vistas locales de depuración."
+
+[settings.memory.model]
+default = "Predeterminado"
+select_model = "Seleccionar modelo"
+dialog_title = "Seleccionar modelo de memoria"
 
 [settings.language]
 system = "Predeterminado del sistema"

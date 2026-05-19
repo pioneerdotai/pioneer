@@ -838,9 +838,17 @@ description = "Разрешить Pioneer использовать сохран�
 label = "Активное вспоминание"
 description = "Запускать дополнительное планирование чтения памяти для контекстных задач."
 
+[settings.memory.active_recall_model]
+label = "Модель активного вспоминания"
+description = "Выберите провайдер и модель для планирования чтения памяти. По умолчанию использует модель текущего треда."
+
 [settings.memory.proactive_writes]
 label = "Проактивная запись"
 description = "Сохранять долговременные факты с высокой уверенностью после хода."
+
+[settings.memory.proactive_writes_model]
+label = "Модель извлечения после хода"
+description = "Выберите провайдер и модель для извлечения памяти после хода. По умолчанию использует модель текущего треда."
 
 [settings.memory.background_extraction]
 label = "Фоновое извлечение"
@@ -849,6 +857,11 @@ description = "Извлекать память после хода в фоне, 
 [settings.memory.debug_trace]
 label = "Отладочные трассы"
 description = "Показывать диагностику механизмов памяти в локальных отладочных представлениях."
+
+[settings.memory.model]
+default = "По умолчанию"
+select_model = "Выбрать модель"
+dialog_title = "Выбор модели памяти"
 
 [settings.language]
 system = "Как в системе"

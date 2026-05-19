@@ -1702,10 +1702,7 @@ impl MemoryService {
                     "memory.active_recall.mode_native_provider_required:{}",
                     params.mode.as_str()
                 )],
-                skipped_reason: Some(format!(
-                    "{}_native_provider_required",
-                    params.mode.as_str()
-                )),
+                skipped_reason: Some(format!("{}_native_provider_required", params.mode.as_str())),
                 ..MemoryModeRecallResponse::default()
             });
         }

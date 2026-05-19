@@ -478,11 +478,17 @@ fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -
     if !config.enabled || !config.active_recall_enabled || !memory.deterministic_recall_enabled {
         memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
     }
+    memory.active_recall.planner.provider_name =
+        config.active_recall_model.model_provider_override();
+    memory.active_recall.planner.model = config.active_recall_model.model_override();
 
     memory.post_turn_extractor.enabled = config.enabled && config.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled = config.enabled && config.proactive_writes_enabled;
     memory.post_turn_extractor.proactive_writes_enabled =
         config.enabled && config.proactive_writes_enabled;
+    memory.post_turn_extractor.provider_name =
+        config.proactive_writes_model.model_provider_override();
+    memory.post_turn_extractor.model = config.proactive_writes_model.model_override();
     memory.post_turn_extractor.await_policy = if config.background_extraction_enabled {
         HookAwaitPolicy::FireAndRecord
     } else {
@@ -490,6 +496,40 @@ fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -
     };
     memory.post_turn_extractor.strict_debug =
         config.debug_trace_enabled || config.strict_diagnostics_enabled;
+
+    memory
+}
+
+pub(crate) fn memory_loop_config_from_gateway_memory_settings(
+    settings: &GatewayMemorySettings,
+) -> MemoryLoopConfig {
+    let mut memory = MemoryLoopConfig::default();
+    memory.deterministic_recall_enabled = settings.enabled && settings.deterministic_recall_enabled;
+    memory.tools_enabled = settings.enabled && settings.tools_enabled;
+
+    if !settings.enabled || !settings.active_recall_enabled || !memory.deterministic_recall_enabled
+    {
+        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
+    }
+    memory.active_recall.planner.provider_name =
+        settings.active_recall_model.model_provider_override();
+    memory.active_recall.planner.model = settings.active_recall_model.model_override();
+
+    memory.post_turn_extractor.enabled = settings.enabled && settings.proactive_writes_enabled;
+    memory.post_turn_extractor.provider_enabled =
+        settings.enabled && settings.proactive_writes_enabled;
+    memory.post_turn_extractor.proactive_writes_enabled =
+        settings.enabled && settings.proactive_writes_enabled;
+    memory.post_turn_extractor.provider_name =
+        settings.proactive_writes_model.model_provider_override();
+    memory.post_turn_extractor.model = settings.proactive_writes_model.model_override();
+    memory.post_turn_extractor.await_policy = if settings.background_extraction_enabled {
+        HookAwaitPolicy::FireAndRecord
+    } else {
+        HookAwaitPolicy::Blocking
+    };
+    memory.post_turn_extractor.strict_debug =
+        settings.debug_trace_enabled || settings.strict_diagnostics_enabled;
 
     memory
 }
@@ -563,7 +603,7 @@ mod tests {
         parse_skill_trust_level,
     };
     use crate::secrets::GatewaySecrets;
-    use pioneer_config::GatewayMemoryConfig;
+    use pioneer_config::{GatewayMemoryConfig, GatewayMemoryModelSelectionConfig};
     use pioneer_hooks::HookAwaitPolicy;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_memory::hooks::MemoryActiveRecallMode;
@@ -636,6 +676,10 @@ mod tests {
         assert!(loop_config.post_turn_extractor.enabled);
         assert!(loop_config.post_turn_extractor.provider_enabled);
         assert!(loop_config.post_turn_extractor.proactive_writes_enabled);
+        assert!(loop_config.active_recall.planner.provider_name.is_none());
+        assert!(loop_config.active_recall.planner.model.is_none());
+        assert!(loop_config.post_turn_extractor.provider_name.is_none());
+        assert!(loop_config.post_turn_extractor.model.is_none());
         assert_eq!(
             loop_config.post_turn_extractor.await_policy,
             HookAwaitPolicy::FireAndRecord
@@ -687,6 +731,38 @@ mod tests {
             HookAwaitPolicy::Blocking
         );
         assert!(loop_config.post_turn_extractor.strict_debug);
+    }
+
+    #[test]
+    fn gateway_memory_config_maps_memory_model_overrides_to_hooks() {
+        let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
+            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
+                "planner-provider",
+                "planner-model",
+            ),
+            proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
+                "extractor-provider",
+                "extractor-model",
+            ),
+            ..GatewayMemoryConfig::default()
+        });
+
+        assert_eq!(
+            loop_config.active_recall.planner.provider_name.as_deref(),
+            Some("planner-provider")
+        );
+        assert_eq!(
+            loop_config.active_recall.planner.model.as_deref(),
+            Some("planner-model")
+        );
+        assert_eq!(
+            loop_config.post_turn_extractor.provider_name.as_deref(),
+            Some("extractor-provider")
+        );
+        assert_eq!(
+            loop_config.post_turn_extractor.model.as_deref(),
+            Some("extractor-model")
+        );
     }
 
     #[test]
