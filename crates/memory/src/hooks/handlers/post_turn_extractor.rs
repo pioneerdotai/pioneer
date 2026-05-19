@@ -113,34 +113,34 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             }
         };
 
-        let extractor_model = config.model.clone().or_else(|| input.model.clone());
-        let extractor_model_provider = config
-            .provider_name
-            .clone()
-            .or_else(|| input.model_provider.clone());
-        let extractor_context = memory_post_turn_extractor_context_from_turn(
+        let primary_extractor_context = memory_post_turn_extractor_context_from_turn(
             &context,
-            extractor_model.clone(),
-            extractor_model_provider.clone(),
+            config.model.clone().or_else(|| input.model.clone()),
+            config
+                .provider_name
+                .clone()
+                .or_else(|| input.model_provider.clone()),
         );
         let extractor_request =
             memory_post_turn_extractor_request_from_input(input, manifest, &config);
-        let raw_json = match extractor_provider
-            .extract_post_turn_memory_json(extractor_context, extractor_request)
-            .await
+
+        let extraction = match extract_post_turn_memory_with_thread_model_retry(
+            extractor_provider.as_ref(),
+            primary_extractor_context,
+            input,
+            extractor_request,
+            &config,
+        )
+        .await
         {
-            Ok(json) => json,
-            Err(_) => {
+            Ok(extraction) => extraction,
+            Err(MemoryPostTurnExtractorFailure::ProviderFailed) => {
                 return Err(memory_retryable_safe_hook_error(
                     "memory.post_turn_extractor.provider_failed",
                     "memory post-turn extractor provider failed",
                 ));
             }
-        };
-
-        let parsed = match parse_memory_post_turn_extractor_json(raw_json.as_str(), &config) {
-            Ok(parsed) => parsed,
-            Err(error) => {
+            Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.post_turn_extractor.invalid_json",
                     format!("memory post-turn extractor returned invalid JSON: {error}"),
@@ -148,6 +148,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 return Ok(response);
             }
         };
+        response.diagnostics.extend(hook_diagnostics_from_strings(
+            extraction.diagnostics.as_slice(),
+        ));
+        let extractor_model = extraction.model;
+        let extractor_model_provider = extraction.model_provider;
+        let parsed = extraction.parsed;
 
         let mut stats = MemoryPostTurnExtractorStats {
             raw_fact_count: parsed.raw_fact_count,
@@ -201,4 +207,102 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         response.metadata = memory_post_turn_stats_metadata(&stats);
         Ok(response)
     }
+}
+
+struct MemoryPostTurnExtractionOutcome {
+    parsed: MemoryPostTurnParsedFacts,
+    model: Option<String>,
+    model_provider: Option<String>,
+    diagnostics: Vec<String>,
+}
+
+enum MemoryPostTurnExtractorFailure {
+    ProviderFailed,
+    InvalidJson(String),
+}
+
+impl MemoryPostTurnExtractorFailure {
+    fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::ProviderFailed => "memory.post_turn_extractor.provider_failed",
+            Self::InvalidJson(_) => "memory.post_turn_extractor.invalid_json",
+        }
+    }
+}
+
+async fn extract_post_turn_memory_with_thread_model_retry(
+    extractor_provider: &dyn AgentMemoryPostTurnExtractorProvider,
+    primary_context: MemoryPostTurnExtractorContext,
+    input: &TurnPostTurnHookInput,
+    request: MemoryPostTurnExtractorRequest,
+    config: &MemoryPostTurnExtractorConfig,
+) -> Result<MemoryPostTurnExtractionOutcome, MemoryPostTurnExtractorFailure> {
+    match extract_post_turn_memory_once(
+        extractor_provider,
+        primary_context.clone(),
+        request.clone(),
+        config,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(primary_failure) => {
+            let Some(retry_context) = post_turn_thread_model_retry_context(&primary_context, input)
+            else {
+                return Err(primary_failure);
+            };
+            match extract_post_turn_memory_once(extractor_provider, retry_context, request, config)
+                .await
+            {
+                Ok(mut outcome) => {
+                    outcome
+                        .diagnostics
+                        .push("memory.post_turn_extractor.thread_model_retry_used".to_owned());
+                    outcome
+                        .diagnostics
+                        .push(primary_failure.diagnostic_code().to_owned());
+                    Ok(outcome)
+                }
+                Err(retry_failure) => Err(retry_failure),
+            }
+        }
+    }
+}
+
+async fn extract_post_turn_memory_once(
+    extractor_provider: &dyn AgentMemoryPostTurnExtractorProvider,
+    context: MemoryPostTurnExtractorContext,
+    request: MemoryPostTurnExtractorRequest,
+    config: &MemoryPostTurnExtractorConfig,
+) -> Result<MemoryPostTurnExtractionOutcome, MemoryPostTurnExtractorFailure> {
+    let raw_json = extractor_provider
+        .extract_post_turn_memory_json(context.clone(), request)
+        .await
+        .map_err(|_| MemoryPostTurnExtractorFailure::ProviderFailed)?;
+    let parsed = parse_memory_post_turn_extractor_json(raw_json.as_str(), config)
+        .map_err(MemoryPostTurnExtractorFailure::InvalidJson)?;
+    Ok(MemoryPostTurnExtractionOutcome {
+        parsed,
+        model: context.model,
+        model_provider: context.model_provider,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn post_turn_thread_model_retry_context(
+    primary_context: &MemoryPostTurnExtractorContext,
+    input: &TurnPostTurnHookInput,
+) -> Option<MemoryPostTurnExtractorContext> {
+    let turn_model = input.model.clone()?;
+    let turn_model_provider = input.model_provider.clone()?;
+    if primary_context.model.as_deref() == Some(turn_model.as_str())
+        && primary_context.model_provider.as_deref() == Some(turn_model_provider.as_str())
+    {
+        return None;
+    }
+
+    let mut retry_context = primary_context.clone();
+    retry_context.model = Some(turn_model);
+    retry_context.model_provider = Some(turn_model_provider);
+    Some(retry_context)
 }

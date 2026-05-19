@@ -699,6 +699,43 @@ impl TestPostTurnExtractorProvider {
     }
 }
 
+struct TestSequencedPostTurnExtractorProvider {
+    responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
+    contexts: Arc<Mutex<Vec<MemoryPostTurnExtractorContext>>>,
+}
+
+impl TestSequencedPostTurnExtractorProvider {
+    fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into_iter().collect()),
+            contexts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn contexts(&self) -> Vec<MemoryPostTurnExtractorContext> {
+        self.contexts.lock().expect("context lock poisoned").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryPostTurnExtractorProvider for TestSequencedPostTurnExtractorProvider {
+    async fn extract_post_turn_memory_json(
+        &self,
+        context: MemoryPostTurnExtractorContext,
+        _request: MemoryPostTurnExtractorRequest,
+    ) -> Result<String, String> {
+        self.contexts
+            .lock()
+            .expect("context lock poisoned")
+            .push(context);
+        self.responses
+            .lock()
+            .expect("post-turn sequenced provider responses lock poisoned")
+            .pop_front()
+            .unwrap_or_else(|| Err("no sequenced provider response".to_owned()))
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
     async fn extract_post_turn_memory_json(
