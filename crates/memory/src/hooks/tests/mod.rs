@@ -981,6 +981,46 @@ impl TestActiveMemoryDecisionProvider {
     }
 }
 
+struct TestSequencedActiveMemoryDecisionProvider {
+    responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
+    contexts: std::sync::Mutex<Vec<MemoryActiveRecallDecisionContext>>,
+}
+
+impl TestSequencedActiveMemoryDecisionProvider {
+    fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into_iter().collect()),
+            contexts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn contexts(&self) -> Vec<MemoryActiveRecallDecisionContext> {
+        self.contexts
+            .lock()
+            .expect("active memory sequenced provider contexts lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentActiveMemoryDecisionProvider for TestSequencedActiveMemoryDecisionProvider {
+    async fn resolve_active_memory_decision_json(
+        &self,
+        context: MemoryActiveRecallDecisionContext,
+        _request: MemoryActiveRecallDecisionRequest,
+    ) -> Result<String, String> {
+        self.contexts
+            .lock()
+            .expect("active memory sequenced provider contexts lock poisoned")
+            .push(context);
+        self.responses
+            .lock()
+            .expect("active memory sequenced provider responses lock poisoned")
+            .pop_front()
+            .unwrap_or_else(|| Err("no sequenced provider response".to_owned()))
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentActiveMemoryDecisionProvider for TestActiveMemoryDecisionProvider {
     async fn resolve_active_memory_decision_json(

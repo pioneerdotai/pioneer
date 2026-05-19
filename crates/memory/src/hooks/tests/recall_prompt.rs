@@ -625,6 +625,66 @@ async fn active_memory_hook_provider_error_falls_back_to_deterministic_plan() {
 }
 
 #[tokio::test]
+async fn active_memory_hook_retries_planner_with_thread_model_before_deterministic_fallback() {
+    let provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        active_project_snapshot(),
+    ));
+    let decision_provider = Arc::new(TestSequencedActiveMemoryDecisionProvider::new([
+        Err("configured planner failed".to_owned()),
+        Ok(
+            r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["profile"]}"#
+                .to_owned(),
+        ),
+    ]));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: provider.clone(),
+        decision_provider: Some(decision_provider.clone()),
+        episodic_provider: None,
+        config: MemoryActiveRecallConfig {
+            max_queries: 1,
+            planner: MemoryActiveRecallPlannerConfig {
+                provider_name: Some("configured-provider".to_owned()),
+                model: Some("configured-model".to_owned()),
+                ..MemoryActiveRecallPlannerConfig::default()
+            },
+            ..MemoryActiveRecallConfig::default()
+        },
+    };
+
+    let response = hook
+        .execute(test_active_prompt_context_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            HookPromptContextSet::default(),
+            "continue the architecture work using prior project decisions",
+        ))
+        .await
+        .expect("thread model retry is best-effort");
+
+    let contexts = decision_provider.contexts();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(
+        contexts[0].model_provider.as_deref(),
+        Some("configured-provider")
+    );
+    assert_eq!(contexts[0].model.as_deref(), Some("configured-model"));
+    assert_eq!(contexts[1].model_provider.as_deref(), Some("test-provider"));
+    assert_eq!(contexts[1].model.as_deref(), Some("test-model"));
+    assert_eq!(provider.recall_call_count(), 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .as_str()
+            .contains("memory.active_recall.thread_model_retry_used")
+    }));
+}
+
+#[tokio::test]
 async fn active_memory_hook_provider_timeout_falls_back_to_deterministic_plan() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),

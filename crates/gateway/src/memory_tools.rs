@@ -67,8 +67,8 @@ impl GatewayMemoryProvider {
         &self,
         processor: &MessageProcessor,
         purpose: MemoryInternalModelPurpose,
-        fallback_provider: Option<&str>,
-        fallback_model: Option<&str>,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
     ) -> (Option<String>, Option<String>) {
         let config = processor.memory_loop_config();
         let (configured_provider, configured_model) = match purpose {
@@ -81,11 +81,26 @@ impl GatewayMemoryProvider {
                 config.post_turn_extractor.model,
             ),
         };
-        (
-            configured_provider.or_else(|| fallback_provider.map(str::to_owned)),
-            configured_model.or_else(|| fallback_model.map(str::to_owned)),
+        resolve_internal_model_selection(
+            requested_provider,
+            requested_model,
+            configured_provider,
+            configured_model,
         )
     }
+}
+
+fn resolve_internal_model_selection(
+    requested_provider: Option<&str>,
+    requested_model: Option<&str>,
+    configured_provider: Option<String>,
+    configured_model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if let (Some(provider), Some(model)) = (requested_provider, requested_model) {
+        return (Some(provider.to_owned()), Some(model.to_owned()));
+    }
+
+    (configured_provider, configured_model)
 }
 
 #[async_trait]
@@ -1501,6 +1516,37 @@ mod tests {
                 Ok(StreamChunk::final_chunk()),
             ])))
         }
+    }
+
+    #[test]
+    fn internal_model_selection_prefers_requested_context_model() {
+        let selected = resolve_internal_model_selection(
+            Some("thread-provider"),
+            Some("thread-model"),
+            Some("configured-provider".to_owned()),
+            Some("configured-model".to_owned()),
+        );
+        assert_eq!(
+            selected,
+            (
+                Some("thread-provider".to_owned()),
+                Some("thread-model".to_owned())
+            )
+        );
+
+        let fallback = resolve_internal_model_selection(
+            None,
+            None,
+            Some("configured-provider".to_owned()),
+            Some("configured-model".to_owned()),
+        );
+        assert_eq!(
+            fallback,
+            (
+                Some("configured-provider".to_owned()),
+                Some("configured-model".to_owned())
+            )
+        );
     }
 
     #[test]

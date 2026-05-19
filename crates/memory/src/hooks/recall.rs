@@ -153,58 +153,72 @@ pub(super) async fn resolve_active_memory_decision(
                 .clone()
                 .or_else(|| input.model_provider.clone()),
         };
-        let provider_input_chars = request
-            .sanitized_input_json(&provider_context)
-            .chars()
-            .count();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(config.planner.timeout_ms),
-            provider.resolve_active_memory_decision_json(provider_context, request),
+        match call_active_recall_decision_provider(
+            provider.as_ref(),
+            provider_context.clone(),
+            request.clone(),
+            config,
         )
         .await
         {
-            Err(_) => {
+            Ok(decision) => {
+                return normalize_active_recall_plan_for_input(decision, &planner_input);
+            }
+            Err(primary_failure) => {
+                if let Some(retry_context) =
+                    active_recall_thread_model_retry_context(&provider_context, input)
+                {
+                    match call_active_recall_decision_provider(
+                        provider.as_ref(),
+                        retry_context,
+                        request,
+                        config,
+                    )
+                    .await
+                    {
+                        Ok(mut decision) => {
+                            decision.diagnostics.insert(
+                                0,
+                                "memory.active_recall.thread_model_retry_used".to_owned(),
+                            );
+                            decision
+                                .diagnostics
+                                .insert(1, primary_failure.reason.to_owned());
+                            return normalize_active_recall_plan_for_input(
+                                decision,
+                                &planner_input,
+                            );
+                        }
+                        Err(retry_failure) => {
+                            let mut decision = active_recall_provider_fallback(
+                                local_plan,
+                                retry_failure.reason,
+                                &planner_input,
+                                config,
+                                retry_failure.provider_input_chars,
+                                retry_failure.provider_output_chars,
+                            );
+                            decision.diagnostics.insert(
+                                0,
+                                "memory.active_recall.thread_model_retry_failed".to_owned(),
+                            );
+                            decision
+                                .diagnostics
+                                .insert(1, primary_failure.reason.to_owned());
+                            return decision;
+                        }
+                    }
+                }
+
                 return active_recall_provider_fallback(
                     local_plan,
-                    "memory.active_recall.provider_timeout",
+                    primary_failure.reason,
                     &planner_input,
                     config,
-                    Some(provider_input_chars),
-                    None,
+                    primary_failure.provider_input_chars,
+                    primary_failure.provider_output_chars,
                 );
             }
-            Ok(provider_result) => match provider_result {
-                Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
-                    Ok(mut decision) => {
-                        decision.provider_input_chars = Some(provider_input_chars);
-                        decision.provider_output_chars = Some(json.chars().count());
-                        decision
-                            .diagnostics
-                            .insert(0, "memory.active_recall.provider_called".to_owned());
-                        return normalize_active_recall_plan_for_input(decision, &planner_input);
-                    }
-                    Err(_) => {
-                        return active_recall_provider_fallback(
-                            local_plan,
-                            "memory.active_recall.invalid_json",
-                            &planner_input,
-                            config,
-                            Some(provider_input_chars),
-                            Some(json.chars().count()),
-                        );
-                    }
-                },
-                Err(_) => {
-                    return active_recall_provider_fallback(
-                        local_plan,
-                        "memory.active_recall.provider_failed",
-                        &planner_input,
-                        config,
-                        Some(provider_input_chars),
-                        None,
-                    );
-                }
-            },
         }
     }
 
@@ -219,6 +233,74 @@ pub(super) async fn resolve_active_memory_decision(
             .push("memory.active_recall.provider_unavailable".to_owned());
     }
     normalize_active_recall_plan_for_input(fallback, &planner_input)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRecallProviderFailure {
+    reason: &'static str,
+    provider_input_chars: Option<usize>,
+    provider_output_chars: Option<usize>,
+}
+
+async fn call_active_recall_decision_provider(
+    provider: &dyn AgentActiveMemoryDecisionProvider,
+    context: MemoryActiveRecallDecisionContext,
+    request: MemoryActiveRecallDecisionRequest,
+    config: &MemoryActiveRecallConfig,
+) -> Result<ActiveMemoryDecision, ActiveRecallProviderFailure> {
+    let provider_input_chars = request.sanitized_input_json(&context).chars().count();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(config.planner.timeout_ms),
+        provider.resolve_active_memory_decision_json(context, request),
+    )
+    .await
+    {
+        Err(_) => Err(ActiveRecallProviderFailure {
+            reason: "memory.active_recall.provider_timeout",
+            provider_input_chars: Some(provider_input_chars),
+            provider_output_chars: None,
+        }),
+        Ok(provider_result) => match provider_result {
+            Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
+                Ok(mut decision) => {
+                    decision.provider_input_chars = Some(provider_input_chars);
+                    decision.provider_output_chars = Some(json.chars().count());
+                    decision
+                        .diagnostics
+                        .insert(0, "memory.active_recall.provider_called".to_owned());
+                    Ok(decision)
+                }
+                Err(_) => Err(ActiveRecallProviderFailure {
+                    reason: "memory.active_recall.invalid_json",
+                    provider_input_chars: Some(provider_input_chars),
+                    provider_output_chars: Some(json.chars().count()),
+                }),
+            },
+            Err(_) => Err(ActiveRecallProviderFailure {
+                reason: "memory.active_recall.provider_failed",
+                provider_input_chars: Some(provider_input_chars),
+                provider_output_chars: None,
+            }),
+        },
+    }
+}
+
+fn active_recall_thread_model_retry_context(
+    primary_context: &MemoryActiveRecallDecisionContext,
+    input: &TurnPrePromptContextHookInput,
+) -> Option<MemoryActiveRecallDecisionContext> {
+    let turn_model = input.model.clone()?;
+    let turn_model_provider = input.model_provider.clone()?;
+    if primary_context.model.as_deref() == Some(turn_model.as_str())
+        && primary_context.model_provider.as_deref() == Some(turn_model_provider.as_str())
+    {
+        return None;
+    }
+
+    let mut retry_context = primary_context.clone();
+    retry_context.model = Some(turn_model);
+    retry_context.model_provider = Some(turn_model_provider);
+    Some(retry_context)
 }
 
 fn active_recall_provider_fallback(
