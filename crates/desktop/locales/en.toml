@@ -816,6 +816,7 @@ description = "Manage application preferences."
 [settings.sidebar]
 back = "Back"
 general = "General"
+memory = "Memory"
 
 [settings.option.language]
 label = "App language"
@@ -827,7 +828,7 @@ description = "Pick a preferred appearance mode."
 
 [settings.memory]
 title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+description = "Control how Pioneer uses durable memory."
 
 [settings.memory.enabled]
 label = "Memory"
@@ -841,13 +842,13 @@ description = "Run extra read-only recall planning for context-heavy turns."
 label = "Proactive writes"
 description = "Save high-confidence durable facts after a turn."
 
+[settings.memory.background_extraction]
+label = "Background extraction"
+description = "Run post-turn memory extraction in the background instead of blocking the turn."
+
 [settings.memory.debug_trace]
 label = "Debug traces"
 description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
 
 [settings.language]
 system = "System default"

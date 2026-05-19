@@ -537,6 +537,7 @@ description = "アプリの設定を管理します。"
 [settings.sidebar]
 back = "戻る"
 general = "一般"
+memory = "メモリ"
 
 [settings.option.language]
 label = "アプリの言語"
@@ -547,28 +548,28 @@ label = "カラーテーマ"
 description = "表示モードを選択します。"
 
 [settings.memory]
-title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+title = "メモリ"
+description = "Pioneer が永続メモリをどのように使うかを制御します。"
 
 [settings.memory.enabled]
-label = "Memory"
-description = "Allow Pioneer to use saved facts and project decisions when useful."
+label = "メモリ"
+description = "役立つ場合に、保存済みの事実やプロジェクトの決定を Pioneer が使用できるようにします。"
 
 [settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
+label = "能動的な呼び出し"
+description = "文脈の多いタスク向けに、読み取り専用の追加メモリ呼び出し計画を実行します。"
 
 [settings.memory.proactive_writes]
-label = "Proactive writes"
-description = "Save high-confidence durable facts after a turn."
+label = "能動的な書き込み"
+description = "ターン後に、信頼度の高い永続的な事実を保存します。"
+
+[settings.memory.background_extraction]
+label = "バックグラウンド抽出"
+description = "ターンをブロックせず、ターン後のメモリ抽出をバックグラウンドで実行します。"
 
 [settings.memory.debug_trace]
-label = "Debug traces"
-description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
+label = "デバッグトレース"
+description = "ローカルのデバッグ画面にメモリ機構の診断を表示します。"
 
 [settings.language]
 system = "システム既定"

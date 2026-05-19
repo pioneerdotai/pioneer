@@ -537,6 +537,7 @@ description = "Gestiona las preferencias de la aplicación."
 [settings.sidebar]
 back = "Atrás"
 general = "General"
+memory = "Memoria"
 
 [settings.option.language]
 label = "Idioma de la aplicación"
@@ -547,28 +548,28 @@ label = "Tema de color"
 description = "Elige el modo de apariencia preferido."
 
 [settings.memory]
-title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+title = "Memoria"
+description = "Controla cómo Pioneer usa la memoria duradera."
 
 [settings.memory.enabled]
-label = "Memory"
-description = "Allow Pioneer to use saved facts and project decisions when useful."
+label = "Memoria"
+description = "Permitir que Pioneer use hechos guardados y decisiones del proyecto cuando sea útil."
 
 [settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
+label = "Recuperación activa"
+description = "Ejecutar planificación adicional de recuperación de solo lectura para tareas con mucho contexto."
 
 [settings.memory.proactive_writes]
-label = "Proactive writes"
-description = "Save high-confidence durable facts after a turn."
+label = "Escritura proactiva"
+description = "Guardar hechos duraderos de alta confianza después de un turno."
+
+[settings.memory.background_extraction]
+label = "Extracción en segundo plano"
+description = "Ejecutar la extracción de memoria después del turno en segundo plano, sin bloquear el turno."
 
 [settings.memory.debug_trace]
-label = "Debug traces"
-description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
+label = "Trazas de depuración"
+description = "Mostrar diagnósticos de los mecanismos de memoria en vistas locales de depuración."
 
 [settings.language]
 system = "Predeterminado del sistema"

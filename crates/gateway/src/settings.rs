@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use pioneer_config::{AppConfig, GatewayMemoryConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path};
@@ -7,21 +8,62 @@ use crate::helpers::normalize_non_empty;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GatewaySettings {
+pub struct GatewaySettings {
     version: u32,
     secrets: GatewaySecretsSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<GatewayMemorySettingsOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GatewaySecretsSettings {
+struct GatewaySecretsSettings {
     backend: GatewaySecretsBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum GatewaySecretsBackend {
+pub enum GatewaySecretsBackend {
     Keystore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayMemorySettings {
+    pub enabled: bool,
+    pub deterministic_recall_enabled: bool,
+    pub active_recall_enabled: bool,
+    pub tools_enabled: bool,
+    pub proactive_writes_enabled: bool,
+    pub background_extraction_enabled: bool,
+    pub debug_trace_enabled: bool,
+    pub strict_diagnostics_enabled: bool,
+}
+
+impl Default for GatewayMemorySettings {
+    fn default() -> Self {
+        Self::from_gateway_memory_config(&GatewayMemoryConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayMemorySettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deterministic_recall_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_recall_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proactive_writes_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background_extraction_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    debug_trace_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict_diagnostics_enabled: Option<bool>,
 }
 
 impl Default for GatewaySecretsSettings {
@@ -33,12 +75,135 @@ impl Default for GatewaySecretsSettings {
 }
 
 impl GatewaySettings {
-    pub(crate) fn secrets_backend(&self) -> GatewaySecretsBackend {
+    pub fn secrets_backend(&self) -> GatewaySecretsBackend {
         self.secrets.backend
+    }
+
+    pub fn has_memory_settings(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    pub fn effective_memory_settings(&self, config: &GatewayMemoryConfig) -> GatewayMemorySettings {
+        let settings = GatewayMemorySettings::from_gateway_memory_config(config);
+        self.memory
+            .map(|memory| memory.apply_to_memory_settings(settings))
+            .unwrap_or(settings)
+    }
+
+    pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
+        self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
+    }
+
+    pub fn apply_to_gateway_memory_config(
+        &self,
+        config: GatewayMemoryConfig,
+    ) -> GatewayMemoryConfig {
+        if let Some(memory) = &self.memory {
+            memory.apply_to_gateway_memory_config(config)
+        } else {
+            config
+        }
+    }
+
+    pub fn apply_to_app_config(&self, mut config: AppConfig) -> AppConfig {
+        config.gateway.memory = self.apply_to_gateway_memory_config(config.gateway.memory);
+        config
     }
 }
 
-pub(crate) fn normalize_settings_file_name(value: &str) -> Result<String> {
+impl GatewayMemorySettings {
+    pub fn from_gateway_memory_config(config: &GatewayMemoryConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            deterministic_recall_enabled: config.deterministic_recall_enabled,
+            active_recall_enabled: config.active_recall_enabled,
+            tools_enabled: config.tools_enabled,
+            proactive_writes_enabled: config.proactive_writes_enabled,
+            background_extraction_enabled: config.background_extraction_enabled,
+            debug_trace_enabled: config.debug_trace_enabled,
+            strict_diagnostics_enabled: config.strict_diagnostics_enabled,
+        }
+    }
+}
+
+impl GatewayMemorySettingsOverride {
+    fn from_memory_settings(settings: GatewayMemorySettings) -> Self {
+        Self {
+            enabled: Some(settings.enabled),
+            deterministic_recall_enabled: Some(settings.deterministic_recall_enabled),
+            active_recall_enabled: Some(settings.active_recall_enabled),
+            tools_enabled: Some(settings.tools_enabled),
+            proactive_writes_enabled: Some(settings.proactive_writes_enabled),
+            background_extraction_enabled: Some(settings.background_extraction_enabled),
+            debug_trace_enabled: Some(settings.debug_trace_enabled),
+            strict_diagnostics_enabled: Some(settings.strict_diagnostics_enabled),
+        }
+    }
+
+    fn apply_to_memory_settings(
+        self,
+        mut settings: GatewayMemorySettings,
+    ) -> GatewayMemorySettings {
+        if let Some(enabled) = self.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(deterministic_recall_enabled) = self.deterministic_recall_enabled {
+            settings.deterministic_recall_enabled = deterministic_recall_enabled;
+        }
+        if let Some(active_recall_enabled) = self.active_recall_enabled {
+            settings.active_recall_enabled = active_recall_enabled;
+        }
+        if let Some(tools_enabled) = self.tools_enabled {
+            settings.tools_enabled = tools_enabled;
+        }
+        if let Some(proactive_writes_enabled) = self.proactive_writes_enabled {
+            settings.proactive_writes_enabled = proactive_writes_enabled;
+        }
+        if let Some(background_extraction_enabled) = self.background_extraction_enabled {
+            settings.background_extraction_enabled = background_extraction_enabled;
+        }
+        if let Some(debug_trace_enabled) = self.debug_trace_enabled {
+            settings.debug_trace_enabled = debug_trace_enabled;
+        }
+        if let Some(strict_diagnostics_enabled) = self.strict_diagnostics_enabled {
+            settings.strict_diagnostics_enabled = strict_diagnostics_enabled;
+        }
+        settings
+    }
+
+    fn apply_to_gateway_memory_config(
+        &self,
+        mut config: GatewayMemoryConfig,
+    ) -> GatewayMemoryConfig {
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(deterministic_recall_enabled) = self.deterministic_recall_enabled {
+            config.deterministic_recall_enabled = deterministic_recall_enabled;
+        }
+        if let Some(active_recall_enabled) = self.active_recall_enabled {
+            config.active_recall_enabled = active_recall_enabled;
+        }
+        if let Some(tools_enabled) = self.tools_enabled {
+            config.tools_enabled = tools_enabled;
+        }
+        if let Some(proactive_writes_enabled) = self.proactive_writes_enabled {
+            config.proactive_writes_enabled = proactive_writes_enabled;
+        }
+        if let Some(background_extraction_enabled) = self.background_extraction_enabled {
+            config.background_extraction_enabled = background_extraction_enabled;
+        }
+        if let Some(debug_trace_enabled) = self.debug_trace_enabled {
+            config.debug_trace_enabled = debug_trace_enabled;
+        }
+        if let Some(strict_diagnostics_enabled) = self.strict_diagnostics_enabled {
+            config.strict_diagnostics_enabled = strict_diagnostics_enabled;
+        }
+        config
+    }
+}
+
+pub fn normalize_settings_file_name(value: &str) -> Result<String> {
     let trimmed = normalize_non_empty(value, "settings_file_name must not be empty")?;
     let path = Path::new(trimmed.as_str());
 
@@ -53,7 +218,7 @@ pub(crate) fn normalize_settings_file_name(value: &str) -> Result<String> {
     Ok(trimmed)
 }
 
-pub(crate) fn load_or_create_gateway_settings(
+pub fn load_or_create_gateway_settings(
     path: &Path,
     expected_version: u32,
     settings_file_name: &str,
@@ -65,6 +230,7 @@ pub(crate) fn load_or_create_gateway_settings(
     let settings = GatewaySettings {
         version: expected_version,
         secrets: GatewaySecretsSettings::default(),
+        memory: None,
     };
 
     save_gateway_settings(path, &settings)?;
@@ -102,7 +268,7 @@ fn load_gateway_settings(
     Ok(settings)
 }
 
-pub(crate) fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
+pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
     let content =
         toml::to_string_pretty(settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
@@ -162,7 +328,8 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::load_or_create_gateway_settings;
+    use super::{GatewayMemorySettings, load_or_create_gateway_settings, save_gateway_settings};
+    use pioneer_config::GatewayMemoryConfig;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -185,6 +352,88 @@ mod tests {
         assert!(!content.contains("[providers.keys]"));
         assert!(!content.contains("[mcp]"));
         assert!(!content.contains("[mcp.secrets]"));
+        assert!(!content.contains("[memory]"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_memory_overrides_gateway_config_without_owning_storage_fields() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[memory]
+enabled = false
+debug_trace_enabled = true
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let base = GatewayMemoryConfig {
+            capsules_dir: "memory/custom".to_owned(),
+            allow_global_user_by_default: false,
+            allow_global_agent_by_default: true,
+            deterministic_recall_enabled: false,
+            active_recall_enabled: false,
+            tools_enabled: false,
+            proactive_writes_enabled: false,
+            background_extraction_enabled: false,
+            strict_diagnostics_enabled: true,
+            ..GatewayMemoryConfig::default()
+        };
+
+        let mapped = settings.apply_to_gateway_memory_config(base);
+
+        assert_eq!(mapped.capsules_dir, "memory/custom");
+        assert!(!mapped.allow_global_user_by_default);
+        assert!(mapped.allow_global_agent_by_default);
+        assert!(!mapped.enabled);
+        assert!(!mapped.deterministic_recall_enabled);
+        assert!(!mapped.active_recall_enabled);
+        assert!(!mapped.tools_enabled);
+        assert!(!mapped.proactive_writes_enabled);
+        assert!(!mapped.background_extraction_enabled);
+        assert!(mapped.debug_trace_enabled);
+        assert!(mapped.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn saves_gateway_memory_settings_in_gateway_settings_file() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        settings.set_memory_settings(GatewayMemorySettings {
+            enabled: false,
+            deterministic_recall_enabled: false,
+            active_recall_enabled: false,
+            tools_enabled: false,
+            proactive_writes_enabled: false,
+            background_extraction_enabled: false,
+            debug_trace_enabled: true,
+            strict_diagnostics_enabled: true,
+        });
+        save_gateway_settings(&path, &settings).expect("settings should save");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[memory]"));
+        assert!(content.contains("enabled = false"));
+        assert!(content.contains("deterministic_recall_enabled = false"));
+        assert!(content.contains("active_recall_enabled = false"));
+        assert!(content.contains("tools_enabled = false"));
+        assert!(content.contains("proactive_writes_enabled = false"));
+        assert!(content.contains("background_extraction_enabled = false"));
+        assert!(content.contains("debug_trace_enabled = true"));
+        assert!(content.contains("strict_diagnostics_enabled = true"));
+        assert!(!content.contains("capsules_dir"));
+        assert!(!content.contains("allow_global_user_by_default"));
+        assert!(!content.contains("allow_global_agent_by_default"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

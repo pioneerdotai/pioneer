@@ -55,9 +55,6 @@ use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
 use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
-use crate::settings::{
-    GatewaySettings, load_or_create_gateway_settings, normalize_settings_file_name,
-};
 use crate::thread::ThreadManager;
 use crate::transport::spawn_server;
 use crate::workspace::WorkspaceManager;
@@ -69,11 +66,15 @@ pub use crate::operations::{
     artifact_gc_dry_run, artifact_gc_execute, artifact_storage_usage, rotate_superuser_jwt_token,
     secrets_garbage_collection, secrets_status,
 };
+pub use crate::settings::{
+    GatewayMemorySettings, GatewaySettings, load_or_create_gateway_settings,
+    normalize_settings_file_name, save_gateway_settings,
+};
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
 
 pub async fn run_gateway_until_shutdown() -> Result<()> {
-    let config = AppConfig::load()?;
+    let mut config = AppConfig::load()?;
     let runtime_home = config.ensure_runtime_home_dir()?;
     info!(
         runtime_home = %runtime_home.display(),
@@ -87,7 +88,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         "runtime identity files are ready"
     );
 
-    load_gateway_settings(&runtime_home, &config)?;
+    let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
+    config = gateway_settings.apply_to_app_config(config);
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     let jwt_material = gateway_secrets
         .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;

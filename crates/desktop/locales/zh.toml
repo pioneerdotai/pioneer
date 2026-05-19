@@ -537,6 +537,7 @@ description = "管理应用偏好设置。"
 [settings.sidebar]
 back = "返回"
 general = "通用"
+memory = "记忆"
 
 [settings.option.language]
 label = "应用语言"
@@ -547,28 +548,28 @@ label = "颜色主题"
 description = "选择偏好的外观模式。"
 
 [settings.memory]
-title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+title = "记忆"
+description = "控制 Pioneer 如何使用持久记忆。"
 
 [settings.memory.enabled]
-label = "Memory"
-description = "Allow Pioneer to use saved facts and project decisions when useful."
+label = "记忆"
+description = "允许 Pioneer 在有用时使用已保存的事实和项目决策。"
 
 [settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
+label = "主动回忆"
+description = "为上下文较重的任务运行额外的只读回忆规划。"
 
 [settings.memory.proactive_writes]
-label = "Proactive writes"
-description = "Save high-confidence durable facts after a turn."
+label = "主动写入"
+description = "在一轮对话后保存高置信度的持久事实。"
+
+[settings.memory.background_extraction]
+label = "后台提取"
+description = "在一轮对话后于后台运行记忆提取，不阻塞该轮对话。"
 
 [settings.memory.debug_trace]
-label = "Debug traces"
-description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
+label = "调试跟踪"
+description = "在本地调试视图中显示记忆机制诊断。"
 
 [settings.language]
 system = "跟随系统"

@@ -537,6 +537,7 @@ description = "Gérez les préférences de l'application."
 [settings.sidebar]
 back = "Retour"
 general = "Général"
+memory = "Mémoire"
 
 [settings.option.language]
 label = "Langue de l'application"
@@ -547,28 +548,28 @@ label = "Thème de couleur"
 description = "Choisissez le mode d'apparence préféré."
 
 [settings.memory]
-title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+title = "Mémoire"
+description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."
 
 [settings.memory.enabled]
-label = "Memory"
-description = "Allow Pioneer to use saved facts and project decisions when useful."
+label = "Mémoire"
+description = "Autoriser Pioneer à utiliser les faits enregistrés et les décisions de projet lorsque c'est utile."
 
 [settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
+label = "Rappel actif"
+description = "Exécuter une planification de rappel supplémentaire en lecture seule pour les tâches riches en contexte."
 
 [settings.memory.proactive_writes]
-label = "Proactive writes"
-description = "Save high-confidence durable facts after a turn."
+label = "Écriture proactive"
+description = "Enregistrer les faits durables à forte confiance après un tour."
+
+[settings.memory.background_extraction]
+label = "Extraction en arrière-plan"
+description = "Exécuter l'extraction de mémoire après le tour en arrière-plan, sans bloquer le tour."
 
 [settings.memory.debug_trace]
-label = "Debug traces"
-description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
+label = "Traces de débogage"
+description = "Afficher les diagnostics des mécanismes de mémoire dans les vues locales de débogage."
 
 [settings.language]
 system = "Par défaut du système"

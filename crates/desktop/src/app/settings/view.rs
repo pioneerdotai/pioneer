@@ -11,12 +11,12 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
     popover::{Popover, PopoverState},
+    switch::Switch,
     theme::ActiveTheme,
     *,
 };
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
-const MEMORY_TOGGLE_VALUES: [bool; 2] = [true, false];
 
 const LANGUAGE_OPTIONS: [AppLanguagePreference; 9] = [
     AppLanguagePreference::System,
@@ -34,13 +34,13 @@ impl PioneerDesktop {
     pub(crate) fn render_settings(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match self.settings_content_view {
             SettingsContentView::General => self.render_settings_general(cx),
+            SettingsContentView::Memory => self.render_settings_memory(cx),
         }
     }
 
     fn render_settings_general(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
-        let memory_settings = settings::memory_settings(cx);
         let desktop_entity = cx.entity().clone();
 
         v_flex()
@@ -77,9 +77,45 @@ impl PioneerDesktop {
                         ))
                         .child(Self::render_theme_setting(
                             selected_theme,
-                            desktop_entity.clone(),
+                            desktop_entity,
                             cx,
-                        ))
+                        )),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_settings_memory(&self, cx: &mut Context<Self>) -> AnyElement {
+        let memory_settings = settings::memory_settings(cx);
+        let desktop_entity = cx.entity().clone();
+
+        v_flex()
+            .id("settings-memory-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_6()
+            .bg(cx.theme().background)
+            .child(
+                h_flex().w_full().justify_center().child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH_PX))
+                        .gap_6()
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_semibold()
+                                        .child(t!("settings.memory.title").to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .opacity(0.6)
+                                        .child(t!("settings.memory.description").to_string()),
+                                ),
+                        )
                         .child(Self::render_memory_settings(
                             memory_settings,
                             desktop_entity,
@@ -184,28 +220,13 @@ impl PioneerDesktop {
     ) -> AnyElement {
         v_flex()
             .w_full()
-            .gap_4()
-            .p_4()
+            .gap_0()
+            .px_4()
+            .py_0()
             .rounded_lg()
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("settings.memory.title").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .child(t!("settings.memory.description").to_string()),
-                    ),
-            )
             .child(Self::render_memory_toggle_row(
                 "settings-memory-enabled",
                 MemorySettingToggle::Enabled,
@@ -215,6 +236,7 @@ impl PioneerDesktop {
                 desktop_entity.clone(),
                 cx,
             ))
+            .child(Self::render_settings_divider(cx))
             .child(Self::render_memory_toggle_row(
                 "settings-memory-active-recall",
                 MemorySettingToggle::ActiveRecall,
@@ -224,6 +246,7 @@ impl PioneerDesktop {
                 desktop_entity.clone(),
                 cx,
             ))
+            .child(Self::render_settings_divider(cx))
             .child(Self::render_memory_toggle_row(
                 "settings-memory-proactive-writes",
                 MemorySettingToggle::ProactiveWrites,
@@ -233,6 +256,17 @@ impl PioneerDesktop {
                 desktop_entity.clone(),
                 cx,
             ))
+            .child(Self::render_settings_divider(cx))
+            .child(Self::render_memory_toggle_row(
+                "settings-memory-background-extraction",
+                MemorySettingToggle::BackgroundExtraction,
+                memory.background_extraction_enabled,
+                t!("settings.memory.background_extraction.label").to_string(),
+                t!("settings.memory.background_extraction.description").to_string(),
+                desktop_entity.clone(),
+                cx,
+            ))
+            .child(Self::render_settings_divider(cx))
             .child(Self::render_memory_toggle_row(
                 "settings-memory-debug-trace",
                 MemorySettingToggle::DebugTrace,
@@ -242,6 +276,14 @@ impl PioneerDesktop {
                 desktop_entity,
                 cx,
             ))
+            .into_any_element()
+    }
+
+    fn render_settings_divider(cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().border)
             .into_any_element()
     }
 
@@ -257,44 +299,26 @@ impl PioneerDesktop {
         h_flex()
             .w_full()
             .gap_6()
+            .py_3()
             .justify_between()
+            .items_start()
             .child(
                 v_flex()
                     .child(div().text_sm().font_semibold().child(label))
                     .child(div().text_xs().opacity(0.6).child(description)),
             )
             .child(
-                ButtonGroup::new(id)
-                    .children(MEMORY_TOGGLE_VALUES.into_iter().enumerate().map(
-                        |(index, value)| {
-                            small_outline_button((id, index))
-                                .selected(selected == value)
-                                .child(div().text_sm().child(Self::memory_toggle_label(value)))
-                        },
-                    ))
-                    .on_click(move |selected_indices, _window, cx| {
-                        let Some(index) = selected_indices.first().copied() else {
-                            return;
-                        };
-                        let Some(value) = MEMORY_TOGGLE_VALUES.get(index).copied() else {
-                            return;
-                        };
-
+                Switch::new(id)
+                    .checked(selected)
+                    .mt_1p5()
+                    .on_click(move |enabled, _, cx| {
                         let _ = desktop_entity.update(cx, |view, cx| {
-                            view.apply_memory_setting(toggle, value, cx);
+                            view.apply_memory_setting(toggle, *enabled, cx);
                             cx.notify();
                         });
                     }),
             )
             .into_any_element()
-    }
-
-    fn memory_toggle_label(enabled: bool) -> String {
-        if enabled {
-            t!("settings.toggle.on").to_string()
-        } else {
-            t!("settings.toggle.off").to_string()
-        }
     }
 
     fn render_theme_setting(

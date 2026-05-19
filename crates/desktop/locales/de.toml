@@ -537,6 +537,7 @@ description = "Verwalten Sie Anwendungseinstellungen."
 [settings.sidebar]
 back = "Zurück"
 general = "Allgemein"
+memory = "Speicher"
 
 [settings.option.language]
 label = "App-Sprache"
@@ -547,28 +548,28 @@ label = "Farbschema"
 description = "Wählen Sie den bevorzugten Darstellungsmodus."
 
 [settings.memory]
-title = "Memory"
-description = "Control how Pioneer uses durable memory for future turns."
+title = "Speicher"
+description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."
 
 [settings.memory.enabled]
-label = "Memory"
-description = "Allow Pioneer to use saved facts and project decisions when useful."
+label = "Speicher"
+description = "Pioneer darf gespeicherte Fakten und Projektentscheidungen verwenden, wenn es hilfreich ist."
 
 [settings.memory.active_recall]
-label = "Active recall"
-description = "Run extra read-only recall planning for context-heavy turns."
+label = "Aktiver Abruf"
+description = "Zusätzliche schreibgeschützte Abrufplanung für kontextreiche Aufgaben ausführen."
 
 [settings.memory.proactive_writes]
-label = "Proactive writes"
-description = "Save high-confidence durable facts after a turn."
+label = "Proaktives Speichern"
+description = "Dauerhafte Fakten mit hoher Sicherheit nach einem Zug speichern."
+
+[settings.memory.background_extraction]
+label = "Extraktion im Hintergrund"
+description = "Speicherextraktion nach dem Zug im Hintergrund ausführen, statt den Zug zu blockieren."
 
 [settings.memory.debug_trace]
-label = "Debug traces"
-description = "Show memory hook diagnostics in local debug surfaces."
-
-[settings.toggle]
-on = "On"
-off = "Off"
+label = "Diagnosespuren"
+description = "Diagnosen der Speichermechanismen in lokalen Fehlerdiagnoseansichten anzeigen."
 
 [settings.language]
 system = "Systemstandard"

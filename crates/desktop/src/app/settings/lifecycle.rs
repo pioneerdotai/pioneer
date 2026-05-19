@@ -1,6 +1,8 @@
 use crate::{
     app::root::{MainContentView, PioneerDesktop, SettingsContentView},
-    app::settings::{MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID},
+    app::settings::{
+        MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
+    },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
 };
@@ -25,11 +27,15 @@ impl PioneerDesktop {
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
         let selected_ix = match self.settings_content_view {
             SettingsContentView::General => Some(0),
+            SettingsContentView::Memory => Some(1),
         };
         let settings_tree_state = self.settings_tree_state.clone();
         settings_tree_state.update(cx, |state, cx| {
             state.set_items(
-                vec![TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general")],
+                vec![
+                    TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general"),
+                    TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
+                ],
                 cx,
             );
             state.set_selected_index(selected_ix, cx);
@@ -76,8 +82,11 @@ impl PioneerDesktop {
         let mut memory = settings::memory_settings(cx);
         match toggle {
             MemorySettingToggle::Enabled => memory.enabled = enabled,
-            MemorySettingToggle::ProactiveWrites => memory.proactive_writes_enabled = enabled,
             MemorySettingToggle::ActiveRecall => memory.active_recall_enabled = enabled,
+            MemorySettingToggle::ProactiveWrites => memory.proactive_writes_enabled = enabled,
+            MemorySettingToggle::BackgroundExtraction => {
+                memory.background_extraction_enabled = enabled
+            }
             MemorySettingToggle::DebugTrace => memory.debug_trace_enabled = enabled,
         }
 

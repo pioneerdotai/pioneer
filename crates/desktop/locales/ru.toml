@@ -816,6 +816,7 @@ description = "Управляйте параметрами приложения.
 [settings.sidebar]
 back = "Назад"
 general = "Общие"
+memory = "Память"
 
 [settings.option.language]
 label = "Язык приложения"
@@ -827,27 +828,27 @@ description = "Выберите предпочтительный режим оф
 
 [settings.memory]
 title = "Память"
-description = "Управляйте тем, как Pioneer использует долговременную память в следующих ходах."
+description = "Управляйте тем, как Pioneer использует долговременную память."
 
 [settings.memory.enabled]
 label = "Память"
 description = "Разрешить Pioneer использовать сохранённые факты и проектные решения, когда это полезно."
 
 [settings.memory.active_recall]
-label = "Активный recall"
-description = "Запускать дополнительное read-only планирование памяти для контекстных задач."
+label = "Активное вспоминание"
+description = "Запускать дополнительное планирование чтения памяти для контекстных задач."
 
 [settings.memory.proactive_writes]
 label = "Проактивная запись"
 description = "Сохранять долговременные факты с высокой уверенностью после хода."
 
-[settings.memory.debug_trace]
-label = "Debug traces"
-description = "Показывать диагностику memory hooks в локальных debug-поверхностях."
+[settings.memory.background_extraction]
+label = "Фоновое извлечение"
+description = "Извлекать память после хода в фоне, не блокируя завершение ответа."
 
-[settings.toggle]
-on = "Вкл"
-off = "Выкл"
+[settings.memory.debug_trace]
+label = "Отладочные трассы"
+description = "Показывать диагностику механизмов памяти в локальных отладочных представлениях."
 
 [settings.language]
 system = "Как в системе"

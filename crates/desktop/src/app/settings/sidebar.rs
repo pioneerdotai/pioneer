@@ -1,4 +1,4 @@
-use super::SETTINGS_CONTENT_GENERAL_NODE_ID;
+use super::{SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID};
 use crate::app::root::{PioneerDesktop, SettingsContentView};
 use gpui::{ClickEvent, prelude::*, *};
 use gpui_component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
@@ -75,10 +75,9 @@ impl PioneerDesktop {
                                                             .when(selected, |this| {
                                                                 this.opacity(1.0)
                                                             })
-                                                            .child(
-                                                                t!("settings.sidebar.general")
-                                                                    .to_string(),
-                                                            ),
+                                                            .child(settings_sidebar_content_label(
+                                                                content_view,
+                                                            )),
                                                     ),
                                             ),
                                     ),
@@ -112,6 +111,16 @@ fn parse_settings_sidebar_node_key(value: &str) -> SettingsSidebarNodeKey {
     if value == SETTINGS_CONTENT_GENERAL_NODE_ID {
         return SettingsSidebarNodeKey::Content(SettingsContentView::General);
     }
+    if value == SETTINGS_CONTENT_MEMORY_NODE_ID {
+        return SettingsSidebarNodeKey::Content(SettingsContentView::Memory);
+    }
 
     SettingsSidebarNodeKey::Unknown
+}
+
+fn settings_sidebar_content_label(content_view: SettingsContentView) -> String {
+    match content_view {
+        SettingsContentView::General => t!("settings.sidebar.general").to_string(),
+        SettingsContentView::Memory => t!("settings.sidebar.memory").to_string(),
+    }
 }

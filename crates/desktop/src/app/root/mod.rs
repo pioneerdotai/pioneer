@@ -135,6 +135,7 @@ pub(super) enum MainContentView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsContentView {
     General,
+    Memory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -58,7 +58,6 @@ pub struct GatewayRuntime {
 impl GatewayRuntime {
     pub fn load() -> Result<Self> {
         let config = AppConfig::load().context(t!("errors.config.load_app").to_string())?;
-        let config = crate::settings::apply_loaded_memory_settings_to_app_config(config);
         let runtime_home = config
             .ensure_runtime_home_dir()
             .context(t!("errors.runtime.ensure_home").to_string())?;
