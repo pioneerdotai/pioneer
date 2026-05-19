@@ -5298,7 +5298,7 @@ async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insuffici
     assert!(
         prompt
             .full_system_text
-            .contains("If unsure on a non-trivial task, do one lightweight memory_search")
+            .contains("If unsure whether injected memory is enough for a non-trivial task")
     );
     assert!(!prompt.full_system_text.contains("Relevant memories:"));
 }

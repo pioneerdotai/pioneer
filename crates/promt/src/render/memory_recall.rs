@@ -92,10 +92,12 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
                 prompt.push_str("Use memory_list, not memory_search, when the user asks what is stored in memory, asks for a memory audit/inventory, or asks to delete, keep, compare, or clean up memories in bulk. memory_search is relevance-ranked and may omit records.\n");
             }
             if has_search {
-                prompt.push_str("If relevant memory is already shown below, use it. If memory is likely relevant but the recalled block is missing or insufficient, call memory_search early.\n");
-                prompt.push_str("Use memory_search for user identity, preferences, biography, relationships, recurring instructions, communication style, project conventions, architecture, previous decisions, ongoing tasks, todos, plans, known failures, debugging history, or anything the user asks you to continue, remember, compare, or keep consistent.\n");
+                prompt.push_str("If relevant memory is already shown below and directly answers the user's request, answer from that recalled context without calling memory_search.\n");
+                prompt.push_str("Do not call memory_search merely because the request mentions memory, remembering, identity, preferences, or prior context; check injected memory context first.\n");
+                prompt.push_str("Call memory_search early only when memory is likely relevant and the recalled context is missing, insufficient, ambiguous, stale, conflicting, or the user needs provenance or exhaustive lookup.\n");
+                prompt.push_str("Use memory_search to fill gaps for user identity, preferences, biography, relationships, recurring instructions, communication style, project conventions, architecture, previous decisions, ongoing tasks, todos, plans, known failures, debugging history, or anything the user asks you to continue, remember, compare, or keep consistent.\n");
                 prompt.push_str(
-                    "If unsure on a non-trivial task, do one lightweight memory_search.\n",
+                    "If unsure whether injected memory is enough for a non-trivial task, do one lightweight memory_search.\n",
                 );
             }
         }
@@ -375,11 +377,15 @@ mod tests {
         assert!(prompt.contains("Treat memory as working context"));
         assert!(prompt.contains("Skip memory only when the request is clearly self-contained"));
         assert!(prompt.contains(
-            "If memory is likely relevant but the recalled block is missing or insufficient"
+            "directly answers the user's request, answer from that recalled context without calling memory_search"
         ));
-        assert!(
-            prompt.contains("If unsure on a non-trivial task, do one lightweight memory_search")
-        );
+        assert!(prompt.contains(
+            "Do not call memory_search merely because the request mentions memory"
+        ));
+        assert!(prompt.contains("Call memory_search early only when memory is likely relevant"));
+        assert!(prompt.contains("Use memory_search to fill gaps"));
+        assert!(prompt
+            .contains("If unsure whether injected memory is enough for a non-trivial task"));
         assert!(prompt.contains("Call memory_remember proactively"));
         assert!(prompt.contains("If the user asks you to forget"));
         assert!(prompt.contains("Use memory_list, not memory_search"));

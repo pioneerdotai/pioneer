@@ -25,11 +25,11 @@ pub fn render_memory_active_recall_planner_prompt(
             "  \"targets\": [\n",
             "    {{\n",
             "      \"scopeKind\": \"user\" | \"workspace\" | \"agent\" | \"thread\" | \"task\",\n",
-            "      \"factClass\": string,\n",
-            "      \"category\": string,\n",
-            "      \"subject\": string,\n",
-            "      \"attribute\": string,\n",
-            "      \"canonicalKey\": string\n",
+            "      \"factClass\": \"user_identity\" | \"user_biography\" | \"user_relationship\" | \"stable_user_preference\" | \"communication_preference\" | \"recurring_user_instruction\" | \"project_policy\" | \"project_decision\" | \"project_procedure\" | \"project_constraint\" | \"task_lifecycle_state\" | \"operational_observation\" | \"thread_local_state\" | \"tool_result_fact\" | \"assistant_self_description\" | \"generated_summary_fact\" | \"domain_owned_state\" | \"secret_or_credential\" | \"regulated_sensitive_fact\",\n",
+            "      \"category\": \"identity\" | \"biography\" | \"relationship\" | \"preference\" | \"communication_style\" | \"recurring_instruction\" | \"project_policy\" | \"project_decision\" | \"procedure\" | \"constraint\" | \"todo\" | \"project_fact\" | \"custom\",\n",
+            "      \"subject\": \"current_user\" | \"current_agent\" | \"project\" | \"thread\" | \"task\" | string,\n",
+            "      \"attribute\": \"name\" | \"birthdate\" | \"preference\" | \"communication_style\" | \"decision\" | \"instruction\" | \"status\" | string,\n",
+            "      \"canonicalKey\": string | null\n",
             "    }}\n",
             "  ],\n",
             "  \"diagnostics\": [string]\n",
@@ -39,6 +39,7 @@ pub fn render_memory_active_recall_planner_prompt(
             "- Use \"run\" when additional memory is likely to improve correctness, continuity, personalization, or consistency.\n",
             "- Use \"uncertain\" when the structured input is insufficient to choose safely.\n",
             "- Include only modes listed in availableModes.\n",
+            "- Use factClass values exactly as listed above. Do not use category names such as \"identity\" as factClass; use \"user_identity\" for the current user's name or identity facts.\n",
             "- Do not include exact_canonical unless an exact canonical target is present.\n",
             "- Do not include current_task/task_context unless current task context capability is available.\n",
             "- Do not include completed_task unless completed task summary capability is available.\n",
@@ -78,6 +79,8 @@ mod tests {
         assert!(prompt.contains("create threads"));
         assert!(prompt.contains("read memory directly"));
         assert!(prompt.contains("Make decisions by semantic need and structured fields"));
+        assert!(prompt.contains(r#""factClass": "user_identity""#));
+        assert!(prompt.contains(r#"Do not use category names such as "identity" as factClass"#));
         assert!(prompt.contains(r#""availableModes":["profile"]"#));
         assert!(!prompt.contains("запомни"));
         assert!(!prompt.contains("remember that"));
