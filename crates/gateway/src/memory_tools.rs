@@ -325,11 +325,11 @@ async fn request_active_memory_decision_json(
     prompt: String,
     max_output_chars: usize,
 ) -> Result<String, String> {
-    match request_active_memory_decision_json_once(provider, model, prompt.clone(), Some(0.0)).await
-    {
+    match request_active_memory_decision_json_once(provider, model, prompt.clone(), None).await {
         Ok(json) => bounded_active_memory_decision_json(json, max_output_chars),
         Err(primary_error) => {
-            if !should_retry_post_turn_extractor_without_optional_params(primary_error.as_str()) {
+            if !should_retry_internal_memory_request_without_optional_params(primary_error.as_str())
+            {
                 return Err(format!(
                     "active memory planner request failed: {primary_error}"
                 ));
@@ -405,10 +405,11 @@ async fn request_post_turn_extractor_json(
     model: &str,
     prompt: String,
 ) -> Result<String, String> {
-    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), Some(0.0)).await {
+    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), None).await {
         Ok(json) => Ok(json),
         Err(primary_error) => {
-            if !should_retry_post_turn_extractor_without_optional_params(primary_error.as_str()) {
+            if !should_retry_internal_memory_request_without_optional_params(primary_error.as_str())
+            {
                 return Err(format!(
                     "memory post-turn extractor request failed: {primary_error}"
                 ));
@@ -481,7 +482,7 @@ fn post_turn_extractor_chat_request(
     }
 }
 
-fn should_retry_post_turn_extractor_without_optional_params(error: &str) -> bool {
+fn should_retry_internal_memory_request_without_optional_params(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("400")
         || error.contains("bad request")
@@ -1558,7 +1559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_turn_extractor_retries_without_optional_params_on_compatibility_error() {
+    async fn post_turn_extractor_omits_optional_params_by_default() {
         let provider = CompatibilityFallbackProvider::new();
 
         let json = request_post_turn_extractor_json(
@@ -1571,11 +1572,29 @@ mod tests {
 
         assert_eq!(json, r#"{"facts":[]}"#);
         let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].temperature, Some(0.0));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].temperature, None);
         assert_eq!(requests[0].max_tokens, None);
-        assert_eq!(requests[1].temperature, None);
-        assert_eq!(requests[1].max_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn active_memory_planner_omits_optional_params_by_default() {
+        let provider = CompatibilityFallbackProvider::new();
+
+        let json = request_active_memory_decision_json(
+            &provider,
+            "openrouter/owl-alpha",
+            "plan memory".to_owned(),
+            1_000,
+        )
+        .await
+        .expect("request should succeed without compatibility retry");
+
+        assert_eq!(json, r#"{"facts":[]}"#);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].temperature, None);
+        assert_eq!(requests[0].max_tokens, None);
     }
 
     #[tokio::test]
