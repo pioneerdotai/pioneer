@@ -82,9 +82,15 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
     let has_search = available_tool_names
         .iter()
         .any(|name| name == "memory_search");
+    let has_list = available_tool_names
+        .iter()
+        .any(|name| name == "memory_list");
     match input.policy {
         MemoryRecallPromptPolicy::Full | MemoryRecallPromptPolicy::ReadOnly => {
             prompt.push_str("Before non-trivial tasks, decide whether memory is likely to help. Skip memory only when the request is clearly self-contained, such as simple translation, trivial formatting, current-time questions, or one-off commands.\n");
+            if has_list {
+                prompt.push_str("Use memory_list, not memory_search, when the user asks what is stored in memory, asks for a memory audit/inventory, or asks to delete, keep, compare, or clean up memories in bulk. memory_search is relevance-ranked and may omit records.\n");
+            }
             if has_search {
                 prompt.push_str("If relevant memory is already shown below, use it. If memory is likely relevant but the recalled block is missing or insufficient, call memory_search early.\n");
                 prompt.push_str("Use memory_search for user identity, preferences, biography, relationships, recurring instructions, communication style, project conventions, architecture, previous decisions, ongoing tasks, todos, plans, known failures, debugging history, or anything the user asks you to continue, remember, compare, or keep consistent.\n");
@@ -95,6 +101,9 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
         }
         MemoryRecallPromptPolicy::ForgetOnly => {
             prompt.push_str("Use memory tools only to identify and forget the memory target explicitly requested by the user. Do not perform broad memory recall or unrelated memory search.\n");
+            if has_list {
+                prompt.push_str("For broad delete/keep cleanup requests, call memory_list first to inventory all active candidate records before calling memory_forget.\n");
+            }
         }
     }
     if available_tool_names.iter().any(|name| name == "memory_get") {
@@ -117,6 +126,9 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
         .any(|name| name == "memory_forget")
     {
         prompt.push_str("If the user asks you to forget something, call memory_forget.");
+        if has_list {
+            prompt.push_str(" For broad cleanup, list memory first so records are not missed.");
+        }
         if has_search {
             prompt.push_str(" Resolve ambiguous forget targets with memory_search first.");
         }
@@ -341,6 +353,7 @@ mod tests {
         let prompt = render_memory_recall_prompt(&MemoryRecallPromptInput {
             available_tool_names: vec![
                 "memory_search".to_owned(),
+                "memory_list".to_owned(),
                 "memory_get".to_owned(),
                 "memory_search".to_owned(),
                 "memory_remember".to_owned(),
@@ -357,7 +370,7 @@ mod tests {
         .expect("memory prompt");
 
         assert!(prompt.contains(
-            "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+            "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
         ));
         assert!(prompt.contains("Treat memory as working context"));
         assert!(prompt.contains("Skip memory only when the request is clearly self-contained"));
@@ -369,6 +382,7 @@ mod tests {
         );
         assert!(prompt.contains("Call memory_remember proactively"));
         assert!(prompt.contains("If the user asks you to forget"));
+        assert!(prompt.contains("Use memory_list, not memory_search"));
         assert!(prompt.contains("Do not store one-off commands"));
         assert!(prompt.contains("Relevant memory context for this turn:"));
         assert!(prompt.contains("- user identity: User's name is Alexander."));

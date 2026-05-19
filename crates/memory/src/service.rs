@@ -1006,7 +1006,7 @@ impl MemoryService {
             Vec::new()
         };
         let Some(record) = self
-            .hydrate_visible_row(row, &context, &allowed_statuses, now, true)
+            .hydrate_control_plane_row(row, &context, &allowed_statuses, now, true)
             .await?
         else {
             return Ok(MemoryGetResponse { record: None });
@@ -1037,7 +1037,7 @@ impl MemoryService {
             return Ok(MemoryGetResponse { record: None });
         };
         let Some(record) = self
-            .hydrate_visible_row(row, &context, &[], now, true)
+            .hydrate_control_plane_row(row, &context, &[], now, true)
             .await?
         else {
             return Ok(MemoryGetResponse { record: None });
@@ -1100,7 +1100,7 @@ impl MemoryService {
         let mut records = Vec::new();
         for row in rows {
             if let Some(record) = self
-                .hydrate_visible_row(row, &context, &params.statuses, now, false)
+                .hydrate_control_plane_row(row, &context, &params.statuses, now, false)
                 .await?
             {
                 records.push(record);
@@ -2900,15 +2900,71 @@ impl MemoryService {
         let Some(row) = row else {
             return Ok(Vec::new());
         };
-        if self
-            .row_recall_visibility(&row, context, &[], now)
-            .await?
-            .is_visible()
-        {
+        if self.row_control_plane_visible(&row, context, &[], now) {
             Ok(vec![row])
         } else {
             Ok(Vec::new())
         }
+    }
+
+    async fn hydrate_control_plane_row(
+        &self,
+        row: AgentMemoryControlRecord,
+        context: &MemoryOperationContext,
+        allowed_statuses: &[MemoryStatus],
+        now: i64,
+        record_access: bool,
+    ) -> Result<Option<MemoryRecord>> {
+        if !self.row_control_plane_visible(&row, context, allowed_statuses, now) {
+            return Ok(None);
+        }
+
+        let payload = match self.backend.get(backend_get_request(&row)).await? {
+            Some(payload) => payload,
+            None if row.status == MemoryStatus::Deleted => BackendPayload {
+                memory_id: row.id.clone(),
+                content: row.content_preview.clone().unwrap_or_default(),
+                snippet: row.content_preview.clone(),
+                metadata_json: None,
+            },
+            None => {
+                self.mark_missing_backend_payload(&row, now).await?;
+                return Ok(None);
+            }
+        };
+
+        let row = if record_access && row.status == MemoryStatus::Active {
+            self.store
+                .record_agent_memory_access(row.id.as_str(), now)
+                .await?;
+            self.store
+                .get_agent_memory_record(row.id.as_str(), true)
+                .await?
+                .unwrap_or(row)
+        } else {
+            row
+        };
+
+        Ok(Some(crud_record_to_protocol(row, payload)?))
+    }
+
+    fn row_control_plane_visible(
+        &self,
+        row: &AgentMemoryControlRecord,
+        context: &MemoryOperationContext,
+        allowed_statuses: &[MemoryStatus],
+        now: i64,
+    ) -> bool {
+        if !control_plane_status_visible(row, allowed_statuses, now) {
+            return false;
+        }
+        if row.repair_status != REPAIR_STATUS_OK {
+            return false;
+        }
+        if !self.policy.read_policy(context).allows(row.sensitivity) {
+            return false;
+        }
+        workspace_visible(row, context)
     }
 
     async fn hydrate_visible_row(
@@ -2990,18 +3046,6 @@ impl MemoryService {
         };
 
         Ok(Some((crud_record_to_protocol(row, payload)?, quality)))
-    }
-
-    async fn row_recall_visibility(
-        &self,
-        row: &AgentMemoryControlRecord,
-        context: &MemoryOperationContext,
-        allowed_statuses: &[MemoryStatus],
-        now: i64,
-    ) -> Result<MemoryRecallVisibility> {
-        let quality = self.recall_quality_signals_for_row(row).await?;
-        self.row_recall_visibility_with_quality(row, context, allowed_statuses, now, &quality)
-            .await
     }
 
     async fn row_recall_visibility_with_quality(
@@ -4056,6 +4100,36 @@ fn recency_anchor_unix(row: &AgentMemoryControlRecord) -> i64 {
         .unwrap_or(row.updated_at_unix)
         .max(row.updated_at_unix)
         .max(row.created_at_unix)
+}
+
+fn control_plane_status_visible(
+    row: &AgentMemoryControlRecord,
+    allowed_statuses: &[MemoryStatus],
+    now: i64,
+) -> bool {
+    if allowed_statuses.is_empty() {
+        if row.status != MemoryStatus::Active {
+            return false;
+        }
+    } else if !allowed_statuses.contains(&row.status) {
+        return false;
+    }
+
+    if row.deleted_at_unix.is_some() && !allowed_statuses.contains(&MemoryStatus::Deleted) {
+        return false;
+    }
+    if row.superseded_by.is_some() && !allowed_statuses.contains(&MemoryStatus::Superseded) {
+        return false;
+    }
+    if row
+        .expires_at_unix
+        .is_some_and(|expires_at| expires_at <= now)
+        && !allowed_statuses.contains(&MemoryStatus::Expired)
+    {
+        return false;
+    }
+
+    true
 }
 
 fn backend_get_request(row: &AgentMemoryControlRecord) -> BackendGetRequest {

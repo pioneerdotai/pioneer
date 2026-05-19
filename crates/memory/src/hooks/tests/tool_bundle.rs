@@ -5,6 +5,7 @@ fn memory_tool_bundle_contribution_uses_stable_ids_and_policy_diagnostic() {
     let policy = MemoryTurnPolicy::normal_default_allow();
     let bundle = test_memory_tool_bundle(&[
         MEMORY_SEARCH_TOOL,
+        MEMORY_LIST_TOOL,
         MEMORY_GET_TOOL,
         MEMORY_REMEMBER_TOOL,
         MEMORY_FORGET_TOOL,
@@ -24,6 +25,7 @@ fn memory_tool_bundle_contribution_uses_stable_ids_and_policy_diagnostic() {
         hook_tool_names_to_strings(&contribution.tool_names),
         vec![
             MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
             MEMORY_GET_TOOL,
             MEMORY_REMEMBER_TOOL,
             MEMORY_FORGET_TOOL,
@@ -46,6 +48,7 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
             MemoryTurnPolicy::normal_default_allow(),
             vec![
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -58,6 +61,7 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
             ),
             vec![
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -67,13 +71,19 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
         (MemoryTurnPolicy::no_use(), Vec::new(), 0),
         (
             MemoryTurnPolicy::no_save(),
-            vec![MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+            vec![
+                MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
+                MEMORY_GET_TOOL,
+                MEMORY_FORGET_TOOL,
+            ],
             1,
         ),
         (
             MemoryTurnPolicy::explicit_remember(),
             vec![
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -82,7 +92,12 @@ async fn memory_tool_bundle_hook_applies_policy_visibility_matrix() {
         ),
         (
             MemoryTurnPolicy::explicit_forget(Some("birthday".to_owned())),
-            vec![MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL],
+            vec![
+                MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
+                MEMORY_GET_TOOL,
+                MEMORY_FORGET_TOOL,
+            ],
             1,
         ),
     ];
@@ -214,9 +229,10 @@ async fn memory_tool_bundle_hook_does_not_execute_tool_handlers_during_materiali
         response_tool_names(&response),
         vec![
             MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
             MEMORY_GET_TOOL,
             MEMORY_REMEMBER_TOOL,
-            MEMORY_FORGET_TOOL
+            MEMORY_FORGET_TOOL,
         ]
     );
 }
@@ -259,6 +275,7 @@ fn memory_tool_filtering_applies_turn_policy() {
         bundles: vec![pioneer_tools::ToolExtensionBundle {
             specs: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -268,6 +285,7 @@ fn memory_tool_filtering_applies_turn_policy() {
             .collect(),
             handlers: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -290,7 +308,12 @@ fn memory_tool_filtering_applies_turn_policy() {
     );
     assert_eq!(
         memory_tool_names(&filtered),
-        vec![MEMORY_SEARCH_TOOL, MEMORY_GET_TOOL, MEMORY_FORGET_TOOL]
+        vec![
+            MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
+            MEMORY_GET_TOOL,
+            MEMORY_FORGET_TOOL,
+        ]
     );
     assert!(
         filtered
@@ -306,6 +329,7 @@ fn permissive_classifier_fallback_filter_keeps_all_explicit_memory_tools() {
         bundles: vec![pioneer_tools::ToolExtensionBundle {
             specs: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -315,6 +339,7 @@ fn permissive_classifier_fallback_filter_keeps_all_explicit_memory_tools() {
             .collect(),
             handlers: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -342,6 +367,7 @@ fn permissive_classifier_fallback_filter_keeps_all_explicit_memory_tools() {
         memory_tool_names(&filtered),
         vec![
             MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
             MEMORY_GET_TOOL,
             MEMORY_REMEMBER_TOOL,
             MEMORY_FORGET_TOOL,

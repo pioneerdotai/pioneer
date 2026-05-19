@@ -11,6 +11,7 @@ pub(super) fn memory_tool_names_from_prompt_compile_input(
 
     [
         MEMORY_SEARCH_TOOL,
+        MEMORY_LIST_TOOL,
         MEMORY_GET_TOOL,
         MEMORY_REMEMBER_TOOL,
         MEMORY_FORGET_TOOL,

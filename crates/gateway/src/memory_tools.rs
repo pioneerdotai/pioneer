@@ -31,11 +31,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 const MEMORY_SEARCH_TOOL: &str = "memory_search";
+const MEMORY_LIST_TOOL: &str = "memory_list";
 const MEMORY_GET_TOOL: &str = "memory_get";
 const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
 const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
+const DEFAULT_LIST_LIMIT: u32 = 50;
+const MAX_LIST_LIMIT: u32 = 100;
 const SNIPPET_MAX_CHARS: usize = 280;
 
 #[derive(Clone)]
@@ -545,6 +548,7 @@ impl ToolHandler for MemoryToolHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         match invocation.tool_name.as_str() {
             MEMORY_SEARCH_TOOL => self.handle_search(invocation).await,
+            MEMORY_LIST_TOOL => self.handle_list(invocation).await,
             MEMORY_GET_TOOL => self.handle_get(invocation).await,
             MEMORY_REMEMBER_TOOL => self.handle_remember(invocation).await,
             MEMORY_FORGET_TOOL => self.handle_forget(invocation).await,
@@ -588,6 +592,43 @@ impl MemoryToolHandler {
 
         Ok(function_output(search_output(
             &response.hits,
+            response.next_cursor.as_deref(),
+            input.include_provenance,
+        )))
+    }
+
+    async fn handle_list(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: MemoryListToolInput = decode_tool_args(invocation)?;
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT);
+        let scopes = self.scopes_for_kinds(&input.scopes)?;
+        let context = self.operation_context(None)?;
+
+        let response = self
+            .processor
+            .memory_runtime()
+            .service()
+            .list(
+                context,
+                MemoryListParams {
+                    scopes,
+                    categories: input.categories,
+                    statuses: input.statuses,
+                    query: None,
+                    limit: Some(limit),
+                    cursor: input.cursor,
+                },
+            )
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+
+        Ok(function_output(list_output(
+            &response.records,
             response.next_cursor.as_deref(),
             input.include_provenance,
         )))
@@ -858,6 +899,23 @@ struct MemorySearchToolInput {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemoryListToolInput {
+    #[serde(default)]
+    scopes: Vec<MemoryScopeKind>,
+    #[serde(default)]
+    categories: Vec<MemoryCategory>,
+    #[serde(default)]
+    statuses: Vec<MemoryStatus>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    include_provenance: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryGetToolInput {
     #[serde(default)]
     memory_id: Option<String>,
@@ -927,6 +985,12 @@ fn memory_tool_specs() -> Vec<ConfiguredToolSpec> {
             MEMORY_SEARCH_TOOL,
             "Search durable memory in the current active scopes. Use for prior user preferences, identity, dates, relationships, project facts, project decisions, durable procedures, constraints and remembered communication style.",
             memory_search_schema(),
+            safe_read_recovery(),
+        ),
+        memory_tool_spec(
+            MEMORY_LIST_TOOL,
+            "List durable memory inventory in the current active scopes without semantic search. Use when the user asks what is stored, asks to audit memory, or asks to delete/keep memories in bulk.",
+            memory_list_schema(),
             safe_read_recovery(),
         ),
         memory_tool_spec(
@@ -1003,6 +1067,30 @@ fn memory_search_schema() -> JsonValue {
     })
 }
 
+fn memory_list_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "scopes": {
+                "type": "array",
+                "items": { "type": "string", "enum": scope_kind_values() }
+            },
+            "categories": {
+                "type": "array",
+                "items": { "type": "string", "enum": category_values() }
+            },
+            "statuses": {
+                "type": "array",
+                "items": { "type": "string", "enum": status_values() }
+            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT },
+            "cursor": { "type": "string" },
+            "includeProvenance": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn memory_get_schema() -> JsonValue {
     json!({
         "type": "object",
@@ -1071,6 +1159,10 @@ fn category_values() -> Vec<&'static str> {
 
 fn sensitivity_values() -> Vec<&'static str> {
     vec!["normal", "personal", "secret_like", "regulated"]
+}
+
+fn status_values() -> Vec<&'static str> {
+    vec!["active", "superseded", "deleted", "expired"]
 }
 
 fn decode_tool_args<T>(invocation: ToolInvocation) -> Result<T, ToolError>
@@ -1184,6 +1276,20 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
         object.insert("provenance".to_owned(), to_json_value(&record.provenance));
     }
     JsonValue::Object(object)
+}
+
+fn list_output(
+    records: &[MemoryRecord],
+    next_cursor: Option<&str>,
+    include_provenance: bool,
+) -> JsonValue {
+    json!({
+        "records": records
+            .iter()
+            .map(|record| record_output(record, true, include_provenance))
+            .collect::<Vec<_>>(),
+        "nextCursor": next_cursor,
+    })
 }
 
 fn remember_output(response: &pioneer_protocol::MemoryRememberResponse) -> JsonValue {

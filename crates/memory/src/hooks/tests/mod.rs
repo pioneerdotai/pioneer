@@ -543,6 +543,7 @@ fn standard_tool_materialization() -> MemoryToolMaterialization {
     MemoryToolMaterialization {
         bundles: vec![test_memory_tool_bundle(&[
             MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
             MEMORY_GET_TOOL,
             MEMORY_REMEMBER_TOOL,
             MEMORY_FORGET_TOOL,
@@ -557,6 +558,7 @@ fn panicking_handler_tool_materialization() -> MemoryToolMaterialization {
         bundles: vec![ToolExtensionBundle {
             specs: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -566,6 +568,7 @@ fn panicking_handler_tool_materialization() -> MemoryToolMaterialization {
             .collect(),
             handlers: [
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -594,6 +597,7 @@ fn hook_tool_names_to_static(tool_names: &[HookToolName]) -> Vec<&'static str> {
         .iter()
         .filter_map(|name| match name.as_str() {
             MEMORY_SEARCH_TOOL => Some(MEMORY_SEARCH_TOOL),
+            MEMORY_LIST_TOOL => Some(MEMORY_LIST_TOOL),
             MEMORY_GET_TOOL => Some(MEMORY_GET_TOOL),
             MEMORY_REMEMBER_TOOL => Some(MEMORY_REMEMBER_TOOL),
             MEMORY_FORGET_TOOL => Some(MEMORY_FORGET_TOOL),

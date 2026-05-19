@@ -1212,6 +1212,7 @@ fn fake_standard_memory_tool_bundle() -> ToolExtensionBundle {
     fake_memory_tool_bundle_for_names(
         &[
             "memory_search",
+            "memory_list",
             "memory_get",
             "memory_remember",
             "memory_forget",
@@ -1230,6 +1231,7 @@ fn recording_standard_memory_tool_bundle()
         fake_memory_tool_bundle_for_names(
             &[
                 "memory_search",
+                "memory_list",
                 "memory_get",
                 "memory_remember",
                 "memory_forget",
@@ -4303,6 +4305,7 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
         .as_ref()
         .expect("agent request should include tools");
     assert!(tools.iter().any(|tool| tool.name == "memory_search"));
+    assert!(tools.iter().any(|tool| tool.name == "memory_list"));
     assert!(tools.iter().any(|tool| tool.name == "memory_get"));
     assert!(tools.iter().any(|tool| tool.name == "memory_remember"));
     assert!(tools.iter().any(|tool| tool.name == "memory_forget"));
@@ -4312,7 +4315,7 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
         .expect("agent request should include compiled prompt");
     assert!(prompt.full_system_text.contains("## Memory Recall"));
     assert!(prompt.full_system_text.contains(
-        "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+        "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
     ));
     assert!(
         !prompt

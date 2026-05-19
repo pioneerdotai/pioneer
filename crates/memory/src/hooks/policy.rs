@@ -473,6 +473,7 @@ impl MemoryTurnPolicy {
 
     pub(crate) fn allows_any_memory_tool(&self) -> bool {
         self.allows_memory_tool(MEMORY_SEARCH_TOOL)
+            || self.allows_memory_tool(MEMORY_LIST_TOOL)
             || self.allows_memory_tool(MEMORY_GET_TOOL)
             || self.allows_memory_tool(MEMORY_REMEMBER_TOOL)
             || self.allows_memory_tool(MEMORY_FORGET_TOOL)
@@ -480,7 +481,7 @@ impl MemoryTurnPolicy {
 
     pub(crate) fn allows_memory_tool(&self, tool_name: &str) -> bool {
         match tool_name {
-            MEMORY_SEARCH_TOOL | MEMORY_GET_TOOL => {
+            MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => {
                 matches!(
                     self.read_tools,
                     MemoryReadToolPolicy::Allow | MemoryReadToolPolicy::ForgetOnly

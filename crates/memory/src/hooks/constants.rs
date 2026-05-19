@@ -1,4 +1,5 @@
 pub const MEMORY_SEARCH_TOOL: &str = "memory_search";
+pub const MEMORY_LIST_TOOL: &str = "memory_list";
 pub const MEMORY_GET_TOOL: &str = "memory_get";
 pub const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
 pub const MEMORY_FORGET_TOOL: &str = "memory_forget";

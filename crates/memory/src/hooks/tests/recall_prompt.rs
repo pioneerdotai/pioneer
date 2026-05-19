@@ -1106,6 +1106,7 @@ async fn memory_prompt_contract_hook_renders_from_prompt_context_and_compile_inp
                 MEMORY_FORGET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_GET_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_SEARCH_TOOL,
             ],
             prompt_context_set,
@@ -1115,8 +1116,9 @@ async fn memory_prompt_contract_hook_renders_from_prompt_context_and_compile_inp
 
     let content = prompt_section_content(response).expect("prompt section is rendered");
     assert!(content.contains(
-        "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+        "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
     ));
+    assert!(content.contains("Use memory_list, not memory_search"));
     assert!(content.contains("User likes Porto."));
     assert!(content.contains("Call memory_remember proactively"));
 }

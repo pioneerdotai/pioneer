@@ -13247,7 +13247,7 @@ async fn memory_methods_fail_when_runtime_disabled() {
 }
 
 #[tokio::test]
-async fn memory_provider_materializes_four_memory_tools_when_runtime_enabled() {
+async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
     let harness = setup_memory_gateway_harness("tools_materialize", true).await;
     let materialization =
         materialize_memory_tools_for_context(&harness, memory_tool_context(&harness, "mat")).await;
@@ -13265,6 +13265,7 @@ async fn memory_provider_materializes_four_memory_tools_when_runtime_enabled() {
         std::collections::BTreeSet::from([
             "memory_forget",
             "memory_get",
+            "memory_list",
             "memory_remember",
             "memory_search",
         ])
@@ -13291,6 +13292,16 @@ async fn memory_provider_materializes_four_memory_tools_when_runtime_enabled() {
         pioneer_tools::ToolIdempotencyMode::Safe
     );
     assert!(search.spec.recovery.can_resume);
+    let list = bundle
+        .specs
+        .iter()
+        .find(|configured| configured.spec.name == "memory_list")
+        .expect("list spec");
+    assert_eq!(
+        list.spec.recovery.idempotency_mode,
+        pioneer_tools::ToolIdempotencyMode::Safe
+    );
+    assert!(list.spec.recovery.can_resume);
     let remember = bundle
         .specs
         .iter()
@@ -13301,6 +13312,67 @@ async fn memory_provider_materializes_four_memory_tools_when_runtime_enabled() {
         pioneer_tools::ToolIdempotencyMode::RequiresKey
     );
     assert_eq!(remember.spec.recovery.max_attempts, 1);
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_list_tool_returns_inventory_without_semantic_query() {
+    let harness = setup_memory_gateway_harness("tool_list_inventory", true).await;
+    let tools = built_memory_tools(&harness, "tool_list_inventory").await;
+
+    let name_result = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_list_seed_name",
+        json!({
+            "content": "Имя пользователя — Александр.",
+            "category": "identity",
+            "key": "user_name"
+        }),
+    )
+    .await;
+    let language_result = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_list_seed_lang",
+        json!({
+            "content": "Пользователь предпочитает русский язык для общения.",
+            "category": "preference",
+            "key": "preferred_language"
+        }),
+    )
+    .await;
+
+    let list_result = execute_memory_tool_payload(
+        &tools,
+        "memory_list",
+        "call_memory_list_inventory",
+        json!({
+            "scopes": ["user"],
+            "limit": 20
+        }),
+    )
+    .await;
+
+    let name_id = name_result
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember should return name memory id");
+    let language_id = language_result
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("remember should return language memory id");
+    let records = list_result
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .expect("list should return records");
+    let listed_ids = records
+        .iter()
+        .filter_map(|record| record.get("memoryId").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(listed_ids.contains(name_id));
+    assert!(listed_ids.contains(language_id));
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
@@ -13831,6 +13903,11 @@ async fn memory_tool_invalid_args_return_tool_error() {
             "memory_search",
             "call_invalid_unknown",
             json!({ "query": "x", "unknown": true }),
+        ),
+        (
+            "memory_list",
+            "call_invalid_list_unknown",
+            json!({ "unknown": true }),
         ),
     ] {
         let error = execute_memory_tool_error(&tools, tool_name, call_id, args).await;

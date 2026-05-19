@@ -16,8 +16,8 @@ use pioneer_protocol::{
     MemoryDurability, MemoryEvidenceClass, MemoryExplicitness, MemoryExtractorCertainty,
     MemoryFactClass, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryIntent,
     MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryListParams, MemoryOwnershipClass,
-    MemoryQualityAction, MemoryQualityReasonCode, MemoryRememberParams, MemoryScope,
-    MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
+    MemoryProvenance, MemoryQualityAction, MemoryQualityReasonCode, MemoryRememberParams,
+    MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySearchParams, MemorySemanticFields,
     MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteRoute,
     MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
     MemoryWriteEvidence, MemoryWriteRelation,
@@ -628,6 +628,102 @@ async fn remember_get_and_list_hydrate_content_from_backend() {
     let preview = control.content_preview.expect("preview");
     assert!(preview.len() < full_content.len());
     assert!(full_content.starts_with(preview.as_str()));
+}
+
+#[tokio::test]
+async fn list_get_and_forget_use_control_plane_visibility() {
+    let (store, _backend, service) = setup_service().await;
+    let mut params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("legacy.weather"),
+        "User wants current Moscow weather sent to this chat every 15 minutes.",
+    );
+    params.category = MemoryCategory::Preference;
+    params.source_context_kind = Some(MemorySourceContextKind::AssistantResponse);
+    params.provenance = Some(MemoryProvenance {
+        source_thread_id: Some("thread_legacy".to_owned()),
+        source_turn_id: Some("turn_legacy".to_owned()),
+        source_item_id: None,
+        created_by: Some(MemoryActor {
+            kind: MemoryActorKind::Assistant,
+            id: None,
+        }),
+    });
+
+    let remembered = service
+        .remember(user_context(150), params)
+        .await
+        .expect("remember legacy memory");
+    attach_quality_decision(
+        &store,
+        remembered.record.id.as_str(),
+        MemoryQualityAction::ForceReject,
+        MemoryOwnershipClass::Reject,
+        MemorySourceContextKind::AssistantResponse,
+        MemoryFactClass::StableUserPreference,
+        MemoryLifetimeClass::LongLived,
+        MemoryOwnershipClass::DurableUserMemory,
+        MemoryEvidenceClass::AssistantInference,
+        MemoryWriteRelation::Novel,
+        vec![MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence],
+        151,
+    )
+    .await;
+
+    let search = service
+        .search(
+            user_context(152),
+            MemorySearchParams {
+                query: "Moscow weather".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("search");
+    assert!(search.hits.is_empty());
+
+    let listed = service
+        .list(user_context(153), MemoryListParams::default())
+        .await
+        .expect("list");
+    assert_eq!(
+        listed
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![remembered.record.id.as_str()]
+    );
+
+    let loaded = service
+        .get(
+            user_context(154),
+            MemoryGetParams {
+                memory_id: remembered.record.id.clone(),
+                include_deleted: false,
+            },
+        )
+        .await
+        .expect("get")
+        .record
+        .expect("record");
+    assert_eq!(loaded.content, remembered.record.content);
+
+    let forgotten = service
+        .forget(
+            user_context(155),
+            MemoryForgetParams {
+                target: MemoryForgetTarget::Id {
+                    memory_id: remembered.record.id.clone(),
+                },
+                reason: Some("cleanup".to_owned()),
+                actor: None,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("forget");
+    assert_eq!(forgotten.forgotten_memory_ids, vec![remembered.record.id]);
 }
 
 #[tokio::test]

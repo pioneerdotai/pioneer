@@ -28,6 +28,7 @@ async fn permissive_classifier_fallback_keeps_memory_surfaces_available() {
             true,
             &[
                 MEMORY_SEARCH_TOOL,
+                MEMORY_LIST_TOOL,
                 MEMORY_GET_TOOL,
                 MEMORY_REMEMBER_TOOL,
                 MEMORY_FORGET_TOOL,
@@ -38,7 +39,7 @@ async fn permissive_classifier_fallback_keeps_memory_surfaces_available() {
         .expect("prompt contract executes");
     let prompt = prompt_section_content(prompt_response).expect("memory prompt renders");
     assert!(prompt.contains(
-        "Available memory tools: memory_search, memory_get, memory_remember, memory_forget."
+        "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
     ));
     assert!(prompt.contains("User likes Porto."));
 
@@ -64,6 +65,7 @@ async fn permissive_classifier_fallback_keeps_memory_surfaces_available() {
         response_tool_names(&tool_response),
         vec![
             MEMORY_SEARCH_TOOL,
+            MEMORY_LIST_TOOL,
             MEMORY_GET_TOOL,
             MEMORY_REMEMBER_TOOL,
             MEMORY_FORGET_TOOL,
