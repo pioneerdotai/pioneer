@@ -530,6 +530,10 @@ description = "स्थानीय vLLM OpenAI-संगत API"
 title = "OSaurus"
 description = "स्थानीय OSaurus OpenAI-संगत API"
 
+[settings]
+loading = "सेटिंग्स लोड हो रही हैं..."
+unavailable = "सेटिंग्स उपलब्ध नहीं हैं."
+
 [settings.screen]
 title = "सेटिंग्स"
 description = "एप्लिकेशन प्राथमिकताओं का प्रबंधन करें।"

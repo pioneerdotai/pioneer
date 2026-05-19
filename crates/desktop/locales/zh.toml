@@ -530,6 +530,10 @@ description = "本地 vLLM 兼容 OpenAI API"
 title = "OSaurus"
 description = "本地 OSaurus 兼容 OpenAI API"
 
+[settings]
+loading = "正在加载设置..."
+unavailable = "设置不可用。"
+
 [settings.screen]
 title = "设置"
 description = "管理应用偏好设置。"

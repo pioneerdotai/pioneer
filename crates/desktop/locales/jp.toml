@@ -530,6 +530,10 @@ description = "ローカル vLLM OpenAI 互換 API"
 title = "OSaurus"
 description = "ローカル OSaurus OpenAI 互換 API"
 
+[settings]
+loading = "設定を読み込み中..."
+unavailable = "設定を利用できません。"
+
 [settings.screen]
 title = "設定"
 description = "アプリの設定を管理します。"

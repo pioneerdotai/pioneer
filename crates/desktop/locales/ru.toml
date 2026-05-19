@@ -809,6 +809,10 @@ verified = "Проверенный"
 community = "Сообщество"
 untrusted = "Недоверенный"
 
+[settings]
+loading = "Загрузка настроек..."
+unavailable = "Настройки недоступны."
+
 [settings.screen]
 title = "Настройки"
 description = "Управляйте параметрами приложения."

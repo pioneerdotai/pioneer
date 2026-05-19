@@ -379,13 +379,14 @@ mod tests {
         assert!(prompt.contains(
             "directly answers the user's request, answer from that recalled context without calling memory_search"
         ));
-        assert!(prompt.contains(
-            "Do not call memory_search merely because the request mentions memory"
-        ));
+        assert!(
+            prompt.contains("Do not call memory_search merely because the request mentions memory")
+        );
         assert!(prompt.contains("Call memory_search early only when memory is likely relevant"));
         assert!(prompt.contains("Use memory_search to fill gaps"));
-        assert!(prompt
-            .contains("If unsure whether injected memory is enough for a non-trivial task"));
+        assert!(
+            prompt.contains("If unsure whether injected memory is enough for a non-trivial task")
+        );
         assert!(prompt.contains("Call memory_remember proactively"));
         assert!(prompt.contains("If the user asks you to forget"));
         assert!(prompt.contains("Use memory_list, not memory_search"));

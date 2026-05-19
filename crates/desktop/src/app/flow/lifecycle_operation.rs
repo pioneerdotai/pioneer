@@ -100,6 +100,7 @@ impl PioneerDesktop {
 
         if self.gateway.connection_state == GatewayConnectionState::Connected {
             self.refresh_workspace_list(cx);
+            self.refresh_gateway_settings(cx);
             self.enqueue_in_flight_turns_for_resume();
             let _ = self.drive_turn_resume_queue(cx);
         }

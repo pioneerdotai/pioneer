@@ -14,6 +14,9 @@ impl PioneerDesktop {
         self.gateway.status_level = GatewayStatusLevel::Neutral;
         self.gateway.connection_state = GatewayConnectionState::Connecting;
         self.gateway.error = None;
+        self.gateway.settings = None;
+        self.gateway.settings_loading = false;
+        self.gateway.settings_error = None;
 
         if endpoint_kind == GatewayEndpointKind::Local {
             self.gateway.status = t!("gateway.status.starting_local").to_string();
@@ -72,6 +75,9 @@ impl PioneerDesktop {
         self.gateway.status_level = GatewayStatusLevel::Degraded;
         self.gateway.connection_state = GatewayConnectionState::Reconnecting;
         self.gateway.error = Some(reason);
+        self.gateway.settings = None;
+        self.gateway.settings_loading = false;
+        self.gateway.settings_error = Some("Gateway is not connected".to_owned());
         self.thread_list_loading = false;
         self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {
@@ -105,6 +111,9 @@ impl PioneerDesktop {
         self.gateway.status_level = GatewayStatusLevel::Failed;
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(reason);
+        self.gateway.settings = None;
+        self.gateway.settings_loading = false;
+        self.gateway.settings_error = Some("Gateway is not connected".to_owned());
         self.thread_list_loading = false;
         self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {
@@ -138,6 +147,9 @@ impl PioneerDesktop {
         self.gateway.status_level = GatewayStatusLevel::Failed;
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(error);
+        self.gateway.settings = None;
+        self.gateway.settings_loading = false;
+        self.gateway.settings_error = Some("Gateway is not connected".to_owned());
         self.thread_list_loading = false;
         self.set_workspaces_loading(false);
         if !self.should_resume_in_flight_turn() {

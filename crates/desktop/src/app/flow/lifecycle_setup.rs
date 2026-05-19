@@ -27,6 +27,9 @@ impl PioneerDesktop {
         self.reset_thread_start_state();
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
+        self.gateway.settings = None;
+        self.gateway.settings_loading = false;
+        self.gateway.settings_error = None;
         thread_ids
     }
 

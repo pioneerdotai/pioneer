@@ -809,6 +809,10 @@ verified = "Verified"
 community = "Community"
 untrusted = "Untrusted"
 
+[settings]
+loading = "Loading settings..."
+unavailable = "Settings are unavailable."
+
 [settings.screen]
 title = "Settings"
 description = "Manage application preferences."

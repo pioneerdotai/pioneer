@@ -95,9 +95,27 @@ impl PioneerDesktop {
             .gateway
             .settings
             .as_ref()
-            .map(|settings| settings.memory.clone())
-            .unwrap_or_default();
+            .map(|settings| settings.memory.clone());
+        let memory_settings_status = if memory_settings.is_none() {
+            Some(self.gateway.settings_error.clone().unwrap_or_else(|| {
+                if self.gateway.settings_loading {
+                    t!("settings.loading").to_string()
+                } else {
+                    t!("settings.unavailable").to_string()
+                }
+            }))
+        } else {
+            None
+        };
         let desktop_entity = cx.entity().clone();
+        let memory_settings_panel = if let Some(memory_settings) = memory_settings {
+            Self::render_memory_settings(memory_settings, desktop_entity, cx)
+        } else {
+            Self::render_memory_settings_status(
+                memory_settings_status.expect("missing memory settings should have status"),
+                cx,
+            )
+        };
 
         v_flex()
             .id("settings-memory-scroll")
@@ -126,11 +144,7 @@ impl PioneerDesktop {
                                         .child(t!("settings.memory.description").to_string()),
                                 ),
                         )
-                        .child(Self::render_memory_settings(
-                            memory_settings,
-                            desktop_entity,
-                            cx,
-                        )),
+                        .child(memory_settings_panel),
                 ),
             )
             .into_any_element()
@@ -315,6 +329,19 @@ impl PioneerDesktop {
                 desktop_entity,
                 cx,
             ))
+            .into_any_element()
+    }
+
+    fn render_memory_settings_status(message: String, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .px_4()
+            .py_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(div().text_xs().opacity(0.65).child(message))
             .into_any_element()
     }
 

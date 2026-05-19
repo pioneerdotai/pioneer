@@ -126,13 +126,18 @@ impl PioneerDesktop {
             return;
         }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
+            self.gateway.settings = None;
+            self.gateway.settings_loading = false;
             self.gateway.settings_error = Some("Gateway is not connected".to_owned());
             return;
         }
         let Some(connection_id) = self.gateway.ws_connection_id else {
+            self.gateway.settings = None;
+            self.gateway.settings_loading = false;
             self.gateway.settings_error = Some("Gateway is not connected".to_owned());
             return;
         };
+        let connection_epoch = self.gateway.connection_epoch;
 
         self.gateway.settings_loading = true;
         self.gateway.settings_error = None;
@@ -146,7 +151,9 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if view.gateway.ws_connection_id != Some(connection_id)
+                        || view.gateway.connection_epoch != connection_epoch
+                    {
                         return;
                     }
 
@@ -187,6 +194,7 @@ impl PioneerDesktop {
             warn!("cannot update gateway memory settings without an active gateway connection");
             return;
         };
+        let connection_epoch = self.gateway.connection_epoch;
 
         let mut snapshot = self.gateway.settings.clone().unwrap_or_else(|| {
             pioneer_protocol::GatewaySettingsSnapshot {
@@ -210,7 +218,9 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if view.gateway.ws_connection_id != Some(connection_id)
+                        || view.gateway.connection_epoch != connection_epoch
+                    {
                         return;
                     }
 

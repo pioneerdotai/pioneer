@@ -530,6 +530,10 @@ description = "Lokale OpenAI-kompatible vLLM-API"
 title = "OSaurus"
 description = "Lokale OpenAI-kompatible OSaurus-API"
 
+[settings]
+loading = "Einstellungen werden geladen..."
+unavailable = "Einstellungen sind nicht verfügbar."
+
 [settings.screen]
 title = "Einstellungen"
 description = "Verwalten Sie Anwendungseinstellungen."

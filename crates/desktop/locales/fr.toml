@@ -530,6 +530,10 @@ description = "API locale vLLM compatible OpenAI"
 title = "OSaurus"
 description = "API locale OSaurus compatible OpenAI"
 
+[settings]
+loading = "Chargement des paramètres..."
+unavailable = "Les paramètres sont indisponibles."
+
 [settings.screen]
 title = "Paramètres"
 description = "Gérez les préférences de l'application."

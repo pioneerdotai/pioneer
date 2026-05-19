@@ -530,6 +530,10 @@ description = "API local de vLLM compatible con OpenAI"
 title = "OSaurus"
 description = "API local de OSaurus compatible con OpenAI"
 
+[settings]
+loading = "Cargando ajustes..."
+unavailable = "Los ajustes no están disponibles."
+
 [settings.screen]
 title = "Ajustes"
 description = "Gestiona las preferencias de la aplicación."
