@@ -24,12 +24,12 @@ pub fn render_memory_active_recall_planner_prompt(
             "  \"modes\": [\"profile\" | \"project\" | \"durable\" | \"current_thread\" | \"related_thread\" | \"current_task\" | \"completed_task\" | \"thread_episodic\" | \"task_context\" | \"exact_canonical\"],\n",
             "  \"targets\": [\n",
             "    {{\n",
-            "      \"scopeKind\": \"user\" | \"workspace\" | \"agent\" | \"thread\" | \"task\",\n",
-            "      \"factClass\": \"user_identity\" | \"user_biography\" | \"user_relationship\" | \"stable_user_preference\" | \"communication_preference\" | \"recurring_user_instruction\" | \"project_policy\" | \"project_decision\" | \"project_procedure\" | \"project_constraint\" | \"task_lifecycle_state\" | \"operational_observation\" | \"thread_local_state\" | \"tool_result_fact\" | \"assistant_self_description\" | \"generated_summary_fact\" | \"domain_owned_state\" | \"secret_or_credential\" | \"regulated_sensitive_fact\",\n",
-            "      \"category\": \"identity\" | \"biography\" | \"relationship\" | \"preference\" | \"communication_style\" | \"recurring_instruction\" | \"project_policy\" | \"project_decision\" | \"procedure\" | \"constraint\" | \"todo\" | \"project_fact\" | \"custom\",\n",
-            "      \"subject\": \"current_user\" | \"current_agent\" | \"project\" | \"thread\" | \"task\" | string,\n",
-            "      \"attribute\": \"name\" | \"birthdate\" | \"preference\" | \"communication_style\" | \"decision\" | \"instruction\" | \"status\" | string,\n",
-            "      \"canonicalKey\": string | null\n",
+            "      \"scopeKind\": optional \"user\" | \"workspace\" | \"thread\" | \"agent\" | \"task\",\n",
+            "      \"factClass\": optional \"user_identity\" | \"user_biography\" | \"user_relationship\" | \"stable_user_preference\" | \"communication_preference\" | \"recurring_user_instruction\" | \"project_policy\" | \"project_decision\" | \"project_procedure\" | \"project_constraint\" | \"task_lifecycle_state\" | \"operational_observation\" | \"thread_local_state\" | \"tool_result_fact\" | \"assistant_self_description\" | \"generated_summary_fact\" | \"domain_owned_state\" | \"secret_or_credential\" | \"regulated_sensitive_fact\",\n",
+            "      \"category\": optional \"identity\" | \"preference\" | \"biography\" | \"relationship\" | \"recurring_instruction\" | \"project_policy\" | \"project_fact\" | \"project_decision\" | \"procedure\" | \"todo\" | \"constraint\" | \"communication_style\" | \"custom\",\n",
+            "      \"subject\": optional \"current_user\" | \"current_agent\" | \"workspace\" | \"project\" | \"person\" | \"organization\" | \"artifact\" | \"custom\",\n",
+            "      \"attribute\": optional \"name\" | \"birthday\" | \"preferred_language\" | \"communication_style\" | \"migration_policy\" | \"review_style\" | \"phase_naming\" | \"custom\",\n",
+            "      \"canonicalKey\": optional string | null\n",
             "    }}\n",
             "  ],\n",
             "  \"diagnostics\": [string]\n",
@@ -38,8 +38,13 @@ pub fn render_memory_active_recall_planner_prompt(
             "- Use \"skip\" when the turn is self-contained or memory is not useful.\n",
             "- Use \"run\" when additional memory is likely to improve correctness, continuity, personalization, or consistency.\n",
             "- Use \"uncertain\" when the structured input is insufficient to choose safely.\n",
+            "- For \"run\", modes must contain at least one allowed mode.\n",
+            "- For \"skip\" or \"uncertain\", modes must be [] and targets must be [].\n",
             "- Include only modes listed in availableModes.\n",
-            "- Use factClass values exactly as listed above. Do not use category names such as \"identity\" as factClass; use \"user_identity\" for the current user's name or identity facts.\n",
+            "- The target object is an advisory filter. Omit target fields that are not structurally clear; use targets: [] when no exact listed target fields fit.\n",
+            "- Use scopeKind, factClass, category, subject, and attribute values exactly as listed above. Never output free-form strings for these fields.\n",
+            "- Do not use category names such as \"identity\" as factClass; use \"user_identity\" for the current user's name or identity facts.\n",
+            "- Do not use category names such as \"preference\" as attribute; use category=\"preference\" and omit attribute, or use attribute=\"custom\" only for a clearly custom preference attribute.\n",
             "- Do not include exact_canonical unless an exact canonical target is present.\n",
             "- Do not include current_task/task_context unless current task context capability is available.\n",
             "- Do not include completed_task unless completed task summary capability is available.\n",
@@ -79,8 +84,20 @@ mod tests {
         assert!(prompt.contains("create threads"));
         assert!(prompt.contains("read memory directly"));
         assert!(prompt.contains("Make decisions by semantic need and structured fields"));
-        assert!(prompt.contains(r#""factClass": "user_identity""#));
+        assert!(prompt.contains(r#""factClass": optional "user_identity""#));
+        assert!(prompt.contains(r#""subject": optional "current_user" | "current_agent" | "workspace" | "project" | "person" | "organization" | "artifact" | "custom""#));
+        assert!(prompt.contains(r#""attribute": optional "name" | "birthday" | "preferred_language" | "communication_style" | "migration_policy" | "review_style" | "phase_naming" | "custom""#));
         assert!(prompt.contains(r#"Do not use category names such as "identity" as factClass"#));
+        assert!(prompt.contains("Never output free-form strings for these fields."));
+        assert!(prompt.contains(r#"Do not use category names such as "preference" as attribute"#));
+        assert!(prompt.contains(r#"For "run", modes must contain at least one allowed mode."#));
+        assert!(
+            prompt
+                .contains(r#"For "skip" or "uncertain", modes must be [] and targets must be []."#)
+        );
+        assert!(!prompt.contains(" | string"));
+        assert!(!prompt.contains(r#""attribute": "name" | "birthdate""#));
+        assert!(!prompt.contains(r#""subject": "current_user" | "current_agent" | "project" | "thread" | "task" | string"#));
         assert!(prompt.contains(r#""availableModes":["profile"]"#));
         assert!(!prompt.contains("запомни"));
         assert!(!prompt.contains("remember that"));
