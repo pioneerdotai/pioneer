@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use std::future::Future;
+use std::pin::Pin;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +69,8 @@ where
     P: Fn(&E) -> bool,
 {
     for attempt in 0..=retry_attempts {
-        match operation().await {
+        let operation: Pin<Box<Fut>> = Box::pin(operation());
+        match operation.await {
             Ok(value) => return Ok(value),
             Err(error) if attempt < retry_attempts && is_retryable(&error) => {
                 let multiplier = 1u64 << attempt;
