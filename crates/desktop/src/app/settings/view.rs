@@ -242,7 +242,7 @@ impl PioneerDesktop {
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        v_flex()
+        let mut settings = v_flex()
             .w_full()
             .gap_0()
             .px_4()
@@ -259,21 +259,24 @@ impl PioneerDesktop {
                 t!("settings.memory.enabled.description").to_string(),
                 desktop_entity.clone(),
                 cx,
-            ))
-            .child(Self::render_settings_divider(cx))
-            .child(Self::render_memory_toggle_row(
-                "settings-memory-active-recall",
-                MemorySettingToggle::ActiveRecall,
-                memory.active_recall_enabled,
-                t!("settings.memory.active_recall.label").to_string(),
-                t!("settings.memory.active_recall.description").to_string(),
-                desktop_entity.clone(),
-                cx,
-            ))
-            .child(Self::render_settings_divider(cx))
-            .when(memory.enabled && memory.active_recall_enabled, |settings| {
-                settings
-                    .child(Self::render_memory_model_row(
+            ));
+
+        if memory.enabled {
+            settings = settings.child(Self::render_settings_divider(cx)).child(
+                Self::render_memory_toggle_row(
+                    "settings-memory-active-recall",
+                    MemorySettingToggle::ActiveRecall,
+                    memory.active_recall_enabled,
+                    t!("settings.memory.active_recall.label").to_string(),
+                    t!("settings.memory.active_recall.description").to_string(),
+                    desktop_entity.clone(),
+                    cx,
+                ),
+            );
+
+            if memory.active_recall_enabled {
+                settings = settings.child(Self::render_settings_divider(cx)).child(
+                    Self::render_memory_model_row(
                         "settings-memory-active-recall-model",
                         MemoryModelSetting::ActiveRecallPlanner,
                         memory.active_recall_model.clone(),
@@ -281,55 +284,60 @@ impl PioneerDesktop {
                         t!("settings.memory.active_recall_model.description").to_string(),
                         desktop_entity.clone(),
                         cx,
-                    ))
-                    .child(Self::render_settings_divider(cx))
-            })
-            .child(Self::render_memory_toggle_row(
-                "settings-memory-proactive-writes",
-                MemorySettingToggle::ProactiveWrites,
-                memory.proactive_writes_enabled,
-                t!("settings.memory.proactive_writes.label").to_string(),
-                t!("settings.memory.proactive_writes.description").to_string(),
-                desktop_entity.clone(),
-                cx,
-            ))
-            .child(Self::render_settings_divider(cx))
-            .when(
-                memory.enabled && memory.proactive_writes_enabled,
-                |settings| {
-                    settings
-                        .child(Self::render_memory_model_row(
-                            "settings-memory-post-turn-extractor-model",
-                            MemoryModelSetting::PostTurnExtractor,
-                            memory.proactive_writes_model.clone(),
-                            t!("settings.memory.proactive_writes_model.label").to_string(),
-                            t!("settings.memory.proactive_writes_model.description").to_string(),
-                            desktop_entity.clone(),
-                            cx,
-                        ))
-                        .child(Self::render_settings_divider(cx))
-                },
-            )
-            .child(Self::render_memory_toggle_row(
-                "settings-memory-background-extraction",
-                MemorySettingToggle::BackgroundExtraction,
-                memory.background_extraction_enabled,
-                t!("settings.memory.background_extraction.label").to_string(),
-                t!("settings.memory.background_extraction.description").to_string(),
-                desktop_entity.clone(),
-                cx,
-            ))
-            .child(Self::render_settings_divider(cx))
-            .child(Self::render_memory_toggle_row(
-                "settings-memory-debug-trace",
-                MemorySettingToggle::DebugTrace,
-                memory.debug_trace_enabled,
-                t!("settings.memory.debug_trace.label").to_string(),
-                t!("settings.memory.debug_trace.description").to_string(),
-                desktop_entity,
-                cx,
-            ))
-            .into_any_element()
+                    ),
+                );
+            }
+
+            settings = settings.child(Self::render_settings_divider(cx)).child(
+                Self::render_memory_toggle_row(
+                    "settings-memory-proactive-writes",
+                    MemorySettingToggle::ProactiveWrites,
+                    memory.proactive_writes_enabled,
+                    t!("settings.memory.proactive_writes.label").to_string(),
+                    t!("settings.memory.proactive_writes.description").to_string(),
+                    desktop_entity.clone(),
+                    cx,
+                ),
+            );
+
+            if memory.proactive_writes_enabled {
+                settings = settings.child(Self::render_settings_divider(cx)).child(
+                    Self::render_memory_model_row(
+                        "settings-memory-post-turn-extractor-model",
+                        MemoryModelSetting::PostTurnExtractor,
+                        memory.proactive_writes_model.clone(),
+                        t!("settings.memory.proactive_writes_model.label").to_string(),
+                        t!("settings.memory.proactive_writes_model.description").to_string(),
+                        desktop_entity.clone(),
+                        cx,
+                    ),
+                );
+            }
+
+            settings = settings
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_memory_toggle_row(
+                    "settings-memory-background-extraction",
+                    MemorySettingToggle::BackgroundExtraction,
+                    memory.background_extraction_enabled,
+                    t!("settings.memory.background_extraction.label").to_string(),
+                    t!("settings.memory.background_extraction.description").to_string(),
+                    desktop_entity.clone(),
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_memory_toggle_row(
+                    "settings-memory-debug-trace",
+                    MemorySettingToggle::DebugTrace,
+                    memory.debug_trace_enabled,
+                    t!("settings.memory.debug_trace.label").to_string(),
+                    t!("settings.memory.debug_trace.description").to_string(),
+                    desktop_entity,
+                    cx,
+                ));
+        }
+
+        settings.into_any_element()
     }
 
     fn render_memory_settings_status(message: String, cx: &mut Context<Self>) -> AnyElement {
@@ -367,16 +375,17 @@ impl PioneerDesktop {
             .gap_6()
             .py_3()
             .justify_between()
-            .items_start()
+            .items_center()
             .child(
                 v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .child(div().text_sm().font_semibold().child(label))
                     .child(div().text_xs().opacity(0.6).child(description)),
             )
             .child(
                 Switch::new(id)
                     .checked(selected)
-                    .mt_1p5()
                     .on_click(move |enabled, _, cx| {
                         let _ = desktop_entity.update(cx, |view, cx| {
                             view.apply_memory_setting(toggle, *enabled, cx);
@@ -407,32 +416,38 @@ impl PioneerDesktop {
             t!("settings.memory.model.default").to_string()
         };
 
-        h_flex()
+        v_flex()
             .w_full()
-            .gap_6()
-            .py_3()
+            .gap_3()
+            .pt_3()
+            .pb_4()
             .justify_between()
             .items_start()
             .child(
                 v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .child(div().text_sm().font_semibold().child(label))
                     .child(div().text_xs().opacity(0.6).child(description)),
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .w_full()
+                    .gap_6()
                     .items_center()
+                    .justify_between()
                     .mt_0p5()
                     .child(
                         div()
-                            .max_w(px(260.))
-                            .text_xs()
-                            .opacity(0.65)
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .font_medium()
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(selection_label),
                     )
-                    .child(
+                    .child(h_flex().flex_none().gap_1().child(
                         small_outline_button((id, 0usize))
                             .label(t!("settings.memory.model.select_model").to_string())
                             .on_click({
@@ -487,26 +502,27 @@ impl PioneerDesktop {
                                     });
                                 }
                             }),
-                    )
-                    .when(is_custom, |row| {
+                    ).when(is_custom, |row| {
                         row.child(
-                            small_outline_button((id, 1usize))
-                                .label(t!("settings.memory.model.default").to_string())
-                                .on_click({
-                                    let desktop_entity = desktop_entity.clone();
-                                    move |_, _, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.apply_memory_model_setting(
-                                                setting,
-                                                GatewayMemoryModelSelection::thread(),
-                                                cx,
-                                            );
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
+                            div().flex_none().child(
+                                small_outline_button((id, 1usize))
+                                    .label(t!("settings.memory.model.default").to_string())
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        move |_, _, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.apply_memory_model_setting(
+                                                    setting,
+                                                    GatewayMemoryModelSelection::thread(),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            ),
                         )
-                    }),
+                    })),
             )
             .into_any_element()
     }
