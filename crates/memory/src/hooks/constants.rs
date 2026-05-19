@@ -29,6 +29,10 @@ pub(super) const MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID: &str =
 pub(super) const MEMORY_ACTIVE_RECALL_HOOK_ID: &str = "memory.active_recall";
 pub(super) const MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID: &str = "memory.active_recall.default";
 pub(super) const MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID: &str = "memory.active_recall.context";
+pub(super) const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str =
+    "memory.active_recall.thread_context";
+pub(super) const MEMORY_TASK_CONTEXT_CONTRIBUTION_ID: &str =
+    "memory.active_recall.task_context";
 pub(super) const MEMORY_PROMPT_CONTRACT_HOOK_ID: &str = "memory.prompt_contract";
 pub(super) const MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID: &str = "memory.prompt_contract.default";
 pub(super) const MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID: &str = "memory.prompt_contract.section";

@@ -1,6 +1,6 @@
 use crate::{
     app::root::{MainContentView, PioneerDesktop, SettingsContentView},
-    app::settings::SETTINGS_CONTENT_GENERAL_NODE_ID,
+    app::settings::{MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID},
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
 };
@@ -65,5 +65,27 @@ impl PioneerDesktop {
         }
 
         window::persist_theme_preference(window, preference, cx);
+    }
+
+    pub(super) fn apply_memory_setting(
+        &mut self,
+        toggle: MemorySettingToggle,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut memory = settings::memory_settings(cx);
+        match toggle {
+            MemorySettingToggle::Enabled => memory.enabled = enabled,
+            MemorySettingToggle::ProactiveWrites => memory.proactive_writes_enabled = enabled,
+            MemorySettingToggle::ActiveRecall => memory.active_recall_enabled = enabled,
+            MemorySettingToggle::DebugTrace => memory.debug_trace_enabled = enabled,
+        }
+
+        if let Err(error) = settings::set_memory_settings(cx, memory) {
+            warn!(
+                error = %format!("{error:#}"),
+                "failed to save memory settings"
+            );
+        }
     }
 }

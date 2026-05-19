@@ -388,6 +388,7 @@ impl MessageProcessor {
                 Some(memory_provider.clone()),
                 Some(memory_policy_provider),
                 Some(memory_provider),
+                None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.tool_loop_config.memory.clone(),
             ))

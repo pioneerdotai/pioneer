@@ -177,6 +177,13 @@ enabled = true
 capsules_dir = "memory/capsules"
 allow_global_user_by_default = true
 allow_global_agent_by_default = false
+deterministic_recall_enabled = true
+active_recall_enabled = true
+tools_enabled = true
+proactive_writes_enabled = true
+background_extraction_enabled = true
+debug_trace_enabled = false
+strict_diagnostics_enabled = false
 
 [gateway.auth]
 jwt_issuer = "pioneer"

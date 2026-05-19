@@ -633,8 +633,7 @@ mod tests {
     use super::*;
     use pioneer_protocol::{
         MemoryAttribute, MemoryCategory, MemoryExtractorCertainty, MemoryQualityReasonCode,
-        MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySemanticFields, MemorySourceKind,
-        MemorySubject,
+        MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySemanticFields, MemorySubject,
     };
 
     fn base_input() -> MemoryCandidatePolicyInput {
@@ -665,7 +664,6 @@ mod tests {
             has_rejected_duplicate: false,
             sensitivity: MemorySensitivity::Normal,
             active_no_memory_policy: false,
-            source_kind: MemorySourceKind::ExplicitUserRequest,
             quality_action: MemoryQualityAction::CandidatePolicy,
             quality_target_ownership: MemoryOwnershipClass::DurableUserMemory,
             quality_reason_codes: vec![MemoryQualityReasonCode::CandidatePolicyAllowed],

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use pioneer_protocol::{
-    MemoryActorKind, MemoryCategory, MemoryScope, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemoryActorKind, MemoryCategory, MemoryScope, MemorySensitivity, MemoryStatus,
 };
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
@@ -24,7 +24,6 @@ pub struct BackendPutRequest {
     pub content: String,
     pub sensitivity: MemorySensitivity,
     pub metadata_json: Option<String>,
-    pub source_kind: MemorySourceKind,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,

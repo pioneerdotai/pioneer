@@ -90,16 +90,41 @@ impl Default for GatewayArtifactsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GatewayMemoryConfig {
+    /// Enables the durable memory product surface for the gateway.
     #[serde(default = "default_gateway_memory_enabled")]
     pub enabled: bool,
+    /// Relative runtime-home directory where memvid capsules are stored.
     #[serde(default = "default_gateway_memory_capsules_dir")]
     pub capsules_dir: String,
+    /// Allows user/global memories to be used when a request has no narrower workspace scope.
     #[serde(default = "default_gateway_memory_allow_global_user")]
     pub allow_global_user_by_default: bool,
+    /// Allows agent/global memories to be used when explicitly enabled by config.
     #[serde(default = "default_gateway_memory_allow_global_agent")]
     pub allow_global_agent_by_default: bool,
+    /// Enables deterministic pre-turn recall into the prompt context.
+    #[serde(default = "default_gateway_memory_deterministic_recall_enabled")]
+    pub deterministic_recall_enabled: bool,
+    /// Enables active recall planning before prompt compilation.
+    #[serde(default = "default_gateway_memory_active_recall_enabled")]
+    pub active_recall_enabled: bool,
+    /// Exposes explicit memory tools to capable model providers.
+    #[serde(default = "default_gateway_memory_tools_enabled")]
+    pub tools_enabled: bool,
+    /// Allows post-turn extraction to propose durable facts through the quality gate.
+    #[serde(default = "default_gateway_memory_proactive_writes_enabled")]
+    pub proactive_writes_enabled: bool,
+    /// Runs post-turn extraction as background hook work instead of blocking the user turn.
+    #[serde(default = "default_gateway_memory_background_extraction_enabled")]
+    pub background_extraction_enabled: bool,
+    /// Enables user/developer-visible memory debug trace surfaces.
+    #[serde(default)]
+    pub debug_trace_enabled: bool,
+    /// Enables strict developer diagnostics without changing product safety gates.
+    #[serde(default)]
+    pub strict_diagnostics_enabled: bool,
 }
 
 impl Default for GatewayMemoryConfig {
@@ -109,6 +134,13 @@ impl Default for GatewayMemoryConfig {
             capsules_dir: default_gateway_memory_capsules_dir(),
             allow_global_user_by_default: default_gateway_memory_allow_global_user(),
             allow_global_agent_by_default: default_gateway_memory_allow_global_agent(),
+            deterministic_recall_enabled: default_gateway_memory_deterministic_recall_enabled(),
+            active_recall_enabled: default_gateway_memory_active_recall_enabled(),
+            tools_enabled: default_gateway_memory_tools_enabled(),
+            proactive_writes_enabled: default_gateway_memory_proactive_writes_enabled(),
+            background_extraction_enabled: default_gateway_memory_background_extraction_enabled(),
+            debug_trace_enabled: false,
+            strict_diagnostics_enabled: false,
         }
     }
 }
@@ -737,6 +769,26 @@ const fn default_gateway_memory_allow_global_user() -> bool {
 
 const fn default_gateway_memory_allow_global_agent() -> bool {
     false
+}
+
+const fn default_gateway_memory_deterministic_recall_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_memory_active_recall_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_memory_tools_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_memory_proactive_writes_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_memory_background_extraction_enabled() -> bool {
+    true
 }
 
 const fn default_gateway_hook_recovery_enabled() -> bool {
@@ -1434,8 +1486,8 @@ fn user_config_directory_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG_TOML, InstallManagedBy, InstallState, load_config_from_sources,
-        load_install_state, save_install_state,
+        DEFAULT_CONFIG_TOML, GatewayMemoryConfig, InstallManagedBy, InstallState,
+        load_config_from_sources, load_install_state, save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1790,6 +1842,13 @@ service_name = "com.pioneer.gateway.env"
         assert_eq!(config.gateway.memory.capsules_dir, "memory/capsules");
         assert!(config.gateway.memory.allow_global_user_by_default);
         assert!(!config.gateway.memory.allow_global_agent_by_default);
+        assert!(config.gateway.memory.deterministic_recall_enabled);
+        assert!(config.gateway.memory.active_recall_enabled);
+        assert!(config.gateway.memory.tools_enabled);
+        assert!(config.gateway.memory.proactive_writes_enabled);
+        assert!(config.gateway.memory.background_extraction_enabled);
+        assert!(!config.gateway.memory.debug_trace_enabled);
+        assert!(!config.gateway.memory.strict_diagnostics_enabled);
         assert_eq!(
             config
                 .gateway
@@ -1815,6 +1874,79 @@ service_name = "com.pioneer.gateway.env"
                 "capsules_dir `{capsules_dir}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn gateway_memory_product_config_defaults_are_safe_and_useful() {
+        let config = GatewayMemoryConfig::default();
+
+        assert!(config.enabled);
+        assert!(config.allow_global_user_by_default);
+        assert!(!config.allow_global_agent_by_default);
+        assert!(config.deterministic_recall_enabled);
+        assert!(config.active_recall_enabled);
+        assert!(config.tools_enabled);
+        assert!(config.proactive_writes_enabled);
+        assert!(config.background_extraction_enabled);
+        assert!(!config.debug_trace_enabled);
+        assert!(!config.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn gateway_memory_product_config_deserializes_missing_fields_with_defaults() {
+        let config = toml::from_str::<GatewayMemoryConfig>(
+            r#"
+enabled = false
+capsules_dir = "memory/custom-capsules"
+"#,
+        )
+        .expect("gateway memory config should deserialize with defaults");
+
+        assert!(!config.enabled);
+        assert_eq!(config.capsules_dir, "memory/custom-capsules");
+        assert!(config.allow_global_user_by_default);
+        assert!(!config.allow_global_agent_by_default);
+        assert!(config.deterministic_recall_enabled);
+        assert!(config.active_recall_enabled);
+        assert!(config.tools_enabled);
+        assert!(config.proactive_writes_enabled);
+        assert!(config.background_extraction_enabled);
+        assert!(!config.debug_trace_enabled);
+        assert!(!config.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn gateway_memory_product_config_serializes_stable_field_names() {
+        let config = GatewayMemoryConfig {
+            enabled: true,
+            capsules_dir: "memory/capsules".to_owned(),
+            allow_global_user_by_default: true,
+            allow_global_agent_by_default: false,
+            deterministic_recall_enabled: true,
+            active_recall_enabled: true,
+            tools_enabled: false,
+            proactive_writes_enabled: false,
+            background_extraction_enabled: false,
+            debug_trace_enabled: true,
+            strict_diagnostics_enabled: true,
+        };
+
+        let serialized = toml::to_string(&config).expect("gateway memory config should serialize");
+        assert!(serialized.contains("enabled = true"));
+        assert!(serialized.contains("capsules_dir = \"memory/capsules\""));
+        assert!(serialized.contains("allow_global_user_by_default = true"));
+        assert!(serialized.contains("allow_global_agent_by_default = false"));
+        assert!(serialized.contains("deterministic_recall_enabled = true"));
+        assert!(serialized.contains("active_recall_enabled = true"));
+        assert!(serialized.contains("tools_enabled = false"));
+        assert!(serialized.contains("proactive_writes_enabled = false"));
+        assert!(serialized.contains("background_extraction_enabled = false"));
+        assert!(serialized.contains("debug_trace_enabled = true"));
+        assert!(serialized.contains("strict_diagnostics_enabled = true"));
+
+        let roundtrip = toml::from_str::<GatewayMemoryConfig>(serialized.as_str())
+            .expect("gateway memory config should deserialize");
+        assert_eq!(roundtrip, config);
     }
 
     fn write_file(path: &PathBuf, content: &str) {

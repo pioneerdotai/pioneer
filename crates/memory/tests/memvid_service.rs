@@ -7,7 +7,7 @@ use pioneer_memory::{
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
     MemoryGetParams, MemoryListParams, MemoryRememberParams, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemorySearchParams, MemorySensitivity, MemoryStatus,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -90,6 +90,7 @@ fn remember_params(scope: MemoryScope, key: Option<&str>, content: &str) -> Memo
         confidence: None,
         importance: None,
         provenance: None,
+        source_context_kind: None,
         idempotency_key: None,
         supersedes: None,
         metadata: BTreeMap::new(),
@@ -651,7 +652,6 @@ async fn backend_only_memvid_hit_creates_stale_repair_diagnostic() {
             content: "Backend-only memvid stale memory.".to_owned(),
             sensitivity: MemorySensitivity::Normal,
             metadata_json: None,
-            source_kind: MemorySourceKind::ExplicitUserRequest,
             source_thread_id: None,
             source_turn_id: None,
             source_item_id: None,

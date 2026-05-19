@@ -1,6 +1,7 @@
 use pioneer_protocol::{
     MemoryAttribute, MemoryCategory, MemoryFactClass, MemoryScope, MemoryScopeKind, MemorySubject,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryRecallParams {
@@ -51,7 +52,7 @@ impl MemoryRecallMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MemoryRecallTarget {
     pub scope_kind: Option<MemoryScopeKind>,
     pub fact_class: Option<MemoryFactClass>,

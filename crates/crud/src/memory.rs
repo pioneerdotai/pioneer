@@ -3,8 +3,8 @@ use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory,
     MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
     MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode,
-    MemoryScope, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind,
-    MemoryStatus, MemoryWriteRelation,
+    MemoryScope, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus,
+    MemoryWriteRelation,
 };
 use sha2::{Digest, Sha256};
 
@@ -15,8 +15,7 @@ use crate::convention::{
     memory_lifecycle_actor_kind_to_db, memory_lifecycle_reason_code_from_db,
     memory_lifetime_class_from_db, memory_ownership_class_from_db, memory_quality_action_from_db,
     memory_scope_kind_from_db, memory_scope_kind_to_db, memory_sensitivity_from_db,
-    memory_source_context_kind_from_db, memory_source_kind_from_db, memory_status_from_db,
-    memory_write_relation_from_db,
+    memory_source_context_kind_from_db, memory_status_from_db, memory_write_relation_from_db,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +64,6 @@ pub struct AgentMemoryControlRecord {
     pub frame_id: Option<i64>,
     pub frame_uri: Option<String>,
     pub frame_version: i64,
-    pub source_kind: MemorySourceKind,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -101,7 +99,6 @@ pub struct NewAgentMemoryControlRecord {
     pub frame_id: Option<i64>,
     pub frame_uri: Option<String>,
     pub frame_version: i64,
-    pub source_kind: MemorySourceKind,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -199,7 +196,6 @@ pub struct NewAgentMemoryCandidate {
     pub candidate_text: String,
     pub confidence: f64,
     pub reason: String,
-    pub source_kind: MemorySourceKind,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -251,7 +247,6 @@ pub struct AgentMemoryCandidateRecord {
     pub candidate_text: String,
     pub confidence: f64,
     pub reason: String,
-    pub source_kind: MemorySourceKind,
     pub source_context_kind: Option<MemorySourceContextKind>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
@@ -580,7 +575,6 @@ pub(crate) fn agent_memory_control_record_from_model(
         frame_id: model.frame_id,
         frame_uri: model.frame_uri,
         frame_version: model.frame_version,
-        source_kind: memory_source_kind_from_db(model.source_kind.as_str())?,
         source_context_kind: model
             .source_context_kind
             .as_deref()
@@ -666,7 +660,6 @@ pub(crate) fn agent_memory_candidate_record_from_model(
         candidate_text: model.candidate_text,
         confidence: model.confidence,
         reason: model.reason,
-        source_kind: memory_source_kind_from_db(model.source_kind.as_str())?,
         source_context_kind: model
             .source_context_kind
             .as_deref()

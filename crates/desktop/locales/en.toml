@@ -825,6 +825,30 @@ description = "Choose the language used in the interface."
 label = "Color theme"
 description = "Pick a preferred appearance mode."
 
+[settings.memory]
+title = "Memory"
+description = "Control how Pioneer uses durable memory for future turns."
+
+[settings.memory.enabled]
+label = "Memory"
+description = "Allow Pioneer to use saved facts and project decisions when useful."
+
+[settings.memory.active_recall]
+label = "Active recall"
+description = "Run extra read-only recall planning for context-heavy turns."
+
+[settings.memory.proactive_writes]
+label = "Proactive writes"
+description = "Save high-confidence durable facts after a turn."
+
+[settings.memory.debug_trace]
+label = "Debug traces"
+description = "Show memory hook diagnostics in local debug surfaces."
+
+[settings.toggle]
+on = "On"
+off = "Off"
+
 [settings.language]
 system = "System default"
 english = "English"

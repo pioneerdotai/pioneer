@@ -33,10 +33,7 @@ use crate::policy::{
     MemoryPolicyEngine, POLICY_ACTION_FORGET, POLICY_ACTION_REMEMBER, POLICY_DECISION_ALLOW,
     POLICY_DECISION_ERROR,
 };
-use crate::quality::{
-    classify_semantic_memory_fact, legacy_source_kind_for_source_context,
-    resolve_semantic_write_source_context,
-};
+use crate::quality::{classify_semantic_memory_fact, resolve_semantic_write_source_context};
 use crate::quality_gate::{
     MemoryQualityGate, MemoryQualityGateInput, memory_quality_gate_input_from_semantic_write,
 };
@@ -82,8 +79,8 @@ use pioneer_protocol::{
     MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySemanticWriteRouteInfo, MemorySensitivity,
-    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
-    MemoryWriteEvidence, MemoryWriteRelation, generate_id,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemoryWriteEvidence,
+    MemoryWriteRelation, generate_id,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -240,6 +237,9 @@ impl MemoryService {
         source_context_kind: Option<MemorySourceContextKind>,
     ) -> Result<MemoryRememberResponse> {
         let now = context.now_or(current_unix());
+        let source_context_kind = source_context_kind
+            .or(params.source_context_kind)
+            .or(Some(MemorySourceContextKind::DirectUserConversation));
         let prepared = self.policy.prepare_remember(&context, &params)?;
         let resolved_scope = self
             .store
@@ -296,7 +296,6 @@ impl MemoryService {
             content: prepared.content.clone(),
             sensitivity: prepared.sensitivity,
             metadata_json: metadata_json.clone(),
-            source_kind: provenance.source_kind,
             source_thread_id: provenance.source_thread_id.clone(),
             source_turn_id: provenance.source_turn_id.clone(),
             source_item_id: provenance.source_item_id.clone(),
@@ -344,7 +343,6 @@ impl MemoryService {
             frame_id: backend_result.frame_id,
             frame_uri: backend_result.frame_uri,
             frame_version: backend_result.frame_version,
-            source_kind: provenance.source_kind,
             source_context_kind,
             source_thread_id: provenance.source_thread_id.clone(),
             source_turn_id: provenance.source_turn_id.clone(),
@@ -1695,6 +1693,22 @@ impl MemoryService {
                 .recall_exact_canonical_for_prompt(context, params, top_k, max_chars)
                 .await;
         }
+        if matches!(
+            params.mode,
+            MemoryRecallMode::ThreadEpisodic | MemoryRecallMode::TaskContext
+        ) {
+            return Ok(MemoryModeRecallResponse {
+                diagnostics: vec![format!(
+                    "memory.active_recall.mode_native_provider_required:{}",
+                    params.mode.as_str()
+                )],
+                skipped_reason: Some(format!(
+                    "{}_native_provider_required",
+                    params.mode.as_str()
+                )),
+                ..MemoryModeRecallResponse::default()
+            });
+        }
 
         let scopes = memory_recall_mode_scopes(&context, params.mode);
         if scopes.is_empty() {
@@ -2650,6 +2664,7 @@ impl MemoryService {
                 confidence: params.confidence,
                 importance: params.importance,
                 provenance: Some(provenance),
+                source_context_kind: params.source_context_kind,
                 idempotency_key: None,
                 supersedes,
                 metadata: serde_json::from_str(metadata_json.as_str())
@@ -2691,7 +2706,6 @@ impl MemoryService {
             has_rejected_duplicate: relation == MemoryWriteRelation::SuppressedByRejection,
             sensitivity,
             active_no_memory_policy: false,
-            source_kind: provenance.source_kind,
             quality_action: quality_decision.action,
             quality_target_ownership: quality_decision.target_ownership,
             quality_reason_codes: quality_decision.reason_codes.clone(),
@@ -2842,7 +2856,6 @@ impl MemoryService {
                     candidate_text: content.to_owned(),
                     confidence: f64::from(params.confidence.unwrap_or(0.5).clamp(0.0, 1.0)),
                     reason: reason.to_owned(),
-                    source_kind: provenance.source_kind,
                     source_context_kind: params.source_context_kind,
                     source_thread_id: provenance.source_thread_id.clone(),
                     source_turn_id: provenance.source_turn_id.clone(),
@@ -3628,20 +3641,6 @@ fn semantic_write_provenance(
 
     let evidence = params.evidence.as_ref();
     MemoryProvenance {
-        source_kind: params
-            .source_context_kind
-            .map(|source_context_kind| {
-                legacy_source_kind_for_source_context(source_context_kind, &params.semantic)
-            })
-            .unwrap_or_else(|| match params.semantic.intent {
-                pioneer_protocol::MemoryIntent::ExplicitStore => {
-                    MemorySourceKind::ExplicitUserRequest
-                }
-                pioneer_protocol::MemoryIntent::ExplicitForget
-                | pioneer_protocol::MemoryIntent::ExplicitNoMemory => MemorySourceKind::System,
-                pioneer_protocol::MemoryIntent::ImplicitCandidate
-                | pioneer_protocol::MemoryIntent::None => MemorySourceKind::BackgroundExtractor,
-            }),
         source_thread_id: evidence
             .and_then(|evidence| evidence.source_thread_id.clone())
             .or_else(|| context.thread_id.clone()),
@@ -3795,7 +3794,6 @@ fn candidate_semantic_write_params(
         extractor_reason: Some("candidate approved through memory service lifecycle".to_owned()),
     };
     let provenance = MemoryProvenance {
-        source_kind: candidate.source_kind,
         source_thread_id: candidate.source_thread_id.clone(),
         source_turn_id: candidate.source_turn_id.clone(),
         source_item_id: candidate.source_item_id.clone(),
@@ -4082,7 +4080,6 @@ fn backend_put_request_from_row(row: &AgentMemoryControlRecord) -> BackendPutReq
         content: row.content_preview.clone().unwrap_or_default(),
         sensitivity: row.sensitivity,
         metadata_json: row.metadata_json.clone(),
-        source_kind: row.source_kind,
         source_thread_id: row.source_thread_id.clone(),
         source_turn_id: row.source_turn_id.clone(),
         source_item_id: row.source_item_id.clone(),
@@ -4269,7 +4266,7 @@ mod tests {
                 extractor_reason: Some("explicit self-identification".to_owned()),
             }),
             provenance: None,
-            source_context_kind: None,
+            source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: None,
             confidence: Some(0.99),

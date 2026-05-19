@@ -11,8 +11,7 @@ use pioneer_protocol::{
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass,
     MemoryFactClass, MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryLifetimeClass,
     MemoryOwnershipClass, MemoryQualityAction, MemoryQualityReasonCode, MemoryScope,
-    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemorySourceKind, MemoryStatus,
-    MemoryWriteRelation,
+    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
@@ -94,7 +93,6 @@ fn new_memory(
         frame_id: Some(1),
         frame_uri: Some(format!("frame://{id}")),
         frame_version: 1,
-        source_kind: MemorySourceKind::ExplicitUserRequest,
         source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         source_thread_id: Some("thread_memory_a".to_owned()),
         source_turn_id: Some("turn_memory_a".to_owned()),
@@ -607,7 +605,6 @@ async fn agent_memory_candidate_dedupe_and_decision_roundtrip() {
         candidate_text: "Use memvid for agent memory.".to_owned(),
         confidence: 0.9,
         reason: "Repeated explicit project instruction.".to_owned(),
-        source_kind: MemorySourceKind::BackgroundExtractor,
         source_context_kind: Some(MemorySourceContextKind::ToolResult),
         source_thread_id: Some("thread_memory_a".to_owned()),
         source_turn_id: Some("turn_candidate".to_owned()),

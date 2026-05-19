@@ -9,12 +9,14 @@ const UNIQUE_ACTIVE_QUARANTINE_INDEX: &str = "uidx_agent_memory_quarantine_activ
 #[derive(DeriveIden)]
 enum AgentMemory {
     Table,
+    SourceKind,
     SourceContextKind,
 }
 
 #[derive(DeriveIden)]
 enum AgentMemoryCandidate {
     Table,
+    SourceKind,
     SourceContextKind,
 }
 
@@ -68,6 +70,7 @@ impl MigrationTrait for Migration {
         add_agent_memory_source_context_columns(manager).await?;
         create_agent_memory_quality_decision_table(manager).await?;
         create_agent_memory_quarantine_table(manager).await?;
+        drop_agent_memory_source_kind_columns(manager).await?;
 
         manager
             .get_connection()
@@ -135,6 +138,35 @@ async fn normalize_active_current_workspace(manager: &SchemaManager<'_>) -> Resu
                )",
         )
         .await?;
+
+    Ok(())
+}
+
+async fn drop_agent_memory_source_kind_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager.has_column("agent_memory", "source_kind").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(AgentMemory::Table)
+                    .drop_column(AgentMemory::SourceKind)
+                    .to_owned(),
+            )
+            .await?;
+    }
+
+    if manager
+        .has_column("agent_memory_candidate", "source_kind")
+        .await?
+    {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(AgentMemoryCandidate::Table)
+                    .drop_column(AgentMemoryCandidate::SourceKind)
+                    .to_owned(),
+            )
+            .await?;
+    }
 
     Ok(())
 }

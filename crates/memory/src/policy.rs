@@ -1,6 +1,6 @@
 use crate::{MemoryOperationContext, MemoryReadPolicy, MemoryServiceConfig};
 use anyhow::{Result, bail};
-use pioneer_protocol::{MemoryRememberParams, MemorySensitivity, MemorySourceKind};
+use pioneer_protocol::{MemoryRememberParams, MemorySensitivity, MemorySourceContextKind};
 
 pub const POLICY_ACTION_REMEMBER: &str = "remember";
 #[allow(dead_code)]
@@ -70,13 +70,11 @@ impl MemoryPolicyEngine {
             );
         }
 
-        let source_kind = params
-            .provenance
-            .as_ref()
-            .map(|provenance| provenance.source_kind)
-            .unwrap_or(MemorySourceKind::ExplicitUserRequest);
         let confidence = params.confidence.unwrap_or_else(|| {
-            if source_kind == MemorySourceKind::ExplicitUserRequest {
+            if params
+                .source_context_kind
+                .is_none_or(|kind| kind == MemorySourceContextKind::DirectUserConversation)
+            {
                 1.0
             } else {
                 0.5
@@ -138,6 +136,7 @@ mod tests {
             confidence: None,
             importance: None,
             provenance: None,
+            source_context_kind: None,
             idempotency_key: None,
             supersedes: None,
             metadata: BTreeMap::new(),

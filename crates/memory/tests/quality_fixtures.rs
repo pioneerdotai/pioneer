@@ -6,7 +6,7 @@ use pioneer_protocol::{
     MemoryEvidenceClass, MemoryExplicitness, MemoryExtractorCertainty, MemoryFactClass,
     MemoryIntent, MemoryLifetimeClass, MemoryOwnershipClass, MemoryScope, MemoryScopeHint,
     MemoryScopeKind, MemorySemanticFields, MemorySensitivityHint, MemorySourceContextKind,
-    MemorySourceKind, MemorySubject,
+    MemorySubject, MemoryWriteEvidence,
 };
 
 struct MemoryQualityFixture {
@@ -16,7 +16,7 @@ struct MemoryQualityFixture {
     evidence_class: MemoryEvidenceClass,
     semantic: MemorySemanticFields,
     scope: Option<MemoryScope>,
-    source_input: MemorySourceContextInput<'static>,
+    source_fixture: MemoryQualitySourceFixture,
     expected_fact_class: MemoryFactClass,
     expected_lifetime_class: MemoryLifetimeClass,
     expected_ownership_class: MemoryOwnershipClass,
@@ -29,7 +29,7 @@ fn quality_fixtures_map_by_class_not_language_variant() {
         assert_fixture_text_is_example_data(&fixture);
 
         let ontology = classify_semantic_memory_fact(&fixture.semantic, fixture.scope.as_ref());
-        let source_context = classify_memory_source_context(fixture.source_input);
+        let source_context = classify_source_fixture(fixture.source_fixture);
 
         assert_eq!(
             ontology.fact_class, fixture.expected_fact_class,
@@ -79,7 +79,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::LongLived,
             ),
             scope: Some(scope(MemoryScopeKind::User, "user-1")),
-            source_input: source_from_kind(MemorySourceKind::ExplicitUserRequest),
+            source_fixture: MemoryQualitySourceFixture::DirectUserAssertion,
             expected_fact_class: MemoryFactClass::UserIdentity,
             expected_lifetime_class: MemoryLifetimeClass::LongLived,
             expected_ownership_class: MemoryOwnershipClass::DurableUserMemory,
@@ -98,7 +98,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::LongLived,
             ),
             scope: Some(scope(MemoryScopeKind::User, "user-1")),
-            source_input: source_from_kind(MemorySourceKind::ExplicitUserRequest),
+            source_fixture: MemoryQualitySourceFixture::DirectUserAssertion,
             expected_fact_class: MemoryFactClass::StableUserPreference,
             expected_lifetime_class: MemoryLifetimeClass::LongLived,
             expected_ownership_class: MemoryOwnershipClass::DurableUserMemory,
@@ -117,7 +117,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::LongLived,
             ),
             scope: Some(scope(MemoryScopeKind::User, "user-1")),
-            source_input: source_from_kind(MemorySourceKind::ExplicitUserRequest),
+            source_fixture: MemoryQualitySourceFixture::DirectUserAssertion,
             expected_fact_class: MemoryFactClass::CommunicationPreference,
             expected_lifetime_class: MemoryLifetimeClass::LongLived,
             expected_ownership_class: MemoryOwnershipClass::DurableUserMemory,
@@ -136,7 +136,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::ProjectLifetime,
             ),
             scope: Some(scope(MemoryScopeKind::Workspace, "workspace-1")),
-            source_input: source_from_kind(MemorySourceKind::ExplicitUserRequest),
+            source_fixture: MemoryQualitySourceFixture::DirectUserAssertion,
             expected_fact_class: MemoryFactClass::ProjectDecision,
             expected_lifetime_class: MemoryLifetimeClass::ProjectLifetime,
             expected_ownership_class: MemoryOwnershipClass::DurableWorkspaceMemory,
@@ -158,10 +158,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::SessionOnly,
             ),
             scope: Some(scope(MemoryScopeKind::Workspace, "workspace-1")),
-            source_input: MemorySourceContextInput {
-                task_id: Some("task-1"),
-                ..MemorySourceContextInput::default()
-            },
+            source_fixture: MemoryQualitySourceFixture::TaskRuntime,
             expected_fact_class: MemoryFactClass::TaskLifecycleState,
             expected_lifetime_class: MemoryLifetimeClass::TaskLifetime,
             expected_ownership_class: MemoryOwnershipClass::TaskRuntimeState,
@@ -180,7 +177,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::Transient,
             ),
             scope: Some(scope(MemoryScopeKind::Workspace, "workspace-1")),
-            source_input: source_from_kind(MemorySourceKind::System),
+            source_fixture: MemoryQualitySourceFixture::SystemRuntime,
             expected_fact_class: MemoryFactClass::OperationalObservation,
             expected_lifetime_class: MemoryLifetimeClass::NaturallyExpiring,
             expected_ownership_class: MemoryOwnershipClass::DomainRuntimeState,
@@ -202,7 +199,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::SessionOnly,
             ),
             scope: Some(scope(MemoryScopeKind::User, "user-1")),
-            source_input: source_from_kind(MemorySourceKind::ExplicitUserRequest),
+            source_fixture: MemoryQualitySourceFixture::DirectUserAssertion,
             expected_fact_class: MemoryFactClass::ThreadLocalState,
             expected_lifetime_class: MemoryLifetimeClass::ThreadLifetime,
             expected_ownership_class: MemoryOwnershipClass::ThreadEpisodicContext,
@@ -224,7 +221,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::Transient,
             ),
             scope: Some(scope(MemoryScopeKind::Workspace, "workspace-1")),
-            source_input: source_from_kind(MemorySourceKind::ToolObservation),
+            source_fixture: MemoryQualitySourceFixture::ToolResult,
             expected_fact_class: MemoryFactClass::ToolResultFact,
             expected_lifetime_class: MemoryLifetimeClass::NaturallyExpiring,
             expected_ownership_class: MemoryOwnershipClass::DomainRuntimeState,
@@ -243,7 +240,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::LongLived,
             ),
             scope: Some(scope(MemoryScopeKind::Agent, "agent-1")),
-            source_input: source_from_kind(MemorySourceKind::AssistantInference),
+            source_fixture: MemoryQualitySourceFixture::AssistantResponse,
             expected_fact_class: MemoryFactClass::AssistantSelfDescription,
             expected_lifetime_class: MemoryLifetimeClass::LongLived,
             expected_ownership_class: MemoryOwnershipClass::DurableAgentMemory,
@@ -262,10 +259,7 @@ fn quality_fixtures() -> Vec<MemoryQualityFixture> {
                 MemoryDurability::Unknown,
             ),
             scope: None,
-            source_input: MemorySourceContextInput {
-                has_user_text: true,
-                ..MemorySourceContextInput::default()
-            },
+            source_fixture: MemoryQualitySourceFixture::UserTextWeak,
             expected_fact_class: MemoryFactClass::Unknown,
             expected_lifetime_class: MemoryLifetimeClass::Unknown,
             expected_ownership_class: MemoryOwnershipClass::AuditOnly,
@@ -304,10 +298,42 @@ fn scope(kind: MemoryScopeKind, key: &str) -> MemoryScope {
     }
 }
 
-fn source_from_kind(source_kind: MemorySourceKind) -> MemorySourceContextInput<'static> {
-    MemorySourceContextInput {
-        source_kind: Some(source_kind),
+#[derive(Debug, Clone, Copy)]
+enum MemoryQualitySourceFixture {
+    DirectUserAssertion,
+    AssistantResponse,
+    ToolResult,
+    TaskRuntime,
+    SystemRuntime,
+    UserTextWeak,
+}
+
+fn classify_source_fixture(
+    fixture: MemoryQualitySourceFixture,
+) -> pioneer_memory::MemorySourceContextClassification {
+    let evidence = match fixture {
+        MemoryQualitySourceFixture::DirectUserAssertion => Some(evidence("turn.post_turn:user")),
+        MemoryQualitySourceFixture::AssistantResponse => Some(evidence("turn.post_turn:assistant")),
+        MemoryQualitySourceFixture::ToolResult => Some(evidence("tool:cargo")),
+        MemoryQualitySourceFixture::SystemRuntime => Some(evidence("system:runtime")),
+        MemoryQualitySourceFixture::TaskRuntime | MemoryQualitySourceFixture::UserTextWeak => None,
+    };
+    classify_memory_source_context(MemorySourceContextInput {
+        task_id: matches!(fixture, MemoryQualitySourceFixture::TaskRuntime).then_some("task-1"),
+        has_user_text: matches!(fixture, MemoryQualitySourceFixture::UserTextWeak),
+        evidence: evidence.as_ref(),
         ..MemorySourceContextInput::default()
+    })
+}
+
+fn evidence(source_ref: &'static str) -> MemoryWriteEvidence {
+    MemoryWriteEvidence {
+        source_thread_id: Some("thread-1".to_owned()),
+        source_turn_id: Some("turn-1".to_owned()),
+        source_item_id: None,
+        source_ref: Some(source_ref.to_owned()),
+        quote_or_span: Some("structured evidence".to_owned()),
+        extractor_reason: None,
     }
 }
 

@@ -35,10 +35,11 @@ pub use hooks::AgentPostTurnHookDispatchPolicy;
 use hooks::AgentToolBundleArtifactStore;
 use manager_recovery::apply_recovery_adjustments;
 pub use pioneer_memory::hooks::{
-    AgentActiveMemoryDecisionProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
-    AgentMemoryTurnPolicyProvider, AgentMemoryWriteProvider, MemoryActiveContextPolicy,
-    MemoryActiveRecallConfig, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    MemoryActiveRecallMode, MemoryActiveRecallPlannerConfig,
+    AgentActiveMemoryDecisionProvider, AgentEpisodicRecallProvider,
+    AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
+    AgentMemoryWriteProvider, MemoryActiveContextPolicy, MemoryActiveRecallConfig,
+    MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest, MemoryActiveRecallMode,
+    MemoryActiveRecallPlannerConfig,
     MemoryActiveRecallPlannerFallbackPolicy, MemoryClassifierFallbackPolicy,
     MemoryExtractionPolicy, MemoryLoopConfig, MemoryManifest, MemoryManifestActiveItem,
     MemoryManifestCandidateItem, MemoryManifestRequest, MemoryMutationToolPolicy,
@@ -1403,6 +1404,7 @@ pub struct AgentManager {
     memory_turn_policy_provider: RwLock<Option<Arc<dyn AgentMemoryTurnPolicyProvider>>>,
     memory_active_recall_decision_provider:
         RwLock<Option<Arc<dyn AgentActiveMemoryDecisionProvider>>>,
+    memory_episodic_recall_provider: RwLock<Option<Arc<dyn AgentEpisodicRecallProvider>>>,
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
@@ -1439,6 +1441,7 @@ impl AgentManager {
             memory_post_turn_extractor_provider: RwLock::new(None),
             memory_turn_policy_provider: RwLock::new(None),
             memory_active_recall_decision_provider: RwLock::new(None),
+            memory_episodic_recall_provider: RwLock::new(None),
             hook_runtime: RwLock::new(None),
             tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
@@ -1483,6 +1486,13 @@ impl AgentManager {
         provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     ) {
         *self.memory_active_recall_decision_provider.write().await = provider;
+    }
+
+    pub async fn set_memory_episodic_recall_provider(
+        &self,
+        provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
+    ) {
+        *self.memory_episodic_recall_provider.write().await = provider;
     }
 
     pub async fn set_hook_runtime(&self, runtime: Option<Arc<HookRuntime>>) {

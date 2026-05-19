@@ -1,6 +1,7 @@
 mod classifier_fallback;
 mod descriptors;
 mod eligibility;
+mod episodic_recall;
 mod policy_basics;
 mod policy_classifier;
 mod post_turn;
@@ -45,6 +46,7 @@ fn install_memory_hook_package_for_test(
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> Result<(), HookRegistryError> {
@@ -55,6 +57,7 @@ fn install_memory_hook_package_for_test(
             post_turn_extractor_provider,
             policy_provider,
             active_recall_decision_provider,
+            episodic_recall_provider,
             tool_bundle_artifacts,
             memory_config,
         ))?
@@ -758,7 +761,6 @@ fn test_memory_record(id: &str) -> MemoryRecord {
         importance: 0.7,
         sensitivity: pioneer_protocol::MemorySensitivity::Personal,
         provenance: MemoryProvenance {
-            source_kind: MemorySourceKind::ExplicitUserRequest,
             source_thread_id: Some("thr".to_owned()),
             source_turn_id: Some("turn".to_owned()),
             source_item_id: None,

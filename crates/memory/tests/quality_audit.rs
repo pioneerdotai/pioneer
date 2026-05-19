@@ -8,7 +8,7 @@ use pioneer_protocol::{
     MemoryExtractorCertainty, MemoryFactClass, MemoryIntent, MemoryLifetimeClass,
     MemoryOwnershipClass, MemoryProvenance, MemoryRecord, MemoryScope, MemoryScopeHint,
     MemoryScopeKind, MemorySemanticFields, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemorySubject,
+    MemorySourceContextKind, MemoryStatus, MemorySubject,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -82,7 +82,7 @@ fn representative_memory_record() -> MemoryRecord {
         confidence: 0.96,
         importance: 0.82,
         sensitivity: MemorySensitivity::Personal,
-        provenance: provenance(MemorySourceKind::ExplicitUserRequest, "thread-1", "turn-1"),
+        provenance: provenance("thread-1", "turn-1"),
         source_context_kind: None,
         created_at: 1,
         updated_at: 1,
@@ -146,7 +146,7 @@ fn representative_memory_candidate() -> MemoryCandidate {
         candidate_text: "Project uses Phase naming.".to_owned(),
         confidence: 0.74,
         reason: "candidate_policy".to_owned(),
-        provenance: provenance(MemorySourceKind::ExplicitUserRequest, "thread-2", "turn-2"),
+        provenance: provenance("thread-2", "turn-2"),
         source_context_kind: None,
         status: MemoryCandidateStatus::PendingSilent,
         created_at: 2,
@@ -219,9 +219,8 @@ fn scope(kind: MemoryScopeKind, key: &str) -> MemoryScope {
     }
 }
 
-fn provenance(source_kind: MemorySourceKind, thread_id: &str, turn_id: &str) -> MemoryProvenance {
+fn provenance(thread_id: &str, turn_id: &str) -> MemoryProvenance {
     MemoryProvenance {
-        source_kind,
         source_thread_id: Some(thread_id.to_owned()),
         source_turn_id: Some(turn_id.to_owned()),
         source_item_id: None,

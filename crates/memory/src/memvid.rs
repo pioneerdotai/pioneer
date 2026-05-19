@@ -12,8 +12,7 @@ use pioneer_crud::{
     AgentMemoryCapsuleRecord, CrudStore, MemoryScopeResolution, NewAgentMemoryRepairJob,
 };
 use pioneer_protocol::{
-    MemoryActorKind, MemoryCategory, MemoryScope, MemoryScopeKind, MemorySensitivity,
-    MemorySourceKind, MemoryStatus,
+    MemoryActorKind, MemoryCategory, MemoryScope, MemoryScopeKind, MemorySensitivity, MemoryStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -800,7 +799,6 @@ fn put_options(
     let category = category_to_db(request.category);
     let key = request.key.as_deref().unwrap_or("");
     let sensitivity = sensitivity_to_db(request.sensitivity);
-    let source_kind = source_kind_to_db(request.source_kind);
     let status = status_to_db(request.status);
 
     let mut builder = PutOptions::builder()
@@ -815,7 +813,6 @@ fn put_options(
         .tag("pioneer.category", category)
         .tag("pioneer.key", key)
         .tag("pioneer.sensitivity", sensitivity)
-        .tag("pioneer.source_kind", source_kind)
         .tag(
             "pioneer.source_thread_id",
             request.source_thread_id.as_deref().unwrap_or(""),
@@ -999,18 +996,6 @@ fn sensitivity_to_db(sensitivity: MemorySensitivity) -> &'static str {
     }
 }
 
-fn source_kind_to_db(source_kind: MemorySourceKind) -> &'static str {
-    match source_kind {
-        MemorySourceKind::ExplicitUserRequest => "explicit_user_request",
-        MemorySourceKind::UserCorrection => "user_correction",
-        MemorySourceKind::AssistantInference => "assistant_inference",
-        MemorySourceKind::BackgroundExtractor => "background_extractor",
-        MemorySourceKind::ToolObservation => "tool_observation",
-        MemorySourceKind::Import => "import",
-        MemorySourceKind::System => "system",
-    }
-}
-
 fn actor_kind_to_db(actor_kind: MemoryActorKind) -> &'static str {
     match actor_kind {
         MemoryActorKind::User => "user",
@@ -1037,6 +1022,7 @@ fn current_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memvid_core::SearchHitMetadata;
 
     #[test]
     fn search_request_helper_sets_all_fields_explicitly() {
@@ -1062,5 +1048,40 @@ mod tests {
         assert_eq!(id.len(), 21);
         assert!(!reference.contains("raw-user-key"));
         assert!(reference.contains(scope_key_hash.as_str()));
+    }
+
+    #[test]
+    fn stale_source_kind_metadata_is_ignored_by_search_mapping() {
+        let mut extra_metadata = BTreeMap::new();
+        extra_metadata.insert("pioneer.memory_id".to_owned(), "mem_legacy".to_owned());
+        extra_metadata.insert("pioneer.scope_kind".to_owned(), "user".to_owned());
+        extra_metadata.insert("pioneer.scope_key_hash".to_owned(), "scope_hash".to_owned());
+        extra_metadata.insert(
+            "pioneer.source_kind".to_owned(),
+            "explicit_user_request".to_owned(),
+        );
+
+        let hit = SearchHit {
+            rank: 1,
+            frame_id: 42,
+            uri: "memvid://legacy".to_owned(),
+            title: None,
+            range: (0, 6),
+            text: "legacy".to_owned(),
+            matches: 1,
+            chunk_range: None,
+            chunk_text: None,
+            score: Some(0.9),
+            metadata: Some(SearchHitMetadata {
+                extra_metadata,
+                ..SearchHitMetadata::default()
+            }),
+        };
+
+        let mapped = search_hit_to_backend_hit(hit, "user", "scope_hash")
+            .expect("legacy source_kind metadata should not suppress hit");
+
+        assert_eq!(mapped.memory_id, "mem_legacy");
+        assert_eq!(mapped.score, Some(0.9));
     }
 }

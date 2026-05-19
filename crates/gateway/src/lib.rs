@@ -26,9 +26,10 @@ mod workspace;
 use anyhow::{Context, Result};
 use attachment::CrudArtifactExternalRefCacheBackend;
 use pioneer_agent::ToolLoopConfig;
-use pioneer_config::AppConfig;
+use pioneer_config::{AppConfig, GatewayMemoryConfig};
 use pioneer_crud::CrudStore;
-use pioneer_memory::hooks::MemoryLoopConfig;
+use pioneer_hooks::HookAwaitPolicy;
+use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
@@ -336,7 +337,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
                 allow_function_proxy_tools: skills_cfg.runtime.allow_function_proxy_tools,
             },
         },
-        memory: MemoryLoopConfig::default(),
+        memory: memory_loop_config_from_gateway_memory_config(&config.gateway.memory),
         budget: ToolLoopBudgetConfig {
             max_agent_rounds_per_turn: tool_budget_cfg.max_agent_rounds_per_turn,
             max_tool_calls_per_turn: tool_budget_cfg.max_tool_calls_per_turn,
@@ -467,6 +468,30 @@ fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<Gate
     )
 }
 
+fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -> MemoryLoopConfig {
+    let mut memory = MemoryLoopConfig::default();
+    memory.deterministic_recall_enabled = config.enabled && config.deterministic_recall_enabled;
+    memory.tools_enabled = config.enabled && config.tools_enabled;
+
+    if !config.enabled || !config.active_recall_enabled || !memory.deterministic_recall_enabled {
+        memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
+    }
+
+    memory.post_turn_extractor.enabled = config.enabled && config.proactive_writes_enabled;
+    memory.post_turn_extractor.provider_enabled = config.enabled && config.proactive_writes_enabled;
+    memory.post_turn_extractor.proactive_writes_enabled =
+        config.enabled && config.proactive_writes_enabled;
+    memory.post_turn_extractor.await_policy = if config.background_extraction_enabled {
+        HookAwaitPolicy::FireAndRecord
+    } else {
+        HookAwaitPolicy::Blocking
+    };
+    memory.post_turn_extractor.strict_debug =
+        config.debug_trace_enabled || config.strict_diagnostics_enabled;
+
+    memory
+}
+
 fn parse_skill_trust_level(raw: &str, field_name: &str) -> Result<SkillTrustLevel> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "internal" => Ok(SkillTrustLevel::Internal),
@@ -531,9 +556,15 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_home_directory_templates, parse_skill_trust_level};
+    use super::{
+        expand_home_directory_templates, memory_loop_config_from_gateway_memory_config,
+        parse_skill_trust_level,
+    };
     use crate::secrets::GatewaySecrets;
+    use pioneer_config::GatewayMemoryConfig;
+    use pioneer_hooks::HookAwaitPolicy;
     use pioneer_keystore::MemorySecretStore;
+    use pioneer_memory::hooks::MemoryActiveRecallMode;
     use pioneer_skills::SkillTrustLevel;
     use std::sync::Arc;
 
@@ -587,6 +618,73 @@ mod tests {
                 ".agents/skills".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn gateway_memory_config_maps_to_memory_loop_defaults() {
+        let loop_config =
+            memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig::default());
+
+        assert!(loop_config.deterministic_recall_enabled);
+        assert!(loop_config.tools_enabled);
+        assert_eq!(
+            loop_config.active_recall.mode,
+            MemoryActiveRecallMode::Hybrid
+        );
+        assert!(loop_config.post_turn_extractor.enabled);
+        assert!(loop_config.post_turn_extractor.provider_enabled);
+        assert!(loop_config.post_turn_extractor.proactive_writes_enabled);
+        assert_eq!(
+            loop_config.post_turn_extractor.await_policy,
+            HookAwaitPolicy::FireAndRecord
+        );
+        assert!(!loop_config.post_turn_extractor.strict_debug);
+    }
+
+    #[test]
+    fn gateway_memory_config_disables_hook_surfaces_without_agent_loop_branches() {
+        let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
+            enabled: false,
+            ..GatewayMemoryConfig::default()
+        });
+
+        assert!(!loop_config.deterministic_recall_enabled);
+        assert!(!loop_config.tools_enabled);
+        assert_eq!(
+            loop_config.active_recall.mode,
+            MemoryActiveRecallMode::Disabled
+        );
+        assert!(!loop_config.post_turn_extractor.enabled);
+        assert!(!loop_config.post_turn_extractor.provider_enabled);
+        assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
+    }
+
+    #[test]
+    fn gateway_memory_config_can_disable_individual_product_features() {
+        let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
+            deterministic_recall_enabled: false,
+            active_recall_enabled: true,
+            tools_enabled: false,
+            proactive_writes_enabled: false,
+            background_extraction_enabled: false,
+            debug_trace_enabled: true,
+            ..GatewayMemoryConfig::default()
+        });
+
+        assert!(!loop_config.deterministic_recall_enabled);
+        assert!(!loop_config.tools_enabled);
+        assert_eq!(
+            loop_config.active_recall.mode,
+            MemoryActiveRecallMode::Disabled
+        );
+        assert!(!loop_config.post_turn_extractor.enabled);
+        assert!(!loop_config.post_turn_extractor.provider_enabled);
+        assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
+        assert_eq!(
+            loop_config.post_turn_extractor.await_policy,
+            HookAwaitPolicy::Blocking
+        );
+        assert!(loop_config.post_turn_extractor.strict_debug);
     }
 
     #[test]

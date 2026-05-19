@@ -32,7 +32,6 @@ pub(crate) fn effective_provenance(
             provenance
         }
         None => MemoryProvenance {
-            source_kind: pioneer_protocol::MemorySourceKind::ExplicitUserRequest,
             source_thread_id: None,
             source_turn_id: None,
             source_item_id: None,
@@ -70,7 +69,6 @@ pub(crate) fn crud_record_to_protocol(
         importance: checked_f32(record.importance, "importance")?,
         sensitivity: record.sensitivity,
         provenance: MemoryProvenance {
-            source_kind: record.source_kind,
             source_thread_id: record.source_thread_id,
             source_turn_id: record.source_turn_id,
             source_item_id: record.source_item_id,
@@ -102,7 +100,6 @@ pub(crate) fn crud_candidate_to_protocol(
         confidence: checked_f32(candidate.confidence, "confidence")?,
         reason: candidate.reason,
         provenance: MemoryProvenance {
-            source_kind: candidate.source_kind,
             source_thread_id: candidate.source_thread_id,
             source_turn_id: candidate.source_turn_id,
             source_item_id: candidate.source_item_id,

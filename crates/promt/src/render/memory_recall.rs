@@ -11,6 +11,8 @@ pub struct MemoryRecallPromptInput {
     pub recalled_items: Vec<MemoryRecallPromptItem>,
     pub recalled_context: Option<MemoryRecallPromptContextBlock>,
     pub active_context: Option<MemoryRecallPromptContextBlock>,
+    pub thread_context: Option<MemoryRecallPromptContextBlock>,
+    pub task_context: Option<MemoryRecallPromptContextBlock>,
     pub truncated: bool,
 }
 
@@ -159,6 +161,32 @@ pub fn render_memory_recall_prompt(input: &MemoryRecallPromptInput) -> Option<St
             if active_truncated {
                 prompt
                     .push_str("\nAdditional active memory context was omitted for prompt budget.");
+            }
+        }
+    }
+    if input.policy != MemoryRecallPromptPolicy::ForgetOnly
+        && let Some(thread_context) = input.thread_context.as_ref()
+    {
+        let (thread_context, thread_truncated) =
+            render_synthesized_context_block(thread_context, input.truncated);
+        if !thread_context.is_empty() {
+            prompt.push_str("\n\nRelevant thread context for this turn:\n");
+            prompt.push_str(thread_context.as_str());
+            if thread_truncated {
+                prompt.push_str("\nAdditional thread context was omitted for prompt budget.");
+            }
+        }
+    }
+    if input.policy != MemoryRecallPromptPolicy::ForgetOnly
+        && let Some(task_context) = input.task_context.as_ref()
+    {
+        let (task_context, task_truncated) =
+            render_synthesized_context_block(task_context, input.truncated);
+        if !task_context.is_empty() {
+            prompt.push_str("\n\nRelevant task context for this turn:\n");
+            prompt.push_str(task_context.as_str());
+            if task_truncated {
+                prompt.push_str("\nAdditional task context was omitted for prompt budget.");
             }
         }
     }
@@ -322,6 +350,8 @@ mod tests {
             recalled_items: vec![memory_prompt_item("mem_123", "User's name is Alexander.")],
             recalled_context: None,
             active_context: None,
+            thread_context: None,
+            task_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -355,6 +385,8 @@ mod tests {
                 recalled_items: Vec::new(),
                 recalled_context: None,
                 active_context: None,
+                thread_context: None,
+                task_context: None,
                 truncated: false,
             })
             .is_none()
@@ -381,6 +413,8 @@ mod tests {
             recalled_items: items,
             recalled_context: None,
             active_context: None,
+            thread_context: None,
+            task_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -403,6 +437,8 @@ mod tests {
             recalled_items: vec![memory_prompt_item("mem_123", "User prefers short answers.")],
             recalled_context: None,
             active_context: None,
+            thread_context: None,
+            task_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -427,6 +463,14 @@ mod tests {
                 "- active identity: Active should also be omitted.",
                 false,
             ),
+            thread_context: MemoryRecallPromptContextBlock::from_text(
+                "- thread context: This should be omitted.",
+                false,
+            ),
+            task_context: MemoryRecallPromptContextBlock::from_text(
+                "- task context: This should be omitted.",
+                false,
+            ),
             truncated: false,
         })
         .expect("memory prompt");
@@ -449,6 +493,8 @@ mod tests {
                 "- workspace project decision: User is working on Pioneer memory architecture.",
                 false,
             ),
+            thread_context: None,
+            task_context: None,
             truncated: false,
         })
         .expect("memory prompt");
@@ -477,6 +523,8 @@ mod tests {
                 "- workspace project decision: Use hook runtime for memory domains.",
                 false,
             ),
+            thread_context: None,
+            task_context: None,
             truncated: false,
         })
         .expect("memory prompt");

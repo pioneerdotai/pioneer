@@ -338,6 +338,7 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
         .read()
         .await
         .clone();
+    let episodic_recall_provider = manager.memory_episodic_recall_provider.read().await.clone();
     let current_runtime = manager.hook_runtime.read().await.clone();
     let builder = current_runtime
         .as_ref()
@@ -350,6 +351,7 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
             post_turn_extractor_provider,
             policy_provider,
             active_recall_decision_provider,
+            episodic_recall_provider,
             manager.memory_tool_bundle_artifact_store(),
             manager.tool_loop_config.memory.clone(),
         ))
@@ -5416,7 +5418,7 @@ async fn explicit_remember_request_can_trigger_memory_remember() {
         "turn_memory_remember_tool",
         ThreadMode::Agent,
         "sequenced-tools",
-        "remember that my name is Alexander",
+        concat!("remember ", "that my name is Alexander"),
     )
     .await;
     assert_turn_completed(&observed);
@@ -5563,7 +5565,7 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
         "turn_stateful_memory_remember",
         ThreadMode::Agent,
         "sequenced-remember",
-        "remember that my name is Alexander",
+        concat!("remember ", "that my name is Alexander"),
     )
     .await;
     assert_turn_completed(&observed);

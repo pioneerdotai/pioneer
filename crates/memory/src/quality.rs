@@ -4,7 +4,7 @@ use pioneer_protocol::{
     MemoryDurability, MemoryEvidenceActorRole, MemoryEvidenceClass, MemoryFactClass,
     MemoryLifetimeClass, MemoryOwnershipClass, MemoryRecord, MemoryScope, MemoryScopeHint,
     MemoryScopeKind, MemorySemanticFields, MemorySemanticWriteParams, MemorySensitivityHint,
-    MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemorySubject, MemoryWriteEvidence,
+    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -30,7 +30,6 @@ pub struct MemorySourceContextInput<'a> {
     pub thread_id: Option<&'a str>,
     pub turn_id: Option<&'a str>,
     pub task_id: Option<&'a str>,
-    pub source_kind: Option<MemorySourceKind>,
     pub has_user_text: bool,
     pub has_assistant_text: bool,
     pub has_tool_events: bool,
@@ -177,8 +176,6 @@ pub fn classify_memory_source_context(
             false,
             true,
         )
-    } else if let Some(source_kind) = input.source_kind {
-        classify_source_kind(source_kind)
     } else if input.has_user_text {
         source_context(
             MemorySourceContextKind::DirectUserConversation,
@@ -239,49 +236,9 @@ pub fn resolve_semantic_write_source_context(
     classify_memory_source_context(MemorySourceContextInput {
         thread_id: provenance.and_then(|provenance| provenance.source_thread_id.as_deref()),
         turn_id: provenance.and_then(|provenance| provenance.source_turn_id.as_deref()),
-        source_kind: provenance
-            .map(|provenance| provenance.source_kind)
-            .or_else(|| semantic_intent_source_kind(&params.semantic)),
         evidence,
         ..MemorySourceContextInput::default()
     })
-}
-
-fn semantic_intent_source_kind(semantic: &MemorySemanticFields) -> Option<MemorySourceKind> {
-    match semantic.intent {
-        pioneer_protocol::MemoryIntent::ExplicitStore
-        | pioneer_protocol::MemoryIntent::ImplicitCandidate => {
-            Some(MemorySourceKind::ExplicitUserRequest)
-        }
-        pioneer_protocol::MemoryIntent::ExplicitForget
-        | pioneer_protocol::MemoryIntent::ExplicitNoMemory => Some(MemorySourceKind::System),
-        pioneer_protocol::MemoryIntent::None => Some(MemorySourceKind::BackgroundExtractor),
-    }
-}
-
-pub fn legacy_source_kind_for_source_context(
-    source_context_kind: MemorySourceContextKind,
-    semantic: &MemorySemanticFields,
-) -> MemorySourceKind {
-    match source_context_kind {
-        MemorySourceContextKind::DirectUserConversation => {
-            if semantic.explicitness == pioneer_protocol::MemoryExplicitness::Explicit {
-                MemorySourceKind::ExplicitUserRequest
-            } else {
-                MemorySourceKind::BackgroundExtractor
-            }
-        }
-        MemorySourceContextKind::AssistantResponse => MemorySourceKind::AssistantInference,
-        MemorySourceContextKind::ToolResult => MemorySourceKind::ToolObservation,
-        MemorySourceContextKind::TaskRuntime
-        | MemorySourceContextKind::SystemRuntime
-        | MemorySourceContextKind::DeveloperInstruction
-        | MemorySourceContextKind::GeneratedSummary
-        | MemorySourceContextKind::Unknown => MemorySourceKind::System,
-        MemorySourceContextKind::ConnectorContent | MemorySourceContextKind::ImportedDocument => {
-            MemorySourceKind::Import
-        }
-    }
 }
 
 pub fn audit_memory_record_quality(record: &MemoryRecord) -> MemoryQualityAuditRecord {
@@ -307,7 +264,6 @@ pub fn audit_memory_record_quality(record: &MemoryRecord) -> MemoryQualityAuditR
                 thread_id: record.provenance.source_thread_id.as_deref(),
                 turn_id: record.provenance.source_turn_id.as_deref(),
                 task_id: None,
-                source_kind: Some(record.provenance.source_kind),
                 evidence: evidence.as_ref(),
                 ..MemorySourceContextInput::default()
             })
@@ -365,7 +321,6 @@ pub fn audit_memory_candidate_quality(candidate: &MemoryCandidate) -> MemoryQual
                 thread_id: candidate.provenance.source_thread_id.as_deref(),
                 turn_id: candidate.provenance.source_turn_id.as_deref(),
                 task_id: None,
-                source_kind: Some(candidate.provenance.source_kind),
                 evidence: evidence.as_ref(),
                 ..MemorySourceContextInput::default()
             })
@@ -511,53 +466,6 @@ fn persisted_source_context(
     classification.turn_id = turn_id.map(str::to_owned);
     classification.item_id = item_id.map(str::to_owned);
     classification
-}
-
-fn classify_source_kind(source_kind: MemorySourceKind) -> MemorySourceContextClassification {
-    match source_kind {
-        MemorySourceKind::ExplicitUserRequest | MemorySourceKind::UserCorrection => source_context(
-            MemorySourceContextKind::DirectUserConversation,
-            MemoryEvidenceActorRole::User,
-            MemoryEvidenceClass::DirectUserAssertion,
-            true,
-            false,
-        ),
-        MemorySourceKind::AssistantInference => source_context(
-            MemorySourceContextKind::AssistantResponse,
-            MemoryEvidenceActorRole::Assistant,
-            MemoryEvidenceClass::AssistantInference,
-            false,
-            false,
-        ),
-        MemorySourceKind::ToolObservation => source_context(
-            MemorySourceContextKind::ToolResult,
-            MemoryEvidenceActorRole::Tool,
-            MemoryEvidenceClass::ToolObservation,
-            false,
-            true,
-        ),
-        MemorySourceKind::Import => source_context(
-            MemorySourceContextKind::ImportedDocument,
-            MemoryEvidenceActorRole::Connector,
-            MemoryEvidenceClass::SystemObservation,
-            false,
-            true,
-        ),
-        MemorySourceKind::System => source_context(
-            MemorySourceContextKind::SystemRuntime,
-            MemoryEvidenceActorRole::System,
-            MemoryEvidenceClass::SystemObservation,
-            false,
-            true,
-        ),
-        MemorySourceKind::BackgroundExtractor => source_context(
-            MemorySourceContextKind::Unknown,
-            MemoryEvidenceActorRole::Unknown,
-            MemoryEvidenceClass::MissingOrWeak,
-            false,
-            false,
-        ),
-    }
 }
 
 fn source_ref_is(source_ref: Option<&str>, expected: &str) -> bool {
@@ -1183,30 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn source_context_classifies_structured_source_kind() {
-        let classification = classify_memory_source_context(MemorySourceContextInput {
-            source_kind: Some(MemorySourceKind::ToolObservation),
-            ..MemorySourceContextInput::default()
-        });
-
-        assert_eq!(
-            classification.context_kind,
-            MemorySourceContextKind::ToolResult
-        );
-        assert_eq!(classification.actor_role, MemoryEvidenceActorRole::Tool);
-        assert_eq!(
-            classification.evidence_class,
-            MemoryEvidenceClass::ToolObservation
-        );
-        assert!(classification.source_is_system_owned_state);
-    }
-
-    #[test]
     fn semantic_write_source_context_prefers_explicit_typed_context() {
         let mut params = semantic_write_params_for_source_context();
         params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
         params.provenance = Some(MemoryProvenance {
-            source_kind: MemorySourceKind::ExplicitUserRequest,
             source_thread_id: Some("thread-provenance".to_owned()),
             source_turn_id: Some("turn-provenance".to_owned()),
             source_item_id: Some("item-provenance".to_owned()),
@@ -1235,15 +1123,22 @@ mod tests {
     }
 
     #[test]
-    fn semantic_write_source_context_falls_back_to_structured_provenance_and_evidence() {
+    fn semantic_write_source_context_falls_back_to_structured_evidence() {
         let mut params = semantic_write_params_for_source_context();
         params.source_context_kind = None;
         params.provenance = Some(MemoryProvenance {
-            source_kind: MemorySourceKind::ToolObservation,
             source_thread_id: Some("thread-provenance".to_owned()),
             source_turn_id: Some("turn-provenance".to_owned()),
             source_item_id: Some("item-provenance".to_owned()),
             created_by: None,
+        });
+        params.evidence = Some(MemoryWriteEvidence {
+            source_thread_id: None,
+            source_turn_id: None,
+            source_item_id: None,
+            source_ref: Some("tool:read_file".to_owned()),
+            quote_or_span: None,
+            extractor_reason: None,
         });
 
         let classification = resolve_semantic_write_source_context(&params);
@@ -1258,38 +1153,6 @@ mod tests {
             Some("thread-provenance")
         );
         assert_eq!(classification.turn_id.as_deref(), Some("turn-provenance"));
-    }
-
-    #[test]
-    fn source_context_to_legacy_source_kind_mapping_is_structural() {
-        let mut semantic = semantic(
-            MemoryCategory::Identity,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Name,
-            MemoryScopeHint::UserGlobal,
-            MemoryDurability::LongLived,
-        );
-        semantic.explicitness = MemoryExplicitness::Explicit;
-
-        assert_eq!(
-            legacy_source_kind_for_source_context(
-                MemorySourceContextKind::DirectUserConversation,
-                &semantic
-            ),
-            MemorySourceKind::ExplicitUserRequest
-        );
-        assert_eq!(
-            legacy_source_kind_for_source_context(MemorySourceContextKind::ToolResult, &semantic),
-            MemorySourceKind::ToolObservation
-        );
-        assert_eq!(
-            legacy_source_kind_for_source_context(MemorySourceContextKind::TaskRuntime, &semantic),
-            MemorySourceKind::System
-        );
-        assert_eq!(
-            legacy_source_kind_for_source_context(MemorySourceContextKind::Unknown, &semantic),
-            MemorySourceKind::System
-        );
     }
 
     #[test]
@@ -1496,7 +1359,6 @@ mod tests {
             importance: 0.82,
             sensitivity: pioneer_protocol::MemorySensitivity::Personal,
             provenance: pioneer_protocol::MemoryProvenance {
-                source_kind: MemorySourceKind::ExplicitUserRequest,
                 source_thread_id: Some("thread-1".to_owned()),
                 source_turn_id: Some("turn-1".to_owned()),
                 source_item_id: Some("item-1".to_owned()),
@@ -1528,7 +1390,6 @@ mod tests {
             confidence: 0.74,
             reason: "candidate_policy".to_owned(),
             provenance: pioneer_protocol::MemoryProvenance {
-                source_kind: MemorySourceKind::BackgroundExtractor,
                 source_thread_id: Some("thread-2".to_owned()),
                 source_turn_id: Some("turn-2".to_owned()),
                 source_item_id: None,

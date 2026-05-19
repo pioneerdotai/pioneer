@@ -16,7 +16,7 @@ use pioneer_protocol::{
     MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
     MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryScope, MemoryScopeKind,
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
-    MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemorySensitivity, MemorySourceContextKind, MemoryStatus,
 };
 use pioneer_provider::{ChatMessage, ChatRequest, Provider, StreamChunk};
 use pioneer_tools::{
@@ -653,11 +653,11 @@ impl MemoryToolHandler {
             .or_else(|| Some(stable_memory_key(input.category, content.as_str())));
         let actor = assistant_actor(&self.context);
         let context = self.operation_context(Some(actor.clone()))?;
+        let source_context_kind = input
+            .source_context
+            .unwrap_or(MemoryToolSourceContext::DirectUserConversation)
+            .source_context_kind();
         let provenance = MemoryProvenance {
-            source_kind: input
-                .source
-                .unwrap_or(MemoryToolSource::ExplicitUserRequest)
-                .source_kind(),
             source_thread_id: Some(self.context.thread_id.clone()),
             source_turn_id: Some(self.context.turn_id.clone()),
             source_item_id: None,
@@ -680,6 +680,7 @@ impl MemoryToolHandler {
                     confidence: input.confidence,
                     importance: input.importance,
                     provenance: Some(provenance),
+                    source_context_kind: Some(source_context_kind),
                     idempotency_key,
                     supersedes: None,
                     metadata: BTreeMap::new(),
@@ -881,8 +882,8 @@ struct MemoryRememberToolInput {
     confidence: Option<f32>,
     #[serde(default)]
     importance: Option<f32>,
-    #[serde(default)]
-    source: Option<MemoryToolSource>,
+    #[serde(default, rename = "source_context", alias = "sourceContext")]
+    source_context: Option<MemoryToolSourceContext>,
     #[serde(default, rename = "idempotency_key")]
     _idempotency_key: Option<String>,
 }
@@ -906,16 +907,16 @@ struct MemoryForgetToolInput {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum MemoryToolSource {
-    ExplicitUserRequest,
-    AgentInferred,
+enum MemoryToolSourceContext {
+    DirectUserConversation,
+    AssistantResponse,
 }
 
-impl MemoryToolSource {
-    fn source_kind(self) -> MemorySourceKind {
+impl MemoryToolSourceContext {
+    fn source_context_kind(self) -> MemorySourceContextKind {
         match self {
-            Self::ExplicitUserRequest => MemorySourceKind::ExplicitUserRequest,
-            Self::AgentInferred => MemorySourceKind::AssistantInference,
+            Self::DirectUserConversation => MemorySourceContextKind::DirectUserConversation,
+            Self::AssistantResponse => MemorySourceContextKind::AssistantResponse,
         }
     }
 }
@@ -1025,7 +1026,7 @@ fn memory_remember_schema() -> JsonValue {
             "sensitivity": { "type": "string", "enum": sensitivity_values() },
             "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
             "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-            "source": { "type": "string", "enum": ["explicit_user_request", "agent_inferred"] },
+            "source_context": { "type": "string", "enum": ["direct_user_conversation", "assistant_response"] },
             "idempotency_key": { "type": "string" }
         },
         "required": ["content", "category"],
@@ -1175,6 +1176,10 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
     object.insert("score".to_owned(), to_json_value(&hit.score));
     object.insert("matchedTerms".to_owned(), to_json_value(&hit.matched_terms));
     object.insert("updatedAt".to_owned(), JsonValue::from(record.updated_at));
+    object.insert(
+        "sourceContextKind".to_owned(),
+        to_json_value(&record.source_context_kind),
+    );
     if include_provenance {
         object.insert("provenance".to_owned(), to_json_value(&record.provenance));
     }
@@ -1219,6 +1224,10 @@ fn record_output(
     object.insert("sensitivity".to_owned(), to_json_value(&record.sensitivity));
     object.insert("createdAt".to_owned(), JsonValue::from(record.created_at));
     object.insert("updatedAt".to_owned(), JsonValue::from(record.updated_at));
+    object.insert(
+        "sourceContextKind".to_owned(),
+        to_json_value(&record.source_context_kind),
+    );
     if include_provenance {
         object.insert("provenance".to_owned(), to_json_value(&record.provenance));
     }

@@ -88,8 +88,16 @@ pub(super) async fn resolve_active_memory_decision(
     policy: &MemoryTurnPolicy,
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
+    episodic_capabilities: MemoryEpisodicRecallCapabilities,
 ) -> ActiveMemoryDecision {
-    let planner_input = active_recall_planner_input(context, input, policy, config, deterministic);
+    let planner_input = active_recall_planner_input(
+        context,
+        input,
+        policy,
+        config,
+        deterministic,
+        episodic_capabilities,
+    );
     let local_plan = local_active_memory_decision(&planner_input, "");
     if matches!(
         local_plan.reason_code,
@@ -124,6 +132,7 @@ pub(super) async fn resolve_active_memory_decision(
             input_text_char_count: planner_input.input_text_char_count,
             available_modes: active_recall_available_mode_names(&planner_input),
             available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
+            episodic_capabilities: planner_input.episodic_capabilities.clone(),
             max_queries: config.max_queries,
             top_k_per_query: config.top_k_per_query,
             max_prompt_chars: config.max_prompt_chars,

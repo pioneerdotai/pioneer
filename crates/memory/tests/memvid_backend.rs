@@ -7,7 +7,7 @@ use pioneer_memory::{
     memvid_search_request,
 };
 use pioneer_protocol::{
-    MemoryCategory, MemoryScope, MemoryScopeKind, MemorySensitivity, MemorySourceKind, MemoryStatus,
+    MemoryCategory, MemoryScope, MemoryScopeKind, MemorySensitivity, MemoryStatus,
 };
 use sea_orm::Database;
 use std::path::PathBuf;
@@ -61,7 +61,6 @@ fn put_request(memory_id: &str, scope: MemoryScope, key: &str, content: &str) ->
         content: content.to_owned(),
         sensitivity: MemorySensitivity::Normal,
         metadata_json: None,
-        source_kind: MemorySourceKind::ExplicitUserRequest,
         source_thread_id: Some("thread_backend".to_owned()),
         source_turn_id: Some("turn_backend".to_owned()),
         source_item_id: Some("item_backend".to_owned()),
@@ -207,13 +206,7 @@ async fn put_get_reopen_and_update_by_uri() {
             frame.extra_metadata.get("pioneer.key").map(String::as_str),
             Some("user.birthday")
         );
-        assert_eq!(
-            frame
-                .extra_metadata
-                .get("pioneer.source_kind")
-                .map(String::as_str),
-            Some("explicit_user_request")
-        );
+        assert!(!frame.extra_metadata.contains_key("pioneer.source_kind"));
     }
 
     let loaded = harness

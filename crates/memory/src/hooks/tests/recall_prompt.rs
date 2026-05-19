@@ -111,6 +111,7 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             ..MemoryActiveRecallConfig::default()
@@ -180,6 +181,7 @@ async fn active_memory_hook_runs_for_memory_sensitive_turns() {
         let hook = ActiveMemoryRecallHook {
             memory_provider: provider.clone(),
             decision_provider: None,
+            episodic_provider: None,
             config: MemoryActiveRecallConfig {
                 max_queries: 1,
                 ..MemoryActiveRecallConfig::default()
@@ -220,6 +222,7 @@ async fn active_memory_hook_uses_valid_strict_json_plan() {
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
             r#"{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["provider ok"]}"#,
         ))),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             ..MemoryActiveRecallConfig::default()
@@ -273,6 +276,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
 
@@ -301,6 +305,7 @@ async fn active_memory_hook_respects_policy_and_config_skips() {
     let deterministic_only = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::DeterministicOnly,
             ..MemoryActiveRecallConfig::default()
@@ -326,6 +331,7 @@ async fn active_memory_hook_uses_mode_native_recall_for_short_turns() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             ..MemoryActiveRecallConfig::default()
@@ -362,6 +368,7 @@ async fn active_memory_hook_empty_provider_response_falls_back_to_deterministic_
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(""))),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             ..MemoryActiveRecallConfig::default()
@@ -400,6 +407,7 @@ async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
     let deterministic_context = prompt_context_set_from_prompt_context_contribution(
@@ -431,6 +439,7 @@ async fn active_memory_hook_does_not_call_provider_when_deterministic_is_suffici
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
     let deterministic_context = prompt_context_set_from_prompt_context_contribution(
@@ -462,6 +471,7 @@ async fn active_memory_hook_does_not_call_disabled_planner_provider() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(PanickingActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             planner: MemoryActiveRecallPlannerConfig {
                 enabled: false,
@@ -498,6 +508,7 @@ async fn active_memory_hook_deduplicates_deterministic_ids() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::StrictDebug,
             max_queries: 1,
@@ -523,7 +534,10 @@ async fn active_memory_hook_deduplicates_deterministic_ids() {
     assert_no_prompt_context_contributions(&response);
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.no_hits"
-            && diagnostic.message.as_str().contains("non-duplicate")
+            && diagnostic
+                .message
+                .as_str()
+                .contains("no prompt context after synthesis")
     }));
 }
 
@@ -537,6 +551,7 @@ async fn active_memory_hook_ignores_malformed_internal_json() {
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
             "{not json",
         ))),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
 
@@ -572,6 +587,7 @@ async fn active_memory_hook_provider_error_falls_back_to_deterministic_plan() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(TestFailingActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             ..MemoryActiveRecallConfig::default()
@@ -616,6 +632,7 @@ async fn active_memory_hook_provider_timeout_falls_back_to_deterministic_plan() 
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: Some(Arc::new(TestSlowActiveMemoryDecisionProvider)),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             max_queries: 1,
             planner: MemoryActiveRecallPlannerConfig {
@@ -671,6 +688,8 @@ async fn active_recall_executor_runs_mode_native_requests_and_deduplicates() {
                 max_queries: 2,
                 ..MemoryActiveRecallConfig::default()
             },
+            episodic_provider: None,
+            episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         },
     )
     .await;
@@ -711,6 +730,8 @@ async fn active_recall_executor_skips_missing_structured_modes() {
             ),
             deterministic: DeterministicRecallContextSummary::default(),
             config: MemoryActiveRecallConfig::default(),
+            episodic_provider: None,
+            episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         },
     )
     .await;
@@ -734,6 +755,7 @@ async fn active_memory_hook_keeps_broad_query_recall_in_debug_fallback_only() {
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::StrictDebug,
             max_queries: 2,
@@ -922,8 +944,14 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
         .expect("memory turn context builds");
     let deterministic = deterministic_recall_context_summary(&request.prompt_context_set, &config);
 
-    let planner_input =
-        active_recall_planner_input(&context, input, &policy, &config, &deterministic);
+    let planner_input = active_recall_planner_input(
+        &context,
+        input,
+        &policy,
+        &config,
+        &deterministic,
+        MemoryEpisodicRecallCapabilities::default(),
+    );
 
     assert_eq!(planner_input.workspace_id, "ws");
     assert_eq!(planner_input.thread_id, "thr");
@@ -971,6 +999,7 @@ fn active_recall_decision_request_renders_sanitized_planner_prompt() {
         input_text_char_count: 21,
         available_modes: vec!["profile".to_owned(), "project".to_owned()],
         available_scoped_contexts: vec!["workspace".to_owned(), "thread".to_owned()],
+        episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         max_queries: 3,
         top_k_per_query: 5,
         max_prompt_chars: 1_500,
@@ -1037,9 +1066,13 @@ fn deterministic_active_recall_plan_uses_only_structural_context() {
     assert_eq!(english.modes, russian.modes);
 
     input.has_task_context = true;
+    input.episodic_capabilities.current_task_context = true;
     let task_plan = deterministic_active_recall_plan(&input);
     assert_eq!(task_plan.status, ActiveMemoryDecisionStatus::Run);
-    assert_eq!(task_plan.modes, vec![ActiveRecallMode::TaskContext]);
+    assert_eq!(
+        task_plan.modes,
+        vec![ActiveRecallMode::CurrentTask, ActiveRecallMode::TaskContext]
+    );
 
     input.typed_targets = vec![ActiveRecallTarget::exact_canonical(
         "user/global:identity:self:name",
@@ -1442,5 +1475,6 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         typed_targets: Vec::new(),
         has_workspace_context: true,
         has_task_context: false,
+        episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
     }
 }

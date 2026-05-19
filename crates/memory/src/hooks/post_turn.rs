@@ -543,15 +543,7 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
             ))
         });
 
-    let source_kind = if fact.semantic.intent == MemoryIntent::ExplicitStore
-        || fact.semantic.explicitness == MemoryExplicitness::Explicit
-    {
-        MemorySourceKind::ExplicitUserRequest
-    } else {
-        MemorySourceKind::BackgroundExtractor
-    };
     let provenance = MemoryProvenance {
-        source_kind,
         source_thread_id: Some(context.thread_id.clone()),
         source_turn_id: Some(context.turn_id.clone()),
         source_item_id: None,

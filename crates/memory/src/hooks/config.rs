@@ -187,15 +187,30 @@ impl MemoryPostTurnExtractorConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryLoopConfig {
+    pub deterministic_recall_enabled: bool,
+    pub tools_enabled: bool,
     pub active_recall: MemoryActiveRecallConfig,
     pub post_turn_extractor: MemoryPostTurnExtractorConfig,
+}
+
+impl Default for MemoryLoopConfig {
+    fn default() -> Self {
+        Self {
+            deterministic_recall_enabled: true,
+            tools_enabled: true,
+            active_recall: MemoryActiveRecallConfig::default(),
+            post_turn_extractor: MemoryPostTurnExtractorConfig::default(),
+        }
+    }
 }
 
 impl MemoryLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
+            deterministic_recall_enabled: self.deterministic_recall_enabled,
+            tools_enabled: self.tools_enabled,
             active_recall: self.active_recall.normalized(),
             post_turn_extractor: self.post_turn_extractor.normalized(),
         }

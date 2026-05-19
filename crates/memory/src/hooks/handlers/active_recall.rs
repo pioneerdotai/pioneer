@@ -3,6 +3,7 @@ use super::*;
 pub(in crate::hooks) struct ActiveMemoryRecallHook {
     pub(in crate::hooks) memory_provider: Arc<dyn AgentMemoryProvider>,
     pub(in crate::hooks) decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    pub(in crate::hooks) episodic_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     pub(in crate::hooks) config: MemoryActiveRecallConfig,
 }
 
@@ -46,6 +47,8 @@ impl HookHandler for ActiveMemoryRecallHook {
         let deterministic =
             deterministic_recall_context_summary(&request.prompt_context_set, &config);
         let context = memory_turn_context_from_prompt_context_request(&request, input)?;
+        let episodic_capabilities =
+            resolve_episodic_recall_capabilities(self.episodic_provider.as_ref(), &context).await;
         let mut response = HookHandlerResponse::default();
         let decision = resolve_active_memory_decision(
             self.decision_provider.as_ref(),
@@ -54,6 +57,7 @@ impl HookHandler for ActiveMemoryRecallHook {
             &policy,
             &config,
             &deterministic,
+            episodic_capabilities.clone(),
         )
         .await;
         response.diagnostics.extend(hook_diagnostics_from_strings(
@@ -93,6 +97,8 @@ impl HookHandler for ActiveMemoryRecallHook {
                 plan: decision.clone(),
                 deterministic: deterministic.clone(),
                 config: config.clone(),
+                episodic_provider: self.episodic_provider.clone(),
+                episodic_capabilities,
             },
         )
         .await;
@@ -150,70 +156,70 @@ impl HookHandler for ActiveMemoryRecallHook {
                 &deterministic,
                 &active_dedup,
             ));
-        if active_dedup.items.is_empty() {
-            response.diagnostics.push(memory_safe_info_diagnostic(
-                "memory.active_recall.no_hits",
-                "memory active recall returned no non-duplicate memory context",
-            ));
+
+        let mut contributed = false;
+        let mut active_synthesis = None;
+        if !active_dedup.items.is_empty() {
+            let synthesis_result = memory_active_recall_prompt_context_contribution_with_synthesis(
+                active_dedup.items.clone(),
+                execution.truncated,
+                deterministic.memory_ids.clone(),
+                deterministic.rendered_line_fingerprints.clone(),
+                &config,
+            );
             response
-                .contributions
-                .push(active_recall_debug_audit_contribution(
-                    &decision,
-                    &deterministic,
-                    &execution,
-                    Some(&active_dedup),
-                    None,
+                .diagnostics
+                .push(memory_recall_synthesis_observability_diagnostic(
+                    &synthesis_result.synthesis,
                 ));
-            return Ok(response);
+            response.diagnostics.extend(hook_diagnostics_from_strings(
+                synthesis_result.synthesis.diagnostics.as_slice(),
+            ));
+            if let Some(contribution) = synthesis_result.contribution {
+                contributed = true;
+                response.diagnostics.push(memory_safe_info_diagnostic(
+                    "memory.active_recall.context_contributed",
+                    "memory active recall contributed durable prompt context",
+                ));
+                response
+                    .contributions
+                    .push(HookContribution::PromptContext(contribution));
+            }
+            active_synthesis = Some(synthesis_result.synthesis);
         }
 
-        let synthesis_result = memory_active_recall_prompt_context_contribution_with_synthesis(
-            active_dedup.items.clone(),
+        let episodic_contributions = memory_episodic_recall_prompt_context_contributions(
+            execution.episodic_items.clone(),
             execution.truncated,
-            deterministic.memory_ids.clone(),
-            deterministic.rendered_line_fingerprints.clone(),
             &config,
         );
-        response
-            .diagnostics
-            .push(memory_recall_synthesis_observability_diagnostic(
-                &synthesis_result.synthesis,
-            ));
-        response.diagnostics.extend(hook_diagnostics_from_strings(
-            synthesis_result.synthesis.diagnostics.as_slice(),
-        ));
-        if let Some(contribution) = synthesis_result.contribution {
+        if !episodic_contributions.is_empty() {
+            contributed = true;
             response.diagnostics.push(memory_safe_info_diagnostic(
-                "memory.active_recall.context_contributed",
-                "memory active recall contributed prompt context",
+                "memory.episodic_recall.context_contributed",
+                "memory episodic recall contributed prompt context",
             ));
-            response
-                .contributions
-                .push(active_recall_debug_audit_contribution(
-                    &decision,
-                    &deterministic,
-                    &execution,
-                    Some(&active_dedup),
-                    Some(&synthesis_result.synthesis),
-                ));
-            response
-                .contributions
-                .push(HookContribution::PromptContext(contribution));
-        } else {
+            for contribution in episodic_contributions {
+                response
+                    .contributions
+                    .push(HookContribution::PromptContext(contribution));
+            }
+        }
+        if !contributed {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.active_recall.no_hits",
-                "memory active recall synthesis returned no prompt context",
+                "memory active recall returned no prompt context after synthesis",
             ));
-            response
-                .contributions
-                .push(active_recall_debug_audit_contribution(
-                    &decision,
-                    &deterministic,
-                    &execution,
-                    Some(&active_dedup),
-                    Some(&synthesis_result.synthesis),
-                ));
         }
+        response
+            .contributions
+            .push(active_recall_debug_audit_contribution(
+                &decision,
+                &deterministic,
+                &execution,
+                Some(&active_dedup),
+                active_synthesis.as_ref(),
+            ));
         Ok(response)
     }
 }

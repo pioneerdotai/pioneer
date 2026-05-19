@@ -39,7 +39,7 @@ use pioneer_protocol::{
     MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
     MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
     MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, MemorySourceKind, PromptManifest,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
     PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
     PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
     PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
@@ -12433,6 +12433,7 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
                 capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
+                ..GatewayMemoryConfig::default()
             },
         )
         .expect("memory runtime should initialize"),
@@ -12499,6 +12500,7 @@ async fn setup_memory_agent_e2e_harness(
                 capsules_dir: "memory/capsules".to_owned(),
                 allow_global_user_by_default: true,
                 allow_global_agent_by_default: false,
+                ..GatewayMemoryConfig::default()
             },
         )
         .expect("memory runtime should initialize"),
@@ -12568,6 +12570,7 @@ fn memory_remember_params(
         confidence: Some(0.9),
         importance: Some(0.7),
         provenance: None,
+        source_context_kind: None,
         idempotency_key: None,
         supersedes: None,
         metadata: Default::default(),
@@ -13539,7 +13542,7 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
             "category": "preference",
             "scope": "user",
             "key": "phase09_remember_preference",
-            "source": "explicit_user_request"
+            "source_context": "direct_user_conversation"
         }),
     )
     .await;
@@ -13916,7 +13919,6 @@ async fn memory_candidates_list_and_decide_use_service_boundary() {
                     candidate_text: format!("phase06 candidate text {candidate_id_suffix}"),
                     confidence: 0.82,
                     reason: "test candidate".to_owned(),
-                    source_kind: MemorySourceKind::ExplicitUserRequest,
                     source_context_kind: None,
                     source_thread_id: None,
                     source_turn_id: None,

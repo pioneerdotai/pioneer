@@ -37,7 +37,6 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub frame_uri: Option<String>,
     pub frame_version: i64,
-    pub source_kind: String,
     pub source_context_kind: Option<String>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,

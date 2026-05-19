@@ -420,8 +420,7 @@ fn clamp_unit(value: f32) -> f32 {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        MemoryProvenance, MemoryScope, MemoryScopeKind, MemorySensitivity, MemorySourceKind,
-        MemoryStatus,
+        MemoryProvenance, MemoryScope, MemoryScopeKind, MemorySensitivity, MemoryStatus,
     };
     use std::collections::BTreeMap;
 
@@ -460,7 +459,6 @@ mod tests {
                 importance: 0.6,
                 sensitivity: MemorySensitivity::Normal,
                 provenance: MemoryProvenance {
-                    source_kind: MemorySourceKind::ExplicitUserRequest,
                     source_thread_id: None,
                     source_turn_id: None,
                     source_item_id: None,

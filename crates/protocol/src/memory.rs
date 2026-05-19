@@ -56,18 +56,6 @@ pub enum MemorySensitivity {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemorySourceKind {
-    ExplicitUserRequest,
-    UserCorrection,
-    AssistantInference,
-    BackgroundExtractor,
-    ToolObservation,
-    Import,
-    System,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum MemorySourceContextKind {
     DirectUserConversation,
     AssistantResponse,
@@ -300,7 +288,6 @@ pub struct MemoryActor {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct MemoryProvenance {
-    pub source_kind: MemorySourceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,6 +652,8 @@ pub struct MemoryRememberParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<MemoryProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context_kind: Option<MemorySourceContextKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
@@ -796,7 +785,6 @@ pub struct MemoryCandidatePolicyInput {
     pub has_rejected_duplicate: bool,
     pub sensitivity: MemorySensitivity,
     pub active_no_memory_policy: bool,
-    pub source_kind: MemorySourceKind,
     #[serde(default = "default_memory_quality_action")]
     pub quality_action: MemoryQualityAction,
     #[serde(default = "default_memory_quality_target_ownership")]
@@ -1097,6 +1085,7 @@ mod tests {
             confidence: None,
             importance: None,
             provenance: None,
+            source_context_kind: None,
             idempotency_key: None,
             supersedes: None,
             metadata: BTreeMap::new(),

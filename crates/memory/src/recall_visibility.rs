@@ -228,7 +228,6 @@ pub(crate) fn memory_recall_quality_signals_for_row(
         importance: checked_f32(row.importance),
         sensitivity: row.sensitivity,
         provenance: MemoryProvenance {
-            source_kind: row.source_kind,
             source_thread_id: row.source_thread_id.clone(),
             source_turn_id: row.source_turn_id.clone(),
             source_item_id: row.source_item_id.clone(),

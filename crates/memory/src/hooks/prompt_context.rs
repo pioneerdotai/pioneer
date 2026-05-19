@@ -25,6 +25,8 @@ pub(super) fn memory_tool_names_from_prompt_compile_input(
 pub(super) struct MemoryRecallPromptContext {
     pub(super) deterministic_content: Option<String>,
     pub(super) active_content: Option<String>,
+    pub(super) thread_content: Option<String>,
+    pub(super) task_content: Option<String>,
     pub(super) count: usize,
     pub(super) deterministic_count: usize,
     pub(super) deterministic_memory_count: usize,
@@ -59,6 +61,8 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
     let mut context = MemoryRecallPromptContext::default();
     let mut deterministic_content = String::new();
     let mut active_content = String::new();
+    let mut thread_content = String::new();
+    let mut task_content = String::new();
     let mut deterministic_ids = BTreeSet::new();
     let mut seen_line_fingerprints = BTreeSet::new();
     let mut active_ids = BTreeSet::new();
@@ -121,6 +125,16 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
                     context.active_synthesis_rendered |= parsed_id.is_none();
                 }
             }
+            MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID => {
+                append_prompt_context_entry(&mut thread_content, entry.content.as_str());
+                context.count += 1;
+                context.truncated |= entry.truncated;
+            }
+            MEMORY_TASK_CONTEXT_CONTRIBUTION_ID => {
+                append_prompt_context_entry(&mut task_content, entry.content.as_str());
+                context.count += 1;
+                context.truncated |= entry.truncated;
+            }
             _ => {}
         }
     }
@@ -134,7 +148,28 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
     } else {
         Some(active_content)
     };
+    context.thread_content = if thread_content.trim().is_empty() {
+        None
+    } else {
+        Some(thread_content)
+    };
+    context.task_content = if task_content.trim().is_empty() {
+        None
+    } else {
+        Some(task_content)
+    };
     context
+}
+
+fn append_prompt_context_entry(output: &mut String, content: &str) {
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(content);
 }
 
 pub(super) fn render_memory_manifest(manifest: &MemoryManifest) -> String {
@@ -193,6 +228,8 @@ pub(crate) fn memory_recall_prompt_input(
             .collect(),
         recalled_context: None,
         active_context: None,
+        thread_context: None,
+        task_context: None,
         truncated: recall_snapshot.truncated,
     }
 }
@@ -215,6 +252,18 @@ pub(super) fn memory_recall_prompt_section_contribution_from_context(
             }),
         active_context: recall_context
             .active_content
+            .as_deref()
+            .and_then(|content| {
+                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+            }),
+        thread_context: recall_context
+            .thread_content
+            .as_deref()
+            .and_then(|content| {
+                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+            }),
+        task_context: recall_context
+            .task_content
             .as_deref()
             .and_then(|content| {
                 MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)

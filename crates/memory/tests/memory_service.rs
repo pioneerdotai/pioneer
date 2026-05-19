@@ -148,6 +148,7 @@ fn remember_params(scope: MemoryScope, key: Option<&str>, content: &str) -> Memo
         confidence: None,
         importance: None,
         provenance: None,
+        source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         idempotency_key: None,
         supersedes: None,
         metadata: BTreeMap::new(),
@@ -386,7 +387,7 @@ fn semantic_write_params(
         value: Some(value.to_owned()),
         evidence: Some(semantic_evidence(turn_id)),
         provenance: None,
-        source_context_kind: None,
+        source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         disposition: Some(disposition),
         client_provided_key: None,
         confidence: Some(0.95),
@@ -3679,7 +3680,7 @@ async fn recall_mode_for_prompt_exact_canonical_uses_key_lookup_without_search()
 }
 
 #[tokio::test]
-async fn recall_mode_for_prompt_thread_and_task_context_are_scope_bound() {
+async fn recall_mode_for_prompt_thread_and_task_context_require_native_provider() {
     let (_store, _backend, service) = setup_service().await;
     let thread = service
         .recall_mode_for_prompt(
@@ -3699,8 +3700,10 @@ async fn recall_mode_for_prompt_thread_and_task_context_are_scope_bound() {
         .expect("thread recall");
     assert_eq!(
         thread.skipped_reason.as_deref(),
-        Some("thread_episodic_scope_unavailable")
+        Some("thread_episodic_native_provider_required")
     );
+    assert!(thread.diagnostics.iter().any(|diagnostic| diagnostic
+        .contains("memory.active_recall.mode_native_provider_required:thread_episodic")));
 
     let task = service
         .recall_mode_for_prompt(
@@ -3720,8 +3723,10 @@ async fn recall_mode_for_prompt_thread_and_task_context_are_scope_bound() {
         .expect("task recall");
     assert_eq!(
         task.skipped_reason.as_deref(),
-        Some("task_context_scope_unavailable")
+        Some("task_context_native_provider_required")
     );
+    assert!(task.diagnostics.iter().any(|diagnostic| diagnostic
+        .contains("memory.active_recall.mode_native_provider_required:task_context")));
 
     let missing_task = service
         .recall_mode_for_prompt(
@@ -3737,7 +3742,7 @@ async fn recall_mode_for_prompt_thread_and_task_context_are_scope_bound() {
         .expect("missing task recall");
     assert_eq!(
         missing_task.skipped_reason.as_deref(),
-        Some("task_context_scope_unavailable")
+        Some("task_context_native_provider_required")
     );
 }
 
@@ -3981,7 +3986,6 @@ async fn stale_backend_payload_without_control_plane_row_creates_repair_diagnost
             content: "Backend-only stale memory.".to_owned(),
             sensitivity: MemorySensitivity::Normal,
             metadata_json: None,
-            source_kind: pioneer_protocol::MemorySourceKind::ExplicitUserRequest,
             source_thread_id: None,
             source_turn_id: None,
             source_item_id: None,

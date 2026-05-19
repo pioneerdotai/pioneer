@@ -55,8 +55,7 @@ pub use quality::{
     MemoryOntologyClassification, MemoryQualityAuditItemKind, MemoryQualityAuditRecord,
     MemoryQualityAuditStatus, MemorySourceContextClassification, MemorySourceContextInput,
     audit_memory_candidate_quality, audit_memory_record_quality, classify_memory_source_context,
-    classify_semantic_memory_fact, legacy_source_kind_for_source_context,
-    resolve_semantic_write_source_context,
+    classify_semantic_memory_fact, resolve_semantic_write_source_context,
 };
 pub use recall::{
     MemoryModeRecallParams, MemoryModeRecallResponse, MemoryRecallItem, MemoryRecallMode,

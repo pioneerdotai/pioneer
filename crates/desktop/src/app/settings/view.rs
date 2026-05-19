@@ -1,5 +1,8 @@
 use crate::{
-    app::root::{PioneerDesktop, SettingsContentView},
+    app::{
+        root::{PioneerDesktop, SettingsContentView},
+        settings::MemorySettingToggle,
+    },
     assets::PioneerIconName,
     components::buttonts::small_outline_button,
     settings::{self, AppLanguagePreference, WindowThemePreference},
@@ -13,6 +16,7 @@ use gpui_component::{
 };
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
+const MEMORY_TOGGLE_VALUES: [bool; 2] = [true, false];
 
 const LANGUAGE_OPTIONS: [AppLanguagePreference; 9] = [
     AppLanguagePreference::System,
@@ -36,6 +40,7 @@ impl PioneerDesktop {
     fn render_settings_general(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
+        let memory_settings = settings::memory_settings(cx);
         let desktop_entity = cx.entity().clone();
 
         v_flex()
@@ -72,6 +77,11 @@ impl PioneerDesktop {
                         ))
                         .child(Self::render_theme_setting(
                             selected_theme,
+                            desktop_entity.clone(),
+                            cx,
+                        ))
+                        .child(Self::render_memory_settings(
+                            memory_settings,
                             desktop_entity,
                             cx,
                         )),
@@ -165,6 +175,126 @@ impl PioneerDesktop {
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_memory_settings(
+        memory: settings::MemorySettings,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_4()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.memory.title").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.memory.description").to_string()),
+                    ),
+            )
+            .child(Self::render_memory_toggle_row(
+                "settings-memory-enabled",
+                MemorySettingToggle::Enabled,
+                memory.enabled,
+                t!("settings.memory.enabled.label").to_string(),
+                t!("settings.memory.enabled.description").to_string(),
+                desktop_entity.clone(),
+                cx,
+            ))
+            .child(Self::render_memory_toggle_row(
+                "settings-memory-active-recall",
+                MemorySettingToggle::ActiveRecall,
+                memory.active_recall_enabled,
+                t!("settings.memory.active_recall.label").to_string(),
+                t!("settings.memory.active_recall.description").to_string(),
+                desktop_entity.clone(),
+                cx,
+            ))
+            .child(Self::render_memory_toggle_row(
+                "settings-memory-proactive-writes",
+                MemorySettingToggle::ProactiveWrites,
+                memory.proactive_writes_enabled,
+                t!("settings.memory.proactive_writes.label").to_string(),
+                t!("settings.memory.proactive_writes.description").to_string(),
+                desktop_entity.clone(),
+                cx,
+            ))
+            .child(Self::render_memory_toggle_row(
+                "settings-memory-debug-trace",
+                MemorySettingToggle::DebugTrace,
+                memory.debug_trace_enabled,
+                t!("settings.memory.debug_trace.label").to_string(),
+                t!("settings.memory.debug_trace.description").to_string(),
+                desktop_entity,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_memory_toggle_row(
+        id: &'static str,
+        toggle: MemorySettingToggle,
+        selected: bool,
+        label: String,
+        description: String,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .justify_between()
+            .child(
+                v_flex()
+                    .child(div().text_sm().font_semibold().child(label))
+                    .child(div().text_xs().opacity(0.6).child(description)),
+            )
+            .child(
+                ButtonGroup::new(id)
+                    .children(MEMORY_TOGGLE_VALUES.into_iter().enumerate().map(
+                        |(index, value)| {
+                            small_outline_button((id, index))
+                                .selected(selected == value)
+                                .child(div().text_sm().child(Self::memory_toggle_label(value)))
+                        },
+                    ))
+                    .on_click(move |selected_indices, _window, cx| {
+                        let Some(index) = selected_indices.first().copied() else {
+                            return;
+                        };
+                        let Some(value) = MEMORY_TOGGLE_VALUES.get(index).copied() else {
+                            return;
+                        };
+
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_memory_setting(toggle, value, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn memory_toggle_label(enabled: bool) -> String {
+        if enabled {
+            t!("settings.toggle.on").to_string()
+        } else {
+            t!("settings.toggle.off").to_string()
+        }
     }
 
     fn render_theme_setting(

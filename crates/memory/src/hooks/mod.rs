@@ -52,7 +52,7 @@ use pioneer_protocol::{
     MemoryDurability, MemoryExplicitness, MemoryFactClass, MemoryIntent, MemoryProvenance,
     MemoryScope, MemoryScopeHint, MemoryScopeKind, MemorySemanticFields,
     MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
-    MemorySensitivityHint, MemorySourceContextKind, MemorySourceKind, MemoryStatus, MemorySubject,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
     MemoryWriteEvidence, MemoryWriteRelation, ThreadMode,
 };
 use pioneer_tools::ToolExtensionBundle;

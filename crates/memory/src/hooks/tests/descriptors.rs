@@ -128,6 +128,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
             MemoryRecallSnapshot::empty(),
         )),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
 
@@ -171,6 +172,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
         decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
             r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[]}"#,
         ))),
+        episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
     assert!(
@@ -192,6 +194,7 @@ fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
         Arc::new(TestRecallMemoryProvider::with_recall(
             MemoryRecallSnapshot::empty(),
         )),
+        None,
         None,
         None,
         None,
@@ -262,6 +265,45 @@ fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
     );
 }
 
+#[test]
+fn memory_hook_package_respects_product_feature_switches() {
+    let runtime = Arc::new(HookRuntime::new(
+        Arc::new(HookRegistry::new()),
+        Arc::new(HookSubscriptionRegistry::new()),
+    ));
+    install_memory_hook_package_for_test(
+        &runtime,
+        Arc::new(TestRecallMemoryProvider::with_recall(
+            MemoryRecallSnapshot::empty(),
+        )),
+        Some(Arc::new(TestMemoryWriteProvider::default())),
+        Some(Arc::new(TestPostTurnExtractorProvider::json(
+            r#"{"facts":[]}"#,
+        ))),
+        None,
+        None,
+        None,
+        Arc::new(TestToolBundleArtifactStore::new()),
+        MemoryLoopConfig {
+            deterministic_recall_enabled: false,
+            tools_enabled: false,
+            post_turn_extractor: MemoryPostTurnExtractorConfig {
+                enabled: false,
+                ..MemoryPostTurnExtractorConfig::default()
+            },
+            ..MemoryLoopConfig::default()
+        },
+    )
+    .expect("memory hooks install");
+
+    assert_subscription_registered(&runtime, MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID);
+    assert_subscription_registered(&runtime, MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID);
+    assert_subscription_missing(&runtime, MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID);
+    assert_subscription_missing(&runtime, MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID);
+    assert_subscription_missing(&runtime, MEMORY_TOOL_BUNDLE_SUBSCRIPTION_ID);
+    assert_subscription_missing(&runtime, MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID);
+}
+
 #[tokio::test]
 async fn active_memory_timeout_falls_back_without_prompt_context() {
     let runtime = Arc::new(HookRuntime::new(
@@ -271,6 +313,7 @@ async fn active_memory_timeout_falls_back_without_prompt_context() {
     let handler = Arc::new(ActiveMemoryRecallHook {
         memory_provider: Arc::new(SlowRecallMemoryProvider),
         decision_provider: None,
+        episodic_provider: None,
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::StrictDebug,
             max_queries: 1,
@@ -430,6 +473,7 @@ fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
         ))),
         None,
         None,
+        None,
         Arc::new(TestToolBundleArtifactStore::new()),
         MemoryLoopConfig::default(),
     )
@@ -457,4 +501,30 @@ fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
     assert!(handler.capabilities().contains(
         &HookCapability::new("idempotent_side_effect").expect("static capability is valid")
     ));
+}
+
+fn assert_subscription_registered(runtime: &HookRuntime, subscription_id: &str) {
+    let subscription_id =
+        HookSubscriptionId::new(subscription_id).expect("static subscription id is valid");
+    assert!(
+        runtime
+            .subscriptions()
+            .get_subscription(&subscription_id)
+            .expect("subscription lookup succeeds")
+            .is_some(),
+        "subscription `{subscription_id}` should be registered"
+    );
+}
+
+fn assert_subscription_missing(runtime: &HookRuntime, subscription_id: &str) {
+    let subscription_id =
+        HookSubscriptionId::new(subscription_id).expect("static subscription id is valid");
+    assert!(
+        runtime
+            .subscriptions()
+            .get_subscription(&subscription_id)
+            .expect("subscription lookup succeeds")
+            .is_none(),
+        "subscription `{subscription_id}` should not be registered"
+    );
 }

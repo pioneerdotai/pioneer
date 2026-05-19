@@ -615,7 +615,7 @@ mod tests {
                     "confidence": 0.8,
                     "reason": "explicit statement",
                     "provenance": {
-                        "source_kind": "explicit_user_request"
+                        "source_thread_id": "thread_1"
                     },
                     "status": "pending",
                     "created_at": 1700000000

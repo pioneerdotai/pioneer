@@ -4,7 +4,7 @@ use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass, MemoryFactClass,
     MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass,
     MemoryQualityAction, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind,
-    MemorySourceKind, MemoryStatus, MemoryWriteRelation, PromptManifestProfile,
+    MemoryStatus, MemoryWriteRelation, PromptManifestProfile,
     ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
     SandboxMode, TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode,
     TaskDeliveryStatus, TaskExecutorKind, TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus,
@@ -190,31 +190,6 @@ pub fn memory_sensitivity_from_db(value: &str) -> Result<MemorySensitivity> {
         "secret_like" => Ok(MemorySensitivity::SecretLike),
         "regulated" => Ok(MemorySensitivity::Regulated),
         _ => bail!("unknown memory sensitivity `{value}`"),
-    }
-}
-
-pub fn memory_source_kind_to_db(kind: MemorySourceKind) -> &'static str {
-    match kind {
-        MemorySourceKind::ExplicitUserRequest => "explicit_user_request",
-        MemorySourceKind::UserCorrection => "user_correction",
-        MemorySourceKind::AssistantInference => "assistant_inference",
-        MemorySourceKind::BackgroundExtractor => "background_extractor",
-        MemorySourceKind::ToolObservation => "tool_observation",
-        MemorySourceKind::Import => "import",
-        MemorySourceKind::System => "system",
-    }
-}
-
-pub fn memory_source_kind_from_db(value: &str) -> Result<MemorySourceKind> {
-    match value {
-        "explicit_user_request" => Ok(MemorySourceKind::ExplicitUserRequest),
-        "user_correction" => Ok(MemorySourceKind::UserCorrection),
-        "assistant_inference" => Ok(MemorySourceKind::AssistantInference),
-        "background_extractor" => Ok(MemorySourceKind::BackgroundExtractor),
-        "tool_observation" => Ok(MemorySourceKind::ToolObservation),
-        "import" => Ok(MemorySourceKind::Import),
-        "system" => Ok(MemorySourceKind::System),
-        _ => bail!("unknown memory source kind `{value}`"),
     }
 }
 

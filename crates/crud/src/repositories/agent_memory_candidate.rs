@@ -9,7 +9,7 @@ use sea_orm::{
 
 use crate::convention::{
     DB_ID_LEN, memory_candidate_status_to_db, memory_category_to_db, memory_scope_kind_to_db,
-    memory_source_context_kind_to_db, memory_source_kind_to_db,
+    memory_source_context_kind_to_db,
 };
 use crate::memory::{
     AgentMemoryCandidateDecisionRecord, AgentMemoryCandidateListFilter,
@@ -53,7 +53,6 @@ pub async fn insert_candidate<C: ConnectionTrait>(
         candidate_text: Set(candidate.candidate_text),
         confidence: Set(candidate.confidence),
         reason: Set(candidate.reason),
-        source_kind: Set(memory_source_kind_to_db(candidate.source_kind).to_owned()),
         source_context_kind: Set(candidate
             .source_context_kind
             .map(memory_source_context_kind_to_db)

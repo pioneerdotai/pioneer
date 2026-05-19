@@ -8,6 +8,7 @@ pub fn package(
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 ) -> MemoryHookPackage {
@@ -17,6 +18,7 @@ pub fn package(
         post_turn_extractor_provider,
         policy_provider,
         active_recall_decision_provider,
+        episodic_recall_provider,
         tool_bundle_artifacts,
         memory_config,
     }
@@ -28,6 +30,7 @@ pub struct MemoryHookPackage {
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
     active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
+    episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
 }
@@ -43,28 +46,35 @@ impl HookPackage for MemoryHookPackage {
         let post_turn_extractor_config = memory_config.post_turn_extractor.clone();
         let state = Arc::new(MemoryHookTurnStateStore::default());
 
-        Ok(vec![
-            memory_hook_definition(
-                Arc::new(MemoryPolicyClassifierHook {
-                    policy_provider: self.policy_provider.clone(),
-                    state: state.clone(),
-                }),
-                MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID,
-                HookPhase::TurnPrePolicy,
-                0,
-            ),
-            memory_hook_definition(
+        let mut definitions = vec![memory_hook_definition(
+            Arc::new(MemoryPolicyClassifierHook {
+                policy_provider: self.policy_provider.clone(),
+                state: state.clone(),
+            }),
+            MEMORY_POLICY_CLASSIFIER_SUBSCRIPTION_ID,
+            HookPhase::TurnPrePolicy,
+            0,
+        )];
+
+        if memory_config.deterministic_recall_enabled {
+            definitions.push(memory_hook_definition(
                 Arc::new(MemoryDeterministicRecallHook {
                     memory_provider: self.memory_provider.clone(),
                 }),
                 MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID,
                 HookPhase::TurnPrePromptContext,
                 0,
-            ),
-            memory_hook_definition_with_options(
+            ));
+        }
+
+        if memory_config.deterministic_recall_enabled
+            && active_recall_config.mode != MemoryActiveRecallMode::Disabled
+        {
+            definitions.push(memory_hook_definition_with_options(
                 Arc::new(ActiveMemoryRecallHook {
                     memory_provider: self.memory_provider.clone(),
                     decision_provider: self.active_recall_decision_provider.clone(),
+                    episodic_provider: self.episodic_recall_provider.clone(),
                     config: active_recall_config.clone(),
                 }),
                 MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID,
@@ -83,8 +93,11 @@ impl HookPackage for MemoryHookPackage {
                     [],
                 ),
                 HookSubscriptionVisibility::Internal,
-            ),
-            memory_hook_definition(
+            ));
+        }
+
+        if memory_config.tools_enabled {
+            definitions.push(memory_hook_definition(
                 Arc::new(MemoryToolBundleHook {
                     memory_provider: self.memory_provider.clone(),
                     state: state.clone(),
@@ -93,14 +106,18 @@ impl HookPackage for MemoryHookPackage {
                 MEMORY_TOOL_BUNDLE_SUBSCRIPTION_ID,
                 HookPhase::TurnPreToolMaterialization,
                 0,
-            ),
-            memory_hook_definition(
-                Arc::new(MemoryPromptContractHook),
-                MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID,
-                HookPhase::TurnPrePromptCompile,
-                0,
-            ),
-            memory_hook_definition_with_options_and_retry(
+            ));
+        }
+
+        definitions.push(memory_hook_definition(
+            Arc::new(MemoryPromptContractHook),
+            MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID,
+            HookPhase::TurnPrePromptCompile,
+            0,
+        ));
+
+        if post_turn_extractor_config.enabled {
+            definitions.push(memory_hook_definition_with_options_and_retry(
                 Arc::new(MemoryPostTurnExtractorHook {
                     write_provider: self.memory_write_provider.clone(),
                     extractor_provider: self.post_turn_extractor_provider.clone(),
@@ -122,8 +139,10 @@ impl HookPackage for MemoryHookPackage {
                     initial_delay_ms: Some(1_000),
                     idempotency_required: true,
                 },
-            ),
-        ])
+            ));
+        }
+
+        Ok(definitions)
     }
 }
 
