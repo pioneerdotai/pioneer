@@ -2144,7 +2144,7 @@ impl MessageProcessor {
             let loop_config =
                 crate::memory_loop_config_from_gateway_memory_settings(&memory_settings);
             self.apply_memory_loop_config(loop_config);
-            self.ensure_hook_runtime_with_run_store().await;
+            self.reinstall_memory_hook_runtime_if_bound().await;
         }
 
         Ok(snapshot)

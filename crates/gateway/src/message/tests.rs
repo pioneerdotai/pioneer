@@ -805,6 +805,146 @@ async fn phase_21_memory_bridge_installs_recoverable_hook_runtime() {
     assert!(post_turn_subscription.is_some());
 }
 
+#[tokio::test]
+async fn memory_settings_update_reinstalls_memory_hook_runtime() {
+    let mut harness = setup_memory_gateway_harness("settings_reinstall_memory_hooks", true).await;
+    harness.processor.bind_memory_bridge_if_enabled().await;
+
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(
+        &harness.processor,
+        "memory.post_turn_extractor.default",
+        true,
+    )
+    .await;
+
+    let disable_request_id = generate_test_request_id("settings", "disable_memory_hooks");
+    let disable_request = json!({
+        "jsonrpc": "2.0",
+        "id": disable_request_id,
+        "method": "settings/update",
+        "params": {
+            "update": {
+                "memory": {
+                    "enabled": true,
+                    "deterministic_recall_enabled": true,
+                    "active_recall_enabled": false,
+                    "tools_enabled": true,
+                    "proactive_writes_enabled": false,
+                    "background_extraction_enabled": true,
+                    "active_recall_model": {
+                        "source": "thread"
+                    },
+                    "proactive_writes_model": {
+                        "source": "thread"
+                    },
+                    "debug_trace_enabled": false,
+                    "strict_diagnostics_enabled": false
+                }
+            }
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &disable_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, disable_request_id.as_str()).await;
+
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", false)
+        .await;
+    assert_memory_hook_subscription(
+        &harness.processor,
+        "memory.post_turn_extractor.default",
+        false,
+    )
+    .await;
+
+    let enable_request_id = generate_test_request_id("settings", "enable_memory_hooks");
+    let enable_request = json!({
+        "jsonrpc": "2.0",
+        "id": enable_request_id,
+        "method": "settings/update",
+        "params": {
+            "update": {
+                "memory": {
+                    "enabled": true,
+                    "deterministic_recall_enabled": true,
+                    "active_recall_enabled": true,
+                    "tools_enabled": true,
+                    "proactive_writes_enabled": true,
+                    "background_extraction_enabled": true,
+                    "active_recall_model": {
+                        "source": "custom",
+                        "model_provider": "planner-provider",
+                        "model": "planner-model"
+                    },
+                    "proactive_writes_model": {
+                        "source": "custom",
+                        "model_provider": "extractor-provider",
+                        "model": "extractor-model"
+                    },
+                    "debug_trace_enabled": false,
+                    "strict_diagnostics_enabled": false
+                }
+            }
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &enable_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, enable_request_id.as_str()).await;
+
+    assert_memory_hook_subscription(&harness.processor, "memory.active_recall.default", true).await;
+    assert_memory_hook_subscription(
+        &harness.processor,
+        "memory.post_turn_extractor.default",
+        true,
+    )
+    .await;
+    let memory_config = harness.processor.memory_loop_config();
+    assert_eq!(
+        memory_config.active_recall.planner.provider_name.as_deref(),
+        Some("planner-provider")
+    );
+    assert_eq!(
+        memory_config.active_recall.planner.model.as_deref(),
+        Some("planner-model")
+    );
+    assert_eq!(
+        memory_config.post_turn_extractor.provider_name.as_deref(),
+        Some("extractor-provider")
+    );
+    assert_eq!(
+        memory_config.post_turn_extractor.model.as_deref(),
+        Some("extractor-model")
+    );
+}
+
+async fn assert_memory_hook_subscription(
+    processor: &MessageProcessor,
+    subscription_id: &str,
+    expected_present: bool,
+) {
+    let runtime = processor
+        .hook_runtime
+        .read()
+        .await
+        .clone()
+        .expect("memory hook runtime should be installed");
+    let subscription_id =
+        HookSubscriptionId::new(subscription_id).expect("test subscription id should be valid");
+    let found = runtime
+        .subscriptions()
+        .get_subscription(&subscription_id)
+        .expect("subscription lookup should succeed")
+        .is_some();
+    assert_eq!(
+        found, expected_present,
+        "unexpected presence for hook subscription `{subscription_id}`"
+    );
+}
+
 impl SequencedToolProvider {
     fn new(first_tool_calls: Vec<ProviderToolCall>, second_text: impl Into<String>) -> Self {
         Self {

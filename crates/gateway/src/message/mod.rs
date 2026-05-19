@@ -188,12 +188,19 @@ pub struct MessageProcessor {
     task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
     memory_runtime: Arc<GatewayMemoryRuntime>,
+    memory_bridge_providers: Arc<RwLock<Option<MemoryBridgeProviders>>>,
     hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
     artifact_runtime_home: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
+}
+
+#[derive(Clone)]
+struct MemoryBridgeProviders {
+    memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
+    memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
 
 impl MessageProcessor {
@@ -293,6 +300,7 @@ impl MessageProcessor {
             task_agent_executor,
             task_runtime,
             memory_runtime,
+            memory_bridge_providers: Arc::new(RwLock::new(None)),
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             artifact_runtime_home: runtime_home,
@@ -359,7 +367,6 @@ impl MessageProcessor {
     }
 
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
-        self.ensure_hook_runtime_with_run_store().await;
         let memory_provider = Arc::new(crate::memory_tools::GatewayMemoryProvider::new(
             Arc::downgrade(self),
         ));
@@ -383,18 +390,23 @@ impl MessageProcessor {
             .set_memory_active_recall_decision_provider(Some(memory_provider.clone()))
             .await;
 
-        let Some(runtime) = self.hook_runtime.read().await.clone() else {
-            warn!("failed to install memory hook package: hook runtime is not initialized");
-            return;
+        let bridge = MemoryBridgeProviders {
+            memory_provider,
+            memory_policy_provider,
         };
-        match GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), runtime.as_ref())
+        *self.memory_bridge_providers.write().await = Some(bridge.clone());
+        self.install_memory_hook_runtime(bridge).await;
+    }
+
+    async fn install_memory_hook_runtime(&self, bridge: MemoryBridgeProviders) {
+        match GatewayHookRuntimeBuilder::new(self.crud_store.clone())
             .with_crud_run_store()
             .install(pioneer_memory::hooks::package(
-                memory_provider.clone(),
-                Some(memory_provider.clone()),
-                Some(memory_provider.clone()),
-                Some(memory_policy_provider),
-                Some(memory_provider),
+                bridge.memory_provider.clone(),
+                Some(bridge.memory_provider.clone()),
+                Some(bridge.memory_provider.clone()),
+                Some(bridge.memory_policy_provider),
+                Some(bridge.memory_provider),
                 None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
@@ -411,6 +423,14 @@ impl MessageProcessor {
                 warn!(error = %error, "failed to install memory hook package");
             }
         }
+    }
+
+    pub(crate) async fn reinstall_memory_hook_runtime_if_bound(&self) {
+        let Some(bridge) = self.memory_bridge_providers.read().await.clone() else {
+            self.ensure_hook_runtime_with_run_store().await;
+            return;
+        };
+        self.install_memory_hook_runtime(bridge).await;
     }
 
     pub async fn bind_memory_bridge_if_enabled(self: &Arc<Self>) {
@@ -1276,6 +1296,7 @@ impl MessageProcessor {
             task_agent_executor,
             task_runtime,
             memory_runtime,
+            memory_bridge_providers: Arc::new(RwLock::new(None)),
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             artifact_runtime_home,
