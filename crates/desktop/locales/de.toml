@@ -552,8 +552,9 @@ label = "Farbschema"
 description = "Wählen Sie den bevorzugten Darstellungsmodus."
 
 [settings.option.keepawake]
-label = "Computer wach halten"
-description = "Verhindert Ruhezustand bei Inaktivität, solange das Gateway läuft. Der Bildschirm kann sich weiterhin ausschalten."
+label = "Ruhezustand bei Inaktivität verhindern"
+description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand wechselt, solange das Gateway läuft. Beim Zuklappen eines Laptops ist das nicht garantiert; dafür brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
+tooltip = "Verhindert nur den Ruhezustand bei Inaktivität. Für zugeklappte Laptops brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 
 [settings.memory]
 title = "Speicher"

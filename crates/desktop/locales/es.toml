@@ -552,8 +552,9 @@ label = "Tema de color"
 description = "Elige el modo de apariencia preferido."
 
 [settings.option.keepawake]
-label = "Mantener activo"
-description = "Evita la suspensión por inactividad mientras el gateway está en ejecución. La pantalla puede apagarse."
+label = "Evitar reposo por inactividad"
+description = "Evita que el equipo entre en reposo por inactividad mientras el gateway está en ejecución. No garantiza que siga funcionando al cerrar la tapa del portátil; para eso usa el modo clamshell o una máquina siempre encendida."
+tooltip = "Solo evita el reposo por inactividad. Con la tapa cerrada necesitas modo clamshell o una máquina siempre encendida."
 
 [settings.memory]
 title = "Memoria"

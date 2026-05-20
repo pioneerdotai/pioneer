@@ -552,8 +552,9 @@ label = "Thème de couleur"
 description = "Choisissez le mode d'apparence préféré."
 
 [settings.option.keepawake]
-label = "Garder l'ordinateur éveillé"
-description = "Empêche la veille due à l'inactivité tant que la gateway est en cours d'exécution. L'écran peut toujours s'éteindre."
+label = "Empêcher la veille d'inactivité"
+description = "Empêche l'ordinateur de passer en veille pour cause d'inactivité tant que la gateway est en cours d'exécution. Cela ne garantit pas le fonctionnement capot fermé ; pour ce cas, utilisez le mode clamshell ou une machine toujours en marche."
+tooltip = "Empêche seulement la veille d'inactivité. Capot fermé, utilisez le mode clamshell ou une machine toujours en marche."
 
 [settings.memory]
 title = "Mémoire"

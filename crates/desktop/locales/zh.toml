@@ -552,8 +552,9 @@ label = "颜色主题"
 description = "选择偏好的外观模式。"
 
 [settings.option.keepawake]
-label = "保持唤醒"
-description = "网关运行时防止系统因空闲而睡眠。显示器仍可关闭。"
+label = "防止空闲睡眠"
+description = "网关运行时，防止系统因空闲进入睡眠。合上笔记本电脑盖子时不保证继续运行；这种场景请使用闭盖模式，或把网关运行在常开机器上。"
+tooltip = "仅防止空闲睡眠。合盖运行需要闭盖模式或常开机器。"
 
 [settings.memory]
 title = "记忆"

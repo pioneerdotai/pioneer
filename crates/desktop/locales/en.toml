@@ -831,8 +831,9 @@ label = "Color theme"
 description = "Pick a preferred appearance mode."
 
 [settings.option.keepawake]
-label = "Keep awake"
-description = "Prevent idle sleep while the gateway is running. The display can still turn off."
+label = "Prevent idle sleep"
+description = "Prevents idle sleep while the gateway is running. Closing a laptop lid is not covered; use closed-display mode with power and an external display, or run the gateway on an always-on machine."
+tooltip = "Prevents idle sleep only. Closing a laptop lid requires closed-display mode or an always-on machine."
 
 [settings.memory]
 title = "Memory"

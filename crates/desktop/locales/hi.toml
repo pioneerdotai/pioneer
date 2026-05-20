@@ -552,8 +552,9 @@ label = "रंग थीम"
 description = "पसंदीदा रूप-रंग मोड चुनें।"
 
 [settings.option.keepawake]
-label = "जागृत रखें"
-description = "गेटवे चलने के दौरान निष्क्रियता से स्लीप रोकें। डिस्प्ले फिर भी बंद हो सकता है।"
+label = "Idle sleep रोकें"
+description = "जब gateway चल रहा हो, तो सिस्टम को idle sleep में जाने से रोकता है। Laptop lid बंद करने पर यह काम जारी रहने की गारंटी नहीं देता; ऐसे उपयोग के लिए clamshell mode या always-on machine चाहिए."
+tooltip = "सिर्फ idle sleep रोकता है। Lid बंद रखने के लिए clamshell mode या always-on machine चाहिए."
 
 [settings.memory]
 title = "मेमोरी"

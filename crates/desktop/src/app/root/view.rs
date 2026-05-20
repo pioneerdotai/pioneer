@@ -153,7 +153,7 @@ impl Render for PioneerDesktop {
                                                         .compact()
                                                         .disabled(!keepawake_available)
                                                         .tooltip(
-                                                            t!("settings.option.keepawake.description")
+                                                            t!("settings.option.keepawake.tooltip")
                                                                 .to_string(),
                                                         )
                                                         .child(
