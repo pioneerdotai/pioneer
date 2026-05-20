@@ -12,7 +12,10 @@ use gpui_component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
-use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate};
+use pioneer_protocol::{
+    GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
+    GatewayMemorySettings, GatewaySettingsUpdate,
+};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -24,9 +27,7 @@ impl PioneerDesktop {
         self.settings_content_view = content_view;
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
-        if content_view == SettingsContentView::Memory {
-            self.refresh_gateway_settings(cx);
-        }
+        self.refresh_gateway_settings(cx);
     }
 
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
@@ -99,6 +100,29 @@ impl PioneerDesktop {
         }
 
         self.apply_gateway_memory_settings(memory, cx);
+    }
+
+    pub(in crate::app) fn apply_keepawake_setting(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut snapshot) = self.gateway.settings.clone() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+
+        snapshot.general.keepawake = enabled;
+        self.apply_gateway_settings_update(
+            snapshot,
+            GatewaySettingsUpdate {
+                general: Some(GatewayGeneralSettingsUpdate {
+                    keepawake: Some(enabled),
+                }),
+                memory: None,
+            },
+            cx,
+        );
     }
 
     pub(super) fn apply_memory_model_setting(
@@ -190,18 +214,35 @@ impl PioneerDesktop {
         memory: GatewayMemorySettings,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            warn!("cannot update gateway memory settings without an active gateway connection");
-            return;
-        };
-        let connection_epoch = self.gateway.connection_epoch;
-
         let mut snapshot = self.gateway.settings.clone().unwrap_or_else(|| {
             pioneer_protocol::GatewaySettingsSnapshot {
+                general: GatewayGeneralSettings::default(),
                 memory: GatewayMemorySettings::default(),
             }
         });
         snapshot.memory = memory.clone();
+        self.apply_gateway_settings_update(
+            snapshot,
+            GatewaySettingsUpdate {
+                general: None,
+                memory: Some(memory),
+            },
+            cx,
+        );
+    }
+
+    fn apply_gateway_settings_update(
+        &mut self,
+        snapshot: pioneer_protocol::GatewaySettingsSnapshot,
+        update: GatewaySettingsUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            warn!("cannot update gateway settings without an active gateway connection");
+            return;
+        };
+        let connection_epoch = self.gateway.connection_epoch;
+
         self.gateway.settings = Some(snapshot);
         self.gateway.settings_error = None;
 
@@ -210,11 +251,7 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        ws_sender.gateway_settings_update(GatewaySettingsUpdate {
-                            memory: Some(memory),
-                        })
-                    })
+                    .background_spawn(async move { ws_sender.gateway_settings_update(update) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {

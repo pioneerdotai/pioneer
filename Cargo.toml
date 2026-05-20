@@ -98,6 +98,7 @@ chrono-tz = "0.10"
 enigo = "0.6.1"
 xcap = "0.9.4"
 tempfile = "3"
+keepawake = "0.6"
 
 # Agent memory capsule store
 memvid-core = { version = "2.0", default-features = false, features = ["lex", "temporal_track", "simd"] }

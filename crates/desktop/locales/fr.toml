@@ -551,6 +551,10 @@ description = "Choisissez la langue utilisée dans l'interface."
 label = "Thème de couleur"
 description = "Choisissez le mode d'apparence préféré."
 
+[settings.option.keepawake]
+label = "Garder l'ordinateur éveillé"
+description = "Empêche la veille due à l'inactivité tant que la gateway est en cours d'exécution. L'écran peut toujours s'éteindre."
+
 [settings.memory]
 title = "Mémoire"
 description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."

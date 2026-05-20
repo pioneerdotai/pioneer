@@ -551,6 +551,10 @@ description = "Elige el idioma usado en la interfaz."
 label = "Tema de color"
 description = "Elige el modo de apariencia preferido."
 
+[settings.option.keepawake]
+label = "Mantener activo"
+description = "Evita la suspensión por inactividad mientras el gateway está en ejecución. La pantalla puede apagarse."
+
 [settings.memory]
 title = "Memoria"
 description = "Controla cómo Pioneer usa la memoria duradera."

@@ -1,10 +1,9 @@
 use super::{MainContentView, PioneerDesktop};
-use crate::{settings::WindowThemePreference, window};
+use crate::{assets::PioneerIconName, settings::WindowThemePreference, window};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Icon, Sizable,
+    Disableable, Icon, Sizable,
     button::{Button, ButtonVariants},
-    divider::Divider,
     h_flex,
     resizable::{h_resizable, resizable_panel},
     theme::{ActiveTheme, Theme, ThemeMode},
@@ -30,6 +29,12 @@ impl Render for PioneerDesktop {
         let is_mcp_details_view_active = self.main_content_view == MainContentView::McpDetails;
         let is_skills_view_active = self.main_content_view == MainContentView::Skills;
         let is_skill_details_view_active = self.main_content_view == MainContentView::SkillDetails;
+        let keepawake_enabled = self
+            .gateway
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.general.keepawake);
+        let keepawake_available = !is_gateway_setup_required && self.gateway.settings.is_some();
 
         let body = if is_gateway_setup_required {
             self.render_initial_setup(cx)
@@ -118,51 +123,97 @@ impl Render for PioneerDesktop {
                                 .justify_between()
                                 .items_center()
                                 .bg(cx.theme().title_bar)
-                                .child(div())
                                 .child(
                                     h_flex()
                                         .h_full()
-                                        .gap_2()
                                         .items_center()
                                         .child(if !is_gateway_setup_required {
                                             self.render_gateways_popover(cx)
                                         } else {
                                             div().into_any_element()
                                         })
-                                        .child(if !is_gateway_setup_required {
-                                            Divider::vertical().mr_1().into_any_element()
-                                        } else {
-                                            div().into_any_element()
-                                        })
+                                )
+                                .child(
+                                    h_flex()
+                                        .h_full()
+                                        .gap_2()
+                                        .items_center()
+                                        // .child(if !is_gateway_setup_required {
+                                        //     Divider::vertical().mr_1().into_any_element()
+                                        // } else {
+                                        //     div().into_any_element()
+                                        // })
                                         .child(
-                                            Button::new("toggle-theme")
-                                                .ghost()
-                                                .small()
-                                                .compact()
+                                            h_flex()
+                                                .gap_1()
+                                                .child(if !is_gateway_setup_required {
+                                                    Button::new("toggle-keepawake")
+                                                        .ghost()
+                                                        .small()
+                                                        .compact()
+                                                        .disabled(!keepawake_available)
+                                                        .tooltip(
+                                                            t!("settings.option.keepawake.description")
+                                                                .to_string(),
+                                                        )
+                                                        .child(
+                                                            Icon::new(PioneerIconName::PowerOff)
+                                                                .size_3p5()
+                                                                .opacity(0.6)
+                                                                .when(keepawake_enabled, |this| {
+                                                                    this.opacity(1.0)
+                                                                        .text_color(cx.theme().blue)
+                                                                }),
+                                                        )
+                                                        .on_click(cx.listener(|view, _, _, cx| {
+                                                            let Some(settings) =
+                                                                view.gateway.settings.as_ref()
+                                                            else {
+                                                                view.refresh_gateway_settings(cx);
+                                                                cx.notify();
+                                                                return;
+                                                            };
+
+                                                            view.apply_keepawake_setting(
+                                                                !settings.general.keepawake,
+                                                                cx,
+                                                            );
+                                                            cx.notify();
+                                                        }))
+                                                        .into_any_element()
+                                                } else {
+                                                    div().into_any_element()
+                                                })
                                                 .child(
-                                                    Icon::new(theme_icon).size_3p5().opacity(0.6),
-                                                )
-                                                .on_click(cx.listener(|_, _, window, cx| {
-                                                    let (mode, theme_preference) =
-                                                        if cx.theme().mode.is_dark() {
-                                                            (
-                                                                ThemeMode::Light,
-                                                                WindowThemePreference::Light,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                ThemeMode::Dark,
-                                                                WindowThemePreference::Dark,
-                                                            )
-                                                        };
-                                                    Theme::change(mode, Some(window), cx);
-                                                    window::persist_theme_preference(
-                                                        window,
-                                                        theme_preference,
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
+                                                    Button::new("toggle-theme")
+                                                        .ghost()
+                                                        .small()
+                                                        .compact()
+                                                        .child(
+                                                            Icon::new(theme_icon).size_3p5().opacity(0.6),
+                                                        )
+                                                        .on_click(cx.listener(|_, _, window, cx| {
+                                                            let (mode, theme_preference) =
+                                                                if cx.theme().mode.is_dark() {
+                                                                    (
+                                                                        ThemeMode::Light,
+                                                                        WindowThemePreference::Light,
+                                                                    )
+                                                                } else {
+                                                                    (
+                                                                        ThemeMode::Dark,
+                                                                        WindowThemePreference::Dark,
+                                                                    )
+                                                                };
+                                                            Theme::change(mode, Some(window), cx);
+                                                            window::persist_theme_preference(
+                                                                window,
+                                                                theme_preference,
+                                                                cx,
+                                                            );
+                                                        })),
+                                                ),
+                                        )
                                 ),
                         ),
                     )

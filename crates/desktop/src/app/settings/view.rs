@@ -47,6 +47,16 @@ impl PioneerDesktop {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
         let desktop_entity = cx.entity().clone();
+        let keepawake_panel = match &self.gateway.settings {
+            Some(settings) => Self::render_keepawake_setting(
+                settings.general.keepawake,
+                desktop_entity.clone(),
+                cx,
+            ),
+            None => {
+                Self::render_gateway_settings_status(self.gateway_settings_status_message(), cx)
+            }
+        };
 
         v_flex()
             .id("settings-scroll")
@@ -84,37 +94,22 @@ impl PioneerDesktop {
                             selected_theme,
                             desktop_entity,
                             cx,
-                        )),
+                        ))
+                        .child(keepawake_panel),
                 ),
             )
             .into_any_element()
     }
 
     fn render_settings_memory(&self, cx: &mut Context<Self>) -> AnyElement {
-        let memory_settings = self
-            .gateway
-            .settings
-            .as_ref()
-            .map(|settings| settings.memory.clone());
-        let memory_settings_status = if memory_settings.is_none() {
-            Some(self.gateway.settings_error.clone().unwrap_or_else(|| {
-                if self.gateway.settings_loading {
-                    t!("settings.loading").to_string()
-                } else {
-                    t!("settings.unavailable").to_string()
-                }
-            }))
-        } else {
-            None
-        };
         let desktop_entity = cx.entity().clone();
-        let memory_settings_panel = if let Some(memory_settings) = memory_settings {
-            Self::render_memory_settings(memory_settings, desktop_entity, cx)
-        } else {
-            Self::render_memory_settings_status(
-                memory_settings_status.expect("missing memory settings should have status"),
-                cx,
-            )
+        let memory_settings_panel = match &self.gateway.settings {
+            Some(settings) => {
+                Self::render_memory_settings(settings.memory.clone(), desktop_entity, cx)
+            }
+            None => {
+                Self::render_gateway_settings_status(self.gateway_settings_status_message(), cx)
+            }
         };
 
         v_flex()
@@ -340,7 +335,7 @@ impl PioneerDesktop {
         settings.into_any_element()
     }
 
-    fn render_memory_settings_status(message: String, cx: &mut Context<Self>) -> AnyElement {
+    fn render_gateway_settings_status(message: String, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .w_full()
             .px_4()
@@ -350,6 +345,65 @@ impl PioneerDesktop {
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
             .child(div().text_xs().opacity(0.65).child(message))
+            .into_any_element()
+    }
+
+    fn gateway_settings_status_message(&self) -> String {
+        self.gateway.settings_error.clone().unwrap_or_else(|| {
+            if self.gateway.settings_loading {
+                t!("settings.loading").to_string()
+            } else {
+                t!("settings.unavailable").to_string()
+            }
+        })
+    }
+
+    fn render_keepawake_setting(
+        selected: bool,
+        desktop_entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_6()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .gap_6()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("settings.option.keepawake.label").to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(t!("settings.option.keepawake.description").to_string()),
+                            ),
+                    )
+                    .child(
+                        Switch::new("settings-keepawake")
+                            .checked(selected)
+                            .on_click(move |enabled, _, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.apply_keepawake_setting(*enabled, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
             .into_any_element()
     }
 

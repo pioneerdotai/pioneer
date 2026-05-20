@@ -12,7 +12,15 @@ pub struct GatewaySettingsGetResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub general: Option<GatewayGeneralSettingsUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<GatewayMemorySettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayGeneralSettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepawake: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -27,7 +35,15 @@ pub struct GatewaySettingsUpdateResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsSnapshot {
+    #[serde(default)]
+    pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayGeneralSettings {
+    #[serde(default)]
+    pub keepawake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

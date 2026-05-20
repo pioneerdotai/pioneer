@@ -2115,7 +2115,7 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
-        Ok(settings.snapshot(&config.gateway.memory))
+        Ok(settings.snapshot(&config.gateway))
     }
 
     async fn update_gateway_settings(
@@ -2134,10 +2134,29 @@ impl MessageProcessor {
             settings_file_name.as_str(),
         )?;
 
+        let previous_general_settings = settings.effective_general_settings(&config.gateway);
         let changes = settings.apply_protocol_update(update);
-        crate::settings::save_gateway_settings(settings_path.as_path(), &settings)?;
+        if let Some(keepawake) = changes.general.keepawake {
+            self.apply_keepawake_setting(keepawake)
+                .context("failed to apply keepawake setting")?;
+        }
+        if let Err(error) =
+            crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
+        {
+            if changes.general.keepawake.is_some() {
+                if let Err(rollback_error) =
+                    self.apply_keepawake_setting(previous_general_settings.keepawake)
+                {
+                    warn!(
+                        error = %format!("{rollback_error:#}"),
+                        "failed to roll back keepawake setting after settings save failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
 
-        let snapshot = settings.snapshot(&config.gateway.memory);
+        let snapshot = settings.snapshot(&config.gateway);
         if changes.memory {
             let memory_settings =
                 crate::settings::GatewayMemorySettings::from_protocol(snapshot.memory.clone());

@@ -551,6 +551,10 @@ description = "इंटरफ़ेस में उपयोग की जा�
 label = "रंग थीम"
 description = "पसंदीदा रूप-रंग मोड चुनें।"
 
+[settings.option.keepawake]
+label = "जागृत रखें"
+description = "गेटवे चलने के दौरान निष्क्रियता से स्लीप रोकें। डिस्प्ले फिर भी बंद हो सकता है।"
+
 [settings.memory]
 title = "मेमोरी"
 description = "Pioneer टिकाऊ मेमोरी का उपयोग कैसे करता है, इसे नियंत्रित करें."

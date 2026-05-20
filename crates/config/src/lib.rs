@@ -39,6 +39,8 @@ pub struct GatewayConfig {
     pub legacy_service_names: Vec<String>,
     pub listen_addr: String,
     pub outbound_queue_capacity: usize,
+    #[serde(default = "default_gateway_keepawake")]
+    pub keepawake: bool,
     pub thread: GatewayThreadConfig,
     #[serde(default)]
     pub tools: GatewayToolsConfig,
@@ -897,6 +899,10 @@ const fn default_computer_use_max_total_bytes() -> u64 {
 
 const fn default_computer_use_run_max_steps_default() -> u32 {
     300
+}
+
+const fn default_gateway_keepawake() -> bool {
+    false
 }
 
 const fn default_gateway_memory_enabled() -> bool {
@@ -1788,6 +1794,7 @@ service_name = "com.pioneer.gateway.env"
             expected_executable_name("pioneer")
         );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
+        assert!(!config.gateway.keepawake);
     }
 
     #[test]

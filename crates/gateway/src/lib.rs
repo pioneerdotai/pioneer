@@ -5,6 +5,7 @@ mod database;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod keep_awake;
 mod mcp_secrets;
 mod mcp_service;
 mod memory_policy;
@@ -375,6 +376,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.artifacts.clone(),
     ));
 
+    message_processor
+        .apply_keepawake_setting(config.gateway.keepawake)
+        .context("failed to apply gateway keepawake setting")?;
     message_processor
         .set_hook_recovery_config(config.gateway.hooks.recovery.clone())
         .await;

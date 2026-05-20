@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use pioneer_config::{
-    AppConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+    AppConfig, GatewayConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
 };
 use serde::{Deserialize, Serialize};
@@ -13,9 +13,42 @@ use crate::helpers::normalize_non_empty;
 #[serde(deny_unknown_fields)]
 pub struct GatewaySettings {
     version: u32,
+    #[serde(default, skip_serializing_if = "GatewayGeneralSettings::is_default")]
+    general: GatewayGeneralSettings,
     secrets: GatewaySecretsSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<GatewayMemorySettingsOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayGeneralSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keepawake: Option<bool>,
+}
+
+impl GatewayGeneralSettings {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn effective(&self, config: &GatewayConfig) -> pioneer_protocol::GatewayGeneralSettings {
+        pioneer_protocol::GatewayGeneralSettings {
+            keepawake: self.keepawake.unwrap_or(config.keepawake),
+        }
+    }
+
+    fn apply_protocol_update(
+        &mut self,
+        update: pioneer_protocol::GatewayGeneralSettingsUpdate,
+    ) -> GatewayGeneralSettingsChangeSet {
+        let mut changes = GatewayGeneralSettingsChangeSet::default();
+        if let Some(keepawake) = update.keepawake {
+            self.keepawake = Some(keepawake);
+            changes.keepawake = Some(keepawake);
+        }
+        changes
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +119,13 @@ impl Default for GatewaySecretsSettings {
 }
 
 impl GatewaySettings {
+    pub fn effective_general_settings(
+        &self,
+        config: &GatewayConfig,
+    ) -> pioneer_protocol::GatewayGeneralSettings {
+        self.general.effective(config)
+    }
+
     pub fn secrets_backend(&self) -> GatewaySecretsBackend {
         self.secrets.backend
     }
@@ -107,12 +147,10 @@ impl GatewaySettings {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
     }
 
-    pub fn snapshot(
-        &self,
-        config: &GatewayMemoryConfig,
-    ) -> pioneer_protocol::GatewaySettingsSnapshot {
+    pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
         pioneer_protocol::GatewaySettingsSnapshot {
-            memory: self.effective_memory_settings(config).to_protocol(),
+            general: self.effective_general_settings(config),
+            memory: self.effective_memory_settings(&config.memory).to_protocol(),
         }
     }
 
@@ -121,6 +159,9 @@ impl GatewaySettings {
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> GatewaySettingsChangeSet {
         let mut changes = GatewaySettingsChangeSet::default();
+        if let Some(general) = update.general {
+            changes.general = self.general.apply_protocol_update(general);
+        }
         if let Some(memory) = update.memory {
             self.set_memory_settings(GatewayMemorySettings::from_protocol(memory));
             changes.memory = true;
@@ -139,8 +180,14 @@ impl GatewaySettings {
         }
     }
 
+    pub fn apply_to_gateway_config(&self, mut config: GatewayConfig) -> GatewayConfig {
+        config.keepawake = self.effective_general_settings(&config).keepawake;
+        config.memory = self.apply_to_gateway_memory_config(config.memory);
+        config
+    }
+
     pub fn apply_to_app_config(&self, mut config: AppConfig) -> AppConfig {
-        config.gateway.memory = self.apply_to_gateway_memory_config(config.gateway.memory);
+        config.gateway = self.apply_to_gateway_config(config.gateway);
         config
     }
 }
@@ -194,7 +241,13 @@ impl GatewayMemorySettings {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GatewaySettingsChangeSet {
+    pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewayGeneralSettingsChangeSet {
+    pub keepawake: Option<bool>,
 }
 
 impl GatewayMemorySettingsOverride {
@@ -350,6 +403,7 @@ pub fn load_or_create_gateway_settings(
 
     let settings = GatewaySettings {
         version: expected_version,
+        general: GatewayGeneralSettings::default(),
         secrets: GatewaySecretsSettings::default(),
         memory: None,
     };
@@ -450,7 +504,13 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{GatewayMemorySettings, load_or_create_gateway_settings, save_gateway_settings};
-    use pioneer_config::{GatewayMemoryConfig, GatewayMemoryModelSelectionConfig};
+    use pioneer_config::{
+        GatewayArtifactsConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
+        GatewayDatabaseConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+        GatewayProviderConfig, GatewaySkillsConfig, GatewayThreadConfig,
+        GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
+        GatewayWebToolsConfig,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -466,6 +526,8 @@ mod tests {
             .expect("settings should be created");
         let content = fs::read_to_string(&path).expect("read settings");
 
+        assert!(!content.contains("[general]"));
+        assert!(!content.contains("keepawake"));
         assert!(content.contains("[secrets]"));
         assert!(content.contains("backend = \"keystore\""));
         assert!(!content.contains("jwt_secret"));
@@ -530,6 +592,95 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
         );
         assert!(mapped.debug_trace_enabled);
         assert!(mapped.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn gateway_settings_general_overrides_gateway_config() {
+        let settings_without_override = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+        let mut gateway_config = gateway_config_with_keepawake(false);
+        assert!(
+            !settings_without_override
+                .effective_general_settings(&gateway_config)
+                .keepawake
+        );
+        gateway_config.keepawake = true;
+        assert!(
+            settings_without_override
+                .effective_general_settings(&gateway_config)
+                .keepawake
+        );
+
+        let settings_with_enabled_override = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[general]
+keepawake = true
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+        assert!(
+            settings_with_enabled_override
+                .effective_general_settings(&gateway_config_with_keepawake(false))
+                .keepawake
+        );
+
+        let settings_with_disabled_override = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[general]
+keepawake = false
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+        assert!(
+            !settings_with_disabled_override
+                .effective_general_settings(&gateway_config_with_keepawake(true))
+                .keepawake
+        );
+
+        let applied_config = settings_with_disabled_override
+            .apply_to_gateway_config(gateway_config_with_keepawake(true));
+        assert!(!applied_config.keepawake);
+    }
+
+    #[test]
+    fn saves_gateway_general_settings_in_gateway_settings_file() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
+                keepawake: Some(true),
+            }),
+            memory: None,
+        });
+        save_gateway_settings(&path, &settings).expect("settings should save");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[general]"));
+        assert!(content.contains("keepawake = true"));
+        assert!(!content.contains("[memory]"));
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -625,6 +776,33 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
             .expect_err("removed jwt_secret field should be rejected");
         assert!(
             format!("{error:#}").contains("unknown field `jwt_secret`"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn rejects_gateway_settings_with_top_level_keepawake_field() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+            version = 1
+            keepawake = true
+
+            [secrets]
+            backend = "keystore"
+            "#,
+        )
+        .expect("write settings with top-level keepawake field");
+
+        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect_err("top-level keepawake field should be rejected");
+        assert!(
+            format!("{error:#}").contains("unknown field `keepawake`"),
             "unexpected error: {error:#}"
         );
 
@@ -751,5 +929,59 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
             .as_nanos();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("pioneer-settings-tests-{nanos}-{id}"))
+    }
+
+    fn gateway_config_with_keepawake(keepawake: bool) -> GatewayConfig {
+        GatewayConfig {
+            settings_version: 1,
+            settings_file_name: "gateway-settings.toml".to_owned(),
+            service_name: "com.pioneer.gateway".to_owned(),
+            legacy_service_names: Vec::new(),
+            listen_addr: "0.0.0.0:17878".to_owned(),
+            outbound_queue_capacity: 128,
+            keepawake,
+            thread: GatewayThreadConfig {
+                default_model: "gpt-5.4".to_owned(),
+                default_model_provider: "openai".to_owned(),
+                summary_model: None,
+                summary_model_provider: None,
+                title_model: None,
+                title_model_provider: None,
+                max_context_tokens: 128_000,
+                response_reserve_tokens: 16_000,
+            },
+            tools: GatewayToolsConfig {
+                web: GatewayWebToolsConfig::default(),
+                computer_use: GatewayComputerUseToolsConfig::default(),
+                budget: GatewayToolLoopBudgetConfig::default(),
+                retry: GatewayToolRetryBudgetConfig::default(),
+            },
+            skills: GatewaySkillsConfig::default(),
+            provider: GatewayProviderConfig {
+                default_timeout_secs: 120,
+                attachments: Default::default(),
+            },
+            database: GatewayDatabaseConfig {
+                file_name: "gateway.db".to_owned(),
+                max_connections: 10,
+                connect_timeout_ms: 5_000,
+                acquire_timeout_ms: 5_000,
+                idle_timeout_ms: 30_000,
+                sqlx_logging: false,
+                run_migrations_on_startup: true,
+            },
+            memory: GatewayMemoryConfig::default(),
+            hooks: Default::default(),
+            artifacts: GatewayArtifactsConfig::default(),
+            auth: GatewayAuthConfig {
+                jwt_issuer: "pioneer".to_owned(),
+                jwt_audience: "pioneer-clients".to_owned(),
+                superuser_subject: "superuser".to_owned(),
+                superuser_role: "superuser".to_owned(),
+                secret_size_bytes: 64,
+                token_ttl_seconds: 31_536_000,
+                token_refresh_leeway_seconds: 86_400,
+            },
+        }
     }
 }

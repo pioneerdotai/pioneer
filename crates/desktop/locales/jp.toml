@@ -551,6 +551,10 @@ description = "インターフェースで使用する言語を選択します�
 label = "カラーテーマ"
 description = "表示モードを選択します。"
 
+[settings.option.keepawake]
+label = "スリープを防止"
+description = "ゲートウェイの実行中はアイドル状態によるスリープを防ぎます。ディスプレイは消灯できます。"
+
 [settings.memory]
 title = "メモリ"
 description = "Pioneer が永続メモリをどのように使うかを制御します。"

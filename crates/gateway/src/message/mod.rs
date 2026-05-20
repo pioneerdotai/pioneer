@@ -28,6 +28,7 @@ mod workspace_handlers;
 pub use summary::SummaryConfig;
 
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
+use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
@@ -191,6 +192,7 @@ pub struct MessageProcessor {
     memory_bridge_providers: Arc<RwLock<Option<MemoryBridgeProviders>>>,
     hook_runtime: Arc<RwLock<Option<Arc<HookRuntime>>>>,
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
+    keepawake: Arc<GatewayKeepAwake>,
     artifact_runtime_home: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
@@ -303,6 +305,7 @@ impl MessageProcessor {
             memory_bridge_providers: Arc::new(RwLock::new(None)),
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home: runtime_home,
             artifact_service,
             artifact_uploads,
@@ -459,6 +462,10 @@ impl MessageProcessor {
         if let Ok(mut current) = self.memory_loop_config.write() {
             *current = config.normalized();
         }
+    }
+
+    pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {
+        self.keepawake.set_enabled(enabled)
     }
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
@@ -1299,6 +1306,7 @@ impl MessageProcessor {
             memory_bridge_providers: Arc::new(RwLock::new(None)),
             hook_runtime: Arc::new(RwLock::new(None)),
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
+            keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home,
             artifact_service,
             artifact_uploads,

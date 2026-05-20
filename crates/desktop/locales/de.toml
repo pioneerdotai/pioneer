@@ -551,6 +551,10 @@ description = "Wählen Sie die Sprache der Benutzeroberfläche."
 label = "Farbschema"
 description = "Wählen Sie den bevorzugten Darstellungsmodus."
 
+[settings.option.keepawake]
+label = "Computer wach halten"
+description = "Verhindert Ruhezustand bei Inaktivität, solange das Gateway läuft. Der Bildschirm kann sich weiterhin ausschalten."
+
 [settings.memory]
 title = "Speicher"
 description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."

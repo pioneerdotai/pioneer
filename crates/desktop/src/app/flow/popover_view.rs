@@ -70,7 +70,7 @@ impl PioneerDesktop {
             .active(ghost_active);
 
         Popover::new("gateway-switcher-popover")
-            .anchor(Corner::TopRight)
+            .anchor(Corner::TopLeft)
             .p_0()
             .trigger(
                 Button::new("gateway-switcher-button")

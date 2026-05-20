@@ -99,9 +99,10 @@ pub use provider::{
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
 };
 pub use settings::{
-    GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource, GatewayMemorySettings,
-    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
-    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
+    GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
