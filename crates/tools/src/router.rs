@@ -787,6 +787,71 @@ mod tests {
     }
 
     #[test]
+    fn request_tools_rejects_missing_reason() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_missing_reason".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["task"]}"#.to_owned(),
+            })
+            .expect_err("request_tools must require reason");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_rejects_extra_properties() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_extra".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["task"],"reason":"Need task tools.","toolNames":["task_create"]}"#.to_owned(),
+            })
+            .expect_err("request_tools must reject extra properties");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_rejects_blank_reason() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_blank_reason".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["task"],"reason":"   "}"#.to_owned(),
+            })
+            .expect_err("request_tools must reject blank reason");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_rejects_overlong_reason() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+        let reason = "x".repeat(crate::domain::REQUEST_TOOLS_REASON_MAX_CHARS + 1);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_overlong_reason".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: serde_json::json!({
+                    "domains": ["task"],
+                    "reason": reason
+                })
+                .to_string(),
+            })
+            .expect_err("request_tools must reject overlong reason");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
     fn build_tool_call_returns_not_found_for_unknown_tool() {
         let router = router_with_specs(Vec::new());
         let error = router

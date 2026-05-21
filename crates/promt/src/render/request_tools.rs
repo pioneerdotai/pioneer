@@ -70,6 +70,23 @@ mod tests {
     }
 
     #[test]
+    fn request_tools_hidden_domain_catalog_domain_lines_cannot_drift_from_runtime_map() {
+        let catalog = render_request_tools_hidden_domain_catalog_prompt();
+        let domain_lines = catalog
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        let expected = pioneer_tools::builtin_tool_domain_map()
+            .iter()
+            .map(|(domain, tool_names)| {
+                format!("- {}: {}.", domain.as_str(), tool_names.join(", "))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(domain_lines, expected);
+    }
+
+    #[test]
     fn request_tools_hidden_domain_catalog_is_schema_free() {
         let catalog = render_request_tools_hidden_domain_catalog_prompt();
 

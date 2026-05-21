@@ -58,8 +58,8 @@ use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
     REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason,
     ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
-    ToolRetryController, ToolRetryDecision, ToolRetryObservation, build_builtin_tools,
-    build_tools_with_environment, classify_tool_error,
+    ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -146,12 +146,17 @@ impl ExecutedToolResult {
 fn extract_request_tools_result(
     tool_name: &str,
     success: bool,
-    raw_output_json: JsonValue,
+    projection: Option<&ToolResultEnvelope>,
 ) -> Option<RequestToolsResult> {
     if tool_name != REQUEST_TOOLS_TOOL_NAME || !success {
         return None;
     }
-    serde_json::from_value(raw_output_json).ok()
+    let value = match &projection?.llm_view {
+        ToolResultView::Json { value, .. } => value.clone(),
+        ToolResultView::Text { text, .. } => serde_json::from_str(text).ok()?,
+        ToolResultView::Empty => return None,
+    };
+    serde_json::from_value(value).ok()
 }
 
 fn apply_request_tools_visibility_expansion(
@@ -2821,18 +2826,17 @@ async fn execute_agent_provider_response(
                             match dispatch_result {
                                 Ok(result) => {
                                     let success = result.success();
+                                    let projection = result.projection();
                                     let request_tools_result = extract_request_tools_result(
                                         tool_name.as_str(),
                                         success,
-                                        result.raw_output_json(),
+                                        projection,
                                     );
                                     (
                                         result.model_visible_text(),
                                         success,
                                         result.outcome.clone(),
-                                        result
-                                            .projection()
-                                            .and_then(|projection| projection.recovery.clone()),
+                                        projection.and_then(|projection| projection.recovery.clone()),
                                         request_tools_result,
                                         result.to_model_input_item().into_chat_message(),
                                     )
@@ -3365,9 +3369,10 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 mod tests {
     use super::{
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
-        apply_request_tools_visibility_expansion, build_user_message,
-        compile_agent_prompt_bundle_with_prompt_root, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
+        apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
+        build_user_message, compile_agent_prompt_bundle_with_prompt_root,
+        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
+        retain_chat_mode_attachment_messages,
     };
     use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
     use pioneer_promt::{
@@ -3420,6 +3425,13 @@ mod tests {
             request_tools_result: None,
             message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
         }
+    }
+
+    fn request_tools_executed_result(result: RequestToolsResult) -> ExecutedToolResult {
+        let text = serde_json::to_string(&result).expect("request_tools result serializes");
+        let mut executed = task_result("request_tools", true, text.as_str());
+        executed.request_tools_result = Some(result);
+        executed
     }
 
     fn test_web_config() -> WebToolsConfig {
@@ -3642,6 +3654,124 @@ mod tests {
                 "task domain tool `{name}` must be visible next round"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_tools_visibility_expansion_exposes_all_memory_tools_next_round() {
+        let memory_tools = BuiltinToolDomain::Memory.tool_names();
+        let built = build_tools_with_extension_names(memory_tools);
+        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
+        let result = request_tools_result_for_added(
+            "memory",
+            memory_tools.iter().map(|name| (*name).to_owned()),
+        );
+
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible_tool_names,
+            &result,
+            built.router.as_ref(),
+        );
+        built
+            .router
+            .set_model_visible_tools(&visible_tool_names)
+            .await;
+        let visible = built
+            .router
+            .model_visible_specs()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            added,
+            memory_tools
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
+        for name in memory_tools {
+            assert!(
+                visible.contains(&(*name).to_owned()),
+                "memory domain tool `{name}` must be visible next round"
+            );
+        }
+    }
+
+    #[test]
+    fn request_tools_visibility_expansion_exposes_computer_use_only_when_registered() {
+        let built = pioneer_tools::build_builtin_tools(
+            ".",
+            "turn_request_tools_computer_use_visibility",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
+        let result = request_tools_result_for_added(
+            "computer_use",
+            BuiltinToolDomain::ComputerUse
+                .tool_names()
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible_tool_names,
+            &result,
+            built.router.as_ref(),
+        );
+
+        if built.router.find_spec("computer_use").is_some() {
+            assert_eq!(added, vec!["computer_use".to_owned()]);
+            assert!(visible_tool_names.contains(&"computer_use".to_owned()));
+        } else {
+            assert!(added.is_empty());
+            assert!(!visible_tool_names.contains(&"computer_use".to_owned()));
+        }
+        assert!(visible_tool_names.contains(&"request_tools".to_owned()));
+        assert!(visible_tool_names.contains(&"read_file".to_owned()));
+    }
+
+    #[test]
+    fn request_tools_provider_loop_result_batch_expands_visible_tools_for_next_round() {
+        let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
+        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
+        let request_tools_result = request_tools_result_for_added(
+            "artifact",
+            ["artifact_prepare", "artifact_register"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let executed_results = vec![
+            task_result("list_dir", true, "ok"),
+            request_tools_executed_result(request_tools_result),
+        ];
+
+        let added = apply_request_tools_results_to_visible_tools(
+            &mut visible_tool_names,
+            &executed_results,
+            built.router.as_ref(),
+        );
+
+        assert_eq!(added, vec!["artifact_prepare", "artifact_register"]);
+        assert!(visible_tool_names.contains(&"request_tools".to_owned()));
+        assert!(visible_tool_names.contains(&"read_file".to_owned()));
+        assert!(visible_tool_names.contains(&"artifact_prepare".to_owned()));
+        assert!(visible_tool_names.contains(&"artifact_register".to_owned()));
+
+        let added_again = apply_request_tools_results_to_visible_tools(
+            &mut visible_tool_names,
+            &executed_results,
+            built.router.as_ref(),
+        );
+        assert!(added_again.is_empty());
+        assert_eq!(
+            visible_tool_names
+                .iter()
+                .filter(|name| name.as_str() == "artifact_prepare")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -188,6 +188,19 @@ mod tests {
     }
 
     #[test]
+    fn builtin_tool_domain_map_matches_domain_enum_order_and_accessors() {
+        let map = builtin_tool_domain_map();
+        assert_eq!(map.len(), BuiltinToolDomain::ALL.len());
+
+        for ((mapped_domain, mapped_tool_names), expected_domain) in
+            map.iter().zip(BuiltinToolDomain::ALL)
+        {
+            assert_eq!(*mapped_domain, expected_domain);
+            assert_eq!(*mapped_tool_names, expected_domain.tool_names());
+        }
+    }
+
+    #[test]
     fn domain_map_contains_exact_builtin_tool_names() {
         assert_eq!(
             BuiltinToolDomain::Memory.tool_names(),
@@ -271,6 +284,45 @@ mod tests {
         .expect_err("tool names must not be accepted as request_tools domains");
 
         assert!(error.contains("invalid request_tools domain `task_create`"));
+    }
+
+    #[test]
+    fn parse_request_tools_domains_rejects_strict_schema_violations() {
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["task"],
+            "reason": "Need task tools.",
+            "toolNames": ["task_create"]
+        }))
+        .expect_err("request_tools must reject extra keys");
+        assert!(error.contains("does not accept `toolNames`"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["task"]
+        }))
+        .expect_err("request_tools must require reason");
+        assert!(error.contains("`reason` is required"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["task"],
+            "reason": "   "
+        }))
+        .expect_err("request_tools must reject blank reasons");
+        assert!(error.contains("`reason` must be a non-empty string"));
+
+        let too_long = "x".repeat(REQUEST_TOOLS_REASON_MAX_CHARS + 1);
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["task"],
+            "reason": too_long
+        }))
+        .expect_err("request_tools must reject overlong reasons");
+        assert!(error.contains("must be at most"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": [42],
+            "reason": "Need task tools."
+        }))
+        .expect_err("request_tools domains must be strings");
+        assert!(error.contains("entries must be strings"));
     }
 
     #[test]

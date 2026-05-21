@@ -747,6 +747,14 @@ mod tests {
             serde_json::json!(1)
         );
         assert_eq!(
+            request_tools.spec.parameters["properties"]["reason"]["minLength"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            request_tools.spec.parameters["properties"]["reason"]["maxLength"],
+            serde_json::json!(REQUEST_TOOLS_REASON_MAX_CHARS)
+        );
+        assert_eq!(
             request_tools.spec.parameters["properties"]["domains"]["items"]["enum"],
             serde_json::json!(REQUEST_TOOLS_DOMAIN_VALUES)
         );

@@ -250,6 +250,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_tools_result_reports_repeated_visible_domain_as_already_visible() {
+        let visibility = visibility(&["request_tools", "artifact_prepare", "artifact_register"]);
+        let handler = RequestToolsHandler::new(
+            visibility,
+            [
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+            ],
+        );
+
+        let result = handler
+            .resolve(&serde_json::json!({
+                "domains": ["artifact", "artifact"],
+                "reason": "Need artifact tools again."
+            }))
+            .await
+            .expect("valid request_tools arguments should resolve");
+
+        assert!(result.added.is_empty());
+        assert_eq!(
+            result.already_visible.get("artifact"),
+            Some(&vec![
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned()
+            ])
+        );
+        assert!(result.blocked.is_empty());
+        assert!(result.unknown_or_unavailable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_tools_result_reports_computer_use_only_when_registered() {
+        let visibility = visibility(&["request_tools"]);
+        let available_handler =
+            RequestToolsHandler::new(visibility.clone(), ["computer_use".to_owned()]);
+
+        let available = available_handler
+            .resolve(&serde_json::json!({
+                "domains": ["computer_use"],
+                "reason": "Need GUI tools."
+            }))
+            .await
+            .expect("registered computer_use should resolve");
+
+        assert_eq!(
+            available.added.get("computer_use"),
+            Some(&vec!["computer_use".to_owned()])
+        );
+        assert!(available.already_visible.is_empty());
+        assert!(available.blocked.is_empty());
+        assert!(available.unknown_or_unavailable.is_empty());
+
+        let unavailable_handler = RequestToolsHandler::new(visibility, Vec::<String>::new());
+        let unavailable = unavailable_handler
+            .resolve(&serde_json::json!({
+                "domains": ["computer_use"],
+                "reason": "Need GUI tools."
+            }))
+            .await
+            .expect("unregistered computer_use should resolve as unavailable");
+
+        assert!(unavailable.added.is_empty());
+        assert!(unavailable.already_visible.is_empty());
+        assert!(unavailable.blocked.is_empty());
+        assert_eq!(unavailable.unknown_or_unavailable.len(), 1);
+        assert_eq!(unavailable.unknown_or_unavailable[0].domain, "computer_use");
+        assert_eq!(
+            unavailable.unknown_or_unavailable[0].tools,
+            vec!["computer_use".to_owned()]
+        );
+    }
+
+    #[tokio::test]
     async fn request_tools_result_does_not_embed_hidden_schemas() {
         let visibility = visibility(&["request_tools"]);
         let handler = RequestToolsHandler::new(
