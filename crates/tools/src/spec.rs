@@ -236,32 +236,6 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
             },
         ),
         configured_builtin_spec(
-            "tool_search",
-            "Search available tools by intent/query.",
-            tool_search_schema(),
-            PayloadKind::ToolSearch,
-            ExecutionClass::Shared,
-            ToolRecoveryMetadata {
-                retry_class: ToolRetryClass::Arguments,
-                idempotency_mode: ToolIdempotencyMode::Safe,
-                max_attempts: 2,
-                can_resume: false,
-            },
-        ),
-        configured_builtin_spec(
-            "tool_suggest",
-            "Suggest best tools for an intent.",
-            tool_suggest_schema(),
-            PayloadKind::ToolSearch,
-            ExecutionClass::Shared,
-            ToolRecoveryMetadata {
-                retry_class: ToolRetryClass::Arguments,
-                idempotency_mode: ToolIdempotencyMode::Safe,
-                max_attempts: 2,
-                can_resume: false,
-            },
-        ),
-        configured_builtin_spec(
             "web_search",
             "Search the web with DuckDuckGo and return ranked results.",
             web_search_schema(),
@@ -438,32 +412,6 @@ fn apply_patch_schema() -> JsonValue {
         "properties": {
             "input": { "type": "string", "description": "The full apply_patch payload" },
             "patch": { "type": "string", "description": "Alias of input" }
-        },
-        "additionalProperties": false
-    })
-}
-
-fn tool_search_schema() -> JsonValue {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": { "type": "string" },
-            "q": { "type": "string" },
-            "limit": { "type": "integer", "minimum": 1 },
-            "include_hidden": { "type": "boolean" }
-        },
-        "additionalProperties": false
-    })
-}
-
-fn tool_suggest_schema() -> JsonValue {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "intent": { "type": "string" },
-            "query": { "type": "string" },
-            "limit": { "type": "integer", "minimum": 1 },
-            "include_hidden": { "type": "boolean" }
         },
         "additionalProperties": false
     })

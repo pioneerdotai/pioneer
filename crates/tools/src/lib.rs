@@ -91,8 +91,7 @@ use handlers::ComputerUseHandler;
 
 use handlers::{
     ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
-    ToolDiscoveryPolicy, ToolSearchHandler, ToolSuggestHandler, UnifiedExecHandler,
-    WebFetchHandler, WebSearchHandler,
+    UnifiedExecHandler, WebFetchHandler, WebSearchHandler,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -399,15 +398,6 @@ pub fn build_tools_with_environment(
         "computer_use",
         Arc::new(ComputerUseHandler::new(computer_use_tools_config)),
     );
-
-    let discovery_policy = ToolDiscoveryPolicy::default();
-    let search_handler = Arc::new(ToolSearchHandler::new(visibility.clone(), discovery_policy));
-    let suggest_handler = Arc::new(ToolSuggestHandler::new(
-        visibility.clone(),
-        discovery_policy,
-    ));
-    builder.register_handler("tool_search", search_handler);
-    builder.register_handler("tool_suggest", suggest_handler);
 
     for extension in extensions {
         for (name, handler) in extension.handlers {
