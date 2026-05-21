@@ -55,9 +55,10 @@ use pioneer_provider::{
 };
 use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
-    RawToolCall, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
-    ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
+    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason,
+    ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
+    ToolRetryController, ToolRetryDecision, ToolRetryObservation, build_builtin_tools,
+    build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -104,6 +105,7 @@ struct ExecutedToolResult {
     success: bool,
     outcome: ToolOutcome,
     recovery_view: Option<ToolRecoveryView>,
+    request_tools_result: Option<RequestToolsResult>,
     message: ChatMessage,
 }
 
@@ -138,6 +140,60 @@ impl ExecutedToolResult {
         )
         .with_recovery_view(self.recovery_view.clone())
     }
+}
+
+fn extract_request_tools_result(
+    tool_name: &str,
+    success: bool,
+    raw_output_json: JsonValue,
+) -> Option<RequestToolsResult> {
+    if tool_name != REQUEST_TOOLS_TOOL_NAME || !success {
+        return None;
+    }
+    serde_json::from_value(raw_output_json).ok()
+}
+
+fn apply_request_tools_visibility_expansion(
+    visible_tool_names: &mut Vec<String>,
+    request_tools_result: &RequestToolsResult,
+    router: &pioneer_tools::ToolRouter,
+) -> Vec<String> {
+    let mut visible = visible_tool_names.iter().cloned().collect::<BTreeSet<_>>();
+    let mut added = Vec::new();
+
+    for tool_name in request_tools_result
+        .added
+        .values()
+        .flat_map(|names| names.iter())
+    {
+        if visible.contains(tool_name) || router.find_spec(tool_name.as_str()).is_none() {
+            continue;
+        }
+        visible.insert(tool_name.clone());
+        visible_tool_names.push(tool_name.clone());
+        added.push(tool_name.clone());
+    }
+
+    added
+}
+
+fn apply_request_tools_results_to_visible_tools(
+    visible_tool_names: &mut Vec<String>,
+    executed_results: &[ExecutedToolResult],
+    router: &pioneer_tools::ToolRouter,
+) -> Vec<String> {
+    let mut added = Vec::new();
+    for result in executed_results {
+        let Some(request_tools_result) = result.request_tools_result.as_ref() else {
+            continue;
+        };
+        added.extend(apply_request_tools_visibility_expansion(
+            visible_tool_names,
+            request_tools_result,
+            router,
+        ));
+    }
+    added
 }
 
 impl TaskMutationFinalizationGuard {
@@ -1839,7 +1895,7 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
-    let visible_tool_names = all_tool_names.clone();
+    let mut visible_tool_names = all_tool_names.clone();
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -2610,6 +2666,7 @@ async fn execute_agent_provider_response(
                                     success: false,
                                     outcome: outcome.clone(),
                                     recovery_view: None,
+                                    request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         model_tool_call.id,
                                         tool_name,
@@ -2687,6 +2744,7 @@ async fn execute_agent_provider_response(
                                     success: false,
                                     outcome: outcome.clone(),
                                     recovery_view: None,
+                                    request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         model_tool_call.id,
                                         tool_name,
@@ -2737,17 +2795,33 @@ async fn execute_agent_provider_response(
                             .complete_attempt(turn_id.as_str(), item_id.as_str())
                             .await;
 
-                        let (tool_output, success, outcome, recovery_view, message) =
+                        let (
+                            tool_output,
+                            success,
+                            outcome,
+                            recovery_view,
+                            request_tools_result,
+                            message,
+                        ) =
                             match dispatch_result {
-                                Ok(result) => (
-                                    result.model_visible_text(),
-                                    result.success(),
-                                    result.outcome.clone(),
-                                    result
-                                        .projection()
-                                        .and_then(|projection| projection.recovery.clone()),
-                                    result.to_model_input_item().into_chat_message(),
-                                ),
+                                Ok(result) => {
+                                    let success = result.success();
+                                    let request_tools_result = extract_request_tools_result(
+                                        tool_name.as_str(),
+                                        success,
+                                        result.raw_output_json(),
+                                    );
+                                    (
+                                        result.model_visible_text(),
+                                        success,
+                                        result.outcome.clone(),
+                                        result
+                                            .projection()
+                                            .and_then(|projection| projection.recovery.clone()),
+                                        request_tools_result,
+                                        result.to_model_input_item().into_chat_message(),
+                                    )
+                                }
                                 Err(error) => {
                                     let output = error.to_string();
                                     let outcome = classify_tool_error(tool_name.as_str(), &error);
@@ -2757,7 +2831,7 @@ async fn execute_agent_provider_response(
                                         output.clone(),
                                         outcome.clone(),
                                     );
-                                    (output, false, outcome, None, message)
+                                    (output, false, outcome, None, None, message)
                                 }
                             };
 
@@ -2771,6 +2845,7 @@ async fn execute_agent_provider_response(
                             success,
                             outcome,
                             recovery_view,
+                            request_tools_result,
                             message,
                         }
                     }
@@ -2782,6 +2857,12 @@ async fn execute_agent_provider_response(
                 .buffer_unordered(parallel_tool_calls)
                 .collect::<Vec<_>>()
                 .await;
+
+            apply_request_tools_results_to_visible_tools(
+                &mut visible_tool_names,
+                &executed_results,
+                router.as_ref(),
+            );
 
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
@@ -3266,9 +3347,9 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 mod tests {
     use super::{
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
-        build_user_message, compile_agent_prompt_bundle_with_prompt_root,
-        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
-        retain_chat_mode_attachment_messages,
+        apply_request_tools_visibility_expansion, build_user_message,
+        compile_agent_prompt_bundle_with_prompt_root, retain_agent_attachment_messages,
+        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
     };
     use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
     use pioneer_promt::{
@@ -3281,10 +3362,27 @@ mod tests {
         Role,
     };
     use pioneer_tools::{
-        BuiltinToolDomain, ComputerUseToolsConfig, RequestToolsResult, ToolErrorClass, ToolOutcome,
-        WebToolsConfig,
+        BuiltinToolDomain, ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass,
+        FunctionToolOutput, PayloadKind, RequestToolsResult, ToolError, ToolErrorClass,
+        ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutcome, ToolOutput, ToolSpec,
+        WebToolsConfig, dynamic_unknown_output_policy,
     };
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct NoopToolHandler;
+
+    #[async_trait::async_trait]
+    impl ToolHandler for NoopToolHandler {
+        async fn handle(
+            &self,
+            _invocation: ToolInvocation,
+            _trace: pioneer_tools::ToolEventTrace,
+        ) -> Result<Box<dyn ToolOutput>, ToolError> {
+            Ok(Box::new(FunctionToolOutput::new("ok", true)))
+        }
+    }
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
@@ -3301,6 +3399,7 @@ mod tests {
                 ToolOutcome::fatal(ToolErrorClass::InvalidArguments, Some(text.to_owned()))
             },
             recovery_view: None,
+            request_tools_result: None,
             message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
         }
     }
@@ -3334,6 +3433,56 @@ mod tests {
             max_total_bytes: 1024 * 1024 * 1024,
             run_max_steps_default: 30,
             ..ComputerUseToolsConfig::default()
+        }
+    }
+
+    fn configured_test_tool(name: &str) -> ConfiguredToolSpec {
+        ConfiguredToolSpec::new(
+            ToolSpec::new(
+                name,
+                "test domain tool",
+                serde_json::json!({"type":"object"}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+        )
+    }
+
+    fn build_tools_with_extension_names(names: &[&str]) -> pioneer_tools::BuiltinTools {
+        pioneer_tools::build_tools(
+            ".",
+            "turn_request_tools_visibility",
+            test_web_config(),
+            test_computer_use_config(),
+            vec![ToolExtensionBundle {
+                specs: names
+                    .iter()
+                    .map(|name| configured_test_tool(name))
+                    .collect(),
+                handlers: names
+                    .iter()
+                    .map(|name| {
+                        (
+                            (*name).to_owned(),
+                            std::sync::Arc::new(NoopToolHandler) as std::sync::Arc<dyn ToolHandler>,
+                        )
+                    })
+                    .collect(),
+            }],
+        )
+        .expect("test tools must build")
+    }
+
+    fn request_tools_result_for_added(
+        domain: &str,
+        tool_names: impl IntoIterator<Item = String>,
+    ) -> RequestToolsResult {
+        RequestToolsResult {
+            added: BTreeMap::from([(domain.to_owned(), tool_names.into_iter().collect())]),
+            already_visible: BTreeMap::new(),
+            blocked: Vec::new(),
+            unknown_or_unavailable: Vec::new(),
         }
     }
 
@@ -3389,6 +3538,118 @@ mod tests {
         assert!(!text.contains("\"parameters\""));
         assert!(!text.contains("\"properties\""));
         assert!(!text.contains("\"additionalProperties\""));
+    }
+
+    #[tokio::test]
+    async fn request_tools_visibility_expansion_exposes_artifact_next_round() {
+        let built = build_tools_with_extension_names(&[
+            "artifact_prepare",
+            "artifact_register",
+            "skill.test.dynamic",
+        ]);
+        let mut visible_tool_names = vec![
+            "request_tools".to_owned(),
+            "read_file".to_owned(),
+            "skill.test.dynamic".to_owned(),
+        ];
+        let before = visible_tool_names.clone();
+        let result = request_tools_result_for_added(
+            "artifact",
+            ["artifact_prepare", "artifact_register"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible_tool_names,
+            &result,
+            built.router.as_ref(),
+        );
+        built
+            .router
+            .set_model_visible_tools(&visible_tool_names)
+            .await;
+        let visible = built
+            .router
+            .model_visible_specs()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(added, vec!["artifact_prepare", "artifact_register"]);
+        for name in before {
+            assert!(
+                visible.contains(&name),
+                "previously visible tool `{name}` must remain visible"
+            );
+        }
+        assert!(visible.contains(&"artifact_prepare".to_owned()));
+        assert!(visible.contains(&"artifact_register".to_owned()));
+        assert!(!visible.contains(&"web_search".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn request_tools_visibility_expansion_exposes_all_task_tools_next_round() {
+        let task_tools = BuiltinToolDomain::Task.tool_names();
+        let built = build_tools_with_extension_names(task_tools);
+        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
+        let result = request_tools_result_for_added(
+            "task",
+            task_tools.iter().map(|name| (*name).to_owned()),
+        );
+
+        apply_request_tools_visibility_expansion(
+            &mut visible_tool_names,
+            &result,
+            built.router.as_ref(),
+        );
+        built
+            .router
+            .set_model_visible_tools(&visible_tool_names)
+            .await;
+        let visible = built
+            .router
+            .model_visible_specs()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(visible.contains(&"request_tools".to_owned()));
+        assert!(visible.contains(&"read_file".to_owned()));
+        for name in task_tools {
+            assert!(
+                visible.contains(&(*name).to_owned()),
+                "task domain tool `{name}` must be visible next round"
+            );
+        }
+    }
+
+    #[test]
+    fn request_tools_visibility_expansion_is_monotonic_and_registered_only() {
+        let built = build_tools_with_extension_names(&["artifact_prepare"]);
+        let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
+        let before = visible_tool_names.clone();
+        let result = request_tools_result_for_added(
+            "artifact",
+            ["artifact_prepare", "artifact_register"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+
+        let added = apply_request_tools_visibility_expansion(
+            &mut visible_tool_names,
+            &result,
+            built.router.as_ref(),
+        );
+
+        assert_eq!(added, vec!["artifact_prepare"]);
+        for name in before {
+            assert!(visible_tool_names.contains(&name));
+        }
+        assert!(visible_tool_names.contains(&"artifact_prepare".to_owned()));
+        assert!(!visible_tool_names.contains(&"artifact_register".to_owned()));
     }
 
     #[test]
