@@ -63,10 +63,18 @@
         "active_no_memory_policy": {
           "type": "boolean"
         },
+        "evidence_class": {
+          "$ref": "#/$defs/MemoryEvidenceClass",
+          "default": "missing_or_weak"
+        },
         "evidence_count": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "fact_class": {
+          "$ref": "#/$defs/MemoryFactClass",
+          "default": "unknown"
         },
         "has_contradiction": {
           "type": "boolean"
@@ -83,6 +91,32 @@
             "null"
           ]
         },
+        "lifetime_class": {
+          "$ref": "#/$defs/MemoryLifetimeClass",
+          "default": "unknown"
+        },
+        "ownership_class": {
+          "$ref": "#/$defs/MemoryOwnershipClass",
+          "default": "audit_only"
+        },
+        "quality_action": {
+          "$ref": "#/$defs/MemoryQualityAction",
+          "default": "candidate_policy"
+        },
+        "quality_candidate_auto_approve_allowed": {
+          "type": "boolean",
+          "default": false
+        },
+        "quality_reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryQualityReasonCode"
+          }
+        },
+        "quality_target_ownership": {
+          "$ref": "#/$defs/MemoryOwnershipClass",
+          "default": "audit_only"
+        },
         "relation": {
           "$ref": "#/$defs/MemoryWriteRelation"
         },
@@ -98,8 +132,9 @@
         "sensitivity": {
           "$ref": "#/$defs/MemorySensitivity"
         },
-        "source_kind": {
-          "$ref": "#/$defs/MemorySourceKind"
+        "source_context_kind": {
+          "$ref": "#/$defs/MemorySourceContextKind",
+          "default": "unknown"
         }
       },
       "required": [
@@ -112,8 +147,7 @@
         "has_duplicate",
         "has_rejected_duplicate",
         "sensitivity",
-        "active_no_memory_policy",
-        "source_kind"
+        "active_no_memory_policy"
       ]
     },
     "MemoryCandidateScore": {
@@ -138,6 +172,26 @@
           "type": "number",
           "format": "float"
         },
+        "fact_class_score": {
+          "type": "number",
+          "format": "float",
+          "default": 0.0
+        },
+        "lifetime_fit_score": {
+          "type": "number",
+          "format": "float",
+          "default": 0.0
+        },
+        "ownership_fit_score": {
+          "type": "number",
+          "format": "float",
+          "default": 0.0
+        },
+        "penalty_score": {
+          "type": "number",
+          "format": "float",
+          "default": 0.0
+        },
         "reasons": {
           "type": "array",
           "items": {
@@ -152,9 +206,18 @@
           "type": "number",
           "format": "float"
         },
+        "score_version": {
+          "type": "string",
+          "default": "semantic_v1"
+        },
         "sensitivity_score": {
           "type": "number",
           "format": "float"
+        },
+        "source_trust_score": {
+          "type": "number",
+          "format": "float",
+          "default": 0.0
         },
         "total_score": {
           "type": "number",
@@ -225,6 +288,20 @@
         "unknown"
       ]
     },
+    "MemoryEvidenceClass": {
+      "type": "string",
+      "enum": [
+        "direct_user_assertion",
+        "user_correction",
+        "user_approval",
+        "assistant_inference",
+        "tool_observation",
+        "task_runtime_observation",
+        "system_observation",
+        "generated_summary",
+        "missing_or_weak"
+      ]
+    },
     "MemoryExplicitness": {
       "type": "string",
       "enum": [
@@ -242,6 +319,31 @@
         "low"
       ]
     },
+    "MemoryFactClass": {
+      "type": "string",
+      "enum": [
+        "user_identity",
+        "user_biography",
+        "user_relationship",
+        "stable_user_preference",
+        "communication_preference",
+        "recurring_user_instruction",
+        "project_policy",
+        "project_decision",
+        "project_procedure",
+        "project_constraint",
+        "task_lifecycle_state",
+        "operational_observation",
+        "thread_local_state",
+        "tool_result_fact",
+        "assistant_self_description",
+        "generated_summary_fact",
+        "domain_owned_state",
+        "secret_or_credential",
+        "regulated_sensitive_fact",
+        "unknown"
+      ]
+    },
     "MemoryIntent": {
       "type": "string",
       "enum": [
@@ -250,6 +352,95 @@
         "explicit_no_memory",
         "implicit_candidate",
         "none"
+      ]
+    },
+    "MemoryLifetimeClass": {
+      "type": "string",
+      "enum": [
+        "long_lived",
+        "project_lifetime",
+        "task_lifetime",
+        "thread_lifetime",
+        "session_only",
+        "naturally_expiring",
+        "instantaneous",
+        "unknown"
+      ]
+    },
+    "MemoryOwnershipClass": {
+      "type": "string",
+      "enum": [
+        "durable_user_memory",
+        "durable_workspace_memory",
+        "durable_agent_memory",
+        "thread_episodic_context",
+        "task_runtime_state",
+        "domain_runtime_state",
+        "audit_only",
+        "reject"
+      ]
+    },
+    "MemoryQualityAction": {
+      "type": "string",
+      "enum": [
+        "candidate_policy",
+        "force_reject",
+        "quarantine",
+        "route_to_thread_episodic",
+        "route_to_task_state",
+        "route_to_domain_state"
+      ]
+    },
+    "MemoryQualityReasonCode": {
+      "type": "string",
+      "enum": [
+        "source_eligible",
+        "source_ineligible",
+        "direct_user_evidence",
+        "weak_evidence",
+        "durable_lifetime",
+        "non_durable_lifetime",
+        "ownership_fit",
+        "ownership_mismatch",
+        "category_eligible",
+        "category_restricted",
+        "sensitivity_allowed",
+        "sensitivity_restricted",
+        "duplicate",
+        "contradiction",
+        "memory_write_disabled_for_turn",
+        "secret_or_credential",
+        "regulated_sensitive_without_user_approval",
+        "system_owned_state_not_memory",
+        "source_not_authoritative_for_durable_memory",
+        "task_state_not_user_memory",
+        "tool_result_not_user_memory",
+        "assistant_inference_not_durable_evidence",
+        "weak_or_missing_evidence",
+        "duplicate_existing_memory",
+        "route_thread_episodic",
+        "route_task_state",
+        "route_domain_state",
+        "task_lifetime",
+        "tool_owned_state",
+        "generated_summary_not_durable_memory",
+        "candidate_policy_allowed",
+        "durable_user_identity",
+        "durable_user_profile",
+        "durable_user_preference",
+        "durable_recurring_instruction",
+        "durable_project_memory",
+        "user_confirmed_agent_memory",
+        "compatible_update",
+        "contradicts_existing_memory",
+        "requires_resolution",
+        "novel_candidate",
+        "unknown_source_context",
+        "unknown_fact_class",
+        "unknown_lifetime",
+        "source_policy_missing",
+        "no_quality_allow_rule",
+        "unknown"
       ]
     },
     "MemoryScope": {
@@ -377,16 +568,19 @@
         "unknown"
       ]
     },
-    "MemorySourceKind": {
+    "MemorySourceContextKind": {
       "type": "string",
       "enum": [
-        "explicit_user_request",
-        "user_correction",
-        "assistant_inference",
-        "background_extractor",
-        "tool_observation",
-        "import",
-        "system"
+        "direct_user_conversation",
+        "assistant_response",
+        "tool_result",
+        "task_runtime",
+        "system_runtime",
+        "developer_instruction",
+        "connector_content",
+        "imported_document",
+        "generated_summary",
+        "unknown"
       ]
     },
     "MemorySubject": {

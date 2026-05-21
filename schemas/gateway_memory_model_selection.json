@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayMemoryModelSelection",
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+      "default": "thread"
+    }
+  },
+  "$defs": {
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
+    }
+  }
+}

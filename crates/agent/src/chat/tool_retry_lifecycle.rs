@@ -71,6 +71,7 @@ fn protocol_retry_error_class(error_class: pioneer_tools::ToolErrorClass) -> Too
     match error_class {
         pioneer_tools::ToolErrorClass::InvalidArguments => ToolRetryErrorClass::InvalidArguments,
         pioneer_tools::ToolErrorClass::NotFound => ToolRetryErrorClass::NotFound,
+        pioneer_tools::ToolErrorClass::ToolNotVisible => ToolRetryErrorClass::ToolNotVisible,
         pioneer_tools::ToolErrorClass::PermissionDenied => ToolRetryErrorClass::PermissionDenied,
         pioneer_tools::ToolErrorClass::CommandNotFound => ToolRetryErrorClass::CommandNotFound,
         pioneer_tools::ToolErrorClass::Timeout => ToolRetryErrorClass::Timeout,

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryOwnershipClass",
+  "type": "string",
+  "enum": [
+    "durable_user_memory",
+    "durable_workspace_memory",
+    "durable_agent_memory",
+    "thread_episodic_context",
+    "task_runtime_state",
+    "domain_runtime_state",
+    "audit_only",
+    "reject"
+  ]
+}

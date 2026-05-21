@@ -222,6 +222,7 @@ fn post_turn_tool_error_class(error_class: ToolErrorClass) -> TurnPostTurnToolEr
     match error_class {
         ToolErrorClass::InvalidArguments => TurnPostTurnToolErrorClass::InvalidArguments,
         ToolErrorClass::NotFound => TurnPostTurnToolErrorClass::NotFound,
+        ToolErrorClass::ToolNotVisible => TurnPostTurnToolErrorClass::ToolNotVisible,
         ToolErrorClass::PermissionDenied => TurnPostTurnToolErrorClass::PermissionDenied,
         ToolErrorClass::CommandNotFound => TurnPostTurnToolErrorClass::CommandNotFound,
         ToolErrorClass::Timeout => TurnPostTurnToolErrorClass::Timeout,
@@ -2619,11 +2620,11 @@ async fn execute_agent_provider_response(
                             }
                         }
 
-                        let tool_call = match router.build_tool_call(RawToolCall {
+                        let tool_call = match router.build_model_tool_call(RawToolCall {
                             call_id: model_tool_call.id.clone(),
                             tool_name: tool_name.clone(),
                             arguments: arguments.clone(),
-                        }) {
+                        }).await {
                             Ok(tool_call) => tool_call,
                             Err(error) => {
                                 let suppress_partial_unknown_tool_ui =
@@ -2637,12 +2638,7 @@ async fn execute_agent_provider_response(
                                 let output_policy = router
                                     .find_spec(tool_name.as_str())
                                     .map(|configured| configured.output_policy.clone());
-                                let outcome = classify_tool_error(
-                                    tool_name.as_str(),
-                                    &pioneer_tools::ToolError::invalid_arguments(
-                                        error_text.clone(),
-                                    ),
-                                );
+                                let outcome = classify_tool_error(tool_name.as_str(), &error);
                                 if !suppress_partial_unknown_tool_ui {
                                     let _ = event_tx
                                         .publish_durable(AgentDurableEvent::ItemStarted {

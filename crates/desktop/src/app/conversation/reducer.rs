@@ -1106,6 +1106,7 @@ fn tool_retry_error_class_label(error_class: ToolRetryErrorClass) -> &'static st
     match error_class {
         ToolRetryErrorClass::InvalidArguments => "invalid_arguments",
         ToolRetryErrorClass::NotFound => "not_found",
+        ToolRetryErrorClass::ToolNotVisible => "tool_not_visible",
         ToolRetryErrorClass::PermissionDenied => "permission_denied",
         ToolRetryErrorClass::CommandNotFound => "command_not_found",
         ToolRetryErrorClass::Timeout => "timeout",

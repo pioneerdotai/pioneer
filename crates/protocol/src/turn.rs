@@ -1376,6 +1376,7 @@ pub enum ToolOutcomeStatus {
 pub enum ToolErrorClass {
     InvalidArguments,
     NotFound,
+    ToolNotVisible,
     PermissionDenied,
     CommandNotFound,
     Timeout,
@@ -1392,6 +1393,7 @@ pub enum ToolErrorClass {
 pub enum ToolRetryErrorClass {
     InvalidArguments,
     NotFound,
+    ToolNotVisible,
     PermissionDenied,
     CommandNotFound,
     Timeout,

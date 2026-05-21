@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryEvidenceClass",
+  "type": "string",
+  "enum": [
+    "direct_user_assertion",
+    "user_correction",
+    "user_approval",
+    "assistant_inference",
+    "tool_observation",
+    "task_runtime_observation",
+    "system_observation",
+    "generated_summary",
+    "missing_or_weak"
+  ]
+}

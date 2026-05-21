@@ -66,6 +66,16 @@
     "semantic": {
       "$ref": "#/$defs/MemorySemanticFields"
     },
+    "source_context_kind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemorySourceContextKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "value": {
       "type": [
         "string",
@@ -193,9 +203,6 @@
             "null"
           ]
         },
-        "source_kind": {
-          "$ref": "#/$defs/MemorySourceKind"
-        },
         "source_thread_id": {
           "type": [
             "string",
@@ -208,10 +215,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "source_kind"
-      ]
+      }
     },
     "MemoryScope": {
       "type": "object",
@@ -330,16 +334,19 @@
         "unknown"
       ]
     },
-    "MemorySourceKind": {
+    "MemorySourceContextKind": {
       "type": "string",
       "enum": [
-        "explicit_user_request",
-        "user_correction",
-        "assistant_inference",
-        "background_extractor",
-        "tool_observation",
-        "import",
-        "system"
+        "direct_user_conversation",
+        "assistant_response",
+        "tool_result",
+        "task_runtime",
+        "system_runtime",
+        "developer_instruction",
+        "connector_content",
+        "imported_document",
+        "generated_summary",
+        "unknown"
       ]
     },
     "MemorySubject": {

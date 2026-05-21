@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryEvidenceActorRole",
+  "type": "string",
+  "enum": [
+    "user",
+    "assistant",
+    "tool",
+    "task",
+    "system",
+    "developer",
+    "connector",
+    "unknown"
+  ]
+}

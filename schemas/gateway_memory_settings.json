@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayMemorySettings",
+  "type": "object",
+  "properties": {
+    "active_recall_enabled": {
+      "type": "boolean"
+    },
+    "active_recall_model": {
+      "$ref": "#/$defs/GatewayMemoryModelSelection",
+      "default": {
+        "source": "thread"
+      }
+    },
+    "background_extraction_enabled": {
+      "type": "boolean"
+    },
+    "debug_trace_enabled": {
+      "type": "boolean"
+    },
+    "deterministic_recall_enabled": {
+      "type": "boolean"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "proactive_writes_enabled": {
+      "type": "boolean"
+    },
+    "proactive_writes_model": {
+      "$ref": "#/$defs/GatewayMemoryModelSelection",
+      "default": {
+        "source": "thread"
+      }
+    },
+    "strict_diagnostics_enabled": {
+      "type": "boolean"
+    },
+    "tools_enabled": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "enabled",
+    "deterministic_recall_enabled",
+    "active_recall_enabled",
+    "tools_enabled",
+    "proactive_writes_enabled",
+    "background_extraction_enabled",
+    "debug_trace_enabled",
+    "strict_diagnostics_enabled"
+  ],
+  "$defs": {
+    "GatewayMemoryModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+          "default": "thread"
+        }
+      }
+    },
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
+    }
+  }
+}

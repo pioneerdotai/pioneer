@@ -1038,6 +1038,7 @@
       "enum": [
         "invalid_arguments",
         "not_found",
+        "tool_not_visible",
         "permission_denied",
         "command_not_found",
         "timeout",
@@ -1527,6 +1528,7 @@
       "enum": [
         "invalid_arguments",
         "not_found",
+        "tool_not_visible",
         "permission_denied",
         "command_not_found",
         "timeout",

@@ -53,6 +53,10 @@ pub fn default_tool_retry_class_budgets() -> Vec<ToolRetryClassBudget> {
             max_retries: 2,
         },
         ToolRetryClassBudget {
+            error_class: ToolErrorClass::ToolNotVisible,
+            max_retries: 1,
+        },
+        ToolRetryClassBudget {
             error_class: ToolErrorClass::PermissionDenied,
             max_retries: 1,
         },
@@ -790,6 +794,7 @@ fn error_class_code(error_class: ToolErrorClass) -> &'static str {
     match error_class {
         ToolErrorClass::InvalidArguments => "invalid_arguments",
         ToolErrorClass::NotFound => "not_found",
+        ToolErrorClass::ToolNotVisible => "tool_not_visible",
         ToolErrorClass::PermissionDenied => "permission_denied",
         ToolErrorClass::CommandNotFound => "command_not_found",
         ToolErrorClass::Timeout => "timeout",

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryFactClass",
+  "type": "string",
+  "enum": [
+    "user_identity",
+    "user_biography",
+    "user_relationship",
+    "stable_user_preference",
+    "communication_preference",
+    "recurring_user_instruction",
+    "project_policy",
+    "project_decision",
+    "project_procedure",
+    "project_constraint",
+    "task_lifecycle_state",
+    "operational_observation",
+    "thread_local_state",
+    "tool_result_fact",
+    "assistant_self_description",
+    "generated_summary_fact",
+    "domain_owned_state",
+    "secret_or_credential",
+    "regulated_sensitive_fact",
+    "unknown"
+  ]
+}

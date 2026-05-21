@@ -19,9 +19,6 @@
         "null"
       ]
     },
-    "source_kind": {
-      "$ref": "#/$defs/MemorySourceKind"
-    },
     "source_thread_id": {
       "type": [
         "string",
@@ -35,9 +32,6 @@
       ]
     }
   },
-  "required": [
-    "source_kind"
-  ],
   "$defs": {
     "MemoryActor": {
       "type": "object",
@@ -64,18 +58,6 @@
         "extractor",
         "system",
         "tool"
-      ]
-    },
-    "MemorySourceKind": {
-      "type": "string",
-      "enum": [
-        "explicit_user_request",
-        "user_correction",
-        "assistant_inference",
-        "background_extractor",
-        "tool_observation",
-        "import",
-        "system"
       ]
     }
   }

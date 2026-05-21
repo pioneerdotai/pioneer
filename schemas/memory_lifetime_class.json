@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryLifetimeClass",
+  "type": "string",
+  "enum": [
+    "long_lived",
+    "project_lifetime",
+    "task_lifetime",
+    "thread_lifetime",
+    "session_only",
+    "naturally_expiring",
+    "instantaneous",
+    "unknown"
+  ]
+}

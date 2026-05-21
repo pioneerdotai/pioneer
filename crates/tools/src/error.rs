@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 pub enum ToolError {
     InvalidArguments(String),
     NotFound(String),
+    NotVisible(String),
     Rejected(String),
     Cancelled(String),
     ExecutionFailed(String),
@@ -17,6 +18,10 @@ impl ToolError {
 
     pub fn execution_failed(message: impl Into<String>) -> Self {
         Self::ExecutionFailed(message.into())
+    }
+
+    pub fn not_visible(tool_name: impl Into<String>) -> Self {
+        Self::NotVisible(tool_name.into())
     }
 
     pub fn cancelled(message: impl Into<String>) -> Self {
@@ -33,6 +38,7 @@ impl Display for ToolError {
         match self {
             Self::InvalidArguments(message) => write!(f, "invalid arguments: {message}"),
             Self::NotFound(message) => write!(f, "tool not found: {message}"),
+            Self::NotVisible(message) => write!(f, "tool not visible: {message}"),
             Self::Rejected(message) => write!(f, "tool call rejected: {message}"),
             Self::Cancelled(message) => write!(f, "tool call cancelled: {message}"),
             Self::ExecutionFailed(message) => write!(f, "tool execution failed: {message}"),

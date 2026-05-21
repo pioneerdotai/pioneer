@@ -37,6 +37,16 @@
     "relation": {
       "$ref": "#/$defs/MemoryWriteRelation"
     },
+    "route": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemorySemanticWriteRouteInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "semantic_fingerprint": {
       "type": "string"
     },
@@ -140,6 +150,16 @@
         "scope": {
           "$ref": "#/$defs/MemoryScope"
         },
+        "source_context_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemorySourceContextKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/$defs/MemoryCandidateStatus"
         }
@@ -217,6 +237,19 @@
         "custom"
       ]
     },
+    "MemoryOwnershipClass": {
+      "type": "string",
+      "enum": [
+        "durable_user_memory",
+        "durable_workspace_memory",
+        "durable_agent_memory",
+        "thread_episodic_context",
+        "task_runtime_state",
+        "domain_runtime_state",
+        "audit_only",
+        "reject"
+      ]
+    },
     "MemoryProvenance": {
       "type": "object",
       "properties": {
@@ -236,9 +269,6 @@
             "null"
           ]
         },
-        "source_kind": {
-          "$ref": "#/$defs/MemorySourceKind"
-        },
         "source_thread_id": {
           "type": [
             "string",
@@ -251,9 +281,17 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "source_kind"
+      }
+    },
+    "MemoryQualityAction": {
+      "type": "string",
+      "enum": [
+        "candidate_policy",
+        "force_reject",
+        "quarantine",
+        "route_to_thread_episodic",
+        "route_to_task_state",
+        "route_to_domain_state"
       ]
     },
     "MemoryRecord": {
@@ -338,6 +376,16 @@
         "sensitivity": {
           "$ref": "#/$defs/MemorySensitivity"
         },
+        "source_context_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemorySourceContextKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/$defs/MemoryStatus"
         },
@@ -391,6 +439,66 @@
         "task"
       ]
     },
+    "MemorySemanticWriteRoute": {
+      "type": "string",
+      "enum": [
+        "durable_control_plane",
+        "thread_episodic_deferred",
+        "task_state_deferred",
+        "domain_state_deferred",
+        "audit_only",
+        "rejected"
+      ]
+    },
+    "MemorySemanticWriteRouteInfo": {
+      "type": "object",
+      "properties": {
+        "canonical_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality_action": {
+          "$ref": "#/$defs/MemoryQualityAction"
+        },
+        "quality_decision_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/MemorySemanticWriteRoute"
+        },
+        "source_item_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_ownership": {
+          "$ref": "#/$defs/MemoryOwnershipClass"
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "route",
+        "quality_action",
+        "target_ownership"
+      ]
+    },
     "MemorySensitivity": {
       "type": "string",
       "enum": [
@@ -400,16 +508,19 @@
         "regulated"
       ]
     },
-    "MemorySourceKind": {
+    "MemorySourceContextKind": {
       "type": "string",
       "enum": [
-        "explicit_user_request",
-        "user_correction",
-        "assistant_inference",
-        "background_extractor",
-        "tool_observation",
-        "import",
-        "system"
+        "direct_user_conversation",
+        "assistant_response",
+        "tool_result",
+        "task_runtime",
+        "system_runtime",
+        "developer_instruction",
+        "connector_content",
+        "imported_document",
+        "generated_summary",
+        "unknown"
       ]
     },
     "MemoryStatus": {

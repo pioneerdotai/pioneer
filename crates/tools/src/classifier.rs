@@ -100,6 +100,12 @@ impl ErrorClassifier for DefaultErrorClassifier {
                 false,
                 None,
             ),
+            ToolError::NotVisible(_) => ToolOutcome::recoverable(
+                ToolErrorClass::ToolNotVisible,
+                "Tool is registered but hidden in this provider round. Use a visible tool or request the needed domain before retrying.",
+                false,
+                None,
+            ),
             ToolError::Cancelled(_) => ToolOutcome::recoverable(
                 ToolErrorClass::Cancelled,
                 "Tool call was cancelled. Retry if still needed.",
@@ -186,6 +192,12 @@ fn classify_mcp_error(invocation: &ToolInvocation, error: &ToolError) -> ToolOut
         ToolError::NotFound(_) => ToolOutcome::fatal(
             ToolErrorClass::NotFound,
             Some("MCP server or raw tool was not available at call time.".to_owned()),
+        ),
+        ToolError::NotVisible(_) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            "MCP tool is registered but hidden in this provider round. Use a visible tool or request the needed domain before retrying.",
+            false,
+            None,
         ),
         ToolError::Rejected(_) => ToolOutcome::fatal(
             ToolErrorClass::PermissionDenied,
@@ -539,6 +551,12 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
             false,
             None,
         ),
+        ToolError::NotVisible(_) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            "Shell tool is registered but hidden in this provider round. Use a visible tool or request the needed domain before retrying.",
+            false,
+            None,
+        ),
         ToolError::Cancelled(_) => ToolOutcome::recoverable(
             ToolErrorClass::Cancelled,
             "Shell execution was cancelled. Retry command if still needed.",
@@ -584,6 +602,12 @@ fn classify_web_error(error: &ToolError) -> ToolOutcome {
         ToolError::NotFound(_) => ToolOutcome::recoverable(
             ToolErrorClass::NotFound,
             "Requested web resource/session was not found. Fix identifiers and retry.",
+            false,
+            None,
+        ),
+        ToolError::NotVisible(_) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            "Web tool is registered but hidden in this provider round. Use a visible tool or request the needed domain before retrying.",
             false,
             None,
         ),

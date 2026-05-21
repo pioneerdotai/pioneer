@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryQualityAction",
+  "type": "string",
+  "enum": [
+    "candidate_policy",
+    "force_reject",
+    "quarantine",
+    "route_to_thread_episodic",
+    "route_to_task_state",
+    "route_to_domain_state"
+  ]
+}

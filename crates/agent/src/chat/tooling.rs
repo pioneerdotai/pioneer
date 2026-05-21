@@ -493,6 +493,9 @@ fn protocol_outcome_from_tool_outcome(outcome: &ToolOutcome) -> pioneer_protocol
                 pioneer_protocol::ToolErrorClass::InvalidArguments
             }
             pioneer_tools::ToolErrorClass::NotFound => pioneer_protocol::ToolErrorClass::NotFound,
+            pioneer_tools::ToolErrorClass::ToolNotVisible => {
+                pioneer_protocol::ToolErrorClass::ToolNotVisible
+            }
             pioneer_tools::ToolErrorClass::PermissionDenied => {
                 pioneer_protocol::ToolErrorClass::PermissionDenied
             }
@@ -1416,5 +1419,53 @@ mod tests {
 
         assert!(saw_llm_context);
         assert!(saw_completed);
+    }
+
+    #[test]
+    fn hidden_tool_failed_item_preserves_tool_not_visible_outcome() {
+        let outcome = pioneer_tools::ToolOutcome::recoverable(
+            pioneer_tools::ToolErrorClass::ToolNotVisible,
+            "Tool is registered but hidden in this provider round.",
+            false,
+            None,
+        );
+
+        let item = build_failed_tool_turn_item(
+            "call_hidden".to_owned(),
+            "hidden_tool".to_owned(),
+            "{}".to_owned(),
+            "tool not visible: hidden_tool".to_owned(),
+            outcome,
+            None,
+            None,
+            None,
+        );
+
+        let TurnItem::DynamicToolCall {
+            status,
+            success,
+            outcome,
+            recovery,
+            ..
+        } = item
+        else {
+            panic!("hidden tool failure should use normal dynamic tool call item");
+        };
+
+        assert_eq!(status, ToolCallStatus::Failed);
+        assert_eq!(success, Some(false));
+        let outcome = outcome.expect("failed hidden tool item should carry outcome");
+        assert_eq!(
+            outcome.status,
+            pioneer_protocol::ToolOutcomeStatus::RecoverableError
+        );
+        assert_eq!(
+            outcome.error_class,
+            Some(pioneer_protocol::ToolErrorClass::ToolNotVisible)
+        );
+        assert!(
+            recovery.is_some(),
+            "failed hidden tool item should expose normal recovery metadata"
+        );
     }
 }

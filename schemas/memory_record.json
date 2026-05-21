@@ -82,6 +82,16 @@
     "sensitivity": {
       "$ref": "#/$defs/MemorySensitivity"
     },
+    "source_context_kind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemorySourceContextKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "status": {
       "$ref": "#/$defs/MemoryStatus"
     },
@@ -174,9 +184,6 @@
             "null"
           ]
         },
-        "source_kind": {
-          "$ref": "#/$defs/MemorySourceKind"
-        },
         "source_thread_id": {
           "type": [
             "string",
@@ -189,10 +196,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "source_kind"
-      ]
+      }
     },
     "MemoryScope": {
       "type": "object",
@@ -228,16 +232,19 @@
         "regulated"
       ]
     },
-    "MemorySourceKind": {
+    "MemorySourceContextKind": {
       "type": "string",
       "enum": [
-        "explicit_user_request",
-        "user_correction",
-        "assistant_inference",
-        "background_extractor",
-        "tool_observation",
-        "import",
-        "system"
+        "direct_user_conversation",
+        "assistant_response",
+        "tool_result",
+        "task_runtime",
+        "system_runtime",
+        "developer_instruction",
+        "connector_content",
+        "imported_document",
+        "generated_summary",
+        "unknown"
       ]
     },
     "MemoryStatus": {

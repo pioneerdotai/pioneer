@@ -520,6 +520,7 @@ pub enum TurnPostTurnToolOutcomeStatus {
 pub enum TurnPostTurnToolErrorClass {
     InvalidArguments,
     NotFound,
+    ToolNotVisible,
     PermissionDenied,
     CommandNotFound,
     Timeout,

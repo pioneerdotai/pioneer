@@ -244,6 +244,7 @@ impl ToolOrchestrator {
             }
             ToolError::InvalidArguments(_)
             | ToolError::NotFound(_)
+            | ToolError::NotVisible(_)
             | ToolError::Rejected(_)
             | ToolError::Cancelled(_) => false,
         }

@@ -93,6 +93,16 @@ impl ToolRouter {
         self.visibility.set_visible_by_name(names).await;
     }
 
+    pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
+        if self.find_spec(call.tool_name.as_str()).is_some()
+            && !self.is_model_visible_tool(call.tool_name.as_str()).await
+        {
+            return Err(ToolError::not_visible(call.tool_name));
+        }
+
+        self.build_tool_call(call)
+    }
+
     pub fn find_spec(&self, tool_name: &str) -> Option<&ConfiguredToolSpec> {
         self.specs.get(tool_name)
     }
@@ -615,6 +625,85 @@ mod tests {
 
         assert!(!router.is_model_visible_tool("unknown_tool").await);
         assert!(router.find_spec("unknown_tool").is_none());
+    }
+
+    #[tokio::test]
+    async fn build_model_tool_call_rejects_hidden_registered_tool_before_argument_parsing() {
+        let router = router_with_specs(vec![
+            configured_spec(
+                "visible_tool",
+                PayloadKind::Function,
+                ExecutionClass::Shared,
+            ),
+            configured_spec("hidden_tool", PayloadKind::Function, ExecutionClass::Shared),
+        ]);
+
+        router
+            .set_model_visible_tools(&["visible_tool".to_owned()])
+            .await;
+
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_hidden".to_owned(),
+                tool_name: "hidden_tool".to_owned(),
+                arguments: "{not valid json".to_owned(),
+            })
+            .await
+            .expect_err("hidden registered tool should be rejected before parsing args");
+
+        assert!(matches!(error, ToolError::NotVisible(_)));
+    }
+
+    #[tokio::test]
+    async fn build_model_tool_call_preserves_unknown_tool_not_found() {
+        let router = router_with_specs(vec![configured_spec(
+            "visible_tool",
+            PayloadKind::Function,
+            ExecutionClass::Shared,
+        )]);
+
+        router
+            .set_model_visible_tools(&["visible_tool".to_owned()])
+            .await;
+
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_unknown".to_owned(),
+                tool_name: "unknown_tool".to_owned(),
+                arguments: "{}".to_owned(),
+            })
+            .await
+            .expect_err("unknown tool should still be not found");
+
+        assert!(matches!(error, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn build_model_tool_call_preserves_visible_tool_invalid_arguments() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "visible_tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "trigger": { "type": "object" }
+                }
+            }),
+        )]);
+
+        router
+            .set_model_visible_tools(&["visible_tool".to_owned()])
+            .await;
+
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_bad_args".to_owned(),
+                tool_name: "visible_tool".to_owned(),
+                arguments: r#"{"trigger":"bad"}"#.to_owned(),
+            })
+            .await
+            .expect_err("visible tool should still validate arguments normally");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
 
     #[test]

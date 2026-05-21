@@ -126,6 +126,7 @@ pub enum ToolOutcomeStatus {
 pub enum ToolErrorClass {
     InvalidArguments,
     NotFound,
+    ToolNotVisible,
     PermissionDenied,
     CommandNotFound,
     Timeout,
