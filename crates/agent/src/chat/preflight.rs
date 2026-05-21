@@ -3,7 +3,7 @@
 use pioneer_memory::hooks::{
     ActiveRecallPlan, ActiveRecallPlanJson, DeterministicRecallContextSummary,
     MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    parse_active_memory_decision_json,
+    normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_protocol::ThreadMode;
 use pioneer_tools::BuiltinToolDomain;
@@ -179,6 +179,27 @@ pub(crate) fn normalize_provider_turn_preflight_plan(
     plan
 }
 
+pub(crate) fn parse_provider_turn_preflight_plan_json(
+    raw: &str,
+) -> Result<ProviderTurnPreflightPlan, serde_json::Error> {
+    let plan = serde_json::from_str::<ProviderTurnPreflightPlan>(raw.trim())?;
+    validate_provider_turn_preflight_plan(&plan)?;
+    Ok(normalize_provider_turn_preflight_plan(plan))
+}
+
+pub(crate) fn validate_provider_turn_preflight_plan(
+    plan: &ProviderTurnPreflightPlan,
+) -> Result<(), serde_json::Error> {
+    if let Some(active_recall) = plan
+        .memory
+        .as_ref()
+        .and_then(|memory| memory.active_recall.as_ref())
+    {
+        parse_provider_memory_active_recall_plan(active_recall)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_visible_tool_names(tool_names: Vec<String>) -> Vec<String> {
     let mut normalized = tool_names
         .into_iter()
@@ -223,7 +244,7 @@ pub(crate) fn wrap_memory_active_recall_plan(
     TurnPreflightMemoryActiveRecallPlan {
         source,
         fallback_reason,
-        decision,
+        decision: normalize_active_recall_plan(decision),
     }
 }
 
@@ -744,6 +765,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_preflight_plan_json_parse_helper_is_strict_and_normalizes() {
+        let raw = json!({
+            "tools": {
+                "visibleTools": [" memory_get ", "", "memory_search", "memory_get"]
+            },
+            "memory": {
+                "activeRecall": {
+                    "status": "run",
+                    "reasonCode": "memory_likely",
+                    "confidence": 0.92,
+                    "modes": ["exact_canonical"],
+                    "targets": [
+                        {
+                            "canonicalKey": "identity.current_user.name"
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_provider_turn_preflight_plan_json(raw.as_str())
+            .expect("provider plan should parse and normalize");
+
+        assert_eq!(
+            parsed.tools.visible_tools,
+            vec!["memory_get".to_owned(), "memory_search".to_owned()]
+        );
+
+        let malformed = parse_provider_turn_preflight_plan_json("{");
+        assert!(malformed.is_err());
+
+        let host_owned = json!({
+            "source": "provider",
+            "tools": {
+                "visibleTools": []
+            }
+        })
+        .to_string();
+        let error = parse_provider_turn_preflight_plan_json(host_owned.as_str())
+            .expect_err("provider plan must reject top-level host-owned fields");
+        assert!(error.to_string().contains("source"));
+    }
+
+    #[test]
     fn provider_preflight_plan_normalizes_visible_tools_and_diagnostics() {
         let diagnostics = (0..20)
             .map(|index| TurnPreflightDiagnostic {
@@ -867,7 +933,7 @@ mod tests {
         value["memory"]["activeRecall"]["modes"] = json!([]);
 
         let parsed: ProviderTurnPreflightPlan =
-            serde_json::from_value(value).expect("provider plan shape parses");
+            serde_json::from_value(value.clone()).expect("provider plan shape parses");
         let active_recall = parsed
             .memory
             .expect("memory plan")
@@ -880,6 +946,55 @@ mod tests {
             error.to_string().contains("requires at least one mode"),
             "unexpected error: {error}"
         );
+
+        let raw = serde_json::to_string(&value).expect("provider plan serializes");
+        let error = parse_provider_turn_preflight_plan_json(raw.as_str())
+            .expect_err("full provider parse helper should validate active recall");
+        assert!(
+            error.to_string().contains("requires at least one mode"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn host_local_memory_active_recall_wrapper_uses_memory_normalization() {
+        let active_recall = wrap_memory_active_recall_plan(
+            TurnPreflightPlanSource::HostLocal,
+            None,
+            ActiveRecallPlan {
+                status: ActiveMemoryDecisionStatus::Run,
+                reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
+                confidence: 4.0,
+                modes: vec![
+                    ActiveRecallMode::Project,
+                    ActiveRecallMode::Profile,
+                    ActiveRecallMode::Profile,
+                ],
+                targets: Vec::new(),
+                debug_fallback: false,
+                provider_used: false,
+                provider_fallback_used: false,
+                provider_input_chars: None,
+                provider_output_chars: None,
+                diagnostics: vec![String::new(), "host_local".to_owned()],
+            },
+        );
+
+        assert_eq!(active_recall.decision.confidence, 1.0);
+        assert_eq!(active_recall.decision.modes.len(), 2);
+        assert!(
+            active_recall
+                .decision
+                .modes
+                .contains(&ActiveRecallMode::Profile)
+        );
+        assert!(
+            active_recall
+                .decision
+                .modes
+                .contains(&ActiveRecallMode::Project)
+        );
+        assert_eq!(active_recall.decision.diagnostics, vec!["host_local"]);
     }
 
     #[test]

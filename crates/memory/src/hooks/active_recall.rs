@@ -1434,7 +1434,7 @@ fn active_recall_input_length_bucket(char_count: usize) -> ActiveRecallInputLeng
     }
 }
 
-pub(super) fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallPlan {
+pub fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallPlan {
     plan.confidence = plan.confidence.clamp(0.0, 1.0);
     plan.modes = normalize_active_recall_modes(plan.modes);
     plan.targets = plan

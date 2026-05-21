@@ -65,7 +65,8 @@ use active_recall::*;
 pub use active_recall::{
     ActiveMemoryDecision, ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
     ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlan, ActiveRecallPlanJson,
-    ActiveRecallPlanJsonStatus, ActiveRecallTarget, parse_active_memory_decision_json,
+    ActiveRecallPlanJsonStatus, ActiveRecallTarget, normalize_active_recall_plan,
+    parse_active_memory_decision_json,
 };
 pub use artifact_store::*;
 use capabilities::*;
