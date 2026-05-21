@@ -85,6 +85,10 @@ impl ToolRouter {
         self.visibility.get().await
     }
 
+    pub async fn is_model_visible_tool(&self, tool_name: &str) -> bool {
+        self.visibility.contains_name(tool_name).await
+    }
+
     pub async fn set_model_visible_tools(&self, names: &[String]) {
         self.visibility.set_visible_by_name(names).await;
     }
@@ -592,6 +596,25 @@ mod tests {
         assert_eq!(visible[0].name, "tool_a");
 
         assert!(router.find_spec("tool_b").is_some());
+    }
+
+    #[tokio::test]
+    async fn router_reports_only_currently_visible_tools() {
+        let router = router_with_specs(vec![
+            configured_spec("tool_a", PayloadKind::Function, ExecutionClass::Shared),
+            configured_spec("tool_b", PayloadKind::Function, ExecutionClass::Shared),
+        ]);
+
+        router.set_model_visible_tools(&["tool_a".to_owned()]).await;
+
+        assert!(router.is_model_visible_tool("tool_a").await);
+        assert!(router.find_spec("tool_a").is_some());
+
+        assert!(!router.is_model_visible_tool("tool_b").await);
+        assert!(router.find_spec("tool_b").is_some());
+
+        assert!(!router.is_model_visible_tool("unknown_tool").await);
+        assert!(router.find_spec("unknown_tool").is_none());
     }
 
     #[test]
