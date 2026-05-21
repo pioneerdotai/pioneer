@@ -8,8 +8,9 @@ use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{ToolOutputPolicySnapshot, ToolOutputProjectionKind};
 use crate::registry::ToolRegistry;
 use crate::spec::{
-    ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolIdempotencyMode, ToolPayloadBinding,
-    ToolRecoveryMetadata, ToolSpec,
+    ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_DOMAIN_VALUES,
+    REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode, ToolPayloadBinding, ToolRecoveryMetadata,
+    ToolSpec,
 };
 use crate::visibility::ToolVisibilitySnapshot;
 use serde_json::Value as JsonValue;
@@ -236,6 +237,9 @@ impl ToolRouter {
                 let parsed = parse_json_arguments(arguments)?;
                 let normalized =
                     normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
+                if tool_name == REQUEST_TOOLS_TOOL_NAME {
+                    validate_request_tools_arguments(&normalized.arguments)?;
+                }
                 Ok((
                     ToolPayload::Function {
                         arguments: normalized.arguments,
@@ -419,6 +423,66 @@ fn parse_json_arguments(arguments: &str) -> Result<JsonValue, ToolError> {
     })
 }
 
+fn validate_request_tools_arguments(arguments: &JsonValue) -> Result<(), ToolError> {
+    let object = arguments.as_object().ok_or_else(|| {
+        ToolError::invalid_arguments("request_tools arguments must be a JSON object")
+    })?;
+
+    for key in object.keys() {
+        if key != "domains" && key != "reason" {
+            return Err(ToolError::invalid_arguments(format!(
+                "request_tools does not accept `{key}`"
+            )));
+        }
+    }
+
+    let domains = object
+        .get("domains")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            ToolError::invalid_arguments("request_tools `domains` must be a non-empty array")
+        })?;
+
+    if domains.is_empty() {
+        return Err(ToolError::invalid_arguments(
+            "request_tools `domains` must be a non-empty array",
+        ));
+    }
+
+    for domain in domains {
+        let Some(domain) = domain.as_str() else {
+            return Err(ToolError::invalid_arguments(
+                "request_tools `domains` entries must be strings",
+            ));
+        };
+        if !REQUEST_TOOLS_DOMAIN_VALUES.contains(&domain) {
+            return Err(ToolError::invalid_arguments(format!(
+                "invalid request_tools domain `{domain}`; expected one of: {}",
+                REQUEST_TOOLS_DOMAIN_VALUES.join(", ")
+            )));
+        }
+    }
+
+    let reason = object
+        .get("reason")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| ToolError::invalid_arguments("request_tools `reason` is required"))?;
+
+    if reason.trim().is_empty() {
+        return Err(ToolError::invalid_arguments(
+            "request_tools `reason` must be a non-empty string",
+        ));
+    }
+
+    if reason.chars().count() > 512 {
+        return Err(ToolError::invalid_arguments(
+            "request_tools `reason` must be at most 512 characters",
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +513,13 @@ mod tests {
             ExecutionClass::Shared,
             crate::dynamic_unknown_output_policy(),
         )
+    }
+
+    fn request_tools_configured_spec() -> ConfiguredToolSpec {
+        crate::builtin_tool_specs()
+            .into_iter()
+            .find(|configured| configured.spec.name == REQUEST_TOOLS_TOOL_NAME)
+            .expect("request_tools builtin spec should exist")
     }
 
     fn router_with_specs(specs: Vec<ConfiguredToolSpec>) -> ToolRouter {
@@ -702,6 +773,74 @@ mod tests {
             })
             .await
             .expect_err("visible tool should still validate arguments normally");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_accepts_valid_domain_arguments() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["memory","task"],"reason":"Need memory and subtasks."}"#
+                    .to_owned(),
+            })
+            .expect("valid request_tools call should parse");
+
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                assert_eq!(arguments["domains"][0], "memory");
+                assert_eq!(arguments["domains"][1], "task");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_tools_rejects_empty_domains() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_empty".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":[],"reason":"Need tools."}"#.to_owned(),
+            })
+            .expect_err("empty request_tools domains should fail");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_rejects_unknown_domain_values() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_unknown".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["calendar"],"reason":"Need calendar tools."}"#.to_owned(),
+            })
+            .expect_err("unknown request_tools domains should fail");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn request_tools_rejects_individual_tool_name_domains() {
+        let router = router_with_specs(vec![request_tools_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_request_tools_name".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: r#"{"domains":["task_create"],"reason":"Need to create a task."}"#
+                    .to_owned(),
+            })
+            .expect_err("request_tools must accept domains, not individual tool names");
 
         assert!(matches!(error, ToolError::InvalidArguments(_)));
     }

@@ -456,7 +456,8 @@ pub fn build_builtin_tools(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildToolsError, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig, build_tools,
+        BuildToolsError, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig,
+        build_builtin_tools, build_tools,
     };
     use crate::context::{FunctionToolOutput, ToolInvocation};
     use crate::events::ToolEventTrace;
@@ -582,6 +583,22 @@ mod tests {
             .await
             .expect("tool execution should succeed");
         assert_eq!(result.raw_output_text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn request_tools_is_in_default_model_visible_specs() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_request_tools_visible",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let visible = built.router.model_visible_specs().await;
+        assert!(
+            visible.iter().any(|spec| spec.name == "request_tools"),
+            "request_tools must be visible in the default tool-enabled provider catalog"
+        );
     }
 
     #[tokio::test]

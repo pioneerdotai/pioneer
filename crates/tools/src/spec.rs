@@ -3,6 +3,9 @@ use serde_json::Value as JsonValue;
 
 use crate::output_policy::{ToolOutputPolicy, ToolOutputProjectionKind, builtin_output_policy};
 
+pub const REQUEST_TOOLS_TOOL_NAME: &str = "request_tools";
+pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &["memory", "task", "artifact", "computer_use"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionClass {
@@ -274,6 +277,19 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 can_resume: true,
             },
         ),
+        configured_builtin_spec(
+            REQUEST_TOOLS_TOOL_NAME,
+            "Request hidden builtin tool domains for the next provider round. Pass domain names only, not individual tool names.",
+            request_tools_schema(),
+            PayloadKind::Function,
+            ExecutionClass::Shared,
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Arguments,
+                idempotency_mode: ToolIdempotencyMode::Safe,
+                max_attempts: 2,
+                can_resume: false,
+            },
+        ),
     ];
 
     with_optional_builtin_tool_specs(specs)
@@ -478,6 +494,31 @@ fn download_url_schema() -> JsonValue {
     })
 }
 
+fn request_tools_schema() -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "domains": {
+                "type": "array",
+                "description": "Hidden builtin domains to make available in the next provider round. Use domain enum values, not individual tool names.",
+                "items": {
+                    "type": "string",
+                    "enum": REQUEST_TOOLS_DOMAIN_VALUES
+                },
+                "minItems": 1
+            },
+            "reason": {
+                "type": "string",
+                "description": "Short diagnostic reason for requesting hidden tool domains.",
+                "minLength": 1,
+                "maxLength": 512
+            }
+        },
+        "required": ["domains", "reason"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(feature = "computer-use")]
 fn computer_use_schema() -> JsonValue {
     serde_json::json!({
@@ -617,6 +658,10 @@ mod tests {
             Some(&ExecutionClass::SessionScoped)
         );
         assert_eq!(by_name.get("read_file"), Some(&ExecutionClass::Shared));
+        assert_eq!(
+            by_name.get(REQUEST_TOOLS_TOOL_NAME),
+            Some(&ExecutionClass::Shared)
+        );
     }
 
     #[test]
@@ -678,5 +723,40 @@ mod tests {
                 configured.spec.name
             );
         }
+    }
+
+    #[test]
+    fn request_tools_schema_defines_strict_domain_contract() {
+        let specs = builtin_tool_specs();
+        let request_tools = specs
+            .iter()
+            .find(|configured| configured.spec.name == REQUEST_TOOLS_TOOL_NAME)
+            .expect("request_tools spec should exist");
+
+        assert_eq!(request_tools.spec.payload_kind, PayloadKind::Function);
+        assert_eq!(
+            request_tools.spec.parameters["required"],
+            serde_json::json!(["domains", "reason"])
+        );
+        assert_eq!(
+            request_tools.spec.parameters["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            request_tools.spec.parameters["properties"]["domains"]["minItems"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            request_tools.spec.parameters["properties"]["domains"]["items"]["enum"],
+            serde_json::json!(REQUEST_TOOLS_DOMAIN_VALUES)
+        );
+        assert!(
+            !request_tools.spec.parameters["properties"]["domains"]["items"]["enum"]
+                .as_array()
+                .expect("domain enum should be an array")
+                .iter()
+                .any(|value| value.as_str() == Some("task_create")),
+            "request_tools must accept domains, not individual tool names"
+        );
     }
 }
