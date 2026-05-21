@@ -2,6 +2,7 @@ pub mod memory_active_recall_planner;
 pub mod memory_post_turn_extractor;
 pub mod memory_recall;
 pub mod memory_turn_policy;
+pub mod request_tools;
 pub mod task_run;
 pub mod text;
 pub mod tool_loop;

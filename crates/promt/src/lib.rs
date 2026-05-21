@@ -37,6 +37,11 @@ pub use render::{
     memory_turn_policy::{
         MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,
     },
+    request_tools::{
+        REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID, REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE,
+        render_request_tools_hidden_domain_catalog_prompt,
+        request_tools_hidden_domain_catalog_section, runtime_sections_with_request_tools_catalog,
+    },
     task_run::{TaskRunPromptCompiler, TaskRunPromptInput},
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},

@@ -38,7 +38,8 @@ use pioneer_promt::{
     CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId,
     PromptLimits, PromptProfile, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
     PromptRuntimeSectionInput, ToolRetryInstructionKind, compile_prompt,
-    render_tool_retry_instruction, tool_loop_final_answer_instruction,
+    render_tool_retry_instruction, runtime_sections_with_request_tools_catalog,
+    tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
@@ -485,6 +486,7 @@ fn compile_agent_prompt_bundle(
     retry_instruction: Option<String>,
     runtime_sections: &[PromptRuntimeSectionInput],
     include_task_orchestration_policy: bool,
+    include_request_tools_catalog: bool,
     continue_generation_hint: bool,
     thread_id: &str,
     turn_id: &str,
@@ -502,6 +504,7 @@ fn compile_agent_prompt_bundle(
         retry_instruction,
         runtime_sections,
         include_task_orchestration_policy,
+        include_request_tools_catalog,
         continue_generation_hint,
         thread_id,
         turn_id,
@@ -514,16 +517,23 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     retry_instruction: Option<String>,
     runtime_sections: &[PromptRuntimeSectionInput],
     include_task_orchestration_policy: bool,
+    include_request_tools_catalog: bool,
     continue_generation_hint: bool,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CompiledPromptBundle, ChatTurnError> {
     let now = Local::now();
+
     let extra_system = format!(
         "## Runtime\nCurrent date/time: {} ({})\nOS: {}",
         now.format("%Y-%m-%d %H:%M:%S"),
         now.format("%Z"),
         std::env::consts::OS,
+    );
+
+    let runtime_sections = runtime_sections_with_request_tools_catalog(
+        runtime_sections,
+        include_request_tools_catalog,
     );
 
     let bundle = compile_prompt(PromptCompileInput {
@@ -534,7 +544,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         include_tool_recovery_policy: true,
         include_task_orchestration_policy,
         continue_generation_hint,
-        runtime_sections: runtime_sections.to_vec(),
+        runtime_sections,
         dynamic_sections: Vec::new(),
         dynamic_context: None,
         extra_system: Some(extra_system),
@@ -1588,6 +1598,7 @@ async fn execute_agent_provider_response(
             None,
             prompt_sections.runtime_sections.as_slice(),
             include_task_orchestration_policy,
+            false,
             continue_generation_hint,
             thread_id,
             turn_id,
@@ -1865,6 +1876,7 @@ async fn execute_agent_provider_response(
         None,
         prompt_sections.runtime_sections.as_slice(),
         include_task_orchestration_policy,
+        true,
         continue_generation_hint,
         thread_id,
         turn_id,
@@ -2025,6 +2037,7 @@ async fn execute_agent_provider_response(
                         next_retry_instruction.clone(),
                         prompt_sections.runtime_sections.as_slice(),
                         include_task_orchestration_policy,
+                        round_plan.tools_enabled,
                         continue_generation_hint,
                         thread_id,
                         turn_id,
@@ -2103,6 +2116,7 @@ async fn execute_agent_provider_response(
                     applied_retry_instruction.clone(),
                     no_tool_prompt_sections.runtime_sections.as_slice(),
                     include_task_orchestration_policy,
+                    false,
                     continue_generation_hint,
                     thread_id,
                     turn_id,
@@ -2191,6 +2205,7 @@ async fn execute_agent_provider_response(
                             pending_retry_instruction.clone(),
                             prompt_sections.runtime_sections.as_slice(),
                             include_task_orchestration_policy,
+                            false,
                             continue_generation_hint,
                             thread_id,
                             turn_id,
@@ -2883,6 +2898,7 @@ async fn execute_agent_provider_response(
                 .iter()
                 .map(ExecutedToolResult::retry_observation)
                 .collect::<Vec<_>>();
+            let mut next_round_tools_enabled = true;
             pending_retry_instruction = match tool_retry_controller.decide(&retry_observations) {
                 ToolRetryDecision::None { drafts } => {
                     emit_tool_retry_drafts(
@@ -2929,6 +2945,7 @@ async fn execute_agent_provider_response(
                         &prompt.fact_lines(),
                     );
                     if let Some(instruction) = exhausted_instruction.clone() {
+                        next_round_tools_enabled = false;
                         match tool_loop_guard.request_final_answer_with_instruction(instruction) {
                             Ok(instruction) => Some(instruction),
                             Err(message) => {
@@ -2953,6 +2970,7 @@ async fn execute_agent_provider_response(
                     next_retry_instruction.clone(),
                     prompt_sections.runtime_sections.as_slice(),
                     include_task_orchestration_policy,
+                    next_round_tools_enabled,
                     continue_generation_hint,
                     thread_id,
                     turn_id,
@@ -3772,6 +3790,7 @@ mod tests {
             &[],
             false,
             false,
+            false,
             "thread_test",
             "turn_test",
         )
@@ -3801,6 +3820,7 @@ mod tests {
             &[agents_section],
             false,
             false,
+            false,
             "thread_agents_md",
             "turn_agents_md",
         )
@@ -3814,6 +3834,84 @@ mod tests {
         assert_eq!(agents_section.title, "AGENTS.md");
         assert!(bundle.dynamic_system_text.contains("## AGENTS.md"));
         assert!(bundle.dynamic_system_text.contains("Use repo rules."));
+    }
+
+    #[test]
+    fn request_tools_catalog_is_compiled_for_tool_enabled_prompt_bundle() {
+        let runtime_home = temp_dir("request_tools_catalog_prompt");
+
+        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+            runtime_home.as_path(),
+            None,
+            None,
+            &[],
+            false,
+            true,
+            false,
+            "thread_request_tools_catalog",
+            "turn_request_tools_catalog",
+        )
+        .expect("compile prompt bundle");
+
+        let catalog_section = bundle
+            .sections
+            .iter()
+            .find(|section| {
+                section.id.manifest_id() == pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID
+            })
+            .expect("request_tools catalog section should be compiled");
+        assert_eq!(
+            catalog_section.title,
+            pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE
+        );
+        assert!(bundle.dynamic_system_text.contains(
+            "If you need a hidden domain and its tools are not currently visible, call request_tools"
+        ));
+        for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
+            let expected = format!("- {}: {}.", domain.as_str(), tool_names.join(", "));
+            assert!(
+                bundle.dynamic_system_text.contains(expected.as_str()),
+                "catalog missing domain line `{expected}`"
+            );
+        }
+        assert!(!bundle.dynamic_system_text.contains("\"parameters\""));
+        assert!(!bundle.dynamic_system_text.contains("\"properties\""));
+        assert!(
+            !bundle
+                .dynamic_system_text
+                .contains("\"additionalProperties\"")
+        );
+    }
+
+    #[test]
+    fn request_tools_catalog_is_omitted_from_no_tool_prompt_bundle() {
+        let runtime_home = temp_dir("request_tools_catalog_no_tools");
+
+        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+            runtime_home.as_path(),
+            None,
+            None,
+            &[],
+            false,
+            false,
+            false,
+            "thread_no_request_tools_catalog",
+            "turn_no_request_tools_catalog",
+        )
+        .expect("compile prompt bundle");
+
+        assert!(
+            !bundle
+                .sections
+                .iter()
+                .any(|section| section.id.manifest_id()
+                    == pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID)
+        );
+        assert!(
+            !bundle
+                .dynamic_system_text
+                .contains("Some tool domains and their tools are hidden until requested")
+        );
     }
 
     #[test]
