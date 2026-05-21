@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::domain::REQUEST_TOOLS_DOMAIN_VALUES;
+use crate::domain::{REQUEST_TOOLS_DOMAIN_VALUES, REQUEST_TOOLS_REASON_MAX_CHARS};
 use crate::output_policy::{ToolOutputPolicy, ToolOutputProjectionKind, builtin_output_policy};
 
 pub const REQUEST_TOOLS_TOOL_NAME: &str = "request_tools";
@@ -511,7 +511,7 @@ fn request_tools_schema() -> JsonValue {
                 "type": "string",
                 "description": "Short diagnostic reason for requesting hidden tool domains.",
                 "minLength": 1,
-                "maxLength": 512
+                "maxLength": REQUEST_TOOLS_REASON_MAX_CHARS
             }
         },
         "required": ["domains", "reason"],

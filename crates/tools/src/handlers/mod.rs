@@ -5,6 +5,7 @@ mod apply_patch;
 mod files;
 mod http;
 mod mcp;
+mod request_tools;
 mod shell;
 mod skill;
 mod web;
@@ -19,6 +20,7 @@ pub use mcp::{
     McpDynamicToolDescriptor, McpRuntimeToolMaterialization, McpToolCallOutput, McpToolCallRequest,
     McpToolExecutor, materialize_mcp_runtime_tools,
 };
+pub use request_tools::{RequestToolsDomainDiagnostic, RequestToolsHandler, RequestToolsResult};
 pub use shell::UnifiedExecHandler;
 pub use skill::{
     ExcludedSkillRuntimeTool, SkillDynamicToolDescriptor, SkillDynamicToolKind,

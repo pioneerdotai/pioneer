@@ -1,7 +1,7 @@
 use crate::context::{
     ExecCommandArgs, LocalShellPayload, ToolCallSource, ToolInvocation, ToolPayload, WriteStdinArgs,
 };
-use crate::domain::REQUEST_TOOLS_DOMAIN_VALUES;
+use crate::domain::parse_request_tools_domains;
 use crate::error::ToolError;
 use crate::events::{ToolEventBus, ToolEventTrace};
 use crate::normalize_tool_arguments_from_schema;
@@ -238,7 +238,8 @@ impl ToolRouter {
                 let normalized =
                     normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
                 if tool_name == REQUEST_TOOLS_TOOL_NAME {
-                    validate_request_tools_arguments(&normalized.arguments)?;
+                    parse_request_tools_domains(&normalized.arguments)
+                        .map_err(ToolError::invalid_arguments)?;
                 }
                 Ok((
                     ToolPayload::Function {
@@ -421,66 +422,6 @@ fn parse_json_arguments(arguments: &str) -> Result<JsonValue, ToolError> {
     serde_json::from_str::<JsonValue>(trimmed).map_err(|error| {
         ToolError::invalid_arguments(format!("failed to parse tool arguments as JSON: {error}"))
     })
-}
-
-fn validate_request_tools_arguments(arguments: &JsonValue) -> Result<(), ToolError> {
-    let object = arguments.as_object().ok_or_else(|| {
-        ToolError::invalid_arguments("request_tools arguments must be a JSON object")
-    })?;
-
-    for key in object.keys() {
-        if key != "domains" && key != "reason" {
-            return Err(ToolError::invalid_arguments(format!(
-                "request_tools does not accept `{key}`"
-            )));
-        }
-    }
-
-    let domains = object
-        .get("domains")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            ToolError::invalid_arguments("request_tools `domains` must be a non-empty array")
-        })?;
-
-    if domains.is_empty() {
-        return Err(ToolError::invalid_arguments(
-            "request_tools `domains` must be a non-empty array",
-        ));
-    }
-
-    for domain in domains {
-        let Some(domain) = domain.as_str() else {
-            return Err(ToolError::invalid_arguments(
-                "request_tools `domains` entries must be strings",
-            ));
-        };
-        if !REQUEST_TOOLS_DOMAIN_VALUES.contains(&domain) {
-            return Err(ToolError::invalid_arguments(format!(
-                "invalid request_tools domain `{domain}`; expected one of: {}",
-                REQUEST_TOOLS_DOMAIN_VALUES.join(", ")
-            )));
-        }
-    }
-
-    let reason = object
-        .get("reason")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| ToolError::invalid_arguments("request_tools `reason` is required"))?;
-
-    if reason.trim().is_empty() {
-        return Err(ToolError::invalid_arguments(
-            "request_tools `reason` must be a non-empty string",
-        ));
-    }
-
-    if reason.chars().count() > 512 {
-        return Err(ToolError::invalid_arguments(
-            "request_tools `reason` must be at most 512 characters",
-        ));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

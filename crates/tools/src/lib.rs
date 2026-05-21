@@ -44,8 +44,9 @@ pub use events::{
 pub use handlers::{
     ExcludedMcpRuntimeTool, ExcludedSkillRuntimeTool, McpDynamicToolAnnotations,
     McpDynamicToolBinding, McpDynamicToolDescriptor, McpRuntimeToolMaterialization,
-    McpToolCallOutput, McpToolCallRequest, McpToolExecutor, SkillDynamicToolDescriptor,
-    SkillDynamicToolKind, SkillReadToolConfig, SkillReadToolEntry, SkillRuntimeToolMaterialization,
+    McpToolCallOutput, McpToolCallRequest, McpToolExecutor, RequestToolsDomainDiagnostic,
+    RequestToolsHandler, RequestToolsResult, SkillDynamicToolDescriptor, SkillDynamicToolKind,
+    SkillReadToolConfig, SkillReadToolEntry, SkillRuntimeToolMaterialization,
     SkillRuntimeToolPolicyDiagnostic, materialize_mcp_runtime_tools,
     materialize_skill_runtime_tools,
 };
@@ -82,9 +83,9 @@ pub use router::{RawToolCall, ToolCall, ToolRouter};
 pub use runtime::ToolCallRuntime;
 pub use shell_format::{ExecModelPayload, ExecPayloadInput, ExecTruncation, render_exec_ui_text};
 pub use spec::{
-    ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolIdempotencyMode, ToolPayloadBinding,
-    ToolRecoveryMetadata, ToolRetryClass, ToolSpec, builtin_tool_recovery_metadata,
-    builtin_tool_specs,
+    ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
+    ToolPayloadBinding, ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
+    builtin_tool_recovery_metadata, builtin_tool_specs,
 };
 pub use visibility::ToolVisibilitySnapshot;
 pub use web::{
@@ -376,6 +377,11 @@ pub fn build_tools_with_environment(
 
     let mut builder = ToolRegistryBuilder::new();
 
+    let registered_tool_names = configured_specs
+        .iter()
+        .map(|configured| configured.spec.name.clone())
+        .collect::<Vec<_>>();
+
     for configured_spec in configured_specs {
         builder.push_configured_spec(configured_spec);
     }
@@ -398,6 +404,13 @@ pub fn build_tools_with_environment(
     builder.register_handler(
         "download_url",
         Arc::new(DownloadUrlHandler::new(web_tools_config)),
+    );
+    builder.register_handler(
+        REQUEST_TOOLS_TOOL_NAME,
+        Arc::new(RequestToolsHandler::new(
+            visibility.clone(),
+            registered_tool_names,
+        )),
     );
 
     #[cfg(feature = "computer-use")]
@@ -606,6 +619,89 @@ mod tests {
             visible.iter().any(|spec| spec.name == "request_tools"),
             "request_tools must be visible in the default tool-enabled provider catalog"
         );
+        assert!(
+            built.router.has_handler("request_tools"),
+            "request_tools must have a runtime handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_tools_runtime_returns_compact_domain_result() {
+        let extension_specs = ["artifact_prepare", "artifact_register"]
+            .into_iter()
+            .map(|name| {
+                ConfiguredToolSpec::new(
+                    ToolSpec::new(
+                        name,
+                        "Artifact domain test tool",
+                        serde_json::json!({"type":"object"}),
+                        PayloadKind::Function,
+                    ),
+                    ExecutionClass::Shared,
+                    dynamic_unknown_output_policy(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let built = build_tools(
+            ".",
+            "turn_request_tools_result",
+            test_web_config(),
+            test_computer_use_config(),
+            vec![ToolExtensionBundle {
+                specs: extension_specs,
+                handlers: vec![
+                    ("artifact_prepare".to_owned(), Arc::new(EchoHandler)),
+                    ("artifact_register".to_owned(), Arc::new(EchoHandler)),
+                ],
+            }],
+        )
+        .expect("tools must build");
+
+        built
+            .router
+            .set_model_visible_tools(&["request_tools".to_owned(), "read_file".to_owned()])
+            .await;
+
+        let call = built
+            .router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_request_tools_result".to_owned(),
+                tool_name: "request_tools".to_owned(),
+                arguments: serde_json::json!({
+                    "domains": ["artifact", "memory", "artifact"],
+                    "reason": "Need artifact and memory tools."
+                })
+                .to_string(),
+            })
+            .await
+            .expect("request_tools call should parse");
+
+        let result = built
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("request_tools should execute");
+        let output = serde_json::from_value::<crate::RequestToolsResult>(result.raw_output_json())
+            .expect("request_tools output should match compact result contract");
+
+        assert_eq!(
+            output.added.get("artifact"),
+            Some(&vec![
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned()
+            ])
+        );
+        assert_eq!(output.unknown_or_unavailable.len(), 1);
+        assert_eq!(output.unknown_or_unavailable[0].domain, "memory");
+        assert!(output.already_visible.is_empty());
+        assert!(output.blocked.is_empty());
+
+        let model_text = result.model_visible_text();
+        assert!(model_text.contains("\"added\""));
+        assert!(!model_text.contains("\"parameters\""));
+        assert!(!model_text.contains("\"properties\""));
+        assert!(!model_text.contains("\"additionalProperties\""));
     }
 
     #[tokio::test]

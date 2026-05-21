@@ -3280,7 +3280,10 @@ mod tests {
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
         Role,
     };
-    use pioneer_tools::{BuiltinToolDomain, ToolErrorClass, ToolOutcome};
+    use pioneer_tools::{
+        BuiltinToolDomain, ComputerUseToolsConfig, RequestToolsResult, ToolErrorClass, ToolOutcome,
+        WebToolsConfig,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
@@ -3300,6 +3303,92 @@ mod tests {
             recovery_view: None,
             message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
         }
+    }
+
+    fn test_web_config() -> WebToolsConfig {
+        WebToolsConfig {
+            default_timeout_ms: 20_000,
+            hard_max_timeout_ms: 120_000,
+            default_fetch_max_bytes: 2 * 1024 * 1024,
+            hard_fetch_max_bytes: 8 * 1024 * 1024,
+            default_download_max_bytes: 128 * 1024 * 1024,
+            hard_download_max_bytes: 1024 * 1024 * 1024,
+            default_max_results: 8,
+            hard_max_results: 20,
+            default_snippet_chars: 420,
+            hard_max_snippet_chars: 4_096,
+            default_link_count: 40,
+            hard_link_count: 200,
+            default_render_max_chars: 40_000,
+            ddg_html_search_url: "https://duckduckgo.com/html/".to_owned(),
+            ddg_instant_api_url: "https://api.duckduckgo.com/".to_owned(),
+            default_user_agent: "Mozilla/5.0".to_owned(),
+        }
+    }
+
+    fn test_computer_use_config() -> ComputerUseToolsConfig {
+        ComputerUseToolsConfig {
+            runtime_home_dir: std::env::temp_dir().join("pioneer-agent-request-tools-tests"),
+            artifacts_subdir: "tools/computer_use".to_owned(),
+            retention_hours: 24,
+            max_total_bytes: 1024 * 1024 * 1024,
+            run_max_steps_default: 30,
+            ..ComputerUseToolsConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn request_tools_control_result_reports_unavailable_without_schema_leak() {
+        let built = pioneer_tools::build_builtin_tools(
+            ".",
+            "turn_agent_request_tools_result",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+        built
+            .router
+            .set_model_visible_tools(&["request_tools".to_owned()])
+            .await;
+
+        let call = built
+            .router
+            .build_model_tool_call(pioneer_tools::RawToolCall {
+                call_id: "call_agent_request_tools".to_owned(),
+                tool_name: "request_tools".to_owned(),
+                arguments: serde_json::json!({
+                    "domains": ["memory", "memory"],
+                    "reason": "Need memory tools."
+                })
+                .to_string(),
+            })
+            .await
+            .expect("request_tools call should parse");
+
+        let result = built
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("request_tools should execute");
+        let output = serde_json::from_value::<RequestToolsResult>(result.raw_output_json())
+            .expect("request_tools output should match result contract");
+
+        assert!(output.added.is_empty());
+        assert_eq!(output.unknown_or_unavailable.len(), 1);
+        assert_eq!(output.unknown_or_unavailable[0].domain, "memory");
+        assert_eq!(
+            output.unknown_or_unavailable[0].tools,
+            BuiltinToolDomain::Memory
+                .tool_names()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let text = result.model_visible_text();
+        assert!(text.contains("\"unknownOrUnavailable\""));
+        assert!(!text.contains("\"parameters\""));
+        assert!(!text.contains("\"properties\""));
+        assert!(!text.contains("\"additionalProperties\""));
     }
 
     #[test]

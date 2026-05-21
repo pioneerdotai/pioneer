@@ -7,7 +7,6 @@ pub const MEMORY_DOMAIN_TOOL_NAMES: &[&str] = &[
     "memory_remember",
     "memory_forget",
 ];
-
 pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_create",
     "task_wait",
@@ -20,10 +19,9 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_pause",
     "task_resume",
 ];
-
 pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] = &["artifact_prepare", "artifact_register"];
-
 pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
+pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
 pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
     BuiltinToolDomain::Memory.as_str(),
@@ -81,6 +79,73 @@ impl BuiltinToolDomain {
             _ => None,
         }
     }
+}
+
+pub fn parse_request_tools_domains(
+    arguments: &serde_json::Value,
+) -> Result<Vec<BuiltinToolDomain>, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "request_tools arguments must be a JSON object".to_owned())?;
+
+    for key in object.keys() {
+        if key != "domains" && key != "reason" {
+            return Err(format!("request_tools does not accept `{key}`"));
+        }
+    }
+
+    let domains = object
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "request_tools `domains` must be a non-empty array".to_owned())?;
+
+    if domains.is_empty() {
+        return Err("request_tools `domains` must be a non-empty array".to_owned());
+    }
+
+    let mut parsed = Vec::with_capacity(domains.len());
+
+    for domain in domains {
+        let Some(domain) = domain.as_str() else {
+            return Err("request_tools `domains` entries must be strings".to_owned());
+        };
+        let Some(domain) = BuiltinToolDomain::parse(domain) else {
+            return Err(format!(
+                "invalid request_tools domain `{domain}`; expected one of: {}",
+                REQUEST_TOOLS_DOMAIN_VALUES.join(", ")
+            ));
+        };
+        parsed.push(domain);
+    }
+
+    let reason = object
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "request_tools `reason` is required".to_owned())?;
+
+    if reason.trim().is_empty() {
+        return Err("request_tools `reason` must be a non-empty string".to_owned());
+    }
+
+    if reason.chars().count() > REQUEST_TOOLS_REASON_MAX_CHARS {
+        return Err(format!(
+            "request_tools `reason` must be at most {REQUEST_TOOLS_REASON_MAX_CHARS} characters"
+        ));
+    }
+
+    Ok(parsed)
+}
+
+pub fn dedupe_request_tools_domains(
+    domains: impl IntoIterator<Item = BuiltinToolDomain>,
+) -> Vec<BuiltinToolDomain> {
+    let mut deduped = Vec::new();
+    for domain in domains {
+        if !deduped.contains(&domain) {
+            deduped.push(domain);
+        }
+    }
+    deduped
 }
 
 pub fn builtin_tool_domain_map() -> &'static [(BuiltinToolDomain, &'static [&'static str])] {
@@ -195,6 +260,37 @@ mod tests {
 
         assert_eq!(BuiltinToolDomain::parse("task_create"), None);
         assert_eq!(BuiltinToolDomain::parse("mcp_server_tool"), None);
+    }
+
+    #[test]
+    fn parse_request_tools_domains_rejects_invalid_tool_name_domains() {
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["task_create"],
+            "reason": "Need task tools."
+        }))
+        .expect_err("tool names must not be accepted as request_tools domains");
+
+        assert!(error.contains("invalid request_tools domain `task_create`"));
+    }
+
+    #[test]
+    fn dedupe_request_tools_domains_preserves_first_request_order() {
+        let deduped = dedupe_request_tools_domains([
+            BuiltinToolDomain::Task,
+            BuiltinToolDomain::Memory,
+            BuiltinToolDomain::Task,
+            BuiltinToolDomain::Artifact,
+            BuiltinToolDomain::Memory,
+        ]);
+
+        assert_eq!(
+            deduped,
+            vec![
+                BuiltinToolDomain::Task,
+                BuiltinToolDomain::Memory,
+                BuiltinToolDomain::Artifact,
+            ]
+        );
     }
 
     #[cfg(feature = "computer-use")]
