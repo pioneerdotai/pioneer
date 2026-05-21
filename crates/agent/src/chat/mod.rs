@@ -68,8 +68,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const TURN_ITEM_ID_LEN: usize = 21;
-const DISCOVERY_TOOL_SEARCH: &str = "tool_search";
-const DISCOVERY_TOOL_SUGGEST: &str = "tool_suggest";
 const PROVIDER_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDER_INTER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
@@ -1840,7 +1838,7 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
-    let mut visible_tool_names = all_tool_names.clone();
+    let visible_tool_names = all_tool_names.clone();
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -2802,12 +2800,6 @@ async fn execute_agent_provider_response(
                 executed_results
                     .iter()
                     .map(post_turn_domain_event_summary_from_tool),
-            );
-
-            tooling::maybe_update_visible_tools_from_suggestions(
-                executed_results.as_slice(),
-                all_tool_names.as_slice(),
-                &mut visible_tool_names,
             );
 
             let retry_observations = executed_results

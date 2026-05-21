@@ -920,11 +920,11 @@ impl LoopBudgetProvider {
         }
     }
 
-    fn tool_suggest_call(id: usize) -> ProviderToolCall {
+    fn successful_tool_call(id: usize) -> ProviderToolCall {
         ProviderToolCall {
             id: format!("call_loop_budget_success_{id}"),
-            name: "tool_suggest".to_owned(),
-            arguments: r#"{"query":"read files","limit":1}"#.to_owned(),
+            name: "list_dir".to_owned(),
+            arguments: r#"{"path":".","depth":0,"limit":1}"#.to_owned(),
         }
     }
 
@@ -1510,7 +1510,7 @@ impl Provider for LoopBudgetProvider {
             LoopBudgetProviderMode::RetryEpisodeResetThenFinal if tools_available => {
                 match round_index {
                     0 | 2 => vec![Self::missing_tool_call(round_index)],
-                    1 => vec![Self::tool_suggest_call(round_index)],
+                    1 => vec![Self::successful_tool_call(round_index)],
                     _ => Vec::new(),
                 }
             }
@@ -2327,8 +2327,8 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_phase12_tool_summary".to_owned(),
-            name: "tool_suggest".to_owned(),
-            arguments: serde_json::json!({"intent": "find a tool"}).to_string(),
+            name: "list_dir".to_owned(),
+            arguments: serde_json::json!({"path": ".", "depth": 0, "limit": 1}).to_string(),
         }],
         "final after tool",
     ));
@@ -2372,8 +2372,8 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
     let tool_event = payload
         .tool_events
         .iter()
-        .find(|event| event.tool_name == "tool_suggest")
-        .expect("tool_suggest event should be summarized");
+        .find(|event| event.tool_name == "list_dir")
+        .expect("list_dir event should be summarized");
     assert_eq!(tool_event.item_id, "call_phase12_tool_summary");
     assert_eq!(tool_event.status, TurnPostTurnToolStatus::Succeeded);
     assert!(!payload.tool_events_truncated);
@@ -6265,8 +6265,8 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_policy_snapshot".to_owned(),
-            name: "tool_suggest".to_owned(),
-            arguments: serde_json::json!({"intent": "find a tool"}).to_string(),
+            name: "list_dir".to_owned(),
+            arguments: serde_json::json!({"path": ".", "depth": 0, "limit": 1}).to_string(),
         }],
         "done",
     ));
@@ -6308,7 +6308,7 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
                 recovery_policy,
                 ..
             } = &notification.item
-            && tool_name == "tool_suggest"
+            && tool_name == "list_dir"
         {
             return recovery_policy.clone();
         }
@@ -6321,7 +6321,7 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
                 recovery_policy,
                 ..
             } = &notification.item
-            && tool_name == "tool_suggest"
+            && tool_name == "list_dir"
         {
             return recovery_policy.clone();
         }

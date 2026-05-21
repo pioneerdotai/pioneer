@@ -1,4 +1,4 @@
-use super::{ExecutedToolResult, PendingToolUiState};
+use super::PendingToolUiState;
 use crate::{AgentEventHub, AgentEventHubError};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
@@ -1285,80 +1285,6 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
             }
         }
     }
-}
-
-pub(super) fn maybe_update_visible_tools_from_suggestions(
-    executed_results: &[ExecutedToolResult],
-    all_tool_names: &[String],
-    visible_tool_names: &mut Vec<String>,
-) {
-    let mut suggested_names = Vec::new();
-    for result in executed_results {
-        if result.tool_name == super::DISCOVERY_TOOL_SUGGEST && result.success {
-            suggested_names.extend(parse_tool_names_from_suggest_output(
-                result.model_visible_text.as_str(),
-            ));
-        }
-    }
-
-    if suggested_names.is_empty() {
-        return;
-    }
-
-    let all_known: std::collections::HashSet<&str> =
-        all_tool_names.iter().map(String::as_str).collect();
-    let mut next_visible = visible_tool_names.clone();
-    for tool_name in suggested_names {
-        if !all_known.contains(tool_name.as_str()) {
-            continue;
-        }
-        if !next_visible.iter().any(|existing| existing == &tool_name) {
-            next_visible.push(tool_name);
-        }
-    }
-
-    for discovery_tool in [super::DISCOVERY_TOOL_SEARCH, super::DISCOVERY_TOOL_SUGGEST] {
-        if all_known.contains(discovery_tool)
-            && !next_visible
-                .iter()
-                .any(|existing| existing == discovery_tool)
-        {
-            next_visible.push(discovery_tool.to_owned());
-        }
-    }
-
-    *visible_tool_names = next_visible;
-}
-
-fn parse_tool_names_from_suggest_output(output: &str) -> Vec<String> {
-    if output.trim().is_empty() {
-        return Vec::new();
-    }
-
-    if let Ok(items) = serde_json::from_str::<Vec<pioneer_tools::ToolSearchResultTool>>(output) {
-        return items.into_iter().map(|item| item.name).collect();
-    }
-
-    let value = match serde_json::from_str::<serde_json::Value>(output) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-
-    let items = value
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .or_else(|| value.as_array().cloned())
-        .unwrap_or_default();
-
-    items
-        .into_iter()
-        .filter_map(|item| {
-            item.get("name")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect()
 }
 
 pub(super) fn build_tool_error_message(
