@@ -3280,7 +3280,7 @@ mod tests {
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
         Role,
     };
-    use pioneer_tools::{ToolErrorClass, ToolOutcome};
+    use pioneer_tools::{BuiltinToolDomain, ToolErrorClass, ToolOutcome};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
@@ -3300,6 +3300,34 @@ mod tests {
             recovery_view: None,
             message: ChatMessage::tool_result("item_1234567890123456", tool_name, text),
         }
+    }
+
+    #[test]
+    fn tool_visibility_domain_map_excludes_dynamic_and_control_tools() {
+        let mapped = pioneer_tools::builtin_tool_domain_map()
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert!(!mapped.contains(&"request_tools"));
+        assert!(!mapped.contains(&"read_skill"));
+        assert!(!mapped.iter().any(|name| name.starts_with("skill.")));
+        assert!(!mapped.iter().any(|name| name.starts_with("mcp_")));
+        assert_eq!(
+            BuiltinToolDomain::Task.tool_names(),
+            [
+                "task_create",
+                "task_wait",
+                "task_cancel",
+                "task_update",
+                "task_detach",
+                "task_list",
+                "task_get",
+                "task_reschedule",
+                "task_pause",
+                "task_resume",
+            ]
+        );
     }
 
     #[test]

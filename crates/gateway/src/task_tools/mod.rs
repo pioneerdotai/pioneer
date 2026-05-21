@@ -2878,6 +2878,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn domain_map_matches_task_tool_specs() {
+        let specs = task_tool_specs();
+        let actual = specs
+            .iter()
+            .map(|configured| configured.spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual.as_slice(),
+            pioneer_tools::BuiltinToolDomain::Task.tool_names()
+        );
+    }
+
     fn sample_task(status: TaskStatus) -> Task {
         Task {
             id: "task_1234567890123456".to_owned(),

@@ -1520,6 +1520,20 @@ mod tests {
     }
 
     #[test]
+    fn domain_map_matches_memory_tool_specs() {
+        let specs = memory_tool_specs();
+        let actual = specs
+            .iter()
+            .map(|configured| configured.spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual.as_slice(),
+            pioneer_tools::BuiltinToolDomain::Memory.tool_names()
+        );
+    }
+
+    #[test]
     fn internal_model_selection_prefers_requested_context_model() {
         let selected = resolve_internal_model_selection(
             Some("thread-provider"),

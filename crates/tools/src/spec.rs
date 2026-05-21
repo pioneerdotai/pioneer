@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::domain::REQUEST_TOOLS_DOMAIN_VALUES;
 use crate::output_policy::{ToolOutputPolicy, ToolOutputProjectionKind, builtin_output_policy};
 
 pub const REQUEST_TOOLS_TOOL_NAME: &str = "request_tools";
-pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &["memory", "task", "artifact", "computer_use"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

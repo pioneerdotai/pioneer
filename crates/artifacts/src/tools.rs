@@ -815,6 +815,20 @@ mod tests {
         ToolEventBus::default().start_trace("turn_test", "call_1", ARTIFACT_PREPARE_TOOL)
     }
 
+    #[test]
+    fn domain_map_matches_artifact_tool_specs() {
+        let specs = artifact_tool_specs();
+        let actual = specs
+            .iter()
+            .map(|configured| configured.spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual.as_slice(),
+            pioneer_tools::BuiltinToolDomain::Artifact.tool_names()
+        );
+    }
+
     #[tokio::test]
     async fn artifact_prepare_returns_safe_path_inside_output_dir() {
         let output_dir = temp_output_dir("safe");

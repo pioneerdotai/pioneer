@@ -1,6 +1,7 @@
 use crate::context::{
     ExecCommandArgs, LocalShellPayload, ToolCallSource, ToolInvocation, ToolPayload, WriteStdinArgs,
 };
+use crate::domain::REQUEST_TOOLS_DOMAIN_VALUES;
 use crate::error::ToolError;
 use crate::events::{ToolEventBus, ToolEventTrace};
 use crate::normalize_tool_arguments_from_schema;
@@ -8,9 +9,8 @@ use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{ToolOutputPolicySnapshot, ToolOutputProjectionKind};
 use crate::registry::ToolRegistry;
 use crate::spec::{
-    ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_DOMAIN_VALUES,
-    REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode, ToolPayloadBinding, ToolRecoveryMetadata,
-    ToolSpec,
+    ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
+    ToolPayloadBinding, ToolRecoveryMetadata, ToolSpec,
 };
 use crate::visibility::ToolVisibilitySnapshot;
 use serde_json::Value as JsonValue;

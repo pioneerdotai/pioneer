@@ -1,6 +1,7 @@
 mod argument_normalizer;
 mod classifier;
 mod context;
+mod domain;
 mod error;
 mod events;
 mod loop_guard;
@@ -27,6 +28,12 @@ pub use context::{
     AnyToolResult, CallToolResult, ExecCommandArgs, FunctionToolOutput, LocalShellPayload,
     ToolCallSource, ToolErrorClass, ToolInvocation, ToolOutcome, ToolOutcomeStatus, ToolOutput,
     ToolPayload, ToolSearchOutput, ToolSearchResultTool, ToolSuggestOutput, WriteStdinArgs,
+};
+pub use domain::{
+    ARTIFACT_DOMAIN_TOOL_NAMES, BUILTIN_TOOL_DOMAIN_MAP, BuiltinToolDomain,
+    COMPUTER_USE_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, REQUEST_TOOLS_DOMAIN_VALUES,
+    TASK_DOMAIN_TOOL_NAMES, builtin_tool_domain_map, builtin_tool_domain_names,
+    registered_domain_tool_names,
 };
 pub use error::ToolError;
 pub use events::{
