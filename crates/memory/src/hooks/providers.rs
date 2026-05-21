@@ -384,7 +384,8 @@ pub trait AgentMemoryTurnPolicyProvider: Send + Sync {
     ) -> Result<MemoryTurnPolicy, String>;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryActiveRecallDecisionContext {
     pub workspace_id: String,
     pub thread_id: String,
@@ -395,7 +396,8 @@ pub struct MemoryActiveRecallDecisionContext {
     pub model_provider: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryActiveRecallDecisionRequest {
     pub deterministic_context_count: usize,
     pub deterministic_context_chars: usize,

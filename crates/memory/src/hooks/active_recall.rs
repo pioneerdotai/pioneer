@@ -9,15 +9,17 @@ const ACTIVE_RECALL_MAX_DIAGNOSTIC_CHARS: usize = 160;
 const ACTIVE_RECALL_MAX_CANONICAL_KEY_CHARS: usize = 240;
 pub(super) const ACTIVE_RECALL_INPUT_PREVIEW_MAX_CHARS: usize = 1_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActiveMemoryDecisionStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveMemoryDecisionStatus {
     Skip,
     Run,
     Uncertain,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActiveMemoryDecisionReasonCode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveMemoryDecisionReasonCode {
     PolicyDisabled,
     ConfigDisabled,
     DeterministicOnly,
@@ -59,9 +61,9 @@ impl ActiveMemoryDecisionReasonCode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ActiveRecallMode {
+pub enum ActiveRecallMode {
     Profile,
     Project,
     Durable,
@@ -135,21 +137,21 @@ impl ActiveRecallMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ActiveRecallTarget {
+pub struct ActiveRecallTarget {
     #[serde(default)]
-    pub(super) scope_kind: Option<MemoryScopeKind>,
+    pub scope_kind: Option<MemoryScopeKind>,
     #[serde(default)]
-    pub(super) fact_class: Option<MemoryFactClass>,
+    pub fact_class: Option<MemoryFactClass>,
     #[serde(default)]
-    pub(super) category: Option<MemoryCategory>,
+    pub category: Option<MemoryCategory>,
     #[serde(default)]
-    pub(super) subject: Option<MemorySubject>,
+    pub subject: Option<MemorySubject>,
     #[serde(default)]
-    pub(super) attribute: Option<MemoryAttribute>,
+    pub attribute: Option<MemoryAttribute>,
     #[serde(default)]
-    pub(super) canonical_key: Option<String>,
+    pub canonical_key: Option<String>,
 }
 
 impl ActiveRecallTarget {
@@ -182,19 +184,28 @@ impl ActiveRecallTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ActiveRecallPlan {
-    pub(super) status: ActiveMemoryDecisionStatus,
-    pub(super) reason_code: ActiveMemoryDecisionReasonCode,
-    pub(super) confidence: f32,
-    pub(super) modes: Vec<ActiveRecallMode>,
-    pub(super) targets: Vec<ActiveRecallTarget>,
-    pub(super) debug_fallback: bool,
-    pub(super) provider_used: bool,
-    pub(super) provider_fallback_used: bool,
-    pub(super) provider_input_chars: Option<usize>,
-    pub(super) provider_output_chars: Option<usize>,
-    pub(super) diagnostics: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActiveRecallPlan {
+    pub status: ActiveMemoryDecisionStatus,
+    pub reason_code: ActiveMemoryDecisionReasonCode,
+    pub confidence: f32,
+    #[serde(default)]
+    pub modes: Vec<ActiveRecallMode>,
+    #[serde(default)]
+    pub targets: Vec<ActiveRecallTarget>,
+    #[serde(default)]
+    pub debug_fallback: bool,
+    #[serde(default)]
+    pub provider_used: bool,
+    #[serde(default)]
+    pub provider_fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_input_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_output_chars: Option<usize>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 impl ActiveRecallPlan {
@@ -266,7 +277,7 @@ impl ActiveRecallPlan {
     }
 }
 
-pub(super) type ActiveMemoryDecision = ActiveRecallPlan;
+pub type ActiveMemoryDecision = ActiveRecallPlan;
 
 impl From<&ActiveRecallTarget> for MemoryRecallTarget {
     fn from(target: &ActiveRecallTarget) -> Self {
@@ -1684,30 +1695,31 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     diagnostic
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ActiveRecallPlanJson {
-    status: ActiveRecallPlanJsonStatus,
-    reason_code: ActiveMemoryDecisionReasonCodeJson,
-    confidence: f32,
-    modes: Vec<ActiveRecallMode>,
+pub struct ActiveRecallPlanJson {
+    pub status: ActiveRecallPlanJsonStatus,
+    pub reason_code: ActiveMemoryDecisionReasonCodeJson,
+    pub confidence: f32,
     #[serde(default)]
-    targets: Vec<ActiveRecallTarget>,
+    pub modes: Vec<ActiveRecallMode>,
     #[serde(default)]
-    diagnostics: Vec<String>,
+    pub targets: Vec<ActiveRecallTarget>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ActiveRecallPlanJsonStatus {
+pub enum ActiveRecallPlanJsonStatus {
     Skip,
     Run,
     Uncertain,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ActiveMemoryDecisionReasonCodeJson {
+pub enum ActiveMemoryDecisionReasonCodeJson {
     PolicyDisabled,
     ConfigDisabled,
     DeterministicOnly,
@@ -1748,7 +1760,7 @@ impl ActiveMemoryDecisionReasonCodeJson {
     }
 }
 
-pub(super) fn parse_active_memory_decision_json(
+pub fn parse_active_memory_decision_json(
     raw: &str,
 ) -> Result<ActiveMemoryDecision, serde_json::Error> {
     let parsed = serde_json::from_str::<ActiveRecallPlanJson>(raw.trim())?;

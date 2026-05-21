@@ -1,3 +1,4 @@
+pub(crate) mod preflight;
 mod provider;
 mod skill_tools;
 mod skills;

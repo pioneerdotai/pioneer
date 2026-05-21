@@ -44,13 +44,16 @@ pub(super) fn memory_recall_request(input_text: &str) -> MemoryRecallRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct DeterministicRecallContextSummary {
-    pub(super) memory_ids: BTreeSet<String>,
-    pub(super) rendered_line_fingerprints: BTreeSet<String>,
-    pub(super) context_count: usize,
-    pub(super) context_chars: usize,
-    pub(super) sufficient: bool,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeterministicRecallContextSummary {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub memory_ids: BTreeSet<String>,
+    #[serde(skip)]
+    pub rendered_line_fingerprints: BTreeSet<String>,
+    pub context_count: usize,
+    pub context_chars: usize,
+    pub sufficient: bool,
 }
 
 pub(super) fn deterministic_recall_context_summary(

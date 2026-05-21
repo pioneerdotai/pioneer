@@ -56,12 +56,17 @@ use pioneer_protocol::{
     MemoryWriteEvidence, MemoryWriteRelation, ThreadMode,
 };
 use pioneer_tools::ToolExtensionBundle;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use active_recall::*;
+pub use active_recall::{
+    ActiveMemoryDecision, ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
+    ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlan, ActiveRecallPlanJson,
+    ActiveRecallPlanJsonStatus, ActiveRecallTarget, parse_active_memory_decision_json,
+};
 pub use artifact_store::*;
 use capabilities::*;
 pub use config::*;
@@ -79,6 +84,7 @@ use post_turn::*;
 use post_turn_eligibility::*;
 use prompt_context::*;
 pub use providers::*;
+pub use recall::DeterministicRecallContextSummary;
 use recall::*;
 use state::*;
 use synthesis::*;
