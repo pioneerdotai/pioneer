@@ -92,7 +92,11 @@ pub use tool_index::{
     PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor, PreflightToolIndex,
     build_preflight_tool_index,
 };
-pub use visibility::ToolVisibilitySnapshot;
+pub use visibility::{
+    FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilityDiagnostic,
+    ToolVisibilityDiagnosticCode, ToolVisibilitySnapshot, ToolVisibilitySource,
+    compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
+};
 pub use web::{
     DownloadModelPayload, WebFetchLink, WebFetchModelPayload, WebFetchTruncation,
     WebSearchModelPayload, WebSearchResultItem, default_favicon_url, render_download_ui_text,

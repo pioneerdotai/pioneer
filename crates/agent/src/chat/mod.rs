@@ -68,10 +68,11 @@ use pioneer_provider::{
 };
 use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
-    PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass,
-    ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolOutcomeStatus,
-    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
+    FinalToolVisibility, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
+    RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
+    ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope, ToolResultView,
+    ToolRetryController, ToolRetryDecision, ToolRetryObservation, build_builtin_tools,
+    build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -599,6 +600,36 @@ fn trace_agent_turn_preflight(
         final_visible_tools,
     );
     trace_turn_preflight_diagnostics(thread_id, turn_id, &snapshot);
+}
+
+fn compute_agent_turn_final_visible_tools(
+    router: &pioneer_tools::ToolRouter,
+    preflight: &TurnPreflightOrchestratorResult,
+    current_visible_tools: &[String],
+) -> FinalToolVisibility {
+    router.compute_final_visible_tools(
+        &preflight.local_modules.tools.input.core_tools,
+        &preflight.plan.tools.visible_tools,
+        current_visible_tools,
+    )
+}
+
+fn warn_final_visible_tool_diagnostics(
+    thread_id: &str,
+    turn_id: &str,
+    diagnostics: &[pioneer_tools::ToolVisibilityDiagnostic],
+) {
+    for diagnostic in diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            tool_name = diagnostic.tool_name.as_str(),
+            source = diagnostic.source.as_str(),
+            reason = diagnostic.reason.as_str(),
+            code = ?diagnostic.code,
+            "turn final visible tool was clamped"
+        );
+    }
 }
 
 fn preflight_active_recall_prompt_context_input(
@@ -2043,7 +2074,23 @@ async fn execute_agent_provider_response(
         user_input_text.as_str(),
     )
     .await;
-    trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &all_tool_names);
+
+    let initial_visibility =
+        compute_agent_turn_final_visible_tools(router.as_ref(), &turn_preflight, &[]);
+
+    warn_final_visible_tool_diagnostics(
+        thread_id,
+        turn_id,
+        initial_visibility.diagnostics.as_slice(),
+    );
+
+    trace_agent_turn_preflight(
+        thread_id,
+        turn_id,
+        &turn_preflight,
+        initial_visibility.visible_tools.as_slice(),
+    );
+
     if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
         user_input_text.as_str(),
         model.as_str(),
@@ -2120,7 +2167,7 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
-    let mut visible_tool_names = all_tool_names.clone();
+    let mut visible_tool_names = initial_visibility.visible_tools;
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -4006,6 +4053,131 @@ mod tests {
         }
         assert!(visible_tool_names.contains(&"artifact_prepare".to_owned()));
         assert!(!visible_tool_names.contains(&"artifact_register".to_owned()));
+    }
+
+    #[test]
+    fn preflight_visible_tools_core_only_hides_materialized_domain_tools() {
+        let built = build_tools_with_extension_names(&[
+            "memory_search",
+            "memory_get",
+            "task_create",
+            "skill.test.dynamic",
+        ]);
+
+        let visibility = built.router.compute_final_visible_tools(
+            &["exec_command".to_owned(), "request_tools".to_owned()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            visibility.visible_tools,
+            vec![
+                "exec_command".to_owned(),
+                "request_tools".to_owned(),
+                "skill.test.dynamic".to_owned()
+            ]
+        );
+        assert!(
+            !visibility
+                .visible_tools
+                .contains(&"memory_search".to_owned())
+        );
+        assert!(!visibility.visible_tools.contains(&"memory_get".to_owned()));
+        assert!(!visibility.visible_tools.contains(&"task_create".to_owned()));
+    }
+
+    #[test]
+    fn preflight_visible_tools_adds_requested_optional_tools_only_when_registered() {
+        let built = build_tools_with_extension_names(&["memory_search", "memory_get"]);
+
+        let visibility = built.router.compute_final_visible_tools(
+            &["exec_command".to_owned(), "request_tools".to_owned()],
+            &[
+                "memory_search".to_owned(),
+                "memory_get".to_owned(),
+                "memory_forget".to_owned(),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            visibility.visible_tools,
+            vec![
+                "exec_command".to_owned(),
+                "request_tools".to_owned(),
+                "memory_search".to_owned(),
+                "memory_get".to_owned()
+            ]
+        );
+        assert!(visibility.diagnostics.iter().any(|diagnostic| {
+            diagnostic.tool_name == "memory_forget"
+                && diagnostic.code
+                    == pioneer_tools::ToolVisibilityDiagnosticCode::UnknownToolDropped
+        }));
+    }
+
+    #[test]
+    fn preflight_visible_tools_preserves_phase03_current_turn_expansion() {
+        let built = build_tools_with_extension_names(&[
+            "artifact_prepare",
+            "artifact_register",
+            "memory_search",
+        ]);
+
+        let visibility = built.router.compute_final_visible_tools(
+            &["request_tools".to_owned(), "read_file".to_owned()],
+            &["memory_search".to_owned()],
+            &[
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            visibility.visible_tools,
+            vec![
+                "request_tools".to_owned(),
+                "read_file".to_owned(),
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+                "memory_search".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_visible_tools_hidden_task_turn_requires_preflight_or_current_state() {
+        let task_tools = BuiltinToolDomain::Task.tool_names();
+        let built = build_tools_with_extension_names(task_tools);
+
+        let core_only = built.router.compute_final_visible_tools(
+            &["request_tools".to_owned(), "read_file".to_owned()],
+            &[],
+            &[],
+        );
+        for name in task_tools {
+            assert!(
+                !core_only.visible_tools.contains(&(*name).to_owned()),
+                "task tool `{name}` must not be visible by default"
+            );
+        }
+
+        let selected = built.router.compute_final_visible_tools(
+            &["request_tools".to_owned(), "read_file".to_owned()],
+            &["task_create".to_owned()],
+            &[],
+        );
+        assert!(selected.visible_tools.contains(&"task_create".to_owned()));
+        assert!(!selected.visible_tools.contains(&"task_wait".to_owned()));
+
+        let preserved = built.router.compute_final_visible_tools(
+            &["request_tools".to_owned(), "read_file".to_owned()],
+            &[],
+            &["task_create".to_owned(), "task_wait".to_owned()],
+        );
+        assert!(preserved.visible_tools.contains(&"task_create".to_owned()));
+        assert!(preserved.visible_tools.contains(&"task_wait".to_owned()));
     }
 
     #[test]

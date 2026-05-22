@@ -13,7 +13,10 @@ use crate::spec::{
     ToolPayloadBinding, ToolRecoveryMetadata, ToolSpec,
 };
 use crate::tool_index::{PreflightToolIndex, build_preflight_tool_index};
-use crate::visibility::ToolVisibilitySnapshot;
+use crate::visibility::{
+    FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilitySnapshot,
+    compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
+};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -80,7 +83,7 @@ impl ToolRouter {
     }
 
     pub fn all_specs(&self) -> Vec<ToolSpec> {
-        self.specs.values().map(|spec| spec.spec.clone()).collect()
+        self.visibility.all_specs().to_vec()
     }
 
     pub fn preflight_tool_index(&self) -> PreflightToolIndex {
@@ -101,6 +104,37 @@ impl ToolRouter {
 
     pub async fn set_model_visible_tools(&self, names: &[String]) {
         self.visibility.set_visible_by_name(names).await;
+    }
+
+    pub fn compute_final_visible_tools(
+        &self,
+        core_tools: &[String],
+        preflight_visible_tools: &[String],
+        current_visible_tools: &[String],
+    ) -> FinalToolVisibility {
+        let all_tool_names = self
+            .visibility
+            .all_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect::<Vec<_>>();
+        let available_tool_names = all_tool_names
+            .iter()
+            .filter(|name| self.has_handler(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let dynamic_tool_names =
+            materialized_dynamic_extension_tool_names(all_tool_names.clone(), core_tools.to_vec());
+
+        compute_final_tool_visibility(FinalToolVisibilityInput {
+            core_tools: core_tools.to_vec(),
+            current_visible_tools: current_visible_tools.to_vec(),
+            preflight_visible_tools: preflight_visible_tools.to_vec(),
+            dynamic_tool_names,
+            registered_tool_names: all_tool_names,
+            available_tool_names,
+            blocked_tool_names: BTreeMap::new(),
+        })
     }
 
     pub async fn build_model_tool_call(&self, call: RawToolCall) -> Result<ToolCall, ToolError> {
