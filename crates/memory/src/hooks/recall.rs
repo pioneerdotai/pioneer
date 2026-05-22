@@ -194,6 +194,14 @@ pub struct MemoryActiveRecallLocalPlan {
     pub decision_request: MemoryActiveRecallDecisionRequest,
     pub local_decision: ActiveMemoryDecision,
     pub provider_planning_needed: bool,
+    pub provider_fallback_context: Option<MemoryActiveRecallProviderFallbackContext>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryActiveRecallProviderFallbackContext {
+    local_plan: ActiveMemoryDecision,
+    planner_input: ActiveRecallPlannerInput,
+    config: MemoryActiveRecallConfig,
 }
 
 pub fn build_active_recall_local_preflight_plan(
@@ -225,13 +233,36 @@ pub fn build_active_recall_local_preflight_plan(
             provider_available,
         )
     };
+    let provider_fallback_context =
+        provider_planning_needed.then(|| MemoryActiveRecallProviderFallbackContext {
+            local_plan: local.local_plan.clone(),
+            planner_input: local.planner_input.clone(),
+            config: config.normalized(),
+        });
 
     MemoryActiveRecallLocalPlan {
         decision_context: local.decision_context,
         decision_request: local.decision_request,
         local_decision,
         provider_planning_needed,
+        provider_fallback_context,
     }
+}
+
+pub fn active_recall_preflight_provider_fallback(
+    context: &MemoryActiveRecallProviderFallbackContext,
+    reason: &str,
+    provider_input_chars: Option<usize>,
+    provider_output_chars: Option<usize>,
+) -> ActiveMemoryDecision {
+    active_recall_provider_fallback(
+        context.local_plan.clone(),
+        reason,
+        &context.planner_input,
+        &context.config,
+        provider_input_chars,
+        provider_output_chars,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

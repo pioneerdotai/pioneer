@@ -88,6 +88,7 @@ pub use providers::*;
 use recall::*;
 pub use recall::{
     DeterministicRecallContextSummary, MemoryActiveRecallLocalPlan,
+    MemoryActiveRecallProviderFallbackContext, active_recall_preflight_provider_fallback,
     build_active_recall_local_preflight_plan,
 };
 use state::*;

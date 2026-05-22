@@ -3,7 +3,9 @@
 use pioneer_memory::hooks::{
     ActiveRecallPlan, ActiveRecallPlanJson, DeterministicRecallContextSummary,
     MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    MemoryActiveRecallLocalPlan, normalize_active_recall_plan, parse_active_memory_decision_json,
+    MemoryActiveRecallLocalPlan, MemoryActiveRecallProviderFallbackContext,
+    active_recall_preflight_provider_fallback, normalize_active_recall_plan,
+    parse_active_memory_decision_json,
 };
 use pioneer_promt::{
     TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
@@ -114,7 +116,10 @@ pub(crate) struct TurnPreflightLocalMemoryState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TurnPreflightLocalActiveRecallState {
     HostLocalFinal(TurnPreflightMemoryActiveRecallPlan),
-    ProviderNeeded(TurnPreflightMemoryActiveRecallInput),
+    ProviderNeeded {
+        input: TurnPreflightMemoryActiveRecallInput,
+        fallback_context: MemoryActiveRecallProviderFallbackContext,
+    },
 }
 
 pub(crate) fn build_local_preflight_module_plans(
@@ -123,10 +128,15 @@ pub(crate) fn build_local_preflight_module_plans(
     active_recall: MemoryActiveRecallLocalPlan,
 ) -> TurnPreflightLocalModulePlans {
     let active_recall = if active_recall.provider_planning_needed {
-        TurnPreflightLocalActiveRecallState::ProviderNeeded(TurnPreflightMemoryActiveRecallInput {
-            decision_context: active_recall.decision_context,
-            decision_request: active_recall.decision_request,
-        })
+        TurnPreflightLocalActiveRecallState::ProviderNeeded {
+            input: TurnPreflightMemoryActiveRecallInput {
+                decision_context: active_recall.decision_context,
+                decision_request: active_recall.decision_request,
+            },
+            fallback_context: active_recall
+                .provider_fallback_context
+                .expect("provider-needed active recall must include memory-owned fallback context"),
+        }
     } else {
         TurnPreflightLocalActiveRecallState::HostLocalFinal(wrap_memory_active_recall_plan(
             TurnPreflightPlanSource::HostLocal,
@@ -158,7 +168,7 @@ impl TurnPreflightLocalModulePlans {
     pub(crate) fn active_recall_provider_planning_needed(&self) -> bool {
         matches!(
             self.memory.active_recall,
-            TurnPreflightLocalActiveRecallState::ProviderNeeded(_)
+            TurnPreflightLocalActiveRecallState::ProviderNeeded { .. }
         )
     }
 
@@ -167,7 +177,7 @@ impl TurnPreflightLocalModulePlans {
     ) -> Option<&TurnPreflightMemoryActiveRecallPlan> {
         match &self.memory.active_recall {
             TurnPreflightLocalActiveRecallState::HostLocalFinal(plan) => Some(plan),
-            TurnPreflightLocalActiveRecallState::ProviderNeeded(_) => None,
+            TurnPreflightLocalActiveRecallState::ProviderNeeded { .. } => None,
         }
     }
 }
@@ -178,7 +188,9 @@ impl TurnPreflightLocalMemoryState {
             deterministic_summary: self.deterministic_summary.clone(),
             active_recall: match &self.active_recall {
                 TurnPreflightLocalActiveRecallState::HostLocalFinal(_) => None,
-                TurnPreflightLocalActiveRecallState::ProviderNeeded(input) => Some(input.clone()),
+                TurnPreflightLocalActiveRecallState::ProviderNeeded { input, .. } => {
+                    Some(input.clone())
+                }
             },
         }
     }
@@ -815,6 +827,228 @@ pub(crate) fn fallback_turn_preflight_plan(
     }
 }
 
+pub(crate) fn compose_turn_preflight_plan(
+    local_modules: &TurnPreflightLocalModulePlans,
+    provider_result: TurnPreflightProviderCallResult,
+) -> TurnPreflightPlan {
+    match provider_result {
+        TurnPreflightProviderCallResult::Success(success) => {
+            compose_successful_turn_preflight_plan(local_modules, success)
+        }
+        TurnPreflightProviderCallResult::Failure(failure) => {
+            compose_fallback_turn_preflight_plan(local_modules, failure)
+        }
+    }
+}
+
+fn compose_successful_turn_preflight_plan(
+    local_modules: &TurnPreflightLocalModulePlans,
+    success: TurnPreflightProviderSuccess,
+) -> TurnPreflightPlan {
+    let TurnPreflightProviderSuccess {
+        plan,
+        provider_call,
+        diagnostics,
+    } = success;
+    let ProviderTurnPreflightPlan {
+        tools,
+        memory,
+        diagnostics: provider_diagnostics,
+    } = plan;
+
+    let mut module_diagnostics = BTreeMap::new();
+    let active_recall = compose_successful_memory_active_recall_plan(
+        local_modules,
+        memory.as_ref(),
+        &provider_call,
+        &mut module_diagnostics,
+    );
+
+    let diagnostics = diagnostics
+        .into_iter()
+        .chain(provider_diagnostics)
+        .collect::<Vec<_>>();
+
+    TurnPreflightPlan {
+        source: TurnPreflightPlanSource::Provider,
+        fallback_reason: None,
+        tools: TurnPreflightToolsPlan {
+            visible_tools: tools.visible_tools,
+        },
+        memory: TurnPreflightMemoryPlan { active_recall },
+        diagnostics: TurnPreflightDiagnostics {
+            preflight_failed: false,
+            diagnostics: normalize_preflight_diagnostics(diagnostics),
+            module_diagnostics: normalize_module_diagnostics(module_diagnostics),
+        },
+        provider_call: Some(provider_call),
+    }
+}
+
+fn compose_successful_memory_active_recall_plan(
+    local_modules: &TurnPreflightLocalModulePlans,
+    provider_memory: Option<&ProviderTurnPreflightMemoryPlan>,
+    provider_call: &TurnPreflightProviderCallMetadata,
+    module_diagnostics: &mut BTreeMap<String, Vec<TurnPreflightDiagnostic>>,
+) -> TurnPreflightMemoryActiveRecallPlan {
+    match &local_modules.memory.active_recall {
+        TurnPreflightLocalActiveRecallState::HostLocalFinal(plan) => plan.clone(),
+        TurnPreflightLocalActiveRecallState::ProviderNeeded {
+            fallback_context, ..
+        } => {
+            let Some(provider_active_recall) =
+                provider_memory.and_then(|memory| memory.active_recall.as_ref())
+            else {
+                push_module_diagnostic(
+                    module_diagnostics,
+                    "memory.activeRecall",
+                    diagnostic(
+                        "preflight.memory.active_recall.provider_missing",
+                        Some("provider omitted required memory.activeRecall plan"),
+                    ),
+                );
+                return memory_active_recall_provider_failure_fallback_plan(
+                    fallback_context,
+                    TurnPreflightFallbackReason::ValidationError,
+                    Some(provider_call),
+                );
+            };
+
+            match parse_provider_memory_active_recall_plan(provider_active_recall) {
+                Ok(decision) => wrap_memory_active_recall_plan(
+                    TurnPreflightPlanSource::Provider,
+                    None,
+                    decision,
+                ),
+                Err(_) => {
+                    push_module_diagnostic(
+                        module_diagnostics,
+                        "memory.activeRecall",
+                        diagnostic(
+                            "preflight.memory.active_recall.provider_invalid",
+                            Some("provider returned invalid memory.activeRecall plan"),
+                        ),
+                    );
+                    memory_active_recall_provider_failure_fallback_plan(
+                        fallback_context,
+                        TurnPreflightFallbackReason::ValidationError,
+                        Some(provider_call),
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn compose_fallback_turn_preflight_plan(
+    local_modules: &TurnPreflightLocalModulePlans,
+    failure: TurnPreflightProviderFailure,
+) -> TurnPreflightPlan {
+    let provider_call = failure
+        .attempts
+        .last()
+        .map(|attempt| attempt.provider_call.clone());
+    let mut module_diagnostics = BTreeMap::new();
+    push_module_diagnostic(
+        &mut module_diagnostics,
+        "tools",
+        diagnostic(
+            "preflight.tools.fallback.empty_visible_tools",
+            Some("preflight provider failed; optional lazy-domain builtin tools remain hidden"),
+        ),
+    );
+
+    let active_recall = match &local_modules.memory.active_recall {
+        TurnPreflightLocalActiveRecallState::HostLocalFinal(plan) => plan.clone(),
+        TurnPreflightLocalActiveRecallState::ProviderNeeded {
+            fallback_context, ..
+        } => {
+            push_module_diagnostic(
+                &mut module_diagnostics,
+                "memory.activeRecall",
+                diagnostic(
+                    "preflight.memory.active_recall.fallback",
+                    Some("preflight provider failed; using memory-owned active recall fallback"),
+                ),
+            );
+            memory_active_recall_provider_failure_fallback_plan(
+                fallback_context,
+                failure.fallback_reason,
+                provider_call.as_ref(),
+            )
+        }
+    };
+
+    fallback_turn_preflight_plan(
+        failure.fallback_reason,
+        active_recall,
+        failure.diagnostics,
+        module_diagnostics,
+        provider_call,
+    )
+}
+
+fn memory_active_recall_provider_failure_fallback_plan(
+    fallback_context: &MemoryActiveRecallProviderFallbackContext,
+    fallback_reason: TurnPreflightFallbackReason,
+    provider_call: Option<&TurnPreflightProviderCallMetadata>,
+) -> TurnPreflightMemoryActiveRecallPlan {
+    let (provider_input_chars, provider_output_chars) =
+        memory_provider_fallback_chars(fallback_reason, provider_call);
+    let decision = active_recall_preflight_provider_fallback(
+        fallback_context,
+        memory_active_recall_provider_failure_reason(fallback_reason),
+        provider_input_chars,
+        provider_output_chars,
+    );
+    wrap_memory_active_recall_plan(
+        TurnPreflightPlanSource::Fallback,
+        Some(fallback_reason),
+        decision,
+    )
+}
+
+fn memory_active_recall_provider_failure_reason(
+    fallback_reason: TurnPreflightFallbackReason,
+) -> &'static str {
+    match fallback_reason {
+        TurnPreflightFallbackReason::Timeout => "memory.active_recall.provider_timeout",
+        TurnPreflightFallbackReason::ProviderError => "memory.active_recall.provider_failed",
+        TurnPreflightFallbackReason::InvalidJson | TurnPreflightFallbackReason::ValidationError => {
+            "memory.active_recall.invalid_json"
+        }
+    }
+}
+
+fn memory_provider_fallback_chars(
+    fallback_reason: TurnPreflightFallbackReason,
+    provider_call: Option<&TurnPreflightProviderCallMetadata>,
+) -> (Option<usize>, Option<usize>) {
+    let Some(provider_call) = provider_call else {
+        return (None, None);
+    };
+
+    let output_chars = match fallback_reason {
+        TurnPreflightFallbackReason::InvalidJson | TurnPreflightFallbackReason::ValidationError => {
+            Some(provider_call.output_chars)
+        }
+        TurnPreflightFallbackReason::Timeout | TurnPreflightFallbackReason::ProviderError => None,
+    };
+
+    (Some(provider_call.input_chars), output_chars)
+}
+
+fn push_module_diagnostic(
+    module_diagnostics: &mut BTreeMap<String, Vec<TurnPreflightDiagnostic>>,
+    module: &str,
+    diagnostic: TurnPreflightDiagnostic,
+) {
+    module_diagnostics
+        .entry(module.to_owned())
+        .or_default()
+        .push(diagnostic);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnPreflightDiagnosticCode(String);
 
@@ -1006,11 +1240,14 @@ fn validate_bounded_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_hooks::TurnPrePromptContextHookInput;
     use pioneer_memory::hooks::{
         ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
         ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlanJsonStatus,
-        ActiveRecallTarget, MemoryActiveRecallMode, MemoryActiveRecallPlannerFallbackPolicy,
-        MemoryEpisodicRecallCapabilities, parse_active_memory_decision_json,
+        ActiveRecallTarget, MemoryActiveRecallConfig, MemoryActiveRecallMode,
+        MemoryActiveRecallPlannerFallbackPolicy, MemoryEpisodicRecallCapabilities,
+        MemoryTurnContext, MemoryTurnPolicy, build_active_recall_local_preflight_plan,
+        parse_active_memory_decision_json,
     };
     use pioneer_protocol::{
         MemoryAttribute, MemoryCategory, MemoryFactClass, MemoryScopeKind, MemorySubject,
@@ -1486,7 +1723,36 @@ mod tests {
             decision_request: active_recall.decision_request,
             local_decision,
             provider_planning_needed,
+            provider_fallback_context: None,
         }
+    }
+
+    fn sample_memory_local_plan_from_memory(
+        fallback_policy: MemoryActiveRecallPlannerFallbackPolicy,
+    ) -> MemoryActiveRecallLocalPlan {
+        let mut config = MemoryActiveRecallConfig::default();
+        config.planner.fallback = fallback_policy;
+        build_active_recall_local_preflight_plan(
+            &MemoryTurnContext {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thr_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                mode: ThreadMode::Agent,
+                input_text: "как меня зовут?".to_owned(),
+                task_id: None,
+                agent_id: None,
+            },
+            &TurnPrePromptContextHookInput::from_parts(
+                "как меня зовут?",
+                Some("thread-model"),
+                Some("thread-provider"),
+            ),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &config,
+            &sample_deterministic_summary(),
+            MemoryEpisodicRecallCapabilities::default(),
+            true,
+        )
     }
 
     fn sample_skip_decision(reason_code: ActiveMemoryDecisionReasonCode) -> ActiveRecallPlan {
@@ -1525,7 +1791,9 @@ mod tests {
         build_local_preflight_module_plans(
             sample_tool_index(),
             sample_deterministic_summary(),
-            sample_memory_local_plan(true, sample_low_confidence_run_decision()),
+            sample_memory_local_plan_from_memory(
+                MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
+            ),
         )
     }
 
@@ -1553,6 +1821,78 @@ mod tests {
             timeout_ms: TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS,
             max_output_chars: TURN_PREFLIGHT_PROVIDER_DEFAULT_MAX_OUTPUT_CHARS,
         }
+    }
+
+    fn sample_provider_call_metadata(attempt: u32) -> TurnPreflightProviderCallMetadata {
+        TurnPreflightProviderCallMetadata {
+            provider: if attempt == 1 {
+                "configured-provider".to_owned()
+            } else {
+                "thread-provider".to_owned()
+            },
+            model: if attempt == 1 {
+                "configured-model".to_owned()
+            } else {
+                "thread-model".to_owned()
+            },
+            attempt,
+            input_chars: 1_200,
+            output_chars: 240,
+            elapsed_ms: 900,
+        }
+    }
+
+    fn sample_provider_plan() -> ProviderTurnPreflightPlan {
+        parse_provider_turn_preflight_plan_json(sample_provider_plan_json().to_string().as_str())
+            .expect("sample provider plan parses")
+    }
+
+    fn sample_provider_success(attempt: u32) -> TurnPreflightProviderCallResult {
+        TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
+            plan: sample_provider_plan(),
+            provider_call: sample_provider_call_metadata(attempt),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn sample_provider_failure(
+        fallback_reason: TurnPreflightFallbackReason,
+    ) -> TurnPreflightProviderCallResult {
+        TurnPreflightProviderCallResult::Failure(TurnPreflightProviderFailure {
+            fallback_reason,
+            attempts: vec![
+                TurnPreflightProviderAttemptFailure {
+                    fallback_reason: TurnPreflightFallbackReason::ProviderError,
+                    diagnostic: diagnostic(
+                        "preflight.provider.error",
+                        Some("configured preflight provider failed"),
+                    ),
+                    provider_call: sample_provider_call_metadata(1),
+                },
+                TurnPreflightProviderAttemptFailure {
+                    fallback_reason,
+                    diagnostic: diagnostic(
+                        "preflight.provider.invalid_json",
+                        Some("thread model retry failed"),
+                    ),
+                    provider_call: sample_provider_call_metadata(2),
+                },
+            ],
+            diagnostics: vec![
+                diagnostic(
+                    "preflight.provider.error",
+                    Some("configured preflight provider failed"),
+                ),
+                diagnostic(
+                    "preflight.provider.thread_model_retry_failed",
+                    Some("preflight retry through the current thread model failed"),
+                ),
+                diagnostic(
+                    "preflight.provider.invalid_json",
+                    Some("thread model retry failed"),
+                ),
+            ],
+        })
     }
 
     #[test]
@@ -1650,7 +1990,9 @@ mod tests {
         let modules = build_local_preflight_module_plans(
             sample_tool_index(),
             sample_deterministic_summary(),
-            sample_memory_local_plan(true, sample_low_confidence_run_decision()),
+            sample_memory_local_plan_from_memory(
+                MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
+            ),
         );
 
         let provider_input = modules.provider_input(sample_turn_input());
@@ -1671,7 +2013,7 @@ mod tests {
             vec![
                 "profile".to_owned(),
                 "project".to_owned(),
-                "exact_canonical".to_owned()
+                "durable".to_owned()
             ]
         );
     }
@@ -2188,6 +2530,207 @@ mod tests {
             failure.fallback_reason,
             TurnPreflightFallbackReason::InvalidJson
         );
+    }
+
+    #[test]
+    fn preflight_compose_provider_success_merges_provider_tools_and_memory_plan() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(&modules, sample_provider_success(1));
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
+        assert_eq!(plan.fallback_reason, None);
+        assert_eq!(
+            plan.tools.visible_tools,
+            vec!["memory_get".to_owned(), "memory_search".to_owned()]
+        );
+        assert!(!plan.diagnostics.preflight_failed);
+        assert!(plan.diagnostics.module_diagnostics.is_empty());
+        assert_eq!(
+            plan.provider_call.as_ref().map(|call| call.attempt),
+            Some(1)
+        );
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Provider
+        );
+        assert_eq!(plan.memory.active_recall.fallback_reason, None);
+        assert_eq!(
+            plan.memory.active_recall.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::MemoryLikely
+        );
+        assert!(!plan.memory.active_recall.decision.provider_fallback_used);
+    }
+
+    #[test]
+    fn preflight_compose_preserves_host_local_active_recall_on_provider_success() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan(
+                false,
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+            ),
+        );
+
+        let plan = compose_turn_preflight_plan(&modules, sample_provider_success(1));
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::HostLocal
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::DeterministicSufficient
+        );
+    }
+
+    #[test]
+    fn preflight_compose_retry_success_preserves_retry_diagnostics() {
+        let modules = sample_provider_needed_modules();
+        let result = TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
+            plan: sample_provider_plan(),
+            provider_call: sample_provider_call_metadata(2),
+            diagnostics: vec![
+                diagnostic(
+                    "preflight.provider.invalid_json",
+                    Some("configured provider returned invalid JSON"),
+                ),
+                diagnostic(
+                    "preflight.provider.thread_model_retry_used",
+                    Some("preflight retry used the current thread model"),
+                ),
+            ],
+        });
+
+        let plan = compose_turn_preflight_plan(&modules, result);
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
+        assert_eq!(
+            plan.provider_call.as_ref().map(|call| call.attempt),
+            Some(2)
+        );
+        assert_eq!(
+            plan.diagnostics
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "preflight.provider.invalid_json",
+                "preflight.provider.thread_model_retry_used",
+                "preflight.tools.memory_selected"
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_compose_final_failure_uses_empty_tools_and_memory_owned_fallback() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(plan.tools.visible_tools.is_empty());
+        assert!(plan.diagnostics.preflight_failed);
+        assert_eq!(
+            plan.provider_call.as_ref().map(|call| call.attempt),
+            Some(2)
+        );
+        assert!(plan.diagnostics.module_diagnostics.contains_key("tools"));
+        assert!(
+            plan.diagnostics
+                .module_diagnostics
+                .contains_key("memory.activeRecall")
+        );
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Fallback
+        );
+        assert_eq!(
+            plan.memory.active_recall.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(plan.memory.active_recall.decision.provider_fallback_used);
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_input_chars,
+            Some(1_200)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_output_chars,
+            Some(240)
+        );
+        assert!(
+            plan.memory
+                .active_recall
+                .decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
+        );
+
+        let value = serde_json::to_value(&plan).expect("final plan serializes");
+        assert!(value.get("modules").is_none());
+        assert_eq!(value["tools"]["visibleTools"], json!([]));
+        assert_eq!(value["diagnostics"]["preflightFailed"], json!(true));
+    }
+
+    #[test]
+    fn preflight_compose_final_failure_honors_memory_skip_fallback_policy() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan_from_memory(
+                MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall,
+            ),
+        );
+
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::ProviderError),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert!(plan.tools.visible_tools.is_empty());
+        assert_eq!(
+            plan.memory.active_recall.decision.status,
+            ActiveMemoryDecisionStatus::Skip
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::ProviderSkip
+        );
+        assert!(plan.memory.active_recall.decision.provider_fallback_used);
+        assert!(
+            plan.memory
+                .active_recall
+                .decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "planner_fallback_skip")
+        );
+    }
+
+    #[test]
+    fn preflight_compose_rejects_host_owned_provider_metadata_before_composition() {
+        let raw = json!({
+            "source": "provider",
+            "tools": {
+                "visibleTools": ["memory_search"]
+            }
+        })
+        .to_string();
+
+        let error = parse_provider_turn_preflight_plan_json(raw.as_str())
+            .expect_err("provider-owned output must reject host-owned final-plan fields");
+
+        assert!(error.to_string().contains("source"));
     }
 
     #[test]
