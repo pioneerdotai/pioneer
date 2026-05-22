@@ -85,8 +85,11 @@ use post_turn::*;
 use post_turn_eligibility::*;
 use prompt_context::*;
 pub use providers::*;
-pub use recall::DeterministicRecallContextSummary;
 use recall::*;
+pub use recall::{
+    DeterministicRecallContextSummary, MemoryActiveRecallLocalPlan,
+    build_active_recall_local_preflight_plan,
+};
 use state::*;
 use synthesis::*;
 use tools::*;

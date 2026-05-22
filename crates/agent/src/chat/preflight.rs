@@ -3,7 +3,7 @@
 use pioneer_memory::hooks::{
     ActiveRecallPlan, ActiveRecallPlanJson, DeterministicRecallContextSummary,
     MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    normalize_active_recall_plan, parse_active_memory_decision_json,
+    MemoryActiveRecallLocalPlan, normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_protocol::ThreadMode;
 use pioneer_tools::{BuiltinToolDomain, PreflightToolIndex};
@@ -83,6 +83,96 @@ pub(crate) struct TurnPreflightMemoryInput {
 pub(crate) struct TurnPreflightMemoryActiveRecallInput {
     pub decision_context: MemoryActiveRecallDecisionContext,
     pub decision_request: MemoryActiveRecallDecisionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TurnPreflightLocalModulePlans {
+    pub tools: TurnPreflightLocalToolsState,
+    pub memory: TurnPreflightLocalMemoryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnPreflightLocalToolsState {
+    pub input: TurnPreflightToolsInput,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TurnPreflightLocalMemoryState {
+    pub deterministic_summary: DeterministicRecallContextSummary,
+    pub active_recall: TurnPreflightLocalActiveRecallState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TurnPreflightLocalActiveRecallState {
+    HostLocalFinal(TurnPreflightMemoryActiveRecallPlan),
+    ProviderNeeded(TurnPreflightMemoryActiveRecallInput),
+}
+
+pub(crate) fn build_local_preflight_module_plans(
+    tool_index: PreflightToolIndex,
+    deterministic_summary: DeterministicRecallContextSummary,
+    active_recall: MemoryActiveRecallLocalPlan,
+) -> TurnPreflightLocalModulePlans {
+    let active_recall = if active_recall.provider_planning_needed {
+        TurnPreflightLocalActiveRecallState::ProviderNeeded(TurnPreflightMemoryActiveRecallInput {
+            decision_context: active_recall.decision_context,
+            decision_request: active_recall.decision_request,
+        })
+    } else {
+        TurnPreflightLocalActiveRecallState::HostLocalFinal(wrap_memory_active_recall_plan(
+            TurnPreflightPlanSource::HostLocal,
+            None,
+            active_recall.local_decision,
+        ))
+    };
+
+    TurnPreflightLocalModulePlans {
+        tools: TurnPreflightLocalToolsState {
+            input: turn_preflight_tools_input_from_index(tool_index),
+        },
+        memory: TurnPreflightLocalMemoryState {
+            deterministic_summary,
+            active_recall,
+        },
+    }
+}
+
+impl TurnPreflightLocalModulePlans {
+    pub(crate) fn provider_input(&self, turn: TurnPreflightTurnInput) -> TurnPreflightInput {
+        TurnPreflightInput {
+            turn,
+            tools: self.tools.input.clone(),
+            memory: self.memory.provider_input(),
+        }
+    }
+
+    pub(crate) fn active_recall_provider_planning_needed(&self) -> bool {
+        matches!(
+            self.memory.active_recall,
+            TurnPreflightLocalActiveRecallState::ProviderNeeded(_)
+        )
+    }
+
+    pub(crate) fn host_local_active_recall_plan(
+        &self,
+    ) -> Option<&TurnPreflightMemoryActiveRecallPlan> {
+        match &self.memory.active_recall {
+            TurnPreflightLocalActiveRecallState::HostLocalFinal(plan) => Some(plan),
+            TurnPreflightLocalActiveRecallState::ProviderNeeded(_) => None,
+        }
+    }
+}
+
+impl TurnPreflightLocalMemoryState {
+    fn provider_input(&self) -> TurnPreflightMemoryInput {
+        TurnPreflightMemoryInput {
+            deterministic_summary: self.deterministic_summary.clone(),
+            active_recall: match &self.active_recall {
+                TurnPreflightLocalActiveRecallState::HostLocalFinal(_) => None,
+                TurnPreflightLocalActiveRecallState::ProviderNeeded(input) => Some(input.clone()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -774,6 +864,181 @@ mod tests {
         assert_eq!(input.candidate_tools[0].domain, BuiltinToolDomain::Memory);
 
         let serialized = serde_json::to_string(&input).expect("tools input serializes");
+        assert!(!serialized.contains("parameters"));
+        assert!(!serialized.contains("properties"));
+        assert!(!serialized.contains("jsonSchema"));
+    }
+
+    fn sample_turn_input() -> TurnPreflightTurnInput {
+        sample_input().turn
+    }
+
+    fn sample_active_recall_input() -> TurnPreflightMemoryActiveRecallInput {
+        sample_input()
+            .memory
+            .active_recall
+            .expect("sample input has active recall provider input")
+    }
+
+    fn sample_deterministic_summary() -> DeterministicRecallContextSummary {
+        sample_input().memory.deterministic_summary
+    }
+
+    fn sample_tool_index() -> PreflightToolIndex {
+        PreflightToolIndex {
+            core_tools: vec!["exec_command".to_owned(), "request_tools".to_owned()],
+            candidate_tools: vec![
+                pioneer_tools::PreflightCandidateToolDescriptor {
+                    name: "memory_search".to_owned(),
+                    domain: BuiltinToolDomain::Memory,
+                    summary: "Search durable memory.".to_owned(),
+                    mutation: false,
+                },
+                pioneer_tools::PreflightCandidateToolDescriptor {
+                    name: "task_create".to_owned(),
+                    domain: BuiltinToolDomain::Task,
+                    summary: "Create a subtask.".to_owned(),
+                    mutation: true,
+                },
+            ],
+        }
+    }
+
+    fn sample_memory_local_plan(
+        provider_planning_needed: bool,
+        local_decision: ActiveRecallPlan,
+    ) -> MemoryActiveRecallLocalPlan {
+        let active_recall = sample_active_recall_input();
+        MemoryActiveRecallLocalPlan {
+            decision_context: active_recall.decision_context,
+            decision_request: active_recall.decision_request,
+            local_decision,
+            provider_planning_needed,
+        }
+    }
+
+    fn sample_skip_decision(reason_code: ActiveMemoryDecisionReasonCode) -> ActiveRecallPlan {
+        ActiveRecallPlan {
+            status: ActiveMemoryDecisionStatus::Skip,
+            reason_code,
+            confidence: 1.0,
+            modes: Vec::new(),
+            targets: Vec::new(),
+            debug_fallback: false,
+            provider_used: false,
+            provider_fallback_used: false,
+            provider_input_chars: None,
+            provider_output_chars: None,
+            diagnostics: vec!["memory.active_recall.host_local".to_owned()],
+        }
+    }
+
+    fn sample_low_confidence_run_decision() -> ActiveRecallPlan {
+        ActiveRecallPlan {
+            status: ActiveMemoryDecisionStatus::Run,
+            reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
+            confidence: 0.65,
+            modes: vec![ActiveRecallMode::Profile],
+            targets: Vec::new(),
+            debug_fallback: false,
+            provider_used: false,
+            provider_fallback_used: false,
+            provider_input_chars: None,
+            provider_output_chars: None,
+            diagnostics: vec!["memory.active_recall.local_candidate".to_owned()],
+        }
+    }
+
+    #[test]
+    fn preflight_local_host_final_active_recall_is_omitted_from_provider_input() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan(
+                false,
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+            ),
+        );
+
+        let provider_input = modules.provider_input(sample_turn_input());
+
+        assert!(!modules.active_recall_provider_planning_needed());
+        assert!(provider_input.memory.active_recall.is_none());
+        let host_local = modules
+            .host_local_active_recall_plan()
+            .expect("host-local final active recall is retained for final composition");
+        assert_eq!(host_local.source, TurnPreflightPlanSource::HostLocal);
+        assert_eq!(host_local.fallback_reason, None);
+        assert_eq!(
+            host_local.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::DeterministicSufficient
+        );
+    }
+
+    #[test]
+    fn preflight_local_provider_needed_active_recall_enters_provider_input() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan(true, sample_low_confidence_run_decision()),
+        );
+
+        let provider_input = modules.provider_input(sample_turn_input());
+        let active_recall = provider_input
+            .memory
+            .active_recall
+            .expect("provider-needed active recall enters provider input");
+
+        assert!(modules.active_recall_provider_planning_needed());
+        assert!(modules.host_local_active_recall_plan().is_none());
+        assert_eq!(active_recall.decision_context.thread_id, "thr_1");
+        assert_eq!(
+            active_recall.decision_request.config_mode,
+            MemoryActiveRecallMode::Hybrid
+        );
+        assert_eq!(
+            active_recall.decision_request.available_modes,
+            vec![
+                "profile".to_owned(),
+                "project".to_owned(),
+                "exact_canonical".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_local_tools_state_uses_compact_tool_index() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan(
+                false,
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+            ),
+        );
+
+        let provider_input = modules.provider_input(sample_turn_input());
+
+        assert_eq!(
+            provider_input.tools.core_tools,
+            vec!["exec_command".to_owned(), "request_tools".to_owned()]
+        );
+        assert_eq!(provider_input.tools.candidate_tools.len(), 2);
+        assert_eq!(
+            provider_input.tools.candidate_tools[0].name,
+            "memory_search"
+        );
+        assert_eq!(
+            provider_input.tools.candidate_tools[0].domain,
+            BuiltinToolDomain::Memory
+        );
+        assert_eq!(provider_input.tools.candidate_tools[1].name, "task_create");
+        assert_eq!(
+            provider_input.tools.candidate_tools[1].domain,
+            BuiltinToolDomain::Task
+        );
+
+        let serialized = serde_json::to_string(&provider_input).expect("input serializes");
         assert!(!serialized.contains("parameters"));
         assert!(!serialized.contains("properties"));
         assert!(!serialized.contains("jsonSchema"));
