@@ -127,7 +127,6 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
         memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
             MemoryRecallSnapshot::empty(),
         )),
-        decision_provider: None,
         episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
@@ -164,22 +163,6 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
         !capabilities
             .contains(&HookCapability::new("call_provider").expect("static capability is valid"))
     );
-
-    let hook_with_provider = ActiveMemoryRecallHook {
-        memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
-            MemoryRecallSnapshot::empty(),
-        )),
-        decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
-            r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[]}"#,
-        ))),
-        episodic_provider: None,
-        config: MemoryActiveRecallConfig::default(),
-    };
-    assert!(
-        hook_with_provider
-            .capabilities()
-            .contains(&HookCapability::new("call_provider").expect("static capability is valid"))
-    );
 }
 
 #[test]
@@ -194,7 +177,6 @@ fn memory_hook_package_registers_active_recall_after_preflight_with_deadline() {
         Arc::new(TestRecallMemoryProvider::with_recall(
             MemoryRecallSnapshot::empty(),
         )),
-        None,
         None,
         None,
         None,
@@ -279,7 +261,6 @@ fn memory_hook_package_respects_product_feature_switches() {
         ))),
         None,
         None,
-        None,
         Arc::new(TestToolBundleArtifactStore::new()),
         MemoryLoopConfig {
             deterministic_recall_enabled: false,
@@ -309,7 +290,6 @@ async fn active_memory_timeout_falls_back_without_prompt_context() {
     ));
     let handler = Arc::new(ActiveMemoryRecallHook {
         memory_provider: Arc::new(SlowRecallMemoryProvider),
-        decision_provider: None,
         episodic_provider: None,
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::StrictDebug,
@@ -470,7 +450,6 @@ fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
         Some(Arc::new(TestPostTurnExtractorProvider::json(
             r#"{"facts":[]}"#,
         ))),
-        None,
         None,
         None,
         Arc::new(TestToolBundleArtifactStore::new()),

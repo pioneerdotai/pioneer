@@ -115,8 +115,6 @@ pub struct GatewayMemorySettings {
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
     #[serde(default)]
-    pub active_recall_model: GatewayMemoryModelSelectionConfig,
-    #[serde(default)]
     pub proactive_writes_model: GatewayMemoryModelSelectionConfig,
     pub debug_trace_enabled: bool,
     pub strict_diagnostics_enabled: bool,
@@ -143,8 +141,8 @@ struct GatewayMemorySettingsOverride {
     proactive_writes_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     background_extraction_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_recall_model: Option<GatewayMemoryModelSelectionConfig>,
+    #[serde(default, rename = "active_recall_model", skip_serializing)]
+    legacy_active_recall_model: Option<GatewayMemoryModelSelectionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proactive_writes_model: Option<GatewayMemoryModelSelectionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,11 +190,9 @@ impl GatewaySettings {
 
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
-        let mut memory = self.effective_memory_settings(&config.memory);
-        memory.active_recall_model = model_selection_from_protocol(general.preflight_model.clone());
         pioneer_protocol::GatewaySettingsSnapshot {
             general,
-            memory: memory.to_protocol(),
+            memory: self.effective_memory_settings(&config.memory).to_protocol(),
         }
     }
 
@@ -210,10 +206,6 @@ impl GatewaySettings {
         }
         if let Some(memory) = update.memory {
             let memory = GatewayMemorySettings::from_protocol(memory);
-            if changes.general.preflight_model.is_none() {
-                self.general.preflight_model = Some(memory.active_recall_model.clone());
-                changes.general.preflight_model = Some(memory.active_recall_model.clone());
-            }
             self.set_memory_settings(memory);
             changes.memory = true;
         }
@@ -248,10 +240,10 @@ impl GatewaySettings {
         let mut migrated = false;
         if let Some(memory) = &mut self.memory {
             if self.general.preflight_model.is_none() {
-                self.general.preflight_model = memory.active_recall_model.clone();
+                self.general.preflight_model = memory.legacy_active_recall_model.clone();
             }
-            migrated = memory.active_recall_model.is_some();
-            memory.active_recall_model = None;
+            migrated = memory.legacy_active_recall_model.is_some();
+            memory.legacy_active_recall_model = None;
         }
         self.migrated |= migrated;
         migrated
@@ -267,7 +259,6 @@ impl GatewayMemorySettings {
             tools_enabled: config.tools_enabled,
             proactive_writes_enabled: config.proactive_writes_enabled,
             background_extraction_enabled: config.background_extraction_enabled,
-            active_recall_model: config.active_recall_model.clone(),
             proactive_writes_model: config.proactive_writes_model.clone(),
             debug_trace_enabled: config.debug_trace_enabled,
             strict_diagnostics_enabled: config.strict_diagnostics_enabled,
@@ -282,7 +273,6 @@ impl GatewayMemorySettings {
             tools_enabled: settings.tools_enabled,
             proactive_writes_enabled: settings.proactive_writes_enabled,
             background_extraction_enabled: settings.background_extraction_enabled,
-            active_recall_model: model_selection_from_protocol(settings.active_recall_model),
             proactive_writes_model: model_selection_from_protocol(settings.proactive_writes_model),
             debug_trace_enabled: settings.debug_trace_enabled,
             strict_diagnostics_enabled: settings.strict_diagnostics_enabled,
@@ -297,7 +287,6 @@ impl GatewayMemorySettings {
             tools_enabled: self.tools_enabled,
             proactive_writes_enabled: self.proactive_writes_enabled,
             background_extraction_enabled: self.background_extraction_enabled,
-            active_recall_model: model_selection_to_protocol(&self.active_recall_model),
             proactive_writes_model: model_selection_to_protocol(&self.proactive_writes_model),
             debug_trace_enabled: self.debug_trace_enabled,
             strict_diagnostics_enabled: self.strict_diagnostics_enabled,
@@ -326,7 +315,7 @@ impl GatewayMemorySettingsOverride {
             tools_enabled: Some(settings.tools_enabled),
             proactive_writes_enabled: Some(settings.proactive_writes_enabled),
             background_extraction_enabled: Some(settings.background_extraction_enabled),
-            active_recall_model: None,
+            legacy_active_recall_model: None,
             proactive_writes_model: Some(settings.proactive_writes_model),
             debug_trace_enabled: Some(settings.debug_trace_enabled),
             strict_diagnostics_enabled: Some(settings.strict_diagnostics_enabled),
@@ -622,7 +611,7 @@ backend = "keystore"
 [memory]
 enabled = false
 debug_trace_enabled = true
-active_recall_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
 proactive_writes_model = { source = "custom", model_provider = "extractor-provider", model = "extractor-model" }
 "#,
         )
@@ -646,8 +635,8 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
                 .effective_general_settings(&gateway_config_with_keepawake(false))
                 .preflight_model,
             pioneer_protocol::GatewayMemoryModelSelection::custom(
-                "planner-provider",
-                "planner-model"
+                "legacy-provider",
+                "legacy-model"
             )
         );
 
@@ -803,10 +792,6 @@ backend = "keystore"
             tools_enabled: false,
             proactive_writes_enabled: false,
             background_extraction_enabled: false,
-            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
-                "planner-provider",
-                "planner-model",
-            ),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::thread(),
             debug_trace_enabled: true,
             strict_diagnostics_enabled: true,

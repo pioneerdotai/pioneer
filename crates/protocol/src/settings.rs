@@ -59,8 +59,6 @@ pub struct GatewayMemorySettings {
     pub proactive_writes_enabled: bool,
     pub background_extraction_enabled: bool,
     #[serde(default)]
-    pub active_recall_model: GatewayMemoryModelSelection,
-    #[serde(default)]
     pub proactive_writes_model: GatewayMemoryModelSelection,
     pub debug_trace_enabled: bool,
     pub strict_diagnostics_enabled: bool,
@@ -75,7 +73,6 @@ impl Default for GatewayMemorySettings {
             tools_enabled: true,
             proactive_writes_enabled: true,
             background_extraction_enabled: true,
-            active_recall_model: GatewayMemoryModelSelection::thread(),
             proactive_writes_model: GatewayMemoryModelSelection::thread(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,

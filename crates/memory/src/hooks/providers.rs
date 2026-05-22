@@ -424,13 +424,6 @@ pub struct MemoryActiveRecallDecisionRequest {
 }
 
 impl MemoryActiveRecallDecisionRequest {
-    pub fn render_prompt(&self, context: &MemoryActiveRecallDecisionContext) -> String {
-        render_memory_active_recall_planner_prompt(&MemoryActiveRecallPlannerPromptInput {
-            sanitized_input_json: self.sanitized_input_json(context),
-            max_output_chars: self.max_output_chars,
-        })
-    }
-
     pub fn sanitized_input_json(&self, context: &MemoryActiveRecallDecisionContext) -> String {
         let payload = MemoryActiveRecallPlannerSanitizedInput {
             workspace_id_present: !context.workspace_id.trim().is_empty(),
@@ -516,13 +509,4 @@ struct MemoryActiveRecallPlannerBudgetInput {
     max_prompt_chars: usize,
     max_input_chars: usize,
     max_output_chars: usize,
-}
-
-#[async_trait::async_trait]
-pub trait AgentActiveMemoryDecisionProvider: Send + Sync {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        context: MemoryActiveRecallDecisionContext,
-        request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String>;
 }

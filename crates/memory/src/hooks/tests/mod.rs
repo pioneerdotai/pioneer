@@ -46,7 +46,6 @@ fn install_memory_hook_package_for_test(
     memory_write_provider: Option<Arc<dyn AgentMemoryWriteProvider>>,
     post_turn_extractor_provider: Option<Arc<dyn AgentMemoryPostTurnExtractorProvider>>,
     policy_provider: Option<Arc<dyn AgentMemoryTurnPolicyProvider>>,
-    active_recall_decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     episodic_recall_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     tool_bundle_artifacts: Arc<dyn MemoryToolBundleArtifactStore>,
     memory_config: MemoryLoopConfig,
@@ -57,7 +56,6 @@ fn install_memory_hook_package_for_test(
             memory_write_provider,
             post_turn_extractor_provider,
             policy_provider,
-            active_recall_decision_provider,
             episodic_recall_provider,
             tool_bundle_artifacts,
             memory_config,
@@ -1008,110 +1006,6 @@ impl AgentMemoryProvider for SlowRecallMemoryProvider {
         _context: MemoryTurnContext,
     ) -> Result<MemoryToolMaterialization, String> {
         panic!("active memory recall timeout test must not materialize tools")
-    }
-}
-
-struct TestActiveMemoryDecisionProvider {
-    json: String,
-}
-
-impl TestActiveMemoryDecisionProvider {
-    fn json(json: impl Into<String>) -> Self {
-        Self { json: json.into() }
-    }
-}
-
-struct TestSequencedActiveMemoryDecisionProvider {
-    responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
-    contexts: std::sync::Mutex<Vec<MemoryActiveRecallDecisionContext>>,
-}
-
-impl TestSequencedActiveMemoryDecisionProvider {
-    fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
-        Self {
-            responses: std::sync::Mutex::new(responses.into_iter().collect()),
-            contexts: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn contexts(&self) -> Vec<MemoryActiveRecallDecisionContext> {
-        self.contexts
-            .lock()
-            .expect("active memory sequenced provider contexts lock poisoned")
-            .clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentActiveMemoryDecisionProvider for TestSequencedActiveMemoryDecisionProvider {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        context: MemoryActiveRecallDecisionContext,
-        _request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String> {
-        self.contexts
-            .lock()
-            .expect("active memory sequenced provider contexts lock poisoned")
-            .push(context);
-        self.responses
-            .lock()
-            .expect("active memory sequenced provider responses lock poisoned")
-            .pop_front()
-            .unwrap_or_else(|| Err("no sequenced provider response".to_owned()))
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentActiveMemoryDecisionProvider for TestActiveMemoryDecisionProvider {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        _context: MemoryActiveRecallDecisionContext,
-        _request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String> {
-        Ok(self.json.clone())
-    }
-}
-
-struct TestFailingActiveMemoryDecisionProvider;
-
-#[async_trait::async_trait]
-impl AgentActiveMemoryDecisionProvider for TestFailingActiveMemoryDecisionProvider {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        _context: MemoryActiveRecallDecisionContext,
-        _request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String> {
-        Err("provider failed".to_owned())
-    }
-}
-
-struct TestSlowActiveMemoryDecisionProvider;
-
-#[async_trait::async_trait]
-impl AgentActiveMemoryDecisionProvider for TestSlowActiveMemoryDecisionProvider {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        _context: MemoryActiveRecallDecisionContext,
-        _request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String> {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        Ok(
-            r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["profile"]}"#
-                .to_owned(),
-        )
-    }
-}
-
-struct PanickingActiveMemoryDecisionProvider;
-
-#[async_trait::async_trait]
-impl AgentActiveMemoryDecisionProvider for PanickingActiveMemoryDecisionProvider {
-    async fn resolve_active_memory_decision_json(
-        &self,
-        _context: MemoryActiveRecallDecisionContext,
-        _request: MemoryActiveRecallDecisionRequest,
-    ) -> Result<String, String> {
-        panic!("active recall decision provider must not be called")
     }
 }
 

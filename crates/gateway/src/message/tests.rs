@@ -956,9 +956,6 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
                     "tools_enabled": true,
                     "proactive_writes_enabled": false,
                     "background_extraction_enabled": true,
-                    "active_recall_model": {
-                        "source": "thread"
-                    },
                     "proactive_writes_model": {
                         "source": "thread"
                     },
@@ -997,11 +994,6 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
                     "tools_enabled": true,
                     "proactive_writes_enabled": true,
                     "background_extraction_enabled": true,
-                    "active_recall_model": {
-                        "source": "custom",
-                        "model_provider": "planner-provider",
-                        "model": "planner-model"
-                    },
                     "proactive_writes_model": {
                         "source": "custom",
                         "model_provider": "extractor-provider",
@@ -1027,14 +1019,6 @@ async fn memory_settings_update_reinstalls_memory_hook_runtime() {
     )
     .await;
     let memory_config = harness.processor.memory_loop_config();
-    assert_eq!(
-        memory_config.active_recall.planner.provider_name.as_deref(),
-        Some("planner-provider")
-    );
-    assert_eq!(
-        memory_config.active_recall.planner.model.as_deref(),
-        Some("planner-model")
-    );
     assert_eq!(
         memory_config.post_turn_extractor.provider_name.as_deref(),
         Some("extractor-provider")

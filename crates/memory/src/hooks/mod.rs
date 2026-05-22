@@ -42,9 +42,8 @@ use pioneer_hooks::{
 #[cfg(test)]
 use pioneer_promt::MemoryRecallPromptItem;
 use pioneer_promt::{
-    MemoryActiveRecallPlannerPromptInput, MemoryPostTurnExtractorPromptInput,
-    MemoryRecallPromptContextBlock, MemoryRecallPromptInput, MemoryRecallPromptPolicy,
-    render_memory_active_recall_planner_prompt, render_memory_post_turn_extractor_prompt,
+    MemoryPostTurnExtractorPromptInput, MemoryRecallPromptContextBlock, MemoryRecallPromptInput,
+    MemoryRecallPromptPolicy, render_memory_post_turn_extractor_prompt,
     render_memory_recall_prompt,
 };
 use pioneer_protocol::{

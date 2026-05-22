@@ -389,9 +389,6 @@ impl MessageProcessor {
         self.agent_manager
             .set_memory_turn_policy_provider(Some(memory_policy_provider.clone()))
             .await;
-        self.agent_manager
-            .set_memory_active_recall_decision_provider(Some(memory_provider.clone()))
-            .await;
 
         let bridge = MemoryBridgeProviders {
             memory_provider,
@@ -409,7 +406,6 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(bridge.memory_provider),
                 None,
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),

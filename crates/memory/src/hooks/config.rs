@@ -56,8 +56,6 @@ impl MemoryActiveRecallPlannerFallbackPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryActiveRecallPlannerConfig {
     pub enabled: bool,
-    pub provider_name: Option<String>,
-    pub model: Option<String>,
     pub timeout_ms: u64,
     pub max_input_chars: usize,
     pub max_output_chars: usize,
@@ -68,8 +66,6 @@ impl Default for MemoryActiveRecallPlannerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider_name: None,
-            model: None,
             timeout_ms: 60_000,
             max_input_chars: 4_000,
             max_output_chars: 2_000,
@@ -82,8 +78,6 @@ impl MemoryActiveRecallPlannerConfig {
     pub fn normalized(&self) -> Self {
         Self {
             enabled: self.enabled,
-            provider_name: normalized_optional_config_text(self.provider_name.as_deref(), 80),
-            model: normalized_optional_config_text(self.model.as_deref(), 160),
             timeout_ms: self.timeout_ms.max(1),
             max_input_chars: self.max_input_chars.max(1),
             max_output_chars: self.max_output_chars.max(1),

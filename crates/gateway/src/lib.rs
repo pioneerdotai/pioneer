@@ -488,9 +488,6 @@ fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -
     if !config.enabled || !config.active_recall_enabled || !memory.deterministic_recall_enabled {
         memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
     }
-    memory.active_recall.planner.provider_name =
-        config.active_recall_model.model_provider_override();
-    memory.active_recall.planner.model = config.active_recall_model.model_override();
 
     memory.post_turn_extractor.enabled = config.enabled && config.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled = config.enabled && config.proactive_writes_enabled;
@@ -521,9 +518,6 @@ pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     {
         memory.active_recall.mode = MemoryActiveRecallMode::Disabled;
     }
-    memory.active_recall.planner.provider_name =
-        settings.active_recall_model.model_provider_override();
-    memory.active_recall.planner.model = settings.active_recall_model.model_override();
 
     memory.post_turn_extractor.enabled = settings.enabled && settings.proactive_writes_enabled;
     memory.post_turn_extractor.provider_enabled =
@@ -686,8 +680,6 @@ mod tests {
         assert!(loop_config.post_turn_extractor.enabled);
         assert!(loop_config.post_turn_extractor.provider_enabled);
         assert!(loop_config.post_turn_extractor.proactive_writes_enabled);
-        assert!(loop_config.active_recall.planner.provider_name.is_none());
-        assert!(loop_config.active_recall.planner.model.is_none());
         assert!(loop_config.post_turn_extractor.provider_name.is_none());
         assert!(loop_config.post_turn_extractor.model.is_none());
         assert_eq!(
@@ -744,12 +736,8 @@ mod tests {
     }
 
     #[test]
-    fn gateway_memory_config_maps_memory_model_overrides_to_hooks() {
+    fn gateway_memory_config_maps_proactive_model_override_to_hooks() {
         let loop_config = memory_loop_config_from_gateway_memory_config(&GatewayMemoryConfig {
-            active_recall_model: GatewayMemoryModelSelectionConfig::custom(
-                "planner-provider",
-                "planner-model",
-            ),
             proactive_writes_model: GatewayMemoryModelSelectionConfig::custom(
                 "extractor-provider",
                 "extractor-model",
@@ -757,14 +745,6 @@ mod tests {
             ..GatewayMemoryConfig::default()
         });
 
-        assert_eq!(
-            loop_config.active_recall.planner.provider_name.as_deref(),
-            Some("planner-provider")
-        );
-        assert_eq!(
-            loop_config.active_recall.planner.model.as_deref(),
-            Some("planner-model")
-        );
         assert_eq!(
             loop_config.post_turn_extractor.provider_name.as_deref(),
             Some("extractor-provider")

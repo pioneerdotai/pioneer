@@ -84,8 +84,7 @@ pub fn deterministic_recall_context_summary(
     summary
 }
 
-pub(super) async fn resolve_active_memory_decision(
-    provider: Option<&Arc<dyn AgentActiveMemoryDecisionProvider>>,
+pub(super) fn resolve_active_memory_decision_without_preflight_plan(
     context: &MemoryTurnContext,
     input: &TurnPrePromptContextHookInput,
     policy: &MemoryTurnPolicy,
@@ -106,86 +105,7 @@ pub(super) async fn resolve_active_memory_decision(
         return normalize_active_recall_plan_for_input(local.local_plan, &local.planner_input);
     }
 
-    if config.planner.enabled
-        && let Some(provider) = provider
-    {
-        let request = local.decision_request.clone();
-        let provider_context = local.decision_context.clone();
-        match call_active_recall_decision_provider(
-            provider.as_ref(),
-            provider_context.clone(),
-            request.clone(),
-            config,
-        )
-        .await
-        {
-            Ok(decision) => {
-                return normalize_active_recall_plan_for_input(decision, &local.planner_input);
-            }
-            Err(primary_failure) => {
-                if let Some(retry_context) =
-                    active_recall_thread_model_retry_context(&provider_context, input)
-                {
-                    match call_active_recall_decision_provider(
-                        provider.as_ref(),
-                        retry_context,
-                        request,
-                        config,
-                    )
-                    .await
-                    {
-                        Ok(mut decision) => {
-                            decision.diagnostics.insert(
-                                0,
-                                "memory.active_recall.thread_model_retry_used".to_owned(),
-                            );
-                            decision
-                                .diagnostics
-                                .insert(1, primary_failure.reason.to_owned());
-                            return normalize_active_recall_plan_for_input(
-                                decision,
-                                &local.planner_input,
-                            );
-                        }
-                        Err(retry_failure) => {
-                            let mut decision = active_recall_provider_fallback(
-                                local.local_plan.clone(),
-                                retry_failure.reason,
-                                &local.planner_input,
-                                config,
-                                retry_failure.provider_input_chars,
-                                retry_failure.provider_output_chars,
-                            );
-                            decision.diagnostics.insert(
-                                0,
-                                "memory.active_recall.thread_model_retry_failed".to_owned(),
-                            );
-                            decision
-                                .diagnostics
-                                .insert(1, primary_failure.reason.to_owned());
-                            return decision;
-                        }
-                    }
-                }
-
-                return active_recall_provider_fallback(
-                    local.local_plan.clone(),
-                    primary_failure.reason,
-                    &local.planner_input,
-                    config,
-                    primary_failure.provider_input_chars,
-                    primary_failure.provider_output_chars,
-                );
-            }
-        }
-    }
-
-    active_recall_no_provider_local_decision(
-        local.local_plan,
-        &local.planner_input,
-        config,
-        provider.is_some(),
-    )
+    active_recall_no_provider_local_decision(local.local_plan, &local.planner_input, config, false)
 }
 
 pub(super) fn active_memory_decision_from_preflight_plan(
@@ -363,12 +283,8 @@ fn active_recall_local_planning_parts(
         turn_id: context.turn_id.clone(),
         mode: context.mode,
         input_text_preview: planner_input.input_text_preview.clone(),
-        model: config.planner.model.clone().or_else(|| input.model.clone()),
-        model_provider: config
-            .planner
-            .provider_name
-            .clone()
-            .or_else(|| input.model_provider.clone()),
+        model: input.model.clone(),
+        model_provider: input.model_provider.clone(),
     };
 
     ActiveRecallLocalPlanningParts {
@@ -411,74 +327,6 @@ fn active_recall_no_provider_local_decision(
             .push("memory.active_recall.provider_unavailable".to_owned());
     }
     normalize_active_recall_plan_for_input(local_plan, planner_input)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveRecallProviderFailure {
-    reason: &'static str,
-    provider_input_chars: Option<usize>,
-    provider_output_chars: Option<usize>,
-}
-
-async fn call_active_recall_decision_provider(
-    provider: &dyn AgentActiveMemoryDecisionProvider,
-    context: MemoryActiveRecallDecisionContext,
-    request: MemoryActiveRecallDecisionRequest,
-    config: &MemoryActiveRecallConfig,
-) -> Result<ActiveMemoryDecision, ActiveRecallProviderFailure> {
-    let provider_input_chars = request.sanitized_input_json(&context).chars().count();
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(config.planner.timeout_ms),
-        provider.resolve_active_memory_decision_json(context, request),
-    )
-    .await
-    {
-        Err(_) => Err(ActiveRecallProviderFailure {
-            reason: "memory.active_recall.provider_timeout",
-            provider_input_chars: Some(provider_input_chars),
-            provider_output_chars: None,
-        }),
-        Ok(provider_result) => match provider_result {
-            Ok(json) => match parse_active_memory_decision_json(json.as_str()) {
-                Ok(mut decision) => {
-                    decision.provider_input_chars = Some(provider_input_chars);
-                    decision.provider_output_chars = Some(json.chars().count());
-                    decision
-                        .diagnostics
-                        .insert(0, "memory.active_recall.provider_called".to_owned());
-                    Ok(decision)
-                }
-                Err(_) => Err(ActiveRecallProviderFailure {
-                    reason: "memory.active_recall.invalid_json",
-                    provider_input_chars: Some(provider_input_chars),
-                    provider_output_chars: Some(json.chars().count()),
-                }),
-            },
-            Err(_) => Err(ActiveRecallProviderFailure {
-                reason: "memory.active_recall.provider_failed",
-                provider_input_chars: Some(provider_input_chars),
-                provider_output_chars: None,
-            }),
-        },
-    }
-}
-
-fn active_recall_thread_model_retry_context(
-    primary_context: &MemoryActiveRecallDecisionContext,
-    input: &TurnPrePromptContextHookInput,
-) -> Option<MemoryActiveRecallDecisionContext> {
-    let turn_model = input.model.clone()?;
-    let turn_model_provider = input.model_provider.clone()?;
-    if primary_context.model.as_deref() == Some(turn_model.as_str())
-        && primary_context.model_provider.as_deref() == Some(turn_model_provider.as_str())
-    {
-        return None;
-    }
-
-    let mut retry_context = primary_context.clone();
-    retry_context.model = Some(turn_model);
-    retry_context.model_provider = Some(turn_model_provider);
-    Some(retry_context)
 }
 
 fn active_recall_provider_fallback(
@@ -761,8 +609,8 @@ mod active_recall_local_preflight_tests {
         );
     }
 
-    #[tokio::test]
-    async fn active_recall_local_preflight_matches_no_provider_local_resolution() {
+    #[test]
+    fn active_recall_local_preflight_matches_no_provider_local_resolution() {
         let context = test_context(None);
         let input = test_input();
         let policy = MemoryTurnPolicy::normal_default_allow();
@@ -779,16 +627,14 @@ mod active_recall_local_preflight_tests {
             episodic_capabilities.clone(),
             false,
         );
-        let resolved = resolve_active_memory_decision(
-            None,
+        let resolved = resolve_active_memory_decision_without_preflight_plan(
             &context,
             &input,
             &policy,
             &config,
             &deterministic,
             episodic_capabilities,
-        )
-        .await;
+        );
 
         assert!(!plan.provider_planning_needed);
         assert_eq!(plan.local_decision, resolved);
@@ -804,8 +650,8 @@ mod active_recall_local_preflight_tests {
         );
     }
 
-    #[tokio::test]
-    async fn active_recall_local_preflight_matches_planner_disabled_local_resolution() {
+    #[test]
+    fn active_recall_local_preflight_matches_planner_disabled_local_resolution() {
         let context = test_context(None);
         let input = test_input();
         let policy = MemoryTurnPolicy::normal_default_allow();
@@ -823,16 +669,14 @@ mod active_recall_local_preflight_tests {
             episodic_capabilities.clone(),
             true,
         );
-        let resolved = resolve_active_memory_decision(
-            None,
+        let resolved = resolve_active_memory_decision_without_preflight_plan(
             &context,
             &input,
             &policy,
             &config,
             &deterministic,
             episodic_capabilities,
-        )
-        .await;
+        );
 
         assert!(!plan.provider_planning_needed);
         assert_eq!(plan.local_decision, resolved);

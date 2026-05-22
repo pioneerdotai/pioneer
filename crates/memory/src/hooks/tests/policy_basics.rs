@@ -40,12 +40,10 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
 }
 
 #[test]
-fn memory_active_recall_planner_config_normalizes_bounds_and_names() {
+fn memory_active_recall_runtime_config_normalizes_bounds() {
     let config = MemoryActiveRecallConfig {
         planner: MemoryActiveRecallPlannerConfig {
             enabled: true,
-            provider_name: Some("  provider-name-that-is-kept  ".to_owned()),
-            model: Some("  model-name-that-is-kept  ".to_owned()),
             timeout_ms: 0,
             max_input_chars: 0,
             max_output_chars: 0,
@@ -58,14 +56,6 @@ fn memory_active_recall_planner_config_normalizes_bounds_and_names() {
     assert_eq!(
         config.mode.as_str(),
         MemoryActiveRecallMode::Hybrid.as_str()
-    );
-    assert_eq!(
-        config.planner.provider_name.as_deref(),
-        Some("provider-name-that-is-kept")
-    );
-    assert_eq!(
-        config.planner.model.as_deref(),
-        Some("model-name-that-is-kept")
     );
     assert_eq!(config.planner.timeout_ms, 1);
     assert_eq!(config.planner.max_input_chars, 1);

@@ -1,4 +1,4 @@
-pub mod memory_active_recall_planner;
+pub mod memory_active_recall_contract;
 pub mod memory_post_turn_extractor;
 pub mod memory_recall;
 pub mod memory_turn_policy;

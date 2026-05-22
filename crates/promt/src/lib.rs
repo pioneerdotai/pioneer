@@ -24,9 +24,8 @@ pub use hooks::{
 };
 pub use profile::PromptProfile;
 pub use render::{
-    memory_active_recall_planner::{
-        MemoryActiveRecallPlannerPromptInput, MemoryActiveRecallProviderOutputContractInput,
-        MemoryActiveRecallProviderOutputPath, render_memory_active_recall_planner_prompt,
+    memory_active_recall_contract::{
+        MemoryActiveRecallProviderOutputContractInput, MemoryActiveRecallProviderOutputPath,
         render_memory_active_recall_provider_output_contract,
         render_memory_active_recall_provider_output_example,
     },

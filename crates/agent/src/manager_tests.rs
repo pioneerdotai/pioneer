@@ -356,11 +356,6 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
         .await
         .clone();
     let policy_provider = manager.memory_turn_policy_provider.read().await.clone();
-    let active_recall_decision_provider = manager
-        .memory_active_recall_decision_provider
-        .read()
-        .await
-        .clone();
     let episodic_recall_provider = manager.memory_episodic_recall_provider.read().await.clone();
     let current_runtime = manager.hook_runtime.read().await.clone();
     let builder = current_runtime
@@ -373,7 +368,6 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
             memory_write_provider,
             post_turn_extractor_provider,
             policy_provider,
-            active_recall_decision_provider,
             episodic_recall_provider,
             manager.memory_tool_bundle_artifact_store(),
             manager.tool_loop_config.memory.clone(),

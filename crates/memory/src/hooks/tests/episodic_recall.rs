@@ -199,19 +199,30 @@ async fn missing_episodic_capability_drops_provider_selected_mode() {
     ));
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
-        decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
-            r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
-        ))),
         episodic_provider: None,
         config: MemoryActiveRecallConfig::default(),
     };
+    let plan = parse_active_memory_decision_json(
+        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
+    )
+    .expect("provider-owned preflight plan parses");
+    let input = TurnPostPreflightPromptContextHookInput::from_parts(
+        "continue what we discussed earlier",
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .with_active_memory_recall_preflight_plan(
+        serde_json::to_value(plan).expect("active recall plan serializes"),
+    );
+    let mut request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        HookPromptContextSet::default(),
+        "continue what we discussed earlier",
+    );
+    request.input = HookInput::turn_post_preflight_prompt_context(input);
 
     let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            HookPromptContextSet::default(),
-            "continue what we discussed earlier",
-        ))
+        .execute(request)
         .await
         .expect("active recall hook executes");
 
@@ -288,19 +299,30 @@ async fn current_thread_recall_uses_native_provider_and_separate_prompt_context(
     let episodic = Arc::new(episodic);
     let hook = ActiveMemoryRecallHook {
         memory_provider: durable_provider.clone(),
-        decision_provider: Some(Arc::new(TestActiveMemoryDecisionProvider::json(
-            r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
-        ))),
         episodic_provider: Some(episodic.clone()),
         config: MemoryActiveRecallConfig::default(),
     };
+    let plan = parse_active_memory_decision_json(
+        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
+    )
+    .expect("provider-owned preflight plan parses");
+    let input = TurnPostPreflightPromptContextHookInput::from_parts(
+        "continue what we discussed earlier",
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .with_active_memory_recall_preflight_plan(
+        serde_json::to_value(plan).expect("active recall plan serializes"),
+    );
+    let mut request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        HookPromptContextSet::default(),
+        "continue what we discussed earlier",
+    );
+    request.input = HookInput::turn_post_preflight_prompt_context(input);
 
     let response = hook
-        .execute(test_active_prompt_context_hook_request(
-            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-            HookPromptContextSet::default(),
-            "continue what we discussed earlier",
-        ))
+        .execute(request)
         .await
         .expect("active recall hook executes");
 

@@ -2,7 +2,6 @@ use super::*;
 
 pub(in crate::hooks) struct ActiveMemoryRecallHook {
     pub(in crate::hooks) memory_provider: Arc<dyn AgentMemoryProvider>,
-    pub(in crate::hooks) decision_provider: Option<Arc<dyn AgentActiveMemoryDecisionProvider>>,
     pub(in crate::hooks) episodic_provider: Option<Arc<dyn AgentEpisodicRecallProvider>>,
     pub(in crate::hooks) config: MemoryActiveRecallConfig,
 }
@@ -22,11 +21,7 @@ impl HookHandler for ActiveMemoryRecallHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        let config = self.config.normalized();
-        let provider_enabled = self.decision_provider.is_some()
-            && config.planner.enabled
-            && config.mode == MemoryActiveRecallMode::Hybrid;
-        memory_active_recall_capabilities(provider_enabled)
+        memory_active_recall_capabilities()
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
@@ -74,18 +69,14 @@ impl HookHandler for ActiveMemoryRecallHook {
                     return Ok(response);
                 }
             },
-            None => {
-                resolve_active_memory_decision(
-                    self.decision_provider.as_ref(),
-                    &context,
-                    &prompt_input,
-                    &policy,
-                    &config,
-                    &deterministic,
-                    episodic_capabilities.clone(),
-                )
-                .await
-            }
+            None => resolve_active_memory_decision_without_preflight_plan(
+                &context,
+                &prompt_input,
+                &policy,
+                &config,
+                &deterministic,
+                episodic_capabilities.clone(),
+            ),
         };
         response.diagnostics.extend(hook_diagnostics_from_strings(
             decision.diagnostics.as_slice(),

@@ -1,4 +1,4 @@
-use super::memory_active_recall_planner::{
+use super::memory_active_recall_contract::{
     MemoryActiveRecallProviderOutputContractInput,
     render_memory_active_recall_provider_output_contract,
 };
