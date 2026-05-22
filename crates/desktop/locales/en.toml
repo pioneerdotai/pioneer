@@ -835,6 +835,13 @@ label = "Prevent idle sleep"
 description = "Prevents idle sleep while the gateway is running. Closing a laptop lid is not covered; use closed-display mode with power and an external display, or run the gateway on an always-on machine."
 tooltip = "Prevents idle sleep only. Closing a laptop lid requires closed-display mode or an always-on machine."
 
+[settings.general.preflight_model]
+label = "Preflight model"
+description = "Choose the provider and model for internal pre-turn planning. Default uses the current thread model."
+default = "Default"
+select_model = "Select model"
+dialog_title = "Select Preflight Model"
+
 [settings.memory]
 title = "Memory"
 description = "Control how Pioneer uses durable memory."
@@ -846,10 +853,6 @@ description = "Allow Pioneer to use saved facts and project decisions when usefu
 [settings.memory.active_recall]
 label = "Active recall"
 description = "Run extra read-only recall planning for context-heavy turns."
-
-[settings.memory.active_recall_model]
-label = "Active recall model"
-description = "Choose the provider and model for active memory planning. Default uses the current thread model."
 
 [settings.memory.proactive_writes]
 label = "Proactive writes"

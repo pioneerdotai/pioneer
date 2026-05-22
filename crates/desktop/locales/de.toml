@@ -556,6 +556,13 @@ label = "Ruhezustand bei Inaktivität verhindern"
 description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand wechselt, solange das Gateway läuft. Beim Zuklappen eines Laptops ist das nicht garantiert; dafür brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 tooltip = "Verhindert nur den Ruhezustand bei Inaktivität. Für zugeklappte Laptops brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 
+[settings.general.preflight_model]
+label = "Preflight-Modell"
+description = "Wähle Anbieter und Modell für die interne Planung vor einem Zug. Standard verwendet das Modell des aktuellen Threads."
+default = "Standard"
+select_model = "Modell auswählen"
+dialog_title = "Preflight-Modell auswählen"
+
 [settings.memory]
 title = "Speicher"
 description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."
@@ -567,10 +574,6 @@ description = "Pioneer darf gespeicherte Fakten und Projektentscheidungen verwen
 [settings.memory.active_recall]
 label = "Aktiver Abruf"
 description = "Zusätzliche schreibgeschützte Abrufplanung für kontextreiche Aufgaben ausführen."
-
-[settings.memory.active_recall_model]
-label = "Modell für aktiven Abruf"
-description = "Wähle Anbieter und Modell für die Speicherplanung. Standard verwendet das Modell des aktuellen Threads."
 
 [settings.memory.proactive_writes]
 label = "Proaktives Speichern"

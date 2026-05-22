@@ -556,6 +556,13 @@ label = "アイドルスリープを防止"
 description = "ゲートウェイの実行中、アイドル状態によるシステムスリープを防ぎます。ノートPCのフタを閉じた状態での動作は保証されません。その場合はクラムシェルモードを使うか、常時稼働のマシンでゲートウェイを実行してください。"
 tooltip = "防げるのはアイドルスリープのみです。フタを閉じる場合はクラムシェルモードか常時稼働マシンが必要です。"
 
+[settings.general.preflight_model]
+label = "Preflight モデル"
+description = "ターン前の内部計画に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
+default = "デフォルト"
+select_model = "モデルを選択"
+dialog_title = "Preflight モデルを選択"
+
 [settings.memory]
 title = "メモリ"
 description = "Pioneer が永続メモリをどのように使うかを制御します。"
@@ -567,10 +574,6 @@ description = "役立つ場合に、保存済みの事実やプロジェクト�
 [settings.memory.active_recall]
 label = "能動的な呼び出し"
 description = "文脈の多いタスク向けに、読み取り専用の追加メモリ呼び出し計画を実行します。"
-
-[settings.memory.active_recall_model]
-label = "能動的呼び出しモデル"
-description = "メモリ読み取り計画に使うプロバイダーとモデルを選択します。デフォルトは現在のスレッドのモデルを使います。"
 
 [settings.memory.proactive_writes]
 label = "能動的な書き込み"

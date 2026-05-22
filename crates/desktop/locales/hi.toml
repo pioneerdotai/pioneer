@@ -556,6 +556,13 @@ label = "Idle sleep रोकें"
 description = "जब gateway चल रहा हो, तो सिस्टम को idle sleep में जाने से रोकता है। Laptop lid बंद करने पर यह काम जारी रहने की गारंटी नहीं देता; ऐसे उपयोग के लिए clamshell mode या always-on machine चाहिए."
 tooltip = "सिर्फ idle sleep रोकता है। Lid बंद रखने के लिए clamshell mode या always-on machine चाहिए."
 
+[settings.general.preflight_model]
+label = "Preflight मॉडल"
+description = "चरण से पहले की आंतरिक योजना के लिए प्रदाता और मॉडल चुनें. डिफ़ॉल्ट वर्तमान थ्रेड का मॉडल इस्तेमाल करता है."
+default = "डिफ़ॉल्ट"
+select_model = "मॉडल चुनें"
+dialog_title = "Preflight मॉडल चुनें"
+
 [settings.memory]
 title = "मेमोरी"
 description = "Pioneer टिकाऊ मेमोरी का उपयोग कैसे करता है, इसे नियंत्रित करें."
@@ -567,10 +574,6 @@ description = "ज़रूरत पड़ने पर Pioneer को सह�
 [settings.memory.active_recall]
 label = "सक्रिय स्मरण"
 description = "संदर्भ-भारी कार्यों के लिए अतिरिक्त केवल-पढ़ने वाली स्मरण योजना चलाएँ."
-
-[settings.memory.active_recall_model]
-label = "सक्रिय स्मरण मॉडल"
-description = "मेमोरी पढ़ने की योजना के लिए प्रदाता और मॉडल चुनें. डिफ़ॉल्ट वर्तमान थ्रेड का मॉडल इस्तेमाल करता है."
 
 [settings.memory.proactive_writes]
 label = "सक्रिय लेखन"

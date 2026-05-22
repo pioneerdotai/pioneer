@@ -137,13 +137,36 @@ impl PioneerDesktop {
             return;
         };
         match setting {
-            MemoryModelSetting::ActiveRecallPlanner => memory.active_recall_model = model_selection,
             MemoryModelSetting::PostTurnExtractor => {
                 memory.proactive_writes_model = model_selection
             }
         }
 
         self.apply_gateway_memory_settings(memory, cx);
+    }
+
+    pub(super) fn apply_preflight_model_setting(
+        &mut self,
+        model_selection: GatewayMemoryModelSelection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut snapshot) = self.gateway.settings.clone() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+
+        snapshot.general.preflight_model = model_selection.clone();
+        self.apply_gateway_settings_update(
+            snapshot,
+            GatewaySettingsUpdate {
+                general: Some(GatewayGeneralSettingsUpdate {
+                    keepawake: None,
+                    preflight_model: Some(model_selection),
+                }),
+                memory: None,
+            },
+            cx,
+        );
     }
 
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {

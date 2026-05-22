@@ -47,15 +47,47 @@ impl PioneerDesktop {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
         let desktop_entity = cx.entity().clone();
-        let keepawake_panel = match &self.gateway.settings {
-            Some(settings) => Self::render_keepawake_setting(
-                settings.general.keepawake,
+
+        let mut general_settings = v_flex()
+            .w_full()
+            .gap_0()
+            .px_4()
+            .py_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(Self::render_locale_setting(
+                selected_language,
                 desktop_entity.clone(),
                 cx,
-            ),
-            None => {
-                Self::render_gateway_settings_status(self.gateway_settings_status_message(), cx)
-            }
+            ))
+            .child(Self::render_settings_divider(cx))
+            .child(Self::render_theme_setting(
+                selected_theme,
+                desktop_entity.clone(),
+                cx,
+            ));
+
+        general_settings = match &self.gateway.settings {
+            Some(settings) => general_settings
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_keepawake_setting(
+                    settings.general.keepawake,
+                    desktop_entity.clone(),
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_preflight_model_setting(
+                    settings.general.preflight_model.clone(),
+                    desktop_entity,
+                    cx,
+                )),
+            None => general_settings
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_gateway_settings_status_row(
+                    self.gateway_settings_status_message(),
+                )),
         };
 
         v_flex()
@@ -85,17 +117,7 @@ impl PioneerDesktop {
                                         .child(t!("settings.screen.description").to_string()),
                                 ),
                         )
-                        .child(Self::render_locale_setting(
-                            selected_language,
-                            desktop_entity.clone(),
-                            cx,
-                        ))
-                        .child(Self::render_theme_setting(
-                            selected_theme,
-                            desktop_entity,
-                            cx,
-                        ))
-                        .child(keepawake_panel),
+                        .child(general_settings),
                 ),
             )
             .into_any_element()
@@ -148,86 +170,81 @@ impl PioneerDesktop {
     fn render_locale_setting(
         selected_language: AppLanguagePreference,
         desktop_entity: Entity<Self>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected_label = Self::language_option_label(selected_language);
 
-        v_flex()
+        h_flex()
             .w_full()
             .gap_6()
-            .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .py_3()
+            .justify_between()
+            .items_center()
             .child(
-                h_flex()
-                    .gap_6()
-                    .justify_between()
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(t!("settings.option.language.label").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .opacity(0.6)
-                                    .child(t!("settings.option.language.description").to_string()),
-                            ),
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.option.language.label").to_string()),
                     )
                     .child(
-                        Popover::new("settings-language-popover")
-                            .anchor(Corner::TopRight)
-                            .p_0()
-                            .trigger(
-                                small_outline_button("settings-language-trigger").child(
-                                    h_flex()
-                                        .w_full()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_1()
-                                        .child(div().text_sm().child(selected_label))
-                                        .child(Icon::new(IconName::ChevronsUpDown).size_3p5()),
-                                ),
-                            )
-                            .content(move |_, _, popover_cx| {
-                                let popover_entity: Entity<PopoverState> = popover_cx.entity();
-
-                                v_flex().children(LANGUAGE_OPTIONS.iter().enumerate().map(
-                                    |(index, option)| {
-                                        let option = *option;
-
-                                        let option_label = Self::language_option_label(option);
-                                        let is_selected = option == selected_language;
-
-                                        let desktop_entity = desktop_entity.clone();
-                                        let popover_entity = popover_entity.clone();
-
-                                        Button::new(("settings-language-option", index))
-                                            .ghost()
-                                            .small()
-                                            .rounded_none()
-                                            .h_7()
-                                            .justify_start()
-                                            .selected(is_selected)
-                                            .label(option_label)
-                                            .on_click(move |_, window, cx| {
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.apply_language_setting(option, cx);
-                                                    cx.notify();
-                                                });
-                                                let _ = popover_entity.update(cx, |popover, cx| {
-                                                    popover.dismiss(window, cx);
-                                                });
-                                            })
-                                    },
-                                ))
-                            }),
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.option.language.description").to_string()),
                     ),
+            )
+            .child(
+                Popover::new("settings-language-popover")
+                    .anchor(Corner::TopRight)
+                    .p_0()
+                    .trigger(
+                        small_outline_button("settings-language-trigger").child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_1()
+                                .child(div().text_sm().child(selected_label))
+                                .child(Icon::new(IconName::ChevronsUpDown).size_3p5()),
+                        ),
+                    )
+                    .content(move |_, _, popover_cx| {
+                        let popover_entity: Entity<PopoverState> = popover_cx.entity();
+
+                        v_flex().children(LANGUAGE_OPTIONS.iter().enumerate().map(
+                            |(index, option)| {
+                                let option = *option;
+
+                                let option_label = Self::language_option_label(option);
+                                let is_selected = option == selected_language;
+
+                                let desktop_entity = desktop_entity.clone();
+                                let popover_entity = popover_entity.clone();
+
+                                Button::new(("settings-language-option", index))
+                                    .ghost()
+                                    .small()
+                                    .rounded_none()
+                                    .h_7()
+                                    .justify_start()
+                                    .selected(is_selected)
+                                    .label(option_label)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.apply_language_setting(option, cx);
+                                            cx.notify();
+                                        });
+                                        let _ = popover_entity.update(cx, |popover, cx| {
+                                            popover.dismiss(window, cx);
+                                        });
+                                    })
+                            },
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -268,20 +285,6 @@ impl PioneerDesktop {
                     cx,
                 ),
             );
-
-            if memory.active_recall_enabled {
-                settings = settings.child(Self::render_settings_divider(cx)).child(
-                    Self::render_memory_model_row(
-                        "settings-memory-active-recall-model",
-                        MemoryModelSetting::ActiveRecallPlanner,
-                        memory.active_recall_model.clone(),
-                        t!("settings.memory.active_recall_model.label").to_string(),
-                        t!("settings.memory.active_recall_model.description").to_string(),
-                        desktop_entity.clone(),
-                        cx,
-                    ),
-                );
-            }
 
             settings = settings.child(Self::render_settings_divider(cx)).child(
                 Self::render_memory_toggle_row(
@@ -348,6 +351,150 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    fn render_gateway_settings_status_row(message: String) -> AnyElement {
+        h_flex()
+            .w_full()
+            .py_3()
+            .child(div().text_xs().opacity(0.65).child(message))
+            .into_any_element()
+    }
+
+    fn render_preflight_model_setting(
+        selection: GatewayMemoryModelSelection,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected_provider = selection.model_provider_override();
+        let selected_model = selection.model_override();
+        let is_custom = selected_provider.is_some() && selected_model.is_some();
+        let selection_label = if let (Some(provider), Some(model)) =
+            (selected_provider.clone(), selected_model.clone())
+        {
+            format!("{provider}/{model}")
+        } else {
+            t!("settings.general.preflight_model.default").to_string()
+        };
+
+        v_flex()
+            .w_full()
+            .gap_3()
+            .py_3()
+            .justify_between()
+            .items_start()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.general.preflight_model.label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.general.preflight_model.description").to_string()),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_6()
+                    .items_center()
+                    .justify_between()
+                    .mt_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .font_medium()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(selection_label),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                small_outline_button(("settings-preflight-model", 0usize))
+                                    .label(
+                                        t!("settings.general.preflight_model.select_model")
+                                            .to_string(),
+                                    )
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        let selected_provider = selected_provider.clone();
+                                        let selected_model = selected_model.clone();
+                                        move |_, window, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                let workspace_id = view.model_selector_workspace_id();
+                                                view.open_model_selector_dialog(
+                                                    ModelSelectorDialogOptions {
+                                                        title: t!(
+                                                            "settings.general.preflight_model.dialog_title"
+                                                        )
+                                                        .to_string(),
+                                                        selected_provider: selected_provider
+                                                            .clone(),
+                                                        selected_model: selected_model.clone(),
+                                                        workspace_id,
+                                                        ws_sender: view
+                                                            .gateway
+                                                            .ws_command_sender
+                                                            .clone(),
+                                                        on_save: Rc::new(
+                                                            move |view: &mut PioneerDesktop,
+                                                                  selection: ModelSelectorSelection,
+                                                                  cx| {
+                                                                let model_selection =
+                                                                    Self::model_selection_from_selector_selection(
+                                                                        selection,
+                                                                    );
+                                                                view.apply_preflight_model_setting(
+                                                                    model_selection,
+                                                                    cx,
+                                                                );
+                                                                true
+                                                            },
+                                                        ),
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }),
+                            )
+                            .when(is_custom, |row| {
+                                row.child(div().flex_none().child(
+                                    small_outline_button(("settings-preflight-model", 1usize))
+                                        .label(
+                                            t!("settings.general.preflight_model.default")
+                                                .to_string(),
+                                        )
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.apply_preflight_model_setting(
+                                                        GatewayMemoryModelSelection::thread(),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn gateway_settings_status_message(&self) -> String {
         self.gateway.settings_error.clone().unwrap_or_else(|| {
             if self.gateway.settings_loading {
@@ -361,48 +508,40 @@ impl PioneerDesktop {
     fn render_keepawake_setting(
         selected: bool,
         desktop_entity: Entity<Self>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
-        v_flex()
+        h_flex()
             .w_full()
             .gap_6()
-            .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .py_3()
+            .justify_between()
+            .items_center()
             .child(
-                h_flex()
-                    .gap_6()
-                    .justify_between()
-                    .items_center()
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(t!("settings.option.keepawake.label").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .opacity(0.6)
-                                    .child(t!("settings.option.keepawake.description").to_string()),
-                            ),
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.option.keepawake.label").to_string()),
                     )
                     .child(
-                        Switch::new("settings-keepawake")
-                            .checked(selected)
-                            .on_click(move |enabled, _, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.apply_keepawake_setting(*enabled, cx);
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.option.keepawake.description").to_string()),
                     ),
+            )
+            .child(
+                Switch::new("settings-keepawake")
+                    .checked(selected)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_keepawake_setting(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
             )
             .into_any_element()
     }
@@ -526,21 +665,9 @@ impl PioneerDesktop {
                                                           selection: ModelSelectorSelection,
                                                           cx| {
                                                         let model_selection =
-                                                            match (selection.provider, selection.model)
-                                                            {
-                                                                (Some(provider), Some(model))
-                                                                    if !provider.trim().is_empty()
-                                                                        && !model.trim().is_empty() =>
-                                                                {
-                                                                    GatewayMemoryModelSelection::custom(
-                                                                        provider,
-                                                                        model,
-                                                                    )
-                                                                }
-                                                                _ => {
-                                                                    GatewayMemoryModelSelection::thread()
-                                                                }
-                                                            };
+                                                            Self::model_selection_from_selector_selection(
+                                                                selection,
+                                                            );
                                                         view.apply_memory_model_setting(
                                                             setting,
                                                             model_selection,
@@ -581,10 +708,23 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    fn model_selection_from_selector_selection(
+        selection: ModelSelectorSelection,
+    ) -> GatewayMemoryModelSelection {
+        match (selection.provider, selection.model) {
+            (Some(provider), Some(model))
+                if !provider.trim().is_empty() && !model.trim().is_empty() =>
+            {
+                GatewayMemoryModelSelection::custom(provider, model)
+            }
+            _ => GatewayMemoryModelSelection::thread(),
+        }
+    }
+
     fn render_theme_setting(
         selected_theme: WindowThemePreference,
         desktop_entity: Entity<Self>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
         let options = [
             (
@@ -606,64 +746,59 @@ impl PioneerDesktop {
             WindowThemePreference::Dark,
         ];
 
-        v_flex()
+        h_flex()
             .w_full()
             .gap_6()
-            .p_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .py_3()
+            .justify_between()
+            .items_center()
             .child(
-                h_flex()
-                    .gap_6()
-                    .justify_between()
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(t!("settings.option.theme.label").to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .opacity(0.6)
-                                    .child(t!("settings.option.theme.description").to_string()),
-                            ),
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.option.theme.label").to_string()),
                     )
                     .child(
-                        ButtonGroup::new("settings-theme-group")
-                            .children(options.into_iter().enumerate().map(
-                                |(index, (preference, label))| {
-                                    let is_selected = selected_theme == preference;
-
-                                    small_outline_button(("settings-theme-option", index))
-                                        .selected(is_selected)
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(Self::theme_icon(preference))
-                                                .child(div().text_sm().child(label)),
-                                        )
-                                },
-                            ))
-                            .on_click(move |selected_indices, window, cx| {
-                                let Some(index) = selected_indices.first().copied() else {
-                                    return;
-                                };
-                                let Some(preference) = preferences.get(index).copied() else {
-                                    return;
-                                };
-
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.apply_theme_setting(preference, window, cx);
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.option.theme.description").to_string()),
                     ),
+            )
+            .child(
+                ButtonGroup::new("settings-theme-group")
+                    .children(options.into_iter().enumerate().map(
+                        |(index, (preference, label))| {
+                            let is_selected = selected_theme == preference;
+
+                            small_outline_button(("settings-theme-option", index))
+                                .selected(is_selected)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Self::theme_icon(preference))
+                                        .child(div().text_sm().child(label)),
+                                )
+                        },
+                    ))
+                    .on_click(move |selected_indices, window, cx| {
+                        let Some(index) = selected_indices.first().copied() else {
+                            return;
+                        };
+                        let Some(preference) = preferences.get(index).copied() else {
+                            return;
+                        };
+
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_theme_setting(preference, window, cx);
+                            cx.notify();
+                        });
+                    }),
             )
             .into_any_element()
     }

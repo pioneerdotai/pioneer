@@ -16,6 +16,5 @@ pub(super) enum MemorySettingToggle {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MemoryModelSetting {
-    ActiveRecallPlanner,
     PostTurnExtractor,
 }

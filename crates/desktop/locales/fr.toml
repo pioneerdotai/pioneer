@@ -556,6 +556,13 @@ label = "Empêcher la veille d'inactivité"
 description = "Empêche l'ordinateur de passer en veille pour cause d'inactivité tant que la gateway est en cours d'exécution. Cela ne garantit pas le fonctionnement capot fermé ; pour ce cas, utilisez le mode clamshell ou une machine toujours en marche."
 tooltip = "Empêche seulement la veille d'inactivité. Capot fermé, utilisez le mode clamshell ou une machine toujours en marche."
 
+[settings.general.preflight_model]
+label = "Modèle de preflight"
+description = "Choisissez le fournisseur et le modèle pour la planification interne avant le tour. Par défaut utilise le modèle du fil actuel."
+default = "Par défaut"
+select_model = "Sélectionner un modèle"
+dialog_title = "Sélectionner le modèle de preflight"
+
 [settings.memory]
 title = "Mémoire"
 description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."
@@ -567,10 +574,6 @@ description = "Autoriser Pioneer à utiliser les faits enregistrés et les déci
 [settings.memory.active_recall]
 label = "Rappel actif"
 description = "Exécuter une planification de rappel supplémentaire en lecture seule pour les tâches riches en contexte."
-
-[settings.memory.active_recall_model]
-label = "Modèle du rappel actif"
-description = "Choisissez le fournisseur et le modèle pour planifier la lecture de mémoire. Par défaut utilise le modèle du fil actuel."
 
 [settings.memory.proactive_writes]
 label = "Écriture proactive"

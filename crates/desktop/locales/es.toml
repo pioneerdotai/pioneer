@@ -556,6 +556,13 @@ label = "Evitar reposo por inactividad"
 description = "Evita que el equipo entre en reposo por inactividad mientras el gateway está en ejecución. No garantiza que siga funcionando al cerrar la tapa del portátil; para eso usa el modo clamshell o una máquina siempre encendida."
 tooltip = "Solo evita el reposo por inactividad. Con la tapa cerrada necesitas modo clamshell o una máquina siempre encendida."
 
+[settings.general.preflight_model]
+label = "Modelo de preflight"
+description = "Elige el proveedor y el modelo para la planificación interna previa al turno. Predeterminado usa el modelo del hilo actual."
+default = "Predeterminado"
+select_model = "Seleccionar modelo"
+dialog_title = "Seleccionar modelo de preflight"
+
 [settings.memory]
 title = "Memoria"
 description = "Controla cómo Pioneer usa la memoria duradera."
@@ -567,10 +574,6 @@ description = "Permitir que Pioneer use hechos guardados y decisiones del proyec
 [settings.memory.active_recall]
 label = "Recuperación activa"
 description = "Ejecutar planificación adicional de recuperación de solo lectura para tareas con mucho contexto."
-
-[settings.memory.active_recall_model]
-label = "Modelo de recuperación activa"
-description = "Elige el proveedor y el modelo para planificar la lectura de memoria. Predeterminado usa el modelo del hilo actual."
 
 [settings.memory.proactive_writes]
 label = "Escritura proactiva"
