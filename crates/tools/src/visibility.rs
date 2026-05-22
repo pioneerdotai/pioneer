@@ -250,13 +250,16 @@ impl ToolVisibilitySnapshot {
     }
 
     pub async fn set_visible_by_name(&self, names: &[String]) {
-        let set: HashSet<&str> = names.iter().map(String::as_str).collect();
-        let selected = self
-            .all_specs
-            .iter()
-            .filter(|spec| set.contains(spec.name.as_str()))
-            .cloned()
-            .collect();
+        let mut seen = HashSet::<&str>::new();
+        let mut selected = Vec::new();
+        for name in names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            if let Some(spec) = self.all_specs.iter().find(|spec| spec.name == *name) {
+                selected.push(spec.clone());
+            }
+        }
         self.replace(selected).await;
     }
 
@@ -310,6 +313,37 @@ mod tests {
         assert!(snapshot.contains_name("tool_a").await);
         assert!(!snapshot.contains_name("tool_b").await);
         assert!(!snapshot.contains_name("unknown_tool").await);
+    }
+
+    #[tokio::test]
+    async fn visibility_snapshot_preserves_requested_visible_order() {
+        let snapshot =
+            ToolVisibilitySnapshot::new(vec![spec("tool_a"), spec("tool_b"), spec("tool_c")]);
+
+        snapshot
+            .set_visible_by_name(&[
+                "tool_c".to_owned(),
+                "tool_a".to_owned(),
+                "tool_c".to_owned(),
+                "missing_tool".to_owned(),
+                "tool_b".to_owned(),
+            ])
+            .await;
+
+        let visible = snapshot
+            .get()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            vec![
+                "tool_c".to_owned(),
+                "tool_a".to_owned(),
+                "tool_b".to_owned()
+            ]
+        );
     }
 
     #[tokio::test]

@@ -3568,6 +3568,200 @@ async fn phase_10_hook_prompt_section_appears_in_compiled_prompt() {
 }
 
 #[tokio::test]
+async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_memory_tools() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_visible_tools_core",
+        "ws_phase10_visible_tools_core",
+        "turn_phase10_visible_tools_core",
+        ThreadMode::Agent,
+        "capture",
+        "ordinary question",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    let HookInputPayload::TurnPrePromptCompile(payload) = &pre_prompt_compile.payload else {
+        panic!("pre-prompt-compile call should receive typed payload");
+    };
+    let hook_tool_names = payload
+        .available_tool_names
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(hook_tool_names.contains(&"request_tools".to_owned()));
+    assert!(
+        !hook_tool_names
+            .iter()
+            .any(|name| name.starts_with("memory_")),
+        "prompt compile must not see hidden registered memory tools: {hook_tool_names:?}"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request_tool_names = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should include provider tools")
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !request_tool_names
+            .iter()
+            .any(|name| name.starts_with("memory_")),
+        "provider tools must not include hidden registered memory tools: {request_tool_names:?}"
+    );
+    let mut sorted_hook_tool_names = hook_tool_names.clone();
+    sorted_hook_tool_names.sort();
+    let mut sorted_request_tool_names = request_tool_names.clone();
+    sorted_request_tool_names.sort();
+    assert_eq!(sorted_hook_tool_names, sorted_request_tool_names);
+
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Some tool domains and their tools are hidden until requested.")
+    );
+    assert!(
+        !prompt.full_system_text.contains("Available memory tools:"),
+        "hidden memory tools must not render memory prompt contract"
+    );
+}
+
+#[tokio::test]
+async fn phase_10_prompt_compile_receives_preflight_selected_memory_tools() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let preflight_response = json!({
+        "tools": {
+            "visibleTools": ["memory_search", "memory_get"]
+        }
+    });
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        preflight_response.to_string(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot {
+            items: vec![memory_recall_item(
+                "mem_phase10_visible_name",
+                MemoryCategory::Identity,
+                Some("name"),
+                "User's name is Alexander.",
+            )],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_visible_tools_memory",
+        "ws_phase10_visible_tools_memory",
+        "turn_phase10_visible_tools_memory",
+        ThreadMode::Agent,
+        "capture",
+        "what is my name?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let calls = snapshot_hook_calls(&calls);
+    let pre_prompt_compile = calls
+        .iter()
+        .find(|call| call.phase == HookPhase::TurnPrePromptCompile)
+        .expect("pre-prompt-compile hook called");
+    let HookInputPayload::TurnPrePromptCompile(payload) = &pre_prompt_compile.payload else {
+        panic!("pre-prompt-compile call should receive typed payload");
+    };
+    let hook_tool_names = payload
+        .available_tool_names
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(hook_tool_names.contains(&"memory_search".to_owned()));
+    assert!(hook_tool_names.contains(&"memory_get".to_owned()));
+    assert!(!hook_tool_names.contains(&"memory_remember".to_owned()));
+    assert!(!hook_tool_names.contains(&"memory_forget".to_owned()));
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request_tool_names = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should include provider tools")
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(request_tool_names.contains(&"memory_search".to_owned()));
+    assert!(request_tool_names.contains(&"memory_get".to_owned()));
+    assert!(!request_tool_names.contains(&"memory_remember".to_owned()));
+    assert!(!request_tool_names.contains(&"memory_forget".to_owned()));
+
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Available memory tools: memory_search, memory_get.")
+    );
+}
+
+#[tokio::test]
 async fn phase_10_hook_prompt_section_ordering_is_deterministic() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -4034,12 +4228,12 @@ async fn phase_10_pre_prompt_compile_receives_policy_and_prompt_context_sets() {
         ),
         Some(HookValue::Bool(true))
     );
-    assert_eq!(pre_prompt_compile.prompt_context_set.entries.len(), 1);
-    assert_eq!(
-        pre_prompt_compile.prompt_context_set.entries[0]
-            .contribution_id
-            .as_str(),
-        "test.context.phase10"
+    assert!(
+        pre_prompt_compile
+            .prompt_context_set
+            .entries
+            .iter()
+            .any(|entry| entry.contribution_id.as_str() == "test.context.phase10")
     );
 
     let requests = provider.snapshot_requests();

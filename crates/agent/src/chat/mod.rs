@@ -2053,12 +2053,6 @@ async fn execute_agent_provider_response(
         },
     };
 
-    let all_tool_names = router
-        .all_specs()
-        .into_iter()
-        .map(|spec| spec.name)
-        .collect::<Vec<_>>();
-
     let turn_preflight = run_agent_turn_preflight_stage(
         provider_registry,
         provider.clone(),
@@ -2115,7 +2109,7 @@ async fn execute_agent_provider_response(
         Vec::new(),
         TurnPrePromptCompileHookInput::from_parts(
             provider_tool_calling,
-            hook_tool_names_from_strings(&all_tool_names),
+            hook_tool_names_from_strings(initial_visibility.visible_tools.as_slice()),
         ),
     )
     .await
