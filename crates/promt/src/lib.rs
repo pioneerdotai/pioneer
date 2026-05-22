@@ -45,6 +45,7 @@ pub use render::{
     task_run::{TaskRunPromptCompiler, TaskRunPromptInput},
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
+    turn_preflight::{TurnPreflightPromptInput, render_turn_preflight_prompt},
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
 pub use section::{
