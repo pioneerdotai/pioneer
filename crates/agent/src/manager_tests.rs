@@ -50,6 +50,7 @@ use tokio::time::{Duration, Instant, advance, sleep, timeout};
 
 fn test_tool_loop_config() -> ToolLoopConfig {
     ToolLoopConfig {
+        preflight: super::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: 20_000,
             hard_max_timeout_ms: 120_000,
@@ -195,6 +196,15 @@ impl CaptureAgentProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("capture provider lock poisoned")
+                .clone(),
+        )
+    }
+
+    fn snapshot_all_requests(&self) -> Vec<ChatRequest> {
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
@@ -717,6 +727,37 @@ fn assert_stable_requests_eq(left: &ChatRequest, right: &ChatRequest) {
     );
 }
 
+const TEST_PREFLIGHT_RESPONSE: &str = r#"{"tools":{"visibleTools":[]}}"#;
+
+fn is_turn_preflight_request(request: &ChatRequest) -> bool {
+    request.compiled_prompt.is_none()
+        && request.tools.is_none()
+        && request.tool_choice.is_none()
+        && request.messages.len() == 1
+        && request.messages[0]
+            .content
+            .contains("internal turn preflight planner")
+        && request.messages[0]
+            .content
+            .contains("Structured input JSON")
+}
+
+fn test_preflight_response() -> ChatResponse {
+    ChatResponse {
+        text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+        usage: None,
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+fn visible_test_requests(requests: Vec<ChatRequest>) -> Vec<ChatRequest> {
+    requests
+        .into_iter()
+        .filter(|request| !is_turn_preflight_request(request))
+        .collect()
+}
+
 #[derive(Default)]
 struct CaptureStandardProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
@@ -724,10 +765,12 @@ struct CaptureStandardProvider {
 
 impl CaptureStandardProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        self.requests
-            .lock()
-            .expect("capture provider lock poisoned")
-            .clone()
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("capture provider lock poisoned")
+                .clone(),
+        )
     }
 }
 
@@ -752,10 +795,12 @@ impl SequencedToolProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        self.requests
-            .lock()
-            .expect("capture provider lock poisoned")
-            .clone()
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("capture provider lock poisoned")
+                .clone(),
+        )
     }
 }
 
@@ -767,10 +812,12 @@ struct AlwaysTaskCreateProvider {
 
 impl AlwaysTaskCreateProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        self.requests
-            .lock()
-            .expect("always task_create provider lock poisoned")
-            .clone()
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("always task_create provider lock poisoned")
+                .clone(),
+        )
     }
 }
 
@@ -898,10 +945,12 @@ impl LoopBudgetProvider {
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        self.requests
-            .lock()
-            .expect("loop budget provider lock poisoned")
-            .clone()
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("loop budget provider lock poisoned")
+                .clone(),
+        )
     }
 
     fn tools_available(request: &ChatRequest) -> bool {
@@ -943,10 +992,12 @@ struct ProviderRecoveryBoundaryProvider {
 
 impl ProviderRecoveryBoundaryProvider {
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
-        self.requests
-            .lock()
-            .expect("provider boundary lock poisoned")
-            .clone()
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("provider boundary lock poisoned")
+                .clone(),
+        )
     }
 }
 
@@ -1396,10 +1447,14 @@ impl Provider for CaptureStandardProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
         Ok(ChatResponse {
             text: "done".to_owned(),
             usage: None,
@@ -1437,10 +1492,14 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         if index == 0 {
@@ -1489,11 +1548,15 @@ impl Provider for LoopBudgetProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         let tools_available = Self::tools_available(&request);
         self.requests
             .lock()
             .expect("loop budget provider lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let tool_calls = match self.mode {
@@ -1558,10 +1621,14 @@ impl Provider for AlwaysTaskCreateProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("always task_create provider lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         Ok(ChatResponse {
@@ -1610,10 +1677,14 @@ impl Provider for ProviderRecoveryBoundaryProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("provider boundary lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
 
         match self.next_index.fetch_add(1, Ordering::SeqCst) {
             0 => Err(anyhow::anyhow!("initial provider failure 500")),
@@ -1662,10 +1733,14 @@ impl Provider for CaptureAgentProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
         self.requests
             .lock()
             .expect("capture provider lock poisoned")
             .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
         Ok(ChatResponse {
             text: self.response_text.clone(),
             usage: None,
@@ -1966,6 +2041,46 @@ async fn start_simple_turn(
         .expect("turn should start");
 
     recv_events_until_terminal(&mut events).await
+}
+
+#[tokio::test]
+async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "preflight_agent_loop_thread",
+        "workspace",
+        "preflight_agent_loop_turn",
+        ThreadMode::Agent,
+        "capture",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_all_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "agent turn should make one preflight request before the main provider request"
+    );
+    let preflight_request = &requests[0];
+    assert!(preflight_request.tools.is_none());
+    assert!(preflight_request.tool_choice.is_none());
+    assert_eq!(preflight_request.compiled_prompt, None);
+    assert!(
+        preflight_request.messages[0]
+            .content
+            .contains("Structured input JSON")
+    );
+    assert!(preflight_request.messages[0].content.contains("\"tools\""));
+
+    let main_request = &requests[1];
+    assert!(main_request.compiled_prompt.is_some());
+    assert!(main_request.tools.is_some());
 }
 
 #[tokio::test]

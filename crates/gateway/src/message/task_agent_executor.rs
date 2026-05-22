@@ -2287,6 +2287,7 @@ mod tests {
     fn test_tool_loop_config_for_task_artifacts() -> ToolLoopConfig {
         let web = GatewayWebToolsConfig::default();
         ToolLoopConfig {
+            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,

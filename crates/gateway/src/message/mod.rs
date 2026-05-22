@@ -1180,6 +1180,7 @@ impl MessageProcessor {
         let artifact_downloads =
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         let normalized_tool_loop_config = ToolLoopConfig {
+            preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,
                 hard_max_timeout_ms: web.hard_max_timeout_ms,

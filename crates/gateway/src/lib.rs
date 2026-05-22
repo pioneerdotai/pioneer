@@ -255,6 +255,12 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     )?;
 
     let tool_loop_config = ToolLoopConfig {
+        preflight: pioneer_agent::PreflightLoopConfig {
+            provider_name: config.gateway.preflight_model.model_provider_override(),
+            model: config.gateway.preflight_model.model_override(),
+            timeout_ms: None,
+            max_output_chars: None,
+        },
         web: WebToolsConfig {
             default_timeout_ms: web_cfg.default_timeout_ms,
             hard_max_timeout_ms: web_cfg.hard_max_timeout_ms,

@@ -181,6 +181,15 @@ struct CaptureSummaryProvider {
     calls: AtomicUsize,
 }
 
+struct PreflightCaptureProvider {
+    text: String,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+}
+
+struct HangingChildProvider {
+    child_main_calls: AtomicUsize,
+}
+
 struct FlakyTitleProvider {
     failures_before_success: usize,
     text: String,
@@ -308,6 +317,34 @@ impl CaptureSummaryProvider {
     }
 }
 
+impl PreflightCaptureProvider {
+    fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("preflight capture requests lock")
+            .clone()
+    }
+}
+
+impl HangingChildProvider {
+    fn new() -> Self {
+        Self {
+            child_main_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn child_main_call_count(&self) -> usize {
+        self.child_main_calls.load(Ordering::SeqCst)
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for CaptureSummaryProvider {
     fn name(&self) -> &str {
@@ -335,6 +372,87 @@ impl Provider for CaptureSummaryProvider {
             reasoning_content: None,
             tool_calls: Vec::new(),
         })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for PreflightCaptureProvider {
+    fn name(&self) -> &str {
+        "preflight-capture"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
+        self.requests
+            .lock()
+            .expect("preflight capture requests lock")
+            .push(request);
+        if preflight {
+            return Ok(test_turn_preflight_response());
+        }
+        Ok(text_response(self.text.clone()))
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for HangingChildProvider {
+    fn name(&self) -> &str {
+        "hanging-child"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
+        let child_main = is_child_task_main_request(&request);
+        if preflight {
+            return Ok(test_turn_preflight_response());
+        }
+        if child_main {
+            self.child_main_calls.fetch_add(1, Ordering::SeqCst);
+            return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
+        }
+        Ok(text_response("parent done"))
     }
 
     async fn stream_chat(
@@ -422,6 +540,9 @@ impl Provider for GuardAwareProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
@@ -527,6 +648,9 @@ impl Provider for CreateThenHangProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response());
+        }
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
@@ -1092,6 +1216,23 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
     }
 }
 
+fn test_turn_preflight_response() -> ChatResponse {
+    text_response(r#"{"tools":{"visibleTools":[]}}"#)
+}
+
+fn is_turn_preflight_request(request: &ChatRequest) -> bool {
+    request.compiled_prompt.is_none()
+        && request.tools.is_none()
+        && request.tool_choice.is_none()
+        && request.messages.len() == 1
+        && request.messages[0]
+            .content
+            .contains("internal turn preflight planner")
+        && request.messages[0]
+            .content
+            .contains("Structured input JSON")
+}
+
 fn extract_task_id_from_messages(messages: &[pioneer_provider::ChatMessage]) -> Option<String> {
     for message in messages.iter().rev() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(message.content.as_str())
@@ -1119,7 +1260,14 @@ fn is_child_task_request(request: &ChatRequest) -> bool {
         message
             .content
             .contains("You are executing a delegated task.")
+            || message
+                .content
+                .contains("You are executing this durable task run now.")
     })
+}
+
+fn is_child_task_main_request(request: &ChatRequest) -> bool {
+    request.compiled_prompt.is_some() && is_child_task_request(request)
 }
 
 #[async_trait::async_trait]
@@ -1537,6 +1685,7 @@ fn test_context_budget() -> super::ContextBudget {
 fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
+        preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: web.default_timeout_ms,
             hard_max_timeout_ms: web.hard_max_timeout_ms,
@@ -3475,6 +3624,213 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     assert!(event_types.contains(&events::TASK_RUN_STARTED));
     assert!(event_types.contains(&events::TASK_RUN_COMPLETED));
     assert!(event_types.contains(&events::TASK_COMPLETED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
+    let provider = Arc::new(PreflightCaptureProvider::new("hidden child completed"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_preflight_task",
+            "turn_parent_preflight_task",
+            "Hidden preflight child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    let child_thread = crud_store
+        .get_thread_model(lineage.child_thread_id.as_str())
+        .await
+        .expect("child thread query should succeed")
+        .expect("child thread should be persisted");
+    assert_eq!(
+        child_thread.sidebar_visibility,
+        ThreadSidebarVisibility::Hidden
+    );
+
+    let wait_response = wait_tasks_for_test(
+        &processor,
+        TaskWaitParams {
+            task_ids: vec![response.task.id.clone()],
+            run_ids: Vec::new(),
+            timeout_ms: Some(5_000),
+            return_completed: true,
+            return_pending: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("task_wait should succeed");
+    assert!(
+        !wait_response.completed.is_empty(),
+        "hidden child task should complete"
+    );
+
+    let requests = provider.snapshot_requests();
+    let preflight_pos = requests
+        .iter()
+        .position(is_turn_preflight_request)
+        .expect("hidden child task should call preflight");
+    let child_main_pos = requests
+        .iter()
+        .position(is_child_task_main_request)
+        .expect("hidden child task should call main provider after prompt compile");
+    assert!(
+        preflight_pos < child_main_pos,
+        "hidden child task preflight must run before the main child provider request"
+    );
+    assert!(requests[preflight_pos].tools.is_none());
+    assert!(requests[preflight_pos].tool_choice.is_none());
+    assert!(requests[preflight_pos].compiled_prompt.is_none());
+    assert!(requests[child_main_pos].compiled_prompt.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
+    let initial_provider = Arc::new(HangingChildProvider::new());
+    let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        initial_provider.clone(),
+    ));
+    let initial_session_manager = Arc::new(SessionManager::new());
+    let initial_thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let initial_processor = Arc::new(MessageProcessor::new(
+        initial_thread_manager,
+        initial_provider_registry,
+        initial_session_manager,
+        workspace_manager.clone(),
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    initial_processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &initial_processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_recovered_preflight_task",
+            "turn_parent_recovered_preflight_task",
+            "Recovered hidden preflight child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if initial_provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        initial_provider.child_main_call_count() > 0,
+        "initial child task provider should be hanging in the main child request"
+    );
+
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution query should succeed")
+        .expect("task run execution should exist");
+    let stale_at = super::now_timestamp_secs().saturating_sub(120);
+    crud_store
+        .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
+        .await
+        .expect("execution lease should be made stale for startup recovery");
+
+    let recovery_provider = Arc::new(PreflightCaptureProvider::new(
+        "recovered hidden child completed",
+    ));
+    let recovery_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        recovery_provider.clone(),
+    ));
+    let recovery_processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        recovery_provider_registry,
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    recovery_processor.bind_task_bridge().await;
+    recovery_processor
+        .task_runtime
+        .start()
+        .await
+        .expect("startup recovery should run");
+
+    wait_for_task_status(
+        crud_store.clone(),
+        response.task.id.as_str(),
+        pioneer_protocol::TaskStatus::Completed,
+    )
+    .await;
+    let (_, child_turn) = crud_store
+        .get_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("child turn lookup should succeed")
+        .expect("child turn should exist");
+    assert_eq!(child_turn.status, TurnStatus::Completed);
+
+    let requests = recovery_provider.snapshot_requests();
+    let preflight_pos = requests
+        .iter()
+        .position(is_turn_preflight_request)
+        .expect("recovered hidden child task should call preflight");
+    let child_main_pos = requests
+        .iter()
+        .position(is_child_task_main_request)
+        .expect("recovered hidden child task should call main provider after prompt compile");
+    assert!(
+        preflight_pos < child_main_pos,
+        "recovered hidden child task preflight must run before the restored main child provider request"
+    );
+    assert!(requests[preflight_pos].compiled_prompt.is_none());
+    assert!(requests[child_main_pos].compiled_prompt.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

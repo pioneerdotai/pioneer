@@ -56,7 +56,7 @@ pub struct DeterministicRecallContextSummary {
     pub sufficient: bool,
 }
 
-pub(super) fn deterministic_recall_context_summary(
+pub fn deterministic_recall_context_summary(
     prompt_context_set: &pioneer_hooks::HookPromptContextSet,
     config: &MemoryActiveRecallConfig,
 ) -> DeterministicRecallContextSummary {

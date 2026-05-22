@@ -214,6 +214,82 @@ pub(crate) struct TurnPreflightProviderCallInput {
     pub max_output_chars: usize,
 }
 
+#[derive(Clone)]
+pub(crate) struct TurnPreflightOrchestratorInput {
+    pub provider_registry: Arc<ProviderRegistry>,
+    pub workspace_id: String,
+    pub thread_provider: Arc<dyn Provider>,
+    pub thread_provider_name: String,
+    pub thread_model: String,
+    pub preflight_provider_name: Option<String>,
+    pub preflight_model: Option<String>,
+    pub turn: TurnPreflightTurnInput,
+    pub tool_index: PreflightToolIndex,
+    pub deterministic_summary: DeterministicRecallContextSummary,
+    pub active_recall: MemoryActiveRecallLocalPlan,
+    pub timeout_ms: Option<u64>,
+    pub max_output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TurnPreflightOrchestratorResult {
+    pub local_modules: TurnPreflightLocalModulePlans,
+    pub plan: TurnPreflightPlan,
+}
+
+pub(crate) async fn run_turn_preflight_orchestrator(
+    input: TurnPreflightOrchestratorInput,
+) -> TurnPreflightOrchestratorResult {
+    let local_modules = build_local_preflight_module_plans(
+        input.tool_index,
+        input.deterministic_summary,
+        input.active_recall,
+    );
+
+    debug_assert!(
+        turn_preflight_required_for_thread_mode(input.turn.thread_mode),
+        "turn preflight orchestrator should only be called for agent turns"
+    );
+
+    let provider_result = match resolve_turn_preflight_provider_endpoints(
+        input.provider_registry.as_ref(),
+        input.workspace_id.as_str(),
+        input.thread_provider,
+        input.thread_provider_name.as_str(),
+        input.thread_model.as_str(),
+        input.preflight_provider_name.as_deref(),
+        input.preflight_model.as_deref(),
+    ) {
+        Ok((primary, thread)) => {
+            call_turn_preflight_provider_with_retry(TurnPreflightProviderCallInput {
+                local_modules: local_modules.clone(),
+                turn: input.turn,
+                primary,
+                thread,
+                timeout_ms: input
+                    .timeout_ms
+                    .unwrap_or(TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS),
+                max_output_chars: input
+                    .max_output_chars
+                    .unwrap_or(TURN_PREFLIGHT_PROVIDER_DEFAULT_MAX_OUTPUT_CHARS),
+            })
+            .await
+        }
+        Err(error) => TurnPreflightProviderCallResult::Failure(local_preflight_provider_failure(
+            TurnPreflightFallbackReason::ProviderError,
+            "preflight.provider.resolve_failed",
+            error,
+        )),
+    };
+
+    let plan = compose_turn_preflight_plan(&local_modules, provider_result);
+
+    TurnPreflightOrchestratorResult {
+        local_modules,
+        plan,
+    }
+}
+
 pub(crate) fn turn_preflight_required_for_thread_mode(mode: ThreadMode) -> bool {
     matches!(mode, ThreadMode::Agent)
 }

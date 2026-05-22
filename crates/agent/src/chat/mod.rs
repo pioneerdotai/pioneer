@@ -6,6 +6,11 @@ mod tool_recovery_policy;
 mod tool_retry_lifecycle;
 mod tooling;
 
+use self::preflight::{
+    TurnPreflightOrchestratorInput, TurnPreflightOrchestratorResult, TurnPreflightTurnInput,
+    build_turn_preflight_diagnostics_snapshot, run_turn_preflight_orchestrator,
+    trace_turn_preflight_diagnostics,
+};
 use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
@@ -35,6 +40,11 @@ use pioneer_hooks::{
     TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
     TurnPrePromptContextHookInput,
 };
+use pioneer_memory::hooks::{
+    MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
+    build_active_recall_local_preflight_plan, deterministic_recall_context_summary,
+    memory_turn_policy_from_hook_policy_set,
+};
 use pioneer_promt::{
     CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId,
     PromptLimits, PromptProfile, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
@@ -52,14 +62,14 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
-    MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderToolCall,
-    ToolDefinition, infer_mime_from_reference,
+    MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderRegistry,
+    ProviderToolCall, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::SkillPolicyKey;
 use pioneer_tools::{
-    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason,
-    ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
-    ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass,
+    ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolOutcome, ToolOutcomeStatus,
+    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
     ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
@@ -487,6 +497,109 @@ fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
     names
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_turn_preflight_stage(
+    provider_registry: Arc<ProviderRegistry>,
+    provider: Arc<dyn Provider>,
+    model: &str,
+    provider_tool_calling: bool,
+    tool_loop_config: &ToolLoopConfig,
+    effective_policy_set: &EffectiveTurnPolicySet,
+    effective_prompt_context_set: &EffectiveTurnPromptContextSet,
+    tool_index: PreflightToolIndex,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input_text: &str,
+) -> TurnPreflightOrchestratorResult {
+    let memory_config = tool_loop_config.memory.active_recall.normalized();
+    let hook_policy_set = effective_policy_set.clone_hook_policy_set();
+    let memory_policy = match memory_turn_policy_from_hook_policy_set(&hook_policy_set) {
+        Some(Ok(policy)) => policy,
+        Some(Err(error)) => {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %error,
+                "preflight memory policy decode failed; using memory no-use policy"
+            );
+            MemoryTurnPolicy::no_use()
+        }
+        None => MemoryTurnPolicy::no_use(),
+    };
+    let hook_prompt_context_set = effective_prompt_context_set.clone_hook_prompt_context_set();
+    let deterministic_summary =
+        deterministic_recall_context_summary(&hook_prompt_context_set, &memory_config);
+    let prompt_context_input = TurnPrePromptContextHookInput::from_parts(
+        input_text,
+        Some(model.to_owned()),
+        Some(provider.name().to_owned()),
+    );
+    let memory_context = MemoryTurnContext {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        mode: ThreadMode::Agent,
+        input_text: input_text.to_owned(),
+        task_id: None,
+        agent_id: None,
+    };
+    let active_recall = build_active_recall_local_preflight_plan(
+        &memory_context,
+        &prompt_context_input,
+        &memory_policy,
+        &memory_config,
+        &deterministic_summary,
+        MemoryEpisodicRecallCapabilities::default(),
+        true,
+    );
+    let input_text_char_count = input_text.chars().count();
+    let input_text_preview = active_recall.decision_context.input_text_preview.clone();
+    let turn = TurnPreflightTurnInput {
+        has_workspace_id: !workspace_id.trim().is_empty(),
+        has_thread_id: !thread_id.trim().is_empty(),
+        has_turn_id: !turn_id.trim().is_empty(),
+        thread_mode: ThreadMode::Agent,
+        provider_tool_calling,
+        input_text_preview,
+        input_text_char_count,
+    };
+
+    run_turn_preflight_orchestrator(TurnPreflightOrchestratorInput {
+        provider_registry,
+        workspace_id: workspace_id.to_owned(),
+        thread_provider: provider,
+        thread_provider_name: prompt_context_input
+            .model_provider
+            .clone()
+            .unwrap_or_default(),
+        thread_model: model.to_owned(),
+        preflight_provider_name: tool_loop_config.preflight.provider_name.clone(),
+        preflight_model: tool_loop_config.preflight.model.clone(),
+        turn,
+        tool_index,
+        deterministic_summary,
+        active_recall,
+        timeout_ms: tool_loop_config.preflight.timeout_ms,
+        max_output_chars: tool_loop_config.preflight.max_output_chars,
+    })
+    .await
+}
+
+fn trace_agent_turn_preflight(
+    thread_id: &str,
+    turn_id: &str,
+    preflight: &TurnPreflightOrchestratorResult,
+    final_visible_tools: &[String],
+) {
+    let snapshot = build_turn_preflight_diagnostics_snapshot(
+        &preflight.local_modules,
+        &preflight.plan,
+        final_visible_tools,
+    );
+    trace_turn_preflight_diagnostics(thread_id, turn_id, &snapshot);
+}
+
 fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
@@ -910,6 +1023,7 @@ pub(super) async fn execute_chat_turn_flow(
     turn_id: String,
     workspace_id: String,
     mode: ThreadMode,
+    provider_registry: Arc<ProviderRegistry>,
     provider: Arc<dyn Provider>,
     model: String,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
@@ -954,6 +1068,7 @@ pub(super) async fn execute_chat_turn_flow(
 
     let result = match mode {
         ThreadMode::Agent => execute_agent_provider_response(
+            provider_registry,
             &provider,
             model,
             history,
@@ -1384,6 +1499,7 @@ fn terminal_task_status_label(status: &str) -> bool {
 }
 
 async fn execute_agent_provider_response(
+    provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
     model: String,
     history: Vec<ChatMessage>,
@@ -1417,12 +1533,13 @@ async fn execute_agent_provider_response(
     let post_turn_model = model.clone();
     let post_turn_model_provider = provider.name().to_owned();
     let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
+    let user_input_text = user_message.text_content_lossy();
 
     let effective_policy_set = run_agent_turn_policy_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
         TurnPrePolicyHookInput::from_parts(
-            user_message.text_content_lossy(),
+            user_input_text.clone(),
             Some(model.clone()),
             Some(provider.name().to_owned()),
         ),
@@ -1443,7 +1560,7 @@ async fn execute_agent_provider_response(
         &hook_context,
         &effective_policy_set,
         TurnPrePromptContextHookInput::from_parts(
-            user_message.text_content_lossy(),
+            user_input_text.clone(),
             Some(model.clone()),
             Some(provider.name().to_owned()),
         ),
@@ -1577,6 +1694,27 @@ async fn execute_agent_provider_response(
             );
             ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
         })?;
+
+        let turn_preflight = run_agent_turn_preflight_stage(
+            provider_registry.clone(),
+            provider.clone(),
+            model.as_str(),
+            provider_tool_calling,
+            &tool_loop_config,
+            &effective_policy_set,
+            &effective_prompt_context_set,
+            PreflightToolIndex {
+                core_tools: Vec::new(),
+                candidate_tools: Vec::new(),
+            },
+            workspace_id,
+            thread_id,
+            turn_id,
+            user_input_text.as_str(),
+        )
+        .await;
+
+        trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
 
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
@@ -1852,6 +1990,23 @@ async fn execute_agent_provider_response(
         .into_iter()
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
+
+    let turn_preflight = run_agent_turn_preflight_stage(
+        provider_registry,
+        provider.clone(),
+        model.as_str(),
+        provider_tool_calling,
+        &tool_loop_config,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+        router.preflight_tool_index(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        user_input_text.as_str(),
+    )
+    .await;
+    trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &all_tool_names);
 
     let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
         hook_runtime.as_ref(),

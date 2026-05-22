@@ -66,12 +66,32 @@ const COMMAND_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ToolLoopConfig {
+    pub preflight: PreflightLoopConfig,
     pub web: WebToolsConfig,
     pub computer_use: ComputerUseToolsConfig,
     pub skills: SkillsLoopConfig,
     pub memory: MemoryLoopConfig,
     pub budget: ToolLoopBudgetConfig,
     pub retry: ToolRetryBudgetConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreflightLoopConfig {
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_output_chars: Option<usize>,
+}
+
+impl PreflightLoopConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            provider_name: normalized_optional_config_text(self.provider_name.as_deref()),
+            model: normalized_optional_config_text(self.model.as_deref()),
+            timeout_ms: self.timeout_ms,
+            max_output_chars: self.max_output_chars,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +335,7 @@ pub trait TaskToolProvider: Send + Sync {
 impl ToolLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
+            preflight: self.preflight.normalized(),
             web: self.web.normalized(),
             computer_use: self.computer_use.normalized(),
             skills: self.skills.normalized(),
@@ -323,6 +344,14 @@ impl ToolLoopConfig {
             retry: self.retry.normalized(),
         }
     }
+}
+
+fn normalized_optional_config_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 #[cfg(test)]
