@@ -188,6 +188,33 @@ pub(super) async fn resolve_active_memory_decision(
     )
 }
 
+pub(super) fn active_memory_decision_from_preflight_plan(
+    context: &MemoryTurnContext,
+    input: &TurnPrePromptContextHookInput,
+    policy: &MemoryTurnPolicy,
+    config: &MemoryActiveRecallConfig,
+    deterministic: &DeterministicRecallContextSummary,
+    episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    plan: ActiveRecallPlan,
+) -> ActiveMemoryDecision {
+    let local = active_recall_local_planning_parts(
+        context,
+        input,
+        policy,
+        config,
+        deterministic,
+        episodic_capabilities,
+    );
+    if matches!(
+        local.local_plan.reason_code,
+        ActiveMemoryDecisionReasonCode::PolicyDisabled
+            | ActiveMemoryDecisionReasonCode::ConfigDisabled
+    ) {
+        return normalize_active_recall_plan_for_input(local.local_plan, &local.planner_input);
+    }
+    normalize_active_recall_plan_for_input(plan, &local.planner_input)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryActiveRecallLocalPlan {
     pub decision_context: MemoryActiveRecallDecisionContext,

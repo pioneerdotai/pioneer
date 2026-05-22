@@ -7,6 +7,7 @@ use std::str::FromStr;
 pub enum HookPhase {
     TurnPrePolicy,
     TurnPrePromptContext,
+    TurnPostPreflightPromptContext,
     TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
@@ -19,6 +20,7 @@ impl HookPhase {
         match self {
             Self::TurnPrePolicy => "turn.pre_policy",
             Self::TurnPrePromptContext => "turn.pre_prompt_context",
+            Self::TurnPostPreflightPromptContext => "turn.post_preflight_prompt_context",
             Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
@@ -48,6 +50,7 @@ impl FromStr for HookPhase {
         match value {
             "turn.pre_policy" => Ok(Self::TurnPrePolicy),
             "turn.pre_prompt_context" => Ok(Self::TurnPrePromptContext),
+            "turn.post_preflight_prompt_context" => Ok(Self::TurnPostPreflightPromptContext),
             "turn.pre_tool_materialization" => Ok(Self::TurnPreToolMaterialization),
             "turn.pre_prompt_compile" => Ok(Self::TurnPrePromptCompile),
             "turn.post_prompt_compile" => Ok(Self::TurnPostPromptCompile),
@@ -119,6 +122,11 @@ mod tests {
             serde_json::to_value(HookPhase::TurnPreToolMaterialization).expect("phase serializes"),
             serde_json::json!("turn.pre_tool_materialization")
         );
+        assert_eq!(
+            serde_json::to_value(HookPhase::TurnPostPreflightPromptContext)
+                .expect("phase serializes"),
+            serde_json::json!("turn.post_preflight_prompt_context")
+        );
     }
 
     #[test]
@@ -131,6 +139,11 @@ mod tests {
             serde_json::from_value(serde_json::json!("turn.pre_tool_materialization"))
                 .expect("phase deserializes");
         assert_eq!(phase, HookPhase::TurnPreToolMaterialization);
+
+        let phase: HookPhase =
+            serde_json::from_value(serde_json::json!("turn.post_preflight_prompt_context"))
+                .expect("phase deserializes");
+        assert_eq!(phase, HookPhase::TurnPostPreflightPromptContext);
     }
 
     #[test]

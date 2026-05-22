@@ -27,8 +27,8 @@ pub(super) const MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID: &str =
     "memory.deterministic_recall.default";
 pub(super) const MEMORY_DETERMINISTIC_RECALL_CONTRIBUTION_ID: &str =
     "memory.deterministic_recall.context";
-pub(super) const MEMORY_ACTIVE_RECALL_HOOK_ID: &str = "memory.active_recall";
-pub(super) const MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID: &str = "memory.active_recall.default";
+pub const MEMORY_ACTIVE_RECALL_HOOK_ID: &str = "memory.active_recall";
+pub const MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID: &str = "memory.active_recall.default";
 pub(super) const MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID: &str = "memory.active_recall.context";
 pub(super) const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str =
     "memory.active_recall.thread_context";

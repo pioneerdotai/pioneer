@@ -135,7 +135,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
     assert_eq!(hook.id().as_str(), MEMORY_ACTIVE_RECALL_HOOK_ID);
     assert_eq!(
         hook.supported_phases(),
-        vec![HookPhase::TurnPrePromptContext]
+        vec![HookPhase::TurnPostPreflightPromptContext]
     );
     let capabilities = hook.capabilities();
     assert!(
@@ -183,7 +183,7 @@ fn memory_active_recall_hook_descriptor_is_stable_and_read_only() {
 }
 
 #[test]
-fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
+fn memory_hook_package_registers_active_recall_after_preflight_with_deadline() {
     let runtime = Arc::new(HookRuntime::new(
         Arc::new(HookRegistry::new()),
         Arc::new(HookSubscriptionRegistry::new()),
@@ -219,20 +219,17 @@ fn memory_hook_package_registers_active_recall_with_deadline_dependency() {
         .expect("active recall subscription registered");
 
     assert_eq!(subscription.hook_id.as_str(), MEMORY_ACTIVE_RECALL_HOOK_ID);
-    assert_eq!(subscription.phase, HookPhase::TurnPrePromptContext);
+    assert_eq!(
+        subscription.phase,
+        HookPhase::TurnPostPreflightPromptContext
+    );
     assert_eq!(
         subscription.execution_policy.await_policy,
         HookAwaitPolicy::Deadline
     );
     assert_eq!(subscription.execution_policy.timeout_ms, Some(321));
     assert_eq!(subscription.failure_policy, HookFailurePolicy::BestEffort);
-    assert_eq!(
-        subscription.dependencies.after,
-        vec![
-            HookSubscriptionId::new(MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID)
-                .expect("static subscription id is valid")
-        ]
-    );
+    assert!(subscription.dependencies.after.is_empty());
     assert_eq!(
         subscription.visibility,
         HookSubscriptionVisibility::Internal
@@ -328,7 +325,7 @@ async fn active_memory_timeout_falls_back_without_prompt_context() {
         HookSubscription::new(
             subscription_id,
             HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid"),
-            HookPhase::TurnPrePromptContext,
+            HookPhase::TurnPostPreflightPromptContext,
         )
         .with_execution_policy(HookExecutionPolicy {
             await_policy: HookAwaitPolicy::Deadline,
@@ -342,18 +339,20 @@ async fn active_memory_timeout_falls_back_without_prompt_context() {
     let response = runtime
         .run_phase(
             HookPhaseRequest::new(
-                HookPhase::TurnPrePromptContext,
+                HookPhase::TurnPostPreflightPromptContext,
                 HookContext {
                     workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
                     thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
                     turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
                     ..HookContext::default()
                 },
-                HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
-                    "continue the previous memory-aware architecture work",
-                    Some("test-model"),
-                    Some("test-provider"),
-                )),
+                HookInput::turn_post_preflight_prompt_context(
+                    TurnPostPreflightPromptContextHookInput::from_parts(
+                        "continue the previous memory-aware architecture work",
+                        Some("test-model"),
+                        Some("test-provider"),
+                    ),
+                ),
             )
             .with_policy_set(memory_policy_set(&MemoryTurnPolicy::normal_default_allow())),
         )

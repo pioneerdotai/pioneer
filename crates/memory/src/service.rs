@@ -61,7 +61,7 @@ use pioneer_crud::{
     NewAgentMemoryPolicyDecision, NewAgentMemoryQualityDecision, NewAgentMemoryQuarantine,
     NewAgentMemoryRepairJob, ResolveAgentMemoryQuarantine,
 };
-use pioneer_hooks::{HookPhase, HookRunId};
+use pioneer_hooks::HookRunId;
 use pioneer_protocol::{
     MemoryCandidate, MemoryCandidateDecision, MemoryCandidatePolicyDecision,
     MemoryCandidatePolicyInput, MemoryCandidatePolicyOutput, MemoryCandidateStatus,
@@ -1345,7 +1345,7 @@ impl MemoryService {
             .min(MEMORY_DEBUG_TRACE_MAX_HOOK_RUNS);
         let runs = self
             .store
-            .list_hook_runs_for_turn(turn_id, Some(HookPhase::TurnPrePromptContext), limit)
+            .list_hook_runs_for_turn(turn_id, None, limit)
             .await?
             .into_iter()
             .filter(|run| hook_run_visible(run, &context))

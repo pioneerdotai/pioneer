@@ -35,9 +35,9 @@ use pioneer_hooks::{
     HookRetryBackoff, HookRetryPolicy, HookSectionId, HookSourceId, HookSourceKind, HookSourceRef,
     HookSubscription, HookSubscriptionDependencies, HookSubscriptionId, HookSubscriptionVisibility,
     HookToolBundleId, HookToolName, HookValue, PolicyContribution, PromptContextContribution,
-    PromptSectionContribution, ToolBundleContribution, TurnPostTurnDomain, TurnPostTurnHookInput,
-    TurnPostTurnStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
-    TurnPrePromptContextHookInput,
+    PromptSectionContribution, ToolBundleContribution, TurnPostPreflightPromptContextHookInput,
+    TurnPostTurnDomain, TurnPostTurnHookInput, TurnPostTurnStatus, TurnPrePolicyHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 #[cfg(test)]
 use pioneer_promt::MemoryRecallPromptItem;

@@ -13,8 +13,9 @@ use super::*;
 use pioneer_hooks::{
     HookContext, HookInput, HookPhaseRequest, HookPromptContextLimits, HookPromptContextSet,
     HookRegistry, HookRuntime, HookRuntimeBuilder, HookSubscriptionRegistry, HookThreadId,
-    HookToolName, HookTurnId, HookWorkspaceId, TurnPrePromptCompileHookInput,
-    TurnPrePromptContextHookInput, TurnPreToolMaterializationHookInput,
+    HookToolName, HookTurnId, HookWorkspaceId, TurnPostPreflightPromptContextHookInput,
+    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    TurnPreToolMaterializationHookInput,
 };
 use pioneer_protocol::{MemoryAttribute, MemoryCanonicalKey, MemoryRecord, MemorySubject};
 use pioneer_tools::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
@@ -174,18 +175,20 @@ fn test_active_prompt_context_hook_request(
 ) -> HookHandlerRequest {
     HookHandlerRequest {
         hook_id: HookId::new(MEMORY_ACTIVE_RECALL_HOOK_ID).expect("static hook id is valid"),
-        phase: HookPhase::TurnPrePromptContext,
+        phase: HookPhase::TurnPostPreflightPromptContext,
         context: HookContext {
             workspace_id: Some(HookWorkspaceId::new("ws").expect("valid workspace id")),
             thread_id: Some(HookThreadId::new("thr").expect("valid thread id")),
             turn_id: Some(HookTurnId::new("turn").expect("valid turn id")),
             ..HookContext::default()
         },
-        input: HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
-            input_text,
-            Some("test-model"),
-            Some("test-provider"),
-        )),
+        input: HookInput::turn_post_preflight_prompt_context(
+            TurnPostPreflightPromptContextHookInput::from_parts(
+                input_text,
+                Some("test-model"),
+                Some("test-provider"),
+            ),
+        ),
         policy_set,
         prompt_context_set,
     }

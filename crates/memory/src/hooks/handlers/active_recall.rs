@@ -18,7 +18,7 @@ impl HookHandler for ActiveMemoryRecallHook {
     }
 
     fn supported_phases(&self) -> Vec<HookPhase> {
-        vec![HookPhase::TurnPrePromptContext]
+        vec![HookPhase::TurnPostPreflightPromptContext]
     }
 
     fn capabilities(&self) -> HookCapabilities {
@@ -30,7 +30,12 @@ impl HookHandler for ActiveMemoryRecallHook {
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
-        let input = turn_pre_prompt_context_input(&request)?;
+        let input = turn_post_preflight_prompt_context_input(&request)?;
+        let prompt_input = TurnPrePromptContextHookInput::from_parts(
+            input.input_text.clone(),
+            input.model.clone(),
+            input.model_provider.clone(),
+        );
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
             Some(Ok(policy)) => policy,
             Some(Err(error)) => {
@@ -46,20 +51,42 @@ impl HookHandler for ActiveMemoryRecallHook {
         let config = self.config.normalized();
         let deterministic =
             deterministic_recall_context_summary(&request.prompt_context_set, &config);
-        let context = memory_turn_context_from_prompt_context_request(&request, input)?;
+        let context = memory_turn_context_from_prompt_context_request(&request, &prompt_input)?;
         let episodic_capabilities =
             resolve_episodic_recall_capabilities(self.episodic_provider.as_ref(), &context).await;
         let mut response = HookHandlerResponse::default();
-        let decision = resolve_active_memory_decision(
-            self.decision_provider.as_ref(),
-            &context,
-            input,
-            &policy,
-            &config,
-            &deterministic,
-            episodic_capabilities.clone(),
-        )
-        .await;
+        let decision = match &input.active_memory_recall_plan {
+            Some(plan) => match serde_json::from_value::<ActiveRecallPlan>(plan.clone()) {
+                Ok(plan) => active_memory_decision_from_preflight_plan(
+                    &context,
+                    &prompt_input,
+                    &policy,
+                    &config,
+                    &deterministic,
+                    episodic_capabilities.clone(),
+                    plan,
+                ),
+                Err(error) => {
+                    response.diagnostics.push(memory_safe_warning_diagnostic(
+                        "memory.active_recall.preflight_plan_invalid",
+                        format!("memory active recall skipped: invalid preflight plan {error}"),
+                    ));
+                    return Ok(response);
+                }
+            },
+            None => {
+                resolve_active_memory_decision(
+                    self.decision_provider.as_ref(),
+                    &context,
+                    &prompt_input,
+                    &policy,
+                    &config,
+                    &deterministic,
+                    episodic_capabilities.clone(),
+                )
+                .await
+            }
+        };
         response.diagnostics.extend(hook_diagnostics_from_strings(
             decision.diagnostics.as_slice(),
         ));

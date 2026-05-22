@@ -818,6 +818,7 @@ pub enum PromptManifestHookTruncation {
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookPhase {
     TurnPrePromptContext,
+    TurnPostPreflightPromptContext,
     TurnPrePromptCompile,
 }
 

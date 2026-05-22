@@ -18,8 +18,8 @@ use pioneer_hooks::{
     PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
     TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
-use pioneer_memory::MemoryModeRecallParams;
 use pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set;
+use pioneer_memory::{MemoryModeRecallParams, MemoryRecallMode};
 use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
     MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
@@ -40,6 +40,7 @@ use pioneer_tools::{
     ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata, ToolRetryBudgetConfig,
     ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -176,6 +177,7 @@ impl Provider for PendingProvider {
 struct CaptureAgentProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     response_text: String,
+    preflight_response_text: String,
 }
 
 impl Default for CaptureAgentProvider {
@@ -183,6 +185,7 @@ impl Default for CaptureAgentProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             response_text: "done".to_owned(),
+            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
         }
     }
 }
@@ -192,6 +195,15 @@ impl CaptureAgentProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             response_text: response_text.into(),
+            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+        }
+    }
+
+    fn with_preflight_response(preflight_response_text: impl Into<String>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            response_text: "done".to_owned(),
+            preflight_response_text: preflight_response_text.into(),
         }
     }
 
@@ -212,10 +224,11 @@ impl CaptureAgentProvider {
     }
 }
 
-const PHASE_07_HOOK_PHASES: [HookPhase; 6] = [
+const PHASE_07_HOOK_PHASES: [HookPhase; 7] = [
     HookPhase::TurnPrePolicy,
     HookPhase::TurnPrePromptContext,
     HookPhase::TurnPreToolMaterialization,
+    HookPhase::TurnPostPreflightPromptContext,
     HookPhase::TurnPrePromptCompile,
     HookPhase::TurnPostPromptCompile,
     HookPhase::TurnPostTurn,
@@ -620,6 +633,7 @@ fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
     let value = match phase {
         HookPhase::TurnPrePolicy => "test.phase07.pre_policy",
         HookPhase::TurnPrePromptContext => "test.phase07.pre_prompt_context",
+        HookPhase::TurnPostPreflightPromptContext => "test.phase07.post_preflight_prompt_context",
         HookPhase::TurnPreToolMaterialization => "test.phase07.pre_tool_materialization",
         HookPhase::TurnPrePromptCompile => "test.phase07.pre_prompt_compile",
         HookPhase::TurnPostPromptCompile => "test.phase07.post_prompt_compile",
@@ -1739,7 +1753,12 @@ impl Provider for CaptureAgentProvider {
             .expect("capture provider lock poisoned")
             .push(request);
         if preflight {
-            return Ok(test_preflight_response());
+            return Ok(ChatResponse {
+                text: self.preflight_response_text.clone(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
         }
         Ok(ChatResponse {
             text: self.response_text.clone(),
@@ -2204,6 +2223,13 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
         } else if call.phase == HookPhase::TurnPrePromptContext {
             let HookInputPayload::TurnPrePromptContext(payload) = &call.payload else {
                 panic!("pre-prompt-context call should receive typed payload");
+            };
+            assert_eq!(payload.input_text, "phase 07 agent hook phases");
+            assert_eq!(payload.model.as_deref(), Some("test-model"));
+            assert_eq!(payload.model_provider.as_deref(), Some("capture"));
+        } else if call.phase == HookPhase::TurnPostPreflightPromptContext {
+            let HookInputPayload::TurnPostPreflightPromptContext(payload) = &call.payload else {
+                panic!("post-preflight prompt-context call should receive typed payload");
             };
             assert_eq!(payload.input_text, "phase 07 agent hook phases");
             assert_eq!(payload.model.as_deref(), Some("test-model"));
@@ -4911,7 +4937,7 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
         .expect("active recall prompt-context hook source should be recorded");
     assert_eq!(
         active_recall_source.source.phase,
-        PromptManifestHookPhase::TurnPrePromptContext
+        PromptManifestHookPhase::TurnPostPreflightPromptContext
     );
     assert_eq!(
         active_recall_source.source.subscription_id,
@@ -4922,6 +4948,173 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
         Some("memory.active_recall.context")
     );
     assert_eq!(active_recall_source.source_count, Some(1));
+}
+
+#[tokio::test]
+async fn preflight_memory_provider_owned_active_recall_contributes_prompt_context() {
+    let preflight_response = json!({
+        "tools": {
+            "visibleTools": []
+        },
+        "memory": {
+            "activeRecall": {
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.92,
+                "modes": ["profile"],
+                "targets": [{
+                    "scopeKind": "user",
+                    "factClass": "user_identity",
+                    "category": "identity",
+                    "subject": "current_user",
+                    "attribute": "name"
+                }],
+                "diagnostics": ["preflight provider ok"]
+            }
+        }
+    });
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        preflight_response.to_string(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let mut config = test_tool_loop_config();
+    config.memory.active_recall.mode = super::MemoryActiveRecallMode::Hybrid;
+    config
+        .memory
+        .active_recall
+        .deterministic_sufficient_min_items = 99;
+    config.memory.active_recall.max_queries = 1;
+    let manager = AgentManager::new(registry, config);
+    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
+        vec![
+            Ok(MemoryRecallSnapshot::empty()),
+            Ok(MemoryRecallSnapshot {
+                items: vec![memory_recall_item(
+                    "mem_preflight_memory_name",
+                    MemoryCategory::Identity,
+                    Some("name"),
+                    "User's name is Alexander.",
+                )],
+                diagnostics: Vec::new(),
+                truncated: false,
+            }),
+        ],
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_preflight_memory_provider_owned",
+        "ws_preflight_memory_provider_owned",
+        "turn_preflight_memory_provider_owned",
+        ThreadMode::Agent,
+        "capture",
+        "как меня зовут?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let mode_requests = memory_provider.mode_recall_requests();
+    assert_eq!(mode_requests.len(), 1);
+    assert_eq!(mode_requests[0].mode, MemoryRecallMode::Profile);
+    assert!(!memory_provider.recall_contexts().is_empty());
+
+    let requests = provider.snapshot_all_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(is_turn_preflight_request(&requests[0]));
+    let prompt = requests[1]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Additional active memory context for this turn:")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("User's name is Alexander.")
+    );
+}
+
+#[tokio::test]
+async fn preflight_memory_active_recall_disabled_suppresses_provider_plan() {
+    let preflight_response = json!({
+        "tools": {
+            "visibleTools": []
+        },
+        "memory": {
+            "activeRecall": {
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.92,
+                "modes": ["profile"],
+                "targets": [{
+                    "scopeKind": "user",
+                    "factClass": "user_identity",
+                    "category": "identity",
+                    "subject": "current_user",
+                    "attribute": "name"
+                }],
+                "diagnostics": ["must be ignored"]
+            }
+        }
+    });
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        preflight_response.to_string(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let mut config = test_tool_loop_config();
+    config.memory.active_recall.mode = super::MemoryActiveRecallMode::Disabled;
+    let manager = AgentManager::new(registry, config);
+    let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
+        vec![Ok(MemoryRecallSnapshot::empty())],
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_preflight_memory_disabled",
+        "ws_preflight_memory_disabled",
+        "turn_preflight_memory_disabled",
+        ThreadMode::Agent,
+        "capture",
+        "как меня зовут?",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    assert_eq!(memory_provider.recall_contexts().len(), 1);
+    assert!(memory_provider.mode_recall_requests().is_empty());
+    let requests = provider.snapshot_all_requests();
+    assert_eq!(requests.len(), 2);
+    let prompt = requests[1]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        !prompt
+            .full_system_text
+            .contains("Additional active memory context for this turn:")
+    );
+    assert!(!prompt.full_system_text.contains("must be ignored"));
 }
 
 #[tokio::test]
@@ -5012,14 +5205,14 @@ async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
         .expect("prompt manifest should be emitted");
     assert!(manifest.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == PromptManifestDiagnosticCode::HookDiagnostic
-            && diagnostic.message.contains("memory prompt recall dedup")
+            && diagnostic.message.contains("memory active recall dedup")
             && diagnostic.message.contains("active_duplicate_count=1")
             && diagnostic.message.contains("active_rendered_count=0")
-            && diagnostic.message.contains("active_duplicate_only=true")
+            && diagnostic.message.contains("duplicate_only=true")
             && diagnostic
                 .hook_source
                 .as_ref()
-                .is_some_and(|source| source.hook_id == "memory.prompt_contract")
+                .is_some_and(|source| source.hook_id == "memory.active_recall")
     }));
 }
 

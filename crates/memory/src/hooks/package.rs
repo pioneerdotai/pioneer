@@ -78,20 +78,14 @@ impl HookPackage for MemoryHookPackage {
                     config: active_recall_config.clone(),
                 }),
                 MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID,
-                HookPhase::TurnPrePromptContext,
-                -10,
+                HookPhase::TurnPostPreflightPromptContext,
+                0,
                 HookExecutionPolicy {
                     await_policy: HookAwaitPolicy::Deadline,
                     timeout_ms: Some(active_recall_config.timeout_ms),
                     max_parallelism: None,
                 },
-                HookSubscriptionDependencies::new(
-                    [
-                        HookSubscriptionId::new(MEMORY_DETERMINISTIC_RECALL_SUBSCRIPTION_ID)
-                            .expect("static subscription id is valid"),
-                    ],
-                    [],
-                ),
+                HookSubscriptionDependencies::default(),
                 HookSubscriptionVisibility::Internal,
             ));
         }

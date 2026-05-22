@@ -21,6 +21,7 @@ use crate::hooks::{
     EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
     EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
     EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
+    run_agent_turn_post_preflight_prompt_context_hook_phase,
     run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
     run_agent_turn_tool_materialization_hook_phase, run_noop_agent_turn_hook_phase,
     tool_bundle_contributions_from_bundles,
@@ -35,10 +36,10 @@ use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{
-    HookPhase, HookRuntime, HookToolName, TurnPostTurnDomain, TurnPostTurnDomainEventSummary,
-    TurnPostTurnToolErrorClass, TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus,
-    TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
-    TurnPrePromptContextHookInput,
+    HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
+    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolErrorClass,
+    TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus, TurnPostTurnToolStatus,
+    TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
     MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
@@ -600,6 +601,23 @@ fn trace_agent_turn_preflight(
     trace_turn_preflight_diagnostics(thread_id, turn_id, &snapshot);
 }
 
+fn preflight_active_recall_prompt_context_input(
+    input_text: &str,
+    model: &str,
+    provider_name: &str,
+    preflight: &TurnPreflightOrchestratorResult,
+) -> Option<TurnPostPreflightPromptContextHookInput> {
+    let plan = serde_json::to_value(&preflight.plan.memory.active_recall.decision).ok()?;
+    Some(
+        TurnPostPreflightPromptContextHookInput::from_parts(
+            input_text.to_owned(),
+            Some(model.to_owned()),
+            Some(provider_name.to_owned()),
+        )
+        .with_active_memory_recall_preflight_plan(plan),
+    )
+}
+
 fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
@@ -912,6 +930,9 @@ fn prompt_manifest_hook_source(
 fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhase> {
     match phase {
         HookPhase::TurnPrePromptContext => Some(PromptManifestHookPhase::TurnPrePromptContext),
+        HookPhase::TurnPostPreflightPromptContext => {
+            Some(PromptManifestHookPhase::TurnPostPreflightPromptContext)
+        }
         HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
         HookPhase::TurnPrePolicy
         | HookPhase::TurnPreToolMaterialization
@@ -1555,7 +1576,7 @@ async fn execute_agent_provider_response(
         ChatTurnError::Terminal(error.safe_message().to_owned())
     })?;
 
-    let effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
+    let mut effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
         hook_runtime.as_ref(),
         &hook_context,
         &effective_policy_set,
@@ -1715,6 +1736,22 @@ async fn execute_agent_provider_response(
         .await;
 
         trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
+
+        if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
+            user_input_text.as_str(),
+            model.as_str(),
+            provider.name(),
+            &turn_preflight,
+        ) {
+            effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
+                hook_runtime.as_ref(),
+                &hook_context,
+                &effective_policy_set,
+                &effective_prompt_context_set,
+                active_recall_input,
+            )
+            .await;
+        }
 
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
             hook_runtime.as_ref(),
@@ -2007,6 +2044,21 @@ async fn execute_agent_provider_response(
     )
     .await;
     trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &all_tool_names);
+    if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
+        user_input_text.as_str(),
+        model.as_str(),
+        provider.name(),
+        &turn_preflight,
+    ) {
+        effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
+            hook_runtime.as_ref(),
+            &hook_context,
+            &effective_policy_set,
+            &effective_prompt_context_set,
+            active_recall_input,
+        )
+        .await;
+    }
 
     let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
         hook_runtime.as_ref(),
