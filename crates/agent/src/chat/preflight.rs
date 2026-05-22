@@ -4,8 +4,8 @@ use pioneer_memory::hooks::{
     ActiveRecallPlan, ActiveRecallPlanJson, DeterministicRecallContextSummary,
     MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
     MemoryActiveRecallLocalPlan, MemoryActiveRecallProviderFallbackContext,
-    active_recall_preflight_provider_fallback, normalize_active_recall_plan,
-    parse_active_memory_decision_json,
+    active_recall_planned_query_count, active_recall_preflight_provider_fallback,
+    normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_promt::{
     TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 const PREFLIGHT_DIAGNOSTIC_CODE_MAX_CHARS: usize = 160;
 const PREFLIGHT_DIAGNOSTIC_MAX_COUNT: usize = 16;
@@ -659,6 +660,87 @@ pub(crate) struct TurnPreflightPlan {
     pub provider_call: Option<TurnPreflightProviderCallMetadata>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightDiagnosticsSnapshot {
+    pub source: TurnPreflightPlanSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<TurnPreflightFallbackReason>,
+    pub preflight_failed: bool,
+    pub tools: TurnPreflightToolsDiagnosticsSnapshot,
+    pub provider: TurnPreflightProviderDiagnosticsSnapshot,
+    pub memory: TurnPreflightMemoryDiagnosticsSnapshot,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, TurnPreflightModuleDiagnosticsSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<TurnPreflightDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightToolsDiagnosticsSnapshot {
+    pub core_tools: Vec<String>,
+    pub candidate_tools: Vec<String>,
+    pub requested_tools: Vec<String>,
+    pub final_visible_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightProviderDiagnosticsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_call: Option<TurnPreflightProviderCallMetadata>,
+    pub retry_used: bool,
+    pub retry_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_failure_reason: Option<TurnPreflightFallbackReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<TurnPreflightDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightMemoryDiagnosticsSnapshot {
+    pub deterministic_context_count: usize,
+    pub deterministic_context_chars: usize,
+    pub deterministic_sufficient: bool,
+    pub active_recall: TurnPreflightMemoryActiveRecallDiagnosticsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightMemoryActiveRecallDiagnosticsSnapshot {
+    pub source: TurnPreflightPlanSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<TurnPreflightFallbackReason>,
+    pub status: pioneer_memory::hooks::ActiveMemoryDecisionStatus,
+    pub reason_code: pioneer_memory::hooks::ActiveMemoryDecisionReasonCode,
+    pub confidence: f32,
+    pub planned_query_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_modes: Vec<pioneer_memory::hooks::ActiveRecallMode>,
+    pub target_count: usize,
+    pub provider_used: bool,
+    pub provider_fallback_used: bool,
+    pub debug_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_input_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_output_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnPreflightModuleDiagnosticsSnapshot {
+    pub fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<TurnPreflightFallbackReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<TurnPreflightDiagnostic>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TurnPreflightToolsPlan {
@@ -838,6 +920,184 @@ pub(crate) fn compose_turn_preflight_plan(
         TurnPreflightProviderCallResult::Failure(failure) => {
             compose_fallback_turn_preflight_plan(local_modules, failure)
         }
+    }
+}
+
+pub(crate) fn build_turn_preflight_diagnostics_snapshot(
+    local_modules: &TurnPreflightLocalModulePlans,
+    plan: &TurnPreflightPlan,
+    final_visible_tools: &[String],
+) -> TurnPreflightDiagnosticsSnapshot {
+    TurnPreflightDiagnosticsSnapshot {
+        source: plan.source,
+        fallback_reason: plan.fallback_reason,
+        preflight_failed: plan.diagnostics.preflight_failed,
+        tools: TurnPreflightToolsDiagnosticsSnapshot {
+            core_tools: normalize_visible_tool_names(local_modules.tools.input.core_tools.clone()),
+            candidate_tools: normalize_visible_tool_names(
+                local_modules
+                    .tools
+                    .input
+                    .candidate_tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+            ),
+            requested_tools: normalize_visible_tool_names(plan.tools.visible_tools.clone()),
+            final_visible_tools: normalize_visible_tool_names(final_visible_tools.to_vec()),
+        },
+        provider: provider_diagnostics_snapshot(plan),
+        memory: memory_diagnostics_snapshot(local_modules, plan),
+        modules: module_diagnostics_snapshot(plan),
+        diagnostics: normalize_preflight_diagnostics(plan.diagnostics.diagnostics.clone()),
+    }
+}
+
+pub(crate) fn trace_turn_preflight_diagnostics(
+    thread_id: &str,
+    turn_id: &str,
+    snapshot: &TurnPreflightDiagnosticsSnapshot,
+) {
+    debug!(
+        target: "pioneer.preflight",
+        thread_id,
+        turn_id,
+        source = ?snapshot.source,
+        fallback_reason = ?snapshot.fallback_reason,
+        preflight_failed = snapshot.preflight_failed,
+        requested_tools = ?snapshot.tools.requested_tools,
+        final_visible_tools = ?snapshot.tools.final_visible_tools,
+        provider_retry_used = snapshot.provider.retry_used,
+        provider_retry_failed = snapshot.provider.retry_failed,
+        provider_final_attempt = snapshot
+            .provider
+            .final_call
+            .as_ref()
+            .map(|call| call.attempt),
+        memory_active_recall_source = ?snapshot.memory.active_recall.source,
+        memory_active_recall_status = ?snapshot.memory.active_recall.status,
+        memory_active_recall_reason = ?snapshot.memory.active_recall.reason_code,
+        memory_active_recall_planned_query_count =
+            snapshot.memory.active_recall.planned_query_count,
+        "turn preflight diagnostics"
+    );
+}
+
+fn provider_diagnostics_snapshot(
+    plan: &TurnPreflightPlan,
+) -> TurnPreflightProviderDiagnosticsSnapshot {
+    let provider_diagnostics = plan
+        .diagnostics
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code.as_str().starts_with("preflight.provider."))
+        .cloned()
+        .collect::<Vec<_>>();
+    let retry_used = plan
+        .provider_call
+        .as_ref()
+        .is_some_and(|call| call.attempt > 1)
+        || diagnostic_codes_contain(
+            provider_diagnostics.as_slice(),
+            "preflight.provider.thread_model_retry_used",
+        )
+        || diagnostic_codes_contain(
+            provider_diagnostics.as_slice(),
+            "preflight.provider.thread_model_retry_failed",
+        );
+    let retry_failed = diagnostic_codes_contain(
+        provider_diagnostics.as_slice(),
+        "preflight.provider.thread_model_retry_failed",
+    );
+
+    TurnPreflightProviderDiagnosticsSnapshot {
+        final_call: plan.provider_call.clone(),
+        retry_used,
+        retry_failed,
+        final_failure_reason: plan.fallback_reason,
+        diagnostics: normalize_preflight_diagnostics(provider_diagnostics),
+    }
+}
+
+fn diagnostic_codes_contain(diagnostics: &[TurnPreflightDiagnostic], code: &str) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.as_str() == code)
+}
+
+fn memory_diagnostics_snapshot(
+    local_modules: &TurnPreflightLocalModulePlans,
+    plan: &TurnPreflightPlan,
+) -> TurnPreflightMemoryDiagnosticsSnapshot {
+    let deterministic = &local_modules.memory.deterministic_summary;
+    let active_recall = &plan.memory.active_recall;
+    let decision = &active_recall.decision;
+
+    TurnPreflightMemoryDiagnosticsSnapshot {
+        deterministic_context_count: deterministic.context_count,
+        deterministic_context_chars: deterministic.context_chars,
+        deterministic_sufficient: deterministic.sufficient,
+        active_recall: TurnPreflightMemoryActiveRecallDiagnosticsSnapshot {
+            source: active_recall.source,
+            fallback_reason: active_recall.fallback_reason,
+            status: decision.status,
+            reason_code: decision.reason_code,
+            confidence: decision.confidence,
+            planned_query_count: active_recall_planned_query_count(decision),
+            selected_modes: decision.modes.clone(),
+            target_count: decision.targets.len(),
+            provider_used: decision.provider_used,
+            provider_fallback_used: decision.provider_fallback_used,
+            debug_fallback: decision.debug_fallback,
+            provider_input_chars: decision.provider_input_chars,
+            provider_output_chars: decision.provider_output_chars,
+            diagnostics: decision.diagnostics.clone(),
+        },
+    }
+}
+
+fn module_diagnostics_snapshot(
+    plan: &TurnPreflightPlan,
+) -> BTreeMap<String, TurnPreflightModuleDiagnosticsSnapshot> {
+    let mut modules = BTreeMap::new();
+    modules.insert(
+        "tools".to_owned(),
+        module_snapshot(
+            plan.source == TurnPreflightPlanSource::Fallback,
+            plan.fallback_reason,
+            plan.diagnostics.module_diagnostics.get("tools").cloned(),
+        ),
+    );
+    modules.insert(
+        "memory.activeRecall".to_owned(),
+        module_snapshot(
+            plan.memory.active_recall.source == TurnPreflightPlanSource::Fallback,
+            plan.memory.active_recall.fallback_reason,
+            plan.diagnostics
+                .module_diagnostics
+                .get("memory.activeRecall")
+                .cloned(),
+        ),
+    );
+
+    for (module, diagnostics) in &plan.diagnostics.module_diagnostics {
+        modules
+            .entry(module.clone())
+            .or_insert_with(|| module_snapshot(false, None, Some(diagnostics.clone())));
+    }
+
+    modules
+}
+
+fn module_snapshot(
+    fallback: bool,
+    fallback_reason: Option<TurnPreflightFallbackReason>,
+    diagnostics: Option<Vec<TurnPreflightDiagnostic>>,
+) -> TurnPreflightModuleDiagnosticsSnapshot {
+    TurnPreflightModuleDiagnosticsSnapshot {
+        fallback,
+        fallback_reason,
+        diagnostics: normalize_preflight_diagnostics(diagnostics.unwrap_or_default()),
     }
 }
 
@@ -2621,6 +2881,207 @@ mod tests {
                 "preflight.provider.thread_model_retry_used",
                 "preflight.tools.memory_selected"
             ]
+        );
+    }
+
+    #[test]
+    fn preflight_diagnostics_success_snapshot_is_compact_and_memory_aligned() {
+        let mut modules = sample_provider_needed_modules();
+        modules
+            .memory
+            .deterministic_summary
+            .memory_ids
+            .insert("memory_private_id".to_owned());
+        modules.memory.deterministic_summary.context_count = 1;
+        modules.memory.deterministic_summary.context_chars = 128;
+        let plan = compose_turn_preflight_plan(&modules, sample_provider_success(1));
+        let final_visible_tools = vec![
+            "request_tools".to_owned(),
+            "exec_command".to_owned(),
+            "memory_search".to_owned(),
+            "memory_get".to_owned(),
+        ];
+
+        let snapshot =
+            build_turn_preflight_diagnostics_snapshot(&modules, &plan, &final_visible_tools);
+
+        assert_eq!(snapshot.source, TurnPreflightPlanSource::Provider);
+        assert!(!snapshot.preflight_failed);
+        assert_eq!(
+            snapshot.tools.core_tools,
+            vec!["exec_command".to_owned(), "request_tools".to_owned()]
+        );
+        assert_eq!(
+            snapshot.tools.candidate_tools,
+            vec!["memory_search".to_owned(), "task_create".to_owned()]
+        );
+        assert_eq!(
+            snapshot.tools.requested_tools,
+            vec!["memory_get".to_owned(), "memory_search".to_owned()]
+        );
+        assert_eq!(
+            snapshot.tools.final_visible_tools,
+            vec![
+                "exec_command".to_owned(),
+                "memory_get".to_owned(),
+                "memory_search".to_owned(),
+                "request_tools".to_owned()
+            ]
+        );
+        assert_eq!(snapshot.provider.final_call, plan.provider_call);
+        assert!(!snapshot.provider.retry_used);
+        assert_eq!(snapshot.memory.deterministic_context_count, 1);
+        assert_eq!(snapshot.memory.deterministic_context_chars, 128);
+        assert_eq!(
+            snapshot.memory.active_recall.status,
+            ActiveMemoryDecisionStatus::Run
+        );
+        assert_eq!(
+            snapshot.memory.active_recall.reason_code,
+            ActiveMemoryDecisionReasonCode::MemoryLikely
+        );
+        assert_eq!(snapshot.memory.active_recall.planned_query_count, 2);
+        assert_eq!(snapshot.memory.active_recall.target_count, 1);
+        assert_eq!(
+            snapshot.memory.active_recall.diagnostics,
+            vec!["memory.active_recall.identity_lookup".to_owned()]
+        );
+        assert!(!snapshot.modules["tools"].fallback);
+        assert!(!snapshot.modules["memory.activeRecall"].fallback);
+
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(!serialized.contains("memory_private_id"));
+        assert!(!serialized.contains("renderedLineFingerprints"));
+        assert!(!serialized.contains("\"properties\""));
+        assert!(!serialized.contains("\"jsonSchema\""));
+    }
+
+    #[test]
+    fn preflight_diagnostics_retry_success_records_primary_failure_and_retry() {
+        let modules = sample_provider_needed_modules();
+        let result = TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
+            plan: sample_provider_plan(),
+            provider_call: sample_provider_call_metadata(2),
+            diagnostics: vec![
+                diagnostic(
+                    "preflight.provider.invalid_json",
+                    Some("configured provider returned invalid JSON"),
+                ),
+                diagnostic(
+                    "preflight.provider.thread_model_retry_used",
+                    Some("preflight retry used the current thread model"),
+                ),
+            ],
+        });
+        let plan = compose_turn_preflight_plan(&modules, result);
+        let final_visible_tools = vec![
+            "exec_command".to_owned(),
+            "request_tools".to_owned(),
+            "memory_get".to_owned(),
+            "memory_search".to_owned(),
+        ];
+
+        let snapshot =
+            build_turn_preflight_diagnostics_snapshot(&modules, &plan, &final_visible_tools);
+        trace_turn_preflight_diagnostics("thr_1", "turn_1", &snapshot);
+
+        assert_eq!(snapshot.source, TurnPreflightPlanSource::Provider);
+        assert_eq!(
+            snapshot
+                .provider
+                .final_call
+                .as_ref()
+                .map(|call| call.attempt),
+            Some(2)
+        );
+        assert!(snapshot.provider.retry_used);
+        assert!(!snapshot.provider.retry_failed);
+        assert_eq!(
+            snapshot
+                .provider
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "preflight.provider.invalid_json",
+                "preflight.provider.thread_model_retry_used"
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_diagnostics_final_fallback_records_module_fallbacks() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
+        );
+        let final_visible_tools = vec!["exec_command".to_owned(), "request_tools".to_owned()];
+
+        let snapshot =
+            build_turn_preflight_diagnostics_snapshot(&modules, &plan, &final_visible_tools);
+
+        assert_eq!(snapshot.source, TurnPreflightPlanSource::Fallback);
+        assert_eq!(
+            snapshot.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(snapshot.preflight_failed);
+        assert!(snapshot.tools.requested_tools.is_empty());
+        assert_eq!(
+            snapshot.tools.final_visible_tools,
+            vec!["exec_command".to_owned(), "request_tools".to_owned()]
+        );
+        assert!(snapshot.provider.retry_used);
+        assert!(snapshot.provider.retry_failed);
+        assert_eq!(
+            snapshot.provider.final_failure_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert_eq!(
+            snapshot
+                .provider
+                .final_call
+                .as_ref()
+                .map(|call| call.attempt),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .provider
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "preflight.provider.error",
+                "preflight.provider.thread_model_retry_failed",
+                "preflight.provider.invalid_json"
+            ]
+        );
+        assert!(snapshot.modules["tools"].fallback);
+        assert_eq!(
+            snapshot.modules["tools"].fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(snapshot.modules["memory.activeRecall"].fallback);
+        assert_eq!(
+            snapshot.modules["memory.activeRecall"].fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert_eq!(
+            snapshot.memory.active_recall.source,
+            TurnPreflightPlanSource::Fallback
+        );
+        assert!(snapshot.memory.active_recall.provider_fallback_used);
+        assert!(
+            snapshot
+                .memory
+                .active_recall
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
         );
     }
 

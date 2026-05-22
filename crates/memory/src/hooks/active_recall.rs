@@ -1447,6 +1447,18 @@ pub fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallP
     plan
 }
 
+pub fn active_recall_planned_query_count(decision: &ActiveRecallPlan) -> usize {
+    if decision.status != ActiveMemoryDecisionStatus::Run {
+        return 0;
+    }
+
+    if decision.debug_fallback {
+        return decision.modes.len().max(1);
+    }
+
+    decision.modes.len()
+}
+
 pub(super) fn normalize_active_recall_plan_for_input(
     mut plan: ActiveRecallPlan,
     input: &ActiveRecallPlannerInput,
