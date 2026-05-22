@@ -184,7 +184,6 @@ active_recall_enabled = true
 tools_enabled = true
 proactive_writes_enabled = true
 background_extraction_enabled = true
-active_recall_model = "thread"
 proactive_writes_model = "thread"
 debug_trace_enabled = false
 strict_diagnostics_enabled = false

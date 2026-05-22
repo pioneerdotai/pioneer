@@ -9,7 +9,7 @@ use std::path::{Component, Path};
 
 use crate::helpers::normalize_non_empty;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewaySettings {
     version: u32,
@@ -18,6 +18,37 @@ pub struct GatewaySettings {
     secrets: GatewaySecretsSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<GatewayMemorySettingsOverride>,
+    #[serde(skip)]
+    migrated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewaySettingsWire {
+    version: u32,
+    #[serde(default)]
+    general: GatewayGeneralSettings,
+    secrets: GatewaySecretsSettings,
+    #[serde(default)]
+    memory: Option<GatewayMemorySettingsOverride>,
+}
+
+impl<'de> Deserialize<'de> for GatewaySettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = GatewaySettingsWire::deserialize(deserializer)?;
+        let mut settings = Self {
+            version: wire.version,
+            general: wire.general,
+            secrets: wire.secrets,
+            memory: wire.memory,
+            migrated: false,
+        };
+        settings.migrate_legacy_active_recall_model();
+        Ok(settings)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,9 +191,12 @@ impl GatewaySettings {
     }
 
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
+        let general = self.effective_general_settings(config);
+        let mut memory = self.effective_memory_settings(&config.memory);
+        memory.active_recall_model = model_selection_from_protocol(general.preflight_model.clone());
         pioneer_protocol::GatewaySettingsSnapshot {
-            general: self.effective_general_settings(config),
-            memory: self.effective_memory_settings(&config.memory).to_protocol(),
+            general,
+            memory: memory.to_protocol(),
         }
     }
 
@@ -175,7 +209,12 @@ impl GatewaySettings {
             changes.general = self.general.apply_protocol_update(general);
         }
         if let Some(memory) = update.memory {
-            self.set_memory_settings(GatewayMemorySettings::from_protocol(memory));
+            let memory = GatewayMemorySettings::from_protocol(memory);
+            if changes.general.preflight_model.is_none() {
+                self.general.preflight_model = Some(memory.active_recall_model.clone());
+                changes.general.preflight_model = Some(memory.active_recall_model.clone());
+            }
+            self.set_memory_settings(memory);
             changes.memory = true;
         }
         changes
@@ -203,6 +242,19 @@ impl GatewaySettings {
     pub fn apply_to_app_config(&self, mut config: AppConfig) -> AppConfig {
         config.gateway = self.apply_to_gateway_config(config.gateway);
         config
+    }
+
+    fn migrate_legacy_active_recall_model(&mut self) -> bool {
+        let mut migrated = false;
+        if let Some(memory) = &mut self.memory {
+            if self.general.preflight_model.is_none() {
+                self.general.preflight_model = memory.active_recall_model.clone();
+            }
+            migrated = memory.active_recall_model.is_some();
+            memory.active_recall_model = None;
+        }
+        self.migrated |= migrated;
+        migrated
     }
 }
 
@@ -274,7 +326,7 @@ impl GatewayMemorySettingsOverride {
             tools_enabled: Some(settings.tools_enabled),
             proactive_writes_enabled: Some(settings.proactive_writes_enabled),
             background_extraction_enabled: Some(settings.background_extraction_enabled),
-            active_recall_model: Some(settings.active_recall_model),
+            active_recall_model: None,
             proactive_writes_model: Some(settings.proactive_writes_model),
             debug_trace_enabled: Some(settings.debug_trace_enabled),
             strict_diagnostics_enabled: Some(settings.strict_diagnostics_enabled),
@@ -302,9 +354,6 @@ impl GatewayMemorySettingsOverride {
         }
         if let Some(background_extraction_enabled) = self.background_extraction_enabled {
             settings.background_extraction_enabled = background_extraction_enabled;
-        }
-        if let Some(active_recall_model) = &self.active_recall_model {
-            settings.active_recall_model = active_recall_model.clone();
         }
         if let Some(proactive_writes_model) = &self.proactive_writes_model {
             settings.proactive_writes_model = proactive_writes_model.clone();
@@ -339,9 +388,6 @@ impl GatewayMemorySettingsOverride {
         }
         if let Some(background_extraction_enabled) = self.background_extraction_enabled {
             config.background_extraction_enabled = background_extraction_enabled;
-        }
-        if let Some(active_recall_model) = &self.active_recall_model {
-            config.active_recall_model = active_recall_model.clone();
         }
         if let Some(proactive_writes_model) = &self.proactive_writes_model {
             config.proactive_writes_model = proactive_writes_model.clone();
@@ -421,6 +467,7 @@ pub fn load_or_create_gateway_settings(
         general: GatewayGeneralSettings::default(),
         secrets: GatewaySecretsSettings::default(),
         memory: None,
+        migrated: false,
     };
 
     save_gateway_settings(path, &settings)?;
@@ -455,12 +502,20 @@ fn load_gateway_settings(
         );
     }
 
+    if settings.migrated {
+        save_gateway_settings(path, &settings).with_context(|| {
+            format!("failed to save migrated gateway settings `{path_display}`")
+        })?;
+    }
+
     Ok(settings)
 }
 
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
+    let mut settings = settings.clone();
+    settings.migrate_legacy_active_recall_model();
     let content =
-        toml::to_string_pretty(settings).context("failed to serialize gateway settings")?;
+        toml::to_string_pretty(&settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
 }
 
@@ -586,6 +641,16 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
             ..GatewayMemoryConfig::default()
         };
 
+        assert_eq!(
+            settings
+                .effective_general_settings(&gateway_config_with_keepawake(false))
+                .preflight_model,
+            pioneer_protocol::GatewayMemoryModelSelection::custom(
+                "planner-provider",
+                "planner-model"
+            )
+        );
+
         let mapped = settings.apply_to_gateway_memory_config(base);
 
         assert_eq!(mapped.capsules_dir, "memory/custom");
@@ -597,10 +662,7 @@ proactive_writes_model = { source = "custom", model_provider = "extractor-provid
         assert!(!mapped.tools_enabled);
         assert!(!mapped.proactive_writes_enabled);
         assert!(!mapped.background_extraction_enabled);
-        assert_eq!(
-            mapped.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
-        );
+        assert!(mapped.active_recall_model.is_thread_model());
         assert_eq!(
             mapped.proactive_writes_model,
             GatewayMemoryModelSelectionConfig::custom("extractor-provider", "extractor-model")
@@ -759,15 +821,106 @@ backend = "keystore"
         assert!(content.contains("tools_enabled = false"));
         assert!(content.contains("proactive_writes_enabled = false"));
         assert!(content.contains("background_extraction_enabled = false"));
-        assert!(content.contains("active_recall_model"));
-        assert!(content.contains("model_provider = \"planner-provider\""));
-        assert!(content.contains("model = \"planner-model\""));
+        assert!(!content.contains("active_recall_model"));
+        assert!(!content.contains("planner-provider"));
+        assert!(!content.contains("planner-model"));
         assert!(content.contains("proactive_writes_model = \"thread\""));
         assert!(content.contains("debug_trace_enabled = true"));
         assert!(content.contains("strict_diagnostics_enabled = true"));
         assert!(!content.contains("capsules_dir"));
         assert!(!content.contains("allow_global_user_by_default"));
         assert!(!content.contains("allow_global_agent_by_default"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_migration_copies_legacy_active_recall_model_to_general() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[memory]
+proactive_writes_model = { source = "custom", model_provider = "extractor-provider", model = "extractor-model" }
+
+[memory.active_recall_model]
+source = "custom"
+model_provider = "legacy-provider"
+model = "legacy-model"
+"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("legacy settings should load");
+        assert_eq!(
+            settings
+                .effective_general_settings(&gateway_config_with_keepawake(false))
+                .preflight_model,
+            pioneer_protocol::GatewayMemoryModelSelection::custom(
+                "legacy-provider",
+                "legacy-model"
+            )
+        );
+
+        let content = fs::read_to_string(&path).expect("read migrated settings");
+        assert!(content.contains("preflight_model"));
+        assert!(content.contains("legacy-provider"));
+        assert!(content.contains("legacy-model"));
+        assert!(!content.contains("active_recall_model"));
+        assert!(content.contains("proactive_writes_model"));
+        assert!(content.contains("extractor-provider"));
+        assert!(content.contains("extractor-model"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_migration_preserves_explicit_preflight_model() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[general]
+preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
+
+[secrets]
+backend = "keystore"
+
+[memory.active_recall_model]
+source = "custom"
+model_provider = "legacy-provider"
+model = "legacy-model"
+"#,
+        )
+        .expect("write mixed settings");
+
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("mixed settings should load");
+        assert_eq!(
+            settings
+                .effective_general_settings(&gateway_config_with_keepawake(false))
+                .preflight_model,
+            pioneer_protocol::GatewayMemoryModelSelection::custom("new-provider", "new-model")
+        );
+
+        let content = fs::read_to_string(&path).expect("read migrated settings");
+        assert!(content.contains("new-provider"));
+        assert!(content.contains("new-model"));
+        assert!(!content.contains("active_recall_model"));
+        assert!(!content.contains("legacy-provider"));
+        assert!(!content.contains("legacy-model"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

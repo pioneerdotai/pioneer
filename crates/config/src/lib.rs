@@ -1617,11 +1617,58 @@ fn load_config_from_sources(
     let mut builder =
         Config::builder().add_source(File::from_str(default_config_toml, FileFormat::Toml));
 
-    for path in override_paths {
-        builder = builder.add_source(File::from(path).required(false));
+    for path in &override_paths {
+        builder = builder.add_source(File::from(path.as_path()).required(false));
     }
 
-    builder.build()?.try_deserialize()
+    let mut config: AppConfig = builder.build()?.try_deserialize()?;
+    migrate_gateway_preflight_model_from_legacy_overrides(&mut config, override_paths.as_slice());
+    Ok(config)
+}
+
+fn migrate_gateway_preflight_model_from_legacy_overrides(
+    config: &mut AppConfig,
+    override_paths: &[PathBuf],
+) {
+    if override_paths_contain_toml_path(override_paths, &["gateway", "preflight_model"]) {
+        return;
+    }
+
+    if override_paths_contain_toml_path(
+        override_paths,
+        &["gateway", "memory", "active_recall_model"],
+    ) {
+        config.gateway.preflight_model = config.gateway.memory.active_recall_model.clone();
+    }
+}
+
+fn override_paths_contain_toml_path(override_paths: &[PathBuf], path: &[&str]) -> bool {
+    override_paths.iter().any(|override_path| {
+        let Ok(content) = std::fs::read_to_string(override_path) else {
+            return false;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(content.as_str()) else {
+            return false;
+        };
+        toml_value_has_path(&value, path)
+    })
+}
+
+fn toml_value_has_path(value: &toml::Value, path: &[&str]) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+
+    for end in 1..=path.len() {
+        let key = path[..end].join(".");
+        if let Some(next) = value.get(key.as_str())
+            && toml_value_has_path(next, &path[end..])
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn workspace_local_config_path() -> PathBuf {
@@ -1826,6 +1873,81 @@ preflight_model = { source = "custom", model_provider = "planner-provider", mode
         assert_eq!(
             config.gateway.preflight_model,
             GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
+        );
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
+        let workspace_override = unique_temp_file_path("gateway-preflight-model-migration");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.memory]
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with legacy active recall model");
+
+        assert_eq!(
+            config.gateway.preflight_model,
+            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
+        );
+        assert_eq!(
+            config.gateway.memory.active_recall_model,
+            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
+        );
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn migration_toml_path_detection_handles_nested_tables() {
+        let content = r#"
+[gateway.memory]
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
+"#;
+        let value = toml::from_str::<toml::Value>(content).expect("toml should parse");
+
+        assert!(super::toml_value_has_path(
+            &value,
+            &["gateway", "memory", "active_recall_model"]
+        ));
+        assert!(!super::toml_value_has_path(
+            &value,
+            &["gateway", "preflight_model"]
+        ));
+    }
+
+    #[test]
+    fn migration_gateway_preflight_model_preserves_explicit_new_setting() {
+        let workspace_override = unique_temp_file_path("gateway-preflight-model-mixed");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway]
+preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
+
+[gateway.memory]
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with mixed preflight settings");
+
+        assert_eq!(
+            config.gateway.preflight_model,
+            GatewayMemoryModelSelectionConfig::custom("new-provider", "new-model")
+        );
+        assert_eq!(
+            config.gateway.memory.active_recall_model,
+            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
         );
 
         let _ = fs::remove_file(workspace_override);
