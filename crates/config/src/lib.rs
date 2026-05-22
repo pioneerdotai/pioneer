@@ -1879,7 +1879,7 @@ preflight_model = { source = "custom", model_provider = "planner-provider", mode
     }
 
     #[test]
-    fn migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
+    fn settings_migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
         let workspace_override = unique_temp_file_path("gateway-preflight-model-migration");
         write_file(
             &workspace_override,
@@ -1924,7 +1924,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
     }
 
     #[test]
-    fn migration_gateway_preflight_model_preserves_explicit_new_setting() {
+    fn settings_migration_gateway_preflight_model_preserves_explicit_new_setting() {
         let workspace_override = unique_temp_file_path("gateway-preflight-model-mixed");
         write_file(
             &workspace_override,

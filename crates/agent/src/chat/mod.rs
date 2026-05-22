@@ -3639,7 +3639,7 @@ mod tests {
         ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutcome, ToolOutput, ToolSpec,
         WebToolsConfig, dynamic_unknown_output_policy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
@@ -3751,6 +3751,97 @@ mod tests {
             }],
         )
         .expect("test tools must build")
+    }
+
+    fn build_tools_with_extension_specs(
+        specs: Vec<ConfiguredToolSpec>,
+    ) -> pioneer_tools::BuiltinTools {
+        let handlers = specs
+            .iter()
+            .map(|configured| {
+                (
+                    configured.spec.name.clone(),
+                    std::sync::Arc::new(NoopToolHandler) as std::sync::Arc<dyn ToolHandler>,
+                )
+            })
+            .collect();
+        pioneer_tools::build_tools(
+            ".",
+            "turn_schema_token_guard",
+            test_web_config(),
+            test_computer_use_config(),
+            vec![ToolExtensionBundle { specs, handlers }],
+        )
+        .expect("test tools must build")
+    }
+
+    fn all_lazy_domain_tool_names() -> Vec<&'static str> {
+        pioneer_tools::builtin_tool_domain_map()
+            .iter()
+            .flat_map(|(_, tool_names)| tool_names.iter().copied())
+            .collect()
+    }
+
+    fn expected_visible(core_tools: &[String], extra: &[&str]) -> Vec<String> {
+        core_tools
+            .iter()
+            .cloned()
+            .chain(extra.iter().map(|name| (*name).to_owned()))
+            .collect()
+    }
+
+    fn assert_no_discovery_tools(visible_tools: &[String]) {
+        assert!(!visible_tools.iter().any(|name| name == "tool_search"));
+        assert!(!visible_tools.iter().any(|name| name == "tool_suggest"));
+    }
+
+    fn assert_lazy_domain_tools_hidden_except(visible_tools: &[String], allowed: &[&str]) {
+        let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+        for name in all_lazy_domain_tool_names() {
+            if !allowed.contains(name) {
+                assert!(
+                    !visible_tools.iter().any(|visible| visible == name),
+                    "lazy-domain tool `{name}` should stay hidden"
+                );
+            }
+        }
+    }
+
+    fn heavy_hidden_domain_tool(name: &str) -> ConfiguredToolSpec {
+        let mut properties = serde_json::Map::new();
+        for index in 0..48 {
+            properties.insert(
+                format!("field_{index}"),
+                serde_json::json!({
+                    "type": "string",
+                    "description": format!(
+                        "Heavy hidden-domain schema field {index} for `{name}`. This fixture must stay out of ordinary provider requests."
+                    )
+                }),
+            );
+        }
+
+        ConfiguredToolSpec::new(
+            ToolSpec::new(
+                name,
+                "heavy hidden-domain test tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": ["field_0"],
+                    "additionalProperties": false
+                }),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+        )
+    }
+
+    fn serialized_tool_schema_bytes(specs: &[ToolSpec]) -> usize {
+        serde_json::to_vec(specs)
+            .expect("tool specs serialize")
+            .len()
     }
 
     fn request_tools_result_for_added(
@@ -4241,6 +4332,280 @@ mod tests {
                 "task_resume",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_visibility_matrix_canonical_turn_types_and_fallbacks() {
+        let lazy_domain_tools = all_lazy_domain_tool_names();
+        let built = build_tools_with_extension_names(&lazy_domain_tools);
+        let core_tools = built.router.preflight_tool_index().core_tools;
+
+        let cases = [
+            (
+                "core only ordinary q-and-a",
+                "что такое Rust ownership?",
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+            ),
+            (
+                "identity lookup uses memory read tools",
+                "как меня зовут?",
+                vec!["memory_search", "memory_get"],
+                vec!["memory_search", "memory_get"],
+            ),
+            (
+                "explicit remember uses memory mutation tool",
+                "запомни, что меня зовут Александр",
+                vec!["memory_remember"],
+                vec!["memory_remember"],
+            ),
+            (
+                "artifact creation uses artifact tools",
+                "создай отчет в docx",
+                vec!["artifact_prepare", "artifact_register"],
+                vec!["artifact_prepare", "artifact_register"],
+            ),
+            (
+                "task creation uses task_create",
+                "запусти задачу завтра",
+                vec!["task_create"],
+                vec!["task_create"],
+            ),
+            (
+                "computer operation uses computer_use",
+                "открой браузер и проверь сайт",
+                vec!["computer_use"],
+                vec!["computer_use"],
+            ),
+        ];
+
+        for (label, _user_text, selected, expected_extra) in cases {
+            let selected = selected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let visibility = built
+                .router
+                .compute_final_visible_tools(&core_tools, &selected, &[]);
+
+            assert_eq!(
+                visibility.visible_tools,
+                expected_visible(&core_tools, &expected_extra),
+                "{label}"
+            );
+            assert_lazy_domain_tools_hidden_except(&visibility.visible_tools, &expected_extra);
+            assert_no_discovery_tools(&visibility.visible_tools);
+
+            built
+                .router
+                .set_model_visible_tools(&visibility.visible_tools)
+                .await;
+            let provider_tool_names = built
+                .router
+                .model_visible_specs()
+                .await
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>();
+            assert_eq!(provider_tool_names, visibility.visible_tools, "{label}");
+        }
+
+        let provider_final_failure =
+            built
+                .router
+                .compute_final_visible_tools(&core_tools, &[], &[]);
+        assert_eq!(provider_final_failure.visible_tools, core_tools);
+        assert_lazy_domain_tools_hidden_except(&provider_final_failure.visible_tools, &[]);
+        assert!(
+            provider_final_failure
+                .visible_tools
+                .contains(&"request_tools".to_owned())
+        );
+        assert_no_discovery_tools(&provider_final_failure.visible_tools);
+    }
+
+    #[test]
+    fn tool_visibility_matrix_dynamic_tools_hidden_tasks_and_phase03_expansion() {
+        let mut extension_names = all_lazy_domain_tool_names();
+        extension_names.extend([
+            "skill.file_editor",
+            "skill.subtask_planner",
+            "mcp.filesystem.write",
+            "mcp.workspace.read",
+        ]);
+        let built = build_tools_with_extension_names(&extension_names);
+        let core_tools = built.router.preflight_tool_index().core_tools;
+
+        let hidden_file_editing_task =
+            built
+                .router
+                .compute_final_visible_tools(&core_tools, &[], &[]);
+        for dynamic in [
+            "skill.file_editor",
+            "skill.subtask_planner",
+            "mcp.filesystem.write",
+            "mcp.workspace.read",
+        ] {
+            assert!(
+                hidden_file_editing_task
+                    .visible_tools
+                    .contains(&dynamic.to_owned()),
+                "materialized dynamic tool `{dynamic}` must not depend on preflight"
+            );
+        }
+        assert_lazy_domain_tools_hidden_except(&hidden_file_editing_task.visible_tools, &[]);
+        assert_no_discovery_tools(&hidden_file_editing_task.visible_tools);
+
+        let hidden_subtask_creating_task = built.router.compute_final_visible_tools(
+            &core_tools,
+            &["task_create".to_owned(), "task_wait".to_owned()],
+            &[],
+        );
+        assert!(
+            hidden_subtask_creating_task
+                .visible_tools
+                .contains(&"task_create".to_owned())
+        );
+        assert!(
+            hidden_subtask_creating_task
+                .visible_tools
+                .contains(&"task_wait".to_owned())
+        );
+        assert!(
+            !hidden_subtask_creating_task
+                .visible_tools
+                .contains(&"task_cancel".to_owned())
+        );
+        assert_no_discovery_tools(&hidden_subtask_creating_task.visible_tools);
+
+        let phase03_expanded_artifacts = built.router.compute_final_visible_tools(
+            &core_tools,
+            &[],
+            &[
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+            ],
+        );
+        assert!(
+            phase03_expanded_artifacts
+                .visible_tools
+                .contains(&"artifact_prepare".to_owned())
+        );
+        assert!(
+            phase03_expanded_artifacts
+                .visible_tools
+                .contains(&"artifact_register".to_owned())
+        );
+        assert!(
+            phase03_expanded_artifacts
+                .visible_tools
+                .contains(&"request_tools".to_owned())
+        );
+        assert_no_discovery_tools(&phase03_expanded_artifacts.visible_tools);
+    }
+
+    #[tokio::test]
+    async fn token_schema_guard_core_only_request_excludes_heavy_lazy_domain_schemas() {
+        let heavy_specs = all_lazy_domain_tool_names()
+            .into_iter()
+            .map(heavy_hidden_domain_tool)
+            .collect::<Vec<_>>();
+        let built = build_tools_with_extension_specs(heavy_specs);
+        let core_tools = built.router.preflight_tool_index().core_tools;
+        let visibility = built
+            .router
+            .compute_final_visible_tools(&core_tools, &[], &[]);
+        built
+            .router
+            .set_model_visible_tools(&visibility.visible_tools)
+            .await;
+        let specs = built.router.model_visible_specs().await;
+        let names = specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"request_tools"));
+        for name in all_lazy_domain_tool_names() {
+            assert!(
+                !names.contains(&name),
+                "ordinary core-only turns must not include hidden `{name}` schema"
+            );
+        }
+
+        let bytes = serialized_tool_schema_bytes(&specs);
+        const CORE_ONLY_TOOL_SCHEMA_BYTES_LIMIT: usize = 45_000;
+        assert!(
+            bytes <= CORE_ONLY_TOOL_SCHEMA_BYTES_LIMIT,
+            "core-only provider tool schemas are {bytes} bytes; limit {CORE_ONLY_TOOL_SCHEMA_BYTES_LIMIT} leaves margin for core tools while catching accidental all-domain schema leakage"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_schema_guard_selected_phase03_and_dynamic_schemas_are_explicit() {
+        let mut heavy_specs = all_lazy_domain_tool_names()
+            .into_iter()
+            .map(heavy_hidden_domain_tool)
+            .collect::<Vec<_>>();
+        heavy_specs.push(heavy_hidden_domain_tool("skill.report_builder"));
+        heavy_specs.push(heavy_hidden_domain_tool("mcp.filesystem.read"));
+        let built = build_tools_with_extension_specs(heavy_specs);
+        let core_tools = built.router.preflight_tool_index().core_tools;
+
+        let core_visibility = built
+            .router
+            .compute_final_visible_tools(&core_tools, &[], &[]);
+        built
+            .router
+            .set_model_visible_tools(&core_visibility.visible_tools)
+            .await;
+        let core_specs = built.router.model_visible_specs().await;
+        let core_bytes = serialized_tool_schema_bytes(&core_specs);
+        let core_names = core_specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(core_names.contains(&"skill.report_builder"));
+        assert!(core_names.contains(&"mcp.filesystem.read"));
+        assert!(!core_names.contains(&"artifact_prepare"));
+
+        let selected_artifact = built.router.compute_final_visible_tools(
+            &core_tools,
+            &[
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+            ],
+            &[],
+        );
+        built
+            .router
+            .set_model_visible_tools(&selected_artifact.visible_tools)
+            .await;
+        let selected_specs = built.router.model_visible_specs().await;
+        let selected_names = selected_specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(selected_names.contains(&"artifact_prepare"));
+        assert!(selected_names.contains(&"artifact_register"));
+        assert!(serialized_tool_schema_bytes(&selected_specs) > core_bytes);
+
+        let phase03_expanded = built.router.compute_final_visible_tools(
+            &core_tools,
+            &[],
+            &["task_create".to_owned(), "task_wait".to_owned()],
+        );
+        built
+            .router
+            .set_model_visible_tools(&phase03_expanded.visible_tools)
+            .await;
+        let phase03_names = built
+            .router
+            .model_visible_specs()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(phase03_names.contains(&"task_create".to_owned()));
+        assert!(phase03_names.contains(&"task_wait".to_owned()));
+        assert!(!phase03_names.contains(&"task_cancel".to_owned()));
     }
 
     #[test]

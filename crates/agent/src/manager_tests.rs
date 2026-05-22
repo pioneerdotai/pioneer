@@ -5408,7 +5408,7 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
 }
 
 #[tokio::test]
-async fn preflight_memory_provider_owned_active_recall_contributes_prompt_context() {
+async fn memory_identity_flow_preflight_provider_owned_active_recall_contributes_prompt_context() {
     let preflight_response = json!({
         "tools": {
             "visibleTools": ["memory_search", "memory_get"]
@@ -5487,6 +5487,29 @@ async fn preflight_memory_provider_owned_active_recall_contributes_prompt_contex
     let requests = provider.snapshot_all_requests();
     assert_eq!(requests.len(), 2);
     assert!(is_turn_preflight_request(&requests[0]));
+    assert!(requests[0].compiled_prompt.is_none());
+    assert!(requests[0].tools.is_none());
+    assert!(requests[1].compiled_prompt.is_some());
+    let tool_names = requests[1]
+        .tools
+        .as_ref()
+        .expect("main identity request should include final visible tools")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for core_tool in pioneer_tools::PREFLIGHT_CORE_TOOL_NAMES {
+        assert!(
+            tool_names.contains(core_tool),
+            "core tool `{core_tool}` should stay visible in identity flow"
+        );
+    }
+    assert!(tool_names.contains(&"memory_search"));
+    assert!(tool_names.contains(&"memory_get"));
+    assert!(!tool_names.contains(&"memory_list"));
+    assert!(!tool_names.contains(&"memory_remember"));
+    assert!(!tool_names.contains(&"memory_forget"));
+    assert!(!tool_names.contains(&"task_create"));
+    assert!(!tool_names.contains(&"artifact_prepare"));
     let prompt = requests[1]
         .compiled_prompt
         .as_ref()

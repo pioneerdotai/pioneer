@@ -305,3 +305,47 @@ impl PioneerDesktop {
         .detach();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    fn production_lifecycle_source() -> &'static str {
+        include_str!("lifecycle.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source segment exists")
+    }
+
+    #[test]
+    fn settings_preflight_model_update_writes_general_settings_only() {
+        let source = production_lifecycle_source();
+        let preflight_fn = source
+            .split("pub(super) fn apply_preflight_model_setting")
+            .nth(1)
+            .expect("preflight setting function exists")
+            .split("pub(in crate::app) fn refresh_gateway_settings")
+            .next()
+            .expect("preflight setting function body exists");
+
+        assert!(preflight_fn.contains("snapshot.general.preflight_model"));
+        assert!(preflight_fn.contains("general: Some(GatewayGeneralSettingsUpdate"));
+        assert!(preflight_fn.contains("preflight_model: Some(model_selection)"));
+        assert!(preflight_fn.contains("memory: None"));
+    }
+
+    #[test]
+    fn settings_memory_model_update_keeps_only_proactive_write_model_owned_by_memory() {
+        let source = production_lifecycle_source();
+        let memory_model_fn = source
+            .split("pub(super) fn apply_memory_model_setting")
+            .nth(1)
+            .expect("memory model setting function exists")
+            .split("pub(super) fn apply_preflight_model_setting")
+            .next()
+            .expect("memory model setting function body exists");
+
+        assert!(memory_model_fn.contains("MemoryModelSetting::PostTurnExtractor"));
+        assert!(memory_model_fn.contains("memory.proactive_writes_model"));
+        assert!(!memory_model_fn.contains("preflight_model"));
+        assert!(!memory_model_fn.contains("ActiveRecall"));
+    }
+}

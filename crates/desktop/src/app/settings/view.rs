@@ -827,3 +827,69 @@ impl PioneerDesktop {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    fn production_view_source() -> &'static str {
+        include_str!("view.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source segment exists")
+    }
+
+    #[test]
+    fn settings_general_view_owns_preflight_model_selector() {
+        let source = production_view_source();
+        let general_view = source
+            .split("fn render_settings_general")
+            .nth(1)
+            .expect("general renderer exists")
+            .split("fn render_settings_memory")
+            .next()
+            .expect("general renderer body exists");
+
+        assert!(general_view.contains("render_preflight_model_setting"));
+        assert!(general_view.contains("settings.general.preflight_model"));
+        assert!(source.contains("\"settings-preflight-model\""));
+    }
+
+    #[test]
+    fn settings_memory_view_keeps_memory_toggles_without_legacy_planner_model_selector() {
+        let source = production_view_source();
+        let memory_view = source
+            .split("fn render_memory_settings")
+            .nth(1)
+            .expect("memory renderer exists")
+            .split("fn render_gateway_settings_status")
+            .next()
+            .expect("memory renderer body exists");
+
+        assert!(memory_view.contains("\"settings-memory-active-recall\""));
+        assert!(memory_view.contains("settings.memory.active_recall"));
+        assert!(memory_view.contains("\"settings-memory-post-turn-extractor-model\""));
+        assert!(memory_view.contains("MemoryModelSetting::PostTurnExtractor"));
+        assert!(!memory_view.contains("render_preflight_model_setting"));
+        assert!(!memory_view.contains("settings.general.preflight_model"));
+        assert!(!memory_view.contains("settings.memory.active_recall_model"));
+        assert!(!memory_view.contains("settings-memory-active-recall-model"));
+    }
+
+    #[test]
+    fn settings_locale_keys_cover_preflight_and_memory_model_rows() {
+        let en = include_str!("../../../locales/en.toml");
+        let ru = include_str!("../../../locales/ru.toml");
+
+        for source in [en, ru] {
+            for key in [
+                "[settings.general.preflight_model]",
+                "select_model",
+                "dialog_title",
+                "[settings.memory.active_recall]",
+                "[settings.memory.proactive_writes_model]",
+            ] {
+                assert!(source.contains(key), "missing locale key `{key}`");
+            }
+            assert!(!source.contains("[settings.memory.active_recall_model]"));
+        }
+    }
+}

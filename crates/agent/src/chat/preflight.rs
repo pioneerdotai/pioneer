@@ -2037,6 +2037,15 @@ mod tests {
         sample_input().memory.deterministic_summary
     }
 
+    fn sample_sufficient_deterministic_summary() -> DeterministicRecallContextSummary {
+        let mut summary = sample_deterministic_summary();
+        summary.context_count = 1;
+        summary.context_chars = 128;
+        summary.memory_ids.insert("memory_identity_name".to_owned());
+        summary.sufficient = true;
+        summary
+    }
+
     fn sample_tool_index() -> PreflightToolIndex {
         PreflightToolIndex {
             core_tools: vec!["exec_command".to_owned(), "request_tools".to_owned()],
@@ -2076,6 +2085,14 @@ mod tests {
     ) -> MemoryActiveRecallLocalPlan {
         let mut config = MemoryActiveRecallConfig::default();
         config.planner.fallback = fallback_policy;
+        sample_memory_local_plan_from_memory_config(config, sample_deterministic_summary(), true)
+    }
+
+    fn sample_memory_local_plan_from_memory_config(
+        config: MemoryActiveRecallConfig,
+        deterministic: DeterministicRecallContextSummary,
+        provider_available: bool,
+    ) -> MemoryActiveRecallLocalPlan {
         build_active_recall_local_preflight_plan(
             &MemoryTurnContext {
                 workspace_id: "ws_1".to_owned(),
@@ -2093,9 +2110,9 @@ mod tests {
             ),
             &MemoryTurnPolicy::normal_default_allow(),
             &config,
-            &sample_deterministic_summary(),
+            &deterministic,
             MemoryEpisodicRecallCapabilities::default(),
-            true,
+            provider_available,
         )
     }
 
@@ -2360,6 +2377,80 @@ mod tests {
                 "durable".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn memory_identity_flow_local_final_active_recall_variants_omit_provider_owned_input() {
+        let deterministic_sufficient = sample_memory_local_plan_from_memory_config(
+            MemoryActiveRecallConfig::default(),
+            sample_sufficient_deterministic_summary(),
+            true,
+        );
+        let deterministic_only = sample_memory_local_plan_from_memory_config(
+            MemoryActiveRecallConfig {
+                mode: MemoryActiveRecallMode::DeterministicOnly,
+                ..MemoryActiveRecallConfig::default()
+            },
+            sample_deterministic_summary(),
+            true,
+        );
+        let high_confidence_local_run = sample_memory_local_plan(
+            false,
+            ActiveRecallPlan {
+                status: ActiveMemoryDecisionStatus::Run,
+                reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
+                confidence: 0.70,
+                modes: vec![ActiveRecallMode::Profile],
+                targets: Vec::new(),
+                debug_fallback: false,
+                provider_used: false,
+                provider_fallback_used: false,
+                provider_input_chars: None,
+                provider_output_chars: None,
+                diagnostics: vec!["memory.active_recall.local_candidate".to_owned()],
+            },
+        );
+
+        for (label, local_plan, reason_code, status) in [
+            (
+                "deterministic_sufficient",
+                deterministic_sufficient,
+                ActiveMemoryDecisionReasonCode::DeterministicSufficient,
+                ActiveMemoryDecisionStatus::Skip,
+            ),
+            (
+                "deterministic_only",
+                deterministic_only,
+                ActiveMemoryDecisionReasonCode::DeterministicOnly,
+                ActiveMemoryDecisionStatus::Skip,
+            ),
+            (
+                "high_confidence_local_run",
+                high_confidence_local_run,
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                ActiveMemoryDecisionStatus::Run,
+            ),
+        ] {
+            let modules = build_local_preflight_module_plans(
+                sample_tool_index(),
+                sample_deterministic_summary(),
+                local_plan,
+            );
+            let provider_input = modules.provider_input(sample_turn_input());
+
+            assert!(!modules.active_recall_provider_planning_needed(), "{label}");
+            assert!(provider_input.memory.active_recall.is_none(), "{label}");
+            let host_local = modules
+                .host_local_active_recall_plan()
+                .expect("local-final active recall should remain available for final plan");
+            assert_eq!(
+                host_local.source,
+                TurnPreflightPlanSource::HostLocal,
+                "{label}"
+            );
+            assert_eq!(host_local.decision.reason_code, reason_code, "{label}");
+            assert_eq!(host_local.decision.status, status, "{label}");
+        }
     }
 
     #[test]
@@ -3309,6 +3400,46 @@ mod tests {
             plan.memory.active_recall.decision.provider_output_chars,
             Some(240)
         );
+        assert!(
+            plan.memory
+                .active_recall
+                .decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
+        );
+    }
+
+    #[test]
+    fn memory_identity_flow_provider_final_failure_keeps_tools_core_only_and_memory_fallback() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(
+            plan.tools.visible_tools.is_empty(),
+            "tools module fallback must not reveal hidden lazy-domain builtin tools"
+        );
+        assert_eq!(
+            modules.tools.input.core_tools,
+            vec!["exec_command".to_owned(), "request_tools".to_owned()]
+        );
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Fallback
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.status,
+            ActiveMemoryDecisionStatus::Run
+        );
+        assert!(plan.memory.active_recall.decision.provider_fallback_used);
         assert!(
             plan.memory
                 .active_recall

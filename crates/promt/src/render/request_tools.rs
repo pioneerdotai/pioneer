@@ -98,6 +98,22 @@ mod tests {
     }
 
     #[test]
+    fn request_tools_hidden_domain_catalog_token_guard_stays_compact() {
+        let catalog = render_request_tools_hidden_domain_catalog_prompt();
+        const HIDDEN_DOMAIN_CATALOG_CHAR_LIMIT: usize = 1_200;
+
+        assert!(
+            catalog.chars().count() <= HIDDEN_DOMAIN_CATALOG_CHAR_LIMIT,
+            "request_tools catalog should list domain tool names only; full schemas belong in provider tool definitions after explicit visibility expansion"
+        );
+        assert!(catalog.contains("request_tools"));
+        assert!(catalog.contains("memory_search"));
+        assert!(catalog.contains("task_create"));
+        assert!(catalog.contains("artifact_prepare"));
+        assert!(catalog.contains("computer_use"));
+    }
+
+    #[test]
     fn request_tools_hidden_domain_catalog_section_has_stable_identity() {
         let section = request_tools_hidden_domain_catalog_section();
 
