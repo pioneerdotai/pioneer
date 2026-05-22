@@ -292,6 +292,20 @@ pub fn active_recall_preflight_provider_fallback(
     )
 }
 
+pub fn active_recall_preflight_provider_success(
+    mut decision: ActiveMemoryDecision,
+    provider_input_chars: Option<usize>,
+    provider_output_chars: Option<usize>,
+) -> ActiveMemoryDecision {
+    decision.provider_used = true;
+    decision.provider_input_chars = provider_input_chars;
+    decision.provider_output_chars = provider_output_chars;
+    decision
+        .diagnostics
+        .insert(0, "memory.active_recall.provider_called".to_owned());
+    normalize_active_recall_plan(decision)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ActiveRecallLocalPlanningParts {
     planner_input: ActiveRecallPlannerInput,
@@ -556,6 +570,31 @@ mod active_recall_local_preflight_tests {
     }
 
     #[test]
+    fn active_recall_local_preflight_marks_config_disabled_as_host_local_final() {
+        let config = MemoryActiveRecallConfig {
+            mode: MemoryActiveRecallMode::Disabled,
+            ..MemoryActiveRecallConfig::default()
+        };
+
+        let plan = build_active_recall_local_preflight_plan(
+            &test_context(None),
+            &test_input(),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &config,
+            &empty_deterministic(),
+            MemoryEpisodicRecallCapabilities::default(),
+            true,
+        );
+
+        assert!(!plan.provider_planning_needed);
+        assert_eq!(
+            plan.local_decision.reason_code,
+            ActiveMemoryDecisionReasonCode::ConfigDisabled
+        );
+        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
+    }
+
+    #[test]
     fn active_recall_local_preflight_marks_deterministic_sufficient_as_host_local_final() {
         let plan = build_active_recall_local_preflight_plan(
             &test_context(None),
@@ -578,6 +617,31 @@ mod active_recall_local_preflight_tests {
             vec!["memory_1".to_owned()]
         );
         assert!(plan.decision_request.deterministic_sufficient);
+    }
+
+    #[test]
+    fn active_recall_local_preflight_marks_deterministic_only_as_host_local_final() {
+        let config = MemoryActiveRecallConfig {
+            mode: MemoryActiveRecallMode::DeterministicOnly,
+            ..MemoryActiveRecallConfig::default()
+        };
+
+        let plan = build_active_recall_local_preflight_plan(
+            &test_context(None),
+            &test_input(),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &config,
+            &empty_deterministic(),
+            MemoryEpisodicRecallCapabilities::default(),
+            true,
+        );
+
+        assert!(!plan.provider_planning_needed);
+        assert_eq!(
+            plan.local_decision.reason_code,
+            ActiveMemoryDecisionReasonCode::DeterministicOnly
+        );
+        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
     }
 
     #[test]
@@ -604,6 +668,27 @@ mod active_recall_local_preflight_tests {
         );
         assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Run);
         assert!(plan.local_decision.debug_fallback);
+    }
+
+    #[test]
+    fn active_recall_local_preflight_marks_high_confidence_run_as_host_local_final() {
+        let plan = ActiveRecallPlan::run(
+            ActiveMemoryDecisionReasonCode::MemoryLikely,
+            0.70,
+            vec![ActiveRecallMode::Profile],
+            Vec::new(),
+            vec!["memory.active_recall.local_candidate".to_owned()],
+        );
+        assert!(active_recall_local_plan_is_final(&plan));
+
+        let plan = ActiveRecallPlan::run(
+            ActiveMemoryDecisionReasonCode::MemoryLikely,
+            0.69,
+            vec![ActiveRecallMode::Profile],
+            Vec::new(),
+            vec!["memory.active_recall.local_candidate".to_owned()],
+        );
+        assert!(!active_recall_local_plan_is_final(&plan));
     }
 
     #[test]
@@ -641,6 +726,38 @@ mod active_recall_local_preflight_tests {
         assert_eq!(
             plan.decision_request.available_scoped_contexts,
             vec!["workspace".to_owned(), "thread".to_owned()]
+        );
+    }
+
+    #[test]
+    fn active_recall_preflight_provider_success_preserves_provider_metadata() {
+        let parsed = parse_active_memory_decision_json(
+            r#"{
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.82,
+                "modes": ["profile"],
+                "targets": [],
+                "diagnostics": ["memory.active_recall.identity_lookup"]
+            }"#,
+        )
+        .expect("provider active recall parses through memory contract");
+
+        let decision = active_recall_preflight_provider_success(parsed, Some(123), Some(45));
+
+        assert!(decision.provider_used);
+        assert!(!decision.provider_fallback_used);
+        assert_eq!(decision.provider_input_chars, Some(123));
+        assert_eq!(decision.provider_output_chars, Some(45));
+        assert_eq!(
+            decision.diagnostics[0],
+            "memory.active_recall.provider_called"
+        );
+        assert!(
+            decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "memory.active_recall.identity_lookup")
         );
     }
 

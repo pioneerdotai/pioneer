@@ -5,7 +5,8 @@ use pioneer_memory::hooks::{
     MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
     MemoryActiveRecallLocalPlan, MemoryActiveRecallProviderFallbackContext,
     active_recall_planned_query_count, active_recall_preflight_provider_fallback,
-    normalize_active_recall_plan, parse_active_memory_decision_json,
+    active_recall_preflight_provider_success, normalize_active_recall_plan,
+    parse_active_memory_decision_json,
 };
 use pioneer_promt::{
     TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
@@ -1251,11 +1252,18 @@ fn compose_successful_memory_active_recall_plan(
             };
 
             match parse_provider_memory_active_recall_plan(provider_active_recall) {
-                Ok(decision) => wrap_memory_active_recall_plan(
-                    TurnPreflightPlanSource::Provider,
-                    None,
-                    decision,
-                ),
+                Ok(decision) => {
+                    let decision = active_recall_preflight_provider_success(
+                        decision,
+                        Some(provider_call.input_chars),
+                        Some(provider_call.output_chars),
+                    );
+                    wrap_memory_active_recall_plan(
+                        TurnPreflightPlanSource::Provider,
+                        None,
+                        decision,
+                    )
+                }
                 Err(_) => {
                     push_module_diagnostic(
                         module_diagnostics,
@@ -2894,7 +2902,48 @@ mod tests {
             plan.memory.active_recall.decision.reason_code,
             ActiveMemoryDecisionReasonCode::MemoryLikely
         );
+        assert!(plan.memory.active_recall.decision.provider_used);
         assert!(!plan.memory.active_recall.decision.provider_fallback_used);
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_input_chars,
+            Some(1_200)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_output_chars,
+            Some(240)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.diagnostics[0],
+            "memory.active_recall.provider_called"
+        );
+    }
+
+    #[test]
+    fn preflight_memory_fallback_provider_success_preserves_memory_provider_metadata() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(&modules, sample_provider_success(1));
+
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Provider
+        );
+        assert!(plan.memory.active_recall.decision.provider_used);
+        assert!(!plan.memory.active_recall.decision.provider_fallback_used);
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_input_chars,
+            Some(1_200)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_output_chars,
+            Some(240)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.diagnostics,
+            vec![
+                "memory.active_recall.provider_called".to_owned(),
+                "memory.active_recall.identity_lookup".to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -3020,7 +3069,10 @@ mod tests {
         assert_eq!(snapshot.memory.active_recall.target_count, 1);
         assert_eq!(
             snapshot.memory.active_recall.diagnostics,
-            vec!["memory.active_recall.identity_lookup".to_owned()]
+            vec![
+                "memory.active_recall.provider_called".to_owned(),
+                "memory.active_recall.identity_lookup".to_owned()
+            ]
         );
         assert!(!snapshot.modules["tools"].fallback);
         assert!(!snapshot.modules["memory.activeRecall"].fallback);
@@ -3219,6 +3271,55 @@ mod tests {
     }
 
     #[test]
+    fn preflight_memory_fallback_final_failure_uses_memory_owned_deterministic_plan() {
+        let modules = sample_provider_needed_modules();
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::InvalidJson),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert!(plan.tools.visible_tools.is_empty());
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Fallback
+        );
+        assert_eq!(
+            plan.memory.active_recall.fallback_reason,
+            Some(TurnPreflightFallbackReason::InvalidJson)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.status,
+            ActiveMemoryDecisionStatus::Run
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::MemoryLikely
+        );
+        assert!(plan.memory.active_recall.decision.provider_fallback_used);
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_input_chars,
+            Some(1_200)
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.provider_output_chars,
+            Some(240)
+        );
+        assert!(
+            plan.memory
+                .active_recall
+                .decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
+        );
+    }
+
+    #[test]
     fn preflight_compose_final_failure_honors_memory_skip_fallback_policy() {
         let modules = build_local_preflight_module_plans(
             sample_tool_index(),
@@ -3235,6 +3336,46 @@ mod tests {
 
         assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
         assert!(plan.tools.visible_tools.is_empty());
+        assert_eq!(
+            plan.memory.active_recall.decision.status,
+            ActiveMemoryDecisionStatus::Skip
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.reason_code,
+            ActiveMemoryDecisionReasonCode::ProviderSkip
+        );
+        assert!(plan.memory.active_recall.decision.provider_fallback_used);
+        assert!(
+            plan.memory
+                .active_recall
+                .decision
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "planner_fallback_skip")
+        );
+    }
+
+    #[test]
+    fn preflight_memory_fallback_final_failure_honors_memory_skip_policy() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan_from_memory(
+                MemoryActiveRecallPlannerFallbackPolicy::SkipActiveRecall,
+            ),
+        );
+
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            sample_provider_failure(TurnPreflightFallbackReason::ProviderError),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert!(plan.tools.visible_tools.is_empty());
+        assert_eq!(
+            plan.memory.active_recall.source,
+            TurnPreflightPlanSource::Fallback
+        );
         assert_eq!(
             plan.memory.active_recall.decision.status,
             ActiveMemoryDecisionStatus::Skip

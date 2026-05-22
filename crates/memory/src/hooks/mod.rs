@@ -89,7 +89,8 @@ use recall::*;
 pub use recall::{
     DeterministicRecallContextSummary, MemoryActiveRecallLocalPlan,
     MemoryActiveRecallProviderFallbackContext, active_recall_preflight_provider_fallback,
-    build_active_recall_local_preflight_plan, deterministic_recall_context_summary,
+    active_recall_preflight_provider_success, build_active_recall_local_preflight_plan,
+    deterministic_recall_context_summary,
 };
 use state::*;
 use synthesis::*;
