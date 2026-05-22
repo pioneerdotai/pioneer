@@ -4056,7 +4056,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_visible_tools_core_only_hides_materialized_domain_tools() {
+    fn tool_visibility_core_only_hides_materialized_domain_tools() {
         let built = build_tools_with_extension_names(&[
             "memory_search",
             "memory_get",
@@ -4088,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_visible_tools_adds_requested_optional_tools_only_when_registered() {
+    fn tool_visibility_adds_requested_optional_tools_only_when_registered() {
         let built = build_tools_with_extension_names(&["memory_search", "memory_get"]);
 
         let visibility = built.router.compute_final_visible_tools(
@@ -4118,7 +4118,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_visible_tools_preserves_phase03_current_turn_expansion() {
+    fn tool_visibility_preserves_phase03_current_turn_expansion() {
         let built = build_tools_with_extension_names(&[
             "artifact_prepare",
             "artifact_register",
@@ -4147,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_visible_tools_hidden_task_turn_requires_preflight_or_current_state() {
+    fn tool_visibility_hidden_task_turn_requires_preflight_or_current_state() {
         let task_tools = BuiltinToolDomain::Task.tool_names();
         let built = build_tools_with_extension_names(task_tools);
 

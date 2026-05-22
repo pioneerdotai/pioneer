@@ -226,9 +226,10 @@ pub struct ToolVisibilitySnapshot {
 
 impl ToolVisibilitySnapshot {
     pub fn new(all_specs: Vec<ToolSpec>) -> Self {
+        let visible_specs = default_visible_specs(&all_specs);
         Self {
-            all_specs: Arc::new(all_specs.clone()),
-            visible_specs: Arc::new(RwLock::new(all_specs)),
+            all_specs: Arc::new(all_specs),
+            visible_specs: Arc::new(RwLock::new(visible_specs)),
         }
     }
 
@@ -264,6 +265,28 @@ impl ToolVisibilitySnapshot {
     }
 }
 
+fn default_visible_specs(all_specs: &[ToolSpec]) -> Vec<ToolSpec> {
+    let all_tool_names = all_specs
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect::<Vec<_>>();
+    let default_visible_names = PREFLIGHT_CORE_TOOL_NAMES
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .chain(materialized_dynamic_extension_tool_names(
+            all_tool_names,
+            PREFLIGHT_CORE_TOOL_NAMES.iter().copied().map(str::to_owned),
+        ))
+        .collect::<HashSet<_>>();
+
+    all_specs
+        .iter()
+        .filter(|spec| default_visible_names.contains(spec.name.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +310,44 @@ mod tests {
         assert!(snapshot.contains_name("tool_a").await);
         assert!(!snapshot.contains_name("tool_b").await);
         assert!(!snapshot.contains_name("unknown_tool").await);
+    }
+
+    #[tokio::test]
+    async fn visibility_snapshot_defaults_to_core_plus_dynamic_extensions() {
+        let snapshot = ToolVisibilitySnapshot::new(vec![
+            spec("exec_command"),
+            spec("request_tools"),
+            spec("memory_search"),
+            spec("task_create"),
+            spec("artifact_prepare"),
+            spec("computer_use"),
+            spec("skill.weather"),
+            spec("mcp.browser.open"),
+        ]);
+
+        let visible = snapshot
+            .get()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            vec![
+                "exec_command".to_owned(),
+                "request_tools".to_owned(),
+                "skill.weather".to_owned(),
+                "mcp.browser.open".to_owned()
+            ]
+        );
+        assert!(snapshot.contains_name("request_tools").await);
+        assert!(snapshot.contains_name("skill.weather").await);
+        assert!(!snapshot.contains_name("memory_search").await);
+        assert!(!snapshot.contains_name("task_create").await);
+        assert!(!snapshot.contains_name("artifact_prepare").await);
+        assert!(!snapshot.contains_name("computer_use").await);
+        assert_eq!(snapshot.all_specs().len(), 8);
     }
 
     fn visibility_input() -> FinalToolVisibilityInput {

@@ -187,6 +187,9 @@ mod tests {
     #[tokio::test]
     async fn request_tools_result_reports_added_visible_and_unavailable_tools() {
         let visibility = visibility(&["request_tools", "artifact_prepare"]);
+        visibility
+            .set_visible_by_name(&["request_tools".to_owned(), "artifact_prepare".to_owned()])
+            .await;
         let handler = RequestToolsHandler::new(
             visibility,
             [
@@ -252,6 +255,13 @@ mod tests {
     #[tokio::test]
     async fn request_tools_result_reports_repeated_visible_domain_as_already_visible() {
         let visibility = visibility(&["request_tools", "artifact_prepare", "artifact_register"]);
+        visibility
+            .set_visible_by_name(&[
+                "request_tools".to_owned(),
+                "artifact_prepare".to_owned(),
+                "artifact_register".to_owned(),
+            ])
+            .await;
         let handler = RequestToolsHandler::new(
             visibility,
             [
