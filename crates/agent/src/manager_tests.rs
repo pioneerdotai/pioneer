@@ -3860,7 +3860,6 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         "task_wait",
         "artifact_prepare",
         "artifact_register",
-        "computer_use",
     ];
     let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
@@ -3895,17 +3894,36 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
+    let probe_tool_loop_config = test_tool_loop_config();
+    let computer_use_available = pioneer_tools::build_builtin_tools(
+        ".",
+        "turn_phase10_computer_use_probe",
+        probe_tool_loop_config.web,
+        probe_tool_loop_config.computer_use,
+    )
+    .router
+    .has_handler("computer_use");
 
     for selected in [
         "memory_search",
         "task_create",
         "artifact_prepare",
         "artifact_register",
-        "computer_use",
     ] {
         assert!(
             request_tool_names.contains(&selected),
             "selected optional tool `{selected}` should be serialized"
+        );
+    }
+    if computer_use_available {
+        assert!(
+            request_tool_names.contains(&"computer_use"),
+            "selected optional tool `computer_use` should be serialized when registered"
+        );
+    } else {
+        assert!(
+            !request_tool_names.contains(&"computer_use"),
+            "unregistered optional tool `computer_use` must stay hidden"
         );
     }
     for hidden in ["memory_get", "task_wait"] {

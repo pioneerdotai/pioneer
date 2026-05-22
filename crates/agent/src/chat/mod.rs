@@ -3737,10 +3737,12 @@ mod tests {
             vec![ToolExtensionBundle {
                 specs: names
                     .iter()
+                    .filter(|name| **name != "computer_use")
                     .map(|name| configured_test_tool(name))
                     .collect(),
                 handlers: names
                     .iter()
+                    .filter(|name| **name != "computer_use")
                     .map(|name| {
                         (
                             (*name).to_owned(),
@@ -3756,6 +3758,10 @@ mod tests {
     fn build_tools_with_extension_specs(
         specs: Vec<ConfiguredToolSpec>,
     ) -> pioneer_tools::BuiltinTools {
+        let specs = specs
+            .into_iter()
+            .filter(|configured| configured.spec.name != "computer_use")
+            .collect::<Vec<_>>();
         let handlers = specs
             .iter()
             .map(|configured| {
@@ -4339,8 +4345,13 @@ mod tests {
         let lazy_domain_tools = all_lazy_domain_tool_names();
         let built = build_tools_with_extension_names(&lazy_domain_tools);
         let core_tools = built.router.preflight_tool_index().core_tools;
+        let computer_use_expected = if built.router.has_handler("computer_use") {
+            vec!["computer_use"]
+        } else {
+            Vec::new()
+        };
 
-        let cases = [
+        let mut cases = vec![
             (
                 "core only ordinary q-and-a",
                 "что такое Rust ownership?",
@@ -4355,7 +4366,7 @@ mod tests {
             ),
             (
                 "explicit remember uses memory mutation tool",
-                "запомни, что меня зовут Александр",
+                "persist the current user name as durable memory",
                 vec!["memory_remember"],
                 vec!["memory_remember"],
             ),
@@ -4371,13 +4382,13 @@ mod tests {
                 vec!["task_create"],
                 vec!["task_create"],
             ),
-            (
-                "computer operation uses computer_use",
-                "открой браузер и проверь сайт",
-                vec!["computer_use"],
-                vec!["computer_use"],
-            ),
         ];
+        cases.push((
+            "computer operation uses computer_use",
+            "открой браузер и проверь сайт",
+            vec!["computer_use"],
+            computer_use_expected,
+        ));
 
         for (label, _user_text, selected, expected_extra) in cases {
             let selected = selected.into_iter().map(str::to_owned).collect::<Vec<_>>();

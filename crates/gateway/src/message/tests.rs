@@ -541,7 +541,7 @@ impl Provider for GuardAwareProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
+            return Ok(test_task_turn_preflight_response());
         }
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
@@ -649,7 +649,7 @@ impl Provider for CreateThenHangProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
+            return Ok(test_task_turn_preflight_response());
         }
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
@@ -1201,7 +1201,45 @@ fn text_response(text: impl Into<String>) -> ChatResponse {
 }
 
 fn test_turn_preflight_response() -> ChatResponse {
-    text_response(r#"{"tools":{"visibleTools":[]}}"#)
+    test_turn_preflight_response_with_visible_tools(&[])
+}
+
+fn test_task_turn_preflight_response() -> ChatResponse {
+    test_turn_preflight_response_with_visible_tools(&[
+        "task_create",
+        "task_wait",
+        "task_cancel",
+        "task_update",
+        "task_detach",
+        "task_list",
+        "task_get",
+        "task_reschedule",
+        "task_pause",
+        "task_resume",
+    ])
+}
+
+fn test_turn_preflight_response_with_visible_tools(tool_names: &[&str]) -> ChatResponse {
+    text_response(json!({ "tools": { "visibleTools": tool_names } }).to_string())
+}
+
+fn sequenced_tool_provider_preflight_response(
+    request: &ChatRequest,
+    first_tool_calls: &[ProviderToolCall],
+) -> ChatResponse {
+    let task_needed = first_tool_calls
+        .iter()
+        .any(|tool_call| tool_call.name.starts_with("task_"))
+        || request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("delegate a task"));
+
+    if task_needed {
+        test_task_turn_preflight_response()
+    } else {
+        test_turn_preflight_response()
+    }
 }
 
 fn is_turn_preflight_request(request: &ChatRequest) -> bool {
@@ -1270,6 +1308,13 @@ impl Provider for SequencedToolProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(sequenced_tool_provider_preflight_response(
+                &request,
+                &self.first_tool_calls,
+            ));
+        }
+
         self.requests
             .lock()
             .expect("sequenced tool provider lock poisoned")

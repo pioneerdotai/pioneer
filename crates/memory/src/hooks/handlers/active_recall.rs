@@ -52,15 +52,24 @@ impl HookHandler for ActiveMemoryRecallHook {
         let mut response = HookHandlerResponse::default();
         let decision = match &input.active_memory_recall_plan {
             Some(plan) => match serde_json::from_value::<ActiveRecallPlan>(plan.clone()) {
-                Ok(plan) => active_memory_decision_from_preflight_plan(
-                    &context,
-                    &prompt_input,
-                    &policy,
-                    &config,
-                    &deterministic,
-                    episodic_capabilities.clone(),
-                    plan,
-                ),
+                Ok(plan) => match validate_active_recall_preflight_plan_shape(&plan) {
+                    Ok(()) => active_memory_decision_from_preflight_plan(
+                        &context,
+                        &prompt_input,
+                        &policy,
+                        &config,
+                        &deterministic,
+                        episodic_capabilities.clone(),
+                        plan,
+                    ),
+                    Err(error) => {
+                        response.diagnostics.push(memory_safe_warning_diagnostic(
+                            "memory.active_recall.preflight_plan_invalid",
+                            format!("memory active recall skipped: invalid preflight plan {error}"),
+                        ));
+                        return Ok(response);
+                    }
+                },
                 Err(error) => {
                     response.diagnostics.push(memory_safe_warning_diagnostic(
                         "memory.active_recall.preflight_plan_invalid",
@@ -240,4 +249,19 @@ impl HookHandler for ActiveMemoryRecallHook {
             ));
         Ok(response)
     }
+}
+
+fn validate_active_recall_preflight_plan_shape(
+    plan: &ActiveRecallPlan,
+) -> Result<(), &'static str> {
+    if plan.status == ActiveMemoryDecisionStatus::Run
+        && plan.modes.is_empty()
+        && !plan.debug_fallback
+    {
+        return Err("run plan requires at least one mode");
+    }
+    if plan.status != ActiveMemoryDecisionStatus::Run && !plan.modes.is_empty() {
+        return Err("non-run plan must not include modes");
+    }
+    Ok(())
 }
