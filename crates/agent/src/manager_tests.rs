@@ -317,10 +317,30 @@ impl HookHandler for RecordingHookHandler {
         }
 
         Ok(HookHandlerResponse {
-            contributions: self.contributions.clone(),
+            contributions: recording_contributions_for_phase(request.phase, &self.contributions),
             ..HookHandlerResponse::default()
         })
     }
+}
+
+fn recording_contributions_for_phase(
+    phase: HookPhase,
+    contributions: &[HookContribution],
+) -> Vec<HookContribution> {
+    contributions
+        .iter()
+        .filter(|contribution| match contribution {
+            HookContribution::Policy(_) => phase == HookPhase::TurnPrePolicy,
+            HookContribution::PromptContext(_) => phase == HookPhase::TurnPrePromptContext,
+            HookContribution::ToolBundle(_) => phase == HookPhase::TurnPreToolMaterialization,
+            HookContribution::PromptSection(_) | HookContribution::PromptManifestDiagnostic(_) => {
+                phase == HookPhase::TurnPrePromptCompile
+            }
+            HookContribution::Noop => true,
+            HookContribution::Audit(_) | HookContribution::BackgroundJob(_) => false,
+        })
+        .cloned()
+        .collect()
 }
 
 fn test_hook_capabilities() -> HookCapabilities {
@@ -646,16 +666,6 @@ fn phase_07_ignored_contributions() -> Vec<HookContribution> {
             priority: 10_000,
             diagnostics: Vec::new(),
         }),
-        HookContribution::PromptManifestDiagnostic(PromptManifestDiagnosticContribution {
-            code: HookDiagnosticCode::new("test.phase07_manifest_ignored")
-                .expect("valid diagnostic code"),
-            message: HookDiagnosticMessage::new("HOOK MANIFEST DIAGNOSTIC MUST NOT APPEAR")
-                .expect("valid diagnostic message"),
-            severity: HookDiagnosticSeverity::Warning,
-            safe_for_user: false,
-            hook_id: None,
-            subscription_id: None,
-        }),
         HookContribution::Audit(AuditContribution {
             event_kind: HookAuditEventKind::new("test.phase07_audit_ignored")
                 .expect("valid audit event kind"),
@@ -737,6 +747,47 @@ fn assert_stable_requests_eq(left: &ChatRequest, right: &ChatRequest) {
 
 const TEST_PREFLIGHT_RESPONSE: &str = r#"{"tools":{"visibleTools":[]}}"#;
 
+fn preflight_response_with_visible_tools(tool_names: &[&str]) -> String {
+    json!({
+        "tools": {
+            "visibleTools": tool_names,
+        }
+    })
+    .to_string()
+}
+
+fn memory_read_preflight_response() -> String {
+    preflight_response_with_visible_tools(&["memory_search", "memory_get"])
+}
+
+fn memory_all_preflight_response() -> String {
+    preflight_response_with_visible_tools(&[
+        "memory_search",
+        "memory_list",
+        "memory_get",
+        "memory_remember",
+        "memory_forget",
+    ])
+}
+
+fn memory_remember_preflight_response() -> String {
+    preflight_response_with_visible_tools(&["memory_remember"])
+}
+
+fn memory_forget_preflight_response() -> String {
+    preflight_response_with_visible_tools(&["memory_search", "memory_get", "memory_forget"])
+}
+
+fn optional_domain_preflight_response() -> String {
+    preflight_response_with_visible_tools(&[
+        "memory_search",
+        "task_create",
+        "artifact_prepare",
+        "artifact_register",
+        "computer_use",
+    ])
+}
+
 fn is_turn_preflight_request(request: &ChatRequest) -> bool {
     request.compiled_prompt.is_none()
         && request.tools.is_none()
@@ -786,6 +837,7 @@ struct SequencedToolProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     first_tool_calls: Vec<pioneer_provider::ProviderToolCall>,
     second_text: String,
+    preflight_response_text: String,
     next_index: AtomicUsize,
 }
 
@@ -798,6 +850,21 @@ impl SequencedToolProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
             second_text: second_text.into(),
+            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_preflight_response(
+        first_tool_calls: Vec<pioneer_provider::ProviderToolCall>,
+        second_text: impl Into<String>,
+        preflight_response_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            first_tool_calls,
+            second_text: second_text.into(),
+            preflight_response_text: preflight_response_text.into(),
             next_index: AtomicUsize::new(0),
         }
     }
@@ -832,6 +899,11 @@ impl AlwaysTaskCreateProvider {
 #[derive(Default)]
 struct FailingTaskMutationToolProvider {
     handler: Arc<FailingTaskCreateHandler>,
+}
+
+#[derive(Clone)]
+struct StaticTaskToolProvider {
+    bundle: ToolExtensionBundle,
 }
 
 #[derive(Default)]
@@ -926,6 +998,41 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl TaskToolProvider for StaticTaskToolProvider {
+    async fn materialize_task_tools(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        Ok(TaskToolMaterialization {
+            bundles: vec![self.bundle.clone()],
+            diagnostics: Vec::new(),
+        })
+    }
+
+    async fn pending_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn terminal_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn cleanup_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+        _reason: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LoopBudgetProviderMode {
     ToolWhileAvailableThenFinal,
@@ -940,6 +1047,7 @@ struct LoopBudgetProvider {
     next_index: AtomicUsize,
     mode: LoopBudgetProviderMode,
     tool_calls_per_round: usize,
+    preflight_response_text: String,
 }
 
 impl LoopBudgetProvider {
@@ -949,6 +1057,21 @@ impl LoopBudgetProvider {
             next_index: AtomicUsize::new(0),
             mode,
             tool_calls_per_round,
+            preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
+        }
+    }
+
+    fn with_preflight_response(
+        mode: LoopBudgetProviderMode,
+        tool_calls_per_round: usize,
+        preflight_response_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            next_index: AtomicUsize::new(0),
+            mode,
+            tool_calls_per_round,
+            preflight_response_text: preflight_response_text.into(),
         }
     }
 
@@ -1506,7 +1629,12 @@ impl Provider for SequencedToolProvider {
             .expect("capture provider lock poisoned")
             .push(request);
         if preflight {
-            return Ok(test_preflight_response());
+            return Ok(ChatResponse {
+                text: self.preflight_response_text.clone(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
         }
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -1563,7 +1691,12 @@ impl Provider for LoopBudgetProvider {
             .expect("loop budget provider lock poisoned")
             .push(request);
         if preflight {
-            return Ok(test_preflight_response());
+            return Ok(ChatResponse {
+                text: self.preflight_response_text.clone(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
         }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -2993,7 +3126,9 @@ async fn phase_08_fail_closed_policy_hook_failure_fails_turn() {
 #[tokio::test]
 async fn phase_08_policy_contributions_do_not_change_memory_policy_yet() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -3446,7 +3581,9 @@ async fn phase_09_chat_mode_still_does_not_call_turn_hooks() {
 #[tokio::test]
 async fn phase_09_memory_path_remains_unchanged() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -3661,6 +3798,124 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
         !prompt.full_system_text.contains("Available memory tools:"),
         "hidden memory tools must not render memory prompt contract"
     );
+}
+
+#[tokio::test]
+async fn phase_10_prompt_manifest_and_tool_schemas_exclude_discovery_tools() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_no_discovery_tools",
+        "ws_phase10_no_discovery_tools",
+        "turn_phase10_no_discovery_tools",
+        ThreadMode::Agent,
+        "capture",
+        "ordinary question",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should include provider tools");
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(!tool_names.contains(&"tool_search"));
+    assert!(!tool_names.contains(&"tool_suggest"));
+
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("tool_search"));
+    assert!(!prompt.full_system_text.contains("tool_suggest"));
+
+    let manifest = observed
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .next()
+        .expect("prompt manifest should be emitted");
+    let manifest_json = serde_json::to_string(manifest).expect("manifest should serialize");
+    assert!(!manifest_json.contains("tool_search"));
+    assert!(!manifest_json.contains("tool_suggest"));
+}
+
+#[tokio::test]
+async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized() {
+    let registered_optional_tools = [
+        "memory_search",
+        "memory_get",
+        "task_create",
+        "task_wait",
+        "artifact_prepare",
+        "artifact_register",
+        "computer_use",
+    ];
+    let handler: Arc<dyn ToolHandler> = Arc::new(MemoryFakeHandler);
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        optional_domain_preflight_response(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+            bundle: fake_memory_tool_bundle_for_names(&registered_optional_tools, handler),
+        })))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase10_optional_domain_tools",
+        "ws_phase10_optional_domain_tools",
+        "turn_phase10_optional_domain_tools",
+        ThreadMode::Agent,
+        "capture",
+        "ordinary question",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request_tool_names = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should include provider tools")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    for selected in [
+        "memory_search",
+        "task_create",
+        "artifact_prepare",
+        "artifact_register",
+        "computer_use",
+    ] {
+        assert!(
+            request_tool_names.contains(&selected),
+            "selected optional tool `{selected}` should be serialized"
+        );
+    }
+    for hidden in ["memory_get", "task_wait"] {
+        assert!(
+            !request_tool_names.contains(&hidden),
+            "registered but unselected optional tool `{hidden}` must stay hidden"
+        );
+    }
+    assert!(!request_tool_names.contains(&"tool_search"));
+    assert!(!request_tool_names.contains(&"tool_suggest"));
 }
 
 #[tokio::test]
@@ -4421,7 +4676,9 @@ async fn memory_provider_is_optional_and_agent_turn_completes() {
 
 #[tokio::test]
 async fn memory_provider_recall_error_degrades_gracefully() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -4597,7 +4854,9 @@ async fn chat_mode_does_not_call_memory_provider_by_default() {
 
 #[tokio::test]
 async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_them() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -4656,7 +4915,9 @@ async fn memory_tool_materialization_bundles_are_merged_when_provider_returns_th
 #[tokio::test]
 async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_names() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -4724,7 +4985,9 @@ async fn pre_tool_materialization_hook_receives_local_non_memory_tool_bundle_nam
 #[tokio::test]
 async fn phase_13_memory_tool_bundle_visibility_is_driven_by_hook_policy_set() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     manager
@@ -4850,7 +5113,9 @@ async fn phase_13_without_memory_hook_subscription_exposes_no_memory_tools() {
 
 #[tokio::test]
 async fn identity_recall_prompt_contains_relevant_memory() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -4930,7 +5195,9 @@ async fn identity_recall_prompt_contains_relevant_memory() {
 
 #[tokio::test]
 async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -5033,7 +5300,9 @@ async fn phase_14_memory_recall_and_prompt_contract_are_manifest_observable() {
 
 #[tokio::test]
 async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let mut config = test_tool_loop_config();
     config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
@@ -5142,7 +5411,7 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
 async fn preflight_memory_provider_owned_active_recall_contributes_prompt_context() {
     let preflight_response = json!({
         "tools": {
-            "visibleTools": []
+            "visibleTools": ["memory_search", "memory_get"]
         },
         "memory": {
             "activeRecall": {
@@ -5307,7 +5576,9 @@ async fn preflight_memory_active_recall_disabled_suppresses_provider_plan() {
 
 #[tokio::test]
 async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let mut config = test_tool_loop_config();
     config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
@@ -5527,7 +5798,9 @@ async fn memory_policy_classifier_no_use_disables_recall_without_phrase_matching
 
 #[tokio::test]
 async fn memory_policy_no_save_keeps_read_recall_but_blocks_remember() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -5678,7 +5951,9 @@ async fn phase_12_memory_policy_classifier_contributes_full_hook_policy() {
 
 #[tokio::test]
 async fn memory_policy_invalid_classifier_json_uses_default_allow_fallback() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_all_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -5751,7 +6026,9 @@ async fn memory_policy_invalid_classifier_json_uses_default_allow_fallback() {
 
 #[tokio::test]
 async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insufficient() {
-    let provider = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let manager = AgentManager::new(registry, test_tool_loop_config());
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
@@ -5802,13 +6079,14 @@ async fn recall_sensitive_policy_mentions_memory_search_when_recall_is_insuffici
 #[tokio::test]
 async fn memory_policy_default_allows_proactive_remember_tool() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_memory_remember_proactive".to_owned(),
             name: "memory_remember".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "remembered",
+        memory_remember_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
@@ -5877,13 +6155,14 @@ async fn memory_policy_default_allows_proactive_remember_tool() {
 #[tokio::test]
 async fn explicit_remember_request_can_trigger_memory_remember() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_memory_remember".to_owned(),
             name: "memory_remember".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "remembered",
+        memory_remember_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
@@ -5946,13 +6225,14 @@ async fn explicit_remember_request_can_trigger_memory_remember() {
 #[tokio::test]
 async fn explicit_forget_request_can_trigger_memory_forget() {
     let (memory_bundle, calls) = recording_standard_memory_tool_bundle();
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_memory_forget".to_owned(),
             name: "memory_forget".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "forgotten",
+        memory_forget_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
@@ -6030,7 +6310,7 @@ async fn explicit_forget_request_can_trigger_memory_forget() {
 
 #[tokio::test]
 async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() {
-    let remember_provider = Arc::new(SequencedToolProvider::new(
+    let remember_provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_stateful_memory_remember".to_owned(),
             name: "memory_remember".to_owned(),
@@ -6044,6 +6324,7 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
             .to_string(),
         }],
         "remembered",
+        memory_remember_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-remember",
@@ -6069,7 +6350,9 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     .await;
     assert_turn_completed(&observed);
 
-    let recall_provider = Arc::new(CaptureAgentProvider::default());
+    let recall_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     registry.insert("capture-recall", recall_provider.clone());
     let observed = start_simple_turn(
         &manager,
@@ -6095,13 +6378,14 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
             .contains("User's name is Alexander.")
     );
 
-    let forget_provider = Arc::new(SequencedToolProvider::new(
+    let forget_provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_stateful_memory_forget".to_owned(),
             name: "memory_forget".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "forgotten",
+        memory_forget_preflight_response(),
     ));
     registry.insert("sequenced-forget", forget_provider);
     let observed = start_simple_turn(
@@ -6116,7 +6400,9 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     .await;
     assert_turn_completed(&observed);
 
-    let after_forget_provider = Arc::new(CaptureAgentProvider::default());
+    let after_forget_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        memory_read_preflight_response(),
+    ));
     registry.insert("capture-after-forget", after_forget_provider.clone());
     let observed = start_simple_turn(
         &manager,
@@ -6258,9 +6544,10 @@ async fn tool_loop_provider_round_budget_requests_final_no_tools_round() {
 
 #[tokio::test]
 async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
-    let provider = Arc::new(LoopBudgetProvider::new(
+    let provider = Arc::new(LoopBudgetProvider::with_preflight_response(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
+        memory_read_preflight_response(),
     ));
     let mut config = test_tool_loop_config();
     config.budget.max_agent_rounds_per_turn = 2;
