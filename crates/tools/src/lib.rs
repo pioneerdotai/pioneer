@@ -15,6 +15,7 @@ mod router;
 mod runtime;
 mod shell_format;
 mod spec;
+mod tool_index;
 mod visibility;
 mod web;
 
@@ -86,6 +87,10 @@ pub use spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
     ToolPayloadBinding, ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
     builtin_tool_recovery_metadata, builtin_tool_specs,
+};
+pub use tool_index::{
+    PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor, PreflightToolIndex,
+    build_preflight_tool_index,
 };
 pub use visibility::ToolVisibilitySnapshot;
 pub use web::{

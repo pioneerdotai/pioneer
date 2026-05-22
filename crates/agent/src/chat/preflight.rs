@@ -6,7 +6,7 @@ use pioneer_memory::hooks::{
     normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_protocol::ThreadMode;
-use pioneer_tools::BuiltinToolDomain;
+use pioneer_tools::{BuiltinToolDomain, PreflightToolIndex};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -50,6 +50,24 @@ pub(crate) struct TurnPreflightCandidateTool {
     pub domain: BuiltinToolDomain,
     pub summary: String,
     pub mutation: bool,
+}
+
+pub(crate) fn turn_preflight_tools_input_from_index(
+    index: PreflightToolIndex,
+) -> TurnPreflightToolsInput {
+    TurnPreflightToolsInput {
+        core_tools: index.core_tools,
+        candidate_tools: index
+            .candidate_tools
+            .into_iter()
+            .map(|candidate| TurnPreflightCandidateTool {
+                name: candidate.name,
+                domain: candidate.domain,
+                summary: candidate.summary,
+                mutation: candidate.mutation,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -733,6 +751,32 @@ mod tests {
 
         serde_json::from_value::<TurnPreflightInput>(with_source)
             .expect_err("candidate tools must not carry provenance/source fields");
+    }
+
+    #[test]
+    fn preflight_tools_input_adapts_compact_tool_index_without_schemas() {
+        let input = turn_preflight_tools_input_from_index(pioneer_tools::PreflightToolIndex {
+            core_tools: vec!["exec_command".to_owned(), "request_tools".to_owned()],
+            candidate_tools: vec![pioneer_tools::PreflightCandidateToolDescriptor {
+                name: "memory_search".to_owned(),
+                domain: BuiltinToolDomain::Memory,
+                summary: "Search durable memory.".to_owned(),
+                mutation: false,
+            }],
+        });
+
+        assert_eq!(
+            input.core_tools,
+            vec!["exec_command".to_owned(), "request_tools".to_owned()]
+        );
+        assert_eq!(input.candidate_tools.len(), 1);
+        assert_eq!(input.candidate_tools[0].name, "memory_search");
+        assert_eq!(input.candidate_tools[0].domain, BuiltinToolDomain::Memory);
+
+        let serialized = serde_json::to_string(&input).expect("tools input serializes");
+        assert!(!serialized.contains("parameters"));
+        assert!(!serialized.contains("properties"));
+        assert!(!serialized.contains("jsonSchema"));
     }
 
     #[test]

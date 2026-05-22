@@ -12,6 +12,7 @@ use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
     ToolPayloadBinding, ToolRecoveryMetadata, ToolSpec,
 };
+use crate::tool_index::{PreflightToolIndex, build_preflight_tool_index};
 use crate::visibility::ToolVisibilitySnapshot;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
@@ -80,6 +81,14 @@ impl ToolRouter {
 
     pub fn all_specs(&self) -> Vec<ToolSpec> {
         self.specs.values().map(|spec| spec.spec.clone()).collect()
+    }
+
+    pub fn preflight_tool_index(&self) -> PreflightToolIndex {
+        build_preflight_tool_index(
+            self.specs
+                .values()
+                .filter(|configured| self.has_handler(configured.spec.name.as_str())),
+        )
     }
 
     pub async fn model_visible_specs(&self) -> Vec<ToolSpec> {
@@ -480,6 +489,20 @@ mod tests {
             event_bus,
             "test_turn",
         )
+    }
+
+    #[test]
+    fn tool_index_router_view_omits_specs_without_handlers() {
+        let router = router_with_specs(vec![configured_spec(
+            "memory_search",
+            PayloadKind::Function,
+            ExecutionClass::Shared,
+        )]);
+
+        let index = router.preflight_tool_index();
+
+        assert!(index.core_tools.is_empty());
+        assert!(index.candidate_tools.is_empty());
     }
 
     #[test]
