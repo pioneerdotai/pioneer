@@ -25,7 +25,10 @@ pub use hooks::{
 pub use profile::PromptProfile;
 pub use render::{
     memory_active_recall_planner::{
-        MemoryActiveRecallPlannerPromptInput, render_memory_active_recall_planner_prompt,
+        MemoryActiveRecallPlannerPromptInput, MemoryActiveRecallProviderOutputContractInput,
+        MemoryActiveRecallProviderOutputPath, render_memory_active_recall_planner_prompt,
+        render_memory_active_recall_provider_output_contract,
+        render_memory_active_recall_provider_output_example,
     },
     memory_post_turn_extractor::{
         MemoryPostTurnExtractorPromptInput, render_memory_post_turn_extractor_prompt,
@@ -45,7 +48,10 @@ pub use render::{
     task_run::{TaskRunPromptCompiler, TaskRunPromptInput},
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
-    turn_preflight::{TurnPreflightPromptInput, render_turn_preflight_prompt},
+    turn_preflight::{
+        TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
+        render_turn_preflight_prompt,
+    },
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
 pub use section::{
