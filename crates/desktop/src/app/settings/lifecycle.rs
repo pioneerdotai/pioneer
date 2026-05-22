@@ -118,6 +118,7 @@ impl PioneerDesktop {
             GatewaySettingsUpdate {
                 general: Some(GatewayGeneralSettingsUpdate {
                     keepawake: Some(enabled),
+                    preflight_model: None,
                 }),
                 memory: None,
             },

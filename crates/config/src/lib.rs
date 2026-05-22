@@ -41,6 +41,8 @@ pub struct GatewayConfig {
     pub outbound_queue_capacity: usize,
     #[serde(default = "default_gateway_keepawake")]
     pub keepawake: bool,
+    #[serde(default)]
+    pub preflight_model: GatewayMemoryModelSelectionConfig,
     pub thread: GatewayThreadConfig,
     #[serde(default)]
     pub tools: GatewayToolsConfig,
@@ -1795,6 +1797,38 @@ service_name = "com.pioneer.gateway.env"
         );
         assert_eq!(config.gateway.service_name, "com.pioneer.gateway");
         assert!(!config.gateway.keepawake);
+        assert!(config.gateway.preflight_model.is_thread_model());
+    }
+
+    #[test]
+    fn settings_gateway_preflight_model_config_defaults_to_thread() {
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
+
+        assert!(config.gateway.preflight_model.is_thread_model());
+    }
+
+    #[test]
+    fn settings_gateway_preflight_model_config_accepts_custom_override() {
+        let workspace_override = unique_temp_file_path("gateway-preflight-model-config");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway]
+preflight_model = { source = "custom", model_provider = "planner-provider", model = "planner-model" }
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with preflight model override");
+
+        assert_eq!(
+            config.gateway.preflight_model,
+            GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
+        );
+
+        let _ = fs::remove_file(workspace_override);
     }
 
     #[test]

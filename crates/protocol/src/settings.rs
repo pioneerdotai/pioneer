@@ -21,6 +21,8 @@ pub struct GatewaySettingsUpdate {
 pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepawake: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_model: Option<GatewayMemoryModelSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -44,6 +46,8 @@ pub struct GatewaySettingsSnapshot {
 pub struct GatewayGeneralSettings {
     #[serde(default)]
     pub keepawake: bool,
+    #[serde(default)]
+    pub preflight_model: GatewayMemoryModelSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -157,4 +161,39 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
     }
 
     Some(normalized.chars().take(max_len).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
+    };
+
+    #[test]
+    fn settings_general_defaults_to_thread_preflight_model() {
+        let settings = GatewayGeneralSettings::default();
+
+        assert!(!settings.keepawake);
+        assert!(settings.preflight_model.is_thread_model());
+    }
+
+    #[test]
+    fn settings_general_update_roundtrips_preflight_model() {
+        let update = GatewayGeneralSettingsUpdate {
+            keepawake: Some(true),
+            preflight_model: Some(GatewayMemoryModelSelection::custom(
+                "planner-provider",
+                "planner-model",
+            )),
+        };
+
+        let serialized = serde_json::to_string(&update).expect("settings update should serialize");
+        assert!(serialized.contains("preflight_model"));
+        assert!(serialized.contains("planner-provider"));
+        assert!(serialized.contains("planner-model"));
+
+        let roundtrip: GatewayGeneralSettingsUpdate =
+            serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
+        assert_eq!(roundtrip, update);
+    }
 }

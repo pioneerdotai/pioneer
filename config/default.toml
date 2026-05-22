@@ -18,6 +18,7 @@ service_name = "com.pioneer.gateway"
 listen_addr = "0.0.0.0:17878"
 outbound_queue_capacity = 128
 keepawake = false
+preflight_model = "thread"
 
 [gateway.hooks.recovery]
 enabled = true

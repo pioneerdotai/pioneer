@@ -395,6 +395,7 @@ mod tests {
                 listen_addr: "0.0.0.0:17878".to_owned(),
                 outbound_queue_capacity: 128,
                 keepawake: false,
+                preflight_model: Default::default(),
                 thread: GatewayThreadConfig {
                     default_model: "gpt-5.4".to_owned(),
                     default_model_provider: "openai".to_owned(),

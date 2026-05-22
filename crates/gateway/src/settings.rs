@@ -25,6 +25,8 @@ pub struct GatewaySettings {
 struct GatewayGeneralSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keepawake: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
 impl GatewayGeneralSettings {
@@ -35,6 +37,11 @@ impl GatewayGeneralSettings {
     fn effective(&self, config: &GatewayConfig) -> pioneer_protocol::GatewayGeneralSettings {
         pioneer_protocol::GatewayGeneralSettings {
             keepawake: self.keepawake.unwrap_or(config.keepawake),
+            preflight_model: model_selection_to_protocol(
+                self.preflight_model
+                    .as_ref()
+                    .unwrap_or(&config.preflight_model),
+            ),
         }
     }
 
@@ -46,6 +53,11 @@ impl GatewayGeneralSettings {
         if let Some(keepawake) = update.keepawake {
             self.keepawake = Some(keepawake);
             changes.keepawake = Some(keepawake);
+        }
+        if let Some(preflight_model) = update.preflight_model {
+            let preflight_model = model_selection_from_protocol(preflight_model);
+            self.preflight_model = Some(preflight_model.clone());
+            changes.preflight_model = Some(preflight_model);
         }
         changes
     }
@@ -181,7 +193,9 @@ impl GatewaySettings {
     }
 
     pub fn apply_to_gateway_config(&self, mut config: GatewayConfig) -> GatewayConfig {
-        config.keepawake = self.effective_general_settings(&config).keepawake;
+        let general = self.effective_general_settings(&config);
+        config.keepawake = general.keepawake;
+        config.preflight_model = model_selection_from_protocol(general.preflight_model);
         config.memory = self.apply_to_gateway_memory_config(config.memory);
         config
     }
@@ -239,15 +253,16 @@ impl GatewayMemorySettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewaySettingsChangeSet {
     pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayGeneralSettingsChangeSet {
     pub keepawake: Option<bool>,
+    pub preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
 impl GatewayMemorySettingsOverride {
@@ -617,6 +632,17 @@ backend = "keystore"
                 .effective_general_settings(&gateway_config)
                 .keepawake
         );
+        gateway_config.preflight_model =
+            GatewayMemoryModelSelectionConfig::custom("config-provider", "config-model");
+        assert_eq!(
+            settings_without_override
+                .effective_general_settings(&gateway_config)
+                .preflight_model,
+            pioneer_protocol::GatewayMemoryModelSelection::custom(
+                "config-provider",
+                "config-model"
+            )
+        );
 
         let settings_with_enabled_override = toml::from_str::<super::GatewaySettings>(
             r#"
@@ -624,6 +650,7 @@ version = 1
 
 [general]
 keepawake = true
+preflight_model = { source = "custom", model_provider = "settings-provider", model = "settings-model" }
 
 [secrets]
 backend = "keystore"
@@ -634,6 +661,15 @@ backend = "keystore"
             settings_with_enabled_override
                 .effective_general_settings(&gateway_config_with_keepawake(false))
                 .keepawake
+        );
+        assert_eq!(
+            settings_with_enabled_override
+                .effective_general_settings(&gateway_config)
+                .preflight_model,
+            pioneer_protocol::GatewayMemoryModelSelection::custom(
+                "settings-provider",
+                "settings-model"
+            )
         );
 
         let settings_with_disabled_override = toml::from_str::<super::GatewaySettings>(
@@ -670,6 +706,10 @@ backend = "keystore"
         settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
             general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
                 keepawake: Some(true),
+                preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
+                    "planner-provider",
+                    "planner-model",
+                )),
             }),
             memory: None,
         });
@@ -678,6 +718,9 @@ backend = "keystore"
         let content = fs::read_to_string(&path).expect("read settings");
         assert!(content.contains("[general]"));
         assert!(content.contains("keepawake = true"));
+        assert!(content.contains("preflight_model"));
+        assert!(content.contains("model_provider = \"planner-provider\""));
+        assert!(content.contains("model = \"planner-model\""));
         assert!(!content.contains("[memory]"));
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -940,6 +983,7 @@ backend = "keystore"
             listen_addr: "0.0.0.0:17878".to_owned(),
             outbound_queue_capacity: 128,
             keepawake,
+            preflight_model: Default::default(),
             thread: GatewayThreadConfig {
                 default_model: "gpt-5.4".to_owned(),
                 default_model_provider: "openai".to_owned(),
