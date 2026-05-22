@@ -104,7 +104,7 @@ pub use web::{
 };
 
 #[cfg(feature = "computer-use")]
-use handlers::ComputerUseHandler;
+use handlers::materialize_computer_use_domain_bundle;
 
 use handlers::{
     ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
@@ -331,10 +331,19 @@ pub fn build_tools_with_environment(
     let web_tools_config = web_tools_config.normalized();
 
     #[cfg(feature = "computer-use")]
-    let computer_use_tools_config = computer_use_tools_config.normalized();
+    let extensions = {
+        let mut extensions = extensions;
+        extensions.push(materialize_computer_use_domain_bundle(
+            computer_use_tools_config.normalized(),
+        ));
+        extensions
+    };
 
     #[cfg(not(feature = "computer-use"))]
-    let _ = computer_use_tools_config;
+    let extensions = {
+        let _ = computer_use_tools_config;
+        extensions
+    };
 
     let mut configured_specs = builtin_tool_specs();
     let builtin_tool_names = configured_specs
@@ -422,12 +431,6 @@ pub fn build_tools_with_environment(
         )),
     );
 
-    #[cfg(feature = "computer-use")]
-    builder.register_handler(
-        "computer_use",
-        Arc::new(ComputerUseHandler::new(computer_use_tools_config)),
-    );
-
     for extension in extensions {
         for (name, handler) in extension.handlers {
             builder.register_dyn_handler(name, handler);
@@ -493,7 +496,9 @@ mod tests {
     use crate::output_policy::dynamic_unknown_output_policy;
     use crate::registry::ToolHandler;
     use crate::router::RawToolCall;
-    use crate::spec::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
+    use crate::spec::{
+        ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolSpec,
+    };
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -631,6 +636,151 @@ mod tests {
         assert!(
             built.router.has_handler("request_tools"),
             "request_tools must have a runtime handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_is_not_in_default_model_visible_specs() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_computer_use_hidden_default",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let visible = built.router.model_visible_specs().await;
+        assert!(
+            !visible.iter().any(|spec| spec.name == "computer_use"),
+            "computer_use schema must not be visible in the default provider catalog"
+        );
+    }
+
+    #[cfg(feature = "computer-use")]
+    #[tokio::test]
+    async fn computer_use_remains_registered_and_reaches_handler_when_visible() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_computer_use_visible_handler",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        assert!(
+            built.router.find_spec("computer_use").is_some(),
+            "computer_use spec should remain registered when feature-enabled"
+        );
+        assert!(
+            built.router.has_handler("computer_use"),
+            "computer_use handler should remain registered when feature-enabled"
+        );
+        let index = built.router.preflight_tool_index();
+        assert!(index.candidate_tools.iter().any(|candidate| {
+            candidate.name == "computer_use"
+                && candidate.domain == crate::BuiltinToolDomain::ComputerUse
+        }));
+
+        built
+            .router
+            .set_model_visible_tools(&["computer_use".to_owned()])
+            .await;
+        let call = built
+            .router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_computer_use_status".to_owned(),
+                tool_name: "computer_use".to_owned(),
+                arguments: serde_json::json!({
+                    "action": "status",
+                    "session_id": 999_999_u64
+                })
+                .to_string(),
+            })
+            .await
+            .expect("visible computer_use call should pass model visibility gate");
+
+        let error = match built.runtime.execute_tool_call(call).await {
+            Ok(_) => panic!("unknown computer_use session should not succeed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, crate::ToolError::NotFound(_)));
+    }
+
+    #[cfg(feature = "computer-use")]
+    #[tokio::test]
+    async fn request_tools_resolves_computer_use_domain_when_feature_enabled() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_request_tools_computer_use_available",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let call = built
+            .router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_request_tools_computer_use".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: serde_json::json!({
+                    "domains": ["computer_use"],
+                    "reason": "Need GUI control."
+                })
+                .to_string(),
+            })
+            .await
+            .expect("request_tools call should parse");
+
+        let result = built
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("request_tools should execute");
+        let output = serde_json::from_value::<crate::RequestToolsResult>(result.raw_output_json())
+            .expect("request_tools output should match compact result contract");
+
+        assert_eq!(
+            output.added.get("computer_use"),
+            Some(&vec!["computer_use".to_owned()])
+        );
+        assert!(output.unknown_or_unavailable.is_empty());
+    }
+
+    #[cfg(not(feature = "computer-use"))]
+    #[tokio::test]
+    async fn request_tools_reports_computer_use_unavailable_without_feature() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_request_tools_computer_use_unavailable",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let call = built
+            .router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call_request_tools_computer_use_unavailable".to_owned(),
+                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
+                arguments: serde_json::json!({
+                    "domains": ["computer_use"],
+                    "reason": "Need GUI control."
+                })
+                .to_string(),
+            })
+            .await
+            .expect("request_tools call should parse");
+
+        let result = built
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("request_tools should execute");
+        let output = serde_json::from_value::<crate::RequestToolsResult>(result.raw_output_json())
+            .expect("request_tools output should match compact result contract");
+
+        assert!(output.added.is_empty());
+        assert_eq!(output.unknown_or_unavailable.len(), 1);
+        assert_eq!(output.unknown_or_unavailable[0].domain, "computer_use");
+        assert_eq!(
+            output.unknown_or_unavailable[0].tools,
+            vec!["computer_use".to_owned()]
         );
     }
 

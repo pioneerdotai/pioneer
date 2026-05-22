@@ -3982,6 +3982,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_visibility_computer_use_is_hidden_by_default_and_visible_when_selected() {
+        let built = pioneer_tools::build_builtin_tools(
+            ".",
+            "turn_tool_visibility_computer_use",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+        let core_tools = vec!["request_tools".to_owned(), "read_file".to_owned()];
+
+        let core_only = built
+            .router
+            .compute_final_visible_tools(&core_tools, &[], &[]);
+        assert!(
+            !core_only.visible_tools.contains(&"computer_use".to_owned()),
+            "computer_use must not be visible by default"
+        );
+
+        let selected = built.router.compute_final_visible_tools(
+            &core_tools,
+            &["computer_use".to_owned()],
+            &[],
+        );
+        if built.router.find_spec("computer_use").is_some() {
+            assert!(
+                selected.visible_tools.contains(&"computer_use".to_owned()),
+                "registered computer_use must become visible when preflight selects it"
+            );
+        } else {
+            assert!(
+                !selected.visible_tools.contains(&"computer_use".to_owned()),
+                "unregistered computer_use must not become visible"
+            );
+            assert!(selected.diagnostics.iter().any(|diagnostic| {
+                diagnostic.tool_name == "computer_use"
+                    && diagnostic.code
+                        == pioneer_tools::ToolVisibilityDiagnosticCode::UnknownToolDropped
+            }));
+        }
+    }
+
+    #[test]
     fn request_tools_provider_loop_result_batch_expands_visible_tools_for_next_round() {
         let built = build_tools_with_extension_names(&["artifact_prepare", "artifact_register"]);
         let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];

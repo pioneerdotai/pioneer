@@ -347,13 +347,11 @@ mod tests {
 
     #[cfg(feature = "computer-use")]
     #[test]
-    fn domain_map_matches_registered_computer_use_builtin_spec_when_feature_enabled() {
-        let specs = crate::builtin_tool_specs();
-        let actual = specs
-            .iter()
-            .map(|configured| configured.spec.name.as_str())
-            .filter(|name| BuiltinToolDomain::ComputerUse.tool_names().contains(name))
-            .collect::<Vec<_>>();
+    fn domain_map_matches_materialized_computer_use_spec_when_feature_enabled() {
+        let configured = crate::spec::computer_use_configured_spec();
+        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
+            configured.spec.name == name
+        });
 
         assert_eq!(
             actual.as_slice(),

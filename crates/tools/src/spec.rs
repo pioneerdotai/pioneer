@@ -159,7 +159,7 @@ impl ConfiguredToolSpec {
 }
 
 pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
-    let specs = vec![
+    vec![
         configured_builtin_spec(
             "exec_command",
             "Run a command (optionally interactive) and return output or a session id.",
@@ -290,33 +290,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 can_resume: false,
             },
         ),
-    ];
-
-    with_optional_builtin_tool_specs(specs)
-}
-
-#[cfg(feature = "computer-use")]
-fn with_optional_builtin_tool_specs(mut specs: Vec<ConfiguredToolSpec>) -> Vec<ConfiguredToolSpec> {
-    specs.push(configured_builtin_spec(
-        "computer_use",
-        "Remote desktop control loop. Required call shapes: start {action,goal}; snapshot {action,session_id}; act {action,session_id,act:{type,...}}; status {action,session_id}; stop {action,session_id}. For action=act, nested act object is mandatory.",
-        computer_use_schema(),
-        PayloadKind::Function,
-        ExecutionClass::SessionScoped,
-        ToolRecoveryMetadata {
-            retry_class: ToolRetryClass::Session,
-            idempotency_mode: ToolIdempotencyMode::SessionBound,
-            max_attempts: 2,
-            can_resume: true,
-        },
-    ));
-
-    specs
-}
-
-#[cfg(not(feature = "computer-use"))]
-fn with_optional_builtin_tool_specs(specs: Vec<ConfiguredToolSpec>) -> Vec<ConfiguredToolSpec> {
-    specs
+    ]
 }
 
 pub fn builtin_tool_recovery_metadata(tool_name: &str) -> Option<ToolRecoveryMetadata> {
@@ -339,6 +313,23 @@ fn configured_builtin_spec(
         ToolSpec::new(name.clone(), description, parameters, payload_kind).with_recovery(recovery),
         execution_class,
         builtin_output_policy(name.as_str()),
+    )
+}
+
+#[cfg(feature = "computer-use")]
+pub(crate) fn computer_use_configured_spec() -> ConfiguredToolSpec {
+    configured_builtin_spec(
+        "computer_use",
+        "Remote desktop control loop. Required call shapes: start {action,goal}; snapshot {action,session_id}; act {action,session_id,act:{type,...}}; status {action,session_id}; stop {action,session_id}. For action=act, nested act object is mandatory.",
+        computer_use_schema(),
+        PayloadKind::Function,
+        ExecutionClass::SessionScoped,
+        ToolRecoveryMetadata {
+            retry_class: ToolRetryClass::Session,
+            idempotency_mode: ToolIdempotencyMode::SessionBound,
+            max_attempts: 2,
+            can_resume: true,
+        },
     )
 }
 
@@ -723,6 +714,32 @@ mod tests {
                 configured.spec.name
             );
         }
+    }
+
+    #[cfg(feature = "computer-use")]
+    #[test]
+    fn computer_use_configured_spec_preserves_runtime_contract() {
+        let configured = computer_use_configured_spec();
+
+        assert_eq!(configured.spec.name, "computer_use");
+        assert_eq!(configured.spec.payload_kind, PayloadKind::Function);
+        assert_eq!(configured.execution_class, ExecutionClass::SessionScoped);
+        assert_eq!(
+            configured.output_policy,
+            builtin_output_policy("computer_use")
+        );
+        assert_eq!(
+            configured.spec.recovery.retry_class,
+            ToolRetryClass::Session
+        );
+        assert_eq!(
+            configured.spec.recovery.idempotency_mode,
+            ToolIdempotencyMode::SessionBound
+        );
+        assert_eq!(
+            configured.spec.parameters["required"],
+            serde_json::json!(["action"])
+        );
     }
 
     #[test]

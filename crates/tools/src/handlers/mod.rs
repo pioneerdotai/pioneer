@@ -11,7 +11,7 @@ mod skill;
 mod web;
 
 #[cfg(feature = "computer-use")]
-pub use computer_use::ComputerUseHandler;
+pub use computer_use::{ComputerUseHandler, materialize_computer_use_domain_bundle};
 
 pub use apply_patch::ApplyPatchHandler;
 pub use files::{GrepHandler, ListDirHandler, ReadFileHandler};
