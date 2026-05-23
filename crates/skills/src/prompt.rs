@@ -62,7 +62,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
             .filter(|skill| {
                 matches!(
                     skill.reason,
-                    SkillResolvedReason::ExplicitMention | SkillResolvedReason::PathMatch
+                    SkillResolvedReason::ExplicitCapability | SkillResolvedReason::PathMatch
                 )
             })
             .collect::<Vec<_>>();
@@ -161,7 +161,7 @@ mod tests {
 
         ResolvedSkill {
             slug: format!("{owner}/{slug}"),
-            reason: SkillResolvedReason::ExplicitMention,
+            reason: SkillResolvedReason::ExplicitCapability,
             definition,
         }
     }

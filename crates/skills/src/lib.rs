@@ -42,8 +42,8 @@ pub use provenance::{
     upsert_lock_entry, write_skills_lock_atomic,
 };
 pub use resolver::{
-    ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillResolutionInput, SkillResolutionResult,
-    SkillResolvedReason, SkillValidationPolicy, resolve_skills,
+    ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillResolutionInput,
+    SkillResolutionResult, SkillResolvedReason, SkillValidationPolicy, resolve_skills,
 };
 pub use runtime::{
     DynamicDeltaOutputRequest, DynamicDiagnosticExcerptRequest, DynamicLlmOutputRequest,

@@ -681,8 +681,9 @@ mod tests {
     };
     use crate::dependencies::DependencyCheckInput;
     use crate::policy::SkillPolicySet;
-    use crate::resolver::{SkillResolutionInput, SkillValidationPolicy, resolve_skills};
-    use pioneer_protocol::UserInput;
+    use crate::resolver::{
+        SkillExplicitRef, SkillResolutionInput, SkillValidationPolicy, resolve_skills,
+    };
     use serde_json::json;
 
     fn skill_with_runtime_tools(
@@ -729,9 +730,11 @@ mod tests {
             skills: vec![skill_with_runtime_tools(slug, tools)],
         };
         resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: slug.to_owned(),
-                path: String::new(),
+            explicit_refs: &[SkillExplicitRef {
+                capability_id: format!("skill:user:{slug}"),
+                label: Some(slug.to_owned()),
+                slug: slug.to_owned(),
+                source_kind: "user".to_owned(),
             }],
             touched_paths: &[],
             catalog: &catalog,
@@ -926,9 +929,11 @@ mod tests {
             skills: vec![skill],
         };
         let active = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "untrusted-shell".to_owned(),
-                path: String::new(),
+            explicit_refs: &[SkillExplicitRef {
+                capability_id: "skill:user:untrusted-shell".to_owned(),
+                label: Some("untrusted-shell".to_owned()),
+                slug: "untrusted-shell".to_owned(),
+                source_kind: "user".to_owned(),
             }],
             touched_paths: &[],
             catalog: &catalog,

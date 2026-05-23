@@ -1,6 +1,7 @@
 use pioneer_skills::{
-    DependencyCheckInput, SkillExcludedReason, SkillPolicySet, SkillResolutionInput,
-    SkillSourceKind, SkillTrustLevel, SkillValidationPolicy, parse_skill_from_file, resolve_skills,
+    DependencyCheckInput, SkillExcludedReason, SkillExplicitRef, SkillPolicySet,
+    SkillResolutionInput, SkillSourceKind, SkillTrustLevel, SkillValidationPolicy,
+    parse_skill_from_file, resolve_skills,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -142,9 +143,11 @@ fn metadata_command_dependency_can_block_resolution_when_binary_missing() {
     };
 
     let result = resolve_skills(SkillResolutionInput {
-        user_inputs: &[pioneer_protocol::UserInput::Skill {
-            name: "agent-browser".to_owned(),
-            path: String::new(),
+        explicit_refs: &[SkillExplicitRef {
+            capability_id: "skill:user:agent-browser".to_owned(),
+            label: Some("agent-browser".to_owned()),
+            slug: "agent-browser".to_owned(),
+            source_kind: "user".to_owned(),
         }],
         touched_paths: &[],
         catalog: &catalog,

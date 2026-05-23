@@ -6,9 +6,7 @@ use crate::dependencies::{
 use crate::path_match::path_matches_any_pattern;
 use crate::policy::{SkillPolicySet, merge_policy};
 use crate::security::{SecurityFinding, scan_skill_directory};
-use pioneer_protocol::UserInput;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +34,7 @@ impl Default for SkillValidationPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillResolvedReason {
-    ExplicitMention,
+    ExplicitCapability,
     PathMatch,
     Implicit,
 }
@@ -44,7 +42,7 @@ pub enum SkillResolvedReason {
 impl SkillResolvedReason {
     pub fn as_db_value(&self) -> &'static str {
         match self {
-            Self::ExplicitMention => "explicit_mention",
+            Self::ExplicitCapability => "explicit_composer_capability",
             Self::PathMatch => "path_match",
             Self::Implicit => "implicit",
         }
@@ -52,7 +50,7 @@ impl SkillResolvedReason {
 
     fn rank(&self) -> u8 {
         match self {
-            Self::ExplicitMention => 0,
+            Self::ExplicitCapability => 0,
             Self::PathMatch => 1,
             Self::Implicit => 2,
         }
@@ -112,12 +110,20 @@ pub struct SkillResolutionResult {
 
 #[derive(Debug, Clone)]
 pub struct SkillResolutionInput<'a> {
-    pub user_inputs: &'a [UserInput],
+    pub explicit_refs: &'a [SkillExplicitRef],
     pub touched_paths: &'a [String],
     pub catalog: &'a SkillCatalogSnapshot,
     pub policy_set: &'a SkillPolicySet,
     pub validation_policy: SkillValidationPolicy,
     pub dependency_input: &'a DependencyCheckInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillExplicitRef {
+    pub capability_id: String,
+    pub label: Option<String>,
+    pub slug: String,
+    pub source_kind: String,
 }
 
 fn normalize_key(value: &str) -> String {
@@ -137,27 +143,29 @@ fn normalize_key(value: &str) -> String {
         .join("-")
 }
 
-fn explicit_refs(inputs: &[UserInput]) -> (HashSet<String>, HashSet<String>) {
-    let mut names = HashSet::new();
-    let mut paths = HashSet::new();
-
-    for input in inputs {
-        if let UserInput::Skill { name, path } = input {
-            if !name.trim().is_empty() {
-                names.insert(normalize_key(name));
-            }
-            if !path.trim().is_empty() {
-                paths.insert(path.replace('\\', "/"));
-                if let Some(file_name) =
-                    Path::new(path).file_name().and_then(|value| value.to_str())
-                {
-                    names.insert(normalize_key(file_name));
-                }
-            }
-        }
+fn explicit_ref_matches_skill(input: &SkillExplicitRef, skill: &SkillDefinition) -> bool {
+    if !input.source_kind.trim().is_empty()
+        && input.source_kind.as_str() != skill.identity.source_kind.as_db_value()
+    {
+        return false;
     }
 
-    (names, paths)
+    let normalized_ref = normalize_key(input.slug.as_str());
+    if normalized_ref.is_empty() {
+        return false;
+    }
+
+    let normalized_slug = normalize_key(skill.identity.slug.as_str());
+    let normalized_qualified_slug = normalize_key(
+        qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()).as_str(),
+    );
+    let normalized_name = normalize_key(skill.identity.name.as_str());
+    let normalized_display_name = normalize_key(skill.identity.display_name.as_str());
+
+    normalized_ref == normalized_slug
+        || normalized_ref == normalized_qualified_slug
+        || normalized_ref == normalized_name
+        || normalized_ref == normalized_display_name
 }
 
 fn dependency_failures(
@@ -207,32 +215,15 @@ fn trust_blocked(skill: &SkillDefinition, policy: SkillValidationPolicy) -> bool
 
 fn resolve_reason(
     skill: &SkillDefinition,
-    explicit_name_refs: &HashSet<String>,
-    explicit_path_refs: &HashSet<String>,
+    explicit_refs: &[SkillExplicitRef],
     touched_paths: &[String],
     allow_implicit_invocation: bool,
 ) -> Option<SkillResolvedReason> {
-    let normalized_slug = normalize_key(skill.identity.slug.as_str());
-    let normalized_qualified_slug = normalize_key(
-        qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()).as_str(),
-    );
-    let normalized_name = normalize_key(skill.identity.name.as_str());
-    let normalized_display_name = normalize_key(skill.identity.display_name.as_str());
-
-    if explicit_name_refs.contains(normalized_slug.as_str())
-        || explicit_name_refs.contains(normalized_qualified_slug.as_str())
-        || explicit_name_refs.contains(normalized_name.as_str())
-        || explicit_name_refs.contains(normalized_display_name.as_str())
+    if explicit_refs
+        .iter()
+        .any(|explicit_ref| explicit_ref_matches_skill(explicit_ref, skill))
     {
-        return Some(SkillResolvedReason::ExplicitMention);
-    }
-
-    let skill_file = skill.identity.skill_file.replace('\\', "/");
-    let skill_dir = skill.identity.skill_dir.replace('\\', "/");
-    if explicit_path_refs.contains(skill_file.as_str())
-        || explicit_path_refs.contains(skill_dir.as_str())
-    {
-        return Some(SkillResolvedReason::ExplicitMention);
+        return Some(SkillResolvedReason::ExplicitCapability);
     }
 
     if !skill.runtime.paths.is_empty()
@@ -274,8 +265,6 @@ fn has_critical_metadata_issues(skill: &SkillDefinition) -> bool {
 }
 
 pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult {
-    let (explicit_name_refs, explicit_path_refs) = explicit_refs(input.user_inputs);
-
     let mut active = Vec::new();
     let mut excluded = Vec::new();
 
@@ -302,8 +291,7 @@ pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult 
 
         let Some(reason) = resolve_reason(
             skill,
-            &explicit_name_refs,
-            &explicit_path_refs,
+            input.explicit_refs,
             input.touched_paths,
             effective_policy.allow_implicit_invocation,
         ) else {
@@ -317,7 +305,7 @@ pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult 
             continue;
         };
 
-        if !matches!(reason, SkillResolvedReason::ExplicitMention)
+        if !matches!(reason, SkillResolvedReason::ExplicitCapability)
             && skill.runtime.disable_model_invocation
         {
             excluded.push(ExcludedSkill {
@@ -410,8 +398,8 @@ pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult 
 #[cfg(test)]
 mod tests {
     use super::{
-        SkillExcludedReason, SkillResolutionInput, SkillResolvedReason, SkillValidationPolicy,
-        resolve_skills,
+        SkillExcludedReason, SkillExplicitRef, SkillResolutionInput, SkillResolvedReason,
+        SkillValidationPolicy, resolve_skills,
     };
     use crate::compile::{CompileSkillInput, SkillDefinition, compile_skill_definition};
     use crate::contract::{
@@ -420,7 +408,15 @@ mod tests {
     };
     use crate::dependencies::DependencyCheckInput;
     use crate::policy::{SkillPolicy, SkillPolicyKey, SkillPolicySet};
-    use pioneer_protocol::UserInput;
+
+    fn explicit_ref(name: &str) -> SkillExplicitRef {
+        SkillExplicitRef {
+            capability_id: format!("skill:user:{name}"),
+            label: Some(name.to_owned()),
+            slug: name.to_owned(),
+            source_kind: "user".to_owned(),
+        }
+    }
 
     fn skill(slug: &str, paths: &[&str], source_kind: SkillSourceKind) -> SkillDefinition {
         let conformance = default_skill_conformance();
@@ -454,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_mentions_rank_before_path_matches() {
+    fn explicit_capabilities_rank_before_path_matches() {
         let catalog = SkillCatalogSnapshot {
             version: 1,
             generated_at_unix: 1,
@@ -465,10 +461,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "explicit-skill".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("explicit-skill")],
             touched_paths: &["src/main.rs".to_owned()],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -480,7 +473,7 @@ mod tests {
         assert_eq!(result.active[0].slug, "workspace/explicit-skill");
         assert_eq!(
             result.active[0].reason,
-            SkillResolvedReason::ExplicitMention
+            SkillResolvedReason::ExplicitCapability
         );
         assert_eq!(result.active[1].slug, "workspace/path-skill");
         assert_eq!(result.active[1].reason, SkillResolvedReason::PathMatch);
@@ -504,10 +497,7 @@ mod tests {
         );
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "explicit-skill".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("explicit-skill")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy,
@@ -535,10 +525,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "agent-browser".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("agent-browser")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -566,10 +553,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "agent-browser".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("agent-browser")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -597,10 +581,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "system-browser".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("system-browser")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -630,16 +611,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[
-                UserInput::Skill {
-                    name: "registry-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Skill {
-                    name: "user-skill".to_owned(),
-                    path: String::new(),
-                },
-            ],
+            explicit_refs: &[explicit_ref("registry-skill"), explicit_ref("user-skill")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -669,10 +641,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "untrusted".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("untrusted")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -701,10 +670,7 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[UserInput::Skill {
-                name: "agent-browser".to_owned(),
-                path: String::new(),
-            }],
+            explicit_refs: &[explicit_ref("agent-browser")],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -732,15 +698,12 @@ mod tests {
             ],
         };
 
-        let user_inputs = vec![UserInput::Skill {
-            name: "alpha".to_owned(),
-            path: String::new(),
-        }];
+        let explicit_refs = vec![explicit_ref("alpha")];
         let touched_paths = vec!["src/main.rs".to_owned(), "docs/spec.md".to_owned()];
         let policy_set = SkillPolicySet::default();
 
         let first = resolve_skills(SkillResolutionInput {
-            user_inputs: user_inputs.as_slice(),
+            explicit_refs: explicit_refs.as_slice(),
             touched_paths: touched_paths.as_slice(),
             catalog: &catalog,
             policy_set: &policy_set,
@@ -748,7 +711,7 @@ mod tests {
             dependency_input: &DependencyCheckInput::baseline(),
         });
         let second = resolve_skills(SkillResolutionInput {
-            user_inputs: user_inputs.as_slice(),
+            explicit_refs: explicit_refs.as_slice(),
             touched_paths: touched_paths.as_slice(),
             catalog: &catalog,
             policy_set: &policy_set,
@@ -789,7 +752,7 @@ mod tests {
         );
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[],
+            explicit_refs: &[],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy,
@@ -823,7 +786,7 @@ mod tests {
         );
 
         let result = resolve_skills(SkillResolutionInput {
-            user_inputs: &[],
+            explicit_refs: &[],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy,
