@@ -1,8 +1,9 @@
 use crate::{
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ProviderFailureDetails, TaskEvent, TaskEventPayload,
-    ThreadLineage, ToolOutputPolicySnapshot, TurnItemType, TurnToolLoopBudgetExceededNotification,
+    ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, TaskEvent,
+    TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind, TurnItemType,
+    TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,14 @@ pub enum AgentDurableEvent {
         thread_id: String,
         turn_id: String,
         bindings: Vec<TurnSkillBinding>,
+    },
+    TurnCapabilitiesResolved {
+        thread_id: String,
+        turn_id: String,
+        accepted: Vec<TurnAcceptedCapability>,
+        rejected: Vec<TurnRejectedCapability>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mcp_bindings: Vec<McpTurnBindingSummary>,
     },
     SkillAuditEvents {
         thread_id: String,
@@ -130,6 +139,48 @@ pub struct TurnSkillBinding {
     pub resolved_reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TurnAcceptedCapability {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub kind: TurnCapabilityKind,
+    pub reason: TurnCapabilityAcceptedReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCapabilityAcceptedReason {
+    ExplicitComposerCapability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TurnRejectedCapability {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub kind: TurnCapabilityKind,
+    pub reason: TurnCapabilityRejectedReason,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCapabilityRejectedReason {
+    InvalidInput,
+    Duplicate,
+    NotFound,
+    DisabledByPolicy,
+    ValidationRejected,
+    SecurityBlocked,
+    DependencyMissing,
+    Unavailable,
+    CatalogMissing,
+    ToolMissing,
+    ProviderUnsupported,
+    MaterializationFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct SkillAuditEvent {
     pub skill_slug: String,
@@ -162,6 +213,7 @@ impl AgentDurableEvent {
         match self {
             Self::PromptManifestCompiled { turn_id, .. }
             | Self::TurnSkillsResolved { turn_id, .. }
+            | Self::TurnCapabilitiesResolved { turn_id, .. }
             | Self::SkillAuditEvents { turn_id, .. }
             | Self::TurnLlmContextAppended { turn_id, .. }
             | Self::ProviderFailureDetected { turn_id, .. }
@@ -206,6 +258,7 @@ impl AgentDurableEvent {
             Self::TaskEvent { event } => event.is_terminal(),
             Self::PromptManifestCompiled { .. }
             | Self::TurnSkillsResolved { .. }
+            | Self::TurnCapabilitiesResolved { .. }
             | Self::SkillAuditEvents { .. }
             | Self::TurnLlmContextAppended { .. }
             | Self::ItemStarted { .. }

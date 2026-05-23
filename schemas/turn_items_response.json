@@ -657,6 +657,13 @@
         }
       ]
     },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
     "RecoveryAction": {
       "type": "string",
       "enum": [
@@ -3416,6 +3423,79 @@
         "dynamic_tool_call"
       ]
     },
+    "TurnMcpServerCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "name",
+        "scopeKind"
+      ]
+    },
+    "TurnMcpToolCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    },
+    "TurnSkillCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "slug",
+        "sourceKind"
+      ]
+    },
     "UserMessageAttachment": {
       "oneOf": [
         {
@@ -3560,6 +3640,54 @@
           "required": [
             "type",
             "artifact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpServerCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpToolCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
           ]
         }
       ]

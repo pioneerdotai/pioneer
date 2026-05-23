@@ -595,6 +595,12 @@
         "callable_name": {
           "type": "string"
         },
+        "capability_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "catalog_version": {
           "type": "string"
         },
@@ -602,6 +608,9 @@
           "type": "string"
         },
         "raw_tool_name": {
+          "type": "string"
+        },
+        "selection_reason": {
           "type": "string"
         },
         "server_installation_id": {
@@ -617,7 +626,8 @@
         "raw_tool_name",
         "callable_name",
         "catalog_version",
-        "fingerprint"
+        "fingerprint",
+        "selection_reason"
       ]
     }
   }

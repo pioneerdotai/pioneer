@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnRejectedCapability",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/TurnCapabilityKind"
+    },
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "reason": {
+      "$ref": "#/$defs/TurnCapabilityRejectedReason"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "reason",
+    "message"
+  ],
+  "$defs": {
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "TurnCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "sourceKind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "slug",
+            "sourceKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "scopeKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rawToolName": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "serverName",
+            "rawToolName",
+            "scopeKind"
+          ]
+        }
+      ]
+    },
+    "TurnCapabilityRejectedReason": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "duplicate",
+        "not_found",
+        "disabled_by_policy",
+        "validation_rejected",
+        "security_blocked",
+        "dependency_missing",
+        "unavailable",
+        "catalog_missing",
+        "tool_missing",
+        "provider_unsupported",
+        "materialization_failed"
+      ]
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSkillCapabilitySummary",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "slug": {
+      "type": "string"
+    },
+    "sourceKind": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "label",
+    "slug",
+    "sourceKind"
+  ]
+}

@@ -3,6 +3,12 @@
   "title": "TurnStartParams",
   "type": "object",
   "properties": {
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnCapability"
+      }
+    },
     "input": {
       "type": "array",
       "default": [],
@@ -73,6 +79,13 @@
         "end"
       ]
     },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
     "SandboxMode": {
       "type": "string",
       "enum": [
@@ -112,6 +125,95 @@
       "enum": [
         "Chat",
         "Agent"
+      ]
+    },
+    "TurnCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TurnCapabilityKind"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ]
+    },
+    "TurnCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "sourceKind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "slug",
+            "sourceKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "scopeKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rawToolName": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "serverName",
+            "rawToolName",
+            "scopeKind"
+          ]
+        }
       ]
     },
     "UserInput": {
@@ -287,26 +389,6 @@
           "required": [
             "type",
             "artifactId"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "const": "skill"
-            }
-          },
-          "required": [
-            "type",
-            "name",
-            "path"
           ]
         },
         {

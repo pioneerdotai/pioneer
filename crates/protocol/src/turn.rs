@@ -1,4 +1,6 @@
-use crate::{ArtifactRef, MarkdownDocument, SandboxPolicy, TaskEvent, TaskTurnItem, ThreadMode};
+use crate::{
+    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, TaskEvent, TaskTurnItem, ThreadMode,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -320,6 +322,8 @@ pub struct TurnStartParams {
     pub turn_id: String,
     #[serde(default)]
     pub input: Vec<UserInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<TurnCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +332,38 @@ pub struct TurnStartParams {
     pub sandbox_policy: Option<SandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ThreadMode>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCapability {
+    pub id: String,
+    pub kind: TurnCapabilityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TurnCapabilityKind {
+    Skill {
+        slug: String,
+        #[serde(rename = "sourceKind")]
+        source_kind: String,
+    },
+    McpServer {
+        name: String,
+        #[serde(rename = "scopeKind")]
+        scope_kind: McpScopeKind,
+    },
+    McpTool {
+        #[serde(rename = "serverName")]
+        server_name: String,
+        #[serde(rename = "rawToolName")]
+        raw_tool_name: String,
+        #[serde(rename = "scopeKind")]
+        scope_kind: McpScopeKind,
+    },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -769,6 +805,7 @@ pub enum PromptManifestDiagnosticCode {
     DynamicSectionOmitted,
     HookDiagnostic,
     HookBestEffortFailed,
+    CapabilityRejected,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -1532,10 +1569,6 @@ pub enum UserInput {
         #[serde(rename = "versionId", default, skip_serializing_if = "Option::is_none")]
         version_id: Option<String>,
     },
-    Skill {
-        name: String,
-        path: String,
-    },
     Mention {
         name: String,
         path: String,
@@ -1545,15 +1578,75 @@ pub enum UserInput {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum UserMessageAttachment {
-    Image { url: String },
-    LocalImage { path: String },
-    File { url: String },
-    LocalFile { path: String },
-    Audio { url: String },
-    LocalAudio { path: String },
-    Video { url: String },
-    LocalVideo { path: String },
-    Artifact { artifact: ArtifactRef },
+    Image {
+        url: String,
+    },
+    LocalImage {
+        path: String,
+    },
+    File {
+        url: String,
+    },
+    LocalFile {
+        path: String,
+    },
+    Audio {
+        url: String,
+    },
+    LocalAudio {
+        path: String,
+    },
+    Video {
+        url: String,
+    },
+    LocalVideo {
+        path: String,
+    },
+    Artifact {
+        artifact: ArtifactRef,
+    },
+    Skill {
+        capability: TurnSkillCapabilitySummary,
+    },
+    McpServer {
+        capability: TurnMcpServerCapabilitySummary,
+    },
+    McpTool {
+        capability: TurnMcpToolCapabilitySummary,
+    },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSkillCapabilitySummary {
+    pub id: String,
+    pub label: String,
+    pub slug: String,
+    #[serde(rename = "sourceKind")]
+    pub source_kind: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnMcpServerCapabilitySummary {
+    pub id: String,
+    pub label: String,
+    pub name: String,
+    #[serde(rename = "scopeKind")]
+    pub scope_kind: McpScopeKind,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnMcpToolCapabilitySummary {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "serverName")]
+    pub server_name: String,
+    #[serde(rename = "rawToolName")]
+    pub raw_tool_name: String,
+    #[serde(rename = "scopeKind")]
+    pub scope_kind: McpScopeKind,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -2126,6 +2219,7 @@ mod tests {
             input: vec![UserInput::Image {
                 url: "https://example.com/image.png".to_owned(),
             }],
+            capabilities: Vec::new(),
             model: None,
             model_provider: None,
             sandbox_policy: None,
@@ -2205,6 +2299,7 @@ mod tests {
                     version_id: Some("av_123".to_owned()),
                 },
             ],
+            capabilities: Vec::new(),
             model: None,
             model_provider: None,
             sandbox_policy: None,
@@ -2228,6 +2323,79 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_capabilities() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "input": [],
+            "capabilities": [
+                {
+                    "id": "skill:workspace:imagegen",
+                    "label": "imagegen",
+                    "kind": {
+                        "type": "skill",
+                        "slug": "imagegen",
+                        "sourceKind": "workspace"
+                    }
+                },
+                {
+                    "id": "mcp-server:workspace:browser",
+                    "label": "browser",
+                    "kind": {
+                        "type": "mcpServer",
+                        "name": "browser",
+                        "scopeKind": "workspace"
+                    }
+                },
+                {
+                    "id": "mcp-tool:workspace:browser:open",
+                    "label": "browser/open",
+                    "kind": {
+                        "type": "mcpTool",
+                        "serverName": "browser",
+                        "rawToolName": "open",
+                        "scopeKind": "workspace"
+                    }
+                }
+            ]
+        }))
+        .expect("params should decode");
+
+        assert_eq!(params.capabilities.len(), 3);
+        assert_eq!(
+            params.capabilities[0],
+            TurnCapability {
+                id: "skill:workspace:imagegen".to_owned(),
+                label: Some("imagegen".to_owned()),
+                kind: TurnCapabilityKind::Skill {
+                    slug: "imagegen".to_owned(),
+                    source_kind: "workspace".to_owned(),
+                },
+            }
+        );
+        assert_eq!(
+            params.capabilities[1].kind,
+            TurnCapabilityKind::McpServer {
+                name: "browser".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            }
+        );
+        assert_eq!(
+            params.capabilities[2].kind,
+            TurnCapabilityKind::McpTool {
+                server_name: "browser".to_owned(),
+                raw_tool_name: "open".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            }
+        );
+
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(encoded["capabilities"][0]["kind"]["type"], "skill");
+        assert_eq!(encoded["capabilities"][1]["kind"]["type"], "mcpServer");
+        assert_eq!(encoded["capabilities"][2]["kind"]["type"], "mcpTool");
     }
 
     #[test]
@@ -2286,6 +2454,59 @@ mod tests {
         let decoded: UserMessageAttachment =
             serde_json::from_value(encoded).expect("attachment should decode");
         assert_eq!(decoded, attachment);
+    }
+
+    #[test]
+    fn user_message_attachment_capabilities_round_trip_in_single_attachment_list() {
+        let attachments = vec![
+            UserMessageAttachment::Skill {
+                capability: TurnSkillCapabilitySummary {
+                    id: "skill:user:docs".to_owned(),
+                    label: "docs".to_owned(),
+                    slug: "docs".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+            },
+            UserMessageAttachment::McpServer {
+                capability: TurnMcpServerCapabilitySummary {
+                    id: "mcp-server:workspace:resend".to_owned(),
+                    label: "resend".to_owned(),
+                    name: "resend".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+            },
+            UserMessageAttachment::McpTool {
+                capability: TurnMcpToolCapabilitySummary {
+                    id: "mcp-tool:workspace:resend:send".to_owned(),
+                    label: "resend/send".to_owned(),
+                    server_name: "resend".to_owned(),
+                    raw_tool_name: "send".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+            },
+        ];
+
+        let item = TurnItem::UserMessage {
+            id: "user_msg_1".to_owned(),
+            text: "send it".to_owned(),
+            attachments,
+        };
+
+        let encoded = serde_json::to_value(&item).expect("user message should encode");
+        assert_eq!(encoded["attachments"][0]["type"], json!("skill"));
+        assert_eq!(encoded["attachments"][1]["type"], json!("mcpServer"));
+        assert_eq!(encoded["attachments"][2]["type"], json!("mcpTool"));
+        let mut keys = encoded
+            .as_object()
+            .expect("encoded user message should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["attachments", "id", "text", "type"]);
+
+        let decoded: TurnItem = serde_json::from_value(encoded).expect("item should decode");
+        assert_eq!(decoded, item);
     }
 
     #[test]

@@ -281,6 +281,9 @@ pub struct McpTurnBindingSummary {
     pub callable_name: String,
     pub catalog_version: String,
     pub fingerprint: String,
+    pub selection_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

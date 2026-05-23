@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnCapabilityRejectedReason",
+  "type": "string",
+  "enum": [
+    "invalid_input",
+    "duplicate",
+    "not_found",
+    "disabled_by_policy",
+    "validation_rejected",
+    "security_blocked",
+    "dependency_missing",
+    "unavailable",
+    "catalog_missing",
+    "tool_missing",
+    "provider_unsupported",
+    "materialization_failed"
+  ]
+}

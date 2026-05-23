@@ -186,26 +186,6 @@
         },
         "type": {
           "type": "string",
-          "const": "skill"
-        }
-      },
-      "required": [
-        "type",
-        "name",
-        "path"
-      ]
-    },
-    {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
           "const": "mention"
         }
       },

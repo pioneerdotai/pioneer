@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnCapabilityKind",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "skill"
+        }
+      },
+      "required": [
+        "type",
+        "slug",
+        "sourceKind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "type": {
+          "type": "string",
+          "const": "mcpServer"
+        }
+      },
+      "required": [
+        "type",
+        "name",
+        "scopeKind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "mcpTool"
+        }
+      },
+      "required": [
+        "type",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}

@@ -135,17 +135,19 @@ use crate::{
     ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
-    ToolStoragePayload, Turn, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnKind, TurnOrigin, TurnStartParams, TurnStartResponse,
-    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
-    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
-    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification,
-    UserInput, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
-    WorkspaceUpdateResponse,
+    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelParams, TurnCancelResponse,
+    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem,
+    TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    TurnMcpToolCapabilitySummary, TurnOrigin, TurnRejectedCapability, TurnSkillCapabilitySummary,
+    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    TurnStatusChangedNotification, TurnTimelineChangedNotification, TurnTimelineChangedReason,
+    TurnTimelineParams, TurnTimelineResponse, TurnToolLoopBudgetExceededNotification,
+    UnknownGatewayNotification, UserInput, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
 
 pub struct SchemaDocument {
@@ -168,6 +170,16 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("agent_progress_event.json", AgentProgressEvent),
         schema_doc!("durable_event_causality_key.json", DurableEventCausalityKey),
         schema_doc!("progress_coalescing_key.json", ProgressCoalescingKey),
+        schema_doc!("turn_accepted_capability.json", TurnAcceptedCapability),
+        schema_doc!(
+            "turn_capability_accepted_reason.json",
+            TurnCapabilityAcceptedReason
+        ),
+        schema_doc!(
+            "turn_capability_rejected_reason.json",
+            TurnCapabilityRejectedReason
+        ),
+        schema_doc!("turn_rejected_capability.json", TurnRejectedCapability),
         schema_doc!("workspace.json", Workspace),
         schema_doc!("workspace_list_params.json", WorkspaceListParams),
         schema_doc!("workspace_list_response.json", WorkspaceListResponse),
@@ -807,6 +819,20 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("prompt_manifest_profile.json", PromptManifestProfile),
         schema_doc!("turn_status.json", TurnStatus),
         schema_doc!("turn_start_params.json", TurnStartParams),
+        schema_doc!("turn_capability.json", TurnCapability),
+        schema_doc!("turn_capability_kind.json", TurnCapabilityKind),
+        schema_doc!(
+            "turn_skill_capability_summary.json",
+            TurnSkillCapabilitySummary
+        ),
+        schema_doc!(
+            "turn_mcp_server_capability_summary.json",
+            TurnMcpServerCapabilitySummary
+        ),
+        schema_doc!(
+            "turn_mcp_tool_capability_summary.json",
+            TurnMcpToolCapabilitySummary
+        ),
         schema_doc!("turn_start_response.json", TurnStartResponse),
         schema_doc!("turn_cancel_params.json", TurnCancelParams),
         schema_doc!("turn_cancel_response.json", TurnCancelResponse),

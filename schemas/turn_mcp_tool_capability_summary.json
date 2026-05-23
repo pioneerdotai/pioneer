@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnMcpToolCapabilitySummary",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "rawToolName": {
+      "type": "string"
+    },
+    "scopeKind": {
+      "$ref": "#/$defs/McpScopeKind"
+    },
+    "serverName": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "label",
+    "serverName",
+    "rawToolName",
+    "scopeKind"
+  ],
+  "$defs": {
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}

@@ -20,7 +20,9 @@ mod workspace;
 
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
-    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView, TurnSkillBinding,
+    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
+    TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
+    TurnRejectedCapability, TurnSkillBinding,
 };
 pub use artifact::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
@@ -191,13 +193,15 @@ pub use turn::{
     ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
     ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
     ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn, TurnCancelParams,
-    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
-    TurnGetResponse, TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnOrigin,
-    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
-    TurnStatusChangedNotification, TurnTimelineChangedNotification, TurnTimelineChangedReason,
-    TurnTimelineParams, TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UserInput,
-    UserMessageAttachment, WebFetchLink, WebSearchResultItem,
+    TurnCancelResponse, TurnCapability, TurnCapabilityKind, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
+    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
+    TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
+    TurnOrigin, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
+    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
+    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment,
+    WebFetchLink, WebSearchResultItem,
 };
 pub use workspace::{
     Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,

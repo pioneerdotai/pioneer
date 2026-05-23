@@ -3441,7 +3441,8 @@
         "dynamic_section_truncated",
         "dynamic_section_omitted",
         "hook_diagnostic",
-        "hook_best_effort_failed"
+        "hook_best_effort_failed",
+        "capability_rejected"
       ]
     },
     "PromptManifestHookContributionKind": {
@@ -8361,6 +8362,56 @@
         "task_run"
       ]
     },
+    "TurnMcpServerCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "name",
+        "scopeKind"
+      ]
+    },
+    "TurnMcpToolCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    },
     "TurnOrigin": {
       "type": "string",
       "enum": [
@@ -8368,6 +8419,29 @@
         "scheduled_task",
         "detached_task",
         "attached_task"
+      ]
+    },
+    "TurnSkillCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "slug",
+        "sourceKind"
       ]
     },
     "TurnStartedNotification": {
@@ -8678,6 +8752,54 @@
           "required": [
             "type",
             "artifact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpServerCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpToolCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
           ]
         }
       ]

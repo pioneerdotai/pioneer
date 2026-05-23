@@ -107,7 +107,8 @@
         "dynamic_section_truncated",
         "dynamic_section_omitted",
         "hook_diagnostic",
-        "hook_best_effort_failed"
+        "hook_best_effort_failed",
+        "capability_rejected"
       ]
     },
     "PromptManifestHookContributionKind": {
