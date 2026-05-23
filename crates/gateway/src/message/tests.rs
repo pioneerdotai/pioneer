@@ -33,20 +33,20 @@ use pioneer_protocol::{
     McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
     McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState,
     McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
-    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
-    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
-    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
-    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
-    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
-    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
-    PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListParams, ProviderListResponse,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction, RecoveryTrigger,
-    SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse,
-    SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
+    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
+    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
+    MemorySensitivity, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListParams,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction,
+    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
+    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
     SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
@@ -63,12 +63,14 @@ use pioneer_protocol::{
     ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
     ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
     TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
-    ToolResultView, ToolStoragePayload, Turn, TurnCancelResponse, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType,
-    TurnKind, TurnOrigin, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
-    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
+    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -5691,6 +5693,134 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_durable_turn_capabilities_resolved_commits_payload() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager,
+        agent_manager.clone(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+    );
+
+    let thread_id = "thr_capabilities_durable_1";
+    let turn_id = "turn_capabilities_durable_1";
+    agent_manager
+        .ensure_thread(thread_id, workspace_id.as_str())
+        .await
+        .expect("agent thread should be registered for committed subscription");
+    let mut committed_rx = agent_manager
+        .subscribe_committed(thread_id)
+        .await
+        .expect("committed subscription should exist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnCapabilitiesResolved {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            accepted: vec![TurnAcceptedCapability {
+                id: "skill:user:docs".to_owned(),
+                label: Some("docs".to_owned()),
+                kind: TurnCapabilityKind::Skill {
+                    slug: "docs".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+                reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
+            }],
+            rejected: vec![TurnRejectedCapability {
+                id: "skill:user:missing".to_owned(),
+                label: Some("missing".to_owned()),
+                kind: TurnCapabilityKind::Skill {
+                    slug: "missing".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+                reason: TurnCapabilityRejectedReason::NotFound,
+                message: "Skill `missing` is not installed or not available in this workspace."
+                    .to_owned(),
+            }],
+            mcp_bindings: vec![McpTurnBindingSummary {
+                server_installation_id: "mcp_server_resend_001".to_owned(),
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                callable_name: "mcp_resend_send".to_owned(),
+                catalog_version: "catalog-v1".to_owned(),
+                fingerprint: "fingerprint-resend".to_owned(),
+                selection_reason: "explicit_composer_capability".to_owned(),
+                capability_id: Some("mcp-tool:workspace:resend:send".to_owned()),
+            }],
+        })
+        .await;
+
+    let mcp_bindings = crud_store_for_assert
+        .list_turn_mcp_bindings(turn_id)
+        .await
+        .expect("turn MCP bindings should load after durable event");
+    assert_eq!(mcp_bindings.len(), 1);
+    assert_eq!(
+        mcp_bindings[0].selection_reason,
+        "explicit_composer_capability"
+    );
+    assert_eq!(
+        mcp_bindings[0].capability_id.as_deref(),
+        Some("mcp-tool:workspace:resend:send")
+    );
+
+    let committed = timeout(Duration::from_secs(1), committed_rx.recv())
+        .await
+        .expect("committed notification should arrive")
+        .expect("committed lane should stay open");
+    match committed {
+        AgentDurableEvent::TurnCapabilitiesResolved {
+            turn_id: committed_turn_id,
+            accepted,
+            rejected,
+            mcp_bindings,
+            ..
+        } => {
+            assert_eq!(committed_turn_id, turn_id);
+            assert_eq!(accepted.len(), 1);
+            assert_eq!(accepted[0].id, "skill:user:docs");
+            assert_eq!(
+                accepted[0].reason,
+                TurnCapabilityAcceptedReason::ExplicitComposerCapability
+            );
+            assert_eq!(rejected.len(), 1);
+            assert_eq!(rejected[0].reason, TurnCapabilityRejectedReason::NotFound);
+            assert!(
+                rejected[0]
+                    .message
+                    .contains("not installed or not available")
+            );
+            assert_eq!(mcp_bindings.len(), 1);
+            assert_eq!(
+                mcp_bindings[0].selection_reason,
+                "explicit_composer_capability"
+            );
+            assert_eq!(
+                mcp_bindings[0].capability_id.as_deref(),
+                Some("mcp-tool:workspace:resend:send")
+            );
+            let committed_json =
+                serde_json::to_string(&AgentDurableEvent::TurnCapabilitiesResolved {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: committed_turn_id,
+                    accepted,
+                    rejected,
+                    mcp_bindings,
+                })
+                .expect("committed capability event should serialize");
+            assert!(committed_json.contains("explicit_composer_capability"));
+            assert!(committed_json.contains("mcp-tool:workspace:resend:send"));
+        }
+        other => panic!("expected TurnCapabilitiesResolved committed event, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_durable_item_completed_persists_before_committed_notification() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -7183,7 +7313,7 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
                 skill_version: Some("1.2.3".to_owned()),
                 fingerprint: "fp-my-skill".to_owned(),
                 source_kind: "user".to_owned(),
-                resolved_reason: "explicit_mention".to_owned(),
+                resolved_reason: "explicit_composer_capability".to_owned(),
             }],
         })
         .await;
@@ -7194,7 +7324,7 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         .expect("must read persisted turn skill bindings");
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].skill_slug, "pioneer/my-skill");
-    assert_eq!(bindings[0].resolved_reason, "explicit_mention");
+    assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7227,7 +7357,7 @@ async fn agent_skill_audit_event_persists_audit_rows() {
                     action: "resolve_allowed".to_owned(),
                     decision: "allowed".to_owned(),
                     reason_code: None,
-                    details: json!({"resolved_reason":"explicit_mention"}),
+                    details: json!({"resolved_reason":"explicit_composer_capability"}),
                     created_at_unix: 1_700_000_000,
                 },
                 ProtocolSkillAuditEvent {
@@ -9638,8 +9768,14 @@ Gateway skill body"#,
             "thread_id": "thr_000000000000000130",
             "turn_id": "turn_000000000000000130",
             "input": [
-                { "type": "skill", "name": "my-skill", "path": "" },
                 { "type": "text", "text": "run dynamic skill" }
+            ],
+            "capabilities": [
+                {
+                    "id": "skill:user:my-skill",
+                    "kind": { "type": "skill", "slug": "my-skill", "sourceKind": "user" },
+                    "label": "my-skill"
+                }
             ]
         }
     });
@@ -9784,7 +9920,12 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
 
     let materialization = processor
         .mcp_service
-        .materialize_mcp_tools(workspace_id.as_str(), "turn_000000000000000131")
+        .materialize_mcp_tools(pioneer_agent::AgentMcpMaterializationRequest {
+            workspace_id: workspace_id.clone(),
+            turn_id: "turn_000000000000000131".to_owned(),
+            explicit_servers: Vec::new(),
+            explicit_tools: Vec::new(),
+        })
         .await
         .expect("MCP tools should materialize");
     assert!(
@@ -9945,8 +10086,14 @@ Gateway HTTP skill body"#
             "thread_id": "thr_000000000000000131",
             "turn_id": "turn_000000000000000131",
             "input": [
-                { "type": "skill", "name": "http-skill", "path": "" },
                 { "type": "text", "text": "run dynamic http skill" }
+            ],
+            "capabilities": [
+                {
+                    "id": "skill:user:http-skill",
+                    "kind": { "type": "skill", "slug": "http-skill", "sourceKind": "user" },
+                    "label": "http-skill"
+                }
             ]
         }
     });
@@ -11904,6 +12051,8 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
                 callable_name: "mcp_resend_send".to_owned(),
                 catalog_version: "catalog-v1".to_owned(),
                 fingerprint: installed_server.fingerprint.clone(),
+                selection_reason: "implicit_policy".to_owned(),
+                capability_id: None,
             }],
             1_700_000_010,
         )
@@ -11944,12 +12093,13 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
             .iter()
             .all(|event| !event.details.to_string().contains(secret))
     );
-    assert!(
-        details_payload
-            .recent_bindings
-            .iter()
-            .any(|binding| { binding.server_name == "resend" && binding.raw_tool_name == "send" })
-    );
+    let recent_binding = details_payload
+        .recent_bindings
+        .iter()
+        .find(|binding| binding.server_name == "resend" && binding.raw_tool_name == "send")
+        .expect("details should include recent MCP binding");
+    assert_eq!(recent_binding.selection_reason, "implicit_policy");
+    assert_eq!(recent_binding.capability_id, None);
 
     let row_before_uninstall = crud_store_for_assert
         .find_mcp_server_installation("workspace", workspace_id.as_str(), "resend")

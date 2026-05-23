@@ -225,6 +225,7 @@ impl MessageProcessor {
                 &outcome.materialization.thread.model_provider,
                 workspace_skill_policies,
                 outcome.materialization.input.clone(),
+                outcome.materialization.capabilities.clone(),
                 resolved_artifacts,
                 runtime_environment,
                 history,

@@ -851,9 +851,6 @@ fn user_message_payload_from_input(
                     path: path.clone(),
                 });
             }
-            pioneer_protocol::UserInput::Skill { name, .. } => {
-                text_parts.push(format!("skill: {name}"));
-            }
             pioneer_protocol::UserInput::Mention { name, .. } => {
                 text_parts.push(format!("mention: {name}"));
             }
@@ -985,9 +982,6 @@ impl MessageProcessor {
                     attachments.push(pioneer_protocol::UserMessageAttachment::LocalVideo {
                         path: path.clone(),
                     });
-                }
-                pioneer_protocol::UserInput::Skill { name, .. } => {
-                    text_parts.push(format!("skill: {name}"));
                 }
                 pioneer_protocol::UserInput::Mention { name, .. } => {
                     text_parts.push(format!("mention: {name}"));

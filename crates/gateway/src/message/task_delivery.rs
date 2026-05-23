@@ -157,6 +157,7 @@ impl MessageProcessor {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.clone(),
                 input: Vec::new(),
+                capabilities: Vec::new(),
                 model: None,
                 model_provider: None,
                 sandbox_policy: None,

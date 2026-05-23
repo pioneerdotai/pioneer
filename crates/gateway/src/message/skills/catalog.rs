@@ -114,17 +114,26 @@ impl MessageProcessor {
         let explicit_inputs = catalog
             .skills
             .iter()
-            .map(|skill| pioneer_protocol::UserInput::Skill {
-                name: qualified_skill_slug(
+            .map(|skill| SkillExplicitRef {
+                capability_id: format!(
+                    "skills/list:{}:{}",
+                    skill.identity.source_kind.as_db_value(),
+                    qualified_skill_slug(
+                        skill.identity.owner.as_str(),
+                        skill.identity.slug.as_str()
+                    )
+                ),
+                label: Some(skill.identity.display_name.clone()),
+                slug: qualified_skill_slug(
                     skill.identity.owner.as_str(),
                     skill.identity.slug.as_str(),
                 ),
-                path: String::new(),
+                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
             })
             .collect::<Vec<_>>();
 
         let resolution = resolve_skills(SkillResolutionInput {
-            user_inputs: explicit_inputs.as_slice(),
+            explicit_refs: explicit_inputs.as_slice(),
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy_set,

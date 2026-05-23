@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use pioneer_agent::{AgentMcpAvailability, AgentMcpMaterialization, AgentMcpToolProvider};
+use pioneer_agent::{
+    AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationRequest,
+    AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
+};
 use pioneer_crud::{
     CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
     TurnMcpBindingRecord,
@@ -13,7 +16,8 @@ use pioneer_mcp::{
 use pioneer_protocol::{
     JsonRpcNotification, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
     McpServerCatalogChangedNotification, McpServerStatus, McpServerStatusChangedNotification,
-    McpServerStatusItem, constants::events,
+    McpServerStatusItem, TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnRejectedCapability, constants::events,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -72,7 +76,19 @@ struct WorkspaceMcpToolState {
     blocked_mcp: Vec<String>,
     descriptors: Vec<pioneer_tools::McpDynamicToolDescriptor>,
     diagnostics: Vec<String>,
+    accepted_capabilities: Vec<TurnAcceptedCapability>,
+    rejected_capabilities: Vec<TurnRejectedCapability>,
 }
+
+#[derive(Clone)]
+struct McpToolSelection {
+    priority: u8,
+    selection_reason: &'static str,
+    capability_id: Option<String>,
+}
+
+const MCP_SELECTION_IMPLICIT_POLICY: &str = "implicit_policy";
+const MCP_SELECTION_EXPLICIT_CAPABILITY: &str = "explicit_composer_capability";
 
 impl McpSecretResolver for GatewayMcpSecretResolver {
     fn resolve_mcp_secret(&self, ref_id: &str) -> Option<String> {
@@ -273,6 +289,8 @@ impl McpService {
         &self,
         workspace_id: &str,
         include_implicit_tools: bool,
+        explicit_servers: &[AgentMcpServerRef],
+        explicit_tools: &[AgentMcpToolRef],
     ) -> Result<WorkspaceMcpToolState> {
         self.reload_workspace(workspace_id).await?;
         let rows = self
@@ -285,20 +303,111 @@ impl McpService {
         let snapshot_version = self.inner.snapshot_version.load(Ordering::SeqCst);
         let mut state = WorkspaceMcpToolState::default();
         let mut seen_callable_names = HashSet::new();
+        let mut explicit_servers_by_name = HashMap::<String, Vec<&AgentMcpServerRef>>::new();
+        let mut explicit_tools_by_server = HashMap::<String, Vec<&AgentMcpToolRef>>::new();
+        let mut explicit_tools_by_key = HashMap::<(String, String), Vec<&AgentMcpToolRef>>::new();
+        let mut matched_server_capability_ids = HashSet::<String>::new();
+        let mut matched_tool_capability_ids = HashSet::<String>::new();
+
+        for reference in explicit_servers {
+            if reference.capability_id.trim().is_empty() || reference.name.trim().is_empty() {
+                state
+                    .rejected_capabilities
+                    .push(reject_mcp_server_capability(
+                        reference,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "MCP server capability is missing an id or server name.",
+                    ));
+                continue;
+            }
+            if reference.scope_kind != McpScopeKind::Workspace {
+                state
+                    .rejected_capabilities
+                    .push(reject_mcp_server_capability(
+                        reference,
+                        TurnCapabilityRejectedReason::ProviderUnsupported,
+                        "Only workspace MCP servers can be attached to a turn.",
+                    ));
+                continue;
+            }
+            explicit_servers_by_name
+                .entry(mcp_ref_key(reference.name.as_str()))
+                .or_default()
+                .push(reference);
+        }
+
+        for reference in explicit_tools {
+            if reference.capability_id.trim().is_empty()
+                || reference.server_name.trim().is_empty()
+                || reference.raw_tool_name.trim().is_empty()
+            {
+                state.rejected_capabilities.push(reject_mcp_tool_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::InvalidInput,
+                    "MCP tool capability is missing an id, server name, or tool name.",
+                ));
+                continue;
+            }
+            if reference.scope_kind != McpScopeKind::Workspace {
+                state.rejected_capabilities.push(reject_mcp_tool_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::ProviderUnsupported,
+                    "Only workspace MCP tools can be attached to a turn.",
+                ));
+                continue;
+            }
+            let server_key = mcp_ref_key(reference.server_name.as_str());
+            let tool_key = mcp_ref_key(reference.raw_tool_name.as_str());
+            explicit_tools_by_server
+                .entry(server_key.clone())
+                .or_default()
+                .push(reference);
+            explicit_tools_by_key
+                .entry((server_key, tool_key))
+                .or_default()
+                .push(reference);
+        }
 
         for row in rows {
+            let server_key = mcp_ref_key(row.name.as_str());
+            let server_refs = explicit_servers_by_name
+                .get(server_key.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let tool_refs_for_server = explicit_tools_by_server
+                .get(server_key.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let installation_id = match row.id.clone() {
                 Some(id) => id,
                 None => {
                     state
                         .diagnostics
                         .push(format!("MCP server `{}` has no installation id", row.name));
+                    reject_mcp_refs_for_server(
+                        &mut state,
+                        server_refs,
+                        tool_refs_for_server,
+                        &mut matched_server_capability_ids,
+                        &mut matched_tool_capability_ids,
+                        TurnCapabilityRejectedReason::Unavailable,
+                        format!("MCP server `{}` is unavailable.", row.name).as_str(),
+                    );
                     continue;
                 }
             };
 
             if !row.enabled {
                 state.blocked_mcp.push(row.name.clone());
+                reject_mcp_refs_for_server(
+                    &mut state,
+                    server_refs,
+                    tool_refs_for_server,
+                    &mut matched_server_capability_ids,
+                    &mut matched_tool_capability_ids,
+                    TurnCapabilityRejectedReason::DisabledByPolicy,
+                    format!("MCP server `{}` is disabled by workspace policy.", row.name).as_str(),
+                );
                 continue;
             }
 
@@ -307,6 +416,15 @@ impl McpService {
                 state
                     .diagnostics
                     .push(format!("MCP server `{}` is not started", row.name));
+                reject_mcp_refs_for_server(
+                    &mut state,
+                    server_refs,
+                    tool_refs_for_server,
+                    &mut matched_server_capability_ids,
+                    &mut matched_tool_capability_ids,
+                    TurnCapabilityRejectedReason::Unavailable,
+                    format!("MCP server `{}` is not started.", row.name).as_str(),
+                );
                 continue;
             };
 
@@ -316,6 +434,15 @@ impl McpService {
                     "MCP server `{}` is not live ({:?})",
                     row.name, snapshot.state
                 ));
+                reject_mcp_refs_for_server(
+                    &mut state,
+                    server_refs,
+                    tool_refs_for_server,
+                    &mut matched_server_capability_ids,
+                    &mut matched_tool_capability_ids,
+                    TurnCapabilityRejectedReason::Unavailable,
+                    format!("MCP server `{}` is not live.", row.name).as_str(),
+                );
                 continue;
             }
 
@@ -330,16 +457,72 @@ impl McpService {
                 state
                     .diagnostics
                     .push(format!("MCP server `{}` has no catalog snapshot", row.name));
+                reject_mcp_refs_for_server(
+                    &mut state,
+                    server_refs,
+                    tool_refs_for_server,
+                    &mut matched_server_capability_ids,
+                    &mut matched_tool_capability_ids,
+                    TurnCapabilityRejectedReason::CatalogMissing,
+                    format!("MCP server `{}` has no tool catalog snapshot.", row.name).as_str(),
+                );
                 continue;
             };
 
             state.available_mcp.push(row.name.clone());
+            for reference in server_refs {
+                matched_server_capability_ids.insert(reference.capability_id.clone());
+                state
+                    .accepted_capabilities
+                    .push(accept_mcp_server_capability(reference));
+            }
             let tools = parse_catalog_tools(catalog.tools_json.as_str());
             for tool in tools {
                 state
                     .available_mcp
                     .push(format!("{}/{}", row.name, tool.raw_tool_name));
+                let tool_refs = explicit_tools_by_key
+                    .get(&(server_key.clone(), mcp_ref_key(tool.raw_tool_name.as_str())))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                for reference in tool_refs {
+                    matched_tool_capability_ids.insert(reference.capability_id.clone());
+                    state
+                        .accepted_capabilities
+                        .push(accept_mcp_tool_capability(reference));
+                }
+                let mut selection = None;
                 if include_implicit_tools && row.allow_implicit_invocation {
+                    select_mcp_tool(
+                        &mut selection,
+                        McpToolSelection {
+                            priority: 1,
+                            selection_reason: MCP_SELECTION_IMPLICIT_POLICY,
+                            capability_id: None,
+                        },
+                    );
+                }
+                if let Some(reference) = server_refs.first() {
+                    select_mcp_tool(
+                        &mut selection,
+                        McpToolSelection {
+                            priority: 2,
+                            selection_reason: MCP_SELECTION_EXPLICIT_CAPABILITY,
+                            capability_id: Some(reference.capability_id.clone()),
+                        },
+                    );
+                }
+                if let Some(reference) = tool_refs.first() {
+                    select_mcp_tool(
+                        &mut selection,
+                        McpToolSelection {
+                            priority: 3,
+                            selection_reason: MCP_SELECTION_EXPLICIT_CAPABILITY,
+                            capability_id: Some(reference.capability_id.clone()),
+                        },
+                    );
+                }
+                if let Some(selection) = selection {
                     let callable_name = mcp_callable_name(
                         row.name.as_str(),
                         tool.raw_tool_name.as_str(),
@@ -360,9 +543,62 @@ impl McpService {
                             parameters: tool.parameters,
                             annotations: tool.annotations,
                             timeout_ms: tool.timeout_ms,
+                            selection_reason: selection.selection_reason.to_owned(),
+                            capability_id: selection.capability_id,
                         });
                 }
             }
+            for reference in tool_refs_for_server {
+                if matched_tool_capability_ids.contains(reference.capability_id.as_str()) {
+                    continue;
+                }
+                matched_tool_capability_ids.insert(reference.capability_id.clone());
+                state.rejected_capabilities.push(reject_mcp_tool_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::ToolMissing,
+                    format!(
+                        "MCP server `{}` does not expose tool `{}`.",
+                        row.name, reference.raw_tool_name
+                    )
+                    .as_str(),
+                ));
+            }
+        }
+
+        for reference in explicit_servers {
+            if !eligible_workspace_mcp_server_ref(reference)
+                || matched_server_capability_ids.contains(reference.capability_id.as_str())
+            {
+                continue;
+            }
+            state
+                .rejected_capabilities
+                .push(reject_mcp_server_capability(
+                    reference,
+                    TurnCapabilityRejectedReason::NotFound,
+                    format!(
+                        "MCP server `{}` is not installed in this workspace.",
+                        reference.name
+                    )
+                    .as_str(),
+                ));
+        }
+
+        for reference in explicit_tools {
+            if !eligible_workspace_mcp_tool_ref(reference)
+                || matched_tool_capability_ids.contains(reference.capability_id.as_str())
+            {
+                continue;
+            }
+            state.rejected_capabilities.push(reject_mcp_tool_capability(
+                reference,
+                TurnCapabilityRejectedReason::NotFound,
+                format!(
+                    "MCP server `{}` is not installed in this workspace.",
+                    reference.server_name
+                )
+                .as_str(),
+            ));
         }
 
         state.available_mcp.sort();
@@ -1195,7 +1431,7 @@ impl McpService {
 impl AgentMcpToolProvider for McpService {
     async fn mcp_availability(&self, workspace_id: &str) -> Result<AgentMcpAvailability, String> {
         let state = self
-            .workspace_mcp_tool_state(workspace_id, false)
+            .workspace_mcp_tool_state(workspace_id, false, &[], &[])
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok(AgentMcpAvailability {
@@ -1206,11 +1442,15 @@ impl AgentMcpToolProvider for McpService {
 
     async fn materialize_mcp_tools(
         &self,
-        workspace_id: &str,
-        turn_id: &str,
+        request: AgentMcpMaterializationRequest,
     ) -> Result<AgentMcpMaterialization, String> {
         let mut state = self
-            .workspace_mcp_tool_state(workspace_id, true)
+            .workspace_mcp_tool_state(
+                request.workspace_id.as_str(),
+                true,
+                request.explicit_servers.as_slice(),
+                request.explicit_tools.as_slice(),
+            )
             .await
             .map_err(|error| format!("{error:#}"))?;
         let executor: Arc<dyn pioneer_tools::McpToolExecutor> = Arc::new(self.clone());
@@ -1225,6 +1465,20 @@ impl AgentMcpToolProvider for McpService {
                 excluded.reason
             ));
         }
+        let mcp_bindings = materialized
+            .bindings
+            .iter()
+            .map(|binding| pioneer_protocol::McpTurnBindingSummary {
+                server_installation_id: binding.server_installation_id.clone(),
+                server_name: binding.server_name.clone(),
+                raw_tool_name: binding.raw_tool_name.clone(),
+                callable_name: binding.callable_name.clone(),
+                catalog_version: binding.catalog_version.clone(),
+                fingerprint: binding.fingerprint.clone(),
+                selection_reason: binding.selection_reason.clone(),
+                capability_id: binding.capability_id.clone(),
+            })
+            .collect::<Vec<_>>();
         let binding_records = materialized
             .bindings
             .iter()
@@ -1235,11 +1489,17 @@ impl AgentMcpToolProvider for McpService {
                 callable_name: binding.callable_name.clone(),
                 catalog_version: binding.catalog_version.clone(),
                 fingerprint: binding.fingerprint.clone(),
+                selection_reason: binding.selection_reason.clone(),
+                capability_id: binding.capability_id.clone(),
             })
             .collect::<Vec<_>>();
         self.inner
             .crud_store
-            .replace_turn_mcp_bindings(turn_id, binding_records.as_slice(), now_timestamp_secs())
+            .replace_turn_mcp_bindings(
+                request.turn_id.as_str(),
+                binding_records.as_slice(),
+                now_timestamp_secs(),
+            )
             .await
             .map_err(|error| format!("failed to persist turn MCP bindings: {error:#}"))?;
         Ok(AgentMcpMaterialization {
@@ -1247,6 +1507,9 @@ impl AgentMcpToolProvider for McpService {
             available_mcp: state.available_mcp,
             blocked_mcp: state.blocked_mcp,
             diagnostics: state.diagnostics,
+            accepted_capabilities: state.accepted_capabilities,
+            rejected_capabilities: state.rejected_capabilities,
+            mcp_bindings,
         })
     }
 }
@@ -1329,6 +1592,116 @@ fn protocol_runtime_state(state: DomainRuntimeState) -> McpRuntimeState {
         DomainRuntimeState::Stopping => McpRuntimeState::Stopping,
         DomainRuntimeState::Stopped => McpRuntimeState::Stopped,
         DomainRuntimeState::Restarting => McpRuntimeState::Restarting,
+    }
+}
+
+fn mcp_ref_key(value: &str) -> String {
+    value.trim().to_owned()
+}
+
+fn eligible_workspace_mcp_server_ref(reference: &AgentMcpServerRef) -> bool {
+    reference.scope_kind == McpScopeKind::Workspace
+        && !reference.capability_id.trim().is_empty()
+        && !reference.name.trim().is_empty()
+}
+
+fn eligible_workspace_mcp_tool_ref(reference: &AgentMcpToolRef) -> bool {
+    reference.scope_kind == McpScopeKind::Workspace
+        && !reference.capability_id.trim().is_empty()
+        && !reference.server_name.trim().is_empty()
+        && !reference.raw_tool_name.trim().is_empty()
+}
+
+fn mcp_server_capability_kind(reference: &AgentMcpServerRef) -> TurnCapabilityKind {
+    TurnCapabilityKind::McpServer {
+        name: reference.name.clone(),
+        scope_kind: reference.scope_kind,
+    }
+}
+
+fn mcp_tool_capability_kind(reference: &AgentMcpToolRef) -> TurnCapabilityKind {
+    TurnCapabilityKind::McpTool {
+        server_name: reference.server_name.clone(),
+        raw_tool_name: reference.raw_tool_name.clone(),
+        scope_kind: reference.scope_kind,
+    }
+}
+
+fn accept_mcp_server_capability(reference: &AgentMcpServerRef) -> TurnAcceptedCapability {
+    TurnAcceptedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: mcp_server_capability_kind(reference),
+        reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
+    }
+}
+
+fn accept_mcp_tool_capability(reference: &AgentMcpToolRef) -> TurnAcceptedCapability {
+    TurnAcceptedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: mcp_tool_capability_kind(reference),
+        reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
+    }
+}
+
+fn reject_mcp_server_capability(
+    reference: &AgentMcpServerRef,
+    reason: TurnCapabilityRejectedReason,
+    message: &str,
+) -> TurnRejectedCapability {
+    TurnRejectedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: mcp_server_capability_kind(reference),
+        reason,
+        message: message.to_owned(),
+    }
+}
+
+fn reject_mcp_tool_capability(
+    reference: &AgentMcpToolRef,
+    reason: TurnCapabilityRejectedReason,
+    message: &str,
+) -> TurnRejectedCapability {
+    TurnRejectedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: mcp_tool_capability_kind(reference),
+        reason,
+        message: message.to_owned(),
+    }
+}
+
+fn reject_mcp_refs_for_server(
+    state: &mut WorkspaceMcpToolState,
+    server_refs: &[&AgentMcpServerRef],
+    tool_refs: &[&AgentMcpToolRef],
+    matched_server_capability_ids: &mut HashSet<String>,
+    matched_tool_capability_ids: &mut HashSet<String>,
+    reason: TurnCapabilityRejectedReason,
+    message: &str,
+) {
+    for reference in server_refs {
+        matched_server_capability_ids.insert(reference.capability_id.clone());
+        state
+            .rejected_capabilities
+            .push(reject_mcp_server_capability(reference, reason, message));
+    }
+    for reference in tool_refs {
+        matched_tool_capability_ids.insert(reference.capability_id.clone());
+        state
+            .rejected_capabilities
+            .push(reject_mcp_tool_capability(reference, reason, message));
+    }
+}
+
+fn select_mcp_tool(current: &mut Option<McpToolSelection>, candidate: McpToolSelection) {
+    if current
+        .as_ref()
+        .is_none_or(|selected| candidate.priority > selected.priority)
+    {
+        *current = Some(candidate);
     }
 }
 
@@ -1518,6 +1891,225 @@ fn json_object_keys(value: &JsonValue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::bootstrap;
+    use crate::workspace::DEFAULT_WORKSPACE_ID;
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_keystore::MemorySecretStore;
+    use sea_orm::Database;
+    use std::collections::BTreeMap;
+
+    struct TestMcpRuntimeConnector {
+        tools: Vec<&'static str>,
+        fail_auth: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl McpRuntimeConnector for TestMcpRuntimeConnector {
+        async fn connect(
+            &self,
+            _installation: McpServerInstallation,
+            installation_id: String,
+            _resolver: Arc<dyn McpSecretResolver>,
+            now_unix: i64,
+        ) -> Result<Box<dyn pioneer_mcp::McpRuntimeSession>, McpRuntimeError> {
+            if self.fail_auth {
+                return Err(McpRuntimeError::auth_required("missing test secret"));
+            }
+
+            let tools = self
+                .tools
+                .iter()
+                .map(|name| json!({ "name": name }))
+                .collect::<Vec<_>>();
+            let catalog = McpCatalogSnapshot::from_json_values(
+                installation_id,
+                json!({"name":"test-mcp","version":"test"}),
+                None,
+                json!(tools),
+                json!([]),
+                json!([]),
+                json!([]),
+                now_unix,
+            )
+            .expect("test MCP catalog should build");
+            Ok(Box::new(TestMcpRuntimeSession { catalog }))
+        }
+    }
+
+    struct TestMcpRuntimeSession {
+        catalog: McpCatalogSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl pioneer_mcp::McpRuntimeSession for TestMcpRuntimeSession {
+        fn initial_catalog(&self) -> &McpCatalogSnapshot {
+            &self.catalog
+        }
+
+        async fn wait_for_event(&mut self) -> pioneer_mcp::McpSessionEvent {
+            std::future::pending::<pioneer_mcp::McpSessionEvent>().await
+        }
+
+        async fn refresh_catalog(&mut self) -> Result<McpCatalogSnapshot, McpRuntimeError> {
+            Ok(self.catalog.clone())
+        }
+
+        async fn call_tool(
+            &mut self,
+            raw_tool_name: &str,
+            arguments: JsonValue,
+        ) -> Result<McpToolCallResult, McpRuntimeError> {
+            Ok(McpToolCallResult {
+                content: json!([{"type":"text","text":format!("called {raw_tool_name}")}]),
+                structured_content: Some(json!({
+                    "tool": raw_tool_name,
+                    "arguments": arguments,
+                })),
+                is_error: false,
+                duration_ms: 1,
+                meta: None,
+            })
+        }
+
+        async fn shutdown(&mut self) {}
+    }
+
+    async fn test_mcp_service() -> (McpService, Arc<CrudStore>, String) {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        bootstrap(&connection)
+            .await
+            .expect("bootstrap should create default workspace");
+        let crud_store = Arc::new(CrudStore::new(connection));
+        let service = McpService::new(
+            crud_store.clone(),
+            Arc::new(SessionManager::new()),
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+            Arc::new(AtomicU64::new(1)),
+        );
+        (service, crud_store, DEFAULT_WORKSPACE_ID.to_owned())
+    }
+
+    async fn seed_mcp_installation(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        name: &str,
+        enabled: bool,
+        allow_implicit_invocation: bool,
+    ) -> String {
+        let transport = McpTransportConfig::Stdio {
+            command: "test-mcp".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            startup_timeout_ms: 5_000,
+            tool_timeout_ms: 5_000,
+        };
+        let record = McpServerInstallationRecord {
+            id: None,
+            scope_kind: "workspace".to_owned(),
+            scope_key: workspace_id.to_owned(),
+            name: name.to_owned(),
+            display_name: None,
+            source_kind: "config".to_owned(),
+            source_ref: json!({"kind":"test"}).to_string(),
+            transport_kind: "stdio".to_owned(),
+            transport_json: serde_json::to_string(&transport).expect("transport serializes"),
+            auth_json: serde_json::to_string(&McpAuthConfig::default()).expect("auth serializes"),
+            secret_refs_json: "[]".to_owned(),
+            enabled,
+            allow_implicit_invocation,
+            required: false,
+            fingerprint: format!("{name}-fingerprint"),
+            updated_at_unix: 1_700_000_000,
+        };
+        crud_store
+            .upsert_mcp_server_installation(&record, 1_700_000_000)
+            .await
+            .expect("test MCP installation should persist");
+        crud_store
+            .find_mcp_server_installation("workspace", workspace_id, name)
+            .await
+            .expect("test MCP installation lookup should succeed")
+            .and_then(|row| row.id)
+            .expect("test MCP installation should have id")
+    }
+
+    async fn wait_for_catalog(crud_store: &CrudStore, installation_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if crud_store
+                .find_mcp_server_catalog_snapshot(installation_id)
+                .await
+                .expect("catalog lookup should succeed")
+                .is_some()
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "test MCP catalog should be persisted"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_runtime_state(
+        service: &McpService,
+        workspace_id: &str,
+        installation_id: &str,
+        expected: DomainRuntimeState,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = service.runtime_snapshot("workspace", workspace_id).await;
+            if snapshot
+                .get(installation_id)
+                .is_some_and(|snapshot| snapshot.state == expected)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "test MCP runtime should reach {expected:?}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn server_ref(id: &str, name: &str) -> AgentMcpServerRef {
+        AgentMcpServerRef {
+            capability_id: id.to_owned(),
+            label: Some(name.to_owned()),
+            name: name.to_owned(),
+            scope_kind: McpScopeKind::Workspace,
+        }
+    }
+
+    fn tool_ref(id: &str, server_name: &str, raw_tool_name: &str) -> AgentMcpToolRef {
+        AgentMcpToolRef {
+            capability_id: id.to_owned(),
+            label: Some(format!("{server_name}/{raw_tool_name}")),
+            server_name: server_name.to_owned(),
+            raw_tool_name: raw_tool_name.to_owned(),
+            scope_kind: McpScopeKind::Workspace,
+        }
+    }
+
+    fn materialized_tool_names(materialization: &AgentMcpMaterialization) -> Vec<String> {
+        let mut names = materialization
+            .bundles
+            .iter()
+            .flat_map(|bundle| bundle.specs.iter())
+            .map(|configured| configured.spec.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
 
     #[test]
     fn mcp_callable_name_sanitizes_and_prefixes_identity() {
@@ -1543,5 +2135,400 @@ mod tests {
         assert_eq!(first, "mcp_server_a_tool");
         assert_ne!(first, second);
         assert!(second.starts_with("mcp_server_a_tool_"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_capability_validation_accepts_live_server_selection() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send", "domains"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_server_capability".to_owned(),
+                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.rejected_capabilities.is_empty());
+        assert_eq!(materialization.accepted_capabilities.len(), 1);
+        assert_eq!(
+            materialization.accepted_capabilities[0].reason,
+            TurnCapabilityAcceptedReason::ExplicitComposerCapability
+        );
+        assert!(
+            materialization
+                .bundles
+                .iter()
+                .flat_map(|bundle| bundle.specs.iter())
+                .any(|configured| configured.spec.name == "mcp_resend_send")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_capability_validation_accepts_live_tool_selection() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send", "domains"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_tool_capability".to_owned(),
+                explicit_servers: Vec::new(),
+                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.rejected_capabilities.is_empty());
+        assert_eq!(materialization.accepted_capabilities.len(), 1);
+        assert_eq!(
+            materialization.accepted_capabilities[0].id,
+            "mcp-tool:workspace:resend:send"
+        );
+        assert!(
+            materialization
+                .bundles
+                .iter()
+                .flat_map(|bundle| bundle.specs.iter())
+                .any(|configured| configured.spec.name == "mcp_resend_send")
+        );
+        let bindings = crud_store
+            .list_turn_mcp_bindings("turn_mcp_tool_capability")
+            .await
+            .expect("turn MCP bindings should load");
+        let send_binding = bindings
+            .iter()
+            .find(|binding| binding.raw_tool_name == "send")
+            .expect("selected tool should persist a binding");
+        assert_eq!(
+            send_binding.selection_reason,
+            MCP_SELECTION_EXPLICIT_CAPABILITY
+        );
+        assert_eq!(
+            send_binding.capability_id.as_deref(),
+            Some("mcp-tool:workspace:resend:send")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_capability_validation_rejects_unavailable_server() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: true,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_runtime_state(
+            &service,
+            workspace_id.as_str(),
+            installation_id.as_str(),
+            DomainRuntimeState::AuthRequired,
+        )
+        .await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_unavailable_capability".to_owned(),
+                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.accepted_capabilities.is_empty());
+        assert_eq!(materialization.rejected_capabilities.len(), 1);
+        assert_eq!(
+            materialization.rejected_capabilities[0].reason,
+            TurnCapabilityRejectedReason::Unavailable
+        );
+        assert!(
+            materialization.rejected_capabilities[0]
+                .message
+                .contains("not live")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_capability_validation_rejects_missing_tool() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_missing_tool_capability".to_owned(),
+                explicit_servers: Vec::new(),
+                explicit_tools: vec![tool_ref(
+                    "mcp-tool:workspace:resend:missing",
+                    "resend",
+                    "missing",
+                )],
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.accepted_capabilities.is_empty());
+        assert_eq!(materialization.rejected_capabilities.len(), 1);
+        assert_eq!(
+            materialization.rejected_capabilities[0].reason,
+            TurnCapabilityRejectedReason::ToolMissing
+        );
+        assert!(
+            materialization.rejected_capabilities[0]
+                .message
+                .contains("does not expose tool")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_selection_rules_preserve_implicit_policy_without_explicit_refs() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send", "domains"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_implicit_policy".to_owned(),
+                explicit_servers: Vec::new(),
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.accepted_capabilities.is_empty());
+        assert!(materialization.rejected_capabilities.is_empty());
+        assert_eq!(
+            materialized_tool_names(&materialization),
+            vec!["mcp_resend_domains", "mcp_resend_send"]
+        );
+
+        let bindings = crud_store
+            .list_turn_mcp_bindings("turn_mcp_implicit_policy")
+            .await
+            .expect("turn MCP bindings should load");
+        assert_eq!(bindings.len(), 2);
+        for binding in bindings {
+            assert_eq!(binding.selection_reason, MCP_SELECTION_IMPLICIT_POLICY);
+            assert_eq!(binding.capability_id, None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_selection_rules_explicit_tool_attaches_only_selected_tool_when_implicit_false() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send", "domains"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_explicit_tool_only".to_owned(),
+                explicit_servers: Vec::new(),
+                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.rejected_capabilities.is_empty());
+        assert_eq!(materialization.accepted_capabilities.len(), 1);
+        assert_eq!(
+            materialized_tool_names(&materialization),
+            vec!["mcp_resend_send"]
+        );
+
+        let bindings = crud_store
+            .list_turn_mcp_bindings("turn_mcp_explicit_tool_only")
+            .await
+            .expect("turn MCP bindings should load");
+        assert_eq!(bindings.len(), 1);
+        let binding = bindings
+            .first()
+            .expect("explicit tool should persist one MCP binding");
+        assert_eq!(binding.raw_tool_name, "send");
+        assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
+        assert_eq!(
+            binding.capability_id.as_deref(),
+            Some("mcp-tool:workspace:resend:send")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_selection_rules_explicit_server_expands_all_tools_when_implicit_false() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send", "domains"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_explicit_server_all_tools".to_owned(),
+                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.rejected_capabilities.is_empty());
+        assert_eq!(materialization.accepted_capabilities.len(), 1);
+        assert_eq!(
+            materialized_tool_names(&materialization),
+            vec!["mcp_resend_domains", "mcp_resend_send"]
+        );
+
+        let bindings = crud_store
+            .list_turn_mcp_bindings("turn_mcp_explicit_server_all_tools")
+            .await
+            .expect("turn MCP bindings should load");
+        assert_eq!(bindings.len(), 2);
+        for binding in bindings {
+            assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
+            assert_eq!(
+                binding.capability_id.as_deref(),
+                Some("mcp-server:workspace:resend")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_selection_rules_reject_disabled_server() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: false,
+        }));
+        seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", false, false).await;
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_disabled_server".to_owned(),
+                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.accepted_capabilities.is_empty());
+        assert_eq!(materialization.rejected_capabilities.len(), 1);
+        assert_eq!(
+            materialization.rejected_capabilities[0].reason,
+            TurnCapabilityRejectedReason::DisabledByPolicy
+        );
+        assert!(
+            materialization.rejected_capabilities[0]
+                .message
+                .contains("disabled by workspace policy")
+        );
+        assert!(materialization.bundles.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_selection_rules_reject_missing_catalog() {
+        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+            tools: vec!["send"],
+            fail_auth: false,
+        }));
+        let installation_id =
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
+        service
+            .reload_workspace(workspace_id.as_str())
+            .await
+            .expect("MCP workspace should reload");
+        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        crud_store
+            .delete_mcp_server_catalog_snapshot(installation_id.as_str())
+            .await
+            .expect("test MCP catalog snapshot should delete");
+
+        let materialization = service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id,
+                turn_id: "turn_mcp_missing_catalog".to_owned(),
+                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                explicit_tools: Vec::new(),
+            })
+            .await
+            .expect("MCP materialization should succeed");
+
+        assert!(materialization.accepted_capabilities.is_empty());
+        assert_eq!(materialization.rejected_capabilities.len(), 1);
+        assert_eq!(
+            materialization.rejected_capabilities[0].reason,
+            TurnCapabilityRejectedReason::CatalogMissing
+        );
+        assert!(
+            materialization.rejected_capabilities[0]
+                .message
+                .contains("no tool catalog snapshot")
+        );
+        assert!(materialization.bundles.is_empty());
     }
 }

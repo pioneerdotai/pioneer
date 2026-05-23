@@ -66,6 +66,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
     match event {
         AgentDurableEvent::PromptManifestCompiled { thread_id, .. }
         | AgentDurableEvent::TurnSkillsResolved { thread_id, .. }
+        | AgentDurableEvent::TurnCapabilitiesResolved { thread_id, .. }
         | AgentDurableEvent::SkillAuditEvents { thread_id, .. }
         | AgentDurableEvent::TurnLlmContextAppended { thread_id, .. }
         | AgentDurableEvent::ProviderFailureDetected { thread_id, .. }
@@ -601,6 +602,55 @@ impl MessageProcessor {
                         turn_id,
                         error = %format!("{error:#}"),
                         "failed to persist turn skill bindings; continuing without persistence"
+                    );
+                }
+            }
+            AgentDurableEvent::TurnCapabilitiesResolved {
+                thread_id,
+                turn_id,
+                accepted,
+                rejected,
+                mcp_bindings,
+            } => {
+                if !mcp_bindings.is_empty() {
+                    let event_timestamp = now_timestamp_secs();
+                    let binding_records = mcp_bindings
+                        .iter()
+                        .map(|binding| pioneer_crud::TurnMcpBindingRecord {
+                            server_installation_id: binding.server_installation_id.clone(),
+                            server_name: binding.server_name.clone(),
+                            raw_tool_name: binding.raw_tool_name.clone(),
+                            callable_name: binding.callable_name.clone(),
+                            catalog_version: binding.catalog_version.clone(),
+                            fingerprint: binding.fingerprint.clone(),
+                            selection_reason: binding.selection_reason.clone(),
+                            capability_id: binding.capability_id.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if let Err(error) = self
+                        .crud_store
+                        .replace_turn_mcp_bindings(
+                            turn_id.as_str(),
+                            binding_records.as_slice(),
+                            event_timestamp,
+                        )
+                        .await
+                    {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to persist turn MCP bindings; continuing without persistence"
+                        );
+                    }
+                }
+                if !rejected.is_empty() {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        accepted = accepted.len(),
+                        rejected = rejected.len(),
+                        "turn capability resolution rejected selected capabilities"
                     );
                 }
             }

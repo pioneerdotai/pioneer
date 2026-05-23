@@ -14,10 +14,10 @@ use pioneer_protocol::{
     SkillsUpdateResponse,
 };
 use pioneer_skills::{
-    DependencyCheckInput, SkillCatalogLoadParams, SkillPolicy, SkillPolicyKey, SkillPolicySet,
-    SkillResolutionInput, SkillSecurityPolicy, SkillSourceKind, SkillValidationPolicy,
-    is_qualified_skill_slug as is_qualified_slug, load_catalog, merge_policy, qualified_skill_slug,
-    resolve_skills,
+    DependencyCheckInput, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy, SkillPolicyKey,
+    SkillPolicySet, SkillResolutionInput, SkillSecurityPolicy, SkillSourceKind,
+    SkillValidationPolicy, is_qualified_skill_slug as is_qualified_slug, load_catalog,
+    merge_policy, qualified_skill_slug, resolve_skills,
 };
 use serde_json::json;
 use std::collections::HashMap;

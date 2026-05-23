@@ -36,6 +36,7 @@ pub struct TurnStartMaterialization {
     pub thread: Thread,
     pub turn: pioneer_protocol::Turn,
     pub input: Vec<pioneer_protocol::UserInput>,
+    pub capabilities: Vec<pioneer_protocol::TurnCapability>,
     pub sandbox_mode: SandboxMode,
 }
 
@@ -524,6 +525,7 @@ impl ThreadManager {
             thread: entry.thread.clone(),
             turn: started_notification.turn.clone(),
             input: params.input.clone(),
+            capabilities: params.capabilities.clone(),
             sandbox_mode: entry.sandbox_mode,
         };
 
@@ -1113,6 +1115,7 @@ mod tests {
                         text: "long running".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    capabilities: Vec::new(),
                     model: None,
                     model_provider: None,
                     sandbox_policy: None,
@@ -1243,6 +1246,7 @@ mod tests {
                         text: "hello world".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    capabilities: Vec::new(),
                     model: None,
                     model_provider: None,
                     sandbox_policy: None,
@@ -1283,6 +1287,7 @@ mod tests {
                         text: "override model".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
                 },
@@ -1308,6 +1313,7 @@ mod tests {
                     thread_id: "thr_missing".to_owned(),
                     turn_id: "turn_000000000000000002".to_owned(),
                     input: Vec::new(),
+                    capabilities: Vec::new(),
                     model: None,
                     model_provider: None,
                     sandbox_policy: None,
@@ -1347,6 +1353,7 @@ mod tests {
                         text: "hello world".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
                 },
@@ -1374,6 +1381,7 @@ mod tests {
                         text: "second".to_owned(),
                         text_elements: Vec::new(),
                     }],
+                    capabilities: Vec::new(),
                     model: None,
                     model_provider: None,
                     sandbox_policy: None,

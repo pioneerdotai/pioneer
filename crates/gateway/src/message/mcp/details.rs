@@ -412,6 +412,8 @@ fn binding_summary_from_record(
         callable_name: record.callable_name,
         catalog_version: record.catalog_version,
         fingerprint: record.fingerprint,
+        selection_reason: record.selection_reason,
+        capability_id: record.capability_id,
     }
 }
 
