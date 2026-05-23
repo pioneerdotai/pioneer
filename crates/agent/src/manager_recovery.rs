@@ -65,6 +65,7 @@ mod tests {
                 text: "retry".to_owned(),
                 text_elements: Vec::new(),
             }],
+            capabilities: Vec::new(),
             resolved_artifacts: Vec::<ResolvedArtifactInput>::new(),
             runtime_environment: HashMap::new(),
             history: vec![ChatMessage::user("retry")],

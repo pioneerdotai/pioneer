@@ -10,7 +10,9 @@ use crate::hooks::{
     EffectiveTurnPromptContextSet, run_agent_turn_post_turn_hook_phase,
 };
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
-use pioneer_protocol::{AgentDurableEvent, RecoveryAttemptContext, ThreadMode, UserInput};
+use pioneer_protocol::{
+    AgentDurableEvent, RecoveryAttemptContext, ThreadMode, TurnCapability, UserInput,
+};
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::future::Future;
 use std::pin::Pin;
@@ -66,6 +68,7 @@ pub(super) async fn run_agent_loop(
                 provider_name,
                 workspace_skill_policies,
                 input,
+                capabilities,
                 resolved_artifacts,
                 runtime_environment,
                 history,
@@ -84,6 +87,7 @@ pub(super) async fn run_agent_loop(
                     provider_name: provider_name.clone(),
                     workspace_skill_policies,
                     input,
+                    capabilities,
                     resolved_artifacts,
                     runtime_environment,
                     history,
@@ -652,6 +656,7 @@ fn spawn_turn_task(
             turn_request.hook_runtime_context,
             turn_request.workspace_skill_policies,
             turn_request.input,
+            turn_request.capabilities,
             turn_request.resolved_artifacts,
             turn_request.runtime_environment,
             turn_request.history,
@@ -701,6 +706,7 @@ async fn execute_turn_flow(
         super::WorkspaceSkillPolicy,
     >,
     input: Vec<UserInput>,
+    capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<super::ResolvedArtifactInput>,
     runtime_environment: std::collections::HashMap<String, String>,
     history: Vec<ChatMessage>,
@@ -729,6 +735,7 @@ async fn execute_turn_flow(
             hook_runtime_context,
             workspace_skill_policies,
             input,
+            capabilities,
             resolved_artifacts,
             runtime_environment,
             history,

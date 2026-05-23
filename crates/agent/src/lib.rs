@@ -7,8 +7,9 @@ mod manager_tests;
 
 use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream,
-    ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnItemType, UserInput,
+    AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream, McpScopeKind,
+    ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnCapability, TurnItemType,
+    UserInput,
 };
 #[cfg(test)]
 use pioneer_protocol::{
@@ -241,6 +242,34 @@ pub struct AgentMcpMaterialization {
     pub available_mcp: Vec<String>,
     pub blocked_mcp: Vec<String>,
     pub diagnostics: Vec<String>,
+    pub accepted_capabilities: Vec<pioneer_protocol::TurnAcceptedCapability>,
+    pub rejected_capabilities: Vec<pioneer_protocol::TurnRejectedCapability>,
+    pub mcp_bindings: Vec<pioneer_protocol::McpTurnBindingSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentMcpMaterializationRequest {
+    pub workspace_id: String,
+    pub turn_id: String,
+    pub explicit_servers: Vec<AgentMcpServerRef>,
+    pub explicit_tools: Vec<AgentMcpToolRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpServerRef {
+    pub capability_id: String,
+    pub label: Option<String>,
+    pub name: String,
+    pub scope_kind: McpScopeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpToolRef {
+    pub capability_id: String,
+    pub label: Option<String>,
+    pub server_name: String,
+    pub raw_tool_name: String,
+    pub scope_kind: McpScopeKind,
 }
 
 #[async_trait::async_trait]
@@ -249,8 +278,7 @@ pub trait AgentMcpToolProvider: Send + Sync {
 
     async fn materialize_mcp_tools(
         &self,
-        workspace_id: &str,
-        turn_id: &str,
+        request: AgentMcpMaterializationRequest,
     ) -> Result<AgentMcpMaterialization, String>;
 }
 
@@ -366,6 +394,13 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         bindings: Vec<pioneer_protocol::TurnSkillBinding>,
+    },
+    TurnCapabilitiesResolved {
+        thread_id: String,
+        turn_id: String,
+        accepted: Vec<pioneer_protocol::TurnAcceptedCapability>,
+        rejected: Vec<pioneer_protocol::TurnRejectedCapability>,
+        mcp_bindings: Vec<pioneer_protocol::McpTurnBindingSummary>,
     },
     SkillAuditEvents {
         thread_id: String,
@@ -1228,6 +1263,7 @@ struct ActiveTurnRequest {
     provider_name: String,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
+    capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
@@ -1261,6 +1297,7 @@ enum AgentCommand {
         provider_name: String,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
@@ -1621,7 +1658,7 @@ impl AgentManager {
         input: Vec<UserInput>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts(
+        self.start_turn_with_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -1630,6 +1667,35 @@ impl AgentManager {
             workspace_skill_policies,
             input,
             Vec::new(),
+            history,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_capabilities(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts_and_environment(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            Vec::new(),
+            HashMap::new(),
             history,
         )
         .await
@@ -1656,6 +1722,7 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             input,
+            Vec::new(),
             resolved_artifacts,
             HashMap::new(),
             history,
@@ -1673,6 +1740,7 @@ impl AgentManager {
         provider_name: &str,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
@@ -1686,6 +1754,7 @@ impl AgentManager {
             provider_name,
             workspace_skill_policies,
             input,
+            capabilities,
             resolved_artifacts,
             runtime_environment,
             history,
@@ -1704,6 +1773,7 @@ impl AgentManager {
         provider_name: &str,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
@@ -1727,6 +1797,7 @@ impl AgentManager {
                 provider_name: provider_name.to_owned(),
                 workspace_skill_policies,
                 input,
+                capabilities,
                 resolved_artifacts,
                 runtime_environment,
                 history,

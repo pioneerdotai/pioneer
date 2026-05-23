@@ -28,10 +28,11 @@ use crate::hooks::{
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, AgentTurnHookRuntimeContext, ResolvedArtifactInput,
-    RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnToolContext,
-    TurnToolMaterialization, TurnToolProvider,
+    AgentMcpMaterializationRequest, AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
+    AgentTurnHookRuntimeContext, ResolvedArtifactInput, RetainedToolLlmContext,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
+    ToolLoopConfig, TurnExecutionControl, TurnToolContext, TurnToolMaterialization,
+    TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -60,14 +61,19 @@ use pioneer_protocol::{
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
     PromptManifestProfile, ProviderFailureDetails, RecoveryAttemptContext, ThreadMode,
-    ToolRecoveryPolicySnapshot, TurnItem, TurnItemType, UserInput, generate_id,
+    ToolRecoveryPolicySnapshot, TurnAcceptedCapability, TurnCapability,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem,
+    TurnItemType, TurnRejectedCapability, UserInput, generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
     MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderRegistry,
     ProviderToolCall, ToolDefinition, infer_mime_from_reference,
 };
-use pioneer_skills::SkillPolicyKey;
+use pioneer_skills::{
+    ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
+    SkillResolvedReason,
+};
 use pioneer_tools::{
     FinalToolVisibility, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
     RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
@@ -76,7 +82,7 @@ use pioneer_tools::{
     build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
@@ -100,6 +106,25 @@ struct PendingToolUiState {
     output_policy: Option<pioneer_protocol::ToolOutputPolicySnapshot>,
     latest_observation: Option<pioneer_protocol::ToolObservation>,
     started_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnCapabilityResolutionInput<'a> {
+    capabilities: &'a [TurnCapability],
+}
+
+#[derive(Debug, Default)]
+struct TurnCapabilityResolutionOutput {
+    skill_refs: Vec<SkillExplicitRef>,
+    mcp_server_refs: Vec<AgentMcpServerRef>,
+    mcp_tool_refs: Vec<AgentMcpToolRef>,
+    rejected: Vec<TurnRejectedCapability>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TurnCapabilityResolutionSummary {
+    accepted: Vec<TurnAcceptedCapability>,
+    rejected: Vec<TurnRejectedCapability>,
 }
 
 #[derive(Debug)]
@@ -442,6 +467,468 @@ fn normalize_optional_prompt(content: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+
+fn normalize_skill_capability_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn normalize_mcp_capability_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn rejected_capability(
+    capability: &TurnCapability,
+    reason: TurnCapabilityRejectedReason,
+    message: impl Into<String>,
+) -> TurnRejectedCapability {
+    TurnRejectedCapability {
+        id: capability.id.clone(),
+        label: capability.label.clone(),
+        kind: capability.kind.clone(),
+        reason,
+        message: message.into(),
+    }
+}
+
+fn resolve_turn_capability_input(
+    input: TurnCapabilityResolutionInput<'_>,
+) -> TurnCapabilityResolutionOutput {
+    let mut normalized = TurnCapabilityResolutionOutput::default();
+    let mut seen = HashSet::<String>::new();
+
+    for capability in input.capabilities {
+        if capability.id.trim().is_empty() {
+            normalized.rejected.push(rejected_capability(
+                capability,
+                TurnCapabilityRejectedReason::InvalidInput,
+                "Capability is missing an id.",
+            ));
+            continue;
+        }
+
+        let canonical_key = match &capability.kind {
+            TurnCapabilityKind::Skill { slug, source_kind } => {
+                let slug = slug.trim();
+                let source_kind = source_kind.trim();
+                if slug.is_empty() || source_kind.is_empty() {
+                    normalized.rejected.push(rejected_capability(
+                        capability,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "Skill capability is missing a slug or source kind.",
+                    ));
+                    continue;
+                }
+                format!(
+                    "skill:{}:{}",
+                    source_kind.to_ascii_lowercase(),
+                    normalize_skill_capability_token(slug)
+                )
+            }
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    normalized.rejected.push(rejected_capability(
+                        capability,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "MCP server capability is missing a server name.",
+                    ));
+                    continue;
+                }
+                format!(
+                    "mcp_server:{}:{}",
+                    scope_kind.as_str(),
+                    normalize_mcp_capability_token(name)
+                )
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => {
+                let server_name = server_name.trim();
+                let raw_tool_name = raw_tool_name.trim();
+                if server_name.is_empty() || raw_tool_name.is_empty() {
+                    normalized.rejected.push(rejected_capability(
+                        capability,
+                        TurnCapabilityRejectedReason::InvalidInput,
+                        "MCP tool capability is missing a server name or tool name.",
+                    ));
+                    continue;
+                }
+                format!(
+                    "mcp_tool:{}:{}:{}",
+                    scope_kind.as_str(),
+                    normalize_mcp_capability_token(server_name),
+                    normalize_mcp_capability_token(raw_tool_name)
+                )
+            }
+        };
+
+        if !seen.insert(canonical_key) {
+            normalized.rejected.push(rejected_capability(
+                capability,
+                TurnCapabilityRejectedReason::Duplicate,
+                "Capability was selected more than once.",
+            ));
+            continue;
+        }
+
+        match &capability.kind {
+            TurnCapabilityKind::Skill { slug, source_kind } => {
+                normalized.skill_refs.push(SkillExplicitRef {
+                    capability_id: capability.id.clone(),
+                    label: capability.label.clone(),
+                    slug: slug.trim().to_owned(),
+                    source_kind: source_kind.trim().to_owned(),
+                });
+            }
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                normalized.mcp_server_refs.push(AgentMcpServerRef {
+                    capability_id: capability.id.clone(),
+                    label: capability.label.clone(),
+                    name: name.trim().to_owned(),
+                    scope_kind: *scope_kind,
+                });
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => {
+                normalized.mcp_tool_refs.push(AgentMcpToolRef {
+                    capability_id: capability.id.clone(),
+                    label: capability.label.clone(),
+                    server_name: server_name.trim().to_owned(),
+                    raw_tool_name: raw_tool_name.trim().to_owned(),
+                    scope_kind: *scope_kind,
+                });
+            }
+        }
+    }
+
+    normalized
+}
+
+fn normalize_turn_capabilities(capabilities: &[TurnCapability]) -> TurnCapabilityResolutionOutput {
+    resolve_turn_capability_input(TurnCapabilityResolutionInput { capabilities })
+}
+
+fn skill_capability_kind(reference: &SkillExplicitRef) -> TurnCapabilityKind {
+    TurnCapabilityKind::Skill {
+        slug: reference.slug.clone(),
+        source_kind: reference.source_kind.clone(),
+    }
+}
+
+fn accepted_skill_capability(reference: &SkillExplicitRef) -> TurnAcceptedCapability {
+    TurnAcceptedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: skill_capability_kind(reference),
+        reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
+    }
+}
+
+fn rejected_skill_capability(
+    reference: &SkillExplicitRef,
+    reason: TurnCapabilityRejectedReason,
+    message: impl Into<String>,
+) -> TurnRejectedCapability {
+    TurnRejectedCapability {
+        id: reference.capability_id.clone(),
+        label: reference.label.clone(),
+        kind: skill_capability_kind(reference),
+        reason,
+        message: message.into(),
+    }
+}
+
+fn skill_ref_matches_resolved_skill(reference: &SkillExplicitRef, skill: &ResolvedSkill) -> bool {
+    if !reference.source_kind.trim().is_empty()
+        && reference.source_kind.as_str() != skill.definition.identity.source_kind.as_db_value()
+    {
+        return false;
+    }
+
+    let normalized_ref = normalize_skill_capability_token(reference.slug.as_str());
+    if normalized_ref.is_empty() {
+        return false;
+    }
+
+    [
+        skill.slug.as_str(),
+        skill.definition.identity.slug.as_str(),
+        skill.definition.identity.name.as_str(),
+        skill.definition.identity.display_name.as_str(),
+    ]
+    .into_iter()
+    .any(|candidate| normalized_ref == normalize_skill_capability_token(candidate))
+}
+
+fn skill_ref_matches_excluded_skill(reference: &SkillExplicitRef, skill: &ExcludedSkill) -> bool {
+    if !reference.source_kind.trim().is_empty() && reference.source_kind != skill.source_kind {
+        return false;
+    }
+
+    let normalized_ref = normalize_skill_capability_token(reference.slug.as_str());
+    let normalized_slug = normalize_skill_capability_token(skill.slug.as_str());
+    normalized_ref == normalized_slug
+        || skill
+            .slug
+            .rsplit('/')
+            .next()
+            .is_some_and(|slug| normalized_ref == normalize_skill_capability_token(slug))
+}
+
+fn skill_rejection_reason(reason: &SkillExcludedReason) -> TurnCapabilityRejectedReason {
+    match reason {
+        SkillExcludedReason::DisabledByPolicy => TurnCapabilityRejectedReason::DisabledByPolicy,
+        SkillExcludedReason::DependencyMissing => TurnCapabilityRejectedReason::DependencyMissing,
+        SkillExcludedReason::ValidationRejected | SkillExcludedReason::InvalidMetadata => {
+            TurnCapabilityRejectedReason::ValidationRejected
+        }
+        SkillExcludedReason::TrustBlocked | SkillExcludedReason::SecurityBlocked => {
+            TurnCapabilityRejectedReason::SecurityBlocked
+        }
+        SkillExcludedReason::DisabledModelInvocation => TurnCapabilityRejectedReason::Unavailable,
+        SkillExcludedReason::NotMatched => TurnCapabilityRejectedReason::NotFound,
+    }
+}
+
+fn skill_rejection_message(reference: &SkillExplicitRef, reason: &SkillExcludedReason) -> String {
+    let label = reference
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(reference.slug.as_str());
+    match reason {
+        SkillExcludedReason::DisabledByPolicy => {
+            format!("Skill `{label}` is disabled by workspace policy.")
+        }
+        SkillExcludedReason::DependencyMissing => {
+            format!("Skill `{label}` is missing required dependencies.")
+        }
+        SkillExcludedReason::ValidationRejected
+        | SkillExcludedReason::InvalidMetadata
+        | SkillExcludedReason::TrustBlocked
+        | SkillExcludedReason::SecurityBlocked => {
+            format!("Skill `{label}` did not pass validation.")
+        }
+        SkillExcludedReason::DisabledModelInvocation => {
+            format!("Skill `{label}` is not available for model invocation.")
+        }
+        SkillExcludedReason::NotMatched => format!("Skill `{label}` is not available."),
+    }
+}
+
+fn resolve_skill_capability_summary(
+    explicit_refs: &[SkillExplicitRef],
+    resolution: &skills::TurnSkillResolution,
+) -> TurnCapabilityResolutionSummary {
+    let mut summary = TurnCapabilityResolutionSummary::default();
+
+    for reference in explicit_refs {
+        if resolution.result.active.iter().any(|skill| {
+            matches!(skill.reason, SkillResolvedReason::ExplicitCapability)
+                && skill_ref_matches_resolved_skill(reference, skill)
+        }) {
+            summary.accepted.push(accepted_skill_capability(reference));
+            continue;
+        }
+
+        if let Some(excluded) = resolution
+            .result
+            .excluded
+            .iter()
+            .find(|skill| skill_ref_matches_excluded_skill(reference, skill))
+        {
+            summary.rejected.push(rejected_skill_capability(
+                reference,
+                skill_rejection_reason(&excluded.reason),
+                skill_rejection_message(reference, &excluded.reason),
+            ));
+            continue;
+        }
+
+        let label = reference
+            .label
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or(reference.slug.as_str());
+        summary.rejected.push(rejected_skill_capability(
+            reference,
+            TurnCapabilityRejectedReason::NotFound,
+            format!("Skill `{label}` is not installed or not available in this workspace."),
+        ));
+    }
+
+    summary
+}
+
+fn unsupported_mcp_capability_summary(
+    server_refs: &[AgentMcpServerRef],
+    tool_refs: &[AgentMcpToolRef],
+) -> TurnCapabilityResolutionSummary {
+    let mut summary = TurnCapabilityResolutionSummary::default();
+    for reference in server_refs {
+        summary.rejected.push(TurnRejectedCapability {
+            id: reference.capability_id.clone(),
+            label: reference.label.clone(),
+            kind: TurnCapabilityKind::McpServer {
+                name: reference.name.clone(),
+                scope_kind: reference.scope_kind,
+            },
+            reason: TurnCapabilityRejectedReason::ProviderUnsupported,
+            message: "MCP capabilities require a tool-calling model.".to_owned(),
+        });
+    }
+    for reference in tool_refs {
+        summary.rejected.push(TurnRejectedCapability {
+            id: reference.capability_id.clone(),
+            label: reference.label.clone(),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: reference.server_name.clone(),
+                raw_tool_name: reference.raw_tool_name.clone(),
+                scope_kind: reference.scope_kind,
+            },
+            reason: TurnCapabilityRejectedReason::ProviderUnsupported,
+            message: "MCP capabilities require a tool-calling model.".to_owned(),
+        });
+    }
+    summary
+}
+
+fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
+    if let Some(label) = rejected.label.as_deref()
+        && !label.trim().is_empty()
+    {
+        return label.to_owned();
+    }
+
+    match &rejected.kind {
+        TurnCapabilityKind::Skill { slug, .. } => slug.clone(),
+        TurnCapabilityKind::McpServer { name, .. } => name.clone(),
+        TurnCapabilityKind::McpTool {
+            server_name,
+            raw_tool_name,
+            ..
+        } => format!("{server_name}/{raw_tool_name}"),
+    }
+}
+
+fn capability_rejection_warning_message(rejected: &[TurnRejectedCapability]) -> String {
+    match rejected {
+        [] => String::new(),
+        [single] => format!(
+            "Capability `{}` was not attached: {}",
+            capability_display_label(single),
+            single.message
+        ),
+        many => {
+            let details = many
+                .iter()
+                .take(3)
+                .map(|item| format!("{}: {}", capability_display_label(item), item.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if many.len() > 3 {
+                format!(
+                    "{} selected capabilities were not attached: {}; and {} more.",
+                    many.len(),
+                    details,
+                    many.len().saturating_sub(3)
+                )
+            } else {
+                format!(
+                    "{} selected capabilities were not attached: {}.",
+                    many.len(),
+                    details
+                )
+            }
+        }
+    }
+}
+
+fn capability_manifest_diagnostics(
+    rejected: &[TurnRejectedCapability],
+) -> Vec<PromptManifestDiagnostic> {
+    rejected
+        .iter()
+        .map(|capability| PromptManifestDiagnostic {
+            code: PromptManifestDiagnosticCode::CapabilityRejected,
+            message: format!(
+                "Capability `{}` was rejected: {}",
+                capability_display_label(capability),
+                capability.message
+            ),
+            file: None,
+            section_id: None,
+            hook_source: None,
+        })
+        .collect()
+}
+
+async fn emit_capability_resolution_events(
+    event_tx: &AgentEventHub,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    accepted: &[TurnAcceptedCapability],
+    rejected: &[TurnRejectedCapability],
+    mcp_bindings: &[pioneer_protocol::McpTurnBindingSummary],
+) -> Result<(), ChatTurnError> {
+    if accepted.is_empty() && rejected.is_empty() && mcp_bindings.is_empty() {
+        return Ok(());
+    }
+
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::TurnCapabilitiesResolved {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            accepted: accepted.to_vec(),
+            rejected: rejected.to_vec(),
+            mcp_bindings: mcp_bindings.to_vec(),
+        },
+    )
+    .await?;
+
+    if !rejected.is_empty() {
+        emit_durable_event(
+            event_tx,
+            AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: generate_id(TURN_ITEM_ID_LEN),
+                        level: pioneer_protocol::SystemEventLevel::Warning,
+                        message: capability_rejection_warning_message(rejected),
+                        code: Some("capability.rejected".to_owned()),
+                        details: Some(json!({ "rejected": rejected })),
+                    },
+                },
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -845,6 +1332,7 @@ fn prompt_diagnostic_code(code: PromptDiagnosticCode) -> PromptManifestDiagnosti
 fn prompt_manifest_from_bundle(
     bundle: &CompiledPromptBundle,
     hook_metadata: &EffectiveTurnPromptManifestHookMetadata,
+    capability_diagnostics: &[PromptManifestDiagnostic],
 ) -> PromptManifest {
     let mut diagnostics = bundle
         .diagnostics
@@ -858,6 +1346,7 @@ fn prompt_manifest_from_bundle(
         })
         .collect::<Vec<_>>();
     diagnostics.extend(prompt_manifest_hook_diagnostics(hook_metadata));
+    diagnostics.extend(capability_diagnostics.iter().cloned());
 
     PromptManifest {
         compiler_version: bundle.compiler_version.to_owned(),
@@ -1083,6 +1572,7 @@ pub(super) async fn execute_chat_turn_flow(
     hook_runtime_context: AgentTurnHookRuntimeContext,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
+    capabilities: Vec<TurnCapability>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
@@ -1130,6 +1620,7 @@ pub(super) async fn execute_chat_turn_flow(
             history,
             user_message.clone(),
             &input,
+            &capabilities,
             &workspace_skill_policies,
             runtime_environment,
             retained_llm_context,
@@ -1297,11 +1788,21 @@ async fn materialize_mcp_tooling(
     workspace_id: &str,
     turn_id: &str,
     thread_id: &str,
+    explicit_servers: &[AgentMcpServerRef],
+    explicit_tools: &[AgentMcpToolRef],
 ) -> AgentMcpMaterialization {
     let Some(provider) = provider else {
         return AgentMcpMaterialization::default();
     };
-    match provider.materialize_mcp_tools(workspace_id, turn_id).await {
+    match provider
+        .materialize_mcp_tools(AgentMcpMaterializationRequest {
+            workspace_id: workspace_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            explicit_servers: explicit_servers.to_vec(),
+            explicit_tools: explicit_tools.to_vec(),
+        })
+        .await
+    {
         Ok(materialization) => materialization,
         Err(error) => {
             warn!(
@@ -1562,6 +2063,7 @@ async fn execute_agent_provider_response(
     history: Vec<ChatMessage>,
     user_message: ChatMessage,
     input: &[UserInput],
+    capabilities: &[TurnCapability],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     runtime_environment: HashMap<String, String>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
@@ -1632,10 +2134,13 @@ async fn execute_agent_provider_response(
     let mcp_availability =
         load_mcp_availability(mcp_tool_provider.as_ref(), workspace_id, thread_id, turn_id).await;
 
-    let skills_resolution = match skills::resolve_turn_skills(
+    let normalized_capabilities = normalize_turn_capabilities(capabilities);
+
+    let skills_resolution = match skills::resolve_turn_skills_with_explicit_refs(
         workdir.as_path(),
         workspace_id,
         input,
+        normalized_capabilities.skill_refs.as_slice(),
         &tool_loop_config.skills,
         workspace_skill_policies,
         &mcp_availability,
@@ -1663,6 +2168,11 @@ async fn execute_agent_provider_response(
             }
         }
     };
+
+    let skill_capability_summary = resolve_skill_capability_summary(
+        normalized_capabilities.skill_refs.as_slice(),
+        &skills_resolution,
+    );
 
     let bindings = skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice());
 
@@ -1737,6 +2247,27 @@ async fn execute_agent_provider_response(
     }
 
     if !provider_tool_calling {
+        let unsupported_mcp_summary = unsupported_mcp_capability_summary(
+            normalized_capabilities.mcp_server_refs.as_slice(),
+            normalized_capabilities.mcp_tool_refs.as_slice(),
+        );
+        let accepted_capabilities = skill_capability_summary.accepted.clone();
+        let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+        rejected_capabilities.extend(skill_capability_summary.rejected.clone());
+        rejected_capabilities.extend(unsupported_mcp_summary.rejected);
+        emit_capability_resolution_events(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            accepted_capabilities.as_slice(),
+            rejected_capabilities.as_slice(),
+            &[],
+        )
+        .await?;
+        let capability_diagnostics =
+            capability_manifest_diagnostics(rejected_capabilities.as_slice());
+
         let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
@@ -1847,6 +2378,7 @@ async fn execute_agent_provider_response(
                         effective_prompt_context_set.manifest_metadata(),
                         effective_prompt_section_set.manifest_metadata(),
                     ),
+                    capability_diagnostics.as_slice(),
                 ),
             },
         )
@@ -1904,8 +2436,15 @@ async fn execute_agent_provider_response(
         }
     }
 
-    let mcp_materialization =
-        materialize_mcp_tooling(mcp_tool_provider.as_ref(), workspace_id, turn_id, thread_id).await;
+    let mcp_materialization = materialize_mcp_tooling(
+        mcp_tool_provider.as_ref(),
+        workspace_id,
+        turn_id,
+        thread_id,
+        normalized_capabilities.mcp_server_refs.as_slice(),
+        normalized_capabilities.mcp_tool_refs.as_slice(),
+    )
+    .await;
     for diagnostic in &mcp_materialization.diagnostics {
         warn!(
             thread_id,
@@ -1914,6 +2453,23 @@ async fn execute_agent_provider_response(
             "MCP dynamic tool materialization reported diagnostic"
         );
     }
+    let mut accepted_capabilities = skill_capability_summary.accepted.clone();
+    accepted_capabilities.extend(mcp_materialization.accepted_capabilities.clone());
+    let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+    rejected_capabilities.extend(skill_capability_summary.rejected.clone());
+    rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
+    emit_capability_resolution_events(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        accepted_capabilities.as_slice(),
+        rejected_capabilities.as_slice(),
+        mcp_materialization.mcp_bindings.as_slice(),
+    )
+    .await?;
+    let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
+
     let skill_tool_materialization = skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
         &tool_loop_config.skills,
@@ -2168,6 +2724,7 @@ async fn execute_agent_provider_response(
                     effective_prompt_context_set.manifest_metadata(),
                     effective_prompt_section_set.manifest_metadata(),
                 ),
+                capability_diagnostics.as_slice(),
             ),
         },
     )
@@ -2324,6 +2881,7 @@ async fn execute_agent_provider_response(
                                     effective_prompt_context_set.manifest_metadata(),
                                     effective_prompt_section_set.manifest_metadata(),
                                 ),
+                                capability_diagnostics.as_slice(),
                             ),
                         },
                     )
@@ -2399,6 +2957,7 @@ async fn execute_agent_provider_response(
                                 effective_prompt_context_set.manifest_metadata(),
                                 no_tool_prompt_section_set.manifest_metadata(),
                             ),
+                            capability_diagnostics.as_slice(),
                         ),
                     },
                 )
@@ -2492,6 +3051,7 @@ async fn execute_agent_provider_response(
                                         effective_prompt_context_set.manifest_metadata(),
                                         effective_prompt_section_set.manifest_metadata(),
                                     ),
+                                    capability_diagnostics.as_slice(),
                                 ),
                             },
                         )
@@ -3256,6 +3816,7 @@ async fn execute_agent_provider_response(
                                 effective_prompt_context_set.manifest_metadata(),
                                 effective_prompt_section_set.manifest_metadata(),
                             ),
+                            capability_diagnostics.as_slice(),
                         ),
                     },
                 )
@@ -3445,7 +4006,7 @@ fn build_user_message(
                         .push(content_part_for_resolved_artifact(resolved));
                 }
             }
-            UserInput::Text { .. } | UserInput::Skill { .. } | UserInput::Mention { .. } => {}
+            UserInput::Text { .. } | UserInput::Mention { .. } => {}
         }
     }
 
@@ -3632,6 +4193,7 @@ mod tests {
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
         apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
         build_user_message, compile_agent_prompt_bundle_with_prompt_root,
+        normalize_turn_capabilities, resolve_skill_capability_summary,
         retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
         retain_chat_mode_attachment_messages,
     };
@@ -3640,10 +4202,20 @@ mod tests {
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
-    use pioneer_protocol::{TurnItemType, UserInput};
+    use pioneer_protocol::{
+        McpScopeKind, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+        TurnCapabilityRejectedReason, TurnItemType, UserInput,
+    };
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
         Role,
+    };
+    use pioneer_skills::compile::CompileSkillInput;
+    use pioneer_skills::contract::default_skill_conformance;
+    use pioneer_skills::{
+        ExcludedSkill, ResolvedSkill, SkillDependencies, SkillExcludedReason, SkillExplicitRef,
+        SkillResolutionResult, SkillResolvedReason, SkillRuntimePlan, SkillSourceKind,
+        SkillTrustLevel, compile_skill_definition,
     };
     use pioneer_tools::{
         BuiltinToolDomain, ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass,
@@ -3651,7 +4223,7 @@ mod tests {
         ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutcome, ToolOutput, ToolSpec,
         WebToolsConfig, dynamic_unknown_output_policy,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
@@ -3666,6 +4238,274 @@ mod tests {
         ) -> Result<Box<dyn ToolOutput>, ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
+    }
+
+    fn skill_capability(id: &str, slug: &str) -> TurnCapability {
+        TurnCapability {
+            id: id.to_owned(),
+            label: Some(slug.to_owned()),
+            kind: TurnCapabilityKind::Skill {
+                slug: slug.to_owned(),
+                source_kind: "user".to_owned(),
+            },
+        }
+    }
+
+    fn explicit_skill_ref(id: &str, slug: &str) -> SkillExplicitRef {
+        SkillExplicitRef {
+            capability_id: id.to_owned(),
+            label: Some(slug.to_owned()),
+            slug: slug.to_owned(),
+            source_kind: "user".to_owned(),
+        }
+    }
+
+    fn test_skill_definition(slug: &str) -> pioneer_skills::SkillDefinition {
+        let conformance = default_skill_conformance();
+        compile_skill_definition(CompileSkillInput {
+            owner: "workspace".to_owned(),
+            slug: slug.to_owned(),
+            name: slug.to_owned(),
+            display_name: slug.to_owned(),
+            description: "desc".to_owned(),
+            body: "body".to_owned(),
+            source_kind: SkillSourceKind::User,
+            source_root: "/tmp".to_owned(),
+            skill_dir: format!("/tmp/{slug}"),
+            skill_file: format!("/tmp/{slug}/SKILL.md"),
+            version_hint: None,
+            fingerprint: format!("fp-{slug}"),
+            user_invocable: true,
+            disable_model_invocation: false,
+            paths: Vec::new(),
+            allowed_tools: Vec::new(),
+            runtime_tools: Vec::new(),
+            trust_level: SkillTrustLevel::Community,
+            dependencies: SkillDependencies::default(),
+            license: None,
+            compatibility: None,
+            metadata_raw: serde_json::json!({}),
+            conformance,
+        })
+    }
+
+    fn turn_skill_resolution(
+        active: Vec<ResolvedSkill>,
+        excluded: Vec<ExcludedSkill>,
+    ) -> super::skills::TurnSkillResolution {
+        super::skills::TurnSkillResolution {
+            prompt: String::new(),
+            result: SkillResolutionResult { active, excluded },
+            runtime_plan: SkillRuntimePlan {
+                tools: Vec::new(),
+                read_skill_index: HashMap::new(),
+                excluded_tools: Vec::new(),
+            },
+            audit_events: Vec::new(),
+        }
+    }
+
+    fn mcp_server_capability(id: &str, name: &str) -> TurnCapability {
+        TurnCapability {
+            id: id.to_owned(),
+            label: Some(name.trim().to_owned()),
+            kind: TurnCapabilityKind::McpServer {
+                name: name.to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        }
+    }
+
+    fn mcp_tool_capability(id: &str, server_name: &str, raw_tool_name: &str) -> TurnCapability {
+        TurnCapability {
+            id: id.to_owned(),
+            label: Some(format!("{}/{}", server_name.trim(), raw_tool_name.trim())),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: server_name.to_owned(),
+                raw_tool_name: raw_tool_name.to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        }
+    }
+
+    #[test]
+    fn normalize_turn_capabilities_rejects_malformed_inputs() {
+        let normalized = normalize_turn_capabilities(&[TurnCapability {
+            id: String::new(),
+            label: Some("bad".to_owned()),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "browser".to_owned(),
+                raw_tool_name: "open".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        }]);
+
+        assert!(normalized.skill_refs.is_empty());
+        assert!(normalized.mcp_tool_refs.is_empty());
+        assert_eq!(normalized.rejected.len(), 1);
+        assert_eq!(
+            normalized.rejected[0].reason,
+            TurnCapabilityRejectedReason::InvalidInput
+        );
+        assert!(normalized.rejected[0].message.contains("missing an id"));
+    }
+
+    #[test]
+    fn normalize_turn_capabilities_deduplicates_by_canonical_key() {
+        let normalized = normalize_turn_capabilities(&[
+            skill_capability("skill:user:docs-a", "docs"),
+            skill_capability("skill:user:docs-b", "docs"),
+        ]);
+
+        assert_eq!(normalized.skill_refs.len(), 1);
+        assert_eq!(normalized.skill_refs[0].capability_id, "skill:user:docs-a");
+        assert_eq!(normalized.rejected.len(), 1);
+        assert_eq!(normalized.rejected[0].id, "skill:user:docs-b");
+        assert_eq!(
+            normalized.rejected[0].reason,
+            TurnCapabilityRejectedReason::Duplicate
+        );
+    }
+
+    #[test]
+    fn normalize_turn_capabilities_splits_skill_server_and_tool_refs() {
+        let normalized = normalize_turn_capabilities(&[
+            skill_capability("skill:user:docs", "docs"),
+            mcp_server_capability("mcp-server:workspace:browser", " browser "),
+            mcp_tool_capability("mcp-tool:workspace:browser:open", " browser ", " open "),
+        ]);
+
+        assert_eq!(normalized.rejected, Vec::new());
+
+        assert_eq!(normalized.skill_refs.len(), 1);
+        assert_eq!(normalized.skill_refs[0].capability_id, "skill:user:docs");
+        assert_eq!(normalized.skill_refs[0].slug, "docs");
+        assert_eq!(normalized.skill_refs[0].source_kind, "user");
+
+        assert_eq!(normalized.mcp_server_refs.len(), 1);
+        assert_eq!(
+            normalized.mcp_server_refs[0].capability_id,
+            "mcp-server:workspace:browser"
+        );
+        assert_eq!(normalized.mcp_server_refs[0].name, "browser");
+        assert_eq!(
+            normalized.mcp_server_refs[0].scope_kind,
+            McpScopeKind::Workspace
+        );
+
+        assert_eq!(normalized.mcp_tool_refs.len(), 1);
+        assert_eq!(
+            normalized.mcp_tool_refs[0].capability_id,
+            "mcp-tool:workspace:browser:open"
+        );
+        assert_eq!(normalized.mcp_tool_refs[0].server_name, "browser");
+        assert_eq!(normalized.mcp_tool_refs[0].raw_tool_name, "open");
+        assert_eq!(
+            normalized.mcp_tool_refs[0].scope_kind,
+            McpScopeKind::Workspace
+        );
+    }
+
+    #[test]
+    fn resolve_skill_capability_summary_accepts_explicit_skill_with_stable_reason() {
+        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let resolution = turn_skill_resolution(
+            vec![ResolvedSkill {
+                slug: "workspace/docs".to_owned(),
+                reason: SkillResolvedReason::ExplicitCapability,
+                definition: test_skill_definition("docs"),
+            }],
+            Vec::new(),
+        );
+
+        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
+
+        assert!(summary.rejected.is_empty());
+        assert_eq!(summary.accepted.len(), 1);
+        assert_eq!(summary.accepted[0].id, "skill:user:docs");
+        assert_eq!(summary.accepted[0].label.as_deref(), Some("docs"));
+        assert_eq!(
+            summary.accepted[0].reason,
+            TurnCapabilityAcceptedReason::ExplicitComposerCapability
+        );
+        assert_eq!(
+            summary.accepted[0].kind,
+            TurnCapabilityKind::Skill {
+                slug: "docs".to_owned(),
+                source_kind: "user".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_skill_capability_summary_rejects_missing_skill() {
+        let explicit_ref = explicit_skill_ref("skill:user:missing", "missing");
+        let resolution = turn_skill_resolution(Vec::new(), Vec::new());
+
+        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
+
+        assert!(summary.accepted.is_empty());
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].id, "skill:user:missing");
+        assert_eq!(
+            summary.rejected[0].reason,
+            TurnCapabilityRejectedReason::NotFound
+        );
+        assert!(
+            summary.rejected[0]
+                .message
+                .contains("not installed or not available")
+        );
+    }
+
+    #[test]
+    fn resolve_skill_capability_summary_rejects_disabled_skill() {
+        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let resolution = turn_skill_resolution(
+            Vec::new(),
+            vec![ExcludedSkill {
+                slug: "workspace/docs".to_owned(),
+                source_kind: "user".to_owned(),
+                reason: SkillExcludedReason::DisabledByPolicy,
+                dependency_diagnostics: Vec::new(),
+                security_findings: Vec::new(),
+            }],
+        );
+
+        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
+
+        assert!(summary.accepted.is_empty());
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].id, "skill:user:docs");
+        assert_eq!(
+            summary.rejected[0].reason,
+            TurnCapabilityRejectedReason::DisabledByPolicy
+        );
+    }
+
+    #[test]
+    fn resolve_skill_capability_summary_rejects_security_blocked_skill() {
+        let explicit_ref = explicit_skill_ref("skill:user:docs", "docs");
+        let resolution = turn_skill_resolution(
+            Vec::new(),
+            vec![ExcludedSkill {
+                slug: "workspace/docs".to_owned(),
+                source_kind: "user".to_owned(),
+                reason: SkillExcludedReason::SecurityBlocked,
+                dependency_diagnostics: Vec::new(),
+                security_findings: Vec::new(),
+            }],
+        );
+
+        let summary = resolve_skill_capability_summary(&[explicit_ref], &resolution);
+
+        assert!(summary.accepted.is_empty());
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].id, "skill:user:docs");
+        assert_eq!(
+            summary.rejected[0].reason,
+            TurnCapabilityRejectedReason::SecurityBlocked
+        );
     }
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
@@ -4807,6 +5647,9 @@ mod tests {
                 "catalog missing domain line `{expected}`"
             );
         }
+        assert!(!bundle.dynamic_system_text.contains("mcp_"));
+        assert!(!bundle.dynamic_system_text.contains("mcp."));
+        assert!(!bundle.dynamic_system_text.contains("skill."));
         assert!(!bundle.dynamic_system_text.contains("\"parameters\""));
         assert!(!bundle.dynamic_system_text.contains("\"properties\""));
         assert!(

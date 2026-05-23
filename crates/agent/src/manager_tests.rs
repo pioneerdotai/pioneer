@@ -1,10 +1,12 @@
 use super::{
-    AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
-    AgentPostTurnHookDispatchPolicy, AgentStartError, AgentTurnHookRuntimeContext,
-    MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext,
-    MemoryTurnPolicyRequest, RecoveryAttemptRequest, TaskToolMaterialization, TaskToolProvider,
-    TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
+    AgentCommand, AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
+    AgentMcpMaterializationRequest, AgentMcpToolProvider, AgentMemoryProvider,
+    AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
+    AgentTurnHookRuntimeContext, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
+    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
+    TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -21,17 +23,20 @@ use pioneer_hooks::{
 use pioneer_memory::hooks::memory_turn_policy_from_hook_policy_set;
 use pioneer_memory::{MemoryModeRecallParams, MemoryRecallMode};
 use pioneer_protocol::{
-    AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, MemoryCategory,
-    MemoryScope, MemoryScopeKind, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-    PromptManifestHookPhase, PromptManifestHookTruncation, RecoveryAction, RecoveryAttemptContext,
-    StorageOutputPolicy, ThreadMode, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, McpScopeKind,
+    McpTurnBindingSummary, MemoryCategory, MemoryScope, MemoryScopeKind,
+    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
+    PromptManifestHookTruncation, RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy,
+    SystemEventLevel, ThreadMode, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload,
+    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnItem, TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
-    ChatRequest, ChatResponse, Provider, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderRegistry, ProviderToolCall, Role, StreamChunk,
+    AttachmentDataSource, ChatRequest, ChatResponse, MessageContentPart, Provider,
+    ProviderCapabilities, ProviderInputCapabilities, ProviderRegistry, ProviderToolCall, Role,
+    StreamChunk,
 };
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
@@ -141,6 +146,29 @@ fn test_manager() -> AgentManager {
     AgentManager::new(registry, test_tool_loop_config())
 }
 
+fn skill_capability(slug: &str) -> TurnCapability {
+    TurnCapability {
+        id: format!("skill:user:{slug}"),
+        kind: TurnCapabilityKind::Skill {
+            slug: slug.to_owned(),
+            source_kind: "user".to_owned(),
+        },
+        label: Some(slug.to_owned()),
+    }
+}
+
+fn mcp_tool_capability(server_name: &str, raw_tool_name: &str) -> TurnCapability {
+    TurnCapability {
+        id: format!("mcp-tool:workspace:{server_name}:{raw_tool_name}"),
+        kind: TurnCapabilityKind::McpTool {
+            server_name: server_name.to_owned(),
+            raw_tool_name: raw_tool_name.to_owned(),
+            scope_kind: McpScopeKind::Workspace,
+        },
+        label: Some(format!("{server_name}/{raw_tool_name}")),
+    }
+}
+
 /// A provider that never completes — useful for testing concurrent turn rejection.
 struct PendingProvider;
 
@@ -221,6 +249,130 @@ impl CaptureAgentProvider {
             .lock()
             .expect("capture provider lock poisoned")
             .clone()
+    }
+}
+
+struct TestMcpToolProvider {
+    materialization: AgentMcpMaterialization,
+    requests: std::sync::Mutex<Vec<AgentMcpMaterializationRequest>>,
+}
+
+impl TestMcpToolProvider {
+    fn new(materialization: AgentMcpMaterialization) -> Self {
+        Self {
+            materialization,
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<AgentMcpMaterializationRequest> {
+        self.requests
+            .lock()
+            .expect("MCP provider requests lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMcpToolProvider for TestMcpToolProvider {
+    async fn mcp_availability(&self, _workspace_id: &str) -> Result<AgentMcpAvailability, String> {
+        Ok(AgentMcpAvailability {
+            available_mcp: vec!["resend".to_owned(), "resend/send".to_owned()],
+            blocked_mcp: Vec::new(),
+        })
+    }
+
+    async fn materialize_mcp_tools(
+        &self,
+        request: AgentMcpMaterializationRequest,
+    ) -> Result<AgentMcpMaterialization, String> {
+        self.requests
+            .lock()
+            .expect("MCP provider requests lock poisoned")
+            .push(request);
+        Ok(self.materialization.clone())
+    }
+}
+
+struct NoopMcpToolExecutor;
+
+#[async_trait::async_trait]
+impl pioneer_tools::McpToolExecutor for NoopMcpToolExecutor {
+    async fn call_mcp_tool(
+        &self,
+        _request: pioneer_tools::McpToolCallRequest,
+        _trace: ToolEventTrace,
+    ) -> Result<pioneer_tools::McpToolCallOutput, ToolError> {
+        Ok(pioneer_tools::McpToolCallOutput {
+            content: json!([{"type":"text","text":"ok"}]),
+            structured_content: None,
+            is_error: false,
+            duration_ms: 1,
+            meta: None,
+        })
+    }
+}
+
+fn explicit_mcp_tool_materialization(
+    capability_id: &str,
+    workspace_id: &str,
+) -> AgentMcpMaterialization {
+    let descriptor = pioneer_tools::McpDynamicToolDescriptor {
+        callable_name: "mcp_resend_send".to_owned(),
+        workspace_id: workspace_id.to_owned(),
+        server_id: "mcp_server_resend_001".to_owned(),
+        server_name: "resend".to_owned(),
+        raw_tool_name: "send".to_owned(),
+        catalog_version: "catalog-v1".to_owned(),
+        fingerprint: "fingerprint-resend".to_owned(),
+        snapshot_version: 1,
+        description: "Send an email through Resend.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"}
+            },
+            "required": ["to"],
+            "additionalProperties": false
+        }),
+        annotations: pioneer_tools::McpDynamicToolAnnotations::default(),
+        timeout_ms: Some(5_000),
+        selection_reason: "explicit_composer_capability".to_owned(),
+        capability_id: Some(capability_id.to_owned()),
+    };
+    let materialized =
+        pioneer_tools::materialize_mcp_runtime_tools(&[descriptor], Arc::new(NoopMcpToolExecutor));
+
+    AgentMcpMaterialization {
+        bundles: materialized.bundles,
+        available_mcp: vec!["resend".to_owned(), "resend/send".to_owned()],
+        blocked_mcp: Vec::new(),
+        diagnostics: Vec::new(),
+        accepted_capabilities: vec![pioneer_protocol::TurnAcceptedCapability {
+            id: capability_id.to_owned(),
+            label: Some("resend/send".to_owned()),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+            reason: TurnCapabilityAcceptedReason::ExplicitComposerCapability,
+        }],
+        rejected_capabilities: Vec::new(),
+        mcp_bindings: materialized
+            .bindings
+            .into_iter()
+            .map(|binding| McpTurnBindingSummary {
+                server_installation_id: binding.server_installation_id,
+                server_name: binding.server_name,
+                raw_tool_name: binding.raw_tool_name,
+                callable_name: binding.callable_name,
+                catalog_version: binding.catalog_version,
+                fingerprint: binding.fingerprint,
+                selection_reason: binding.selection_reason,
+                capability_id: binding.capability_id,
+            })
+            .collect(),
     }
 }
 
@@ -1944,6 +2096,19 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             turn_id,
             bindings,
         }),
+        AgentDurableEvent::TurnCapabilitiesResolved {
+            thread_id,
+            turn_id,
+            accepted,
+            rejected,
+            mcp_bindings,
+        } => Some(AgentEvent::TurnCapabilitiesResolved {
+            thread_id,
+            turn_id,
+            accepted,
+            rejected,
+            mcp_bindings,
+        }),
         AgentDurableEvent::SkillAuditEvents {
             thread_id,
             turn_id,
@@ -2176,7 +2341,7 @@ async fn start_simple_turn(
         .expect("thread should be created");
     let mut events = subscribe_agent_events(manager, thread_id).await;
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -2187,6 +2352,7 @@ async fn start_simple_turn(
                 text: text.to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -2628,6 +2794,7 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
                 text: "TASK RUN EXECUTION\nRUN OBJECTIVE\nDo the scheduled work.".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
             HashMap::new(),
             Vec::new(),
@@ -4924,6 +5091,7 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
                 text_elements: Vec::new(),
             }],
             Vec::new(),
+            Vec::new(),
             HashMap::new(),
             Vec::new(),
         )
@@ -6629,7 +6797,7 @@ async fn start_loop_budget_turn(
         .expect("thread should be created");
     let events = subscribe_agent_events(manager, thread_id).await;
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -6640,6 +6808,7 @@ async fn start_loop_budget_turn(
                 text: "run loop budget test".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7231,7 +7400,7 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -7242,6 +7411,7 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
                 text: "suggest a tool".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7308,7 +7478,7 @@ async fn start_turn_emits_lifecycle_events() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000001").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000001",
             "turn_000000000000000001",
             ThreadMode::Chat,
@@ -7319,6 +7489,7 @@ async fn start_turn_emits_lifecycle_events() {
                 text: "hello".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7375,7 +7546,7 @@ async fn start_turn_rejects_second_running_turn() {
         .expect("thread should be created");
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000002",
             "turn_000000000000000002",
             ThreadMode::Chat,
@@ -7386,6 +7557,7 @@ async fn start_turn_rejects_second_running_turn() {
                 text: "first".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7598,7 +7770,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -7609,6 +7781,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 text: "hello".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7718,7 +7891,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -7729,6 +7902,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 text: "trigger provider failure".to_owned(),
                 text_elements: Vec::new(),
             }],
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -7860,53 +8034,58 @@ async fn explicit_skill_input_injects_skill_prompt_and_binding() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "capture",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "run with skill".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "run with skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
         .expect("turn should start");
 
-    let mut saw_binding_event = false;
-    for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("must receive agent event in time")
-            .expect("broadcast should remain open");
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
 
-        match event {
-            AgentEvent::TurnSkillsResolved { bindings, .. } => {
-                assert_eq!(bindings.len(), 1);
-                assert_eq!(bindings[0].skill_slug, "tests/my-skill");
-                assert_eq!(bindings[0].resolved_reason, "explicit_mention");
-                saw_binding_event = true;
-            }
-            AgentEvent::TurnCompleted { .. } => break,
-            AgentEvent::TurnFailed { error, .. } => {
-                panic!("turn should not fail: {error}");
-            }
-            _ => {}
+    let saw_binding_event = observed.iter().any(|event| match event {
+        AgentEvent::TurnSkillsResolved { bindings, .. } => {
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].skill_slug, "tests/my-skill");
+            assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
+            true
         }
-    }
+        _ => false,
+    });
+    let saw_capability_event = observed.iter().any(|event| match event {
+        AgentEvent::TurnCapabilitiesResolved {
+            accepted, rejected, ..
+        } => {
+            assert!(rejected.is_empty());
+            assert_eq!(accepted.len(), 1);
+            assert_eq!(accepted[0].id, "skill:user:my-skill");
+            assert_eq!(
+                accepted[0].reason,
+                TurnCapabilityAcceptedReason::ExplicitComposerCapability
+            );
+            true
+        }
+        _ => false,
+    });
 
     assert!(
         saw_binding_event,
         "expected TurnSkillsResolved event with one active skill"
+    );
+    assert!(
+        saw_capability_event,
+        "expected TurnCapabilitiesResolved event with accepted skill capability"
     );
 
     let requests = provider.snapshot_requests();
@@ -7923,7 +8102,155 @@ async fn explicit_skill_input_injects_skill_prompt_and_binding() {
     assert!(compiled_prompt.full_system_text.contains("$tests/my-skill"));
     assert!(compiled_prompt.full_system_text.contains("My Skill"));
 
+    let manifest = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "skills_runtime_prompt"),
+        "accepted skill prompt must remain represented by skills_runtime_prompt"
+    );
+    assert!(
+        !manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "skills_prompt"),
+        "legacy skills_prompt manifest section must not be introduced"
+    );
+
     let _ = fs::remove_dir_all(skill_root);
+}
+
+#[tokio::test]
+async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let mut tool_loop_config = test_tool_loop_config();
+    tool_loop_config.skills.system_roots = Vec::new();
+    tool_loop_config.skills.user_roots = Vec::new();
+    tool_loop_config.skills.registry_roots = Vec::new();
+    let manager = AgentManager::new(registry, tool_loop_config);
+    let thread_id = "thr_capability_rejected_diagnostics";
+    let turn_id = "turn_capability_rejected_diagnostics";
+
+    manager
+        .ensure_thread(thread_id, "ws_capability_rejected_diagnostics")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run with missing skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("missing-skill")],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let (accepted, rejected) = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnCapabilitiesResolved {
+                accepted, rejected, ..
+            } => Some((accepted, rejected)),
+            _ => None,
+        })
+        .expect("capability resolution event should be emitted");
+    assert!(accepted.is_empty());
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].id, "skill:user:missing-skill");
+    assert_eq!(rejected[0].reason, TurnCapabilityRejectedReason::NotFound);
+    assert!(
+        rejected[0]
+            .message
+            .contains("not installed or not available")
+    );
+
+    let serialized = serde_json::to_string(&AgentDurableEvent::TurnCapabilitiesResolved {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        accepted: accepted.clone(),
+        rejected: rejected.clone(),
+        mcp_bindings: Vec::new(),
+    })
+    .expect("capability event should serialize");
+    assert!(serialized.contains("turn_capabilities_resolved"));
+    assert!(serialized.contains("not installed or not available"));
+    assert!(!serialized.contains("SKILL.md"));
+
+    let warning = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. }) => match item {
+                TurnItem::SystemEvent {
+                    level,
+                    message,
+                    code,
+                    details,
+                    ..
+                } if code.as_deref() == Some("capability.rejected") => {
+                    Some((level, message, details))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("rejected capability should emit a visible warning item");
+    assert_eq!(*warning.0, SystemEventLevel::Warning);
+    assert!(
+        warning
+            .1
+            .contains("Capability `missing-skill` was not attached")
+    );
+    assert_eq!(
+        warning
+            .2
+            .as_ref()
+            .and_then(|details| details.get("rejected"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let manifest = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .expect("prompt manifest should be emitted");
+    let diagnostic = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == PromptManifestDiagnosticCode::CapabilityRejected)
+        .expect("rejected capability should be included in prompt manifest diagnostics");
+    assert!(diagnostic.message.contains("missing-skill"));
+    assert!(
+        diagnostic
+            .message
+            .contains("not installed or not available")
+    );
+    assert_eq!(diagnostic.section_id, None);
+    assert_eq!(diagnostic.hook_source, None);
 }
 
 #[tokio::test]
@@ -7959,23 +8286,18 @@ async fn explicit_skill_input_injects_prompt_for_non_tool_calling_provider() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "capture-standard",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "run with skill".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "run with skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8112,23 +8434,18 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000120").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000120",
             "turn_000000000000000120",
             ThreadMode::Agent,
             "test-model",
             "capture",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "use the skill".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "use the skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8158,6 +8475,288 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
     assert!(tool_names.contains(&"read_skill"));
 
     let _ = fs::remove_dir_all(skill_root);
+}
+
+#[tokio::test]
+async fn explicit_mcp_tool_contributes_dynamic_tool_definition_without_prompt_section() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let workspace_id = "ws_000000000000000122";
+    let capability_id = "mcp-tool:workspace:resend:send";
+    let mcp_provider = Arc::new(TestMcpToolProvider::new(explicit_mcp_tool_materialization(
+        capability_id,
+        workspace_id,
+    )));
+
+    let manager = AgentManager::new_with_mcp(
+        registry,
+        test_tool_loop_config(),
+        Some(mcp_provider.clone()),
+    );
+    let thread_id = "thr_000000000000000122";
+    let turn_id = "turn_000000000000000122";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "use resend".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![mcp_tool_capability("resend", "send")],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let materialization_requests = mcp_provider.snapshot_requests();
+    assert_eq!(materialization_requests.len(), 1);
+    assert_eq!(materialization_requests[0].workspace_id, workspace_id);
+    assert_eq!(materialization_requests[0].turn_id, turn_id);
+    assert!(materialization_requests[0].explicit_servers.is_empty());
+    assert_eq!(materialization_requests[0].explicit_tools.len(), 1);
+    assert_eq!(
+        materialization_requests[0].explicit_tools[0].capability_id,
+        capability_id
+    );
+
+    let requests = provider.snapshot_requests();
+    assert!(!requests.is_empty());
+    let first_turn_request = &requests[0];
+    let tools = first_turn_request
+        .tools
+        .as_ref()
+        .expect("agent request should include provider tools");
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"mcp_resend_send"));
+    assert!(
+        !tool_names.contains(&"mcp_resend_domains"),
+        "unselected MCP tools must not appear when materialization did not include them"
+    );
+
+    let prompt = first_turn_request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(!prompt.full_system_text.contains("mcp_resend_send"));
+    assert!(!prompt.full_system_text.contains("resend/send"));
+    assert!(!prompt.full_system_text.contains("MCP server"));
+    assert!(!prompt.dynamic_system_text.contains("mcp_"));
+    assert!(!prompt.dynamic_system_text.contains("resend"));
+
+    let mcp_event_bindings = observed.iter().find_map(|event| match event {
+        AgentEvent::TurnCapabilitiesResolved { mcp_bindings, .. } => Some(mcp_bindings),
+        _ => None,
+    });
+    let mcp_event_bindings =
+        mcp_event_bindings.expect("capability event should include MCP bindings");
+    assert_eq!(mcp_event_bindings.len(), 1);
+    assert_eq!(
+        mcp_event_bindings[0].selection_reason,
+        "explicit_composer_capability"
+    );
+    assert_eq!(
+        mcp_event_bindings[0].capability_id.as_deref(),
+        Some(capability_id)
+    );
+
+    let manifest = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .expect("prompt manifest should be emitted");
+    assert!(
+        !manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id.contains("mcp")),
+        "accepted MCP tools must be represented by bindings/tool schemas, not prompt sections: {:?}",
+        manifest.section_ids
+    );
+}
+
+#[tokio::test]
+async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() {
+    let skill_root = unique_temp_dir("phase-6-combined-skill");
+    let skill_dir = skill_root.join("tests").join("my-skill");
+    fs::create_dir_all(&skill_dir).expect("failed to create skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: My Skill\nslug: my-skill\ndescription: Test skill description\n---\nFollow the skill.",
+    )
+    .expect("failed to write SKILL.md");
+
+    let file_root = unique_temp_dir("phase-6-combined-file");
+    fs::create_dir_all(&file_root).expect("failed to create file root");
+    let attachment_path = file_root.join("note.txt");
+    fs::write(&attachment_path, "file body").expect("failed to write attachment");
+
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let workspace_id = "ws_000000000000000126";
+    let capability_id = "mcp-tool:workspace:resend:send";
+    let mcp_provider = Arc::new(TestMcpToolProvider::new(explicit_mcp_tool_materialization(
+        capability_id,
+        workspace_id,
+    )));
+
+    let mut tool_loop_config = test_tool_loop_config();
+    tool_loop_config.skills.system_roots = Vec::new();
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.registry_roots = Vec::new();
+    let manager =
+        AgentManager::new_with_mcp(registry, tool_loop_config, Some(mcp_provider.clone()));
+    let thread_id = "thr_000000000000000126";
+    let turn_id = "turn_000000000000000126";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![
+                UserInput::Text {
+                    text: "use the file, skill, and resend".to_owned(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::LocalFile {
+                    path: attachment_path.display().to_string(),
+                },
+            ],
+            vec![
+                skill_capability("my-skill"),
+                mcp_tool_capability("resend", "send"),
+            ],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert!(!requests.is_empty());
+    let request = &requests[0];
+    let user_message = request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("request should include user message");
+    assert_eq!(user_message.content, "use the file, skill, and resend");
+    assert_eq!(user_message.content_parts.len(), 1);
+    match &user_message.content_parts[0] {
+        MessageContentPart::File { file } => {
+            assert_eq!(file.mime_type, "text/plain");
+            assert_eq!(
+                file.source,
+                AttachmentDataSource::Path {
+                    path: attachment_path.display().to_string()
+                }
+            );
+        }
+        other => panic!("expected file attachment, got {other:?}"),
+    }
+
+    let prompt = request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+    assert!(prompt.full_system_text.contains("[Skills]"));
+    assert!(prompt.full_system_text.contains("$tests/my-skill"));
+    assert!(!prompt.full_system_text.contains("mcp_resend_send"));
+    assert!(!prompt.full_system_text.contains("resend/send"));
+
+    let tools = request
+        .tools
+        .as_ref()
+        .expect("agent request should include provider tools");
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"mcp_resend_send"));
+
+    let (accepted, rejected, mcp_bindings) = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnCapabilitiesResolved {
+                accepted,
+                rejected,
+                mcp_bindings,
+                ..
+            } => Some((accepted, rejected, mcp_bindings)),
+            _ => None,
+        })
+        .expect("capability resolution event should be emitted");
+    assert!(rejected.is_empty());
+    assert_eq!(accepted.len(), 2);
+    assert!(
+        accepted
+            .iter()
+            .any(|capability| capability.id == "skill:user:my-skill")
+    );
+    assert!(
+        accepted
+            .iter()
+            .any(|capability| capability.id == capability_id)
+    );
+    assert_eq!(mcp_bindings.len(), 1);
+    assert_eq!(
+        mcp_bindings[0].selection_reason,
+        "explicit_composer_capability"
+    );
+
+    let manifest = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
+            _ => None,
+        })
+        .expect("prompt manifest should be emitted");
+    assert!(
+        manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id == "skills_runtime_prompt")
+    );
+    assert!(
+        !manifest
+            .section_ids
+            .iter()
+            .any(|section_id| section_id.contains("mcp")),
+        "MCP capabilities must not create prompt sections: {:?}",
+        manifest.section_ids
+    );
+
+    let _ = fs::remove_dir_all(skill_root);
+    let _ = fs::remove_dir_all(file_root);
 }
 
 #[tokio::test]
@@ -8222,23 +8821,18 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "sequenced-tools",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "trigger tool".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "trigger tool".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8379,23 +8973,18 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "sequenced-tools",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "trigger slow tool".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "trigger slow tool".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8519,23 +9108,18 @@ runtime:
         .expect("thread should be created");
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "sequenced-tools",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "trigger tool".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "trigger tool".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8610,26 +9194,20 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
             "test-model",
             "capture-standard",
             HashMap::new(),
+            vec![UserInput::Text {
+                text: "resolve both skills".to_owned(),
+                text_elements: Vec::new(),
+            }],
             vec![
-                UserInput::Skill {
-                    name: "good-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Skill {
-                    name: "bad-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "resolve both skills".to_owned(),
-                    text_elements: Vec::new(),
-                },
+                skill_capability("good-skill"),
+                skill_capability("bad-skill"),
             ],
             Vec::new(),
         )
@@ -8650,6 +9228,12 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
                     if item.skill_slug == "tests/good-skill"
                         && item.action == SkillAuditAction::ResolveAllowed
                     {
+                        assert_eq!(
+                            item.details
+                                .get("resolved_reason")
+                                .and_then(|value| value.as_str()),
+                            Some("explicit_composer_capability")
+                        );
                         saw_allowed = true;
                     }
                     if item.skill_slug == "tests/bad-skill"
@@ -8714,23 +9298,18 @@ async fn read_skill_returns_active_skill_body() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000122").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000122",
             "turn_000000000000000122",
             ThreadMode::Agent,
             "test-model",
             "sequenced-tools",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "read skill".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "read skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8842,23 +9421,18 @@ async fn read_skill_rejects_non_active_slug() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000123").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000123",
             "turn_000000000000000123",
             ThreadMode::Agent,
             "test-model",
             "sequenced-tools",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "read skill".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "read skill".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -8952,23 +9526,18 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000124").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000124",
             "turn_000000000000000124",
             ThreadMode::Agent,
             "test-model",
             "capture",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "run".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "run".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await
@@ -9048,23 +9617,18 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000125").await;
 
     manager
-        .start_turn(
+        .start_turn_with_capabilities(
             "thr_000000000000000125",
             "turn_000000000000000125",
             ThreadMode::Agent,
             "test-model",
             "capture",
             HashMap::new(),
-            vec![
-                UserInput::Skill {
-                    name: "my-skill".to_owned(),
-                    path: String::new(),
-                },
-                UserInput::Text {
-                    text: "run".to_owned(),
-                    text_elements: Vec::new(),
-                },
-            ],
+            vec![UserInput::Text {
+                text: "run".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![skill_capability("my-skill")],
             Vec::new(),
         )
         .await

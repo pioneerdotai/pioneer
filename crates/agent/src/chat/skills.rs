@@ -1,8 +1,8 @@
 use crate::{AgentMcpAvailability, SkillsLoopConfig, WorkspaceSkillPolicy};
 use pioneer_protocol::{TurnSkillBinding, UserInput};
 use pioneer_skills::{
-    ResolvedSkill, SkillAuditEvent, SkillCatalogLoadParams, SkillPolicy, SkillPolicyKey,
-    SkillPolicySet, SkillPromptBudget, SkillResolutionInput, SkillResolutionResult,
+    ResolvedSkill, SkillAuditEvent, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy,
+    SkillPolicyKey, SkillPolicySet, SkillPromptBudget, SkillResolutionInput, SkillResolutionResult,
     SkillRuntimePlan, SkillValidationPolicy, build_skill_prompt, build_skill_runtime_plan,
     load_catalog, qualified_skill_slug, resolve_skills,
 };
@@ -105,7 +105,6 @@ fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
             | UserInput::LocalFile { path }
             | UserInput::LocalAudio { path }
             | UserInput::LocalVideo { path }
-            | UserInput::Skill { path, .. }
             | UserInput::Mention { path, .. } => {
                 if !path.trim().is_empty() {
                     values.insert(path.trim().to_owned());
@@ -124,10 +123,11 @@ fn collect_touched_paths(input: &[UserInput]) -> Vec<String> {
     sorted
 }
 
-pub(super) fn resolve_turn_skills(
+pub(super) fn resolve_turn_skills_with_explicit_refs(
     workdir: &Path,
     workspace_id: &str,
     input: &[UserInput],
+    explicit_refs: &[SkillExplicitRef],
     skills: &SkillsLoopConfig,
     workspace_skill_policies: &HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     mcp_availability: &AgentMcpAvailability,
@@ -203,7 +203,7 @@ pub(super) fn resolve_turn_skills(
     };
 
     let result = resolve_skills(SkillResolutionInput {
-        user_inputs: input,
+        explicit_refs,
         touched_paths: touched_paths.as_slice(),
         catalog: &catalog,
         policy_set: &SkillPolicySet {
@@ -322,13 +322,14 @@ pub(super) fn to_turn_skill_bindings(active: &[ResolvedSkill]) -> Vec<TurnSkillB
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_workspace_id_token, resolve_root_path, resolve_turn_skills};
+    use super::{
+        expand_workspace_id_token, resolve_root_path, resolve_turn_skills_with_explicit_refs,
+    };
     use crate::{
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
     };
-    use pioneer_protocol::UserInput;
-    use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
+    use pioneer_skills::{SkillExplicitRef, SkillPolicyKey, SkillTrustLevel};
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
@@ -389,6 +390,15 @@ mod tests {
         }
     }
 
+    fn explicit_skill_ref(name: &str) -> SkillExplicitRef {
+        SkillExplicitRef {
+            capability_id: format!("skill:user:{name}"),
+            label: Some(name.to_owned()),
+            slug: name.to_owned(),
+            source_kind: "user".to_owned(),
+        }
+    }
+
     #[test]
     fn workspace_id_token_expands_into_relative_root() {
         let workdir = Path::new("/tmp/workdir");
@@ -437,13 +447,12 @@ Instructions
         )
         .expect("write skill");
 
-        let result = resolve_turn_skills(
+        let explicit_refs = [explicit_skill_ref("agent-browser")];
+        let result = resolve_turn_skills_with_explicit_refs(
             root.as_path(),
             "ws_000000000000000001",
-            &[UserInput::Skill {
-                name: "agent-browser".to_owned(),
-                path: String::new(),
-            }],
+            &[],
+            &explicit_refs,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
@@ -474,13 +483,12 @@ Instructions
         )
         .expect("write skill");
 
-        let result = resolve_turn_skills(
+        let explicit_refs = [explicit_skill_ref("agent-browser")];
+        let result = resolve_turn_skills_with_explicit_refs(
             root.as_path(),
             "ws_000000000000000001",
-            &[UserInput::Skill {
-                name: "agent-browser".to_owned(),
-                path: String::new(),
-            }],
+            &[],
+            &explicit_refs,
             &test_skills_config(root.as_path()),
             &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
             &crate::AgentMcpAvailability::default(),
