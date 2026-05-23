@@ -44,6 +44,8 @@ pub struct McpDynamicToolDescriptor {
     pub parameters: JsonValue,
     pub annotations: McpDynamicToolAnnotations,
     pub timeout_ms: Option<u64>,
+    pub selection_reason: String,
+    pub capability_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub struct McpDynamicToolBinding {
     pub callable_name: String,
     pub catalog_version: String,
     pub fingerprint: String,
+    pub selection_reason: String,
+    pub capability_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +170,8 @@ pub fn materialize_mcp_runtime_tools(
             callable_name: descriptor.callable_name.clone(),
             catalog_version: descriptor.catalog_version.clone(),
             fingerprint: descriptor.fingerprint.clone(),
+            selection_reason: descriptor.selection_reason.clone(),
+            capability_id: descriptor.capability_id.clone(),
         });
         bundle.specs.push(configured);
         bundle.handlers.push((
