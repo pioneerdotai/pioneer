@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     pub name: String,
     pub is_active: bool,
+    #[sea_orm(unique)]
     pub is_current: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

@@ -19,6 +19,8 @@ pub struct Model {
     pub catalog_version: String,
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
+    pub selection_reason: String,
+    pub capability_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    #[sea_orm(unique)]
     pub memory_id: String,
     pub workspace_id: Option<String>,
     pub reason_code: String,
     pub actor_kind: String,
     pub actor_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub created_at: Option<DateTimeWithTimeZone>,
     pub resolved_at: Option<DateTimeWithTimeZone>,
     pub resolved_reason_code: Option<String>,
     pub resolved_actor_kind: Option<String>,

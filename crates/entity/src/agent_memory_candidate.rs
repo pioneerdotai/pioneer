@@ -26,7 +26,6 @@ pub struct Model {
     pub confidence: f64,
     #[sea_orm(column_type = "Text")]
     pub reason: String,
-    pub source_context_kind: Option<String>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
     pub source_item_id: Option<String>,
@@ -44,6 +43,7 @@ pub struct Model {
     pub promoted_memory_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub metadata_json: Option<String>,
+    pub source_context_kind: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
