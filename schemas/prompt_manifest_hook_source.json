@@ -35,6 +35,7 @@
       "type": "string",
       "enum": [
         "turn_pre_prompt_context",
+        "turn_post_preflight_prompt_context",
         "turn_pre_prompt_compile"
       ]
     }

@@ -6,7 +6,10 @@
     "general": {
       "$ref": "#/$defs/GatewayGeneralSettings",
       "default": {
-        "keepawake": false
+        "keepawake": false,
+        "preflight_model": {
+          "source": "thread"
+        }
       }
     },
     "memory": {
@@ -23,6 +26,12 @@
         "keepawake": {
           "type": "boolean",
           "default": false
+        },
+        "preflight_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
         }
       }
     },
@@ -59,12 +68,6 @@
       "properties": {
         "active_recall_enabled": {
           "type": "boolean"
-        },
-        "active_recall_model": {
-          "$ref": "#/$defs/GatewayMemoryModelSelection",
-          "default": {
-            "source": "thread"
-          }
         },
         "background_extraction_enabled": {
           "type": "boolean"

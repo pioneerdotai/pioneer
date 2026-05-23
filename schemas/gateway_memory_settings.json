@@ -6,12 +6,6 @@
     "active_recall_enabled": {
       "type": "boolean"
     },
-    "active_recall_model": {
-      "$ref": "#/$defs/GatewayMemoryModelSelection",
-      "default": {
-        "source": "thread"
-      }
-    },
     "background_extraction_enabled": {
       "type": "boolean"
     },

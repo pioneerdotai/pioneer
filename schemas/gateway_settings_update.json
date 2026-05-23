@@ -33,6 +33,16 @@
             "boolean",
             "null"
           ]
+        },
+        "preflight_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayMemoryModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -69,12 +79,6 @@
       "properties": {
         "active_recall_enabled": {
           "type": "boolean"
-        },
-        "active_recall_model": {
-          "$ref": "#/$defs/GatewayMemoryModelSelection",
-          "default": {
-            "source": "thread"
-          }
         },
         "background_extraction_enabled": {
           "type": "boolean"

@@ -6,6 +6,42 @@
     "keepawake": {
       "type": "boolean",
       "default": false
+    },
+    "preflight_model": {
+      "$ref": "#/$defs/GatewayMemoryModelSelection",
+      "default": {
+        "source": "thread"
+      }
+    }
+  },
+  "$defs": {
+    "GatewayMemoryModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+          "default": "thread"
+        }
+      }
+    },
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
     }
   }
 }
