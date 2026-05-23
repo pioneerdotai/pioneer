@@ -1,10 +1,10 @@
 use super::{
     AgentCommand, AgentEvent, AgentManager, AgentMemoryProvider, AgentMemoryTurnPolicyProvider,
-    AgentPostTurnHookDispatchPolicy, AgentStartError, MemoryExtractionPolicy, MemoryRecallItem,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
-    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl,
+    AgentPostTurnHookDispatchPolicy, AgentStartError, AgentTurnHookRuntimeContext,
+    MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
+    MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext,
+    MemoryTurnPolicyRequest, RecoveryAttemptRequest, TaskToolMaterialization, TaskToolProvider,
+    TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -242,6 +242,7 @@ struct RecordedHookCall {
     workspace_id: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    task_id: Option<String>,
     mode: Option<HookContextMode>,
     actor_kind: Option<HookActorKind>,
     policy_set: HookPolicySet,
@@ -297,6 +298,11 @@ impl HookHandler for RecordingHookHandler {
                 turn_id: request
                     .context
                     .turn_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                task_id: request
+                    .context
+                    .task_id
                     .as_ref()
                     .map(|id| id.as_str().to_owned()),
                 mode: request.context.mode.clone(),
@@ -2590,6 +2596,60 @@ async fn phase_12_post_turn_hook_runs_after_success_with_summary_input() {
 }
 
 #[tokio::test]
+async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    manager
+        .ensure_thread("thr_task_runtime_hook", "ws_task_runtime_hook")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, "thr_task_runtime_hook").await;
+
+    manager
+        .start_turn_with_hook_context(
+            "thr_task_runtime_hook",
+            "turn_task_runtime_hook",
+            ThreadMode::Agent,
+            AgentTurnHookRuntimeContext::task("task-runtime-1"),
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "TASK RUN EXECUTION\nRUN OBJECTIVE\nDo the scheduled work.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("task runtime turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    assert_eq!(call.mode, Some(HookContextMode::Task));
+    assert_eq!(call.actor_kind, Some(HookActorKind::Task));
+    assert_eq!(call.task_id.as_deref(), Some("task-runtime-1"));
+    let HookInputPayload::TurnPostTurn(payload) = call.payload else {
+        panic!("post-turn hook should receive typed post-turn payload");
+    };
+    assert_eq!(payload.status, TurnPostTurnStatus::Succeeded);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+}
+
+#[tokio::test]
 async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(SequencedToolProvider::new(
@@ -4825,6 +4885,69 @@ async fn memory_provider_receives_turn_context_for_agent_mode() {
 
     let tool_contexts = memory_provider.tool_contexts();
     assert_eq!(tool_contexts, recall_contexts);
+}
+
+#[tokio::test]
+async fn memory_provider_receives_task_runtime_context_for_task_turn() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let memory_provider = Arc::new(RecordingMemoryProvider::new(
+        Ok(MemoryRecallSnapshot::empty()),
+        Ok(MemoryToolMaterialization {
+            bundles: vec![fake_standard_memory_tool_bundle()],
+            diagnostics: Vec::new(),
+        }),
+    ));
+    let memory_trait_provider: Arc<dyn AgentMemoryProvider> = memory_provider.clone();
+    manager
+        .set_memory_provider(Some(memory_trait_provider))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("thr_memory_task_context", "ws_memory_task_context")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, "thr_memory_task_context").await;
+
+    manager
+        .start_turn_with_hook_context(
+            "thr_memory_task_context",
+            "turn_memory_task_context",
+            ThreadMode::Agent,
+            AgentTurnHookRuntimeContext::task("task-runtime-memory-context"),
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "TASK RUN EXECUTION\nRUN OBJECTIVE\nSummarize the scheduled work.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("task runtime turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let recall_contexts = memory_provider.recall_contexts();
+    assert!(!recall_contexts.is_empty());
+    assert!(
+        recall_contexts
+            .iter()
+            .all(|context| { context.task_id.as_deref() == Some("task-runtime-memory-context") })
+    );
+
+    let tool_contexts = memory_provider.tool_contexts();
+    assert!(!tool_contexts.is_empty());
+    assert!(
+        tool_contexts
+            .iter()
+            .all(|context| { context.task_id.as_deref() == Some("task-runtime-memory-context") })
+    );
 }
 
 #[tokio::test]

@@ -28,9 +28,10 @@ use crate::hooks::{
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpToolProvider, ResolvedArtifactInput, RetainedToolLlmContext, TaskToolMaterialization,
-    TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
-    TurnExecutionControl, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    AgentMcpToolProvider, AgentTurnHookRuntimeContext, ResolvedArtifactInput,
+    RetainedToolLlmContext, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnToolContext,
+    TurnToolMaterialization, TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -512,6 +513,7 @@ async fn run_agent_turn_preflight_stage(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
     input_text: &str,
 ) -> TurnPreflightOrchestratorResult {
     let memory_config = tool_loop_config.memory.active_recall.normalized();
@@ -543,8 +545,8 @@ async fn run_agent_turn_preflight_stage(
         turn_id: turn_id.to_owned(),
         mode: ThreadMode::Agent,
         input_text: input_text.to_owned(),
-        task_id: None,
-        agent_id: None,
+        task_id: hook_runtime_context.task_id.clone(),
+        agent_id: hook_runtime_context.agent_id.clone(),
     };
     let active_recall = build_active_recall_local_preflight_plan(
         &memory_context,
@@ -1078,6 +1080,7 @@ pub(super) async fn execute_chat_turn_flow(
     provider_registry: Arc<ProviderRegistry>,
     provider: Arc<dyn Provider>,
     model: String,
+    hook_runtime_context: AgentTurnHookRuntimeContext,
     workspace_skill_policies: HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
     resolved_artifacts: Vec<ResolvedArtifactInput>,
@@ -1123,6 +1126,7 @@ pub(super) async fn execute_chat_turn_flow(
             provider_registry,
             &provider,
             model,
+            hook_runtime_context,
             history,
             user_message.clone(),
             &input,
@@ -1554,6 +1558,7 @@ async fn execute_agent_provider_response(
     provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
     model: String,
+    hook_runtime_context: AgentTurnHookRuntimeContext,
     history: Vec<ChatMessage>,
     user_message: ChatMessage,
     input: &[UserInput],
@@ -1584,7 +1589,12 @@ async fn execute_agent_provider_response(
     let provider_tool_calling = provider.capabilities().tool_calling;
     let post_turn_model = model.clone();
     let post_turn_model_provider = provider.name().to_owned();
-    let hook_context = AgentTurnHookContext::new(workspace_id, thread_id, turn_id);
+    let hook_context = AgentTurnHookContext::with_runtime_context(
+        workspace_id,
+        thread_id,
+        turn_id,
+        hook_runtime_context.clone(),
+    );
     let user_input_text = user_message.text_content_lossy();
 
     let effective_policy_set = run_agent_turn_policy_hook_phase(
@@ -1762,6 +1772,7 @@ async fn execute_agent_provider_response(
             workspace_id,
             thread_id,
             turn_id,
+            &hook_runtime_context,
             user_input_text.as_str(),
         )
         .await;
@@ -2065,6 +2076,7 @@ async fn execute_agent_provider_response(
         workspace_id,
         thread_id,
         turn_id,
+        &hook_runtime_context,
         user_input_text.as_str(),
     )
     .await;

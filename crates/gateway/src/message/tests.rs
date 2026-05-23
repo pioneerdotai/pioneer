@@ -14201,6 +14201,32 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 }
 
 #[tokio::test]
+async fn memory_task_runtime_context_materializes_read_only_tools() {
+    let harness = setup_memory_gateway_harness("task_runtime_memory_tools", true).await;
+    let mut context = memory_tool_context(&harness, "task_runtime_memory_tools");
+    context.task_id = Some("task_runtime_memory_tools".to_owned());
+
+    let materialization = materialize_memory_tools_for_context(&harness, context).await;
+    let tool_names = materialization
+        .bundles
+        .iter()
+        .flat_map(|bundle| bundle.specs.iter())
+        .map(|configured| configured.spec.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(tool_names.contains(&"memory_search"));
+    assert!(tool_names.contains(&"memory_list"));
+    assert!(tool_names.contains(&"memory_get"));
+    assert!(!tool_names.contains(&"memory_remember"));
+    assert!(!tool_names.contains(&"memory_forget"));
+    assert!(materialization.diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("memory mutation tools hidden for task runtime context")
+    }));
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
 async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
     let harness = setup_memory_gateway_harness("tool_search", true).await;
     let tools = built_memory_tools(&harness, "search").await;

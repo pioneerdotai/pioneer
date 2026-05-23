@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use pioneer_agent::AgentTurnHookRuntimeContext;
 use pioneer_promt::{TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
     ItemCompletedNotification, ItemStartedNotification, SandboxMode, Task, TaskAgentContext,
@@ -338,10 +339,11 @@ impl TaskAgentExecutor {
             .collect();
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_resolved_artifacts_and_environment(
+            .start_turn_with_hook_context(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
+                AgentTurnHookRuntimeContext::task(task.id.clone()),
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
@@ -590,10 +592,11 @@ impl TaskAgentExecutor {
             .collect();
         processor
             .agent_manager
-            .start_turn_with_resolved_artifacts_and_environment(
+            .start_turn_with_hook_context(
                 lineage.child_thread_id.as_str(),
                 lineage.child_turn_id.as_str(),
                 ThreadMode::Agent,
+                AgentTurnHookRuntimeContext::task(task.id.clone()),
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,

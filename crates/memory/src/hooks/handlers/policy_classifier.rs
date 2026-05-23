@@ -58,8 +58,16 @@ impl HookHandler for MemoryPolicyClassifierHook {
             turn_id: turn_id.to_owned(),
             mode: ThreadMode::Agent,
             input_text: input.input_text.clone(),
-            task_id: None,
-            agent_id: None,
+            task_id: request
+                .context
+                .task_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            agent_id: request
+                .context
+                .agent_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
         };
         self.state.set_turn_context(turn_context);
 

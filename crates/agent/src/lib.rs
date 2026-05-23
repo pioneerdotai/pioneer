@@ -31,8 +31,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-pub use hooks::AgentPostTurnHookDispatchPolicy;
 use hooks::AgentToolBundleArtifactStore;
+pub use hooks::{AgentPostTurnHookDispatchPolicy, AgentTurnHookRuntimeContext};
 use manager_recovery::apply_recovery_adjustments;
 pub use pioneer_memory::hooks::{
     AgentEpisodicRecallProvider, AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider,
@@ -1223,6 +1223,7 @@ struct TurnExecutionOptions {
 struct ActiveTurnRequest {
     turn_id: String,
     mode: ThreadMode,
+    hook_runtime_context: AgentTurnHookRuntimeContext,
     model: String,
     provider_name: String,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
@@ -1255,6 +1256,7 @@ enum AgentCommand {
     StartTurn {
         turn_id: String,
         mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
         model: String,
         provider_name: String,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
@@ -1675,6 +1677,37 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context(
+            thread_id,
+            turn_id,
+            mode,
+            AgentTurnHookRuntimeContext::default(),
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
@@ -1689,6 +1722,7 @@ impl AgentManager {
             .send(AgentCommand::StartTurn {
                 turn_id: turn_id.to_owned(),
                 mode,
+                hook_runtime_context,
                 model: model.to_owned(),
                 provider_name: provider_name.to_owned(),
                 workspace_skill_policies,

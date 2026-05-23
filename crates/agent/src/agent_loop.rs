@@ -61,6 +61,7 @@ pub(super) async fn run_agent_loop(
             AgentCommand::StartTurn {
                 turn_id,
                 mode,
+                hook_runtime_context,
                 model,
                 provider_name,
                 workspace_skill_policies,
@@ -78,6 +79,7 @@ pub(super) async fn run_agent_loop(
                 let turn_request = ActiveTurnRequest {
                     turn_id: turn_id.clone(),
                     mode,
+                    hook_runtime_context,
                     model,
                     provider_name: provider_name.clone(),
                     workspace_skill_policies,
@@ -647,6 +649,7 @@ fn spawn_turn_task(
             provider_registry,
             provider,
             turn_request.model,
+            turn_request.hook_runtime_context,
             turn_request.workspace_skill_policies,
             turn_request.input,
             turn_request.resolved_artifacts,
@@ -692,6 +695,7 @@ async fn execute_turn_flow(
     provider_registry: Arc<ProviderRegistry>,
     provider: Arc<dyn Provider>,
     model: String,
+    hook_runtime_context: super::AgentTurnHookRuntimeContext,
     workspace_skill_policies: std::collections::HashMap<
         pioneer_skills::SkillPolicyKey,
         super::WorkspaceSkillPolicy,
@@ -722,6 +726,7 @@ async fn execute_turn_flow(
             provider_registry,
             provider,
             model,
+            hook_runtime_context,
             workspace_skill_policies,
             input,
             resolved_artifacts,
@@ -813,7 +818,12 @@ fn synthesize_post_turn_failure_dispatch(
         error,
     );
     Some(AgentTurnPostTurnHookDispatch::new(
-        AgentTurnHookContext::new(workspace_id, thread_id, turn_id),
+        AgentTurnHookContext::with_runtime_context(
+            workspace_id,
+            thread_id,
+            turn_id,
+            turn_request.hook_runtime_context.clone(),
+        ),
         EffectiveTurnPolicySet::empty(),
         EffectiveTurnPromptContextSet::empty(),
         summary,

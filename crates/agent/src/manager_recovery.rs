@@ -56,6 +56,7 @@ mod tests {
         let mut turn_request = ActiveTurnRequest {
             turn_id: "turn_recovery".to_owned(),
             mode: ThreadMode::Agent,
+            hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
             workspace_skill_policies:

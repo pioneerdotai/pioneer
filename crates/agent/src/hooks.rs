@@ -1,10 +1,11 @@
 use pioneer_hooks::{
-    HookActor, HookActorKind, HookContext, HookContextMode, HookContribution, HookContributionHash,
-    HookContributionId, HookDiagnostic, HookId, HookIdError, HookInput, HookInputKind, HookPhase,
-    HookPhaseRequest, HookPolicySet, HookPromptContextLimits, HookPromptContextSet,
-    HookPromptSectionLimits, HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime,
-    HookRuntimeError, HookSectionId, HookSubscriptionId, HookThreadId, HookToolBundleId,
-    HookToolBundleSet, HookToolName, HookTurnId, HookWorkspaceId, PromptContextContribution,
+    HookActor, HookActorId, HookActorKind, HookAgentId, HookContext, HookContextMode,
+    HookContribution, HookContributionHash, HookContributionId, HookDiagnostic, HookId,
+    HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
+    HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits, HookPromptSectionSet,
+    HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError, HookSectionId,
+    HookSubscriptionId, HookTaskId, HookThreadId, HookToolBundleId, HookToolBundleSet,
+    HookToolName, HookTurnId, HookWorkspaceId, PromptContextContribution,
     PromptManifestDiagnosticContribution, ToolBundleContribution,
     TurnPostPreflightPromptContextHookInput, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
     TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolEventSummary,
@@ -24,18 +25,69 @@ const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before pr
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTurnHookRuntimeContext {
+    pub mode: HookContextMode,
+    pub actor_kind: HookActorKind,
+    pub actor_id: Option<String>,
+    pub task_id: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+impl Default for AgentTurnHookRuntimeContext {
+    fn default() -> Self {
+        Self {
+            mode: HookContextMode::Agent,
+            actor_kind: HookActorKind::Agent,
+            actor_id: None,
+            task_id: None,
+            agent_id: None,
+        }
+    }
+}
+
+impl AgentTurnHookRuntimeContext {
+    pub fn task(task_id: impl Into<String>) -> Self {
+        let task_id = task_id.into();
+        Self {
+            mode: HookContextMode::Task,
+            actor_kind: HookActorKind::Task,
+            actor_id: Some(task_id.clone()),
+            task_id: Some(task_id),
+            agent_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AgentTurnHookContext {
     workspace_id: String,
     thread_id: String,
     turn_id: String,
+    runtime_context: AgentTurnHookRuntimeContext,
 }
 
 impl AgentTurnHookContext {
+    #[cfg(test)]
     pub(super) fn new(workspace_id: &str, thread_id: &str, turn_id: &str) -> Self {
+        Self::with_runtime_context(
+            workspace_id,
+            thread_id,
+            turn_id,
+            AgentTurnHookRuntimeContext::default(),
+        )
+    }
+
+    pub(super) fn with_runtime_context(
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        runtime_context: AgentTurnHookRuntimeContext,
+    ) -> Self {
         Self {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
+            runtime_context,
         }
     }
 }
@@ -1239,16 +1291,36 @@ fn build_phase_request_with_input(
     prompt_context_set: &EffectiveTurnPromptContextSet,
     input: HookInput,
 ) -> Result<HookPhaseRequest, HookIdError> {
+    let actor_id = context
+        .runtime_context
+        .actor_id
+        .as_ref()
+        .map(|id| HookActorId::new(id.clone()))
+        .transpose()?;
+    let task_id = context
+        .runtime_context
+        .task_id
+        .as_ref()
+        .map(|id| HookTaskId::new(id.clone()))
+        .transpose()?;
+    let agent_id = context
+        .runtime_context
+        .agent_id
+        .as_ref()
+        .map(|id| HookAgentId::new(id.clone()))
+        .transpose()?;
     let request = HookPhaseRequest::new(
         phase,
         HookContext {
             workspace_id: Some(HookWorkspaceId::new(context.workspace_id.clone())?),
             thread_id: Some(HookThreadId::new(context.thread_id.clone())?),
             turn_id: Some(HookTurnId::new(context.turn_id.clone())?),
-            mode: Some(HookContextMode::Agent),
+            task_id,
+            agent_id,
+            mode: Some(context.runtime_context.mode.clone()),
             actor: Some(HookActor {
-                kind: HookActorKind::Agent,
-                id: None,
+                kind: context.runtime_context.actor_kind.clone(),
+                id: actor_id,
             }),
             now_unix: Some(current_unix_timestamp()),
             ..HookContext::default()

@@ -176,17 +176,27 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             });
         }
 
+        let mutation_tools_allowed = !is_task_runtime_context(&context);
         let handler = Arc::new(MemoryToolHandler { processor, context });
         let mut bundle = ToolExtensionBundle::default();
         for configured in memory_tool_specs() {
             let name = configured.spec.name.clone();
+            if !mutation_tools_allowed && is_memory_mutation_tool(name.as_str()) {
+                continue;
+            }
             bundle.specs.push(configured);
             bundle.handlers.push((name, handler.clone()));
         }
 
+        let diagnostics = if mutation_tools_allowed {
+            Vec::new()
+        } else {
+            vec!["memory mutation tools hidden for task runtime context".into()]
+        };
+
         Ok(MemoryToolMaterialization {
             bundles: vec![bundle],
-            diagnostics: Vec::new(),
+            diagnostics,
         })
     }
 
@@ -637,6 +647,8 @@ impl MemoryToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        self.ensure_can_mutate_memory(MEMORY_REMEMBER_TOOL)?;
+
         let idempotency_key = invocation.idempotency_key.clone();
         let input: MemoryRememberToolInput = decode_tool_args(invocation)?;
         let content = required_string(Some(input.content.as_str()), "content")?;
@@ -695,6 +707,8 @@ impl MemoryToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        self.ensure_can_mutate_memory(MEMORY_FORGET_TOOL)?;
+
         let input: MemoryForgetToolInput = decode_tool_args(invocation)?;
         let memory_id = optional_trimmed(input.memory_id);
         let key = optional_trimmed(input.key);
@@ -835,6 +849,26 @@ impl MemoryToolHandler {
             )),
         }
     }
+
+    fn ensure_can_mutate_memory(&self, tool_name: &str) -> Result<(), ToolError> {
+        if is_task_runtime_context(&self.context) {
+            return Err(ToolError::invalid_arguments(format!(
+                "{tool_name} cannot mutate durable memory from task runtime"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn is_task_runtime_context(context: &MemoryTurnContext) -> bool {
+    context
+        .task_id
+        .as_deref()
+        .is_some_and(|task_id| !task_id.trim().is_empty())
+}
+
+fn is_memory_mutation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL)
 }
 
 #[derive(Debug, Clone, Deserialize)]
