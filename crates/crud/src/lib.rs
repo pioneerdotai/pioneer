@@ -410,6 +410,8 @@ pub struct TurnMcpBindingRecord {
     pub callable_name: String,
     pub catalog_version: String,
     pub fingerprint: String,
+    pub selection_reason: String,
+    pub capability_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1734,7 +1736,13 @@ impl CrudStore {
                             })
                             .to_string(),
                         ),
-                        created_at_unix: row.created_at.timestamp(),
+                        created_at_unix: row
+                            .created_at
+                            .as_ref()
+                            .with_context(|| {
+                                format!("quarantine marker `{}` is missing created_at", row.id)
+                            })?
+                            .timestamp(),
                     },
                 )
                 .await?;
@@ -4481,6 +4489,20 @@ impl CrudStore {
         }))
     }
 
+    pub async fn delete_mcp_server_catalog_snapshot(
+        &self,
+        server_installation_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| async {
+            mcp_server_catalog_snapshot::delete_mcp_server_catalog_snapshot(
+                &self.connection,
+                server_installation_id,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn insert_mcp_audit_event_record(&self, record: &McpAuditEventRecord) -> Result<()> {
         self.run_serialized_write(|| async {
             mcp_audit_event::insert_mcp_audit_event(&self.connection, record).await
@@ -4572,6 +4594,8 @@ impl CrudStore {
                 callable_name: model.callable_name,
                 catalog_version: model.catalog_version,
                 fingerprint: model.fingerprint,
+                selection_reason: model.selection_reason,
+                capability_id: model.capability_id,
             })
             .collect())
     }
@@ -4596,6 +4620,8 @@ impl CrudStore {
                 callable_name: model.callable_name,
                 catalog_version: model.catalog_version,
                 fingerprint: model.fingerprint,
+                selection_reason: model.selection_reason,
+                capability_id: model.capability_id,
             })
             .collect())
     }
@@ -9909,7 +9935,7 @@ mod tests {
                 skill_version: Some("1.0.0".to_owned()),
                 fingerprint: "fp-alpha".to_owned(),
                 source_kind: "registry".to_owned(),
-                resolved_reason: "explicit_mention".to_owned(),
+                resolved_reason: "explicit_composer_capability".to_owned(),
             },
             TurnSkillBindingRecord {
                 skill_slug: "pioneer/beta-skill".to_owned(),
@@ -9936,7 +9962,7 @@ mod tests {
             skill_version: Some("2.1.0".to_owned()),
             fingerprint: "fp-gamma".to_owned(),
             source_kind: "system".to_owned(),
-            resolved_reason: "explicit_mention".to_owned(),
+            resolved_reason: "explicit_composer_capability".to_owned(),
         }];
 
         store
@@ -10118,6 +10144,8 @@ mod tests {
             callable_name: "mcp_beta_send".to_owned(),
             catalog_version: "catalog-v1".to_owned(),
             fingerprint: "fingerprint-beta-updated".to_owned(),
+            selection_reason: "explicit_composer_capability".to_owned(),
+            capability_id: Some("mcp:workspace:beta:send".to_owned()),
         }];
         store
             .replace_turn_mcp_bindings("turn_mcp_roundtrip", &turn_bindings, 1_700_000_005)

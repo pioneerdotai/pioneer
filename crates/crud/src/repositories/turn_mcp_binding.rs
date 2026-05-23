@@ -27,6 +27,8 @@ pub async fn replace_turn_mcp_bindings<C: ConnectionTrait>(
             callable_name: Set(binding.callable_name.clone()),
             catalog_version: Set(binding.catalog_version.clone()),
             fingerprint: Set(binding.fingerprint.clone()),
+            selection_reason: Set(binding.selection_reason.clone()),
+            capability_id: Set(binding.capability_id.clone()),
             created_at: Set(created_at),
         })
         .exec(db)

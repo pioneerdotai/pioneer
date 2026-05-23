@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCategory,
     MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
@@ -621,13 +621,19 @@ pub(crate) fn agent_memory_event_record_from_model(
 pub(crate) fn agent_memory_quarantine_record_from_model(
     model: pioneer_entity::agent_memory_quarantine::Model,
 ) -> Result<AgentMemoryQuarantineRecord> {
+    let created_at_unix = model
+        .created_at
+        .as_ref()
+        .with_context(|| format!("quarantine marker `{}` is missing created_at", model.id))?
+        .timestamp();
+
     Ok(AgentMemoryQuarantineRecord {
         id: model.id,
         memory_id: model.memory_id,
         workspace_id: model.workspace_id,
         reason_code: memory_lifecycle_reason_code_from_db(model.reason_code.as_str())?,
         actor: lifecycle_actor_from_db(model.actor_kind, model.actor_id)?,
-        created_at_unix: model.created_at.timestamp(),
+        created_at_unix,
         resolved_at_unix: model.resolved_at.map(|timestamp| timestamp.timestamp()),
         resolved_reason_code: model
             .resolved_reason_code

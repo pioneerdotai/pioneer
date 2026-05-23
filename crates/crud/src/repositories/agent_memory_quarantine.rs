@@ -36,7 +36,7 @@ pub async fn create_active_quarantine<C: ConnectionTrait>(
         reason_code: Set(memory_lifecycle_reason_code_to_db(quarantine.reason_code)),
         actor_kind: Set(lifecycle_actor_kind_to_db(&quarantine.actor)),
         actor_id: Set(lifecycle_actor_id_to_db(&quarantine.actor)),
-        created_at: Set(unix_to_datetime(quarantine.created_at_unix)),
+        created_at: Set(Some(unix_to_datetime(quarantine.created_at_unix))),
         resolved_at: Set(None),
         resolved_reason_code: Set(None),
         resolved_actor_kind: Set(None),
