@@ -161,6 +161,39 @@ pub fn sanitize_display_name(value: &str) -> String {
     }
 }
 
+pub fn display_name_with_mime_extension(display_name: String, mime_type: Option<&str>) -> String {
+    if display_name_has_known_extension(display_name.as_str()) {
+        return display_name;
+    }
+    let Some(extension) = mime_type.and_then(preferred_extension_for_mime_type) else {
+        return display_name;
+    };
+    format!("{display_name}.{extension}")
+}
+
+pub fn preferred_extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
+    let mime_type = normalize_mime_type(mime_type);
+    if mime_type.is_empty() || mime_type == OCTET_STREAM {
+        return None;
+    }
+    match mime_type.as_str() {
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "text/plain" => Some("txt"),
+        "text/tab-separated-values" => Some("tsv"),
+        _ => mime_guess::get_mime_extensions_str(mime_type.as_str())
+            .and_then(|extensions| extensions.first().copied()),
+    }
+}
+
+fn display_name_has_known_extension(display_name: &str) -> bool {
+    Path::new(display_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.trim().is_empty())
+        .is_some_and(|extension| mime_guess::from_ext(extension).first().is_some())
+}
+
 pub fn is_safe_visible_name(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -241,6 +274,22 @@ mod tests {
         assert_eq!(
             metadata.get("declared_detected_mime_mismatch"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn display_name_extension_is_added_from_mime_only_when_missing() {
+        assert_eq!(
+            display_name_with_mime_extension("auto.ru_screenshot".to_owned(), Some("image/png")),
+            "auto.ru_screenshot.png"
+        );
+        assert_eq!(
+            display_name_with_mime_extension("photo.jpeg".to_owned(), Some("image/png")),
+            "photo.jpeg"
+        );
+        assert_eq!(
+            display_name_with_mime_extension("unknown".to_owned(), Some(OCTET_STREAM)),
+            "unknown"
         );
     }
 }

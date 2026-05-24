@@ -22,7 +22,7 @@ use crate::gc::{
     ArtifactGcPlan, ArtifactGcPolicy, ArtifactGcReport, execute_gc_with_policy, plan_gc_with_policy,
 };
 use crate::mime::{
-    MAX_MIME_SNIFF_BYTES, classify_kind, detect_mime_from_bytes,
+    MAX_MIME_SNIFF_BYTES, classify_kind, detect_mime_from_bytes, display_name_with_mime_extension,
     effective_mime_type as choose_effective_mime_type, normalize_mime_type, record_mime_metadata,
     sanitize_display_name,
 };
@@ -197,7 +197,10 @@ impl ArtifactService {
             workspace_id: request.workspace_id,
             primary_thread_id: request.primary_thread_id,
             bytes: Vec::new(),
-            display_name: request.display_name,
+            display_name: display_name_with_mime_extension(
+                request.display_name,
+                Some(effective_mime_type.as_str()),
+            ),
             kind: request.kind,
             mime_type: Some(effective_mime_type),
             created_by_kind: request.created_by_kind,
@@ -642,7 +645,10 @@ impl ArtifactService {
             artifact_version_id: blob.artifact_version_id,
             blob_id: blob.blob_id,
             storage_key: blob.storage_key,
-            display_name: summary.artifact.display_name,
+            display_name: display_name_with_mime_extension(
+                summary.artifact.display_name,
+                summary.artifact.mime_type.as_deref(),
+            ),
             mime_type: summary.artifact.mime_type,
             size_bytes,
             sha256: blob.sha256,
@@ -754,6 +760,8 @@ fn normalize_ingest_mime(mut request: IngestArtifactBytesRequest) -> IngestArtif
         detected_mime_type.as_str(),
         effective_mime_type.as_str(),
     );
+    request.display_name =
+        display_name_with_mime_extension(request.display_name, Some(effective_mime_type.as_str()));
     request.mime_type = Some(effective_mime_type);
     request
 }
@@ -1050,6 +1058,39 @@ mod tests {
         assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
         assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
         assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_bytes_adds_mime_extension_to_extensionless_display_name() {
+        let harness = setup().await;
+        let image_bytes = test_png_bytes(16, 16);
+        let mut request = ingest_request(
+            "ws_a",
+            "thr_a",
+            "turn_a",
+            image_bytes.as_slice(),
+            "auto.ru_screenshot",
+        );
+        request.kind = ArtifactKind::Image;
+        request.mime_type = Some("image/png".to_owned());
+
+        let summary = harness
+            .service
+            .ingest_bytes(request)
+            .await
+            .expect("ingest image");
+        let snapshot = harness
+            .service
+            .download_snapshot(
+                "ws_a",
+                summary.artifact.artifact_id.as_str(),
+                summary.artifact.version_id.as_deref(),
+            )
+            .await
+            .expect("download snapshot");
+
+        assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
+        assert_eq!(snapshot.display_name, "auto.ru_screenshot.png");
     }
 
     #[tokio::test]

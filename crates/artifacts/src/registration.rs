@@ -337,6 +337,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn artifact_registration_adds_mime_extension_to_extensionless_display_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("auto.ru_screenshot");
+        let bytes = b"\x89PNG\r\n\x1a\nrest";
+        tokio::fs::write(source_path.as_path(), bytes)
+            .await
+            .expect("write source");
+        let harness = harness(temp.path().join("runtime")).await;
+
+        let summary = harness
+            .register_candidate(
+                registration_context(temp.path()),
+                ArtifactRegistrationCandidate {
+                    path: source_path,
+                    display_name: Some("auto.ru_screenshot".to_owned()),
+                    mime_type: Some("image/png".to_owned()),
+                    kind_hint: Some(ArtifactKind::Image),
+                    description: None,
+                    sha256: Some(sha256(bytes)),
+                    size_bytes: Some(bytes.len() as u64),
+                    source: ArtifactRegistrationSource::ExplicitArtifactRegister,
+                },
+            )
+            .await
+            .expect("register");
+
+        assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
+        assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+    }
+
     #[test]
     fn artifact_registration_turn_budget_is_explicitly_deferred() {
         assert!(TURN_ARTIFACT_BUDGET_DEFERRED_REASON.contains("deferred"));

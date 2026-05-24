@@ -23,6 +23,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     ArtifactProjectionRecord, ArtifactRegistrationCandidate, ArtifactRegistrationContext,
     ArtifactRegistrationSource, ArtifactService, PIONEER_ARTIFACT_OUTPUT_DIR_ENV,
+    mime::display_name_with_mime_extension,
 };
 
 pub const ARTIFACT_PREPARE_TOOL: &str = "artifact_prepare";
@@ -86,7 +87,14 @@ impl ArtifactToolState {
         tool_call_id: String,
         expires_at: String,
     ) -> Result<PreparedArtifactOutput, ToolError> {
-        let sanitized = sanitize_display_name(params.display_name.as_str());
+        let sanitized = truncate_filename(
+            display_name_with_mime_extension(
+                sanitize_display_name(params.display_name.as_str()),
+                params.mime_type.as_deref(),
+            )
+            .as_str(),
+            MAX_FILENAME_CHARS,
+        );
         let (stem, extension) = split_filename(sanitized.as_str());
         let counter_key = format!("{}:{}", path_key(output_dir), sanitized);
 
@@ -874,6 +882,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(canonical_output_dir);
+    }
+
+    #[tokio::test]
+    async fn artifact_prepare_adds_mime_extension_to_extensionless_name() {
+        let output_dir = temp_output_dir("extension");
+        let state = Arc::new(ArtifactToolState::default());
+        let handler = ArtifactToolHandler::new(
+            Arc::new(artifact_register_service(temp_output_dir("runtime")).await),
+            artifact_register_context(),
+            state,
+            Arc::new(NoopArtifactToolNotificationSink),
+        );
+
+        let output = handler
+            .handle(
+                invocation(
+                    Some(output_dir.as_path()),
+                    serde_json::json!({
+                        "displayName": "auto.ru_screenshot",
+                        "kind": "image",
+                        "mimeType": "image/png"
+                    }),
+                    "call_extension",
+                ),
+                trace(),
+            )
+            .await
+            .expect("prepare should succeed")
+            .raw_json();
+
+        assert_eq!(
+            output["displayName"].as_str(),
+            Some("auto.ru_screenshot.png")
+        );
+        assert!(
+            output["outputPath"]
+                .as_str()
+                .expect("output path")
+                .ends_with("auto.ru_screenshot.png")
+        );
+
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 
     #[tokio::test]
