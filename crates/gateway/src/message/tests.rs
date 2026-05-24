@@ -31,7 +31,7 @@ use pioneer_protocol::{
     ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryScheduledNotification, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
     McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
-    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState,
+    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
     McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
     McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
@@ -3068,6 +3068,126 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
                 && file.mime_type == "text/plain"
                 && file.size_bytes == Some(14)
                 && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_with_capabilities_materializes_user_message_attachments() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("capability answer"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider,
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_capability_user_msg",
+    )
+    .await;
+
+    let turn_id = "turn_capability_user_01";
+    let request_id = generate_test_request_id("turncapmsg", "input");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id.clone(),
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread.thread.id,
+            "turn_id": turn_id,
+            "input": [
+                { "type": "text", "text": "use selected capabilities" }
+            ],
+            "capabilities": [
+                {
+                    "id": "skill:user:weather",
+                    "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
+                    "label": "weather"
+                },
+                {
+                    "id": "mcp-server:workspace:resend",
+                    "kind": { "type": "mcpServer", "name": "resend", "scopeKind": "workspace" },
+                    "label": "resend"
+                },
+                {
+                    "id": "mcp-tool:workspace:resend:send_email",
+                    "kind": {
+                        "type": "mcpTool",
+                        "serverName": "resend",
+                        "rawToolName": "send_email",
+                        "scopeKind": "workspace"
+                    },
+                    "label": "resend / Send Email"
+                }
+            ]
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+
+    let _response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let _turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let mut user_message = None;
+    for _ in 0..10 {
+        let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
+        let completed_payload: pioneer_protocol::ItemCompletedNotification =
+            serde_json::from_value(completed.params.expect("item/completed params"))
+                .expect("item/completed payload should decode");
+        if let TurnItem::UserMessage {
+            text, attachments, ..
+        } = completed_payload.item
+        {
+            user_message = Some((text, attachments));
+            break;
+        }
+    }
+    let (text, attachments) = user_message.expect("expected user message item/completed");
+    let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    assert_eq!(text, "use selected capabilities");
+    assert_eq!(attachments.len(), 3);
+    assert!(matches!(
+        &attachments[0],
+        UserMessageAttachment::Skill { capability }
+            if capability.id == "skill:user:weather"
+                && capability.label == "weather"
+                && capability.slug == "weather"
+                && capability.source_kind == "user"
+    ));
+    assert!(matches!(
+        &attachments[1],
+        UserMessageAttachment::McpServer { capability }
+            if capability.id == "mcp-server:workspace:resend"
+                && capability.label == "resend"
+                && capability.name == "resend"
+                && capability.scope_kind == McpScopeKind::Workspace
+    ));
+    assert!(matches!(
+        &attachments[2],
+        UserMessageAttachment::McpTool { capability }
+            if capability.id == "mcp-tool:workspace:resend:send_email"
+                && capability.label == "resend / Send Email"
+                && capability.server_name == "resend"
+                && capability.raw_tool_name == "send_email"
+                && capability.scope_kind == McpScopeKind::Workspace
     ));
 }
 

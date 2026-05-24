@@ -2627,6 +2627,7 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
         input: &[pioneer_protocol::UserInput],
+        capabilities: &[pioneer_protocol::TurnCapability],
     ) {
         let item_id = user_message_item_id(turn_id);
         let payload = match self
@@ -2651,9 +2652,13 @@ impl MessageProcessor {
                 return;
             }
         };
-        let Some((text, attachments)) = payload else {
+        let capability_attachments = user_message_attachments_from_capabilities(capabilities);
+        let (text, mut attachments) = payload.unwrap_or_default();
+        attachments.extend(capability_attachments);
+
+        if text.is_empty() && attachments.is_empty() {
             return;
-        };
+        }
 
         let item = TurnItem::UserMessage {
             id: item_id,
@@ -2984,4 +2989,58 @@ impl MessageProcessor {
         )
         .await;
     }
+}
+
+fn user_message_attachments_from_capabilities(
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> Vec<pioneer_protocol::UserMessageAttachment> {
+    capabilities
+        .iter()
+        .map(|capability| match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Skill { slug, source_kind } => {
+                pioneer_protocol::UserMessageAttachment::Skill {
+                    capability: pioneer_protocol::TurnSkillCapabilitySummary {
+                        id: capability.id.clone(),
+                        label: capability_label(capability.label.as_deref(), slug),
+                        slug: slug.clone(),
+                        source_kind: source_kind.clone(),
+                    },
+                }
+            }
+            pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => {
+                pioneer_protocol::UserMessageAttachment::McpServer {
+                    capability: pioneer_protocol::TurnMcpServerCapabilitySummary {
+                        id: capability.id.clone(),
+                        label: capability_label(capability.label.as_deref(), name),
+                        name: name.clone(),
+                        scope_kind: *scope_kind,
+                    },
+                }
+            }
+            pioneer_protocol::TurnCapabilityKind::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => {
+                let fallback = format!("{server_name} / {raw_tool_name}");
+                pioneer_protocol::UserMessageAttachment::McpTool {
+                    capability: pioneer_protocol::TurnMcpToolCapabilitySummary {
+                        id: capability.id.clone(),
+                        label: capability_label(capability.label.as_deref(), fallback.as_str()),
+                        server_name: server_name.clone(),
+                        raw_tool_name: raw_tool_name.clone(),
+                        scope_kind: *scope_kind,
+                    },
+                }
+            }
+        })
+        .collect()
+}
+
+fn capability_label(label: Option<&str>, fallback: &str) -> String {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
 }

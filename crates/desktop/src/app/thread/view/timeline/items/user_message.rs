@@ -2,6 +2,7 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry},
     root::PioneerDesktop,
 };
+use crate::assets::PioneerIconName;
 use chrono::{Local, TimeZone};
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
@@ -11,7 +12,15 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 struct ParsedUserAttachment {
     display_name: String,
+    kind: ParsedUserAttachmentKind,
     artifact: Option<ArtifactRef>,
+}
+
+#[derive(Clone, Copy)]
+enum ParsedUserAttachmentKind {
+    File,
+    Skill,
+    Mcp,
 }
 
 impl PioneerDesktop {
@@ -162,9 +171,11 @@ impl PioneerDesktop {
                             .border_color(cx.theme().border)
                             .items_center()
                             .gap_2()
-                            .child(
-                                self.render_user_message_attachment_preview(preview_image_path, cx),
-                            )
+                            .child(self.render_user_message_attachment_preview(
+                                preview_image_path,
+                                attachment.kind,
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -193,8 +204,16 @@ impl PioneerDesktop {
     fn render_user_message_attachment_preview(
         &self,
         preview_image_path: Option<PathBuf>,
+        kind: ParsedUserAttachmentKind,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if matches!(
+            kind,
+            ParsedUserAttachmentKind::Skill | ParsedUserAttachmentKind::Mcp
+        ) {
+            return attachment_capability_icon(kind, cx).into_any_element();
+        }
+
         if let Some(image_path) = preview_image_path {
             div()
                 .size(px(22.))
@@ -214,34 +233,11 @@ impl PioneerDesktop {
                         .h_full()
                         .rounded_full()
                         .object_fit(ObjectFit::Fill)
-                        .with_fallback(move || {
-                            div()
-                                .size(px(22.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(gpui_component::IconName::File)
-                                        .size_3()
-                                        .opacity(0.8),
-                                )
-                                .into_any_element()
-                        }),
+                        .with_fallback(move || attachment_file_icon(false).into_any_element()),
                 )
                 .into_any_element()
         } else {
-            div()
-                .size(px(22.))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(gpui_component::IconName::File)
-                        .size_3()
-                        .opacity(0.8),
-                )
-                .into_any_element()
+            attachment_file_icon(true).into_any_element()
         }
     }
 }
@@ -251,9 +247,20 @@ fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<ParsedUs
         .iter()
         .map(|attachment| ParsedUserAttachment {
             display_name: display_name_from_attachment(attachment),
+            kind: attachment_kind(attachment),
             artifact: artifact_from_attachment(attachment),
         })
         .collect()
+}
+
+fn attachment_kind(attachment: &UserMessageAttachment) -> ParsedUserAttachmentKind {
+    match attachment {
+        UserMessageAttachment::Skill { .. } => ParsedUserAttachmentKind::Skill,
+        UserMessageAttachment::McpServer { .. } | UserMessageAttachment::McpTool { .. } => {
+            ParsedUserAttachmentKind::Mcp
+        }
+        _ => ParsedUserAttachmentKind::File,
+    }
 }
 
 fn display_name_from_attachment(attachment: &UserMessageAttachment) -> String {
@@ -300,6 +307,44 @@ fn artifact_from_attachment(attachment: &UserMessageAttachment) -> Option<Artifa
         UserMessageAttachment::Artifact { artifact } => Some(artifact.clone()),
         _ => None,
     }
+}
+
+fn attachment_file_icon(flex_none: bool) -> gpui::Div {
+    let mut container = div().size(px(22.)).flex().items_center().justify_center();
+    if flex_none {
+        container = container.flex_none();
+    }
+
+    container.child(
+        Icon::new(gpui_component::IconName::File)
+            .size_3()
+            .opacity(0.8),
+    )
+}
+
+fn attachment_capability_icon(
+    kind: ParsedUserAttachmentKind,
+    cx: &mut Context<PioneerDesktop>,
+) -> gpui::Div {
+    let icon = match kind {
+        ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
+        ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,
+        ParsedUserAttachmentKind::File => PioneerIconName::Paperclip,
+    };
+
+    div()
+        .flex_none()
+        .size(px(20.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(icon)
+                .size_3()
+                .opacity(0.8)
+                .text_color(cx.theme().foreground),
+        )
 }
 
 fn stable_user_message_attachment_chip_id(item_id: &str, chip_index: usize) -> u64 {

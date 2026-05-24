@@ -313,6 +313,7 @@ impl MessageProcessor {
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.input.as_slice(),
+            outcome.materialization.capabilities.as_slice(),
         ))
         .await;
 
