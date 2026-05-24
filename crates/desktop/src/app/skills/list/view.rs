@@ -335,11 +335,13 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .h(px(INSTALLED_SKILL_CARD_HEIGHT))
                     .pt_3()
                     .px_4()
                     .pb_3()
                     .rounded_lg()
+                    .overflow_hidden()
                     .bg(cx.theme().background)
                     .border_1()
                     .border_color(cx.theme().border)
@@ -349,68 +351,101 @@ impl PioneerDesktop {
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .gap_1()
                             .child(
                                 h_flex()
                                     .w_full()
+                                    .min_w_0()
                                     .justify_between()
                                     .items_center()
                                     .gap_2()
                                     .child(
                                         h_flex()
+                                            .min_w_0()
                                             .items_center()
                                             .gap_1()
                                             .when_some(owner, |this, owner| {
                                                 this.child(
                                                     div()
+                                                        .flex_none()
                                                         .text_sm()
                                                         .opacity(0.6)
                                                         .child(format!("@{}", owner.to_owned())),
                                                 )
-                                                .child(div().text_sm().opacity(0.6).child("/"))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_sm()
+                                                        .opacity(0.6)
+                                                        .child("/"),
+                                                )
                                             })
                                             .child(
                                                 div()
+                                                    .min_w_0()
                                                     .text_sm()
                                                     .font_semibold()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .child(skill.display_name.clone()),
                                             ),
                                     ),
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .flex_1()
                                     .text_xs()
                                     .line_height(relative(1.3))
                                     .opacity(0.6)
                                     .overflow_hidden()
-                                    .text_ellipsis()
+                                    .whitespace_normal()
                                     .line_clamp(2)
                                     .child(skill.description.clone()),
                             )
                             .child(
-                                h_flex().justify_between().items_center().gap_2().child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(div().text_xs().opacity(0.6).child(format!(
-                                            "{} {}",
-                                            t!("skills.card.version"),
-                                            version_label
-                                        )))
-                                        .when(is_pending, |this| {
-                                            this.child(
-                                                Icon::new(PioneerIconName::RefreshCw)
-                                                    .size_3()
-                                                    .text_color(cx.theme().warning),
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .opacity(0.6)
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(format!(
+                                                        "{} {}",
+                                                        t!("skills.card.version"),
+                                                        version_label
+                                                    )),
                                             )
-                                        }),
-                                ),
+                                            .when(is_pending, |this| {
+                                                this.child(
+                                                    Icon::new(PioneerIconName::RefreshCw)
+                                                        .size_3()
+                                                        .text_color(cx.theme().warning),
+                                                )
+                                            }),
+                                    ),
                             ),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .mt_1p5()
                             .px_2()
                             .py_0p5()

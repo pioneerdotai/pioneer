@@ -118,48 +118,73 @@ impl PioneerDesktop {
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .w_full()
+                            .min_w_0()
                             .justify_between()
                             .items_start()
                             .gap_10()
                             .child(
-                                v_flex().flex_1().gap_3().child(
+                                v_flex().flex_1().min_w_0().gap_3().child(
                                     v_flex()
+                                        .w_full()
+                                        .min_w_0()
                                         .child(
                                             h_flex()
+                                                .w_full()
+                                                .min_w_0()
                                                 .items_baseline()
                                                 .gap_1()
                                                 .when_some(owner, |this, owner| {
                                                     this.child(
                                                         div()
+                                                            .flex_none()
                                                             .text_base()
                                                             .font_medium()
                                                             .opacity(0.6)
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
                                                             .child(format!(
                                                                 "@{}",
                                                                 owner.to_owned()
                                                             )),
                                                     )
                                                     .child(
-                                                        div().text_base().opacity(0.6).child("/"),
+                                                        div()
+                                                            .flex_none()
+                                                            .text_base()
+                                                            .opacity(0.6)
+                                                            .child("/"),
                                                     )
                                                 })
                                                 .child(
                                                     div()
+                                                        .min_w_0()
                                                         .text_base()
                                                         .font_semibold()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
                                                         .child(skill.display_name.clone()),
                                                 ),
                                         )
                                         .child(
                                             div()
+                                                .w_full()
+                                                .min_w_0()
                                                 .text_sm()
+                                                .line_height(relative(1.35))
                                                 .opacity(0.6)
+                                                .overflow_hidden()
+                                                .whitespace_normal()
+                                                .line_clamp(3)
                                                 .child(skill.description.clone()),
                                         ),
                                 ),
                             )
                             .child(
                                 div()
+                                    .flex_none()
                                     .mt_1p5()
                                     .px_2()
                                     .py_0p5()
@@ -339,9 +364,12 @@ impl PioneerDesktop {
     fn render_skill_meta_item(value: String, title: String) -> AnyElement {
         v_flex()
             .w_full()
+            .min_w_0()
             .gap_0p5()
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_sm()
                     .font_medium()
                     .line_height(relative(1.2))
@@ -349,6 +377,8 @@ impl PioneerDesktop {
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_xs()
                     .opacity(0.6)
                     .line_height(relative(1.2))
@@ -388,15 +418,19 @@ impl PioneerDesktop {
 
         let header = h_flex()
             .w_full()
+            .min_w_0()
             .items_center()
             .justify_between()
             .gap_3()
             .child(
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .gap_2()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_sm()
                             .font_semibold()
                             .line_height(relative(1.))
@@ -404,9 +438,14 @@ impl PioneerDesktop {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_xs()
                             .opacity(0.6)
-                            .line_height(relative(1.))
+                            .line_height(relative(1.25))
+                            .overflow_hidden()
+                            .whitespace_normal()
+                            .line_clamp(2)
                             .child(subtitle),
                     ),
             )
@@ -414,6 +453,7 @@ impl PioneerDesktop {
                 this.child(
                     div()
                         .id(("skills-section-toggle", toggle_id))
+                        .flex_none()
                         .flex()
                         .mt_1()
                         .opacity(0.6)
