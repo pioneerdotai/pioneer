@@ -153,7 +153,7 @@ impl PioneerDesktop {
                                         config_json,
                                         scope_kind: McpScopeKind::Workspace,
                                         enabled: true,
-                                        allow_implicit_invocation: true,
+                                        allow_implicit_invocation: false,
                                     })
                                 })
                                 .await;

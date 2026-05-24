@@ -10499,7 +10499,7 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         })
         .expect("default policy should be persisted on install");
     assert_eq!(installed_policy.enabled, Some(true));
-    assert_eq!(installed_policy.allow_implicit_invocation, Some(true));
+    assert_eq!(installed_policy.allow_implicit_invocation, Some(false));
 
     let update_upload_id = create_finalized_skill_upload(
         &processor,
@@ -11099,7 +11099,7 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         })
         .expect("default user policy should be persisted on install");
     assert_eq!(user_policy.enabled, Some(true));
-    assert_eq!(user_policy.allow_implicit_invocation, Some(true));
+    assert_eq!(user_policy.allow_implicit_invocation, Some(false));
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -11499,7 +11499,7 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     assert_eq!(installed_server.runtime.state, McpRuntimeState::NotStarted);
     assert!(!installed_server.runtime.live);
     assert!(installed_server.policy.enabled);
-    assert!(installed_server.policy.allow_implicit_invocation);
+    assert!(!installed_server.policy.allow_implicit_invocation);
 
     let changed = recv_notification_by_method(&mut rx, events::MCP_CHANGED).await;
     let changed_payload: McpChangedNotification =
@@ -11754,7 +11754,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
     assert_eq!(server.runtime.state, McpRuntimeState::Disabled);
     assert_eq!(server.status, McpServerStatus::Disabled);
     assert!(!server.policy.enabled);
-    assert!(server.policy.allow_implicit_invocation);
+    assert!(!server.policy.allow_implicit_invocation);
 
     let _changed = recv_notification_by_method(&mut rx, events::MCP_CHANGED).await;
 
@@ -11767,7 +11767,7 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
     assert!(!row.source_ref.contains(secret));
     assert!(!row.secret_refs_json.contains(secret));
     assert!(!row.enabled);
-    assert!(row.allow_implicit_invocation);
+    assert!(!row.allow_implicit_invocation);
     let secret_refs =
         serde_json::from_str::<Vec<pioneer_mcp::McpSecretRef>>(row.secret_refs_json.as_str())
             .expect("secret refs should decode");

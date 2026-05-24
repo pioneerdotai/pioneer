@@ -5,6 +5,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_workspace_scope() -> McpScopeKind {
     McpScopeKind::Workspace
 }
@@ -30,7 +34,7 @@ pub struct McpInstallParams {
     pub scope_kind: McpScopeKind,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub allow_implicit_invocation: bool,
 }
 
@@ -506,5 +510,7 @@ mod tests {
         .expect("mcp install params should decode without scope_kind");
 
         assert_eq!(params.scope_kind, McpScopeKind::Workspace);
+        assert!(params.enabled);
+        assert!(!params.allow_implicit_invocation);
     }
 }

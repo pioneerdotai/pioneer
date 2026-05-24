@@ -339,7 +339,7 @@ impl MessageProcessor {
             skill_slug: installation_record.slug.clone(),
             source_kind: installation_record.source_kind.clone(),
             enabled: Some(true),
-            allow_implicit_invocation: Some(true),
+            allow_implicit_invocation: Some(false),
         };
 
         if let Err(error) = self

@@ -547,7 +547,7 @@ mod tests {
             scope_kind: McpScopeKind::Workspace,
             scope_key: "w1".to_owned(),
             default_enabled: true,
-            default_allow_implicit_invocation: true,
+            default_allow_implicit_invocation: false,
         }
     }
 
@@ -568,6 +568,7 @@ mod tests {
         assert!(item.is_valid());
         let installation = item.installation.as_ref().unwrap();
         assert_eq!(installation.transport_kind(), "stdio");
+        assert!(!installation.allow_implicit_invocation);
         assert_eq!(item.secrets.len(), 1);
         let transport_json = serde_json::to_string(&installation.transport).unwrap();
         let source_json = serde_json::to_string(&installation.source_ref).unwrap();
@@ -781,6 +782,21 @@ mod tests {
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_allow_implicit_invocation_overrides_default() {
+        let input = r#"{
+          "mcpServers": {
+            "resend": {
+              "command": "npx",
+              "allow_implicit_invocation": true
+            }
+          }
+        }"#;
+        let plan = parse_install_config(input, context()).unwrap();
+        let installation = plan.items[0].installation.as_ref().unwrap();
+        assert!(installation.allow_implicit_invocation);
     }
 
     #[test]

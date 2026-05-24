@@ -5,7 +5,7 @@
   "properties": {
     "allow_implicit_invocation": {
       "type": "boolean",
-      "default": true
+      "default": false
     },
     "config_json": {
       "type": "string"
