@@ -466,6 +466,57 @@ Instructions
     }
 
     #[test]
+    fn explicit_skill_capability_does_not_expand_body_into_prompt() {
+        let root = temp_case("explicit-compact-prompt");
+        let skill_dir = root.join("tests").join("weather");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: weather
+slug: weather
+description: Get weather forecasts.
+---
+SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
+"#,
+        )
+        .expect("write skill");
+
+        let explicit_refs = [explicit_skill_ref("weather")];
+        let result = resolve_turn_skills_with_explicit_refs(
+            root.as_path(),
+            "ws_000000000000000001",
+            &[],
+            &explicit_refs,
+            &test_skills_config(root.as_path()),
+            &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .expect("resolve skills");
+
+        assert_eq!(result.result.active.len(), 1);
+        assert_eq!(result.result.active[0].slug, "tests/weather");
+        assert!(result.prompt.contains("Skill slug for read_skill: `tests/weather`"));
+        assert!(
+            !result
+                .prompt
+                .contains("SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE")
+        );
+        assert_eq!(
+            result
+                .runtime_plan
+                .read_skill_index
+                .get("tests/weather")
+                .expect("read_skill entry")
+                .body
+                .trim(),
+            "SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill."
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_is_excluded_when_metadata_command_dependency_is_missing() {
         let root = temp_case("metadata-missing");
         let skill_dir = root.join("tests").join("agent-browser");

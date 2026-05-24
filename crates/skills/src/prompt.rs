@@ -59,12 +59,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     if can_expand_full {
         let mut full_body_candidates = active
             .iter()
-            .filter(|skill| {
-                matches!(
-                    skill.reason,
-                    SkillResolvedReason::ExplicitCapability | SkillResolvedReason::PathMatch
-                )
-            })
+            .filter(|skill| matches!(skill.reason, SkillResolvedReason::PathMatch))
             .collect::<Vec<_>>();
 
         full_body_candidates.sort_by(|left, right| left.slug.as_str().cmp(right.slug.as_str()));
@@ -131,6 +126,14 @@ mod tests {
     use serde_json::json;
 
     fn resolved(slug: &str, description: &str) -> ResolvedSkill {
+        resolved_with_reason(slug, description, SkillResolvedReason::ExplicitCapability)
+    }
+
+    fn resolved_with_reason(
+        slug: &str,
+        description: &str,
+        reason: SkillResolvedReason,
+    ) -> ResolvedSkill {
         let owner = "workspace";
         let conformance = default_skill_conformance();
         let definition = compile_skill_definition(CompileSkillInput {
@@ -161,7 +164,7 @@ mod tests {
 
         ResolvedSkill {
             slug: format!("{owner}/{slug}"),
-            reason: SkillResolvedReason::ExplicitCapability,
+            reason,
             definition,
         }
     }
@@ -249,5 +252,48 @@ mod tests {
         );
         assert!(!built.text.contains("Location:"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
+    }
+
+    #[test]
+    fn explicit_capability_stays_compact_without_full_body() {
+        let active = vec![resolved("weather", "Get weather forecasts.")];
+
+        let built = build_skill_prompt(
+            active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert!(
+            built
+                .text
+                .contains("Skill slug for read_skill: `workspace/weather`")
+        );
+        assert!(!built.text.contains("[Skill Body: $workspace/weather]"));
+        assert!(!built.text.contains("\nbody\n"));
+    }
+
+    #[test]
+    fn path_match_can_expand_full_body() {
+        let active = vec![resolved_with_reason(
+            "weather",
+            "Get weather forecasts.",
+            SkillResolvedReason::PathMatch,
+        )];
+
+        let built = build_skill_prompt(
+            active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert!(built.text.contains("[Skill Body: $workspace/weather]"));
+        assert!(built.text.contains("\nbody\n"));
     }
 }
