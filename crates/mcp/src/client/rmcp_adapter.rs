@@ -452,8 +452,9 @@ fn classify_runtime_error<E: std::fmt::Display + std::fmt::Debug>(
     secrets: &[String],
 ) -> McpRuntimeError {
     let raw = format!("{context}: {error:#?}");
-    let message = redact_text(raw.as_str(), secrets);
-    let lower = message.to_ascii_lowercase();
+    let redacted = redact_text(raw.as_str(), secrets);
+    let lower = redacted.to_ascii_lowercase();
+    let message = compact_transport_error_message(context, redacted.as_str()).unwrap_or(redacted);
     if lower.contains("auth required")
         || lower.contains("authrequired")
         || lower.contains("unauthorized")
@@ -468,5 +469,62 @@ fn classify_runtime_error<E: std::fmt::Display + std::fmt::Debug>(
         McpRuntimeError::auth_required(message)
     } else {
         McpRuntimeError::failed(message)
+    }
+}
+
+fn compact_transport_error_message(context: &str, message: &str) -> Option<String> {
+    extract_http_response_message(message).map(|http| format!("{context}: {http}"))
+}
+
+fn extract_http_response_message(message: &str) -> Option<String> {
+    let start = http_status_start(message)?;
+    let tail = &message[start..];
+    let end = ["\\n", "\n", "\\r", "\r", "\"", ",", ")"]
+        .iter()
+        .filter_map(|needle| tail.find(needle))
+        .min()
+        .unwrap_or(tail.len());
+    let http = tail[..end].trim();
+    (!http.is_empty()).then(|| http.to_owned())
+}
+
+fn http_status_start(message: &str) -> Option<usize> {
+    message
+        .match_indices("HTTP ")
+        .find(|(index, _)| {
+            message[*index + "HTTP ".len()..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+        })
+        .map(|(index, _)| index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_http_response_message, http_status_start};
+
+    #[test]
+    fn http_status_start_ignores_transport_prefix() {
+        let message = "Streamable HTTP MCP initialize failed: HTTP 403 Forbidden";
+        let start = http_status_start(message).expect("HTTP status start");
+
+        assert_eq!(&message[start..], "HTTP 403 Forbidden");
+    }
+
+    #[test]
+    fn extracts_http_response_from_streamable_transport_debug() {
+        let message = r#"Streamable HTTP MCP initialize failed: TransportError {
+    error: DynamicTransportError {
+        error: UnexpectedServerResponse(
+            "HTTP 403 Forbidden: forbidden: access denied\n",
+        ),
+    },
+}"#;
+
+        assert_eq!(
+            extract_http_response_message(message).as_deref(),
+            Some("HTTP 403 Forbidden: forbidden: access denied")
+        );
     }
 }
