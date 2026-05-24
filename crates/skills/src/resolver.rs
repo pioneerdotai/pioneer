@@ -410,11 +410,16 @@ mod tests {
     use crate::policy::{SkillPolicy, SkillPolicyKey, SkillPolicySet};
 
     fn explicit_ref(name: &str) -> SkillExplicitRef {
+        explicit_ref_with_source_kind(name, SkillSourceKind::User)
+    }
+
+    fn explicit_ref_with_source_kind(name: &str, source_kind: SkillSourceKind) -> SkillExplicitRef {
+        let source_kind = source_kind.as_db_value().to_owned();
         SkillExplicitRef {
-            capability_id: format!("skill:user:{name}"),
+            capability_id: format!("skill:{source_kind}:{name}"),
             label: Some(name.to_owned()),
             slug: name.to_owned(),
-            source_kind: "user".to_owned(),
+            source_kind,
         }
     }
 
@@ -553,7 +558,10 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref("agent-browser")],
+            explicit_refs: &[explicit_ref_with_source_kind(
+                "agent-browser",
+                SkillSourceKind::Registry,
+            )],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -581,7 +589,10 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref("system-browser")],
+            explicit_refs: &[explicit_ref_with_source_kind(
+                "system-browser",
+                SkillSourceKind::System,
+            )],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
@@ -611,7 +622,10 @@ mod tests {
         };
 
         let result = resolve_skills(SkillResolutionInput {
-            explicit_refs: &[explicit_ref("registry-skill"), explicit_ref("user-skill")],
+            explicit_refs: &[
+                explicit_ref_with_source_kind("registry-skill", SkillSourceKind::Registry),
+                explicit_ref("user-skill"),
+            ],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &SkillPolicySet::default(),
