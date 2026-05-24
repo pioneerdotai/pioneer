@@ -126,18 +126,24 @@ impl PioneerDesktop {
 
         let value = self.composer_state.read(cx).value().trim_end().to_owned();
         let attachments = self.composer_attachments.clone();
-        if value.is_empty() && attachments.is_empty() {
+        let capabilities = self.composer_capabilities.clone();
+        if value.is_empty() && attachments.is_empty() && capabilities.is_empty() {
             self.thread_drafts.remove(thread_id.as_str());
             self.thread_draft_attachments.remove(thread_id.as_str());
+            self.thread_draft_capabilities.remove(thread_id.as_str());
         } else {
             self.thread_drafts.insert(thread_id.clone(), value);
-            self.thread_draft_attachments.insert(thread_id, attachments);
+            self.thread_draft_attachments
+                .insert(thread_id.clone(), attachments);
+            self.thread_draft_capabilities
+                .insert(thread_id, capabilities);
         }
     }
 
     pub(in crate::app) fn clear_thread_draft(&mut self, thread_id: &str) {
         self.thread_drafts.remove(thread_id);
         self.thread_draft_attachments.remove(thread_id);
+        self.thread_draft_capabilities.remove(thread_id);
     }
 
     pub(in crate::app) fn restore_thread_draft(
@@ -156,10 +162,16 @@ impl PioneerDesktop {
             .get(thread_id)
             .cloned()
             .unwrap_or_default();
+        let capabilities = self
+            .thread_draft_capabilities
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
         self.composer_state.update(cx, move |state, cx| {
             state.set_value(value.clone(), window, cx)
         });
         self.composer_attachments = attachments;
+        self.composer_capabilities = capabilities;
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(
@@ -177,6 +189,7 @@ impl PioneerDesktop {
         self.composer_state
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.composer_attachments.clear();
+        self.composer_capabilities.clear();
         self.composer_upload_in_progress = false;
         self.composer_upload_error = None;
     }
@@ -306,6 +319,7 @@ impl PioneerDesktop {
         self.thread_coordinators.remove(thread_id);
         self.thread_drafts.remove(thread_id);
         self.thread_draft_attachments.remove(thread_id);
+        self.thread_draft_capabilities.remove(thread_id);
         self.thread_placements.remove(thread_id);
         self.turn_timeline_refresh
             .retain(|(refresh_thread_id, _), _| refresh_thread_id != thread_id);
@@ -316,7 +330,9 @@ impl PioneerDesktop {
         self.thread_coordinators.clear();
         self.thread_drafts.clear();
         self.thread_draft_attachments.clear();
+        self.thread_draft_capabilities.clear();
         self.composer_attachments.clear();
+        self.composer_capabilities.clear();
         self.composer_upload_in_progress = false;
         self.composer_upload_error = None;
         self.composer_selected_provider = None;

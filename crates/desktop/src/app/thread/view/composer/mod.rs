@@ -1,9 +1,18 @@
+mod capabilities;
 mod mode_selector;
 mod model_selector;
 mod view;
 
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use gpui::prelude::*;
+
+fn composer_has_sendable_content(
+    text: &str,
+    has_attachments: bool,
+    has_capabilities: bool,
+) -> bool {
+    !text.trim().is_empty() || has_attachments || has_capabilities
+}
 
 impl PioneerDesktop {
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
@@ -31,7 +40,23 @@ impl PioneerDesktop {
             return false;
         }
 
-        !self.composer_state.read(cx).value().trim().is_empty()
-            || !self.composer_attachments.is_empty()
+        composer_has_sendable_content(
+            self.composer_state.read(cx).value().as_str(),
+            !self.composer_attachments.is_empty(),
+            !self.composer_capabilities.is_empty(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::composer_has_sendable_content;
+
+    #[test]
+    fn composer_content_gate_allows_capability_only_turns() {
+        assert!(composer_has_sendable_content("", false, true));
+        assert!(composer_has_sendable_content("   ", true, false));
+        assert!(composer_has_sendable_content("hello", false, false));
+        assert!(!composer_has_sendable_content("   ", false, false));
     }
 }

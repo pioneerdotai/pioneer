@@ -22,9 +22,9 @@ use gpui_component::{
 };
 use gpui_terminal::TerminalView;
 use pioneer_protocol::{
-    ArtifactRef, ArtifactSummary, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
-    ThreadPlacement, Workspace,
+    ArtifactRef, ArtifactSummary, GatewaySettingsSnapshot, McpListItem, McpScopeKind,
+    McpServerDetailsResponse, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
+    ThreadFolder, ThreadMode, ThreadPlacement, TurnCapability, TurnCapabilityKind, Workspace,
 };
 use std::{
     cell::RefCell,
@@ -241,6 +241,83 @@ pub(super) enum ComposerAttachmentUploadState {
     Failed { error: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ComposerCapability {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) kind: ComposerCapabilityKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ComposerCapabilityKind {
+    Skill {
+        slug: String,
+        source_kind: String,
+    },
+    McpServer {
+        name: String,
+        scope_kind: McpScopeKind,
+    },
+    McpTool {
+        server_name: String,
+        raw_tool_name: String,
+        scope_kind: McpScopeKind,
+    },
+}
+
+impl ComposerCapability {
+    pub(super) fn key(&self) -> String {
+        self.kind.key()
+    }
+
+    pub(super) fn to_turn_capability(&self) -> TurnCapability {
+        TurnCapability {
+            id: self.id.clone(),
+            kind: match &self.kind {
+                ComposerCapabilityKind::Skill { slug, source_kind } => TurnCapabilityKind::Skill {
+                    slug: slug.clone(),
+                    source_kind: source_kind.clone(),
+                },
+                ComposerCapabilityKind::McpServer { name, scope_kind } => {
+                    TurnCapabilityKind::McpServer {
+                        name: name.clone(),
+                        scope_kind: *scope_kind,
+                    }
+                }
+                ComposerCapabilityKind::McpTool {
+                    server_name,
+                    raw_tool_name,
+                    scope_kind,
+                } => TurnCapabilityKind::McpTool {
+                    server_name: server_name.clone(),
+                    raw_tool_name: raw_tool_name.clone(),
+                    scope_kind: *scope_kind,
+                },
+            },
+            label: (!self.label.trim().is_empty()).then(|| self.label.clone()),
+        }
+    }
+}
+
+impl ComposerCapabilityKind {
+    pub(super) fn key(&self) -> String {
+        match self {
+            Self::Skill { slug, source_kind } => format!("skill:{source_kind}:{slug}"),
+            Self::McpServer { name, scope_kind } => {
+                format!("mcp-server:{}:{name}", scope_kind.as_str())
+            }
+            Self::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => format!(
+                "mcp-tool:{}:{server_name}:{raw_tool_name}",
+                scope_kind.as_str()
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct TurnTimelineRefreshState {
     pub(super) in_flight: bool,
@@ -388,6 +465,7 @@ pub struct PioneerDesktop {
     pub(super) draft_thread_by_workspace: HashMap<String, String>,
     pub(super) composer_state: Entity<InputState>,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
+    pub(super) composer_capabilities: Vec<ComposerCapability>,
     pub(super) composer_upload_in_progress: bool,
     pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
@@ -428,6 +506,7 @@ pub struct PioneerDesktop {
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
     pub(super) thread_drafts: HashMap<String, String>,
     pub(super) thread_draft_attachments: HashMap<String, Vec<ComposerAttachment>>,
+    pub(super) thread_draft_capabilities: HashMap<String, Vec<ComposerCapability>>,
     pub(super) thread_start: ThreadStartCoordinator,
     pub(super) thread_start_requested: bool,
     pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,
@@ -444,4 +523,62 @@ pub struct PioneerDesktop {
     pub(super) gateway: GatewayCoordinator,
     pub(super) show_sidebar: bool,
     pub(super) sidebar_panel_width: Pixels,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComposerCapability, ComposerCapabilityKind};
+    use pioneer_protocol::{McpScopeKind, TurnCapabilityKind};
+
+    #[test]
+    fn composer_capability_key_is_canonical_by_kind() {
+        assert_eq!(
+            ComposerCapabilityKind::Skill {
+                slug: "imagegen".to_owned(),
+                source_kind: "user".to_owned(),
+            }
+            .key(),
+            "skill:user:imagegen"
+        );
+        assert_eq!(
+            ComposerCapabilityKind::McpServer {
+                name: "browser".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            }
+            .key(),
+            "mcp-server:workspace:browser"
+        );
+        assert_eq!(
+            ComposerCapabilityKind::McpTool {
+                server_name: "browser".to_owned(),
+                raw_tool_name: "open".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            }
+            .key(),
+            "mcp-tool:workspace:browser:open"
+        );
+    }
+
+    #[test]
+    fn composer_capability_converts_to_turn_capability_without_text_tokens() {
+        let capability = ComposerCapability {
+            id: "skill:user:imagegen".to_owned(),
+            label: "imagegen".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                slug: "imagegen".to_owned(),
+                source_kind: "user".to_owned(),
+            },
+        };
+
+        let turn_capability = capability.to_turn_capability();
+        assert_eq!(turn_capability.id, "skill:user:imagegen");
+        assert_eq!(turn_capability.label.as_deref(), Some("imagegen"));
+        assert_eq!(
+            turn_capability.kind,
+            TurnCapabilityKind::Skill {
+                slug: "imagegen".to_owned(),
+                source_kind: "user".to_owned(),
+            }
+        );
+    }
 }

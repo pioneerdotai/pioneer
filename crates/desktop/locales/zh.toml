@@ -23,6 +23,29 @@ no_providers = "未配置提供商"
 no_models = "没有可用的模型"
 load_error = "加载失败：%{error}"
 
+[chat.composer.add_menu]
+files = "添加文件/文件夹"
+skills = "添加技能"
+mcp = "添加 MCP"
+
+[chat.composer.capability_picker]
+search_skills = "搜索技能"
+search_mcp = "搜索 MCP"
+loading_skills = "正在加载技能..."
+no_skills = "未找到技能"
+refreshing_skills = "正在刷新技能..."
+no_mcp_servers = "未找到 MCP 服务器"
+servers = "服务器"
+tools = "工具"
+refreshing_mcp_servers = "正在刷新 MCP 服务器..."
+loading_tools = "正在加载工具..."
+tools_count = "工具：%{count}"
+disabled_by_policy = "已被策略禁用"
+blocked_by_runtime_checks = "已被运行时检查阻止"
+runtime_unavailable = "运行时不可用"
+runtime_not_ready = "运行时尚未就绪"
+no_tool_catalog = "工具目录不可用"
+
 [chat.composer.preview]
 skill = "技能：%{name}"
 mention = "提及：%{name}"
@@ -36,6 +59,7 @@ or = "或"
 token = "令牌"
 
 [buttons]
+add = "添加"
 cancel = "取消"
 save = "保存"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} 多次重试后失败"
 retry_resolved_label = "重试已完成"
 retries_exhausted_label = "重试已耗尽"
 tool_loop_budget_exceeded = "已达到工具调用限制"
+capability_kind_skill = "技能"
+capability_kind_mcp_server = "MCP 服务器"
+capability_kind_mcp_tool = "MCP 工具"
+capability_kind_capability = "能力"
 code = "代码："

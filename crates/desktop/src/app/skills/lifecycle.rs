@@ -143,7 +143,7 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn skills_workspace_scope(&self) -> Option<String> {
+    pub(in crate::app) fn skills_workspace_scope(&self) -> Option<String> {
         self.preferred_workspace_id()
             .map(str::to_owned)
             .or_else(|| {

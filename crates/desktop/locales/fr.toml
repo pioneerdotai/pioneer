@@ -23,6 +23,29 @@ no_providers = "Aucun fournisseur configuré"
 no_models = "Aucun modèle disponible"
 load_error = "Erreur de chargement : %{error}"
 
+[chat.composer.add_menu]
+files = "Ajouter fichiers/dossiers"
+skills = "Ajouter des compétences"
+mcp = "Ajouter MCP"
+
+[chat.composer.capability_picker]
+search_skills = "Rechercher des compétences"
+search_mcp = "Rechercher MCP"
+loading_skills = "Chargement des compétences..."
+no_skills = "Aucune compétence trouvée"
+refreshing_skills = "Actualisation des compétences..."
+no_mcp_servers = "Aucun serveur MCP trouvé"
+servers = "Serveurs"
+tools = "Outils"
+refreshing_mcp_servers = "Actualisation des serveurs MCP..."
+loading_tools = "Chargement des outils..."
+tools_count = "Outils : %{count}"
+disabled_by_policy = "Désactivé par la politique"
+blocked_by_runtime_checks = "Bloqué par les vérifications du runtime"
+runtime_unavailable = "Runtime indisponible"
+runtime_not_ready = "Le runtime n'est pas prêt"
+no_tool_catalog = "Catalogue d'outils indisponible"
+
 [chat.composer.preview]
 skill = "Compétence : %{name}"
 mention = "Mention : %{name}"
@@ -36,6 +59,7 @@ or = "ou"
 token = "Jeton"
 
 [buttons]
+add = "Ajouter"
 cancel = "Annuler"
 save = "Enregistrer"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} a échoué après les nouvelles tentatives"
 retry_resolved_label = "Nouvelle tentative terminée"
 retries_exhausted_label = "Nouvelles tentatives épuisées"
 tool_loop_budget_exceeded = "Limite d’appels d’outils atteinte"
+capability_kind_skill = "Skill"
+capability_kind_mcp_server = "Serveur MCP"
+capability_kind_mcp_tool = "Outil MCP"
+capability_kind_capability = "Capacité"
 code = "Code :"

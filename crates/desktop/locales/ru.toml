@@ -23,6 +23,29 @@ no_providers = "Нет настроенных провайдеров"
 no_models = "Нет доступных моделей"
 load_error = "Ошибка загрузки: %{error}"
 
+[chat.composer.add_menu]
+files = "Добавить файлы/папки"
+skills = "Добавить навыки"
+mcp = "Добавить MCP"
+
+[chat.composer.capability_picker]
+search_skills = "Поиск навыков"
+search_mcp = "Поиск MCP"
+loading_skills = "Загрузка навыков..."
+no_skills = "Навыки не найдены"
+refreshing_skills = "Обновление навыков..."
+no_mcp_servers = "MCP серверы не найдены"
+servers = "Серверы"
+tools = "Инструменты"
+refreshing_mcp_servers = "Обновление MCP серверов..."
+loading_tools = "Загрузка инструментов..."
+tools_count = "Инструментов: %{count}"
+disabled_by_policy = "Отключено политикой"
+blocked_by_runtime_checks = "Заблокировано проверками среды выполнения"
+runtime_unavailable = "Среда выполнения недоступна"
+runtime_not_ready = "Среда выполнения не готова"
+no_tool_catalog = "Каталог инструментов недоступен"
+
 [chat.composer.preview]
 skill = "Навык: %{name}"
 mention = "Упоминание: %{name}"
@@ -36,6 +59,7 @@ or = "или"
 token = "Токен"
 
 [buttons]
+add = "Добавить"
 cancel = "Отмена"
 save = "Сохранить"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} не выполнен после повто
 retry_resolved_label = "Повтор выполнен"
 retries_exhausted_label = "Повторы исчерпаны"
 tool_loop_budget_exceeded = "Достигнут лимит вызовов инструментов"
+capability_kind_skill = "Скилл"
+capability_kind_mcp_server = "MCP сервер"
+capability_kind_mcp_tool = "MCP инструмент"
+capability_kind_capability = "Возможность"
 code = "Код:"

@@ -23,6 +23,29 @@ no_providers = "プロバイダーが設定されていません"
 no_models = "利用可能なモデルがありません"
 load_error = "読み込みエラー: %{error}"
 
+[chat.composer.add_menu]
+files = "ファイル/フォルダーを追加"
+skills = "スキルを追加"
+mcp = "MCPを追加"
+
+[chat.composer.capability_picker]
+search_skills = "スキルを検索"
+search_mcp = "MCPを検索"
+loading_skills = "スキルを読み込み中..."
+no_skills = "スキルが見つかりません"
+refreshing_skills = "スキルを更新中..."
+no_mcp_servers = "MCPサーバーが見つかりません"
+servers = "サーバー"
+tools = "ツール"
+refreshing_mcp_servers = "MCPサーバーを更新中..."
+loading_tools = "ツールを読み込み中..."
+tools_count = "ツール: %{count}"
+disabled_by_policy = "ポリシーにより無効"
+blocked_by_runtime_checks = "ランタイムチェックによりブロック"
+runtime_unavailable = "ランタイムを利用できません"
+runtime_not_ready = "ランタイムの準備ができていません"
+no_tool_catalog = "ツールカタログを利用できません"
+
 [chat.composer.preview]
 skill = "スキル: %{name}"
 mention = "メンション: %{name}"
@@ -36,6 +59,7 @@ or = "または"
 token = "トークン"
 
 [buttons]
+add = "追加"
 cancel = "キャンセル"
 save = "保存"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} はリトライ後も失敗しました"
 retry_resolved_label = "リトライ完了"
 retries_exhausted_label = "リトライ上限"
 tool_loop_budget_exceeded = "ツール呼び出しの上限に達しました"
+capability_kind_skill = "スキル"
+capability_kind_mcp_server = "MCP サーバー"
+capability_kind_mcp_tool = "MCP ツール"
+capability_kind_capability = "機能"
 code = "コード:"

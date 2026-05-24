@@ -281,7 +281,7 @@ impl PioneerDesktop {
         }
     }
 
-    pub(super) fn mcp_workspace_scope(&self) -> Option<String> {
+    pub(in crate::app) fn mcp_workspace_scope(&self) -> Option<String> {
         self.preferred_workspace_id()
             .map(str::to_owned)
             .or_else(|| {

@@ -23,6 +23,29 @@ no_providers = "No providers configured"
 no_models = "No models available"
 load_error = "Failed to load: %{error}"
 
+[chat.composer.add_menu]
+files = "Add files/folders"
+skills = "Add skills"
+mcp = "Add MCP"
+
+[chat.composer.capability_picker]
+search_skills = "Search skills"
+search_mcp = "Search MCP"
+loading_skills = "Loading skills..."
+no_skills = "No skills found"
+refreshing_skills = "Refreshing skills..."
+no_mcp_servers = "No MCP servers found"
+servers = "Servers"
+tools = "Tools"
+refreshing_mcp_servers = "Refreshing MCP servers..."
+loading_tools = "Loading tools..."
+tools_count = "Tools: %{count}"
+disabled_by_policy = "Disabled by policy"
+blocked_by_runtime_checks = "Blocked by runtime checks"
+runtime_unavailable = "Runtime unavailable"
+runtime_not_ready = "Runtime is not ready"
+no_tool_catalog = "No tool catalog available"
+
 [chat.composer.preview]
 skill = "Skill: %{name}"
 mention = "Mention: %{name}"
@@ -36,6 +59,7 @@ or = "or"
 token = "Token"
 
 [buttons]
+add = "Add"
 cancel = "Cancel"
 save = "Save"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} failed after retries"
 retry_resolved_label = "Retry completed"
 retries_exhausted_label = "Retries exhausted"
 tool_loop_budget_exceeded = "Tool call limit reached"
+capability_kind_skill = "Skill"
+capability_kind_mcp_server = "MCP server"
+capability_kind_mcp_tool = "MCP tool"
+capability_kind_capability = "Capability"
 code = "Code:"

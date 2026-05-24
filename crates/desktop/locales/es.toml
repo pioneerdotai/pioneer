@@ -23,6 +23,29 @@ no_providers = "No hay proveedores configurados"
 no_models = "No hay modelos disponibles"
 load_error = "Error al cargar: %{error}"
 
+[chat.composer.add_menu]
+files = "Añadir archivos/carpetas"
+skills = "Añadir habilidades"
+mcp = "Añadir MCP"
+
+[chat.composer.capability_picker]
+search_skills = "Buscar habilidades"
+search_mcp = "Buscar MCP"
+loading_skills = "Cargando habilidades..."
+no_skills = "No se encontraron habilidades"
+refreshing_skills = "Actualizando habilidades..."
+no_mcp_servers = "No se encontraron servidores MCP"
+servers = "Servidores"
+tools = "Herramientas"
+refreshing_mcp_servers = "Actualizando servidores MCP..."
+loading_tools = "Cargando herramientas..."
+tools_count = "Herramientas: %{count}"
+disabled_by_policy = "Deshabilitado por la política"
+blocked_by_runtime_checks = "Bloqueado por comprobaciones del runtime"
+runtime_unavailable = "Runtime no disponible"
+runtime_not_ready = "El runtime no está listo"
+no_tool_catalog = "Catálogo de herramientas no disponible"
+
 [chat.composer.preview]
 skill = "Habilidad: %{name}"
 mention = "Mención: %{name}"
@@ -36,6 +59,7 @@ or = "o"
 token = "Token"
 
 [buttons]
+add = "Añadir"
 cancel = "Cancelar"
 save = "Guardar"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} falló tras los reintentos"
 retry_resolved_label = "Reintento completado"
 retries_exhausted_label = "Reintentos agotados"
 tool_loop_budget_exceeded = "Se alcanzó el límite de llamadas a herramientas"
+capability_kind_skill = "Skill"
+capability_kind_mcp_server = "Servidor MCP"
+capability_kind_mcp_tool = "Herramienta MCP"
+capability_kind_capability = "Capacidad"
 code = "Código:"

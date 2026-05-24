@@ -267,6 +267,9 @@ fn display_name_from_attachment(attachment: &UserMessageAttachment) -> String {
         | UserMessageAttachment::LocalAudio { path }
         | UserMessageAttachment::LocalVideo { path } => path.as_str(),
         UserMessageAttachment::Artifact { artifact } => return artifact.display_name.clone(),
+        UserMessageAttachment::Skill { capability } => return capability.label.clone(),
+        UserMessageAttachment::McpServer { capability } => return capability.label.clone(),
+        UserMessageAttachment::McpTool { capability } => return capability.label.clone(),
     };
 
     if source.contains("://") || source.starts_with("data:") {
@@ -314,7 +317,10 @@ mod tests {
         artifact_from_attachment, display_name_from_attachment,
         stable_user_message_attachment_chip_id,
     };
-    use pioneer_protocol::{ArtifactKind, ArtifactRef, ArtifactStatus, UserMessageAttachment};
+    use pioneer_protocol::{
+        ArtifactKind, ArtifactRef, ArtifactStatus, McpScopeKind, TurnMcpServerCapabilitySummary,
+        TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
+    };
 
     #[test]
     fn display_name_uses_local_file_name() {
@@ -358,6 +364,48 @@ mod tests {
                 .as_ref()
                 .map(|artifact| artifact.artifact_id.as_str()),
             Some("art_1")
+        );
+    }
+
+    #[test]
+    fn capability_chips_use_labels_and_do_not_resolve_artifacts() {
+        let attachments = vec![
+            UserMessageAttachment::Skill {
+                capability: TurnSkillCapabilitySummary {
+                    id: "skill:user:docs".to_owned(),
+                    label: "docs".to_owned(),
+                    slug: "docs".to_owned(),
+                    source_kind: "user".to_owned(),
+                },
+            },
+            UserMessageAttachment::McpServer {
+                capability: TurnMcpServerCapabilitySummary {
+                    id: "mcp-server:workspace:resend".to_owned(),
+                    label: "resend".to_owned(),
+                    name: "resend".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+            },
+            UserMessageAttachment::McpTool {
+                capability: TurnMcpToolCapabilitySummary {
+                    id: "mcp-tool:workspace:resend:send".to_owned(),
+                    label: "resend/send".to_owned(),
+                    server_name: "resend".to_owned(),
+                    raw_tool_name: "send".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+            },
+        ];
+
+        let labels = attachments
+            .iter()
+            .map(display_name_from_attachment)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["docs", "resend", "resend/send"]);
+        assert!(
+            attachments
+                .iter()
+                .all(|attachment| artifact_from_attachment(attachment).is_none())
         );
     }
 

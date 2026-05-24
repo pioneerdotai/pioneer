@@ -23,6 +23,29 @@ no_providers = "कोई प्रदाता कॉन्फ़िगर न�
 no_models = "कोई मॉडल उपलब्ध नहीं है"
 load_error = "लोड करने में त्रुटि: %{error}"
 
+[chat.composer.add_menu]
+files = "फ़ाइलें/फ़ोल्डर जोड़ें"
+skills = "कौशल जोड़ें"
+mcp = "MCP जोड़ें"
+
+[chat.composer.capability_picker]
+search_skills = "कौशल खोजें"
+search_mcp = "MCP खोजें"
+loading_skills = "कौशल लोड हो रहे हैं..."
+no_skills = "कोई कौशल नहीं मिला"
+refreshing_skills = "कौशल रीफ़्रेश हो रहे हैं..."
+no_mcp_servers = "कोई MCP सर्वर नहीं मिला"
+servers = "सर्वर"
+tools = "टूल"
+refreshing_mcp_servers = "MCP सर्वर रीफ़्रेश हो रहे हैं..."
+loading_tools = "टूल लोड हो रहे हैं..."
+tools_count = "टूल: %{count}"
+disabled_by_policy = "नीति द्वारा अक्षम"
+blocked_by_runtime_checks = "रनटाइम जाँचों द्वारा अवरुद्ध"
+runtime_unavailable = "रनटाइम उपलब्ध नहीं है"
+runtime_not_ready = "रनटाइम तैयार नहीं है"
+no_tool_catalog = "टूल कैटलॉग उपलब्ध नहीं है"
+
 [chat.composer.preview]
 skill = "कौशल: %{name}"
 mention = "उल्लेख: %{name}"
@@ -36,6 +59,7 @@ or = "या"
 token = "टोकन"
 
 [buttons]
+add = "जोड़ें"
 cancel = "रद्द करें"
 save = "सहेजें"
 
@@ -1021,4 +1045,8 @@ tool_retry_exhausted = "%{tool_name} रीट्राई के बाद भ�
 retry_resolved_label = "रीट्राई पूरा हुआ"
 retries_exhausted_label = "रीट्राई खत्म हुए"
 tool_loop_budget_exceeded = "टूल कॉल सीमा पूरी हो गई"
+capability_kind_skill = "स्किल"
+capability_kind_mcp_server = "MCP सर्वर"
+capability_kind_mcp_tool = "MCP टूल"
+capability_kind_capability = "क्षमता"
 code = "कोड:"
