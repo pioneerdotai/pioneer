@@ -169,6 +169,19 @@ fn mcp_tool_capability(server_name: &str, raw_tool_name: &str) -> TurnCapability
     }
 }
 
+fn assert_compact_skill_prompt(
+    system_text: &str,
+    skill_slug: &str,
+    display_name: &str,
+    body: &str,
+) {
+    assert!(system_text.contains("[Skills]"));
+    assert!(system_text.contains(display_name));
+    assert!(system_text.contains(&format!("Skill slug for read_skill: `{skill_slug}`")));
+    assert!(!system_text.contains(&format!("[Skill Body: ${skill_slug}]")));
+    assert!(!system_text.contains(body));
+}
+
 /// A provider that never completes — useful for testing concurrent turn rejection.
 struct PendingProvider;
 
@@ -8005,7 +8018,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
 }
 
 #[tokio::test]
-async fn explicit_skill_input_injects_skill_prompt_and_binding() {
+async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
     let skill_root = unique_temp_dir("skills");
     let skill_dir = skill_root.join("tests").join("my-skill");
     fs::create_dir_all(&skill_dir).expect("failed to create skill dir");
@@ -8098,9 +8111,12 @@ async fn explicit_skill_input_injects_skill_prompt_and_binding() {
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
-    assert!(compiled_prompt.full_system_text.contains("$tests/my-skill"));
-    assert!(compiled_prompt.full_system_text.contains("My Skill"));
+    assert_compact_skill_prompt(
+        compiled_prompt.full_system_text.as_str(),
+        "tests/my-skill",
+        "My Skill",
+        "Follow the skill.",
+    );
 
     let manifest = observed
         .iter()
@@ -8254,7 +8270,7 @@ async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
 }
 
 #[tokio::test]
-async fn explicit_skill_input_injects_prompt_for_non_tool_calling_provider() {
+async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provider() {
     let skill_root = unique_temp_dir("skills-standard");
     let skill_dir = skill_root.join("tests").join("my-skill");
     fs::create_dir_all(&skill_dir).expect("failed to create skill dir");
@@ -8328,8 +8344,12 @@ async fn explicit_skill_input_injects_prompt_for_non_tool_calling_provider() {
         .compiled_prompt
         .as_ref()
         .expect("compiled prompt should be attached to provider request");
-    assert!(compiled_prompt.full_system_text.contains("[Skills]"));
-    assert!(compiled_prompt.full_system_text.contains("$tests/my-skill"));
+    assert_compact_skill_prompt(
+        compiled_prompt.full_system_text.as_str(),
+        "tests/my-skill",
+        "My Skill",
+        "Follow the skill.",
+    );
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -8688,8 +8708,12 @@ async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() 
         .compiled_prompt
         .as_ref()
         .expect("agent request should include compiled prompt");
-    assert!(prompt.full_system_text.contains("[Skills]"));
-    assert!(prompt.full_system_text.contains("$tests/my-skill"));
+    assert_compact_skill_prompt(
+        prompt.full_system_text.as_str(),
+        "tests/my-skill",
+        "My Skill",
+        "Follow the skill.",
+    );
     assert!(!prompt.full_system_text.contains("mcp_resend_send"));
     assert!(!prompt.full_system_text.contains("resend/send"));
 

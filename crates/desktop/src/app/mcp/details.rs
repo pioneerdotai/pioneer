@@ -8,14 +8,13 @@ use crate::app::{
 use chrono::{Local, TimeZone};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    StyledExt,
     button::*,
     collapsible::Collapsible,
     divider::Divider,
     scroll::ScrollableElement,
     table::{Table, TableState},
     theme::ActiveTheme,
-    *,
+    StyledExt, *,
 };
 use pioneer_protocol::{
     McpAuditEventSummary, McpListItem, McpPromptCatalogItem, McpResourceCatalogItem,

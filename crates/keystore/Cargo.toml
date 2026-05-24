@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-db-keystore = "0.4.2-pre.2"
+db-keystore = "0.4"
 keyring-core = "1"
 serde.workspace = true
 serde_json.workspace = true

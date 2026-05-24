@@ -496,7 +496,11 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
 
         assert_eq!(result.result.active.len(), 1);
         assert_eq!(result.result.active[0].slug, "tests/weather");
-        assert!(result.prompt.contains("Skill slug for read_skill: `tests/weather`"));
+        assert!(
+            result
+                .prompt
+                .contains("Skill slug for read_skill: `tests/weather`")
+        );
         assert!(
             !result
                 .prompt
