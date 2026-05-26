@@ -76,6 +76,17 @@ snapshot_transport_max_bytes = 8388608
 snapshot_transport_max_side_px = 1280
 snapshot_transport_min_side_px = 320
 snapshot_downscale_factor = 0.85
+accessibility_tree_max_depth = 6
+accessibility_tree_max_nodes = 200
+accessibility_tree_max_serialized_bytes = 196608
+accessibility_tree_text_max_chars = 160
+semantic_action_timeout_ms = 30000
+app_activation_timeout_ms = 5000
+input_simulation_enabled = true
+launch_if_missing_default = false
+# Empty allows any explicit launch_command. Non-empty restricts launch_command by exact command or prefix.
+allowed_launch_commands = []
+preflight_screenshot_probe_enabled = true
 max_consecutive_same_snapshot_hash = 6
 max_consecutive_same_action_signature = 8
 max_consecutive_no_progress_steps = 4

@@ -1,11 +1,9 @@
 use super::model::{
-    ComputerUseActArgs, ComputerUseFailureClass, ComputerUseLoopState, ComputerUseSession,
-    ComputerUseStatus, DisplayMeta, LoopGuardState, MAX_TEXT_CHARS, MouseButtonKind,
-    ResolvedAction, SnapshotBudget,
+    ComputerUseAction, ComputerUseFailureClass, ComputerUseLoopState, ComputerUseSession,
+    ComputerUseStatus, LoopGuardState, SnapshotBudget,
 };
 use crate::ComputerUseToolsConfig;
 use crate::error::ToolError;
-use enigo::{Button, Key};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
@@ -107,13 +105,13 @@ pub(crate) fn default_loop_guard(config: &ComputerUseToolsConfig) -> LoopGuardSt
     }
 }
 
-pub(crate) fn resolved_action_signature(action: &ResolvedAction) -> String {
+pub(crate) fn resolved_action_signature(action: &ComputerUseAction) -> String {
     serde_json::to_string(action).unwrap_or_else(|_| action.action_type().to_owned())
 }
 
 pub(crate) fn apply_action_loop_guards(
     session: &mut ComputerUseSession,
-    action: &ResolvedAction,
+    action: &ComputerUseAction,
 ) -> Option<String> {
     let signature = resolved_action_signature(action);
     let next = if session
@@ -143,6 +141,7 @@ pub(crate) fn apply_action_loop_guards(
 pub(crate) fn apply_snapshot_loop_guards(
     session: &mut ComputerUseSession,
     new_snapshot_hash: &str,
+    no_progress_after_action: bool,
 ) -> Option<String> {
     let previous_hash = session
         .last_snapshot
@@ -159,7 +158,7 @@ pub(crate) fn apply_snapshot_loop_guards(
     }
 
     if session.awaiting_post_action_snapshot {
-        if previous_hash == Some(new_snapshot_hash) {
+        if no_progress_after_action {
             session.loop_guard.consecutive_no_progress_steps = session
                 .loop_guard
                 .consecutive_no_progress_steps
@@ -280,216 +279,6 @@ fn is_disallowed_path_component(component: Component<'_>) -> bool {
         component,
         Component::ParentDir | Component::RootDir | Component::Prefix(_)
     )
-}
-
-pub(crate) fn resolve_action(
-    act: ComputerUseActArgs,
-    display: &DisplayMeta,
-) -> Result<ResolvedAction, ToolError> {
-    let kind = act.kind.trim().to_lowercase();
-    match kind.as_str() {
-        "move" => {
-            let (x, y) = resolve_absolute_coordinates(display, act.x_norm, act.y_norm)?;
-            Ok(ResolvedAction::Move { x, y })
-        }
-        "click" => {
-            let (x, y) = resolve_absolute_coordinates(display, act.x_norm, act.y_norm)?;
-            Ok(ResolvedAction::Click {
-                x,
-                y,
-                button: parse_mouse_button(act.button.as_deref())?,
-                click_count: 1,
-            })
-        }
-        "double_click" => {
-            let (x, y) = resolve_absolute_coordinates(display, act.x_norm, act.y_norm)?;
-            Ok(ResolvedAction::Click {
-                x,
-                y,
-                button: parse_mouse_button(act.button.as_deref())?,
-                click_count: 2,
-            })
-        }
-        "right_click" => {
-            let (x, y) = resolve_absolute_coordinates(display, act.x_norm, act.y_norm)?;
-            Ok(ResolvedAction::Click {
-                x,
-                y,
-                button: MouseButtonKind::Right,
-                click_count: 1,
-            })
-        }
-        "scroll" => {
-            let delta_x = act.delta_x.unwrap_or(0);
-            let delta_y = act.delta_y.unwrap_or(0);
-            if delta_x == 0 && delta_y == 0 {
-                return Err(ToolError::invalid_arguments(
-                    "scroll requires non-zero delta_x or delta_y",
-                ));
-            }
-            Ok(ResolvedAction::Scroll { delta_x, delta_y })
-        }
-        "type_text" => {
-            let text = act.text.unwrap_or_default().trim().to_owned();
-            if text.is_empty() {
-                return Err(ToolError::invalid_arguments(
-                    "type_text requires non-empty text",
-                ));
-            }
-            if text.chars().count() > MAX_TEXT_CHARS {
-                return Err(ToolError::invalid_arguments(format!(
-                    "text exceeds max length of {} characters",
-                    MAX_TEXT_CHARS
-                )));
-            }
-            Ok(ResolvedAction::TypeText { text })
-        }
-        "hotkey" => {
-            let keys = act.keys.unwrap_or_default();
-            if keys.is_empty() {
-                return Err(ToolError::invalid_arguments(
-                    "hotkey requires at least one key",
-                ));
-            }
-            if keys.len() > 5 {
-                return Err(ToolError::invalid_arguments(
-                    "hotkey supports at most 5 keys",
-                ));
-            }
-            Ok(ResolvedAction::Hotkey { keys })
-        }
-        "wait" => {
-            let wait_ms = act.wait_ms.unwrap_or(250).clamp(1, 60_000);
-            Ok(ResolvedAction::Wait { wait_ms })
-        }
-        _ => Err(ToolError::invalid_arguments(format!(
-            "unsupported act.type `{}`; supported: click, double_click, right_click, move, scroll, type_text, hotkey, wait",
-            kind
-        ))),
-    }
-}
-
-fn parse_mouse_button(button: Option<&str>) -> Result<MouseButtonKind, ToolError> {
-    match button.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(MouseButtonKind::Left),
-        Some(value) => match value.to_lowercase().as_str() {
-            "left" => Ok(MouseButtonKind::Left),
-            "right" => Ok(MouseButtonKind::Right),
-            "middle" => Ok(MouseButtonKind::Middle),
-            other => Err(ToolError::invalid_arguments(format!(
-                "unsupported mouse button `{}`",
-                other
-            ))),
-        },
-    }
-}
-
-pub(crate) fn to_enigo_button(button: MouseButtonKind) -> Button {
-    match button {
-        MouseButtonKind::Left => Button::Left,
-        MouseButtonKind::Right => Button::Right,
-        MouseButtonKind::Middle => Button::Middle,
-    }
-}
-
-pub(crate) fn resolve_absolute_coordinates(
-    display: &DisplayMeta,
-    x_norm: Option<f64>,
-    y_norm: Option<f64>,
-) -> Result<(i32, i32), ToolError> {
-    let x_norm = x_norm.ok_or_else(|| ToolError::invalid_arguments("x_norm is required"))?;
-    let y_norm = y_norm.ok_or_else(|| ToolError::invalid_arguments("y_norm is required"))?;
-
-    if !x_norm.is_finite() || !y_norm.is_finite() {
-        return Err(ToolError::invalid_arguments(
-            "x_norm and y_norm must be finite numbers",
-        ));
-    }
-    if !(0.0..=1.0).contains(&x_norm) || !(0.0..=1.0).contains(&y_norm) {
-        return Err(ToolError::invalid_arguments(
-            "x_norm and y_norm must be between 0 and 1",
-        ));
-    }
-    if display.width_px == 0 || display.height_px == 0 {
-        return Err(ToolError::execution_failed(format!(
-            "display {} has invalid dimensions {}x{}",
-            display.display_id, display.width_px, display.height_px
-        )));
-    }
-
-    let local_x = (x_norm * f64::from(display.width_px.saturating_sub(1))).round() as i32;
-    let local_y = (y_norm * f64::from(display.height_px.saturating_sub(1))).round() as i32;
-    let global_x = display.origin_x.saturating_add(local_x);
-    let global_y = display.origin_y.saturating_add(local_y);
-    Ok((global_x, global_y))
-}
-
-pub(crate) fn parse_hotkey_key(value: &str) -> Result<Key, ToolError> {
-    let normalized = normalize_hotkey_token(value);
-    let key = match normalized.as_str() {
-        "ctrl" => Key::Control,
-        "shift" => Key::Shift,
-        "alt" => Key::Alt,
-        "meta" => Key::Meta,
-        "enter" => Key::Return,
-        "tab" => Key::Tab,
-        "space" => Key::Space,
-        "esc" => Key::Escape,
-        "backspace" => Key::Backspace,
-        "delete" => Key::Delete,
-        "up" => Key::UpArrow,
-        "down" => Key::DownArrow,
-        "left" => Key::LeftArrow,
-        "right" => Key::RightArrow,
-        "home" => Key::Home,
-        "end" => Key::End,
-        "pageup" => Key::PageUp,
-        "pagedown" => Key::PageDown,
-        "f1" => Key::F1,
-        "f2" => Key::F2,
-        "f3" => Key::F3,
-        "f4" => Key::F4,
-        "f5" => Key::F5,
-        "f6" => Key::F6,
-        "f7" => Key::F7,
-        "f8" => Key::F8,
-        "f9" => Key::F9,
-        "f10" => Key::F10,
-        "f11" => Key::F11,
-        "f12" => Key::F12,
-        "f13" => Key::F13,
-        "f14" => Key::F14,
-        "f15" => Key::F15,
-        "f16" => Key::F16,
-        "f17" => Key::F17,
-        "f18" => Key::F18,
-        "f19" => Key::F19,
-        "f20" => Key::F20,
-        _ if normalized.chars().count() == 1 => {
-            Key::Unicode(normalized.chars().next().expect("single char"))
-        }
-        _ => {
-            return Err(ToolError::invalid_arguments(format!(
-                "unsupported hotkey token `{}`",
-                value
-            )));
-        }
-    };
-    Ok(key)
-}
-
-fn normalize_hotkey_token(value: &str) -> String {
-    match value.trim().to_lowercase().as_str() {
-        "control" | "ctrl" => "ctrl".to_owned(),
-        "option" | "alt" => "alt".to_owned(),
-        "command" | "cmd" | "meta" | "super" | "win" | "windows" => "meta".to_owned(),
-        "return" | "enter" => "enter".to_owned(),
-        "escape" | "esc" => "esc".to_owned(),
-        "del" | "delete" => "delete".to_owned(),
-        "pgup" | "page_up" => "pageup".to_owned(),
-        "pgdn" | "page_down" => "pagedown".to_owned(),
-        other => other.to_owned(),
-    }
 }
 
 pub(crate) fn compute_hash(bytes: &[u8]) -> String {

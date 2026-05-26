@@ -34,9 +34,9 @@ use pioneer_protocol::{
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
-    AttachmentDataSource, ChatRequest, ChatResponse, MessageContentPart, Provider,
-    ProviderCapabilities, ProviderInputCapabilities, ProviderRegistry, ProviderToolCall, Role,
-    StreamChunk,
+    AttachmentDataSource, ChatRequest, ChatResponse, InputTypeSupport, MessageContentPart,
+    Provider, ProviderCapabilities, ProviderInputCapabilities, ProviderRegistry, ProviderToolCall,
+    Role, StreamChunk,
 };
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
@@ -262,6 +262,22 @@ impl CaptureAgentProvider {
             .lock()
             .expect("capture provider lock poisoned")
             .clone()
+    }
+}
+
+struct TextOnlyAgentProvider {
+    inner: CaptureAgentProvider,
+}
+
+impl TextOnlyAgentProvider {
+    fn with_preflight_response(preflight_response_text: impl Into<String>) -> Self {
+        Self {
+            inner: CaptureAgentProvider::with_preflight_response(preflight_response_text),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.inner.snapshot_requests()
     }
 }
 
@@ -917,6 +933,16 @@ fn assert_stable_requests_eq(left: &ChatRequest, right: &ChatRequest) {
 }
 
 const TEST_PREFLIGHT_RESPONSE: &str = r#"{"tools":{"visibleTools":[]}}"#;
+
+fn test_native_image_input_capabilities() -> ProviderInputCapabilities {
+    ProviderInputCapabilities {
+        text: true,
+        file: InputTypeSupport::fallback_only(),
+        image: InputTypeSupport::data_url_inline_only(),
+        audio: InputTypeSupport::fallback_only(),
+        video: InputTypeSupport::fallback_only(),
+    }
+}
 
 fn preflight_response_with_visible_tools(tool_names: &[&str]) -> String {
     json!({
@@ -1787,9 +1813,9 @@ impl Provider for SequencedToolProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: false,
-            vision: false,
+            vision: true,
             tool_calling: true,
-            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+            input_types: test_native_image_input_capabilities(),
         }
     }
 
@@ -1848,9 +1874,9 @@ impl Provider for LoopBudgetProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: false,
-            vision: false,
+            vision: true,
             tool_calling: true,
-            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+            input_types: test_native_image_input_capabilities(),
         }
     }
 
@@ -2076,6 +2102,33 @@ impl Provider for CaptureAgentProvider {
             Ok(StreamChunk::final_chunk()),
         ])
         .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for TextOnlyAgentProvider {
+    fn name(&self) -> &str {
+        "text-only"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.inner.chat(request).await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        self.inner.stream_chat(request).await
     }
 }
 
@@ -2412,6 +2465,115 @@ async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
     let main_request = &requests[1];
     assert!(main_request.compiled_prompt.is_some());
     assert!(main_request.tools.is_some());
+}
+
+#[tokio::test]
+async fn context_isolation_old_task_local_constraint_stays_historical() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread_id = "context_isolation_thread";
+    let workspace_id = "context_isolation_workspace";
+
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            "context_isolation_turn_1",
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "For this one-off check, do not click the red button.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("first turn should start");
+    let first_observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&first_observed);
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            "context_isolation_turn_2",
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "Open the requested desktop location.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("second turn should start");
+    let second_observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&second_observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "two completed agent turns should produce two visible provider requests"
+    );
+    let second_request = &requests[1];
+    let second_prompt = second_request
+        .compiled_prompt
+        .as_ref()
+        .expect("agent request should include compiled prompt");
+
+    assert!(
+        second_prompt
+            .full_system_text
+            .contains("## Turn Context Isolation")
+    );
+    assert!(
+        second_prompt
+            .full_system_text
+            .contains("Current-turn user instructions are authoritative")
+    );
+    assert!(
+        second_prompt
+            .full_system_text
+            .contains("Durable preferences include stable language/style/project conventions")
+    );
+    assert!(
+        !second_prompt
+            .full_system_text
+            .contains("For this one-off check, do not click the red button."),
+        "old task-local text must not be promoted into the active system prompt"
+    );
+
+    let second_messages_text = second_request
+        .messages
+        .iter()
+        .map(|message| message.text_content_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        second_messages_text.contains("Open the requested desktop location."),
+        "current turn instruction must be present"
+    );
+    assert!(
+        !second_request.messages.iter().any(|message| {
+            message.role == pioneer_provider::Role::System
+                && message
+                    .text_content_lossy()
+                    .contains("For this one-off check, do not click the red button.")
+        }),
+        "old task-local text must not be reintroduced as an active system instruction"
+    );
 }
 
 #[tokio::test]
@@ -4092,6 +4254,67 @@ async fn phase_10_prompt_manifest_and_tool_schemas_exclude_discovery_tools() {
 }
 
 #[tokio::test]
+async fn prompt_manifest_desktop_tool_policy_is_in_compiled_prompt() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_prompt_manifest_desktop_tool_policy",
+        "ws_prompt_manifest_desktop_tool_policy",
+        "turn_prompt_manifest_desktop_tool_policy",
+        ThreadMode::Agent,
+        "capture",
+        "Open the requested desktop location.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("## Desktop Automation Tool Policy")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("request and use the `computer_use` domain first")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("do not call `exec_command`, `osascript`, shell scripts")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("use `open_app` with an explicit app identity")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("use `open_path` or `reveal_path` only with an explicit filesystem path")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("use `open_url` with an explicit URL")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("Do not claim desktop task success without completion evidence")
+    );
+}
+
+#[tokio::test]
 async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized() {
     let registered_optional_tools = [
         "memory_search",
@@ -4174,6 +4397,109 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
     }
     assert!(!request_tool_names.contains(&"tool_search"));
     assert!(!request_tool_names.contains(&"tool_suggest"));
+}
+
+#[tokio::test]
+async fn computer_use_image_capability_text_only_model_blocks_computer_use() {
+    let provider = Arc::new(TextOnlyAgentProvider::with_preflight_response(
+        preflight_response_with_visible_tools(&["computer_use"]),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "text-only",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_computer_use_image_capability_text_only",
+        "ws_computer_use_image_capability_text_only",
+        "turn_computer_use_image_capability_text_only",
+        ThreadMode::Agent,
+        "text-only",
+        "Open the requested desktop location.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request_tool_names = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should still include available provider tools")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !request_tool_names.contains(&"computer_use"),
+        "computer_use must be blocked when provider/model cannot receive screenshot images"
+    );
+    let prompt = requests[0]
+        .compiled_prompt
+        .as_ref()
+        .expect("main request should include compiled prompt");
+    assert!(
+        prompt
+            .full_system_text
+            .contains("computer_use is unavailable for this provider/model")
+    );
+    assert!(
+        prompt
+            .full_system_text
+            .contains("requires a model/provider with image input support")
+    );
+}
+
+#[tokio::test]
+async fn computer_use_image_capability_image_model_exposes_computer_use() {
+    let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
+        preflight_response_with_visible_tools(&["computer_use"]),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_computer_use_image_capability_image_model",
+        "ws_computer_use_image_capability_image_model",
+        "turn_computer_use_image_capability_image_model",
+        ThreadMode::Agent,
+        "capture",
+        "Open the requested desktop location.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let request_tool_names = requests[0]
+        .tools
+        .as_ref()
+        .expect("main request should include provider tools")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let probe_tool_loop_config = test_tool_loop_config();
+    let computer_use_available = pioneer_tools::build_builtin_tools(
+        ".",
+        "turn_computer_use_image_capability_probe",
+        probe_tool_loop_config.web,
+        probe_tool_loop_config.computer_use,
+    )
+    .router
+    .has_handler("computer_use");
+    if computer_use_available {
+        assert!(
+            request_tool_names.contains(&"computer_use"),
+            "image-capable providers may expose computer_use when preflight selects it"
+        );
+    } else {
+        assert!(
+            !request_tool_names.contains(&"computer_use"),
+            "unregistered computer_use must stay hidden even for image-capable providers"
+        );
+    }
 }
 
 #[tokio::test]

@@ -173,6 +173,13 @@ fn dynamic_tool_registration_candidate(
             .get("snapshot")
             .and_then(|value| value.get("path"))
             .and_then(JsonValue::as_str)
+            .or_else(|| {
+                metadata
+                    .get("llm_context")
+                    .and_then(|value| value.get("attachment"))
+                    .and_then(|value| value.get("path"))
+                    .and_then(JsonValue::as_str)
+            })
             .or_else(|| metadata.get("path").and_then(JsonValue::as_str))?;
         return Some(ArtifactRegistrationCandidate {
             path: PathBuf::from(path),
@@ -382,6 +389,44 @@ mod tests {
         assert_eq!(
             candidates[0].source,
             ArtifactRegistrationSource::ComputerUseSnapshot
+        );
+        assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::Screenshot));
+    }
+
+    #[test]
+    fn artifact_registration_computer_use_artifact_reads_llm_context_attachment_path() {
+        let item = TurnItem::DynamicToolCall {
+            id: "call_cu".to_owned(),
+            tool_name: "computer_use".to_owned(),
+            arguments: json!({"action": "snapshot"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: Some(recovery_policy()),
+            output_policy: output_policy(),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(json!({
+                    "action": "snapshot",
+                    "session_id": 7,
+                    "llm_context": {
+                        "attachment": {
+                            "path": "/workspace/snap-from-llm-context.png",
+                            "mime_type": "image/png"
+                        }
+                    }
+                })),
+            },
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+
+        let candidates = artifact_registration_candidates_from_completed_item(&item);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].path,
+            PathBuf::from("/workspace/snap-from-llm-context.png")
         );
         assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::Screenshot));
     }

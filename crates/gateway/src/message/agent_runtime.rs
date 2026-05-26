@@ -444,6 +444,8 @@ impl MessageProcessor {
         existing: Option<String>,
         error_message: &str,
     ) -> String {
+        const RECOVERY_DISPLAY_MAX_CHARS: usize = 1_800;
+        
         let mut lines = Vec::new();
         if let Some(value) = existing
             && !value.trim().is_empty()
@@ -451,7 +453,11 @@ impl MessageProcessor {
             lines.push(value);
         }
         lines.push(format!("recovery failed: {error_message}"));
-        lines.join("\n")
+        let text = lines.join("\n");
+        if text.chars().count() <= RECOVERY_DISPLAY_MAX_CHARS {
+            return text;
+        }
+        text.chars().take(RECOVERY_DISPLAY_MAX_CHARS).collect()
     }
 
     pub(super) fn normalize_item_markdown(item: &mut TurnItem) -> (String, String) {

@@ -768,6 +768,26 @@ pub struct GatewayComputerUseToolsConfig {
     pub snapshot_transport_min_side_px: u32,
     #[serde(default = "default_computer_use_snapshot_downscale_factor")]
     pub snapshot_downscale_factor: f64,
+    #[serde(default = "default_computer_use_accessibility_tree_max_depth")]
+    pub accessibility_tree_max_depth: usize,
+    #[serde(default = "default_computer_use_accessibility_tree_max_nodes")]
+    pub accessibility_tree_max_nodes: usize,
+    #[serde(default = "default_computer_use_accessibility_tree_max_serialized_bytes")]
+    pub accessibility_tree_max_serialized_bytes: usize,
+    #[serde(default = "default_computer_use_accessibility_tree_text_max_chars")]
+    pub accessibility_tree_text_max_chars: usize,
+    #[serde(default = "default_computer_use_semantic_action_timeout_ms")]
+    pub semantic_action_timeout_ms: u64,
+    #[serde(default = "default_computer_use_app_activation_timeout_ms")]
+    pub app_activation_timeout_ms: u64,
+    #[serde(default = "default_computer_use_input_simulation_enabled")]
+    pub input_simulation_enabled: bool,
+    #[serde(default = "default_computer_use_launch_if_missing_default")]
+    pub launch_if_missing_default: bool,
+    #[serde(default)]
+    pub allowed_launch_commands: Vec<String>,
+    #[serde(default = "default_computer_use_preflight_screenshot_probe_enabled")]
+    pub preflight_screenshot_probe_enabled: bool,
     #[serde(default = "default_computer_use_max_consecutive_same_snapshot_hash")]
     pub max_consecutive_same_snapshot_hash: u32,
     #[serde(default = "default_computer_use_max_consecutive_same_action_signature")]
@@ -791,6 +811,19 @@ impl Default for GatewayComputerUseToolsConfig {
             snapshot_transport_max_side_px: default_computer_use_snapshot_transport_max_side_px(),
             snapshot_transport_min_side_px: default_computer_use_snapshot_transport_min_side_px(),
             snapshot_downscale_factor: default_computer_use_snapshot_downscale_factor(),
+            accessibility_tree_max_depth: default_computer_use_accessibility_tree_max_depth(),
+            accessibility_tree_max_nodes: default_computer_use_accessibility_tree_max_nodes(),
+            accessibility_tree_max_serialized_bytes:
+                default_computer_use_accessibility_tree_max_serialized_bytes(),
+            accessibility_tree_text_max_chars:
+                default_computer_use_accessibility_tree_text_max_chars(),
+            semantic_action_timeout_ms: default_computer_use_semantic_action_timeout_ms(),
+            app_activation_timeout_ms: default_computer_use_app_activation_timeout_ms(),
+            input_simulation_enabled: default_computer_use_input_simulation_enabled(),
+            launch_if_missing_default: default_computer_use_launch_if_missing_default(),
+            allowed_launch_commands: Vec::new(),
+            preflight_screenshot_probe_enabled:
+                default_computer_use_preflight_screenshot_probe_enabled(),
             max_consecutive_same_snapshot_hash:
                 default_computer_use_max_consecutive_same_snapshot_hash(),
             max_consecutive_same_action_signature:
@@ -992,6 +1025,42 @@ const fn default_computer_use_snapshot_transport_min_side_px() -> u32 {
 
 const fn default_computer_use_snapshot_downscale_factor() -> f64 {
     0.85
+}
+
+const fn default_computer_use_accessibility_tree_max_depth() -> usize {
+    6
+}
+
+const fn default_computer_use_accessibility_tree_max_nodes() -> usize {
+    200
+}
+
+const fn default_computer_use_accessibility_tree_max_serialized_bytes() -> usize {
+    192 * 1024
+}
+
+const fn default_computer_use_accessibility_tree_text_max_chars() -> usize {
+    160
+}
+
+const fn default_computer_use_semantic_action_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_computer_use_app_activation_timeout_ms() -> u64 {
+    5_000
+}
+
+const fn default_computer_use_input_simulation_enabled() -> bool {
+    true
+}
+
+const fn default_computer_use_launch_if_missing_default() -> bool {
+    false
+}
+
+const fn default_computer_use_preflight_screenshot_probe_enabled() -> bool {
+    true
 }
 
 const fn default_computer_use_max_consecutive_same_snapshot_hash() -> u32 {
@@ -2079,6 +2148,63 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(
             config.gateway.tools.computer_use.snapshot_downscale_factor,
             0.85
+        );
+        assert_eq!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .accessibility_tree_max_depth,
+            6
+        );
+        assert_eq!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .accessibility_tree_max_nodes,
+            200
+        );
+        assert_eq!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .accessibility_tree_max_serialized_bytes,
+            192 * 1024
+        );
+        assert_eq!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .accessibility_tree_text_max_chars,
+            160
+        );
+        assert_eq!(
+            config.gateway.tools.computer_use.semantic_action_timeout_ms,
+            30_000
+        );
+        assert_eq!(
+            config.gateway.tools.computer_use.app_activation_timeout_ms,
+            5_000
+        );
+        assert!(config.gateway.tools.computer_use.input_simulation_enabled);
+        assert!(!config.gateway.tools.computer_use.launch_if_missing_default);
+        assert!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .allowed_launch_commands
+                .is_empty()
+        );
+        assert!(
+            config
+                .gateway
+                .tools
+                .computer_use
+                .preflight_screenshot_probe_enabled
         );
         assert_eq!(
             config

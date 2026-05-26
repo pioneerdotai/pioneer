@@ -7,7 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-computer-use = ["dep:enigo", "dep:xcap"]
+computer-use = ["dep:xa11y", "dep:xcap", "dep:image"]
 
 [dependencies]
 anyhow.workspace = true
@@ -29,5 +29,6 @@ libc.workspace = true
 scraper.workspace = true
 webclaw-core.workspace = true
 futures-util.workspace = true
-enigo = { workspace = true, optional = true }
+xa11y = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
+image = { workspace = true, optional = true }

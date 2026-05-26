@@ -113,7 +113,7 @@ use handlers::{
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct WebToolsConfig {
@@ -185,6 +185,16 @@ pub struct ComputerUseToolsConfig {
     pub snapshot_transport_max_side_px: u32,
     pub snapshot_transport_min_side_px: u32,
     pub snapshot_downscale_factor: f64,
+    pub accessibility_tree_max_depth: usize,
+    pub accessibility_tree_max_nodes: usize,
+    pub accessibility_tree_max_serialized_bytes: usize,
+    pub accessibility_tree_text_max_chars: usize,
+    pub semantic_action_timeout_ms: u64,
+    pub app_activation_timeout_ms: u64,
+    pub input_simulation_enabled: bool,
+    pub launch_if_missing_default: bool,
+    pub allowed_launch_commands: Vec<String>,
+    pub preflight_screenshot_probe_enabled: bool,
     pub max_consecutive_same_snapshot_hash: u32,
     pub max_consecutive_same_action_signature: u32,
     pub max_consecutive_no_progress_steps: u32,
@@ -195,11 +205,7 @@ pub struct ComputerUseToolsConfig {
 impl ComputerUseToolsConfig {
     pub fn normalized(&self) -> Self {
         let artifacts_subdir = normalize_artifacts_subdir(self.artifacts_subdir.as_str());
-        let runtime_home_dir = if self.runtime_home_dir.as_os_str().is_empty() {
-            PathBuf::from(".pioneer")
-        } else {
-            self.runtime_home_dir.clone()
-        };
+        let runtime_home_dir = self.runtime_home_dir.clone();
 
         Self {
             runtime_home_dir,
@@ -211,6 +217,26 @@ impl ComputerUseToolsConfig {
             snapshot_transport_max_side_px: self.snapshot_transport_max_side_px.clamp(320, 4096),
             snapshot_transport_min_side_px: self.snapshot_transport_min_side_px.clamp(160, 2048),
             snapshot_downscale_factor: self.snapshot_downscale_factor.clamp(0.5, 0.95),
+            accessibility_tree_max_depth: self.accessibility_tree_max_depth.clamp(1, 50),
+            accessibility_tree_max_nodes: self.accessibility_tree_max_nodes.clamp(1, 5_000),
+            accessibility_tree_max_serialized_bytes: self
+                .accessibility_tree_max_serialized_bytes
+                .clamp(4 * 1024, 2 * 1024 * 1024),
+            accessibility_tree_text_max_chars: self
+                .accessibility_tree_text_max_chars
+                .clamp(16, 4096),
+            semantic_action_timeout_ms: self.semantic_action_timeout_ms.clamp(1, 120_000),
+            app_activation_timeout_ms: self.app_activation_timeout_ms.clamp(0, 120_000),
+            input_simulation_enabled: self.input_simulation_enabled,
+            launch_if_missing_default: self.launch_if_missing_default,
+            allowed_launch_commands: self
+                .allowed_launch_commands
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            preflight_screenshot_probe_enabled: self.preflight_screenshot_probe_enabled,
             max_consecutive_same_snapshot_hash: self.max_consecutive_same_snapshot_hash.max(1),
             max_consecutive_same_action_signature: self
                 .max_consecutive_same_action_signature
@@ -225,7 +251,7 @@ impl ComputerUseToolsConfig {
 impl Default for ComputerUseToolsConfig {
     fn default() -> Self {
         Self {
-            runtime_home_dir: PathBuf::from(".pioneer"),
+            runtime_home_dir: PathBuf::new(),
             artifacts_subdir: "tools/computer_use".to_owned(),
             retention_hours: 24,
             max_total_bytes: 1024 * 1024 * 1024,
@@ -234,6 +260,16 @@ impl Default for ComputerUseToolsConfig {
             snapshot_transport_max_side_px: 1280,
             snapshot_transport_min_side_px: 320,
             snapshot_downscale_factor: 0.85,
+            accessibility_tree_max_depth: 6,
+            accessibility_tree_max_nodes: 200,
+            accessibility_tree_max_serialized_bytes: 192 * 1024,
+            accessibility_tree_text_max_chars: 160,
+            semantic_action_timeout_ms: 30_000,
+            app_activation_timeout_ms: 5_000,
+            input_simulation_enabled: true,
+            launch_if_missing_default: false,
+            allowed_launch_commands: Vec::new(),
+            preflight_screenshot_probe_enabled: true,
             max_consecutive_same_snapshot_hash: 6,
             max_consecutive_same_action_signature: 8,
             max_consecutive_no_progress_steps: 4,
@@ -423,12 +459,14 @@ pub fn build_tools_with_environment(
         "download_url",
         Arc::new(DownloadUrlHandler::new(web_tools_config)),
     );
+    let blocked_tool_names = Arc::new(RwLock::new(BTreeMap::new()));
+
     builder.register_handler(
         REQUEST_TOOLS_TOOL_NAME,
-        Arc::new(RequestToolsHandler::new(
-            visibility.clone(),
-            registered_tool_names,
-        )),
+        Arc::new(
+            RequestToolsHandler::new(visibility.clone(), registered_tool_names)
+                .with_shared_blocked_tool_names(blocked_tool_names.clone()),
+        ),
     );
 
     for extension in extensions {
@@ -441,12 +479,13 @@ pub fn build_tools_with_environment(
 
     let event_bus = ToolEventBus::default();
 
-    let router = Arc::new(ToolRouter::new(
+    let router = Arc::new(ToolRouter::new_with_blocked_tool_names(
         configured_specs,
         registry,
         visibility.clone(),
         event_bus.clone(),
         turn_id.clone(),
+        blocked_tool_names,
     ));
 
     let orchestrator = Arc::new(ToolOrchestrator::new(OrchestratorPolicy::default()));
@@ -562,6 +601,25 @@ mod tests {
             max_total_bytes: 1024 * 1024 * 1024,
             run_max_steps_default: 30,
             ..ComputerUseToolsConfig::default()
+        }
+    }
+
+    #[test]
+    fn computer_use_config_normalization_rejects_absolute_and_traversal_artifact_dirs() {
+        for artifacts_subdir in ["/tmp/computer_use", "../computer_use", "tools/../x"] {
+            let config = ComputerUseToolsConfig {
+                artifacts_subdir: artifacts_subdir.to_owned(),
+                semantic_action_timeout_ms: 0,
+                app_activation_timeout_ms: 130_000,
+                allowed_launch_commands: vec!["".to_owned(), "open -a ExampleApp".to_owned()],
+                ..ComputerUseToolsConfig::default()
+            }
+            .normalized();
+
+            assert_eq!(config.artifacts_subdir, "tools/computer_use");
+            assert_eq!(config.semantic_action_timeout_ms, 1);
+            assert_eq!(config.app_activation_timeout_ms, 120_000);
+            assert_eq!(config.allowed_launch_commands, vec!["open -a ExampleApp"]);
         }
     }
 

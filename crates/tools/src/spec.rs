@@ -320,7 +320,7 @@ fn configured_builtin_spec(
 pub(crate) fn computer_use_configured_spec() -> ConfiguredToolSpec {
     configured_builtin_spec(
         "computer_use",
-        "Remote desktop control loop. Required call shapes: start {action,goal}; snapshot {action,session_id}; act {action,session_id,act:{type,...}}; status {action,session_id}; stop {action,session_id}. For action=act, nested act object is mandatory.",
+        "Remote desktop control loop for visible app/UI tasks. Use computer_use for desktop UI state, screenshots, accessibility actions, and explicit input simulation. exec_command may be used for diagnostics or app metadata lookup, but not as a replacement for UI clicking/typing/verification. Layered control order: top-level OS/session operations first (preflight, list_apps, start, snapshot, status, stop); high-level OS actions in action=act second (open_app, activate_app, open_path, reveal_path, open_url, select_menu_item, focus_window); semantic accessibility actions third (press/focus/set_value/type_text with node_id or selector); explicit input_* simulation fallback last. start requires explicit target: app_name/pid/identity_key/bundle_id/executable_path/active_app for app tasks, screen only for whole-desktop tasks. Do not invent unsupported nested act.type verbs such as open; use open_app/open_path/open_url. input_key sends exactly one key; input_chord sends a multi-key hotkey. The preflight action is a computer_use OS capability/permission check and is unrelated to gateway model/provider preflight. Do not use stop outcome=completed until computer_use verify has passed or the latest post-action snapshot returned completion_evidence.",
         computer_use_schema(),
         PayloadKind::Function,
         ExecutionClass::SessionScoped,
@@ -514,81 +514,146 @@ fn request_tools_schema() -> JsonValue {
 fn computer_use_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
-        "description": "Session-oriented remote computer control. When action is `act`, arguments MUST include both `session_id` and nested `act` object.",
+        "description": "Session-oriented remote computer control for visible app/UI tasks. Use this tool for desktop UI state, screenshots, accessibility actions, and explicit input simulation. exec_command may be used for diagnostics or app metadata lookup, but not as a replacement for UI clicking/typing/verification. Layered control order: top-level OS/session operations first, high-level OS act.type actions second, semantic accessibility actions third, explicit input simulation fallback last. `preflight` checks OS desktop-control permissions/capabilities without creating a session. `start` requires explicit target: use app_name/pid/identity_key/bundle_id/executable_path/active_app for app tasks and screen only for whole-desktop tasks. When action is `act`, arguments MUST include both `session_id` and nested `act` object. Do not call snapshot/act/verify/status/stop until a successful start returns session_id. Do not use `stop` with `outcome=completed` until `verify` passes or the latest post-action snapshot includes `completion_evidence`.",
+        "examples": [
+            { "action": "preflight" },
+            {
+                "action": "start",
+                "goal": "Open the requested application",
+                "target": {
+                    "type": "app_name",
+                    "name": "ExampleApp",
+                    "launch_if_missing": true
+                }
+            },
+            { "action": "snapshot", "session_id": 1 },
+            {
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "open_app",
+                    "app": "ExampleApp"
+                }
+            },
+            {
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "open_path",
+                    "path": "/absolute/path"
+                }
+            },
+            {
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "press",
+                    "target": { "node_id": "n42", "snapshot_id": "s1-1" }
+                }
+            },
+            {
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "input_chord",
+                    "keys": ["meta", "space"]
+                }
+            },
+            {
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "input_click",
+                    "target": { "point": { "x": 100, "y": 200, "coordinate_space": "source_pixels" } }
+                }
+            },
+            {
+                "action": "verify",
+                "session_id": 1,
+                "expect": {
+                    "app": "ExampleApp",
+                    "window_title": "Example Window",
+                    "visible_text": "Expected visible text"
+                }
+            }
+        ],
         "properties": {
             "action": {
                 "type": "string",
-                "description": "Operation name. Use `act` only with nested `act` object.",
+                "description": "Operation name. `preflight` is a computer_use desktop permission/capability check and does not require session_id. Use `act` only with nested `act` object.",
                 "enum": [
+                    "preflight",
+                    "list_apps",
                     "list_displays",
                     "start",
                     "snapshot",
                     "act",
+                    "verify",
                     "status",
                     "stop"
                 ]
             },
             "session_id": { "type": "integer", "minimum": 1 },
             "goal": { "type": "string" },
+            "target": {
+                "type": "object",
+                "description": "Required for action=start. Desktop target for a session. Prefer app_name, pid, identity_key, bundle_id, executable_path, or active_app for accessibility control; use screen only for whole-desktop tasks.",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["screen", "active_app", "app_name", "app", "pid", "identity_key", "bundle_id", "executable_path"]
+                    },
+                    "name": { "type": "string" },
+                    "pid": { "type": "integer", "minimum": 1 },
+                    "identity_key": { "type": "string" },
+                    "bundle_id": { "type": "string" },
+                    "executable_path": { "type": "string" },
+                    "display_id": { "type": "integer", "minimum": 0 },
+                    "launch_if_missing": { "type": "boolean" },
+                    "launch_command": { "type": "string" },
+                    "activation_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 120000 },
+                    "tree_max_depth": { "type": "integer", "minimum": 1, "maximum": 50 }
+                },
+                "required": ["type"],
+                "additionalProperties": false
+            },
             "max_steps": { "type": "integer", "minimum": 1, "maximum": 200 },
             "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
             "display_id": { "type": "integer", "minimum": 0 },
+            "launch_if_missing": { "type": "boolean" },
+            "launch_command": { "type": "string" },
+            "activation_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 120000 },
+            "tree_max_depth": { "type": "integer", "minimum": 1, "maximum": 50 },
             "planner_provider": { "type": "string" },
             "planner_model": { "type": "string" },
             "snapshot_max_bytes": { "type": "integer", "minimum": 262144, "maximum": 67108864 },
             "snapshot_max_side_px": { "type": "integer", "minimum": 320, "maximum": 4096 },
             "screenshot_path": { "type": "string" },
             "recovery_attempt": { "type": "integer", "minimum": 0, "maximum": 100 },
-            "expected_effect_mismatch": { "type": "boolean" },
             "failure_class": {
                 "type": "string",
                 "enum": [
+                    "permission_denied",
+                    "accessibility_unavailable",
+                    "accessibility_not_enabled",
+                    "app_not_found",
+                    "element_not_found",
+                    "element_stale",
+                    "action_not_supported",
+                    "input_simulation_unavailable",
+                    "screenshot_unavailable",
                     "attachment_transport_failure",
                     "provider_timeout",
                     "provider_rate_limit",
-                    "expected_effect_mismatch",
-                    "policy_blocked",
-                    "runtime_action_error",
                     "loop_guard_triggered",
-                    "recovery_budget_exceeded"
+                    "recovery_budget_exceeded",
+                    "runtime_action_error"
                 ]
             },
             "outcome": { "type": "string", "enum": ["stopped", "completed", "failed"] },
             "reason": { "type": "string" },
-            "act": {
-                "type": "object",
-                "description": "Required when action=`act`. Nested action payload to execute on the desktop.",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": [
-                            "click",
-                            "double_click",
-                            "right_click",
-                            "move",
-                            "scroll",
-                            "type_text",
-                            "hotkey",
-                            "wait"
-                        ]
-                    },
-                    "x_norm": { "type": "number", "minimum": 0, "maximum": 1 },
-                    "y_norm": { "type": "number", "minimum": 0, "maximum": 1 },
-                    "button": { "type": "string", "enum": ["left", "right", "middle"] },
-                    "delta_x": { "type": "integer" },
-                    "delta_y": { "type": "integer" },
-                    "text": { "type": "string" },
-                    "keys": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 5
-                    },
-                    "wait_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
-                },
-                "required": ["type"],
-                "additionalProperties": false
-            }
+            "expect": computer_use_verify_expect_schema(),
+            "act": computer_use_act_schema()
         },
         "allOf": [
             {
@@ -604,6 +669,10 @@ fn computer_use_schema() -> JsonValue {
                 "then": { "required": ["session_id", "act"] }
             },
             {
+                "if": { "properties": { "action": { "const": "verify" } }, "required": ["action"] },
+                "then": { "required": ["session_id", "expect"] }
+            },
+            {
                 "if": { "properties": { "action": { "const": "status" } }, "required": ["action"] },
                 "then": { "required": ["session_id"] }
             },
@@ -613,6 +682,194 @@ fn computer_use_schema() -> JsonValue {
             }
         ],
         "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+#[cfg(feature = "computer-use")]
+fn computer_use_verify_expect_schema() -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "description": "Deterministic verification expectations checked against the latest computer_use snapshot/accessibility tree. Does not call OCR/VLM/provider.",
+        "properties": {
+            "app": { "type": "string" },
+            "window_title": { "type": "string" },
+            "visible_text": { "type": "string" },
+            "node": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "role": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "snapshot_hash_changed": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    })
+}
+
+#[cfg(feature = "computer-use")]
+fn computer_use_act_schema() -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "description": "Required when action=`act`. High-level OS actions are preferred for common desktop tasks; semantic accessibility actions are next; explicit input_* actions are fallback-only. Do not use unsupported high-level verbs such as open; use open_app/open_path/open_url. input_key sends exactly one key; input_chord sends a multi-key hotkey/chord.",
+        "examples": [
+            { "type": "open_app", "app": "ExampleApp" },
+            { "type": "open_path", "path": "/absolute/path" },
+            { "type": "select_menu_item", "app": "ExampleApp", "menu_path": ["File", "New Window"] },
+            { "type": "focus_window", "app": "ExampleApp", "title": "Example Window" },
+            { "type": "press", "target": { "node_id": "n42", "snapshot_id": "s1-1" } },
+            { "type": "input_key", "keys": ["enter"] },
+            { "type": "input_chord", "keys": ["meta", "space"] },
+            { "type": "input_click", "target": { "point": { "x": 100, "y": 200, "coordinate_space": "source_pixels" } } }
+        ],
+        "properties": {
+            "type": {
+                "type": "string",
+                "description": "OS actions operate on apps, paths, URLs, menus, or windows. Semantic actions target accessibility nodes. Explicit input_* actions use raw input simulation and should be used only when OS/semantic actions are insufficient. input_key requires exactly one key in keys; input_chord requires keys for a simultaneous hotkey/chord.",
+                "enum": [
+                    "open_app",
+                    "activate_app",
+                    "open_path",
+                    "reveal_path",
+                    "open_url",
+                    "select_menu_item",
+                    "focus_window",
+                    "press",
+                    "focus",
+                    "blur",
+                    "toggle",
+                    "select",
+                    "expand",
+                    "collapse",
+                    "show_menu",
+                    "scroll_into_view",
+                    "set_value",
+                    "set_numeric_value",
+                    "type_text",
+                    "select_text",
+                    "perform_action",
+                    "wait_for",
+                    "input_click",
+                    "input_double_click",
+                    "input_right_click",
+                    "input_move",
+                    "input_drag",
+                    "input_scroll",
+                    "input_key",
+                    "input_chord",
+                    "input_type_text",
+                    "wait"
+                ]
+            },
+            "target": computer_use_action_target_schema(true),
+            "from": computer_use_action_target_schema(true),
+            "to": computer_use_action_target_schema(true),
+            "button": { "type": "string", "enum": ["left", "right", "middle"] },
+            "delta_x": { "type": "integer" },
+            "delta_y": { "type": "integer" },
+            "text": { "type": "string" },
+            "numeric_value": { "type": "number" },
+            "action_name": { "type": "string" },
+            "condition": { "type": "string" },
+            "app": {
+                "type": "string",
+                "description": "Required for open_app, activate_app, select_menu_item, and focus_window."
+            },
+            "path": {
+                "type": "string",
+                "description": "Required for open_path and reveal_path."
+            },
+            "url": {
+                "type": "string",
+                "description": "Required for open_url."
+            },
+            "menu_path": {
+                "type": "array",
+                "description": "Required for select_menu_item; ordered menu labels such as [\"File\",\"New Window\"].",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 1
+            },
+            "title": {
+                "type": "string",
+                "description": "Optional window title filter for focus_window."
+            },
+            "keys": {
+                "type": "array",
+                "description": "For input_key, provide exactly one key such as [\"enter\"]. For input_chord, provide a simultaneous hotkey/chord such as [\"meta\",\"space\"].",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "maxItems": 5
+            },
+            "wait_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+    })
+}
+
+#[cfg(feature = "computer-use")]
+fn computer_use_action_target_schema(allow_point: bool) -> JsonValue {
+    let mut properties = serde_json::json!({
+        "node_id": { "type": "string" },
+        "snapshot_id": {
+            "type": "string",
+            "description": "Required when using node_id; copy it from the latest computer_use snapshot response. Omit for selector/role/name targets."
+        },
+        "selector": { "type": "string" },
+        "role": { "type": "string" },
+        "name": { "type": "string" },
+        "nth": { "type": "integer", "minimum": 1 },
+        "bounds_anchor": {
+            "type": "object",
+            "properties": {
+                "node_id": { "type": "string" },
+                "snapshot_id": {
+                    "type": "string",
+                    "description": "Required with bounds_anchor.node_id; copy it from the latest snapshot."
+                },
+                "anchor": {
+                    "type": "string",
+                    "enum": ["center", "top_left", "top_right", "bottom_left", "bottom_right"]
+                }
+            },
+            "required": ["node_id", "snapshot_id"],
+            "additionalProperties": false
+        }
+    });
+    if allow_point {
+        if let Some(object) = properties.as_object_mut() {
+            object.insert(
+                "point".to_owned(),
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Explicit point target. coordinate_space is required in the tool schema to prevent mixing source screenshot pixels, downscaled transport pixels, accessibility logical coordinates, and native input coordinates. Runtime only defaults missing coordinate_space to source_pixels when the latest snapshot was not transformed.",
+                    "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" },
+                        "coordinate_space": {
+                            "type": "string",
+                            "enum": ["source_pixels", "transport_pixels", "logical_screen", "native_input"],
+                            "description": "source_pixels = original screenshot pixel coordinates; transport_pixels = downscaled image sent to the LLM; logical_screen = accessibility/display logical bounds; native_input = coordinates accepted by the input backend."
+                        }
+                    },
+                    "required": ["x", "y", "coordinate_space"],
+                    "additionalProperties": false
+                }),
+            );
+        }
+    }
+    serde_json::json!({
+        "type": "object",
+        "description": if allow_point {
+            "Action target. Point targets are valid only for explicit input_* actions and should include coordinate_space. node_id and bounds_anchor.node_id targets must include snapshot_id from the latest snapshot."
+        } else {
+            "Semantic accessibility target. Use node_id with snapshot_id from the latest snapshot when available; point coordinates are intentionally not accepted for semantic actions."
+        },
+        "properties": properties,
         "additionalProperties": false
     })
 }
@@ -739,6 +996,119 @@ mod tests {
         assert_eq!(
             configured.spec.parameters["required"],
             serde_json::json!(["action"])
+        );
+        let actions = configured.spec.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .expect("computer_use action enum");
+        assert!(
+            actions.contains(&serde_json::json!("preflight")),
+            "computer_use must expose its own desktop permission preflight action"
+        );
+        assert!(
+            configured.spec.description.contains("unrelated to gateway"),
+            "computer_use preflight description must distinguish it from gateway model/provider preflight"
+        );
+        assert!(
+            configured
+                .spec
+                .description
+                .contains("Layered control order")
+                && configured
+                    .spec
+                    .description
+                    .contains("exec_command may be used for diagnostics"),
+            "computer_use description must tell the model the desktop control policy"
+        );
+        assert!(
+            configured
+                .spec
+                .description
+                .contains("input_key sends exactly one key")
+                && configured
+                    .spec
+                    .description
+                    .contains("input_chord sends a multi-key hotkey"),
+            "computer_use description must distinguish input_key from input_chord"
+        );
+
+        let parameters = &configured.spec.parameters;
+        let examples = parameters["examples"]
+            .as_array()
+            .expect("computer_use schema examples");
+        for required_example in [
+            serde_json::json!({ "action": "preflight" }),
+            serde_json::json!({
+                "action": "snapshot",
+                "session_id": 1
+            }),
+            serde_json::json!({
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "open_app",
+                    "app": "ExampleApp"
+                }
+            }),
+            serde_json::json!({
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "open_path",
+                    "path": "/absolute/path"
+                }
+            }),
+            serde_json::json!({
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "press",
+                    "target": { "node_id": "n42", "snapshot_id": "s1-1" }
+                }
+            }),
+            serde_json::json!({
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "input_chord",
+                    "keys": ["meta", "space"]
+                }
+            }),
+            serde_json::json!({
+                "action": "act",
+                "session_id": 1,
+                "act": {
+                    "type": "input_click",
+                    "target": { "point": { "x": 100, "y": 200, "coordinate_space": "source_pixels" } }
+                }
+            }),
+        ] {
+            assert!(
+                examples.contains(&required_example),
+                "missing computer_use example: {required_example}"
+            );
+        }
+        assert!(
+            examples.iter().any(|example| {
+                example.get("action").and_then(JsonValue::as_str) == Some("start")
+                    && example.pointer("/target/type").and_then(JsonValue::as_str)
+                        == Some("app_name")
+            }),
+            "computer_use schema must include start target.type=app_name example"
+        );
+
+        let act_enum = parameters["properties"]["act"]["properties"]["type"]["enum"]
+            .as_array()
+            .expect("computer_use act.type enum");
+        assert!(
+            !act_enum.contains(&serde_json::json!("open")),
+            "computer_use act.type enum must not imply unsupported open action"
+        );
+        let act_schema_text =
+            serde_json::to_string(&parameters["properties"]["act"]).expect("act schema JSON");
+        assert!(
+            act_schema_text.contains("input_key requires exactly one key")
+                && act_schema_text.contains("input_chord requires keys"),
+            "act schema must document input_key versus input_chord"
         );
     }
 

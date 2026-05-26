@@ -1,7 +1,13 @@
+mod actions;
 mod backend;
 mod handler;
 mod model;
+mod permissions;
+mod platform;
+mod runtime;
 mod state;
+mod targets;
+mod tree;
 mod util;
 
 #[cfg(test)]

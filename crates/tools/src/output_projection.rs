@@ -200,7 +200,7 @@ fn project_web_fetch(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     envelope(
         &input,
         llm_view_for_policy(&input),
-        ToolDisplayPayload::Summary(summary),
+        display_for_policy(input.output_policy, summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
@@ -295,7 +295,7 @@ fn project_download(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     envelope(
         &input,
         llm_view_for_policy(&input),
-        ToolDisplayPayload::Summary(summary),
+        display_for_policy(input.output_policy, summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
@@ -520,7 +520,8 @@ fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
 }
 
 fn project_computer_use(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
-    let metadata = remove_raw_like_fields(input.raw_output_json);
+    let metadata = compact_computer_use_metadata(input.raw_output_json);
+    let lines = computer_use_summary_lines(input.raw_output_json);
     let summary = summary(
         input
             .raw_output_json
@@ -528,19 +529,103 @@ fn project_computer_use(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
             .and_then(JsonValue::as_str)
             .map(|action| format!("computer_use {action}"))
             .unwrap_or_else(|| "computer_use completed".to_owned()),
-        Vec::new(),
+        lines,
         metadata.clone(),
         input.outcome.incomplete,
     );
     envelope(
         &input,
         llm_view_for_policy(&input),
-        ToolDisplayPayload::Summary(summary),
+        display_for_policy(input.output_policy, summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
         recovery_view(&input),
     )
+}
+
+fn computer_use_summary_lines(value: &JsonValue) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(coordinate) = value.pointer("/result/coordinate_observability") {
+        lines.extend(computer_use_coordinate_lines(coordinate));
+    } else if let Some(coordinate) = value.get("coordinate_observability") {
+        lines.extend(computer_use_coordinate_lines(coordinate));
+    }
+    lines
+}
+
+fn computer_use_coordinate_lines(coordinate: &JsonValue) -> Vec<String> {
+    let Some(slots) = coordinate.get("slots").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    slots
+        .iter()
+        .filter_map(|(name, slot)| {
+            let requested = slot.get("requested_point")?;
+            let converted = slot.get("converted_point")?;
+            let requested_space = slot
+                .get("requested_space")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("unknown");
+            let converted_space = slot
+                .get("converted_space")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("unknown");
+            let requested_x = requested.get("x").and_then(JsonValue::as_i64)?;
+            let requested_y = requested.get("y").and_then(JsonValue::as_i64)?;
+            let converted_x = converted.get("x").and_then(JsonValue::as_i64)?;
+            let converted_y = converted.get("y").and_then(JsonValue::as_i64)?;
+            let status = slot
+                .get("validation_status")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("unknown");
+            Some(format!(
+                "coordinate {name}: {requested_space}({requested_x},{requested_y}) -> {converted_space}({converted_x},{converted_y}), validation={status}"
+            ))
+        })
+        .collect()
+}
+
+fn compact_computer_use_metadata(value: &JsonValue) -> JsonValue {
+    let mut metadata = remove_raw_like_fields(value);
+    compact_accessibility_payload(&mut metadata);
+    metadata
+}
+
+fn compact_accessibility_payload(value: &mut JsonValue) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(tree) = object.get_mut("accessibility_tree") {
+        compact_accessibility_tree_nodes(tree);
+    }
+    if let Some(accessibility) = object.get_mut("accessibility") {
+        compact_accessibility_tree_nodes(accessibility);
+    }
+    if let Some(llm_context) = object
+        .get_mut("llm_context")
+        .and_then(JsonValue::as_object_mut)
+    {
+        if let Some(tree) = llm_context.get_mut("accessibility_tree") {
+            compact_accessibility_tree_nodes(tree);
+        }
+        if let Some(accessibility) = llm_context.get_mut("accessibility") {
+            compact_accessibility_tree_nodes(accessibility);
+        }
+    }
+}
+
+fn compact_accessibility_tree_nodes(value: &mut JsonValue) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(nodes) = object.remove("nodes") {
+        let node_count = nodes.as_array().map_or(0, Vec::len);
+        object.insert(
+            "node_count".to_owned(),
+            JsonValue::Number(serde_json::Number::from(node_count)),
+        );
+    }
 }
 
 fn project_dynamic_generic(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -853,8 +938,9 @@ fn display_for_policy(
     summary: ToolOutputSummary,
 ) -> ToolDisplayPayload {
     match output_policy.timeline {
-        TimelineOutputPolicy::Full { .. } | TimelineOutputPolicy::Summary { .. } => {
-            ToolDisplayPayload::Summary(summary)
+        TimelineOutputPolicy::Full { .. } => ToolDisplayPayload::Summary(summary),
+        TimelineOutputPolicy::Summary { max_chars } => {
+            ToolDisplayPayload::Summary(bounded_summary_for_chars(summary, max_chars))
         }
         TimelineOutputPolicy::MetadataOnly | TimelineOutputPolicy::Hidden => {
             ToolDisplayPayload::Hidden
@@ -868,8 +954,9 @@ fn storage_for_policy(
     raw_metadata: JsonValue,
 ) -> ToolStoragePayload {
     match output_policy.storage {
-        StorageOutputPolicy::Full { .. } | StorageOutputPolicy::Summary { .. } => {
-            ToolStoragePayload::Summary(summary)
+        StorageOutputPolicy::Full { .. } => ToolStoragePayload::Summary(summary),
+        StorageOutputPolicy::Summary { max_chars } => {
+            ToolStoragePayload::Summary(bounded_summary_for_chars(summary, max_chars))
         }
         StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(raw_metadata),
@@ -1245,6 +1332,44 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+fn bounded_summary_for_chars(summary: ToolOutputSummary, max_chars: usize) -> ToolOutputSummary {
+    let mut remaining = max_chars;
+    let mut truncated = summary.truncated;
+    let (title, title_truncated) = take_chars_with_status(summary.title.as_str(), remaining);
+    truncated |= title_truncated;
+    remaining = remaining.saturating_sub(title.chars().count());
+
+    let mut lines = Vec::new();
+    for line in summary.lines {
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let (bounded, line_truncated) = take_chars_with_status(line.as_str(), remaining);
+        remaining = remaining.saturating_sub(bounded.chars().count());
+        lines.push(bounded);
+        if line_truncated {
+            truncated = true;
+            break;
+        }
+    }
+
+    ToolOutputSummary {
+        title,
+        lines,
+        metadata: summary.metadata,
+        truncated,
+    }
+}
+
+fn take_chars_with_status(text: &str, max_chars: usize) -> (String, bool) {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return (text.to_owned(), false);
+    }
+    (text.chars().take(max_chars).collect(), true)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1325,6 +1450,213 @@ mod tests {
                 .unwrap()
                 .contains("SECRET_PAGE_BODY_SENTINEL")
         );
+    }
+
+    #[test]
+    fn computer_use_projection_compacts_accessibility_nodes_outside_llm_view() {
+        let payload = serde_json::json!({
+            "action": "snapshot",
+            "session_id": 1,
+            "snapshot": {
+                "path": "/tmp/snap.png"
+            },
+            "accessibility_tree": {
+                "status": "ok",
+                "nodes": [
+                    { "id": "n1", "role": "button", "name": "SECRET_TREE_NODE" }
+                ],
+                "truncated": false
+            },
+            "llm_context": {
+                "attachment": {
+                    "path": "/tmp/snap.png",
+                    "mime_type": "image/png"
+                },
+                "accessibility_tree": {
+                    "status": "ok",
+                    "nodes": [
+                        { "id": "n1", "role": "button", "name": "SECRET_TREE_NODE" }
+                    ],
+                    "truncated": false
+                }
+            }
+        });
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_computer_use",
+            tool_name: "computer_use",
+            arguments: &serde_json::json!({"action": "snapshot"}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        assert!(
+            serde_json::to_string(&envelope.llm_view)
+                .unwrap()
+                .contains("SECRET_TREE_NODE")
+        );
+        assert!(
+            !serde_json::to_string(&envelope.display)
+                .unwrap()
+                .contains("SECRET_TREE_NODE")
+        );
+        assert!(
+            serde_json::to_string(&envelope.display)
+                .unwrap()
+                .contains("node_count")
+        );
+        assert!(
+            !serde_json::to_string(&envelope.storage)
+                .unwrap()
+                .contains("SECRET_TREE_NODE")
+        );
+    }
+
+    #[test]
+    fn computer_use_projection_bounds_display_summary_to_timeline_policy() {
+        let slots = (0..80)
+            .map(|index| {
+                (
+                    format!("slot_{index}"),
+                    serde_json::json!({
+                        "requested_point": { "x": 10, "y": 20 },
+                        "converted_point": { "x": 10, "y": 20 },
+                        "requested_space": "snapshot",
+                        "converted_space": "screen",
+                        "validation_status": "ok"
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let payload = serde_json::json!({
+            "action": "act",
+            "result": {
+                "coordinate_observability": {
+                    "slots": slots
+                }
+            }
+        });
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_computer_use",
+            tool_name: "computer_use",
+            arguments: &serde_json::json!({"action": "act"}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let ToolDisplayPayload::Summary(summary) = envelope.display else {
+            panic!("computer_use should use summary display");
+        };
+        let visible_chars = summary.title.chars().count()
+            + summary
+                .lines
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>();
+        assert!(visible_chars <= 2_000, "visible_chars={visible_chars}");
+        assert!(summary.truncated);
+    }
+
+    #[test]
+    fn computer_use_coordinate_observability_projection_is_compact() {
+        let payload = serde_json::json!({
+            "action": "act",
+            "session_id": 1,
+            "result": {
+                "coordinate_observability": {
+                    "validation_status": "ok",
+                    "slots": {
+                        "target": {
+                            "requested_point": {
+                                "x": 100,
+                                "y": 50,
+                                "coordinate_space": "transport_pixels"
+                            },
+                            "requested_space": "transport_pixels",
+                            "converted_point": {
+                                "x": 100,
+                                "y": 50,
+                                "coordinate_space": "native_input"
+                            },
+                            "converted_space": "native_input",
+                            "validation_status": "ok"
+                        }
+                    },
+                    "display_bounds": {
+                        "native_input": { "width": 320, "height": 180 }
+                    }
+                }
+            }
+        });
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_computer_use",
+            tool_name: "computer_use",
+            arguments: &serde_json::json!({"action": "act"}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let display = serde_json::to_string(&envelope.display).expect("display serializes");
+        assert!(display.contains("transport_pixels(100,50)"));
+        assert!(display.contains("native_input(100,50)"));
+        assert!(display.contains("validation=ok"));
+        assert!(
+            serde_json::to_string(&envelope.storage)
+                .unwrap()
+                .contains("coordinate_observability")
+        );
+    }
+
+    #[test]
+    fn output_projection_preserves_computer_use_trace_metadata() {
+        let payload = serde_json::json!({
+            "action": "act",
+            "session_id": 7,
+            "trace": {
+                "session_id": 7,
+                "snapshot_id": "s7-1",
+                "action_kind": "semantic",
+                "action_type": "press",
+                "execution_status": "failed",
+                "failure_class": "element_stale",
+                "suggested_fallbacks": [{ "type": "snapshot" }]
+            },
+            "result": {
+                "trace": {
+                    "session_id": 7,
+                    "action_kind": "semantic",
+                    "action_type": "press",
+                    "failure_class": "element_stale"
+                }
+            }
+        });
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_computer_use",
+            tool_name: "computer_use",
+            arguments: &serde_json::json!({"action": "act"}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("computer_use"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let storage = serde_json::to_string(&envelope.storage).expect("storage serializes");
+        assert!(storage.contains("\"trace\""));
+        assert!(storage.contains("element_stale"));
+        assert!(storage.contains("suggested_fallbacks"));
     }
 
     #[test]

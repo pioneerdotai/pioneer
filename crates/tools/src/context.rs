@@ -495,6 +495,14 @@ mod tests {
         let outcome = ToolOutcome::ok();
         let model_payload = serde_json::json!({
             "action": "snapshot",
+            "session_id": 1,
+            "accessibility_tree": {
+                "status": "ok",
+                "nodes": [
+                    {"id": "n1", "role": "button", "name": "OK"}
+                ],
+                "truncated": false
+            },
             "llm_context": {
                 "attachment": {
                     "path": "/tmp/session/snapshots/1.png",
@@ -529,6 +537,7 @@ mod tests {
         assert_eq!(message.tool_call_id.as_deref(), Some("call_42"));
         assert_eq!(message.name.as_deref(), Some("computer_use"));
         assert!(message.content.contains("\"llm_context\""));
+        assert!(message.content.contains("\"accessibility_tree\""));
         assert!(message.content.contains("\"partial_output\""));
         assert_eq!(message.content_parts.len(), 1);
 

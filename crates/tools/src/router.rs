@@ -20,6 +20,7 @@ use crate::visibility::{
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,7 @@ pub struct ToolRouter {
     visibility: ToolVisibilitySnapshot,
     event_bus: ToolEventBus,
     turn_id: String,
+    blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl ToolRouter {
@@ -64,6 +66,24 @@ impl ToolRouter {
         visibility: ToolVisibilitySnapshot,
         event_bus: ToolEventBus,
         turn_id: impl Into<String>,
+    ) -> Self {
+        Self::new_with_blocked_tool_names(
+            specs,
+            registry,
+            visibility,
+            event_bus,
+            turn_id,
+            Arc::new(RwLock::new(BTreeMap::new())),
+        )
+    }
+
+    pub fn new_with_blocked_tool_names(
+        specs: Vec<ConfiguredToolSpec>,
+        registry: ToolRegistry,
+        visibility: ToolVisibilitySnapshot,
+        event_bus: ToolEventBus,
+        turn_id: impl Into<String>,
+        blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
     ) -> Self {
         let specs = specs
             .into_iter()
@@ -75,7 +95,26 @@ impl ToolRouter {
             visibility,
             event_bus,
             turn_id: turn_id.into(),
+            blocked_tool_names,
         }
+    }
+
+    pub fn set_blocked_tool_names(
+        &self,
+        blocked_tool_names: impl IntoIterator<Item = (String, String)>,
+    ) {
+        *self
+            .blocked_tool_names
+            .write()
+            .expect("tool router blocked tool map lock poisoned") =
+            blocked_tool_names.into_iter().collect();
+    }
+
+    fn blocked_tool_names_snapshot(&self) -> BTreeMap<String, String> {
+        self.blocked_tool_names
+            .read()
+            .expect("tool router blocked tool map lock poisoned")
+            .clone()
     }
 
     pub fn has_handler(&self, tool_name: &str) -> bool {
@@ -87,11 +126,11 @@ impl ToolRouter {
     }
 
     pub fn preflight_tool_index(&self) -> PreflightToolIndex {
-        build_preflight_tool_index(
-            self.specs
-                .values()
-                .filter(|configured| self.has_handler(configured.spec.name.as_str())),
-        )
+        let blocked_tool_names = self.blocked_tool_names_snapshot();
+        build_preflight_tool_index(self.specs.values().filter(|configured| {
+            self.has_handler(configured.spec.name.as_str())
+                && !blocked_tool_names.contains_key(configured.spec.name.as_str())
+        }))
     }
 
     pub async fn model_visible_specs(&self) -> Vec<ToolSpec> {
@@ -133,7 +172,7 @@ impl ToolRouter {
             dynamic_tool_names,
             registered_tool_names: all_tool_names,
             available_tool_names,
-            blocked_tool_names: BTreeMap::new(),
+            blocked_tool_names: self.blocked_tool_names_snapshot(),
         })
     }
 

@@ -79,6 +79,10 @@ impl ErrorClassifier for DefaultErrorClassifier {
             return classify_shell_error(error);
         }
 
+        if is_computer_use_tool(invocation.tool_name.as_str()) {
+            return classify_computer_use_error(error);
+        }
+
         if is_web_tool(invocation.tool_name.as_str()) {
             return classify_web_error(error);
         }
@@ -461,6 +465,18 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
 
+    if action == "act" && computer_use_act_failed(raw_output_json) {
+        if let Some(failure_class) = computer_use_result_failure_class(raw_output_json) {
+            return computer_use_failure_outcome(failure_class, false);
+        }
+        return ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "computer_use action failed without a structured failure_class. Request a fresh snapshot and choose a corrected action.",
+            true,
+            Some("runtime_action_error".to_owned()),
+        );
+    }
+
     if action == "snapshot" {
         let has_attachment = raw_output_json
             .get("llm_context")
@@ -487,42 +503,15 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
         if action == "stop" && (failure_class.is_empty() || loop_state == "stopped") {
             return ToolOutcome::ok();
         }
-        return match failure_class {
-            "provider_timeout" | "provider_rate_limit" => ToolOutcome::recoverable(
-                ToolErrorClass::Timeout,
-                "computer_use stopped due provider timeout/rate-limit. Start a new session and retry.",
-                true,
-                Some(failure_class.to_owned()),
-            ),
-            "attachment_transport_failure" | "expected_effect_mismatch" => {
-                ToolOutcome::recoverable(
-                    ToolErrorClass::ExecutionFailed,
-                    "computer_use stopped due recoverable transport/perception issue. Start a new session and retry with refined instructions.",
-                    true,
-                    Some(failure_class.to_owned()),
-                )
-            }
-            "loop_guard_triggered" | "recovery_budget_exceeded" => ToolOutcome::fatal(
-                ToolErrorClass::ExecutionFailed,
-                Some(
-                    "computer_use stopped by loop/recovery guard. Adjust task plan or start a fresh session."
-                        .to_owned(),
-                ),
-            ),
-            "policy_blocked" => ToolOutcome::fatal(
-                ToolErrorClass::Unknown,
-                Some(
-                    "computer_use action was blocked by policy. Adjust policy profile or task plan."
-                        .to_owned(),
-                ),
-            ),
-            _ => ToolOutcome::recoverable(
-                ToolErrorClass::ExecutionFailed,
-                "computer_use session stopped. Inspect stop_reason and decide whether to start a new session.",
-                false,
-                None,
-            ),
-        };
+        if let Some(failure_class) = canonical_computer_use_failure_class(failure_class) {
+            return computer_use_failure_outcome(failure_class, true);
+        }
+        return ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "computer_use session stopped. Inspect stop_reason and decide whether to start a new session.",
+            false,
+            None,
+        );
     }
 
     if success {
@@ -534,6 +523,237 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
             false,
             None,
         )
+    }
+}
+
+fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
+    match error {
+        ToolError::InvalidArguments(message) => {
+            let lower = message.to_lowercase();
+            if lower.contains("session_id") {
+                return ToolOutcome::fatal(
+                    ToolErrorClass::InvalidArguments,
+                    Some(
+                        "computer_use requires a valid session_id from a successful start call before snapshot/act/verify/status/stop."
+                            .to_owned(),
+                    ),
+                );
+            }
+            ToolOutcome::recoverable(
+                ToolErrorClass::InvalidArguments,
+                "Fix computer_use arguments according to the schema and retry.",
+                false,
+                None,
+            )
+        }
+        ToolError::NotFound(message) => {
+            let lower = message.to_lowercase();
+            if lower.contains("computer_use session") && lower.contains("not found") {
+                return ToolOutcome::fatal(
+                    ToolErrorClass::InvalidArguments,
+                    Some(
+                        "computer_use session_id is invalid or stale. Do not call snapshot/act/verify/status/stop until start returns a new successful session_id."
+                            .to_owned(),
+                    ),
+                );
+            }
+            if lower.contains("app target")
+                || lower.contains("target app")
+                || lower.contains("app_not_found")
+            {
+                return ToolOutcome::fatal(
+                    ToolErrorClass::NotFound,
+                    Some(
+                        "computer_use target app was not found. Do not retry the same target blindly; use list_apps or provide a stable bundle_id/executable_path/launch_command."
+                            .to_owned(),
+                    ),
+                );
+            }
+            ToolOutcome::fatal(
+                ToolErrorClass::NotFound,
+                Some(
+                    "computer_use resource was not found. Correct the target before retrying."
+                        .to_owned(),
+                ),
+            )
+        }
+        ToolError::ExecutionFailed(message) => {
+            let lower = message.to_lowercase();
+            if lower.contains("failed to activate computer_use target")
+                || lower.contains("failed to launch computer_use target")
+            {
+                return ToolOutcome::fatal(
+                    ToolErrorClass::ExecutionFailed,
+                    Some(
+                        "computer_use could not launch or activate the requested app target. Do not retry the same target blindly; resolve a stable app identity first."
+                            .to_owned(),
+                    ),
+                );
+            }
+            ToolOutcome::recoverable(
+                ToolErrorClass::ExecutionFailed,
+                "computer_use execution failed. Inspect the structured error and retry with corrected state.",
+                false,
+                None,
+            )
+        }
+        ToolError::NotVisible(_) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            "computer_use is registered but hidden in this provider round. Request the computer_use domain before retrying.",
+            false,
+            None,
+        ),
+        ToolError::Cancelled(_) => ToolOutcome::recoverable(
+            ToolErrorClass::Cancelled,
+            "computer_use call was cancelled. Retry only if the desktop task is still needed.",
+            false,
+            None,
+        ),
+        ToolError::Rejected(_) => ToolOutcome::fatal(
+            ToolErrorClass::Unknown,
+            Some("computer_use call was rejected by policy.".to_owned()),
+        ),
+        ToolError::Internal(_) => ToolOutcome::fatal(
+            ToolErrorClass::Internal,
+            Some("computer_use failed with an internal error.".to_owned()),
+        ),
+    }
+}
+
+fn computer_use_act_failed(raw_output_json: &JsonValue) -> bool {
+    raw_output_json
+        .pointer("/result/status")
+        .and_then(JsonValue::as_str)
+        == Some("failed")
+        || raw_output_json
+            .pointer("/result/execution/status")
+            .and_then(JsonValue::as_str)
+            == Some("failed")
+}
+
+fn computer_use_result_failure_class(raw_output_json: &JsonValue) -> Option<&'static str> {
+    raw_output_json
+        .pointer("/result/execution/failure_class")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            raw_output_json
+                .pointer("/result/failure_class")
+                .and_then(JsonValue::as_str)
+        })
+        .or_else(|| {
+            raw_output_json
+                .get("failure_class")
+                .and_then(JsonValue::as_str)
+        })
+        .and_then(canonical_computer_use_failure_class)
+}
+
+fn canonical_computer_use_failure_class(value: &str) -> Option<&'static str> {
+    match normalize_computer_use_failure_class(value).as_str() {
+        "permissiondenied" => Some("permission_denied"),
+        "accessibilityunavailable" => Some("accessibility_unavailable"),
+        "accessibilitynotenabled" => Some("accessibility_not_enabled"),
+        "appnotfound" => Some("app_not_found"),
+        "elementnotfound" => Some("element_not_found"),
+        "elementstale" => Some("element_stale"),
+        "actionnotsupported" => Some("action_not_supported"),
+        "inputsimulationunavailable" => Some("input_simulation_unavailable"),
+        "screenshotunavailable" => Some("screenshot_unavailable"),
+        "attachmenttransportfailure" => Some("attachment_transport_failure"),
+        "providertimeout" => Some("provider_timeout"),
+        "providerratelimit" => Some("provider_rate_limit"),
+        "loopguardtriggered" => Some("loop_guard_triggered"),
+        "recoverybudgetexceeded" => Some("recovery_budget_exceeded"),
+        "runtimeactionerror" => Some("runtime_action_error"),
+        _ => None,
+    }
+}
+
+fn normalize_computer_use_failure_class(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> ToolOutcome {
+    match failure_class {
+        "provider_timeout" | "provider_rate_limit" => ToolOutcome::recoverable(
+            ToolErrorClass::Timeout,
+            if stopped {
+                "computer_use stopped due provider timeout/rate-limit. Start a new session and retry."
+            } else {
+                "computer_use hit a provider timeout/rate-limit. Retry after a fresh snapshot."
+            },
+            true,
+            Some(failure_class.to_owned()),
+        ),
+        "attachment_transport_failure" | "screenshot_unavailable" => ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "computer_use hit a recoverable screenshot/attachment transport issue. Retry snapshot before acting again.",
+            true,
+            Some(failure_class.to_owned()),
+        ),
+        "element_not_found" | "element_stale" => ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "computer_use target is missing or stale. Request a new snapshot, re-resolve the target, and do not retry the stale node_id blindly.",
+            true,
+            Some(failure_class.to_owned()),
+        ),
+        "permission_denied" | "accessibility_not_enabled" => ToolOutcome::fatal(
+            ToolErrorClass::PermissionDenied,
+            Some(
+                "computer_use requires OS accessibility/screen permissions before retrying."
+                    .to_owned(),
+            ),
+        ),
+        "accessibility_unavailable" => ToolOutcome::fatal(
+            ToolErrorClass::ExecutionFailed,
+            Some("computer_use accessibility backend is unavailable on this host.".to_owned()),
+        ),
+        "app_not_found" => ToolOutcome::fatal(
+            ToolErrorClass::NotFound,
+            Some(
+                "computer_use target app was not found. Retry only after providing launch_if_missing/launch_command or starting the app."
+                    .to_owned(),
+            ),
+        ),
+        "action_not_supported" => ToolOutcome::fatal(
+            ToolErrorClass::ExecutionFailed,
+            Some(
+                "computer_use action is unsupported for the target. Do not retry the same action."
+                    .to_owned(),
+            ),
+        ),
+        "input_simulation_unavailable" => ToolOutcome::fatal(
+            ToolErrorClass::ExecutionFailed,
+            Some(
+                "computer_use input simulation is unavailable. Use semantic accessibility actions instead of input_*."
+                    .to_owned(),
+            ),
+        ),
+        "loop_guard_triggered" | "recovery_budget_exceeded" => ToolOutcome::fatal(
+            ToolErrorClass::ExecutionFailed,
+            Some(
+                "computer_use stopped by loop/recovery guard. Adjust task plan or start a fresh session."
+                    .to_owned(),
+            ),
+        ),
+        "runtime_action_error" => ToolOutcome::fatal(
+            ToolErrorClass::ExecutionFailed,
+            Some(
+                "computer_use action failed at runtime. Inspect execution details before starting a new plan."
+                    .to_owned(),
+            ),
+        ),
+        _ => ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "computer_use failed. Inspect failure_class and retry with corrected state.",
+            false,
+            Some(failure_class.to_owned()),
+        ),
     }
 }
 
@@ -703,6 +923,23 @@ mod tests {
     use super::*;
     use crate::shell_format::{ExecPayloadInput, build_exec_model_payload};
 
+    fn computer_use_invocation() -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call".to_owned(),
+            tool_name: "computer_use".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: crate::context::ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+            workdir: std::path::PathBuf::from("."),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[test]
     fn grep_needs_narrowing_result_uses_dedicated_error_class() {
         let classifier = DefaultErrorClassifier;
@@ -771,20 +1008,7 @@ mod tests {
     #[test]
     fn computer_use_snapshot_without_attachment_is_recoverable() {
         let classifier = DefaultErrorClassifier;
-        let invocation = ToolInvocation {
-            call_id: "call".to_owned(),
-            tool_name: "computer_use".to_owned(),
-            source: crate::context::ToolCallSource::Model,
-            payload: crate::context::ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            workdir: std::path::PathBuf::from("."),
-            environment: Default::default(),
-            attempt_id: 1,
-            idempotency_key: None,
-            recovery: crate::spec::ToolRecoveryMetadata::default(),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        };
+        let invocation = computer_use_invocation();
         let outcome = classifier.classify_result(
             &invocation,
             &serde_json::json!({
@@ -804,20 +1028,7 @@ mod tests {
     #[test]
     fn computer_use_completed_outcome_is_ok() {
         let classifier = DefaultErrorClassifier;
-        let invocation = ToolInvocation {
-            call_id: "call".to_owned(),
-            tool_name: "computer_use".to_owned(),
-            source: crate::context::ToolCallSource::Model,
-            payload: crate::context::ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            workdir: std::path::PathBuf::from("."),
-            environment: Default::default(),
-            attempt_id: 1,
-            idempotency_key: None,
-            recovery: crate::spec::ToolRecoveryMetadata::default(),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        };
+        let invocation = computer_use_invocation();
         let outcome = classifier.classify_result(
             &invocation,
             &serde_json::json!({
@@ -828,5 +1039,143 @@ mod tests {
             true,
         );
         assert_eq!(outcome.status, ToolOutcomeStatus::Ok);
+    }
+
+    #[test]
+    fn computer_use_stale_session_error_is_terminal() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = computer_use_invocation();
+        let outcome = classifier.classify_error(
+            &invocation,
+            &ToolError::NotFound("computer_use session 2 not found".to_owned()),
+        );
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn computer_use_app_target_not_found_error_is_terminal() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = computer_use_invocation();
+        let outcome = classifier.classify_error(
+            &invocation,
+            &ToolError::NotFound(
+                "computer_use app target not found; failure_class=app_not_found".to_owned(),
+            ),
+        );
+        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::NotFound));
+        assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn computer_use_classifier_covers_every_failure_class_for_act_failures() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = computer_use_invocation();
+        let expected = [
+            ("permission_denied", ToolOutcomeStatus::FatalError),
+            ("accessibility_unavailable", ToolOutcomeStatus::FatalError),
+            ("accessibility_not_enabled", ToolOutcomeStatus::FatalError),
+            ("app_not_found", ToolOutcomeStatus::FatalError),
+            ("element_not_found", ToolOutcomeStatus::RecoverableError),
+            ("element_stale", ToolOutcomeStatus::RecoverableError),
+            ("action_not_supported", ToolOutcomeStatus::FatalError),
+            (
+                "input_simulation_unavailable",
+                ToolOutcomeStatus::FatalError,
+            ),
+            (
+                "screenshot_unavailable",
+                ToolOutcomeStatus::RecoverableError,
+            ),
+            (
+                "attachment_transport_failure",
+                ToolOutcomeStatus::RecoverableError,
+            ),
+            ("provider_timeout", ToolOutcomeStatus::RecoverableError),
+            ("provider_rate_limit", ToolOutcomeStatus::RecoverableError),
+            ("loop_guard_triggered", ToolOutcomeStatus::FatalError),
+            ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
+            ("runtime_action_error", ToolOutcomeStatus::FatalError),
+        ];
+
+        for (failure_class, expected_status) in expected {
+            let outcome = classifier.classify_result(
+                &invocation,
+                &serde_json::json!({
+                    "action": "act",
+                    "status": "running",
+                    "loop_state": "post_action_result_reported",
+                    "result": {
+                        "status": "failed",
+                        "execution": {
+                            "status": "failed",
+                            "failure_class": failure_class
+                        }
+                    }
+                }),
+                true,
+            );
+            assert_eq!(
+                outcome.status, expected_status,
+                "unexpected outcome for {failure_class}"
+            );
+            assert_eq!(outcome.incomplete_reason.as_deref(), {
+                match expected_status {
+                    ToolOutcomeStatus::RecoverableError => Some(failure_class),
+                    _ => None,
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn computer_use_classifier_covers_every_failure_class_for_stopped_sessions() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = computer_use_invocation();
+        let expected = [
+            ("permission_denied", ToolOutcomeStatus::FatalError),
+            ("accessibility_unavailable", ToolOutcomeStatus::FatalError),
+            ("accessibility_not_enabled", ToolOutcomeStatus::FatalError),
+            ("app_not_found", ToolOutcomeStatus::FatalError),
+            ("element_not_found", ToolOutcomeStatus::RecoverableError),
+            ("element_stale", ToolOutcomeStatus::RecoverableError),
+            ("action_not_supported", ToolOutcomeStatus::FatalError),
+            (
+                "input_simulation_unavailable",
+                ToolOutcomeStatus::FatalError,
+            ),
+            (
+                "screenshot_unavailable",
+                ToolOutcomeStatus::RecoverableError,
+            ),
+            (
+                "attachment_transport_failure",
+                ToolOutcomeStatus::RecoverableError,
+            ),
+            ("provider_timeout", ToolOutcomeStatus::RecoverableError),
+            ("provider_rate_limit", ToolOutcomeStatus::RecoverableError),
+            ("loop_guard_triggered", ToolOutcomeStatus::FatalError),
+            ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
+            ("runtime_action_error", ToolOutcomeStatus::FatalError),
+        ];
+
+        for (failure_class, expected_status) in expected {
+            let outcome = classifier.classify_result(
+                &invocation,
+                &serde_json::json!({
+                    "action": "act",
+                    "status": "stopped",
+                    "loop_state": "failed",
+                    "failure_class": failure_class
+                }),
+                true,
+            );
+            assert_eq!(
+                outcome.status, expected_status,
+                "unexpected outcome for {failure_class}"
+            );
+        }
     }
 }

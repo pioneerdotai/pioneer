@@ -95,8 +95,8 @@ webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-
 scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
-enigo = "0.6.1"
 xcap = "0.9"
+xa11y = "0.8.1"
 tempfile = "3"
 keepawake = "0.6"
 

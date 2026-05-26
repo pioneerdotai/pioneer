@@ -1963,19 +1963,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core-graphics"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "064badf302c3194842cf2c5d61f56cc88e54a759313879cdf03abdd27d0c3b97"
-dependencies = [
- "bitflags 2.11.0",
- "core-foundation 0.10.0",
- "core-graphics-types 0.2.0",
- "foreign-types",
- "libc",
-]
-
-[[package]]
 name = "core-graphics-helmer-fork"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2907,27 +2894,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
-name = "enigo"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71c6c56e50f7acae2906a0dcbb34529ca647e40421119ad5d12e7f8ba6e50010"
-dependencies = [
- "core-foundation 0.10.0",
- "core-graphics 0.25.0",
- "foreign-types-shared",
- "libc",
- "log",
- "nom 8.0.0",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "windows 0.61.3",
- "x11rb",
- "xkbcommon 0.9.0",
- "xkeysym",
-]
-
-[[package]]
 name = "enum-iterator"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3068,6 +3034,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df61bf483e837f88d5c2291dcf55c67be7e676b3a51acc48db3a7b163b91ed63"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "evdev"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25b686663ba7f08d92880ff6ba22170f1df4e83629341cba34cf82cd65ebea99"
+dependencies = [
+ "bitvec",
+ "cfg-if",
+ "libc",
+ "nix 0.29.0",
 ]
 
 [[package]]
@@ -7514,9 +7492,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "enigo",
  "futures-util",
  "hex",
+ "image",
  "libc",
  "pioneer-protocol",
  "pioneer-provider",
@@ -7531,6 +7509,7 @@ dependencies = [
  "tracing",
  "url",
  "webclaw-core",
+ "xa11y",
  "xcap",
 ]
 
@@ -10218,6 +10197,9 @@ name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
 
 [[package]]
 name = "strum_macros"
@@ -10237,6 +10219,18 @@ name = "strum_macros"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -13237,6 +13231,73 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xa11y"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e09e33beab44d1a3196766ed6f9daad7727c03cd0afe580e0abf4a1679103592"
+dependencies = [
+ "serde_json",
+ "xa11y-core",
+ "xa11y-linux",
+ "xa11y-macos",
+ "xa11y-windows",
+]
+
+[[package]]
+name = "xa11y-core"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f46ab6b920846ef45a34b3cffd5d9094f103c44d97e6f1f58e38c5f20389156"
+dependencies = [
+ "png 0.18.1",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "xa11y-linux"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b2f41653dc68e3eaa4fcf8c159ce262c20b3da94ca1bfe0d451176275906c37"
+dependencies = [
+ "evdev",
+ "png 0.18.1",
+ "rayon",
+ "serde_json",
+ "x11rb",
+ "xa11y-core",
+ "xkbcommon 0.9.0",
+ "zbus",
+]
+
+[[package]]
+name = "xa11y-macos"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b679bed3794ce54e577b34cf75896b245e8129bb6fdcf9c78c1eddf4c0617de"
+dependencies = [
+ "cc",
+ "core-foundation 0.10.0",
+ "rayon",
+ "serde_json",
+ "xa11y-core",
+]
+
+[[package]]
+name = "xa11y-windows"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24095e36a85b156cb094a8aafd1fa51385fc4a4f034a939378c76908f081e703"
+dependencies = [
+ "serde_json",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "xa11y-core",
+]
 
 [[package]]
 name = "xattr"

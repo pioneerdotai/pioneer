@@ -537,6 +537,44 @@ fn summary_payload(
     }
 }
 
+fn bounded_summary_for_chars(summary: ToolOutputSummary, max_chars: usize) -> ToolOutputSummary {
+    let mut remaining = max_chars;
+    let mut truncated = summary.truncated;
+    let (title, title_truncated) = take_summary_chars(summary.title.as_str(), remaining);
+    truncated |= title_truncated;
+    remaining = remaining.saturating_sub(title.chars().count());
+
+    let mut lines = Vec::new();
+    for line in summary.lines {
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let (bounded, line_truncated) = take_summary_chars(line.as_str(), remaining);
+        remaining = remaining.saturating_sub(bounded.chars().count());
+        lines.push(bounded);
+        if line_truncated {
+            truncated = true;
+            break;
+        }
+    }
+
+    ToolOutputSummary {
+        title,
+        lines,
+        metadata: summary.metadata,
+        truncated,
+    }
+}
+
+fn take_summary_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return (value.to_owned(), false);
+    }
+    (value.chars().take(max_chars).collect(), true)
+}
+
 fn summary_display(summary: ToolOutputSummary) -> ToolDisplayPayload {
     ToolDisplayPayload::Summary(summary)
 }
@@ -939,8 +977,9 @@ fn display_for_policy(
     summary: ToolOutputSummary,
 ) -> ToolDisplayPayload {
     match output_policy.timeline {
-        TimelineOutputPolicy::Full { .. } | TimelineOutputPolicy::Summary { .. } => {
-            ToolDisplayPayload::Summary(summary)
+        TimelineOutputPolicy::Full { .. } => ToolDisplayPayload::Summary(summary),
+        TimelineOutputPolicy::Summary { max_chars } => {
+            ToolDisplayPayload::Summary(bounded_summary_for_chars(summary, max_chars))
         }
         TimelineOutputPolicy::MetadataOnly | TimelineOutputPolicy::Hidden => {
             ToolDisplayPayload::Hidden
@@ -953,8 +992,9 @@ fn storage_for_policy(
     summary: ToolOutputSummary,
 ) -> ToolStoragePayload {
     match output_policy.storage {
-        StorageOutputPolicy::Full { .. } | StorageOutputPolicy::Summary { .. } => {
-            ToolStoragePayload::Summary(summary)
+        StorageOutputPolicy::Full { .. } => ToolStoragePayload::Summary(summary),
+        StorageOutputPolicy::Summary { max_chars } => {
+            ToolStoragePayload::Summary(bounded_summary_for_chars(summary, max_chars))
         }
         StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
             metadata: summary.metadata,
@@ -1467,5 +1507,37 @@ mod tests {
             recovery.is_some(),
             "failed hidden tool item should expose normal recovery metadata"
         );
+    }
+
+    #[test]
+    fn failed_tool_item_display_summary_is_bounded_by_policy() {
+        let item = build_failed_tool_turn_item(
+            "call_computer_use".to_owned(),
+            "computer_use".to_owned(),
+            serde_json::json!({"action": "start"}).to_string(),
+            "computer_use app target not found ".repeat(300),
+            pioneer_tools::ToolOutcome::fatal(
+                pioneer_tools::ToolErrorClass::NotFound,
+                Some("target not found".to_owned()),
+            ),
+            None,
+            Some(ToolOutputPolicySnapshot::for_tool_name("computer_use")),
+            None,
+        );
+
+        let TurnItem::DynamicToolCall { display, .. } = item else {
+            panic!("computer_use failure should be a dynamic tool call");
+        };
+        let ToolDisplayPayload::Summary(summary) = display else {
+            panic!("computer_use failure should render a summary display");
+        };
+        let visible_chars = summary.title.chars().count()
+            + summary
+                .lines
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>();
+        assert!(visible_chars <= 2_000, "visible_chars={visible_chars}");
+        assert!(summary.truncated);
     }
 }

@@ -289,6 +289,17 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             snapshot_transport_max_side_px: computer_use_cfg.snapshot_transport_max_side_px,
             snapshot_transport_min_side_px: computer_use_cfg.snapshot_transport_min_side_px,
             snapshot_downscale_factor: computer_use_cfg.snapshot_downscale_factor,
+            accessibility_tree_max_depth: computer_use_cfg.accessibility_tree_max_depth,
+            accessibility_tree_max_nodes: computer_use_cfg.accessibility_tree_max_nodes,
+            accessibility_tree_max_serialized_bytes: computer_use_cfg
+                .accessibility_tree_max_serialized_bytes,
+            accessibility_tree_text_max_chars: computer_use_cfg.accessibility_tree_text_max_chars,
+            semantic_action_timeout_ms: computer_use_cfg.semantic_action_timeout_ms,
+            app_activation_timeout_ms: computer_use_cfg.app_activation_timeout_ms,
+            input_simulation_enabled: computer_use_cfg.input_simulation_enabled,
+            launch_if_missing_default: computer_use_cfg.launch_if_missing_default,
+            allowed_launch_commands: computer_use_cfg.allowed_launch_commands.clone(),
+            preflight_screenshot_probe_enabled: computer_use_cfg.preflight_screenshot_probe_enabled,
             max_consecutive_same_snapshot_hash: computer_use_cfg.max_consecutive_same_snapshot_hash,
             max_consecutive_same_action_signature: computer_use_cfg
                 .max_consecutive_same_action_signature,

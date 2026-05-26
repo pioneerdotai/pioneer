@@ -6,7 +6,7 @@ use crate::visibility::ToolVisibilitySnapshot;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,7 +29,7 @@ pub struct RequestToolsDomainDiagnostic {
 pub struct RequestToolsHandler {
     visibility: ToolVisibilitySnapshot,
     registered_tool_names: Arc<BTreeSet<String>>,
-    blocked_tool_names: Arc<BTreeMap<String, String>>,
+    blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl RequestToolsHandler {
@@ -40,7 +40,7 @@ impl RequestToolsHandler {
         Self {
             visibility,
             registered_tool_names: Arc::new(registered_tool_names.into_iter().collect()),
-            blocked_tool_names: Arc::new(BTreeMap::new()),
+            blocked_tool_names: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -48,7 +48,15 @@ impl RequestToolsHandler {
         mut self,
         blocked_tool_names: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        self.blocked_tool_names = Arc::new(blocked_tool_names.into_iter().collect());
+        self.blocked_tool_names = Arc::new(RwLock::new(blocked_tool_names.into_iter().collect()));
+        self
+    }
+
+    pub fn with_shared_blocked_tool_names(
+        mut self,
+        blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
+    ) -> Self {
+        self.blocked_tool_names = blocked_tool_names;
         self
     }
 
@@ -79,6 +87,11 @@ impl RequestToolsHandler {
         let mut already_visible = BTreeMap::new();
         let mut blocked = Vec::new();
         let mut unknown_or_unavailable = Vec::new();
+        let blocked_tool_names = self
+            .blocked_tool_names
+            .read()
+            .expect("request_tools blocked tool map lock poisoned")
+            .clone();
 
         for domain in requested {
             let domain_name = domain.as_str().to_owned();
@@ -88,7 +101,7 @@ impl RequestToolsHandler {
             let mut domain_unknown_or_unavailable = Vec::new();
 
             for tool_name in domain.tool_names() {
-                if self.blocked_tool_names.contains_key(*tool_name) {
+                if blocked_tool_names.contains_key(*tool_name) {
                     domain_blocked.push((*tool_name).to_owned());
                     continue;
                 }
@@ -114,7 +127,7 @@ impl RequestToolsHandler {
             if !domain_blocked.is_empty() {
                 let reason = domain_blocked
                     .iter()
-                    .filter_map(|tool_name| self.blocked_tool_names.get(tool_name))
+                    .filter_map(|tool_name| blocked_tool_names.get(tool_name))
                     .next()
                     .cloned()
                     .unwrap_or_else(|| "blocked_by_host_policy".to_owned());

@@ -1,7 +1,7 @@
-use super::model::ComputerUseSession;
+use super::model::{ComputerUseArgs, ComputerUseSession};
 use crate::context::ToolPayload;
 use crate::error::ToolError;
-use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,23 +45,191 @@ fn discover_max_session_id(root: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn parse_json_args<T: for<'de> Deserialize<'de>>(
-    payload: ToolPayload,
-) -> Result<T, ToolError> {
-    match payload {
-        ToolPayload::Function { arguments } => serde_json::from_value(arguments).map_err(|error| {
-            ToolError::invalid_arguments(format!("failed to parse function arguments: {error}"))
-        }),
-        ToolPayload::Custom { input } => {
-            serde_json::from_str::<T>(input.as_str()).map_err(|error| {
-                ToolError::invalid_arguments(format!("failed to parse custom arguments: {error}"))
-            })
+const COMPUTER_USE_ACCEPTED_SHAPE: &str =
+    r#"{"action":"start","goal":"...","target":{"type":"app_name","name":"ExampleApp"}}"#;
+const COMPUTER_USE_VALID_EXAMPLE: &str = r#"{"action":"act","session_id":1,"act":{"type":"press","target":{"node_id":"n42","snapshot_id":"s1-1"}}}"#;
+const TOP_LEVEL_FIELDS: &[&str] = &[
+    "action",
+    "session_id",
+    "goal",
+    "target",
+    "display_id",
+    "launch_if_missing",
+    "launch_command",
+    "activation_timeout_ms",
+    "tree_max_depth",
+    "screenshot_path",
+    "act",
+    "max_steps",
+    "timeout_ms",
+    "planner_provider",
+    "planner_model",
+    "snapshot_max_bytes",
+    "snapshot_max_side_px",
+    "recovery_attempt",
+    "failure_class",
+    "outcome",
+    "reason",
+    "expect",
+];
+const TARGET_FIELDS: &[&str] = &[
+    "type",
+    "name",
+    "pid",
+    "identity_key",
+    "bundle_id",
+    "executable_path",
+    "display_id",
+    "launch_if_missing",
+    "launch_command",
+    "activation_timeout_ms",
+    "tree_max_depth",
+];
+const ACT_FIELDS: &[&str] = &[
+    "type",
+    "target",
+    "from",
+    "to",
+    "button",
+    "delta_x",
+    "delta_y",
+    "text",
+    "keys",
+    "numeric_value",
+    "action_name",
+    "condition",
+    "wait_ms",
+    "app",
+    "path",
+    "url",
+    "menu_path",
+    "title",
+];
+const ACTION_TARGET_FIELDS: &[&str] = &[
+    "node_id",
+    "snapshot_id",
+    "selector",
+    "role",
+    "name",
+    "nth",
+    "bounds_anchor",
+    "point",
+];
+const BOUNDS_ANCHOR_FIELDS: &[&str] = &["node_id", "snapshot_id", "anchor"];
+const INPUT_POINT_FIELDS: &[&str] = &["x", "y", "coordinate_space"];
+const VERIFY_EXPECT_FIELDS: &[&str] = &[
+    "app",
+    "window_title",
+    "visible_text",
+    "node",
+    "snapshot_hash_changed",
+];
+const VERIFY_NODE_FIELDS: &[&str] = &["node_id", "selector", "role", "name"];
+
+pub(crate) fn parse_computer_use_args(payload: ToolPayload) -> Result<ComputerUseArgs, ToolError> {
+    let value = match payload {
+        ToolPayload::Function { arguments } => arguments,
+        ToolPayload::Custom { input } => serde_json::from_str::<JsonValue>(input.as_str())
+            .map_err(|error| argument_contract_error("$", format!("invalid JSON: {error}")))?,
+        other => {
+            return Err(ToolError::invalid_arguments(format!(
+                "unsupported payload for computer_use tool: {}",
+                other.log_payload()
+            )));
         }
-        other => Err(ToolError::invalid_arguments(format!(
-            "unsupported payload for computer_use tool: {}",
-            other.log_payload()
-        ))),
+    };
+    validate_computer_use_json_contract(&value)?;
+    serde_json::from_value(value).map_err(|error| {
+        argument_contract_error(
+            "$",
+            format!("failed to parse computer_use arguments: {error}"),
+        )
+    })
+}
+
+fn validate_computer_use_json_contract(value: &JsonValue) -> Result<(), ToolError> {
+    validate_object_fields(value, "$", TOP_LEVEL_FIELDS)?;
+    validate_optional_object_fields(value.get("target"), "$.target", TARGET_FIELDS)?;
+    if let Some(act) = value.get("act") {
+        validate_object_fields(act, "$.act", ACT_FIELDS)?;
+        validate_action_target_fields(act.get("target"), "$.act.target")?;
+        validate_action_target_fields(act.get("from"), "$.act.from")?;
+        validate_action_target_fields(act.get("to"), "$.act.to")?;
     }
+    if let Some(expect) = value.get("expect") {
+        validate_object_fields(expect, "$.expect", VERIFY_EXPECT_FIELDS)?;
+        validate_optional_object_fields(expect.get("node"), "$.expect.node", VERIFY_NODE_FIELDS)?;
+    }
+    Ok(())
+}
+
+fn validate_action_target_fields(value: Option<&JsonValue>, path: &str) -> Result<(), ToolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_object_fields(value, path, ACTION_TARGET_FIELDS)?;
+    if let Some(bounds_anchor) = value.get("bounds_anchor") {
+        validate_object_fields(
+            bounds_anchor,
+            &format!("{path}.bounds_anchor"),
+            BOUNDS_ANCHOR_FIELDS,
+        )?;
+    }
+    if let Some(point) = value.get("point") {
+        validate_object_fields(point, &format!("{path}.point"), INPUT_POINT_FIELDS)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_object_fields(
+    value: Option<&JsonValue>,
+    path: &str,
+    accepted: &[&str],
+) -> Result<(), ToolError> {
+    if let Some(value) = value {
+        validate_object_fields(value, path, accepted)?;
+    }
+    Ok(())
+}
+
+fn validate_object_fields(
+    value: &JsonValue,
+    path: &str,
+    accepted: &[&str],
+) -> Result<(), ToolError> {
+    let object = value.as_object().ok_or_else(|| {
+        argument_contract_error(
+            path,
+            format!("expected object, got {}", json_type_name(value)),
+        )
+    })?;
+    for key in object.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(argument_contract_error(
+                &format!("{path}.{key}"),
+                format!("unknown field `{key}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_type_name(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+pub(crate) fn argument_contract_error(path: &str, message: impl Into<String>) -> ToolError {
+    ToolError::invalid_arguments(format!(
+        "invalid computer_use arguments at {path}: {}. Accepted shape: {COMPUTER_USE_ACCEPTED_SHAPE}. Example: {COMPUTER_USE_VALID_EXAMPLE}",
+        message.into()
+    ))
 }
 
 pub(crate) fn cleanup_artifacts_sync(
