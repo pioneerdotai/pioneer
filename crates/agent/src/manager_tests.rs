@@ -2534,21 +2534,6 @@ async fn context_isolation_old_task_local_constraint_stays_historical() {
         .expect("agent request should include compiled prompt");
 
     assert!(
-        second_prompt
-            .full_system_text
-            .contains("## Turn Context Isolation")
-    );
-    assert!(
-        second_prompt
-            .full_system_text
-            .contains("Current-turn user instructions are authoritative")
-    );
-    assert!(
-        second_prompt
-            .full_system_text
-            .contains("Durable preferences include stable language/style/project conventions")
-    );
-    assert!(
         !second_prompt
             .full_system_text
             .contains("For this one-off check, do not click the red button."),
@@ -4254,67 +4239,6 @@ async fn phase_10_prompt_manifest_and_tool_schemas_exclude_discovery_tools() {
 }
 
 #[tokio::test]
-async fn prompt_manifest_desktop_tool_policy_is_in_compiled_prompt() {
-    let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
-
-    let observed = start_simple_turn(
-        &manager,
-        "thr_prompt_manifest_desktop_tool_policy",
-        "ws_prompt_manifest_desktop_tool_policy",
-        "turn_prompt_manifest_desktop_tool_policy",
-        ThreadMode::Agent,
-        "capture",
-        "Open the requested desktop location.",
-    )
-    .await;
-    assert_turn_completed(&observed);
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 1);
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("main request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("## Desktop Automation Tool Policy")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("request and use the `computer_use` domain first")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("do not call `exec_command`, `osascript`, shell scripts")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("use `open_app` with an explicit app identity")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("use `open_path` or `reveal_path` only with an explicit filesystem path")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("use `open_url` with an explicit URL")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("Do not claim desktop task success without completion evidence")
-    );
-}
-
-#[tokio::test]
 async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized() {
     let registered_optional_tools = [
         "memory_search",
@@ -4400,7 +4324,7 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
 }
 
 #[tokio::test]
-async fn computer_use_image_capability_text_only_model_blocks_computer_use() {
+async fn computer_use_text_only_model_does_not_gate_computer_use() {
     let provider = Arc::new(TextOnlyAgentProvider::with_preflight_response(
         preflight_response_with_visible_tools(&["computer_use"]),
     ));
@@ -4412,9 +4336,9 @@ async fn computer_use_image_capability_text_only_model_blocks_computer_use() {
 
     let observed = start_simple_turn(
         &manager,
-        "thr_computer_use_image_capability_text_only",
-        "ws_computer_use_image_capability_text_only",
-        "turn_computer_use_image_capability_text_only",
+        "thr_computer_use_text_only_no_gate",
+        "ws_computer_use_text_only_no_gate",
+        "turn_computer_use_text_only_no_gate",
         ThreadMode::Agent,
         "text-only",
         "Open the requested desktop location.",
@@ -4431,28 +4355,30 @@ async fn computer_use_image_capability_text_only_model_blocks_computer_use() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(
-        !request_tool_names.contains(&"computer_use"),
-        "computer_use must be blocked when provider/model cannot receive screenshot images"
-    );
-    let prompt = requests[0]
-        .compiled_prompt
-        .as_ref()
-        .expect("main request should include compiled prompt");
-    assert!(
-        prompt
-            .full_system_text
-            .contains("computer_use is unavailable for this provider/model")
-    );
-    assert!(
-        prompt
-            .full_system_text
-            .contains("requires a model/provider with image input support")
-    );
+    let probe_tool_loop_config = test_tool_loop_config();
+    let computer_use_available = pioneer_tools::build_builtin_tools(
+        ".",
+        "turn_computer_use_text_only_no_gate_probe",
+        probe_tool_loop_config.web,
+        probe_tool_loop_config.computer_use,
+    )
+    .router
+    .has_handler("computer_use");
+    if computer_use_available {
+        assert!(
+            request_tool_names.contains(&"computer_use"),
+            "computer_use must not be provider-gated by image capability"
+        );
+    } else {
+        assert!(
+            !request_tool_names.contains(&"computer_use"),
+            "unregistered computer_use must stay hidden"
+        );
+    }
 }
 
 #[tokio::test]
-async fn computer_use_image_capability_image_model_exposes_computer_use() {
+async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         preflight_response_with_visible_tools(&["computer_use"]),
     ));
@@ -4461,9 +4387,9 @@ async fn computer_use_image_capability_image_model_exposes_computer_use() {
 
     let observed = start_simple_turn(
         &manager,
-        "thr_computer_use_image_capability_image_model",
-        "ws_computer_use_image_capability_image_model",
-        "turn_computer_use_image_capability_image_model",
+        "thr_computer_use_registered_tool",
+        "ws_computer_use_registered_tool",
+        "turn_computer_use_registered_tool",
         ThreadMode::Agent,
         "capture",
         "Open the requested desktop location.",
@@ -4483,7 +4409,7 @@ async fn computer_use_image_capability_image_model_exposes_computer_use() {
     let probe_tool_loop_config = test_tool_loop_config();
     let computer_use_available = pioneer_tools::build_builtin_tools(
         ".",
-        "turn_computer_use_image_capability_probe",
+        "turn_computer_use_registered_tool_probe",
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
     )

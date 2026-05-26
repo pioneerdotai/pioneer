@@ -445,7 +445,7 @@ impl MessageProcessor {
         error_message: &str,
     ) -> String {
         const RECOVERY_DISPLAY_MAX_CHARS: usize = 1_800;
-        
+
         let mut lines = Vec::new();
         if let Some(value) = existing
             && !value.trim().is_empty()
