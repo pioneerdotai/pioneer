@@ -6,6 +6,7 @@ pub mod methods {
     pub const WORKSPACE_UPDATE: &str = "workspace/update";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
+    pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
     pub const THREAD_FOLDER_CREATE: &str = "thread/folder/create";
     pub const THREAD_FOLDER_MOVE: &str = "thread/folder/move";

@@ -93,6 +93,19 @@ pub struct ThreadTreeParams {
     pub workspace_id: String,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThreadUpdateParams {
+    pub workspace_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadUpdateResponse {
+    pub thread: Thread,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTreeResponse {
     pub workspace_id: String,

@@ -162,7 +162,7 @@ pub use thread::{
     ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
     ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams,
     ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, ThreadUpdatedNotification,
+    ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
 };
 pub use thread_agents_doc::{
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
