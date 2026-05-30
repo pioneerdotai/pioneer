@@ -1,7 +1,10 @@
 use super::{MessageProcessor, artifact_finalization_diagnostics};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pioneer_agent::{TurnToolContext, TurnToolMaterialization, TurnToolProvider};
+use pioneer_agent::{
+    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
+    TurnToolMaterialization, TurnToolProvider,
+};
 use pioneer_artifacts::{
     ArtifactToolContext, ArtifactToolHandler, ArtifactToolNotification,
     ArtifactToolNotificationSink, ArtifactToolState, artifact_tool_specs,
@@ -14,7 +17,23 @@ pub(crate) struct GatewayArtifactToolProvider {
     processor: Weak<MessageProcessor>,
 }
 
+pub(crate) struct GatewayArtifactFinalizationProvider {
+    processor: Weak<MessageProcessor>,
+}
+
 impl GatewayArtifactToolProvider {
+    pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
+        Self { processor }
+    }
+
+    fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
+        self.processor
+            .upgrade()
+            .ok_or_else(|| "message processor is no longer available".to_owned())
+    }
+}
+
+impl GatewayArtifactFinalizationProvider {
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
         Self { processor }
     }
@@ -60,6 +79,23 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[async_trait]
+impl TurnFinalizationProvider for GatewayArtifactFinalizationProvider {
+    async fn check_turn_finalization(
+        &self,
+        context: TurnFinalizationContext,
+    ) -> Result<TurnFinalizationDecision, String> {
+        let processor = self.processor()?;
+        Ok(processor
+            .artifact_finalization_decision(
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+                context.final_text.as_str(),
+            )
+            .await)
     }
 }
 
@@ -129,6 +165,11 @@ impl MessageProcessor {
                 Arc::downgrade(self),
             ))))
             .await;
+        self.agent_manager
+            .set_turn_finalization_provider(Some(Arc::new(
+                GatewayArtifactFinalizationProvider::new(Arc::downgrade(self)),
+            )))
+            .await;
     }
 
     pub(crate) async fn artifact_tool_state_for_turn(
@@ -142,14 +183,17 @@ impl MessageProcessor {
             .clone()
     }
 
-    pub(super) async fn artifact_finalization_blocks_completion(
+    pub(super) async fn artifact_finalization_decision(
         &self,
         thread_id: &str,
         turn_id: &str,
-    ) -> bool {
-        let diagnostics = self.artifact_finalization_diagnostics(turn_id).await;
+        final_text: &str,
+    ) -> TurnFinalizationDecision {
+        let diagnostics = self
+            .artifact_finalization_diagnostics_for_final_text(turn_id, Some(final_text))
+            .await;
         if diagnostics.is_empty() {
-            return false;
+            return TurnFinalizationDecision::Allow;
         }
 
         let retry_already_used = self
@@ -165,31 +209,33 @@ impl MessageProcessor {
             && self.mark_artifact_finalization_retry_used(turn_id).await
         {
             self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
-            match self
-                .agent_manager
-                .start_post_turn_followup_run(thread_id, turn_id, instruction)
-                .await
-            {
-                Ok(()) => {
-                    warn!(thread_id, turn_id, "artifact finalization retry scheduled");
-                    return true;
-                }
-                Err(error) => {
-                    let terminal_error =
-                        artifact_finalization_diagnostics::artifact_finalization_terminal_error(
-                            diagnostics.as_slice(),
-                        );
-                    self.mark_turn_failed(
-                        thread_id.to_owned(),
-                        turn_id.to_owned(),
-                        format!(
-                            "failed to start artifact finalization retry: {error}; {terminal_error}"
-                        ),
-                    )
-                    .await;
-                    return true;
-                }
-            }
+            return TurnFinalizationDecision::Retry { instruction };
+        }
+
+        self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
+        TurnFinalizationDecision::Fail {
+            message: artifact_finalization_diagnostics::artifact_finalization_terminal_error(
+                diagnostics.as_slice(),
+            ),
+        }
+    }
+
+    pub(super) async fn artifact_finalization_blocks_completion(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> bool {
+        let final_text = self
+            .turn_final_assistant_texts
+            .lock()
+            .await
+            .get(turn_id)
+            .cloned();
+        let diagnostics = self
+            .artifact_finalization_diagnostics_for_final_text(turn_id, final_text.as_deref())
+            .await;
+        if diagnostics.is_empty() {
+            return false;
         }
 
         self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
@@ -204,9 +250,10 @@ impl MessageProcessor {
         true
     }
 
-    async fn artifact_finalization_diagnostics(
+    async fn artifact_finalization_diagnostics_for_final_text(
         &self,
         turn_id: &str,
+        final_text: Option<&str>,
     ) -> Vec<artifact_finalization_diagnostics::ArtifactFinalizationDiagnostic> {
         let prepared_outputs = self
             .artifact_tool_states
@@ -216,17 +263,11 @@ impl MessageProcessor {
             .map(|state| state.prepared_outputs())
             .unwrap_or_default();
         let output_dir = self.artifact_output_dirs.lock().await.get(turn_id).cloned();
-        let final_text = self
-            .turn_final_assistant_texts
-            .lock()
-            .await
-            .get(turn_id)
-            .cloned();
 
         artifact_finalization_diagnostics::diagnose_artifact_finalization(
             prepared_outputs.as_slice(),
             output_dir.as_deref(),
-            final_text.as_deref(),
+            final_text,
         )
     }
 

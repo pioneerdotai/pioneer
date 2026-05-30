@@ -336,6 +336,29 @@ pub trait TurnToolProvider: Send + Sync {
     ) -> Result<TurnToolMaterialization, String>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFinalizationContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub final_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnFinalizationDecision {
+    Allow,
+    Retry { instruction: String },
+    Fail { message: String },
+}
+
+#[async_trait::async_trait]
+pub trait TurnFinalizationProvider: Send + Sync {
+    async fn check_turn_finalization(
+        &self,
+        context: TurnFinalizationContext,
+    ) -> Result<TurnFinalizationDecision, String>;
+}
+
 #[async_trait::async_trait]
 pub trait TaskToolProvider: Send + Sync {
     async fn materialize_task_tools(
@@ -1322,11 +1345,6 @@ enum AgentCommand {
         request: RecoveryAttemptRequest,
         ack: oneshot::Sender<Result<(), AgentControlError>>,
     },
-    StartPostTurnFollowupRun {
-        turn_id: String,
-        instruction: String,
-        ack: oneshot::Sender<Result<(), AgentControlError>>,
-    },
     RecoveryAttemptSucceeded {
         turn_id: String,
         run_id: u64,
@@ -1463,6 +1481,7 @@ pub struct AgentManager {
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: RwLock<Option<Arc<dyn TurnToolProvider>>>,
+    turn_finalization_provider: RwLock<Option<Arc<dyn TurnFinalizationProvider>>>,
     task_tool_provider: RwLock<Option<Arc<dyn TaskToolProvider>>>,
     memory_provider: RwLock<Option<Arc<dyn AgentMemoryProvider>>>,
     memory_write_provider: RwLock<Option<Arc<dyn AgentMemoryWriteProvider>>>,
@@ -1500,6 +1519,7 @@ impl AgentManager {
             tool_loop_config: tool_loop_config.normalized(),
             mcp_tool_provider,
             turn_tool_provider: RwLock::new(None),
+            turn_finalization_provider: RwLock::new(None),
             task_tool_provider: RwLock::new(None),
             memory_provider: RwLock::new(memory_provider),
             memory_write_provider: RwLock::new(None),
@@ -1518,6 +1538,13 @@ impl AgentManager {
 
     pub async fn set_turn_tool_provider(&self, provider: Option<Arc<dyn TurnToolProvider>>) {
         *self.turn_tool_provider.write().await = provider;
+    }
+
+    pub async fn set_turn_finalization_provider(
+        &self,
+        provider: Option<Arc<dyn TurnFinalizationProvider>>,
+    ) {
+        *self.turn_finalization_provider.write().await = provider;
     }
 
     pub async fn set_memory_provider(&self, provider: Option<Arc<dyn AgentMemoryProvider>>) {
@@ -1625,6 +1652,7 @@ impl AgentManager {
             self.tool_loop_config.clone(),
             self.mcp_tool_provider.clone(),
             self.turn_tool_provider.read().await.clone(),
+            self.turn_finalization_provider.read().await.clone(),
             self.task_tool_provider.read().await.clone(),
             hook_runtime,
             tool_bundle_artifacts,
@@ -1991,38 +2019,6 @@ impl AgentManager {
         ack_rx.await.unwrap_or_else(|_| {
             Err(AgentControlError::Internal(
                 "agent loop dropped recovery ack".to_owned(),
-            ))
-        })
-    }
-
-    pub async fn start_post_turn_followup_run(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        instruction: String,
-    ) -> Result<(), AgentControlError> {
-        let command_tx = {
-            let state = self.state.read().await;
-            let Some(thread) = state.threads.get(thread_id) else {
-                return Err(AgentControlError::ThreadNotFound);
-            };
-            thread.command_tx.clone()
-        };
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-
-        command_tx
-            .send(AgentCommand::StartPostTurnFollowupRun {
-                turn_id: turn_id.to_owned(),
-                instruction,
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| AgentControlError::ThreadNotFound)?;
-
-        ack_rx.await.unwrap_or_else(|_| {
-            Err(AgentControlError::Internal(
-                "agent loop dropped post-turn follow-up run ack".to_owned(),
             ))
         })
     }

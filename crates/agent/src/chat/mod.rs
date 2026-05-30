@@ -31,8 +31,8 @@ use crate::{
     AgentMcpMaterializationRequest, AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
     AgentTurnHookRuntimeContext, ResolvedArtifactInput, RetainedToolLlmContext,
     TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
-    ToolLoopConfig, TurnExecutionControl, TurnToolContext, TurnToolMaterialization,
-    TurnToolProvider,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -1591,6 +1591,7 @@ pub(super) async fn execute_chat_turn_flow(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
+    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -1638,6 +1639,7 @@ pub(super) async fn execute_chat_turn_flow(
             tool_loop_config,
             mcp_tool_provider,
             turn_tool_provider,
+            turn_finalization_provider,
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,
@@ -2081,6 +2083,7 @@ async fn execute_agent_provider_response(
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
+    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
@@ -2976,6 +2979,7 @@ async fn execute_agent_provider_response(
                 Some(compiled_prompt_payload_from_bundle(&prompt_without_tools))
             };
 
+            let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let round = provider::request_agent_round(
                 provider,
                 ChatRequest {
@@ -2998,7 +3002,7 @@ async fn execute_agent_provider_response(
             )
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
-            
+
             if !round.text.trim().is_empty() {
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
             }
@@ -3078,9 +3082,8 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
-                    
                     consecutive_empty_no_tool_rounds = 0;
-                    
+
                     continue;
                 }
                 ToolLoopGuardDecision::FailTurn {
@@ -3340,6 +3343,63 @@ async fn execute_agent_provider_response(
 
                     messages.push(ChatMessage::user(EMPTY_NO_TOOL_ROUND_RECOVERY_INSTRUCTION));
                     continue;
+                }
+
+                if let Some(finalization_provider) = turn_finalization_provider.as_ref() {
+                    match finalization_provider
+                        .check_turn_finalization(TurnFinalizationContext {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            final_text: final_text.clone(),
+                        })
+                        .await
+                    {
+                        Ok(TurnFinalizationDecision::Allow) => {}
+                        Ok(TurnFinalizationDecision::Retry { instruction }) => {
+                            post_turn_assistant_text
+                                .truncate(post_turn_assistant_text_len_before_round);
+                            if !round.reasoning.trim().is_empty() {
+                                send_reasoning_completed(
+                                    workspace_id,
+                                    thread_id,
+                                    turn_id,
+                                    current_thinking_id.as_str(),
+                                    round.reasoning.as_str(),
+                                    event_tx.as_ref(),
+                                )
+                                .await
+                                .map_err(|error| (error, current_thinking_id.clone()))?;
+
+                                current_thinking_id = start_reasoning_item(
+                                    workspace_id,
+                                    thread_id,
+                                    turn_id,
+                                    event_tx.as_ref(),
+                                )
+                                .await
+                                .map_err(|error| (error, current_thinking_id.clone()))?;
+                            }
+                            consecutive_empty_no_tool_rounds = 0;
+                            messages.push(ChatMessage::user(instruction));
+                            continue;
+                        }
+                        Ok(TurnFinalizationDecision::Fail { message }) => {
+                            post_turn_assistant_text
+                                .truncate(post_turn_assistant_text_len_before_round);
+                            return Err((ChatTurnError::Terminal(message), current_thinking_id.clone()));
+                        }
+                        Err(error) => {
+                            post_turn_assistant_text
+                                .truncate(post_turn_assistant_text_len_before_round);
+                            return Err((
+                                ChatTurnError::Terminal(format!(
+                                    "turn finalization check failed: {error}"
+                                )),
+                                current_thinking_id.clone(),
+                            ));
+                        }
+                    }
                 }
                 if final_text != round.text {
                     post_turn_assistant_text = final_text.clone();

@@ -6,7 +6,8 @@ use super::{
     MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
     MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
     TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl,
+    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -228,6 +229,18 @@ struct EmptyNoToolRoundProvider {
     next_index: AtomicUsize,
 }
 
+struct SequencedTextProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    responses: Vec<String>,
+    next_index: AtomicUsize,
+}
+
+#[derive(Default)]
+struct RetryOnceFinalizationProvider {
+    contexts: std::sync::Mutex<Vec<TurnFinalizationContext>>,
+    next_index: AtomicUsize,
+}
+
 impl Default for CaptureAgentProvider {
     fn default() -> Self {
         Self {
@@ -301,6 +314,34 @@ impl EmptyNoToolRoundProvider {
                 .expect("empty no-tool provider lock poisoned")
                 .clone(),
         )
+    }
+}
+
+impl SequencedTextProvider {
+    fn new(responses: Vec<&str>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: responses.into_iter().map(str::to_owned).collect(),
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("sequenced text provider lock poisoned")
+                .clone(),
+        )
+    }
+}
+
+impl RetryOnceFinalizationProvider {
+    fn snapshot_contexts(&self) -> Vec<TurnFinalizationContext> {
+        self.contexts
+            .lock()
+            .expect("retry finalization provider lock poisoned")
+            .clone()
     }
 }
 
@@ -2213,6 +2254,80 @@ impl Provider for EmptyNoToolRoundProvider {
 }
 
 #[async_trait::async_trait]
+impl Provider for SequencedTextProvider {
+    fn name(&self) -> &str {
+        "sequenced-text"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
+        self.requests
+            .lock()
+            .expect("sequenced text provider lock poisoned")
+            .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
+
+        let index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        let text = self
+            .responses
+            .get(index)
+            .or_else(|| self.responses.last())
+            .cloned()
+            .unwrap_or_else(|| "done".to_owned());
+        Ok(ChatResponse {
+            text,
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnFinalizationProvider for RetryOnceFinalizationProvider {
+    async fn check_turn_finalization(
+        &self,
+        context: TurnFinalizationContext,
+    ) -> Result<TurnFinalizationDecision, String> {
+        self.contexts
+            .lock()
+            .expect("retry finalization provider lock poisoned")
+            .push(context);
+        let index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            Ok(TurnFinalizationDecision::Retry {
+                instruction: "finalization retry instruction".to_owned(),
+            })
+        } else {
+            Ok(TurnFinalizationDecision::Allow)
+        }
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for TextOnlyAgentProvider {
     fn name(&self) -> &str {
         "text-only"
@@ -2694,6 +2809,67 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
             .content
             .contains("Your previous response was empty and was not accepted")
     }));
+}
+
+#[tokio::test]
+async fn finalization_retry_runs_before_agent_message_in_same_loop() {
+    let provider = Arc::new(SequencedTextProvider::new(vec![
+        "premature final answer",
+        "accepted final answer",
+    ]));
+    let finalization = Arc::new(RetryOnceFinalizationProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_finalization_provider(Some(finalization.clone()))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "finalization_retry_thread",
+        "workspace",
+        "finalization_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "finish with artifact",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let completed_messages = observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                return None;
+            };
+            Some(text.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_messages,
+        vec!["accepted final answer".to_owned()],
+        "rejected finalization attempt must not be emitted as AgentMessage"
+    );
+
+    let contexts = finalization.snapshot_contexts();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].final_text, "premature final answer");
+    assert_eq!(contexts[1].final_text, "accepted final answer");
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("finalization retry instruction") })
+    );
 }
 
 #[tokio::test]
