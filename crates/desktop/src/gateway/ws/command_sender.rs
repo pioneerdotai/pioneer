@@ -68,6 +68,23 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::THREAD_TREE, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn thread_update(&self, params: ThreadUpdateParams) -> Result<ThreadUpdateResponse> {
+        if params.workspace_id.trim().is_empty() {
+            return Err(anyhow!("workspace_id is required for thread/update"));
+        }
+        if params.thread_id.trim().is_empty() {
+            return Err(anyhow!("thread_id is required for thread/update"));
+        }
+        let Some(name) = params.name.as_deref() else {
+            return Err(anyhow!("at least one field is required for thread/update"));
+        };
+        if name.trim().is_empty() {
+            return Err(anyhow!("name must not be empty for thread/update"));
+        }
+
+        self.send_request_typed(methods::THREAD_UPDATE, &params, RPC_REQUEST_TIMEOUT)
+    }
+
     pub fn thread_move(&self, params: ThreadMoveParams) -> Result<ThreadMoveResponse> {
         if params.workspace_id.trim().is_empty() {
             return Err(anyhow!("workspace_id is required for thread/move"));

@@ -104,6 +104,7 @@ actions!(
     sidebar_root_menu,
     [SidebarRootEditAgentsDoc, SidebarRootRemoveAgentsDoc]
 );
+actions!(sidebar_thread_menu, [SidebarThreadRename]);
 
 impl PioneerDesktop {
     pub(in crate::app) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
@@ -274,6 +275,7 @@ impl PioneerDesktop {
                             title: thread_id.to_owned(),
                         });
                     let thread_id_for_click = row.thread_id.clone();
+                    let thread_id_for_context_menu_rename = row.thread_id.clone();
                     let thread_payload = SidebarTreeDragPayload {
                         label: row.title.clone(),
                         item: SidebarTreeDragItem::Thread {
@@ -290,6 +292,17 @@ impl PioneerDesktop {
                             cx.notify();
                         },
                     );
+                    let thread_rename_action_listener = window.listener_for(
+                        &desktop_entity,
+                        move |view, _: &SidebarThreadRename, window, cx| {
+                            view.open_rename_thread_dialog(
+                                thread_id_for_context_menu_rename.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        },
+                    );
 
                     ListItem::new(("thread-tree-row", ix))
                         .separator()
@@ -302,7 +315,14 @@ impl PioneerDesktop {
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .on_click(open_listener)
+                                .on_action(thread_rename_action_listener)
                                 .on_drag(thread_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                .context_menu(move |menu, _, _| {
+                                    menu.menu(
+                                        t!("sidebar.contextmenu.thread.edit"),
+                                        Box::new(SidebarThreadRename),
+                                    )
+                                })
                                 .child(
                                     h_flex()
                                         .w_full()

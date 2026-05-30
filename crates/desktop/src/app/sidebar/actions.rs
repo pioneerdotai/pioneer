@@ -8,7 +8,7 @@ use crate::app::{
 use gpui::{prelude::*, *};
 use pioneer_protocol::{
     ThreadAgentsDocArchiveParams, ThreadAgentsDocSummary, ThreadFolderCreateParams,
-    ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams,
+    ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams, ThreadUpdateParams,
 };
 use tracing::warn;
 
@@ -191,6 +191,89 @@ impl PioneerDesktop {
                     }
 
                     view.refresh_thread_list(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn rename_thread_from_sidebar(
+        &mut self,
+        thread_id: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            return;
+        }
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            return;
+        };
+        let Some(workspace_id) = self.sidebar_workspace_id() else {
+            return;
+        };
+        if self.thread_workspace_id(thread_id.as_str()) != Some(workspace_id.as_str()) {
+            return;
+        }
+        let trimmed_name = new_name.trim();
+        if trimmed_name.is_empty() {
+            return;
+        }
+        if self
+            .thread_coordinator(thread_id.as_str())
+            .and_then(|coordinator| coordinator.thread())
+            .and_then(|thread| thread.name.as_deref())
+            .is_some_and(|name| name == trimmed_name)
+        {
+            return;
+        }
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        let new_name = trimmed_name.to_owned();
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let thread_id_for_request = thread_id.clone();
+            let workspace_id_for_request = workspace_id.clone();
+            let new_name_for_request = new_name.clone();
+
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.thread_update(ThreadUpdateParams {
+                            workspace_id: workspace_id_for_request,
+                            thread_id: thread_id_for_request,
+                            name: Some(new_name_for_request),
+                        })
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            let thread = response.thread;
+                            let thread_id = thread.id.clone();
+                            let workspace_id = thread.workspace_id.clone();
+                            view.upsert_thread_snapshot(thread);
+                            view.upsert_thread_for_workspace(
+                                thread_id.as_str(),
+                                workspace_id.as_str(),
+                            );
+                            view.rebuild_sidebar_tree_state(cx);
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "failed to rename thread"
+                            );
+                        }
+                    }
+
                     cx.notify();
                 });
             }
