@@ -617,6 +617,259 @@ impl MessageProcessor {
         Ok(threads)
     }
 
+    pub(super) async fn thread_update(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: ThreadUpdateParams,
+    ) {
+        if params.workspace_id.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `workspace_id` is required",
+                        methods::THREAD_UPDATE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if params.thread_id.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `thread_id` is required",
+                        methods::THREAD_UPDATE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let Some(name) = params.name.as_deref() else {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: at least one field is required",
+                        methods::THREAD_UPDATE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `name` must not be empty",
+                        methods::THREAD_UPDATE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let workspace_id = match self
+            .workspace_manager
+            .validate_workspace_id(params.workspace_id.as_str())
+            .await
+        {
+            Ok(workspace_id) => workspace_id,
+            Err(error) => {
+                let (code, message) = match &error {
+                    WorkspaceError::Internal(message) => (
+                        INVALID_REQUEST_CODE,
+                        format!("failed to validate workspace for thread/update: {message}"),
+                    ),
+                    _ => (
+                        INVALID_PARAMS_CODE,
+                        format!("invalid params for `{}`: {error}", methods::THREAD_UPDATE),
+                    ),
+                };
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), code, message),
+                )
+                .await;
+                return;
+            }
+        };
+        self.session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+
+        let current_thread = match self
+            .crud_store
+            .get_thread_model(params.thread_id.as_str())
+            .await
+        {
+            Ok(Some(thread)) => thread,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("thread `{}` was not found", params.thread_id),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load thread for update: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if current_thread.workspace_id != workspace_id {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: thread `{}` belongs to workspace `{}`",
+                        methods::THREAD_UPDATE,
+                        params.thread_id,
+                        current_thread.workspace_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let changed = match self
+            .crud_store
+            .update_thread_name_if_changed(params.thread_id.as_str(), name)
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to update thread: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let thread = if changed {
+            match self
+                .crud_store
+                .get_thread_model(params.thread_id.as_str())
+                .await
+            {
+                Ok(Some(thread)) => thread,
+                Ok(None) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("thread `{}` was not found after update", params.thread_id),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load thread after update: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            current_thread
+        };
+
+        if changed {
+            self.thread_manager
+                .sync_thread_metadata_from_persisted(&thread)
+                .await;
+        }
+
+        let response_payload = ThreadUpdateResponse {
+            thread: thread.clone(),
+        };
+        let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send thread/update response"
+            );
+            return;
+        }
+
+        if changed {
+            let notification = ThreadUpdatedNotification {
+                thread: thread.clone(),
+            };
+            self.send_notification_to_thread_subscribers(
+                thread.id.as_str(),
+                events::THREAD_UPDATED,
+                &notification,
+            )
+            .await;
+            self.notify_thread_tree_changed(workspace_id).await;
+        }
+    }
+
     pub(super) async fn thread_move(
         &self,
         connection_id: ConnectionId,

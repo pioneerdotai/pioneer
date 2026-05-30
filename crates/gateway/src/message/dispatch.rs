@@ -360,6 +360,25 @@ impl MessageProcessor {
                     }
                 }
             }
+            methods::THREAD_UPDATE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<ThreadUpdateParams>(params_value) {
+                    Ok(params) => {
+                        self.thread_update(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::THREAD_UPDATE),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
             methods::THREAD_MOVE => {
                 let params_value = request.params.unwrap_or_else(empty_object_value);
                 match serde_json::from_value::<ThreadMoveParams>(params_value) {
