@@ -12,6 +12,7 @@
     "max_output_tokens",
     "stream_stall",
     "stream_truncated",
+    "empty_response",
     "invalid_request",
     "permission_denied",
     "unknown"

@@ -266,6 +266,16 @@ impl Default for RecoveryPolicyRegistry {
             },
         );
         by_provider_failure_class.insert(
+            ProviderFailureClass::EmptyResponse,
+            ProviderRecoveryPolicy {
+                action: RetryWithBackoff,
+                max_attempts: 2,
+                base_backoff_secs: 2,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
             ProviderFailureClass::InvalidRequest,
             ProviderRecoveryPolicy {
                 action: MarkFailed,
@@ -1595,7 +1605,8 @@ impl RecoveryCoordinator {
         match class {
             ProviderFailureClass::NetworkTransient
             | ProviderFailureClass::RateLimit
-            | ProviderFailureClass::Provider5xx => {}
+            | ProviderFailureClass::Provider5xx
+            | ProviderFailureClass::EmptyResponse => {}
             ProviderFailureClass::StreamStall | ProviderFailureClass::StreamTruncated => {
                 if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT {
                     plan.force_non_stream = true;

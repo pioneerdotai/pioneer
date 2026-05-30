@@ -1319,6 +1319,7 @@ pub enum ProviderFailureClass {
     MaxOutputTokens,
     StreamStall,
     StreamTruncated,
+    EmptyResponse,
     InvalidRequest,
     PermissionDenied,
     Unknown,

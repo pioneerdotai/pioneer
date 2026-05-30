@@ -26,11 +26,11 @@ use pioneer_protocol::{
     AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, McpScopeKind,
     McpTurnBindingSummary, MemoryCategory, MemoryScope, MemoryScopeKind,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookTruncation, RecoveryAction, RecoveryAttemptContext, StorageOutputPolicy,
-    SystemEventLevel, ThreadMode, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
-    ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass, ToolRetryResolution, ToolStoragePayload,
-    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnItem, TurnItemType, UserInput,
+    PromptManifestHookTruncation, ProviderFailureClass, RecoveryAction, RecoveryAttemptContext,
+    StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolLoopBudgetAction,
+    ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
+    ToolRetryResolution, ToolStoragePayload, TurnCapability, TurnCapabilityAcceptedReason,
+    TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem, TurnItemType, UserInput,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -221,6 +221,13 @@ struct CaptureAgentProvider {
     preflight_response_text: String,
 }
 
+struct EmptyNoToolRoundProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    first_tool_call: Option<ProviderToolCall>,
+    empty_rounds_before_final: usize,
+    next_index: AtomicUsize,
+}
+
 impl Default for CaptureAgentProvider {
     fn default() -> Self {
         Self {
@@ -262,6 +269,38 @@ impl CaptureAgentProvider {
             .lock()
             .expect("capture provider lock poisoned")
             .clone()
+    }
+}
+
+impl EmptyNoToolRoundProvider {
+    fn new(empty_rounds_before_final: usize) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            first_tool_call: None,
+            empty_rounds_before_final,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_first_tool_call(
+        first_tool_call: ProviderToolCall,
+        empty_rounds_before_final: usize,
+    ) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            first_tool_call: Some(first_tool_call),
+            empty_rounds_before_final,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("empty no-tool provider lock poisoned")
+                .clone(),
+        )
     }
 }
 
@@ -2106,6 +2145,74 @@ impl Provider for CaptureAgentProvider {
 }
 
 #[async_trait::async_trait]
+impl Provider for EmptyNoToolRoundProvider {
+    fn name(&self) -> &str {
+        "empty-no-tool-round"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
+        self.requests
+            .lock()
+            .expect("empty no-tool provider lock poisoned")
+            .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
+
+        let index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        if index == 0
+            && let Some(first_tool_call) = self.first_tool_call.clone()
+        {
+            return Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![first_tool_call],
+            });
+        }
+
+        let empty_index = index.saturating_sub(usize::from(self.first_tool_call.is_some()));
+        if empty_index < self.empty_rounds_before_final {
+            return Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        Ok(ChatResponse {
+            text: "done after empty response recovery".to_owned(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for TextOnlyAgentProvider {
     fn name(&self) -> &str {
         "text-only"
@@ -2465,6 +2572,211 @@ async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
     let main_request = &requests[1];
     assert!(main_request.compiled_prompt.is_some());
     assert!(main_request.tools.is_some());
+}
+
+#[tokio::test]
+async fn empty_no_tool_round_retries_without_empty_agent_message() {
+    let provider = Arc::new(EmptyNoToolRoundProvider::new(2));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "empty-no-tool-round",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "empty_no_tool_retry_thread",
+        "workspace",
+        "empty_no_tool_retry_turn",
+        ThreadMode::Agent,
+        "empty-no-tool-round",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let completed_messages = observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                return None;
+            };
+            Some(text.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_messages,
+        vec!["done after empty response recovery".to_owned()],
+        "empty no-tool rounds must not create completed AgentMessage items"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "two empty model rounds should be retried inside the same agent loop before final answer"
+    );
+    assert_eq!(
+        requests[1]
+            .messages
+            .iter()
+            .filter(|message| message
+                .content
+                .contains("Your previous response was empty and was not accepted"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests[2]
+            .messages
+            .iter()
+            .filter(|message| message
+                .content
+                .contains("Your previous response was empty and was not accepted"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn empty_no_tool_round_after_tool_result_preserves_context() {
+    let provider = Arc::new(EmptyNoToolRoundProvider::with_first_tool_call(
+        ProviderToolCall {
+            id: "call_empty_after_tool_list_dir".to_owned(),
+            name: "list_dir".to_owned(),
+            arguments: serde_json::json!({"path": ".", "depth": 0, "limit": 1}).to_string(),
+        },
+        1,
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "empty-no-tool-round",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "empty_after_tool_retry_thread",
+        "workspace",
+        "empty_after_tool_retry_turn",
+        ThreadMode::Agent,
+        "empty-no-tool-round",
+        "list files",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(
+        completed_agent_message_text(&observed).as_deref(),
+        Some("done after empty response recovery")
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "tool round, empty retry round, and final retry round should stay in one loop"
+    );
+    assert_eq!(
+        tool_result_message_count(&requests[1]),
+        1,
+        "empty model round should see the completed tool result"
+    );
+    assert_eq!(
+        tool_result_message_count(&requests[2]),
+        1,
+        "retry after empty model round must keep prior tool result context"
+    );
+    assert!(requests[2].messages.iter().any(|message| {
+        message
+            .content
+            .contains("Your previous response was empty and was not accepted")
+    }));
+}
+
+#[tokio::test]
+async fn third_consecutive_empty_no_tool_round_surfaces_provider_failure() {
+    let provider = Arc::new(EmptyNoToolRoundProvider::new(usize::MAX));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "empty-no-tool-round",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread_id = "empty_no_tool_failure_thread";
+    let turn_id = "empty_no_tool_failure_turn";
+
+    manager
+        .ensure_thread(thread_id, "workspace")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "empty-no-tool-round",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut completed_agent_messages = Vec::new();
+    for _ in 0..40 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("must receive agent event in time")
+            .expect("broadcast should remain open");
+        match event {
+            AgentEvent::ItemCompleted(notification) => {
+                if let TurnItem::AgentMessage { text, .. } = notification.item {
+                    completed_agent_messages.push(text);
+                }
+            }
+            AgentEvent::ProviderFailureDetected { failure, .. } => {
+                assert_eq!(failure.class, ProviderFailureClass::EmptyResponse);
+                assert_eq!(
+                    failure.provider_code.as_deref(),
+                    Some("empty_model_response")
+                );
+                assert!(failure.is_recoverable_hint);
+                assert_eq!(
+                    failure.message.as_deref(),
+                    Some("model returned an empty response without tool calls")
+                );
+                assert!(
+                    completed_agent_messages.is_empty(),
+                    "empty no-tool provider failure must not create AgentMessage items"
+                );
+                assert_eq!(
+                    provider.snapshot_requests().len(),
+                    3,
+                    "provider failure should happen on the third consecutive empty no-tool round"
+                );
+                return;
+            }
+            AgentEvent::TurnCompleted { .. } => {
+                panic!("empty no-tool rounds must not complete the turn")
+            }
+            AgentEvent::TurnFailed { error, .. } => {
+                panic!(
+                    "empty no-tool rounds should surface provider failure, not TurnFailed: {error}"
+                )
+            }
+            _ => {}
+        }
+    }
+
+    panic!("provider failure was not emitted for repeated empty no-tool rounds")
 }
 
 #[tokio::test]

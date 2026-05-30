@@ -60,10 +60,11 @@ use pioneer_protocol::{
     ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderFailureDetails, RecoveryAttemptContext, ThreadMode,
-    ToolRecoveryPolicySnapshot, TurnAcceptedCapability, TurnCapability,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem,
-    TurnItemType, TurnRejectedCapability, UserInput, generate_id,
+    PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
+    ProviderTransportKind, RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot,
+    TurnAcceptedCapability, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnItem, TurnItemType, TurnRejectedCapability, UserInput,
+    generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
@@ -97,6 +98,14 @@ const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
 const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
 const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
+const MAX_CONSECUTIVE_EMPTY_NO_TOOL_ROUNDS: usize = 3;
+const EMPTY_NO_TOOL_ROUND_RECOVERY_INSTRUCTION: &str = concat!(
+    "Your previous response was empty and was not accepted. ",
+    "Continue the current turn from the existing tool results in context. ",
+    "Do not restart completed work. ",
+    "If work remains, call the next required tool. ",
+    "If the task is complete, provide a non-empty final answer."
+);
 
 #[derive(Debug, Default, Clone)]
 struct PendingToolUiState {
@@ -2795,6 +2804,7 @@ async fn execute_agent_provider_response(
 
     let turn_result: Result<(), (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
+        let mut consecutive_empty_no_tool_rounds = 0usize;
 
         loop {
             retain_agent_attachment_messages(&mut messages);
@@ -2988,7 +2998,10 @@ async fn execute_agent_provider_response(
             )
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
-            append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
+            
+            if !round.text.trim().is_empty() {
+                append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
+            }
 
             turn_control
                 .succeed_recovery_attempt(turn_id, recovery.take())
@@ -3065,6 +3078,9 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
+                    
+                    consecutive_empty_no_tool_rounds = 0;
+                    
                     continue;
                 }
                 ToolLoopGuardDecision::FailTurn {
@@ -3161,6 +3177,7 @@ async fn execute_agent_provider_response(
 
             if round.tool_calls.is_empty() {
                 if round_plan.tools_enabled && pending_retry_instruction.take().is_some() {
+                    consecutive_empty_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -3207,6 +3224,7 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
+                    consecutive_empty_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -3257,12 +3275,72 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
+                    consecutive_empty_no_tool_rounds = 0;
                     continue;
                 }
 
-                let final_text = task_mutation_finalization_guard
-                    .deterministic_failure_message()
+                let deterministic_final_text =
+                    task_mutation_finalization_guard.deterministic_failure_message();
+                let final_text = deterministic_final_text
+                    .clone()
                     .unwrap_or_else(|| round.text.clone());
+                if deterministic_final_text.is_none() && final_text.trim().is_empty() {
+                    consecutive_empty_no_tool_rounds += 1;
+
+                    if consecutive_empty_no_tool_rounds
+                        >= MAX_CONSECUTIVE_EMPTY_NO_TOOL_ROUNDS
+                    {
+                        return Err((
+                            ChatTurnError::ProviderFailure {
+                                item_id: current_thinking_id.clone(),
+                                item_type: TurnItemType::Reasoning,
+                                failure: ProviderFailureDetails {
+                                    provider: provider.name().to_owned(),
+                                    model: model.clone(),
+                                    transport: if provider.capabilities().streaming
+                                        && !force_non_stream
+                                    {
+                                        ProviderTransportKind::Stream
+                                    } else {
+                                        ProviderTransportKind::NonStream
+                                    },
+                                    class: ProviderFailureClass::EmptyResponse,
+                                    stage: ProviderFailureStage::Finalize,
+                                    http_status: None,
+                                    provider_code: Some("empty_model_response".to_owned()),
+                                    retry_after_ms: None,
+                                    is_recoverable_hint: true,
+                                    message: Some(
+                                        "model returned an empty response without tool calls"
+                                            .to_owned(),
+                                    ),
+                                },
+                            },
+                            current_thinking_id.clone(),
+                        ));
+                    }
+
+                    if !round.reasoning.trim().is_empty() {
+                        send_reasoning_completed(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            current_thinking_id.as_str(),
+                            round.reasoning.as_str(),
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+
+                        current_thinking_id =
+                            start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                                .await
+                                .map_err(|error| (error, current_thinking_id.clone()))?;
+                    }
+
+                    messages.push(ChatMessage::user(EMPTY_NO_TOOL_ROUND_RECOVERY_INSTRUCTION));
+                    continue;
+                }
                 if final_text != round.text {
                     post_turn_assistant_text = final_text.clone();
                 }
@@ -3339,6 +3417,8 @@ async fn execute_agent_provider_response(
 
                 return Ok(());
             }
+
+            consecutive_empty_no_tool_rounds = 0;
 
             send_reasoning_completed(
                 workspace_id,
