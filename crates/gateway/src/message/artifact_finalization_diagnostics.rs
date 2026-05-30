@@ -91,7 +91,11 @@ pub(super) fn diagnose_artifact_finalization(
 ) -> Vec<ArtifactFinalizationDiagnostic> {
     let mut diagnostics = Vec::new();
 
-    for output in prepared_outputs.iter().filter(|output| !output.registered) {
+    for output in prepared_outputs
+        .iter()
+        .filter(|output| !output.is_registered())
+        .filter(|output| prepared_output_is_materialized(output))
+    {
         let path = output.output_path.display().to_string();
         diagnostics.push(ArtifactFinalizationDiagnostic {
             code: ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered,
@@ -129,6 +133,14 @@ pub(super) fn diagnose_artifact_finalization(
     diagnostics
 }
 
+fn prepared_output_is_materialized(output: &PreparedArtifactOutput) -> bool {
+    match std::fs::symlink_metadata(output.output_path.as_path()) {
+        Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 fn private_artifact_output_paths(
     prepared_outputs: &[PreparedArtifactOutput],
     output_dir: Option<&str>,
@@ -151,6 +163,7 @@ fn private_artifact_output_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_artifacts::PreparedArtifactOutputStatus;
     use pioneer_protocol::ArtifactPrepareKind;
     use std::path::PathBuf;
 
@@ -164,17 +177,30 @@ mod tests {
             mime_type: None,
             description: None,
             expires_at: "2026-05-17T00:00:00Z".to_owned(),
-            registered,
+            status: if registered {
+                PreparedArtifactOutputStatus::Registered {
+                    artifact_id: "artifact-1".to_owned(),
+                    version_id: "version-1".to_owned(),
+                }
+            } else {
+                PreparedArtifactOutputStatus::Reserved
+            },
         }
+    }
+
+    fn materialized_prepared(registered: bool) -> (tempfile::TempDir, PreparedArtifactOutput) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("report.txt");
+        std::fs::write(path.as_path(), b"artifact").expect("write prepared output");
+        let mut output = prepared(path.to_str().expect("utf8 temp path"), registered);
+        output.output_dir = temp.path().to_path_buf();
+        (temp, output)
     }
 
     #[test]
     fn artifact_diagnostic_reports_prepared_but_unregistered_output() {
-        let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", false)],
-            Some("/tmp/pioneer-output"),
-            Some("Done."),
-        );
+        let (_temp, output) = materialized_prepared(false);
+        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
 
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered
@@ -184,10 +210,19 @@ mod tests {
 
     #[test]
     fn artifact_diagnostic_ignores_registered_prepared_output() {
+        let (_temp, output) = materialized_prepared(true);
+        let diagnostics =
+            diagnose_artifact_finalization(&[output], None, Some("Registered artifact is ready."));
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn artifact_diagnostic_ignores_unused_unregistered_prepare_without_file() {
         let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", true)],
+            &[prepared("/tmp/pioneer-output/missing-report.txt", false)],
             Some("/tmp/pioneer-output"),
-            Some("Registered artifact is ready."),
+            Some("Done."),
         );
 
         assert!(diagnostics.is_empty());
@@ -231,37 +266,30 @@ mod tests {
 
     #[test]
     fn artifact_retry_instruction_names_artifact_register_and_safe_path() {
-        let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", false)],
-            Some("/tmp/pioneer-output"),
-            Some("Done."),
-        );
+        let (_temp, output) = materialized_prepared(false);
+        let output_path = output.output_path.display().to_string();
+        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
 
         let instruction = artifact_finalization_retry_instruction(&diagnostics, false)
             .expect("unregistered prepared output should trigger one retry");
 
         assert!(instruction.contains("artifact_register"));
-        assert!(instruction.contains("/tmp/pioneer-output/report.txt"));
+        assert!(instruction.contains(output_path.as_str()));
     }
 
     #[test]
     fn artifact_retry_instruction_is_suppressed_after_retry_used() {
-        let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", false)],
-            Some("/tmp/pioneer-output"),
-            Some("Done."),
-        );
+        let (_temp, output) = materialized_prepared(false);
+        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
 
         assert!(artifact_finalization_retry_instruction(&diagnostics, true).is_none());
     }
 
     #[test]
     fn artifact_retry_successful_registration_clears_diagnostic() {
-        let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", true)],
-            Some("/tmp/pioneer-output"),
-            Some("Registered artifact is ready."),
-        );
+        let (_temp, output) = materialized_prepared(true);
+        let diagnostics =
+            diagnose_artifact_finalization(&[output], None, Some("Registered artifact is ready."));
 
         assert!(diagnostics.is_empty());
         assert!(artifact_finalization_retry_instruction(&diagnostics, false).is_none());
@@ -269,11 +297,8 @@ mod tests {
 
     #[test]
     fn artifact_retry_terminal_error_reports_failure_after_one_attempt() {
-        let diagnostics = diagnose_artifact_finalization(
-            &[prepared("/tmp/pioneer-output/report.txt", false)],
-            Some("/tmp/pioneer-output"),
-            Some("Done."),
-        );
+        let (_temp, output) = materialized_prepared(false);
+        let diagnostics = diagnose_artifact_finalization(&[output], None, Some("Done."));
 
         let error = artifact_finalization_terminal_error(&diagnostics);
 

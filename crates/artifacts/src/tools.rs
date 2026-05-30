@@ -19,6 +19,7 @@ use pioneer_tools::{
 };
 use schemars::{JsonSchema, schema_for};
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ArtifactProjectionRecord, ArtifactRegistrationCandidate, ArtifactRegistrationContext,
@@ -34,6 +35,16 @@ const PREPARED_OUTPUT_TTL_HOURS: i64 = 24;
 const MAX_FILENAME_CHARS: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedArtifactOutputStatus {
+    Reserved,
+    Registered {
+        artifact_id: String,
+        version_id: String,
+    },
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedArtifactOutput {
     pub tool_call_id: String,
     pub output_path: PathBuf,
@@ -43,7 +54,17 @@ pub struct PreparedArtifactOutput {
     pub mime_type: Option<String>,
     pub description: Option<String>,
     pub expires_at: String,
-    pub registered: bool,
+    pub status: PreparedArtifactOutputStatus,
+}
+
+impl PreparedArtifactOutput {
+    pub fn is_registered(&self) -> bool {
+        matches!(self.status, PreparedArtifactOutputStatus::Registered { .. })
+    }
+
+    pub fn is_reserved(&self) -> bool {
+        matches!(self.status, PreparedArtifactOutputStatus::Reserved)
+    }
 }
 
 #[derive(Default)]
@@ -72,10 +93,18 @@ impl ArtifactToolState {
             .and_then(|inner| inner.prepared_by_path.get(&path_key(path)).cloned())
     }
 
-    pub fn mark_registered(&self, path: &Path) -> Option<PreparedArtifactOutput> {
+    pub fn mark_registered(
+        &self,
+        path: &Path,
+        artifact_id: &str,
+        version_id: &str,
+    ) -> Option<PreparedArtifactOutput> {
         self.inner.lock().ok().and_then(|mut inner| {
             let prepared = inner.prepared_by_path.get_mut(&path_key(path))?;
-            prepared.registered = true;
+            prepared.status = PreparedArtifactOutputStatus::Registered {
+                artifact_id: artifact_id.to_owned(),
+                version_id: version_id.to_owned(),
+            };
             Some(prepared.clone())
         })
     }
@@ -134,7 +163,7 @@ impl ArtifactToolState {
             mime_type: params.mime_type.filter(|value| !value.trim().is_empty()),
             description: params.description.filter(|value| !value.trim().is_empty()),
             expires_at,
-            registered: false,
+            status: PreparedArtifactOutputStatus::Reserved,
         };
         inner
             .prepared_by_path
@@ -367,7 +396,7 @@ pub fn artifact_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         artifact_tool_spec(
             ARTIFACT_REGISTER_TOOL,
-            "Register a file you created into the artifact store. Path must be inside the current workspace or the artifact output dir returned by artifact_prepare. Do not register arbitrary system files.",
+            "Register a file you created into the artifact store. Path must be inside the current workspace or the artifact output dir returned by artifact_prepare. If path is a copy or moved version of a prepared output, pass preparedOutputPath with the original outputPath. Do not register arbitrary system files.",
             artifact_register_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -524,6 +553,13 @@ async fn register_artifact_for_invocation(
     let prepared_canonical = prepared_output_path
         .as_ref()
         .and_then(|path| std::fs::canonicalize(path).ok());
+    let prepared_registration_plan = resolve_prepared_registration_plan(
+        artifact_state,
+        source_canonical.as_deref(),
+        prepared_output_path.as_deref(),
+        prepared_canonical.as_deref(),
+    )
+    .await?;
     let cleanup_source_after_success = source_canonical.as_ref().is_some_and(|path| {
         prepared_canonical.as_ref() == Some(path)
             || output_root_canonical
@@ -564,12 +600,6 @@ async fn register_artifact_for_invocation(
         .register_candidate(registration_context, candidate)
         .await
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-    if let Some(path) = source_canonical.as_ref() {
-        artifact_state.mark_registered(path);
-    }
-    if let Some(path) = prepared_canonical.as_ref() {
-        artifact_state.mark_registered(path);
-    }
 
     let artifact = &summary.artifact;
     let version_id = artifact.version_id.clone().ok_or_else(|| {
@@ -578,6 +608,18 @@ async fn register_artifact_for_invocation(
             artifact.artifact_id
         ))
     })?;
+    for prepared in prepared_registration_plan.prepared_outputs {
+        artifact_state.mark_registered(
+            prepared.output_path.as_path(),
+            artifact.artifact_id.as_str(),
+            version_id.as_str(),
+        );
+        let prepared_canonical = std::fs::canonicalize(prepared.output_path.as_path()).ok();
+        if prepared_canonical.as_ref() != source_canonical.as_ref() {
+            let _ = crate::output_dir::cleanup_artifact_output_file(prepared.output_path.as_path())
+                .await;
+        }
+    }
     let size_bytes = artifact.size_bytes.ok_or_else(|| {
         ToolError::internal(format!(
             "registered artifact `{}` has no size",
@@ -600,6 +642,152 @@ async fn register_artifact_for_invocation(
         sha256,
     };
     Ok(ArtifactRegisterOutcome { response, summary })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreparedRegistrationPlan {
+    prepared_outputs: Vec<PreparedArtifactOutput>,
+}
+
+async fn resolve_prepared_registration_plan(
+    artifact_state: &ArtifactToolState,
+    source_canonical: Option<&Path>,
+    explicit_prepared_path: Option<&Path>,
+    explicit_prepared_canonical: Option<&Path>,
+) -> Result<PreparedRegistrationPlan, ToolError> {
+    if let Some(explicit_path) = explicit_prepared_path {
+        let explicit_prepared = find_prepared_output(
+            artifact_state,
+            &[explicit_prepared_canonical, Some(explicit_path)],
+        )
+        .ok_or_else(|| {
+            ToolError::invalid_arguments(
+                "`preparedOutputPath` was not returned by artifact_prepare in this turn",
+            )
+        })?;
+
+        if let Some(source_path) = source_canonical {
+            if let Some(source_prepared) =
+                find_prepared_output(artifact_state, &[Some(source_path)])
+                && source_prepared.output_path != explicit_prepared.output_path
+            {
+                return Err(ToolError::invalid_arguments(
+                    "`path` and `preparedOutputPath` reference different prepared outputs",
+                ));
+            }
+
+            validate_prepared_source_content_match(
+                source_path,
+                explicit_prepared.output_path.as_path(),
+            )
+            .await?;
+        }
+
+        return Ok(PreparedRegistrationPlan {
+            prepared_outputs: vec![explicit_prepared],
+        });
+    }
+
+    if let Some(source_path) = source_canonical
+        && let Some(source_prepared) = find_prepared_output(artifact_state, &[Some(source_path)])
+    {
+        return Ok(PreparedRegistrationPlan {
+            prepared_outputs: vec![source_prepared],
+        });
+    }
+
+    let Some(source_path) = source_canonical else {
+        return Ok(PreparedRegistrationPlan::default());
+    };
+    let Some(source_fingerprint) = file_fingerprint(source_path).await? else {
+        return Ok(PreparedRegistrationPlan::default());
+    };
+
+    let mut matches = Vec::new();
+    for prepared in artifact_state
+        .prepared_outputs()
+        .into_iter()
+        .filter(PreparedArtifactOutput::is_reserved)
+    {
+        let Some(prepared_fingerprint) = file_fingerprint(prepared.output_path.as_path()).await?
+        else {
+            continue;
+        };
+        if prepared_fingerprint == source_fingerprint {
+            matches.push(prepared);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(PreparedRegistrationPlan::default()),
+        1 => Ok(PreparedRegistrationPlan {
+            prepared_outputs: matches,
+        }),
+        _ => Err(ToolError::invalid_arguments(
+            "registered file matches multiple prepared outputs; pass preparedOutputPath",
+        )),
+    }
+}
+
+fn find_prepared_output(
+    artifact_state: &ArtifactToolState,
+    paths: &[Option<&Path>],
+) -> Option<PreparedArtifactOutput> {
+    paths
+        .iter()
+        .filter_map(|path| *path)
+        .find_map(|path| artifact_state.prepared_output_for_path(path))
+}
+
+async fn validate_prepared_source_content_match(
+    source_path: &Path,
+    prepared_path: &Path,
+) -> Result<(), ToolError> {
+    let source_fingerprint = file_fingerprint(source_path).await?;
+    let prepared_fingerprint = file_fingerprint(prepared_path).await?;
+    if let (Some(source), Some(prepared)) = (source_fingerprint, prepared_fingerprint)
+        && source != prepared
+    {
+        return Err(ToolError::invalid_arguments(
+            "`path` content does not match `preparedOutputPath`",
+        ));
+    }
+    Ok(())
+}
+
+async fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, ToolError> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ToolError::execution_failed(format!(
+                "failed to inspect prepared artifact output `{}`: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let bytes = tokio::fs::read(path).await.map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to read prepared artifact output `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes.as_slice());
+    Ok(Some(FileFingerprint {
+        size_bytes: metadata.len(),
+        sha256: hex::encode(hasher.finalize()),
+    }))
 }
 
 fn artifact_register_workspace_root(invocation: &ToolInvocation) -> Result<PathBuf, ToolError> {
@@ -1029,20 +1217,51 @@ mod tests {
         output_dir: Option<PathBuf>,
         path: String,
     ) -> ToolInvocation {
-        let mut invocation = invocation(
-            output_dir.as_deref(),
-            serde_json::json!({
-                "path": path,
-                "displayName": "registered.txt",
-                "kind": "document",
-                "mimeType": "text/plain",
-                "description": "registered from test"
-            }),
-            "call_artifact_register",
-        );
+        artifact_register_invocation_with_prepared(workdir, output_dir, path, None)
+    }
+
+    fn artifact_register_invocation_with_prepared(
+        workdir: PathBuf,
+        output_dir: Option<PathBuf>,
+        path: String,
+        prepared_output_path: Option<String>,
+    ) -> ToolInvocation {
+        let mut arguments = serde_json::json!({
+            "path": path,
+            "displayName": "registered.txt",
+            "kind": "document",
+            "mimeType": "text/plain",
+            "description": "registered from test"
+        });
+        if let Some(prepared_output_path) = prepared_output_path {
+            arguments["preparedOutputPath"] = JsonValue::String(prepared_output_path);
+        }
+        let mut invocation = invocation(output_dir.as_deref(), arguments, "call_artifact_register");
         invocation.tool_name = ARTIFACT_REGISTER_TOOL.to_owned();
         invocation.workdir = workdir;
         invocation
+    }
+
+    fn reserve_prepared_output(
+        state: &ArtifactToolState,
+        output_dir: &Path,
+        display_name: &str,
+        call_id: &str,
+    ) -> PreparedArtifactOutput {
+        let canonical_output_dir = std::fs::canonicalize(output_dir).expect("canonical output dir");
+        state
+            .reserve_output(
+                canonical_output_dir.as_path(),
+                ArtifactPrepareParams {
+                    display_name: display_name.to_owned(),
+                    kind: ArtifactPrepareKind::Document,
+                    mime_type: Some("text/plain".to_owned()),
+                    description: None,
+                },
+                call_id.to_owned(),
+                "2026-05-17T00:00:00Z".to_owned(),
+            )
+            .expect("reserve prepared output")
     }
 
     #[tokio::test]
@@ -1097,6 +1316,172 @@ mod tests {
             page.items[0].artifact.artifact_id,
             outcome.response.artifact_id
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_register_closes_explicit_prepared_output_when_registering_copy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let output_dir = temp.path().join("output");
+        let downloads = workspace.join("Downloads");
+        tokio::fs::create_dir_all(downloads.as_path())
+            .await
+            .expect("create downloads");
+        tokio::fs::create_dir_all(output_dir.as_path())
+            .await
+            .expect("create output dir");
+        let service = artifact_register_service(temp.path().join("runtime")).await;
+        let state = ArtifactToolState::default();
+        let prepared =
+            reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
+        tokio::fs::write(prepared.output_path.as_path(), b"registered copy")
+            .await
+            .expect("write prepared");
+        let copy_path = downloads.join("report.txt");
+        tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
+            .await
+            .expect("copy prepared output");
+        let invocation = artifact_register_invocation_with_prepared(
+            workspace.clone(),
+            Some(output_dir.clone()),
+            copy_path.display().to_string(),
+            Some(prepared.output_path.display().to_string()),
+        );
+
+        let outcome = register_artifact_for_invocation(
+            &service,
+            &artifact_register_context(),
+            &state,
+            &invocation,
+            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+        )
+        .await
+        .expect("register copied prepared output");
+
+        let prepared_after = state
+            .prepared_output_for_path(prepared.output_path.as_path())
+            .expect("prepared output remains tracked");
+        assert!(prepared_after.is_registered());
+        assert_eq!(outcome.response.display_name, "registered.txt");
+        assert!(
+            !prepared.output_path.exists(),
+            "staging source should be cleaned after copied registration"
+        );
+        assert!(copy_path.exists(), "user-requested copy should remain");
+    }
+
+    #[tokio::test]
+    async fn artifact_register_infers_single_prepared_copy_by_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let output_dir = temp.path().join("output");
+        tokio::fs::create_dir_all(workspace.as_path())
+            .await
+            .expect("create workspace");
+        tokio::fs::create_dir_all(output_dir.as_path())
+            .await
+            .expect("create output dir");
+        let service = artifact_register_service(temp.path().join("runtime")).await;
+        let state = ArtifactToolState::default();
+        let prepared =
+            reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
+        tokio::fs::write(prepared.output_path.as_path(), b"same bytes")
+            .await
+            .expect("write prepared");
+        let copy_path = workspace.join("report-copy.txt");
+        tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
+            .await
+            .expect("copy prepared output");
+        let invocation = artifact_register_invocation(
+            workspace.clone(),
+            Some(output_dir.clone()),
+            copy_path.display().to_string(),
+        );
+
+        register_artifact_for_invocation(
+            &service,
+            &artifact_register_context(),
+            &state,
+            &invocation,
+            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+        )
+        .await
+        .expect("register copied prepared output");
+
+        let prepared_after = state
+            .prepared_output_for_path(prepared.output_path.as_path())
+            .expect("prepared output remains tracked");
+        assert!(prepared_after.is_registered());
+        assert!(
+            !prepared.output_path.exists(),
+            "matched staging source should be cleaned after registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_register_rejects_ambiguous_prepared_copy_without_explicit_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let output_dir = temp.path().join("output");
+        tokio::fs::create_dir_all(workspace.as_path())
+            .await
+            .expect("create workspace");
+        tokio::fs::create_dir_all(output_dir.as_path())
+            .await
+            .expect("create output dir");
+        let service = artifact_register_service(temp.path().join("runtime")).await;
+        let state = ArtifactToolState::default();
+        let first = reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_1");
+        let second = reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_2");
+        tokio::fs::write(first.output_path.as_path(), b"same bytes")
+            .await
+            .expect("write first prepared");
+        tokio::fs::write(second.output_path.as_path(), b"same bytes")
+            .await
+            .expect("write second prepared");
+        let copy_path = workspace.join("report-copy.txt");
+        tokio::fs::write(copy_path.as_path(), b"same bytes")
+            .await
+            .expect("write copy");
+        let invocation = artifact_register_invocation(
+            workspace.clone(),
+            Some(output_dir.clone()),
+            copy_path.display().to_string(),
+        );
+
+        let error = register_artifact_for_invocation(
+            &service,
+            &artifact_register_context(),
+            &state,
+            &invocation,
+            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+        )
+        .await
+        .expect_err("ambiguous prepared copy should fail before registration")
+        .to_string();
+
+        assert!(error.contains("preparedOutputPath"), "{error}");
+        assert!(
+            state
+                .prepared_output_for_path(first.output_path.as_path())
+                .expect("first prepared")
+                .is_reserved()
+        );
+        assert!(
+            state
+                .prepared_output_for_path(second.output_path.as_path())
+                .expect("second prepared")
+                .is_reserved()
+        );
+        let page = service
+            .list_thread_artifacts(
+                "ws_artifact_register",
+                "thr_artifact_register",
+                crate::ArtifactListFilter::default(),
+            )
+            .await
+            .expect("list artifacts");
+        assert!(page.items.is_empty());
     }
 
     #[tokio::test]
