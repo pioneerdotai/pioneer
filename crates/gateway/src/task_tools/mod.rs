@@ -30,6 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 const TASK_CREATE_TOOL: &str = "task_create";
 const TASK_WAIT_TOOL: &str = "task_wait";
@@ -53,6 +54,49 @@ where
     F: Future<Output = T> + Send + 'a,
 {
     Box::pin(future)
+}
+
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self
+            .handle
+            .as_mut()
+            .expect("join handle should be present")
+            .await;
+        self.handle = None;
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
+    }
+}
+
+// Service calls from agent tool execution can otherwise inherit a very deep poll stack.
+async fn task_tool_fresh_task<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    AbortOnDropJoinHandle::new(tokio::spawn(future))
+        .join()
+        .await
 }
 
 #[derive(Clone)]
@@ -290,14 +334,24 @@ impl TaskToolHandler {
             return Ok(function_output(output));
         }
         let params = self.create_params(input).await?;
-        let response = task_tool_future(
-            self.processor
-                .task_runtime
-                .service()
-                .create_task(pioneer_tasks::TaskCreateContext::default(), params),
-        )
+        let service = self.processor.task_runtime.service();
+        let response = match task_tool_fresh_task(async move {
+            service
+                .create_task(pioneer_tasks::TaskCreateContext::default(), params)
+                .await
+        })
         .await
-        .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        {
+            Ok(response) => {
+                response.map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+            }
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "task_create worker failed: {error}"
+                )));
+            }
+        };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
         let output = task_create_tool_output(&response, &anchor);
         if let Some(key) = cache_key {

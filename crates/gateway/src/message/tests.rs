@@ -4476,7 +4476,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), ""));
+    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         provider.clone(),
@@ -4545,7 +4545,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         );
     }
 
-    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), ""));
+    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         chat_provider.clone(),
