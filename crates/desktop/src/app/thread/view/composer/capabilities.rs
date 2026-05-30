@@ -370,7 +370,6 @@ impl PioneerDesktop {
             );
             state.mcp_server_rows = server_rows;
             if let Some(details) = initial_details {
-                state.active_mcp_server_id = Some(details.server.id.clone());
                 state.mcp_tool_rows = filter_mcp_tool_capability_rows(&details, "");
             }
             state
@@ -382,6 +381,7 @@ impl PioneerDesktop {
             let (
                 server_rows,
                 tool_rows,
+                has_query,
                 active_server_id,
                 selected,
                 loading_server_id,
@@ -428,6 +428,7 @@ impl PioneerDesktop {
                             query.as_str(),
                         )
                     },
+                    has_query,
                     active_server_id,
                     state.selected.clone(),
                     state.mcp_tool_loading_server_id.clone(),
@@ -493,6 +494,7 @@ impl PioneerDesktop {
                         .child(render_mcp_rows(
                             server_rows,
                             tool_rows,
+                            has_query,
                             active_server_id,
                             selected,
                             loading_server_id,
@@ -949,6 +951,7 @@ fn render_picker_select_control(
 fn render_mcp_rows(
     server_rows: Vec<SelectableMcpCapability>,
     tool_rows: Vec<SelectableMcpCapability>,
+    has_query: bool,
     active_server_id: Option<String>,
     selected: HashSet<String>,
     loading_server_id: Option<String>,
@@ -973,11 +976,13 @@ fn render_mcp_rows(
         );
     }
 
-    let mut rows = v_flex()
-        .max_h(px(420.))
-        .overflow_y_scrollbar()
-        .gap_2()
-        .child(
+    let has_server_rows = !server_rows.is_empty();
+    let has_tool_rows = !tool_rows.is_empty();
+
+    let mut rows = v_flex().max_h(px(420.)).overflow_y_scrollbar().gap_2();
+
+    if has_server_rows {
+        rows = rows.child(
             v_flex()
                 .gap_1()
                 .child(
@@ -987,23 +992,24 @@ fn render_mcp_rows(
                         .opacity(0.6)
                         .child(t!("chat.composer.capability_picker.servers").to_string()),
                 )
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .children(server_rows.into_iter().map(|row| {
-                            render_mcp_row(
-                                row,
-                                active_server_id.as_deref(),
-                                loading_server_id.as_deref(),
-                                &loaded_tool_server_ids,
-                                selected.clone(),
-                                desktop_entity.clone(),
-                                picker_state.clone(),
-                                cx,
-                            )
-                        })),
-                ),
+                .child(render_mcp_server_rows(
+                    server_rows,
+                    if has_query {
+                        Vec::new()
+                    } else {
+                        tool_rows.clone()
+                    },
+                    active_server_id.as_deref(),
+                    loading_server_id.as_deref(),
+                    if has_query { None } else { tool_error.clone() },
+                    &loaded_tool_server_ids,
+                    selected.clone(),
+                    desktop_entity.clone(),
+                    picker_state.clone(),
+                    cx,
+                )),
         );
+    }
 
     if server_loading {
         rows = rows.child(picker_status_banner(
@@ -1016,7 +1022,10 @@ fn render_mcp_rows(
         rows = rows.child(picker_error_banner(error, cx));
     }
 
-    if loading_server_id.is_some() && loading_server_id.as_deref() == active_server_id.as_deref() {
+    if has_query
+        && loading_server_id.is_some()
+        && loading_server_id.as_deref() == active_server_id.as_deref()
+    {
         rows = rows.child(
             div()
                 .rounded_md()
@@ -1029,7 +1038,7 @@ fn render_mcp_rows(
         );
     }
 
-    if let Some(error) = tool_error {
+    if has_query && let Some(error) = tool_error {
         rows = rows.child(
             div()
                 .p_2()
@@ -1039,7 +1048,7 @@ fn render_mcp_rows(
         );
     }
 
-    if !tool_rows.is_empty() {
+    if has_query && has_tool_rows {
         rows = rows.child(
             v_flex()
                 .gap_1()
@@ -1067,6 +1076,115 @@ fn render_mcp_rows(
     }
 
     rows.into_any_element()
+}
+
+fn render_mcp_server_rows(
+    server_rows: Vec<SelectableMcpCapability>,
+    tool_rows: Vec<SelectableMcpCapability>,
+    active_server_id: Option<&str>,
+    loading_server_id: Option<&str>,
+    tool_error: Option<String>,
+    loaded_tool_server_ids: &HashSet<String>,
+    selected: HashSet<String>,
+    desktop_entity: Entity<PioneerDesktop>,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .children(server_rows.into_iter().flat_map(|row| {
+            let server_id = row.server_id.clone();
+            let is_active_server = active_server_id == Some(server_id.as_str());
+            let mut elements = vec![render_mcp_row(
+                row,
+                active_server_id,
+                loading_server_id,
+                loaded_tool_server_ids,
+                selected.clone(),
+                desktop_entity.clone(),
+                picker_state.clone(),
+                cx,
+            )];
+
+            if is_active_server {
+                if loading_server_id == Some(server_id.as_str()) {
+                    elements.push(render_mcp_tools_loading_row(cx));
+                }
+
+                if let Some(error) = tool_error.clone() {
+                    elements.push(render_mcp_tools_error_row(error, cx));
+                }
+
+                let active_tool_rows = tool_rows
+                    .iter()
+                    .filter(|tool_row| tool_row.server_id == server_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !active_tool_rows.is_empty() {
+                    elements.push(render_mcp_tool_rows(
+                        active_tool_rows,
+                        active_server_id,
+                        loading_server_id,
+                        loaded_tool_server_ids,
+                        selected.clone(),
+                        desktop_entity.clone(),
+                        picker_state.clone(),
+                        cx,
+                    ));
+                }
+            }
+
+            elements
+        }))
+        .into_any_element()
+}
+
+fn render_mcp_tool_rows(
+    tool_rows: Vec<SelectableMcpCapability>,
+    active_server_id: Option<&str>,
+    loading_server_id: Option<&str>,
+    loaded_tool_server_ids: &HashSet<String>,
+    selected: HashSet<String>,
+    desktop_entity: Entity<PioneerDesktop>,
+    picker_state: Entity<CapabilityPickerState>,
+    cx: &mut App,
+) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .children(tool_rows.into_iter().map(|row| {
+            render_mcp_row(
+                row,
+                active_server_id,
+                loading_server_id,
+                loaded_tool_server_ids,
+                selected.clone(),
+                desktop_entity.clone(),
+                picker_state.clone(),
+                cx,
+            )
+        }))
+        .into_any_element()
+}
+
+fn render_mcp_tools_loading_row(cx: &mut App) -> AnyElement {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .p_2()
+        .text_sm()
+        .opacity(0.6)
+        .child(t!("chat.composer.capability_picker.loading_tools").to_string())
+        .into_any_element()
+}
+
+fn render_mcp_tools_error_row(error: String, cx: &mut App) -> AnyElement {
+    div()
+        .p_2()
+        .text_sm()
+        .text_color(cx.theme().danger)
+        .child(error)
+        .into_any_element()
 }
 
 fn render_mcp_row(
