@@ -295,9 +295,16 @@ create_agents_doc = "Crear AGENTS.md"
 edit_agents_doc = "Editar AGENTS.md"
 remove_agents_doc_override = "Quitar AGENTS.md"
 
+[sidebar.contextmenu.thread]
+edit = "Renombrar"
+
 [dialog.folder.rename]
 title = "Renombrar carpeta"
 description = "Hazlo corto y fácil de recordar."
+
+[dialog.thread.rename]
+title = "Renombrar"
+description = "Actualiza el título del hilo."
 
 [editor.agents_doc]
 title = "AGENTS.md"

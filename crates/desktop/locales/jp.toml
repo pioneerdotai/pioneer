@@ -295,9 +295,16 @@ create_agents_doc = "AGENTS.mdを作成"
 edit_agents_doc = "AGENTS.mdを編集"
 remove_agents_doc_override = "AGENTS.mdを削除"
 
+[sidebar.contextmenu.thread]
+edit = "名前を変更"
+
 [dialog.folder.rename]
 title = "フォルダ名を変更"
 description = "短く、覚えやすい名前にしてください。"
+
+[dialog.thread.rename]
+title = "名前を変更"
+description = "スレッドのタイトルを更新します。"
 
 [editor.agents_doc]
 title = "AGENTS.md"

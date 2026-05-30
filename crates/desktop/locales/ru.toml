@@ -295,9 +295,16 @@ create_agents_doc = "Создать AGENTS.md"
 edit_agents_doc = "Редактировать AGENTS.md"
 remove_agents_doc_override = "Удалить AGENTS.md"
 
+[sidebar.contextmenu.thread]
+edit = "Переименовать"
+
 [dialog.folder.rename]
 title = "Переименовать папку"
 description = "Сделайте название коротким и легко запоминающимся."
+
+[dialog.thread.rename]
+title = "Переименовать"
+description = "Измените название треда."
 
 [editor.agents_doc]
 title = "AGENTS.md"

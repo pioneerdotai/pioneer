@@ -295,9 +295,16 @@ create_agents_doc = "创建 AGENTS.md"
 edit_agents_doc = "编辑 AGENTS.md"
 remove_agents_doc_override = "移除 AGENTS.md"
 
+[sidebar.contextmenu.thread]
+edit = "重命名"
+
 [dialog.folder.rename]
 title = "重命名文件夹"
 description = "请保持简短且便于记忆。"
+
+[dialog.thread.rename]
+title = "重命名"
+description = "更新话题标题。"
 
 [editor.agents_doc]
 title = "AGENTS.md"

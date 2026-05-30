@@ -295,9 +295,16 @@ create_agents_doc = "AGENTS.md बनाएँ"
 edit_agents_doc = "AGENTS.md संपादित करें"
 remove_agents_doc_override = "AGENTS.md हटाएँ"
 
+[sidebar.contextmenu.thread]
+edit = "नाम बदलें"
+
 [dialog.folder.rename]
 title = "फ़ोल्डर का नाम बदलें"
 description = "इसे छोटा और याद रखने में आसान रखें।"
+
+[dialog.thread.rename]
+title = "नाम बदलें"
+description = "थ्रेड का शीर्षक अपडेट करें।"
 
 [editor.agents_doc]
 title = "AGENTS.md"
