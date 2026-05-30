@@ -4,8 +4,8 @@ use crate::components::buttonts::{default_outline_button, default_primary_button
 use gpui::{prelude::*, *};
 use gpui_component::{
     StyledExt, WindowExt,
+    form::{field, v_form},
     input::{Input, InputState},
-    label::Label,
     *,
 };
 use pioneer_protocol::{
@@ -272,12 +272,18 @@ impl PioneerDesktop {
                         .pb_5()
                         .gap_4()
                         .child(
-                            v_flex()
-                                .gap_1()
-                                .child(Label::new(t!("mcp.dialog.config_json")).text_xs())
-                                .child(Input::new(&config_input_state))
+                            v_form()
+                                .child(
+                                    field()
+                                        .label(t!("mcp.dialog.config_json").to_string())
+                                        .child(Input::new(&config_input_state).min_w_0()),
+                                )
                                 .when_some(field_error_message, |this, error| {
-                                    this.child(mcp_config_field_error(error, cx))
+                                    this.child(
+                                        field()
+                                            .label_indent(false)
+                                            .child(mcp_config_field_error(error, cx)),
+                                    )
                                 }),
                         )
                         .child(

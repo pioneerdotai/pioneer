@@ -4,8 +4,8 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     WindowExt,
     button::*,
+    form::{field, v_form},
     input::{Input, InputState},
-    label::Label,
     theme::ActiveTheme,
     *,
 };
@@ -149,26 +149,30 @@ impl PioneerDesktop {
                                 .child(provider_description.clone()),
                         )
                         .child(
-                            v_flex()
-                                .gap_1()
-                                .child(Label::new(t!("providers.dialog.api_key_label")).text_xs())
-                                .child(Input::new(&api_key_input_state)),
-                        )
-                        .when(is_configured, |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .line_height(relative(1.3))
-                                    .opacity(0.6)
-                                    .child(
-                                        t!(
-                                            "providers.dialog.replace_hint",
-                                            provider = provider_title.as_str()
-                                        )
-                                        .to_string(),
-                                    ),
-                            )
-                        }),
+                            v_form()
+                                .child(
+                                    field()
+                                        .label(t!("providers.dialog.api_key_label").to_string())
+                                        .child(Input::new(&api_key_input_state).min_w_0()),
+                                )
+                                .when(is_configured, |this| {
+                                    this.child(
+                                        field().label_indent(false).child(
+                                            div()
+                                                .text_xs()
+                                                .line_height(relative(1.3))
+                                                .opacity(0.6)
+                                                .child(
+                                                    t!(
+                                                        "providers.dialog.replace_hint",
+                                                        provider = provider_title.as_str()
+                                                    )
+                                                    .to_string(),
+                                                ),
+                                        ),
+                                    )
+                                }),
+                        ),
                 )
         });
     }

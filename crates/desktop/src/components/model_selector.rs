@@ -7,8 +7,8 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Icon,
     divider::Divider,
+    form::{Field, field, v_form},
     input::{Input, InputState},
-    label::Label,
     popover::{Popover, PopoverState},
     scroll::Scrollbar,
     theme::ActiveTheme,
@@ -343,19 +343,17 @@ impl PioneerDesktop {
                     }
                 })
                 .child(
-                    v_flex()
-                        .w_full()
-                        .pt_4()
-                        .pb_5()
-                        .gap_4()
-                        .child(Self::render_provider_selector_section(
-                            state.clone(),
-                            provider_trigger_label,
-                        ))
-                        .child(Self::render_model_selector_section(
-                            state.clone(),
-                            model_trigger_label,
-                        )),
+                    v_flex().w_full().pt_4().pb_5().child(
+                        v_form()
+                            .child(Self::render_provider_selector_section(
+                                state.clone(),
+                                provider_trigger_label,
+                            ))
+                            .child(Self::render_model_selector_section(
+                                state.clone(),
+                                model_trigger_label,
+                            )),
+                    ),
                 )
         });
     }
@@ -393,13 +391,11 @@ impl PioneerDesktop {
     fn render_provider_selector_section(
         state: ModelSelectorDialogState,
         provider_trigger_label: String,
-    ) -> AnyElement {
+    ) -> Field {
         let provider_trigger_width_px = state.provider_trigger_width_px.clone();
         let desktop_entity = state.desktop_entity.clone();
-        v_flex()
-            .w_full()
-            .gap_1()
-            .child(Label::new(t!("chat.composer.model.provider_label")).text_xs())
+        field()
+            .label(t!("chat.composer.model.provider_label").to_string())
             .child(
                 div()
                     .w_full()
@@ -435,7 +431,6 @@ impl PioneerDesktop {
                         .size_full(),
                     ),
             )
-            .into_any_element()
     }
 
     fn render_provider_popover_content(
@@ -477,13 +472,7 @@ impl PioneerDesktop {
 
         let mut content = v_flex()
             .w(popover_width)
-            .child(
-                div().child(
-                    Input::new(&state.provider_search_input)
-                        .appearance(false)
-                        .px_2(),
-                ),
-            )
+            .child(render_selector_filter_form(&state.provider_search_input))
             .child(Divider::horizontal());
 
         let mut list = v_flex()
@@ -584,13 +573,11 @@ impl PioneerDesktop {
     fn render_model_selector_section(
         state: ModelSelectorDialogState,
         model_trigger_label: String,
-    ) -> AnyElement {
+    ) -> Field {
         let model_trigger_width_px = state.model_trigger_width_px.clone();
         let desktop_entity = state.desktop_entity.clone();
-        v_flex()
-            .w_full()
-            .gap_1()
-            .child(Label::new(t!("chat.composer.model.model_label")).text_xs())
+        field()
+            .label(t!("chat.composer.model.model_label").to_string())
             .child(
                 div()
                     .w_full()
@@ -630,7 +617,6 @@ impl PioneerDesktop {
                         .size_full(),
                     ),
             )
-            .into_any_element()
     }
 
     fn render_model_popover_content(
@@ -684,13 +670,7 @@ impl PioneerDesktop {
 
         let mut content = v_flex()
             .w(popover_width)
-            .child(
-                div().child(
-                    Input::new(&state.model_search_input)
-                        .appearance(false)
-                        .px_2(),
-                ),
-            )
+            .child(render_selector_filter_form(&state.model_search_input))
             .child(Divider::horizontal());
 
         if is_loading {
@@ -938,4 +918,14 @@ impl PioneerDesktop {
             )
             .into_any_element()
     }
+}
+
+fn render_selector_filter_form(search: &Entity<InputState>) -> AnyElement {
+    v_form()
+        .child(
+            field()
+                .label_indent(false)
+                .child(Input::new(search).appearance(false).px_2().min_w_0()),
+        )
+        .into_any_element()
 }

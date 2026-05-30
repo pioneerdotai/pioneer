@@ -5,6 +5,7 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, StyledExt, WindowExt,
+    form::{field, v_form},
     input::{Input, InputState},
     theme::ActiveTheme,
     v_flex,
@@ -128,17 +129,26 @@ impl PioneerDesktop {
                                 .line_height(relative(1.35))
                                 .child(t!("workspace.dialog.rename_description").to_string()),
                         )
-                        .child(Input::new(&name_input_state))
-                        .when_some(field_error_message, |this, error| {
-                            this.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().danger)
-                                    .line_height(relative(1.3))
-                                    .whitespace_normal()
-                                    .child(error),
-                            )
-                        }),
+                        .child(
+                            v_form()
+                                .child(
+                                    field()
+                                        .label(t!("workspace.dialog.name_label").to_string())
+                                        .child(Input::new(&name_input_state).min_w_0()),
+                                )
+                                .when_some(field_error_message, |this, error| {
+                                    this.child(
+                                        field().label_indent(false).child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().danger)
+                                                .line_height(relative(1.3))
+                                                .whitespace_normal()
+                                                .child(error),
+                                        ),
+                                    )
+                                }),
+                        ),
                 )
         });
     }
@@ -249,17 +259,26 @@ impl PioneerDesktop {
                                 .line_height(relative(1.35))
                                 .child(t!("workspace.dialog.create_description").to_string()),
                         )
-                        .child(Input::new(&name_input_state))
-                        .when_some(field_error_message, |this, error| {
-                            this.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().danger)
-                                    .line_height(relative(1.3))
-                                    .whitespace_normal()
-                                    .child(error),
-                            )
-                        }),
+                        .child(
+                            v_form()
+                                .child(
+                                    field()
+                                        .label(t!("workspace.dialog.name_label").to_string())
+                                        .child(Input::new(&name_input_state).min_w_0()),
+                                )
+                                .when_some(field_error_message, |this, error| {
+                                    this.child(
+                                        field().label_indent(false).child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().danger)
+                                                .line_height(relative(1.3))
+                                                .whitespace_normal()
+                                                .child(error),
+                                        ),
+                                    )
+                                }),
+                        ),
                 )
         });
     }
