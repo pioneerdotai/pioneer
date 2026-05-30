@@ -50,6 +50,7 @@ fn runtime_descriptor_to_dynamic_descriptor(
     SkillDynamicToolDescriptor {
         canonical_tool_name: descriptor.canonical_tool_name.clone(),
         skill_slug: descriptor.skill_slug.clone(),
+        skill_asset_root: descriptor.skill_asset_root.clone(),
         skill_fingerprint: descriptor.skill_fingerprint.clone(),
         source_kind: descriptor.source_kind.clone(),
         trust_level: descriptor.trust_level.clone(),
@@ -91,6 +92,7 @@ fn map_read_skill_index(
                     name: entry.name.clone(),
                     description: entry.description.clone(),
                     body: entry.body.clone(),
+                    skill_asset_root: entry.skill_asset_root.clone(),
                     fingerprint: entry.fingerprint.clone(),
                     source_kind: entry.source_kind.clone(),
                 },

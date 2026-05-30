@@ -9540,7 +9540,7 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
 #[tokio::test]
 async fn read_skill_returns_active_skill_body() {
     let skill_root = unique_temp_dir("read-skill-ok");
-    write_skill(
+    let skill_dir = write_skill(
         skill_root.as_path(),
         "my-skill",
         "Full body text for read_skill.",
@@ -9655,6 +9655,22 @@ async fn read_skill_returns_active_skill_body() {
         read_skill_result
             .content
             .contains("Full body text for read_skill.")
+    );
+    assert!(
+        read_skill_result.content.contains(
+            format!(
+                "\"skill_asset_root\":\"{}\"",
+                fs::canonicalize(skill_dir.as_path())
+                    .expect("skill dir canonicalizes")
+                    .display()
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        read_skill_result
+            .content
+            .contains("relative_path_resolution")
     );
 
     let _ = fs::remove_dir_all(skill_root);

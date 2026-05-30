@@ -762,19 +762,19 @@ pub fn parse_skill_from_file(
         .unwrap_or("skill")
         .to_owned();
 
-    let slug = sidecar_meta
+    let raw_slug = sidecar_meta
         .slug
         .as_deref()
         .or(frontmatter.slug.as_deref())
-        .map(normalize_slug)
-        .filter(|value| !value.is_empty());
+        .unwrap_or(parent_directory_name.as_str());
+    let slug = normalize_slug(raw_slug);
 
-    let Some(slug) = slug else {
+    if slug.is_empty() {
         bail!(
-            "skill `{}` is missing required `slug`; define frontmatter `slug` or `_meta.json.slug`",
+            "skill `{}` could not derive a slug from frontmatter `slug`, `_meta.json.slug`, or the skill directory name",
             skill_file.display()
         );
-    };
+    }
 
     let owner = sidecar_meta
         .owner
@@ -950,6 +950,34 @@ Instructions
         assert_eq!(skill.dependencies.commands, vec!["agent-browser"]);
         assert_eq!(skill.dependencies.bins, vec!["node"]);
         assert!(skill.metadata_raw.get("clawdbot").is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn derives_slug_from_skill_directory_when_metadata_omits_slug() {
+        let dir = temp_case("directory-slug");
+        let skill_file = write_skill(
+            &dir,
+            "docx",
+            r#"---
+name: docx
+description: Word document helper
+---
+Use scripts under this skill.
+"#,
+        );
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("skill parses");
+
+        assert_eq!(skill.identity.slug, "docx");
+        assert_eq!(skill.identity.name, "docx");
 
         let _ = fs::remove_dir_all(dir);
     }

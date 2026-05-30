@@ -287,6 +287,8 @@ pub struct SkillRuntimeDescriptor {
     pub canonical_tool_name: String,
     pub skill_slug: String,
     pub skill_name: String,
+    #[serde(default)]
+    pub skill_asset_root: String,
     pub skill_fingerprint: String,
     pub source_kind: SkillSourceKind,
     pub trust_level: SkillTrustLevel,
@@ -300,6 +302,8 @@ pub struct ReadSkillEntry {
     pub name: String,
     pub description: String,
     pub body: String,
+    #[serde(default)]
+    pub skill_asset_root: String,
     pub fingerprint: String,
     pub source_kind: String,
 }
@@ -517,6 +521,7 @@ pub fn build_skill_runtime_plan(
                 name: skill.definition.identity.display_name.clone(),
                 description: skill.definition.instructions.description.clone(),
                 body: skill.definition.instructions.body.clone(),
+                skill_asset_root: skill.definition.identity.skill_dir.clone(),
                 fingerprint: skill.definition.identity.fingerprint.clone(),
                 source_kind: skill
                     .definition
@@ -623,6 +628,7 @@ pub fn build_skill_runtime_plan(
                 canonical_tool_name,
                 skill_slug: skill.slug.clone(),
                 skill_name: skill.definition.identity.display_name.clone(),
+                skill_asset_root: skill.definition.identity.skill_dir.clone(),
                 skill_fingerprint: skill.definition.identity.fingerprint.clone(),
                 source_kind: skill.definition.identity.source_kind.clone(),
                 trust_level: skill.definition.runtime.trust_level.clone(),

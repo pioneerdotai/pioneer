@@ -37,6 +37,7 @@ pub enum SkillDynamicToolKind {
 pub struct SkillDynamicToolDescriptor {
     pub canonical_tool_name: String,
     pub skill_slug: String,
+    pub skill_asset_root: String,
     pub skill_fingerprint: String,
     pub source_kind: SkillSourceKind,
     pub trust_level: SkillTrustLevel,
@@ -54,6 +55,7 @@ pub struct SkillReadToolEntry {
     pub name: String,
     pub description: String,
     pub body: String,
+    pub skill_asset_root: String,
     pub fingerprint: String,
     pub source_kind: String,
 }
@@ -344,7 +346,7 @@ fn read_skill_spec() -> ConfiguredToolSpec {
     ConfiguredToolSpec::new(
         ToolSpec::new(
             READ_SKILL_TOOL_NAME,
-            "Read full instructions for an active skill by its exact qualified slug.",
+            "Read full instructions and skill_asset_root for an active skill by its exact qualified slug. Relative paths in the returned skill body resolve under skill_asset_root.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -464,6 +466,8 @@ impl ToolHandler for ReadSkillHandler {
                 "slug": entry.slug,
                 "name": entry.name,
                 "description": entry.description,
+                "skill_asset_root": entry.skill_asset_root,
+                "relative_path_resolution": "Resolve relative file paths mentioned by this skill under skill_asset_root. Prefer absolute paths built from skill_asset_root for commands and file operations.",
                 "body": body,
                 "truncated": truncated,
                 "fingerprint": entry.fingerprint,
@@ -472,6 +476,8 @@ impl ToolHandler for ReadSkillHandler {
         } else {
             serde_json::json!({
                 "slug": entry.slug,
+                "skill_asset_root": entry.skill_asset_root,
+                "relative_path_resolution": "Resolve relative file paths mentioned by this skill under skill_asset_root. Prefer absolute paths built from skill_asset_root for commands and file operations.",
                 "body": body,
                 "truncated": truncated
             })
@@ -619,13 +625,23 @@ impl ToolHandler for SkillShellToolHandler {
             command
                 .iter()
                 .filter_map(JsonValue::as_str)
-                .map(str::to_owned)
+                .map(|value| {
+                    expand_skill_asset_placeholders(
+                        value,
+                        self.descriptor.skill_asset_root.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>()
         } else if let Some(command) = config.get("command").and_then(JsonValue::as_array) {
             command
                 .iter()
                 .filter_map(JsonValue::as_str)
-                .map(str::to_owned)
+                .map(|value| {
+                    expand_skill_asset_placeholders(
+                        value,
+                        self.descriptor.skill_asset_root.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>()
         } else {
             return Err(ToolError::invalid_arguments(
@@ -706,6 +722,12 @@ impl ToolHandler for SkillShellToolHandler {
             payload,
         )))
     }
+}
+
+fn expand_skill_asset_placeholders(value: &str, skill_asset_root: &str) -> String {
+    value
+        .replace("${skill_asset_root}", skill_asset_root)
+        .replace("${skill_dir}", skill_asset_root)
 }
 
 struct SkillFunctionProxyHandler {
@@ -804,6 +826,7 @@ mod tests {
             name: name.to_owned(),
             description: "Skill description".to_owned(),
             body: "Skill body".to_owned(),
+            skill_asset_root: "/tmp/pioneer-skills/workspace/weather".to_owned(),
             fingerprint: "fingerprint".to_owned(),
             source_kind: "user".to_owned(),
         }
@@ -844,6 +867,7 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Do not pass the display name alone")
         );
+        assert!(spec.spec.description.contains("skill_asset_root"));
     }
 
     #[tokio::test]
@@ -868,6 +892,27 @@ mod tests {
 
         assert_eq!(output.raw_json()["slug"], "workspace/weather");
         assert_eq!(output.raw_json()["body"], "Skill body");
+        assert_eq!(
+            output.raw_json()["skill_asset_root"],
+            "/tmp/pioneer-skills/workspace/weather"
+        );
+        assert!(
+            output.raw_json()["relative_path_resolution"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("skill_asset_root")
+        );
+    }
+
+    #[test]
+    fn expands_skill_asset_placeholders() {
+        assert_eq!(
+            super::expand_skill_asset_placeholders(
+                "${skill_asset_root}/scripts/run.py:${skill_dir}/data",
+                "/tmp/skill-root",
+            ),
+            "/tmp/skill-root/scripts/run.py:/tmp/skill-root/data"
+        );
     }
 
     #[tokio::test]

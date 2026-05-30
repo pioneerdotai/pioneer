@@ -25,8 +25,11 @@ fn compact_skill_block(skill: &ResolvedSkill) -> String {
 
 fn full_skill_block(skill: &ResolvedSkill) -> String {
     format!(
-        "\n[Skill Body: ${}]\n{}\n",
-        skill.slug, skill.definition.instructions.body
+        "\nSkill asset root for ${}: `{}`\nResolve relative paths mentioned by this skill under Skill asset root. Prefer absolute paths built from Skill asset root for commands and file operations.\n[Skill Body: ${}]\n{}\n",
+        skill.slug,
+        skill.definition.identity.skill_dir,
+        skill.slug,
+        skill.definition.instructions.body
     )
 }
 
@@ -79,7 +82,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     }
 
     if text.len() < max_chars {
-        let footer = "\nWhen a skill is relevant, call `read_skill` with the exact `Skill slug for read_skill` value before executing specialized actions. Do not use the display name alone. Then follow its instructions";
+        let footer = "\nWhen a skill is relevant, call `read_skill` with the exact `Skill slug for read_skill` value before executing specialized actions. Do not use the display name alone. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Then follow its instructions";
         if text.len() + footer.len() <= max_chars {
             text.push_str(footer);
         }
@@ -250,6 +253,11 @@ mod tests {
                 .text
                 .contains("call `read_skill` with the exact `Skill slug for read_skill` value")
         );
+        assert!(
+            built
+                .text
+                .contains("`read_skill` returns `skill_asset_root`")
+        );
         assert!(!built.text.contains("Location:"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
     }
@@ -294,6 +302,16 @@ mod tests {
         );
 
         assert!(built.text.contains("[Skill Body: $workspace/weather]"));
+        assert!(
+            built
+                .text
+                .contains("Skill asset root for $workspace/weather: `/tmp/weather`")
+        );
+        assert!(
+            built
+                .text
+                .contains("Resolve relative paths mentioned by this skill under Skill asset root")
+        );
         assert!(built.text.contains("\nbody\n"));
     }
 }
