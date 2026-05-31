@@ -1797,16 +1797,25 @@ impl TaskEventPayload {
                 "run:{}:candidate:{}:review:{}",
                 review_event.run_id, review_event.candidate_id, review_event.id
             )),
-            Self::TaskResultCandidateAccepted { candidate, .. } => Some(format!(
-                "run:{}:candidate:{}:accepted",
+            Self::TaskResultCandidateAccepted {
+                candidate,
+                review_event_id,
+            } => Some(format!(
+                "run:{}:candidate:{}:accepted:{review_event_id}",
                 candidate.run_id, candidate.id
             )),
-            Self::TaskResultCandidateRejected { candidate, .. } => Some(format!(
-                "run:{}:candidate:{}:rejected",
+            Self::TaskResultCandidateRejected {
+                candidate,
+                review_event_id,
+            } => Some(format!(
+                "run:{}:candidate:{}:rejected:{review_event_id}",
                 candidate.run_id, candidate.id
             )),
-            Self::TaskResultCandidateCancelled { candidate, .. } => Some(format!(
-                "run:{}:candidate:{}:cancelled",
+            Self::TaskResultCandidateCancelled {
+                candidate,
+                review_event_id,
+            } => Some(format!(
+                "run:{}:candidate:{}:cancelled:{review_event_id}",
                 candidate.run_id, candidate.id
             )),
             Self::TaskRevisionRequested {

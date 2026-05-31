@@ -99,6 +99,18 @@ impl TaskExecutionHandle {
         .await
     }
 
+    pub async fn record_task_run_turn_completed(
+        &self,
+        task_run_turn: TaskRunTurn,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.append_and_publish(
+            vec![TaskEventPayload::TaskRunTurnCompleted { task_run_turn }],
+            event_timestamp_secs,
+        )
+        .await
+    }
+
     pub async fn record_auto_accepted_result_candidate(
         &self,
         task_run_turn: TaskRunTurn,

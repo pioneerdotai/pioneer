@@ -19,6 +19,7 @@ pub struct ReconciliationReport {
     pub queued_runs: usize,
     pub starting_runs: usize,
     pub running_runs: usize,
+    pub waiting_review_runs: usize,
     pub recovered_events: usize,
 }
 
@@ -61,6 +62,10 @@ impl TaskStartupReconciler {
             .store
             .list_task_runs_by_status(TaskRunStatus::Running, 1024)
             .await?;
+        let waiting_review_runs = self
+            .store
+            .list_task_runs_by_status(TaskRunStatus::WaitingReview, 1024)
+            .await?;
         let mut recovered_events = 0usize;
 
         for trigger in &active_triggers {
@@ -99,6 +104,7 @@ impl TaskStartupReconciler {
             .iter()
             .chain(starting_runs.iter())
             .chain(running_runs.iter())
+            .chain(waiting_review_runs.iter())
         {
             if self.recover_run(run, now).await? {
                 recovered_events = recovered_events.saturating_add(1);
@@ -111,6 +117,7 @@ impl TaskStartupReconciler {
             queued_runs: queued_runs.len(),
             starting_runs: starting_runs.len(),
             running_runs: running_runs.len(),
+            waiting_review_runs: waiting_review_runs.len(),
             recovered_events,
         })
     }
@@ -127,6 +134,7 @@ impl TaskStartupReconciler {
             TaskRunStatus::Starting | TaskRunStatus::Running => {
                 "in-flight run is recoverable after startup"
             }
+            TaskRunStatus::WaitingReview => "waiting-review run is recoverable after startup",
             _ => return Ok(false),
         };
         let mut emitted_recovery_event = false;
@@ -154,6 +162,35 @@ impl TaskStartupReconciler {
             emitted_recovery_event = true;
         }
         if run.status == TaskRunStatus::Queued {
+            return Ok(emitted_recovery_event);
+        }
+        if run.status == TaskRunStatus::WaitingReview {
+            let handle = TaskExecutionHandle::new(
+                self.store.clone(),
+                self.event_bus.clone(),
+                run.task_id.clone(),
+                run.id.clone(),
+            );
+            if let Err(error) = executor
+                .recover_run(
+                    TaskExecutionContext {
+                        workspace_id: task_response.task.workspace_id,
+                        task_id: run.task_id.clone(),
+                        execution_id: None,
+                        worker_id: format!("task-review-recovery-{}", generate_id(ID_LEN)),
+                    },
+                    run.clone(),
+                    handle,
+                )
+                .await
+            {
+                warn!(
+                    task_id = %run.task_id,
+                    run_id = %run.id,
+                    error = %format!("{error:#}"),
+                    "task executor waiting-review recovery failed"
+                );
+            }
             return Ok(emitted_recovery_event);
         }
 

@@ -9,15 +9,19 @@ use pioneer_protocol::{
     TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass,
     TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskRun, TaskRunExecution, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
-    TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-    ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
-    TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    TaskResultReviewerKind, TaskResultReviewerSpec, TaskRun, TaskRunExecution, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskThreadLineage, TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnCompletedNotification,
+    TurnFailedNotification, TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification,
+    TurnStatus, UserInput,
 };
 use pioneer_tasks::{
+    CreateTaskResultReviewerContextParams, RecordTaskResultReviewEventParams,
     TASK_EXECUTION_LEASE_SECONDS, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
-    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, WriteLockDecision,
+    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, TaskResultReviewActor,
+    WriteLockDecision, stable_review_thread_id, stable_review_turn_id,
+    task_result_reviewer_spec_key,
 };
 use std::collections::BTreeMap;
 use std::sync::{RwLock as StdRwLock, Weak};
@@ -67,6 +71,11 @@ impl TaskAgentExecutor {
         }
         let agent_spec = select_agent_spec(&task_response, run.id.as_str())
             .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", run.task_id))?;
+        if run.status == TaskRunStatus::WaitingReview {
+            return self
+                .recover_waiting_review_run(&processor, &task_response, &run, &agent_spec)
+                .await;
+        }
         let Some(execution) = self
             .load_or_reserve_execution(&processor, &context, &run)
             .await?
@@ -146,6 +155,50 @@ impl TaskAgentExecutor {
             .await
             .context("failed to claim task run execution")?;
         Ok(claimed)
+    }
+
+    async fn recover_waiting_review_run(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+        run: &TaskRun,
+        agent_spec: &TaskAgentSpec,
+    ) -> Result<TaskExecutorStartOutcome> {
+        let Some(review_policy) = agent_spec
+            .review_policy
+            .as_ref()
+            .filter(|policy| policy.is_enabled())
+        else {
+            return Ok(TaskExecutorStartOutcome::Queued);
+        };
+        let mut candidates = processor
+            .crud_store
+            .list_task_result_candidates(run.id.as_str())
+            .await?;
+        candidates.retain(|candidate| {
+            matches!(
+                candidate.status,
+                TaskResultCandidateStatus::PendingReview
+                    | TaskResultCandidateStatus::ExtractionFailed
+            )
+        });
+        candidates.sort_by(|left, right| {
+            right
+                .round
+                .cmp(&left.round)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+        });
+        if let Some(candidate) = candidates.first() {
+            self.start_reviewer_turns_for_candidate(
+                processor,
+                task_response,
+                agent_spec,
+                review_policy,
+                candidate,
+            )
+            .await?;
+        }
+        Ok(TaskExecutorStartOutcome::Started)
     }
 
     async fn start_new_child_turn(
@@ -666,6 +719,23 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.task_id.clone(),
             child_runtime.task_run_turn.run_id.clone(),
         );
+        if child_runtime.task_run_turn.kind == TaskRunTurnKind::Review {
+            let failed_at = now_timestamp_secs();
+            record_task_run_turn_failure(
+                &handle,
+                &child_runtime.task_run_turn,
+                TaskRunTurnStatus::Failed,
+                Some(task_error(
+                    "reviewer_turn_failed",
+                    error_message.to_owned(),
+                    TaskErrorClass::Unknown,
+                    Some(child_runtime.task_run_turn.run_id.clone()),
+                )),
+                failed_at,
+            )
+            .await?;
+            return Ok(true);
+        }
         let target_status = processor
             .crud_store
             .get_turn(thread_id, turn_id)
@@ -683,6 +753,11 @@ impl TaskAgentExecutor {
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        if child_runtime.task_run_turn.kind == TaskRunTurnKind::Review {
+            self.complete_reviewer_turn(processor, child_runtime, handle)
+                .await?;
+            return Ok(());
+        }
         let task_response = processor
             .crud_store
             .get_task(child_runtime.task_run_turn.task_id.as_str())
@@ -780,9 +855,18 @@ impl TaskAgentExecutor {
                     }
                     None => pending_review_result_candidate(&completed_turn, result, completed_at),
                 };
+                let candidate_for_review = candidate.clone();
                 handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
                     .await?;
+                self.start_reviewer_turns_for_candidate(
+                    processor,
+                    &task_response,
+                    &agent_spec,
+                    review_policy,
+                    &candidate_for_review,
+                )
+                .await?;
             }
             Ok(result) => {
                 let completed_at = now_timestamp_secs();
@@ -812,9 +896,19 @@ impl TaskAgentExecutor {
                     candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
                 let candidate =
                     extraction_failed_result_candidate(&completed_turn, error, completed_at);
+                let candidate_for_review = candidate.clone();
                 handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
                     .await?;
+                let review_policy = review_policy.as_ref().expect("review policy checked");
+                self.start_reviewer_turns_for_candidate(
+                    processor,
+                    &task_response,
+                    &agent_spec,
+                    review_policy,
+                    &candidate_for_review,
+                )
+                .await?;
             }
             Err(error) => {
                 let failed_at = now_timestamp_secs();
@@ -835,6 +929,341 @@ impl TaskAgentExecutor {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn start_reviewer_turns_for_candidate(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+        agent_spec: &TaskAgentSpec,
+        review_policy: &TaskAgentReviewPolicy,
+        candidate: &TaskResultCandidate,
+    ) -> Result<()> {
+        if review_policy.reviewers.is_empty() {
+            return Ok(());
+        }
+        for (index, reviewer_spec) in review_policy.reviewers.iter().enumerate() {
+            if reviewer_spec.reviewer_kind != TaskResultReviewerKind::ReviewAgent {
+                continue;
+            }
+            let reviewer_key = task_result_reviewer_spec_key(index, reviewer_spec);
+            let reviewer_thread_id =
+                stable_review_thread_id(candidate.id.as_str(), reviewer_key.as_str());
+            let reviewer_turn_id =
+                stable_review_turn_id(candidate.id.as_str(), reviewer_key.as_str());
+            let reviewer_context = processor
+                .task_runtime
+                .service()
+                .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+                    candidate_id: candidate.id.clone(),
+                    reviewer_index: index,
+                    reviewer_spec: reviewer_spec.clone(),
+                    reviewer_thread_id,
+                    reviewer_turn_id,
+                    created_at: Some(now_timestamp_secs()),
+                })
+                .await?;
+            self.dispatch_or_recover_reviewer_turn(
+                processor,
+                task_response,
+                agent_spec,
+                review_policy,
+                candidate,
+                index,
+                reviewer_spec,
+                reviewer_context.task_run_turn,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn dispatch_or_recover_reviewer_turn(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+        agent_spec: &TaskAgentSpec,
+        review_policy: &TaskAgentReviewPolicy,
+        candidate: &TaskResultCandidate,
+        reviewer_index: usize,
+        reviewer_spec: &TaskResultReviewerSpec,
+        task_run_turn: TaskRunTurn,
+    ) -> Result<()> {
+        if self
+            .review_event_exists_for_turn(candidate.id.as_str(), task_run_turn.turn_id.as_str())
+            .await?
+        {
+            return Ok(());
+        }
+        if let Some((_, turn)) = processor
+            .crud_store
+            .get_turn(
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+            )
+            .await?
+        {
+            match turn.status {
+                TurnStatus::Completed => {
+                    let handle = TaskExecutionHandle::new(
+                        processor.crud_store.clone(),
+                        processor.task_runtime.event_bus(),
+                        task_run_turn.task_id.clone(),
+                        task_run_turn.run_id.clone(),
+                    );
+                    self.complete_reviewer_turn(
+                        processor,
+                        TaskRunChildRuntime {
+                            lineage: processor
+                                .crud_store
+                                .get_task_thread_lineage(task_run_turn.thread_id.as_str())
+                                .await?
+                                .unwrap_or_else(|| {
+                                    fallback_lineage_for_task_run_turn(&task_run_turn)
+                                }),
+                            task_run_turn,
+                        },
+                        handle,
+                    )
+                    .await?;
+                }
+                TurnStatus::InProgress => {}
+                TurnStatus::Failed | TurnStatus::Interrupted => {}
+            }
+            return Ok(());
+        }
+
+        let task = &task_response.task;
+        let effective_model = effective_agent_model(agent_spec)?;
+        let thread_params = pioneer_protocol::ThreadStartParams {
+            thread_id: task_run_turn.thread_id.clone(),
+            workspace_id: task.workspace_id.clone(),
+            name: Some(reviewer_thread_name(task, reviewer_spec)),
+            model: Some(effective_model.model.clone()),
+            model_provider: Some(effective_model.model_provider.clone()),
+            sandbox: Some(SandboxMode::FullAccess),
+            mode: Some(ThreadMode::Agent),
+            origin_kind: Some(ThreadOriginKind::TaskRun),
+            sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+            agent_nickname: reviewer_spec.agent_nickname.clone(),
+            agent_role: reviewer_spec.agent_role.clone(),
+        };
+        let thread_outcome = processor
+            .thread_manager
+            .system_thread_start_seeded(task.workspace_id.clone(), thread_params, None, None)
+            .await
+            .context("failed to create hidden reviewer thread")?;
+        let reviewer_key = task_result_reviewer_spec_key(reviewer_index, reviewer_spec);
+        let prompt = materialize_reviewer_prompt(
+            task_response,
+            agent_spec,
+            review_policy,
+            candidate,
+            reviewer_spec,
+            reviewer_key.as_str(),
+        );
+        let input = vec![UserInput::Text {
+            text: prompt,
+            text_elements: Vec::new(),
+        }];
+        let turn_outcome = processor
+            .thread_manager
+            .system_turn_start(TurnStartParams {
+                thread_id: task_run_turn.thread_id.clone(),
+                turn_id: task_run_turn.turn_id.clone(),
+                input,
+                capabilities: Vec::new(),
+                model: Some(effective_model.model),
+                model_provider: Some(effective_model.model_provider),
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+            })
+            .await
+            .context("failed to create hidden reviewer turn")?;
+
+        if let Err(error) = processor
+            .validate_artifact_user_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to validate hidden reviewer input");
+        }
+        if let Err(error) = processor
+            .crud_store
+            .materialize_turn_start(
+                &turn_outcome.materialization.thread,
+                turn_outcome.materialization.sandbox_mode,
+                &turn_outcome.materialization.turn,
+                &turn_outcome.materialization.input,
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to persist hidden reviewer turn");
+        }
+
+        processor.ensure_hook_runtime_with_run_store().await;
+        processor
+            .agent_manager
+            .ensure_thread(task_run_turn.thread_id.as_str(), task.workspace_id.as_str())
+            .await
+            .map_err(|error| anyhow!("failed to prepare reviewer agent runtime: {error}"))?;
+        let workspace_skill_policies =
+            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let resolved_artifacts = processor
+            .resolve_provider_artifact_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+            .context("failed to resolve reviewer artifact input for provider")?;
+        let runtime_environment = processor
+            .create_artifact_output_environment(
+                task.workspace_id.as_str(),
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+            )
+            .await
+            .context("failed to prepare reviewer artifact output directory")?
+            .into_iter()
+            .collect();
+        if let Err(error) = processor
+            .agent_manager
+            .start_turn_with_hook_context(
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                ThreadMode::Agent,
+                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                workspace_skill_policies,
+                turn_outcome.materialization.input,
+                turn_outcome.materialization.capabilities,
+                resolved_artifacts,
+                runtime_environment,
+                Vec::new(),
+            )
+            .await
+        {
+            processor
+                .mark_turn_failed(
+                    task_run_turn.thread_id,
+                    task_run_turn.turn_id,
+                    format!("failed to dispatch reviewer task turn: {error}"),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn complete_reviewer_turn(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        reviewer_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
+        let Some(candidate_id) = reviewer_runtime.task_run_turn.reviews_candidate_id.clone() else {
+            return Ok(());
+        };
+        if self
+            .review_event_exists_for_turn(
+                candidate_id.as_str(),
+                reviewer_runtime.task_run_turn.turn_id.as_str(),
+            )
+            .await?
+        {
+            self.mark_reviewer_turn_recorded(handle, reviewer_runtime.task_run_turn)
+                .await?;
+            return Ok(());
+        }
+        let Some(candidate) = processor
+            .crud_store
+            .get_task_result_candidate(candidate_id.as_str())
+            .await?
+        else {
+            return Ok(());
+        };
+        let task_response = processor
+            .crud_store
+            .get_task(candidate.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
+        let agent_spec = select_agent_spec(&task_response, candidate.run_id.as_str())
+            .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", task_response.task.id))?;
+        let reviewer_key = reviewer_key_for_turn(
+            agent_spec.review_policy.as_ref(),
+            &candidate,
+            &reviewer_runtime.task_run_turn,
+        );
+        let advisory =
+            extract_reviewer_advisory(processor, reviewer_runtime.task_run_turn.turn_id.as_str())
+                .await?;
+        processor
+            .task_runtime
+            .service()
+            .record_task_result_review_event(RecordTaskResultReviewEventParams {
+                candidate_id: candidate.id,
+                review_event_id: Some(format!("trre_{}", reviewer_runtime.task_run_turn.turn_id)),
+                actor: TaskResultReviewActor {
+                    reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+                    reviewer_thread_id: Some(reviewer_runtime.task_run_turn.thread_id.clone()),
+                    reviewer_turn_id: Some(reviewer_runtime.task_run_turn.turn_id.clone()),
+                    reviewer_user_id: None,
+                    reviewer_agent_spec_id: reviewer_key,
+                },
+                event_kind: TaskResultReviewEventKind::Advisory,
+                decision: advisory.decision,
+                feedback_text: advisory.feedback_text,
+                feedback: advisory.feedback,
+                confidence: advisory.confidence,
+                supersedes_review_event_id: None,
+                next_task_run_turn_id: None,
+                created_at: Some(now_timestamp_secs()),
+            })
+            .await?;
+        self.mark_reviewer_turn_recorded(handle, reviewer_runtime.task_run_turn)
+            .await?;
+        Ok(())
+    }
+
+    async fn review_event_exists_for_turn(
+        &self,
+        candidate_id: &str,
+        turn_id: &str,
+    ) -> Result<bool> {
+        let processor = self.processor()?;
+        Ok(processor
+            .crud_store
+            .list_task_result_review_events(candidate_id)
+            .await?
+            .iter()
+            .any(|event| event.reviewer_turn_id.as_deref() == Some(turn_id)))
+    }
+
+    async fn mark_reviewer_turn_recorded(
+        &self,
+        handle: TaskExecutionHandle,
+        mut task_run_turn: TaskRunTurn,
+    ) -> Result<()> {
+        if task_run_turn.status == TaskRunTurnStatus::ReviewRecorded {
+            return Ok(());
+        }
+        let completed_at = now_timestamp_secs();
+        task_run_turn.status = TaskRunTurnStatus::ReviewRecorded;
+        task_run_turn.completed_at = Some(completed_at);
+        handle
+            .record_task_run_turn_completed(task_run_turn, completed_at)
+            .await?;
         Ok(())
     }
 
@@ -916,8 +1345,10 @@ impl TaskExecutor for TaskAgentExecutor {
                 cancelled_at,
             )
             .await?;
-            mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, reason)
-                .await?;
+            if child_runtime.task_run_turn.kind != TaskRunTurnKind::Review {
+                mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, reason)
+                    .await?;
+            }
         }
         if let Some(execution) = processor.crud_store.load_execution_for_run(run_id).await?
             && !execution.status.is_terminal()
@@ -1304,8 +1735,11 @@ async fn load_child_runtime_for_run(
 ) -> Result<Option<TaskRunChildRuntime>> {
     let Some(task_run_turn) = processor
         .crud_store
-        .get_latest_task_run_turn(run_id)
+        .list_task_run_turns(run_id)
         .await?
+        .into_iter()
+        .rev()
+        .find(|turn| turn.kind != TaskRunTurnKind::Review)
     else {
         return Ok(None);
     };
@@ -1347,10 +1781,11 @@ async fn load_child_runtime_from_task_run_turn(
     processor: &Arc<MessageProcessor>,
     task_run_turn: TaskRunTurn,
 ) -> Result<TaskRunChildRuntime> {
-    if let Some(binding) = processor
-        .crud_store
-        .get_task_run_primary_thread_binding(task_run_turn.run_id.as_str())
-        .await?
+    if task_run_turn.kind != TaskRunTurnKind::Review
+        && let Some(binding) = processor
+            .crud_store
+            .get_task_run_primary_thread_binding(task_run_turn.run_id.as_str())
+            .await?
         && binding.thread_id != task_run_turn.thread_id
     {
         bail!(
@@ -1825,6 +2260,203 @@ fn materialize_child_task_input(prompt: String, agent_spec: &TaskAgentSpec) -> V
     }];
     input.extend(task_artifacts::task_agent_artifact_user_inputs(agent_spec));
     input
+}
+
+fn materialize_reviewer_prompt(
+    task_response: &TaskGetResponse,
+    agent_spec: &TaskAgentSpec,
+    review_policy: &TaskAgentReviewPolicy,
+    candidate: &TaskResultCandidate,
+    reviewer_spec: &TaskResultReviewerSpec,
+    reviewer_key: &str,
+) -> String {
+    let result_json = candidate
+        .result
+        .as_ref()
+        .and_then(|result| serde_json::to_string_pretty(result).ok())
+        .unwrap_or_else(|| "null".to_owned());
+    let extraction_error_json = candidate
+        .extraction_error
+        .as_ref()
+        .and_then(|error| serde_json::to_string_pretty(error).ok())
+        .unwrap_or_else(|| "null".to_owned());
+    let reviewer_role = reviewer_spec
+        .agent_role
+        .as_deref()
+        .or(reviewer_spec.agent_nickname.as_deref())
+        .unwrap_or("reviewer");
+    format!(
+        r#"You are reviewing a child agent result for a task.
+
+Task title:
+{title}
+
+Task goal:
+{goal}
+
+Original child-agent instructions:
+{instructions}
+
+Review policy:
+- strategy: {strategy:?}
+- max revision rounds: {max_revision_rounds}
+- reviewer key: {reviewer_key}
+- reviewer role: {reviewer_role}
+- required reviewer: {required}
+
+Candidate:
+- id: {candidate_id}
+- round: {round}
+- status: {status:?}
+- summary: {summary}
+
+Candidate result JSON:
+{result_json}
+
+Candidate extraction error JSON:
+{extraction_error_json}
+
+Return only one JSON object:
+{{
+  "decision": "accept" | "request_changes" | "reject" | "abstain",
+  "feedback": "short actionable feedback",
+  "confidence": 0.0
+}}
+"#,
+        title = task_response.task.title,
+        goal = task_response.task.goal,
+        instructions = agent_spec.prompt.instructions.join("\n"),
+        strategy = review_policy.resolution_strategy,
+        max_revision_rounds = review_policy.max_revision_rounds,
+        required = reviewer_spec.required,
+        candidate_id = candidate.id,
+        round = candidate.round,
+        status = candidate.status,
+        summary = candidate.summary.as_deref().unwrap_or(""),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ReviewerAdvisory {
+    decision: TaskResultReviewDecision,
+    feedback_text: Option<String>,
+    feedback: Option<TaskValue>,
+    confidence: Option<f64>,
+}
+
+async fn extract_reviewer_advisory(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+) -> Result<ReviewerAdvisory> {
+    let messages = processor
+        .crud_store
+        .list_completed_agent_messages(turn_id)
+        .await?;
+    let final_text = messages.into_iter().rev().find_map(|item| match item {
+        TurnItem::AgentMessage { text, .. } => Some(text),
+        _ => None,
+    });
+    Ok(match final_text {
+        Some(text) => parse_reviewer_advisory_text(text.as_str()),
+        None => ReviewerAdvisory {
+            decision: TaskResultReviewDecision::Abstain,
+            feedback_text: Some("reviewer turn completed without a final agent message".to_owned()),
+            feedback: None,
+            confidence: None,
+        },
+    })
+}
+
+fn parse_reviewer_advisory_text(raw: &str) -> ReviewerAdvisory {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .or_else(|| extract_json_object(raw).and_then(|json| serde_json::from_str(&json).ok()));
+    let Some(value) = parsed else {
+        return ReviewerAdvisory {
+            decision: fallback_review_decision(raw),
+            feedback_text: Some(raw.trim().to_owned()).filter(|text| !text.is_empty()),
+            feedback: None,
+            confidence: None,
+        };
+    };
+    let decision = value
+        .get("decision")
+        .and_then(|value| value.as_str())
+        .and_then(parse_review_decision)
+        .unwrap_or(TaskResultReviewDecision::Abstain);
+    let feedback_text = value
+        .get("feedback")
+        .or_else(|| value.get("feedbackText"))
+        .or_else(|| value.get("reason"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let confidence = value.get("confidence").and_then(|value| value.as_f64());
+    ReviewerAdvisory {
+        decision,
+        feedback_text,
+        feedback: Some(task_value_from_json(value)),
+        confidence,
+    }
+}
+
+fn extract_json_object(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end >= start).then(|| raw[start..=end].to_owned())
+}
+
+fn parse_review_decision(value: &str) -> Option<TaskResultReviewDecision> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "accept" | "accepted" | "approve" | "approved" => Some(TaskResultReviewDecision::Accept),
+        "request_changes" | "request changes" | "revise" | "needs_changes" => {
+            Some(TaskResultReviewDecision::RequestChanges)
+        }
+        "reject" | "rejected" => Some(TaskResultReviewDecision::Reject),
+        "cancel" | "cancelled" | "canceled" => Some(TaskResultReviewDecision::Cancel),
+        "abstain" | "unknown" => Some(TaskResultReviewDecision::Abstain),
+        _ => None,
+    }
+}
+
+fn fallback_review_decision(raw: &str) -> TaskResultReviewDecision {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("request changes")
+        || lower.contains("needs changes")
+        || lower.contains("revise")
+    {
+        TaskResultReviewDecision::RequestChanges
+    } else if lower.contains("reject") {
+        TaskResultReviewDecision::Reject
+    } else if lower.contains("accept") || lower.contains("approve") {
+        TaskResultReviewDecision::Accept
+    } else {
+        TaskResultReviewDecision::Abstain
+    }
+}
+
+fn reviewer_key_for_turn(
+    review_policy: Option<&TaskAgentReviewPolicy>,
+    candidate: &TaskResultCandidate,
+    task_run_turn: &TaskRunTurn,
+) -> Option<String> {
+    let review_policy = review_policy?;
+    review_policy
+        .reviewers
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| task_result_reviewer_spec_key(index, spec))
+        .find(|key| {
+            stable_review_thread_id(candidate.id.as_str(), key.as_str()) == task_run_turn.thread_id
+        })
+}
+
+fn reviewer_thread_name(task: &Task, reviewer_spec: &TaskResultReviewerSpec) -> String {
+    let reviewer = reviewer_spec
+        .agent_nickname
+        .as_deref()
+        .or(reviewer_spec.agent_role.as_deref())
+        .unwrap_or("Reviewer");
+    format!("{reviewer}: {}", task.title)
 }
 
 fn find_task_run_trigger<'a>(
@@ -3084,6 +3716,32 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_id.as_deref(), Some("artifact"));
         assert_eq!(artifacts[0].version_id.as_deref(), Some("version"));
+    }
+
+    #[test]
+    fn reviewer_advisory_parser_reads_json_decision_feedback_and_confidence() {
+        let advisory = parse_reviewer_advisory_text(
+            r#"{"decision":"request_changes","feedback":"tighten the summary","confidence":0.8}"#,
+        );
+
+        assert_eq!(advisory.decision, TaskResultReviewDecision::RequestChanges);
+        assert_eq!(
+            advisory.feedback_text.as_deref(),
+            Some("tighten the summary")
+        );
+        assert_eq!(advisory.confidence, Some(0.8));
+        assert!(matches!(advisory.feedback, Some(TaskValue::Object(_))));
+    }
+
+    #[test]
+    fn reviewer_advisory_parser_falls_back_to_text_decision() {
+        let advisory = parse_reviewer_advisory_text("I would accept this result.");
+
+        assert_eq!(advisory.decision, TaskResultReviewDecision::Accept);
+        assert_eq!(
+            advisory.feedback_text.as_deref(),
+            Some("I would accept this result.")
+        );
     }
 
     #[tokio::test]

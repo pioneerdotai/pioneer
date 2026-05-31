@@ -1,21 +1,24 @@
 use crate::{
-    TaskCreateContext, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
-    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, TaskMutationContext,
-    TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig, TaskRuntimeResult, TaskWaitContext,
-    WriteLockDecision,
+    CreateTaskResultReviewerContextParams, RecordTaskResultReviewEventParams,
+    RecordUserTaskResultReviewEventParams, TaskCreateContext, TaskExecutionContext,
+    TaskExecutionHandle, TaskExecutor, TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome,
+    TaskMutationContext, TaskResultReviewActor, TaskReviewRuntimeConfig, TaskRuntime,
+    TaskRuntimeConfig, TaskRuntimeResult, TaskWaitContext, WriteLockDecision,
 };
 use async_trait::async_trait;
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{CrudStore, TaskEventAppendStatus};
 use pioneer_protocol::{
-    TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentReviewPolicy,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
-    TaskCancelParams, TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams,
-    TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus,
-    TaskDetachParams, TaskError, TaskErrorClass, TaskEventPayload, TaskEventsParams,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
-    TaskPauseParams, TaskRescheduleParams, TaskRescheduleReason, TaskResult, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
+    TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentReviewMode,
+    TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
+    TaskAttachmentMode, TaskCancelParams, TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy,
+    TaskCreateParams, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskDetachParams, TaskError, TaskErrorClass, TaskEventPayload,
+    TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskRescheduleReason,
+    TaskResult, TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+    TaskResultReviewEventKind, TaskResultReviewResolutionStrategy, TaskResultReviewerKind,
+    TaskResultReviewerSpec, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
     TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
     TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
@@ -479,12 +482,25 @@ async fn create_waiting_review_agent_task(
     candidate_round: u32,
     candidate_status: TaskResultCandidateStatus,
 ) -> (String, String, String) {
+    create_waiting_review_agent_task_with_policy(
+        runtime,
+        TaskAgentReviewPolicy::parent_agent_default(max_revision_rounds),
+        candidate_round,
+        candidate_status,
+    )
+    .await
+}
+
+async fn create_waiting_review_agent_task_with_policy(
+    runtime: &TaskRuntime,
+    review_policy: TaskAgentReviewPolicy,
+    candidate_round: u32,
+    candidate_status: TaskResultCandidateStatus,
+) -> (String, String, String) {
     let mut params = create_params(TaskTriggerSpec::Immediate);
     params.executor_kind = TaskExecutorKind::Agent;
     let mut spec = agent_spec(3);
-    spec.review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(
-        max_revision_rounds,
-    ));
+    spec.review_policy = Some(review_policy);
     params.agent_spec = Some(spec);
 
     let response = runtime
@@ -597,6 +613,453 @@ async fn create_waiting_review_agent_task(
         .await
         .expect("pending review candidate should record");
     (response.task.id, run.id, candidate_id)
+}
+
+#[tokio::test]
+async fn review_event_advisory_keeps_candidate_pending() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let recorded = runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id: candidate_id.clone(),
+            review_event_id: Some("review_advisory_pending".to_owned()),
+            actor: TaskResultReviewActor {
+                reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+                reviewer_thread_id: Some("reviewer_thread_pending".to_owned()),
+                reviewer_turn_id: Some("reviewer_turn_pending".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: Some("reviewer_spec_pending".to_owned()),
+            },
+            event_kind: TaskResultReviewEventKind::Advisory,
+            decision: TaskResultReviewDecision::RequestChanges,
+            feedback_text: Some("needs edits".to_owned()),
+            feedback: None,
+            confidence: Some(0.75),
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_000),
+        })
+        .await
+        .expect("advisory review event should record");
+
+    assert_eq!(
+        recorded.candidate.status,
+        TaskResultCandidateStatus::PendingReview
+    );
+    assert!(recorded.candidate.final_review_event_id.is_none());
+    assert!(recorded.resolution.is_none());
+    let events = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].decision, TaskResultReviewDecision::RequestChanges);
+    assert!(
+        runtime
+            .service()
+            .store()
+            .get_pending_task_result_candidate(run_id.as_str())
+            .await
+            .expect("pending candidate should query")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn review_event_decision_accept_resolves_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let recorded = runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id: candidate_id.clone(),
+            review_event_id: Some("review_parent_accept".to_owned()),
+            actor: TaskResultReviewActor {
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("parent_thread_accept".to_owned()),
+                reviewer_turn_id: Some("parent_turn_accept".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+            },
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: None,
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_001),
+        })
+        .await
+        .expect("parent accept should record");
+
+    assert_eq!(
+        recorded.candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert_eq!(
+        recorded.candidate.final_review_event_id.as_deref(),
+        Some("review_parent_accept")
+    );
+    assert!(recorded.candidate.resolved_at.is_some());
+}
+
+#[tokio::test]
+async fn review_event_decision_request_changes_rejects_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let recorded = runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id,
+            review_event_id: Some("review_parent_request_changes".to_owned()),
+            actor: TaskResultReviewActor {
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("parent_thread_request".to_owned()),
+                reviewer_turn_id: Some("parent_turn_request".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+            },
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::RequestChanges,
+            feedback_text: Some("redo this".to_owned()),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_002),
+        })
+        .await
+        .expect("parent request changes should record");
+
+    assert_eq!(
+        recorded.candidate.status,
+        TaskResultCandidateStatus::Rejected
+    );
+    assert_eq!(
+        recorded.candidate.final_review_event_id.as_deref(),
+        Some("review_parent_request_changes")
+    );
+}
+
+#[tokio::test]
+async fn review_event_cancel_resolves_candidate_cancelled() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let recorded = runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id,
+            review_event_id: Some("review_system_cancel".to_owned()),
+            actor: TaskResultReviewActor::system(),
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::Cancel,
+            feedback_text: Some("cancelled by test".to_owned()),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_003),
+        })
+        .await
+        .expect("system cancel should record");
+
+    assert_eq!(
+        recorded.candidate.status,
+        TaskResultCandidateStatus::Cancelled
+    );
+    assert_eq!(
+        recorded.candidate.final_review_event_id.as_deref(),
+        Some("review_system_cancel")
+    );
+}
+
+#[tokio::test]
+async fn review_event_override_updates_final_pointer_without_losing_history() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id: candidate_id.clone(),
+            review_event_id: Some("review_parent_reject_before_override".to_owned()),
+            actor: TaskResultReviewActor {
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("parent_thread_override".to_owned()),
+                reviewer_turn_id: Some("parent_turn_override_1".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+            },
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::Reject,
+            feedback_text: Some("reject first".to_owned()),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_004),
+        })
+        .await
+        .expect("initial reject should record");
+
+    let overridden = runtime
+        .service()
+        .record_task_result_review_event(RecordTaskResultReviewEventParams {
+            candidate_id: candidate_id.clone(),
+            review_event_id: Some("review_parent_override_accept".to_owned()),
+            actor: TaskResultReviewActor {
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("parent_thread_override".to_owned()),
+                reviewer_turn_id: Some("parent_turn_override_2".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+            },
+            event_kind: TaskResultReviewEventKind::Override,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: Some("accept after dispute".to_owned()),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: Some(10_005),
+        })
+        .await
+        .expect("override accept should record");
+
+    assert_eq!(
+        overridden.candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert_eq!(
+        overridden.candidate.final_review_event_id.as_deref(),
+        Some("review_parent_override_accept")
+    );
+    let events = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1].supersedes_review_event_id.as_deref(),
+        Some("review_parent_reject_before_override")
+    );
+}
+
+#[tokio::test]
+async fn reviewer_contexts_allow_multiple_review_turns_for_one_candidate_round() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let reviewer_spec = TaskResultReviewerSpec {
+        reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+        agent_nickname: Some("reviewer".to_owned()),
+        agent_role: Some("review".to_owned()),
+        required: true,
+        weight: None,
+    };
+
+    let first = runtime
+        .service()
+        .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+            candidate_id: candidate_id.clone(),
+            reviewer_index: 0,
+            reviewer_spec: reviewer_spec.clone(),
+            reviewer_thread_id: "reviewer_thread_one".to_owned(),
+            reviewer_turn_id: "reviewer_turn_one".to_owned(),
+            created_at: Some(20_000),
+        })
+        .await
+        .expect("first reviewer context should create");
+    let second = runtime
+        .service()
+        .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+            candidate_id: candidate_id.clone(),
+            reviewer_index: 1,
+            reviewer_spec,
+            reviewer_thread_id: "reviewer_thread_two".to_owned(),
+            reviewer_turn_id: "reviewer_turn_two".to_owned(),
+            created_at: Some(20_001),
+        })
+        .await
+        .expect("second reviewer context should create");
+
+    assert!(first.created);
+    assert!(second.created);
+    assert_eq!(
+        first.binding.binding_kind,
+        TaskRunThreadBindingKind::Reviewer
+    );
+    assert_eq!(
+        second.binding.binding_kind,
+        TaskRunThreadBindingKind::Reviewer
+    );
+    assert_eq!(first.task_run_turn.kind, TaskRunTurnKind::Review);
+    assert_eq!(second.task_run_turn.kind, TaskRunTurnKind::Review);
+    assert_eq!(first.task_run_turn.round, 0);
+    assert_eq!(second.task_run_turn.round, 0);
+    assert_eq!(
+        first.task_run_turn.reviews_candidate_id.as_deref(),
+        Some(candidate_id.as_str())
+    );
+    assert_eq!(
+        second.task_run_turn.reviews_candidate_id.as_deref(),
+        Some(candidate_id.as_str())
+    );
+    assert!(second.task_run_turn.sequence > first.task_run_turn.sequence);
+
+    let turns = runtime
+        .service()
+        .store()
+        .list_task_run_turns(run_id.as_str())
+        .await
+        .expect("turns should list");
+    assert_eq!(
+        turns
+            .iter()
+            .filter(|turn| turn.kind == TaskRunTurnKind::Review)
+            .count(),
+        2
+    );
+    assert!(
+        runtime
+            .service()
+            .store()
+            .get_task_result_candidate_by_turn(first.task_run_turn.id.as_str())
+            .await
+            .expect("candidate lookup should succeed")
+            .is_none(),
+        "review turns must not produce task result candidates"
+    );
+
+    let first_again = runtime
+        .service()
+        .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+            candidate_id,
+            reviewer_index: 0,
+            reviewer_spec: TaskResultReviewerSpec {
+                reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+                agent_nickname: Some("reviewer".to_owned()),
+                agent_role: Some("review".to_owned()),
+                required: true,
+                weight: None,
+            },
+            reviewer_thread_id: "reviewer_thread_one".to_owned(),
+            reviewer_turn_id: "reviewer_turn_one".to_owned(),
+            created_at: Some(20_010),
+        })
+        .await
+        .expect("existing reviewer context should reload");
+    assert!(!first_again.created);
+    assert_eq!(first_again.task_run_turn.id, first.task_run_turn.id);
+}
+
+#[tokio::test]
+async fn user_review_event_resolves_when_policy_is_user_final() {
+    let runtime = runtime_with_review_config().await;
+    let policy = TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 1,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    };
+    let (_task_id, _run_id, candidate_id) = create_waiting_review_agent_task_with_policy(
+        &runtime,
+        policy,
+        0,
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let recorded = runtime
+        .service()
+        .record_user_task_result_review_event(
+            TaskMutationContext {
+                actor_id: Some("user_1".to_owned()),
+            },
+            RecordUserTaskResultReviewEventParams {
+                candidate_id,
+                review_event_id: Some("review_user_accept".to_owned()),
+                decision: TaskResultReviewDecision::Accept,
+                feedback_text: Some("approved".to_owned()),
+                feedback: None,
+                confidence: None,
+                next_task_run_turn_id: None,
+                created_at: Some(30_000),
+            },
+        )
+        .await
+        .expect("user final review should record");
+
+    assert_eq!(
+        recorded.review_event.reviewer_kind,
+        TaskResultReviewerKind::User
+    );
+    assert_eq!(
+        recorded.review_event.reviewer_user_id.as_deref(),
+        Some("user_1")
+    );
+    assert_eq!(
+        recorded.candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert_eq!(
+        recorded.candidate.final_review_event_id.as_deref(),
+        Some("review_user_accept")
+    );
+}
+
+#[tokio::test]
+async fn user_review_event_is_blocked_when_policy_is_parent_final() {
+    let runtime = runtime_with_review_config().await;
+    let (_task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let error = runtime
+        .service()
+        .record_user_task_result_review_event(
+            TaskMutationContext {
+                actor_id: Some("user_1".to_owned()),
+            },
+            RecordUserTaskResultReviewEventParams {
+                candidate_id,
+                review_event_id: Some("review_user_blocked".to_owned()),
+                decision: TaskResultReviewDecision::Accept,
+                feedback_text: None,
+                feedback: None,
+                confidence: None,
+                next_task_run_turn_id: None,
+                created_at: Some(30_001),
+            },
+        )
+        .await
+        .expect_err("user final review should be blocked by parent-final policy");
+    assert!(
+        format!("{error:#}").contains("user final review is not allowed"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]
