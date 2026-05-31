@@ -28,8 +28,9 @@ use pioneer_protocol::{
     TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams,
     TaskTreeResponse, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams,
     TaskUpdateResponse, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem,
-    TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWriteLock,
-    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
+    TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction,
+    TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict,
+    TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use std::collections::VecDeque;
 use std::future::Future;
@@ -1691,9 +1692,11 @@ impl TaskService {
         let mut completed = Vec::new();
         let mut failed = Vec::new();
         let mut cancelled = Vec::new();
+        let mut review_required = Vec::new();
         let mut pending = Vec::new();
         let mut total_count = 0u32;
         let mut terminal_count = 0u32;
+        let mut review_required_count = 0u32;
         let mut pending_count = 0u32;
 
         for task_id in task_ids {
@@ -1712,8 +1715,8 @@ impl TaskService {
                 None => Default::default(),
             };
             let item = TaskWaitItem {
-                task: response.task,
-                run,
+                task: response.task.clone(),
+                run: run.clone(),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
             };
@@ -1733,6 +1736,20 @@ impl TaskService {
                     terminal_count = terminal_count.saturating_add(1);
                     cancelled.push(item);
                 }
+                WaitItemState::ReviewRequired => {
+                    if let Some(review_item) = self
+                        .review_required_wait_item(&response, item.clone())
+                        .await?
+                    {
+                        review_required_count = review_required_count.saturating_add(1);
+                        review_required.push(review_item);
+                    } else {
+                        pending_count = pending_count.saturating_add(1);
+                        if params.return_pending {
+                            pending.push(item);
+                        }
+                    }
+                }
                 WaitItemState::Pending => {
                     pending_count = pending_count.saturating_add(1);
                     if params.return_pending {
@@ -1746,15 +1763,50 @@ impl TaskService {
             completed,
             failed,
             cancelled,
+            review_required,
             pending,
             non_waitable: Vec::new(),
             timed_out: false,
             total_count,
             terminal_count,
             pending_count,
+            review_required_count,
             non_waitable_count: 0,
             mode: params.mode,
         })
+    }
+
+    async fn review_required_wait_item(
+        &self,
+        response: &TaskGetResponse,
+        item: TaskWaitItem,
+    ) -> TaskRuntimeResult<Option<TaskWaitReviewItem>> {
+        let Some(run) = item.run.as_ref() else {
+            return Ok(None);
+        };
+        let Some(candidate) = self
+            .active_review_candidate_for_run(run.id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let max_revision_rounds = wait_review_policy(response, run)
+            .map(|policy| policy.max_revision_rounds)
+            .unwrap_or_default();
+        let remaining_revision_rounds = max_revision_rounds.saturating_sub(candidate.round);
+        let allowed_actions =
+            wait_review_allowed_actions(candidate.status, remaining_revision_rounds);
+        let revision_blocked_reason =
+            wait_review_revision_blocked_reason(candidate.status, remaining_revision_rounds);
+
+        Ok(Some(TaskWaitReviewItem {
+            item,
+            candidate,
+            max_revision_rounds,
+            remaining_revision_rounds,
+            allowed_actions,
+            revision_blocked_reason,
+        }))
     }
 
     async fn build_wait_target_plan(
@@ -2673,12 +2725,14 @@ fn empty_wait_response(mode: TaskWaitMode) -> TaskWaitResponse {
         completed: Vec::new(),
         failed: Vec::new(),
         cancelled: Vec::new(),
+        review_required: Vec::new(),
         pending: Vec::new(),
         non_waitable: Vec::new(),
         timed_out: false,
         total_count: 0,
         terminal_count: 0,
         pending_count: 0,
+        review_required_count: 0,
         non_waitable_count: 0,
         mode,
     }
@@ -2693,6 +2747,7 @@ enum WaitItemState {
     Completed,
     Failed,
     Cancelled,
+    ReviewRequired,
     Pending,
 }
 
@@ -2702,6 +2757,7 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
             TaskRunStatus::Succeeded => return WaitItemState::Completed,
             TaskRunStatus::Failed | TaskRunStatus::TimedOut => return WaitItemState::Failed,
             TaskRunStatus::Cancelled => return WaitItemState::Cancelled,
+            TaskRunStatus::WaitingReview => return WaitItemState::ReviewRequired,
             _ => {}
         }
     }
@@ -2710,8 +2766,61 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
         TaskStatus::Completed => WaitItemState::Completed,
         TaskStatus::Failed => WaitItemState::Failed,
         TaskStatus::Cancelled => WaitItemState::Cancelled,
+        TaskStatus::WaitingReview => WaitItemState::ReviewRequired,
         _ => WaitItemState::Pending,
     }
+}
+
+fn wait_review_policy<'a>(
+    response: &'a TaskGetResponse,
+    run: &TaskRun,
+) -> Option<&'a TaskAgentReviewPolicy> {
+    response
+        .agent_specs
+        .iter()
+        .find(|spec| spec.run_id.as_deref() == Some(run.id.as_str()))
+        .and_then(|spec| spec.review_policy.as_ref())
+        .or_else(|| {
+            response
+                .agent_specs
+                .iter()
+                .find(|spec| spec.run_id.is_none())
+                .and_then(|spec| spec.review_policy.as_ref())
+        })
+        .filter(|policy| policy.is_enabled())
+}
+
+fn wait_review_allowed_actions(
+    candidate_status: TaskResultCandidateStatus,
+    remaining_revision_rounds: u32,
+) -> Vec<TaskWaitReviewAction> {
+    let mut actions = Vec::new();
+    if candidate_status == TaskResultCandidateStatus::PendingReview {
+        actions.push(TaskWaitReviewAction::TaskAccept);
+    }
+    if wait_review_candidate_can_revise(candidate_status) && remaining_revision_rounds > 0 {
+        actions.push(TaskWaitReviewAction::TaskRevise);
+    }
+    actions.push(TaskWaitReviewAction::TaskCancel);
+    actions
+}
+
+fn wait_review_revision_blocked_reason(
+    candidate_status: TaskResultCandidateStatus,
+    remaining_revision_rounds: u32,
+) -> Option<TaskWaitRevisionBlockedReason> {
+    if !wait_review_candidate_can_revise(candidate_status) {
+        return Some(TaskWaitRevisionBlockedReason::CandidateNotRevisable);
+    }
+    (remaining_revision_rounds == 0)
+        .then_some(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
+}
+
+fn wait_review_candidate_can_revise(candidate_status: TaskResultCandidateStatus) -> bool {
+    matches!(
+        candidate_status,
+        TaskResultCandidateStatus::PendingReview | TaskResultCandidateStatus::ExtractionFailed
+    )
 }
 
 fn wait_condition_satisfied(response: &TaskWaitResponse) -> bool {
@@ -2719,8 +2828,14 @@ fn wait_condition_satisfied(response: &TaskWaitResponse) -> bool {
         .total_count
         .saturating_sub(response.non_waitable_count);
     match response.mode {
-        TaskWaitMode::AllTerminal => response.pending_count == 0,
+        TaskWaitMode::AllTerminal => {
+            response.pending_count == 0 && response.review_required_count == 0
+        }
         TaskWaitMode::AnyTerminal => response.terminal_count > 0 || waitable_total == 0,
+        TaskWaitMode::AllTerminalOrReviewRequired => response.pending_count == 0,
+        TaskWaitMode::AnyTerminalOrReviewRequired => {
+            response.terminal_count > 0 || response.review_required_count > 0 || waitable_total == 0
+        }
     }
 }
 

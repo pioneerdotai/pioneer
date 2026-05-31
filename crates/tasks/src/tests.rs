@@ -1,23 +1,26 @@
 use crate::{
     TaskCreateContext, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
-    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, TaskMutationContext, TaskRuntime,
-    TaskRuntimeResult, TaskWaitContext, WriteLockDecision,
+    TaskExecutorRecoveryOutcome, TaskExecutorStartOutcome, TaskMutationContext,
+    TaskReviewRuntimeConfig, TaskRuntime, TaskRuntimeConfig, TaskRuntimeResult, TaskWaitContext,
+    WriteLockDecision,
 };
 use async_trait::async_trait;
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{CrudStore, TaskEventAppendStatus};
 use pioneer_protocol::{
-    TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentSpecInput,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCancelParams,
-    TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskDeliveriesParams,
-    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
-    TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
-    TaskRescheduleReason, TaskResult, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy,
-    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentReviewPolicy,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
+    TaskCancelParams, TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams,
+    TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus,
+    TaskDetachParams, TaskError, TaskErrorClass, TaskEventPayload, TaskEventsParams,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseParams, TaskRescheduleParams, TaskRescheduleReason, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
     TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
     TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
-    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, ThreadLineage,
+    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, TaskWaitReviewAction,
+    TaskWaitRevisionBlockedReason, ThreadLineage,
 };
 use sea_orm::Database;
 use std::sync::{
@@ -330,6 +333,26 @@ async fn runtime() -> TaskRuntime {
     TaskRuntime::new(Arc::new(CrudStore::new(connection)))
 }
 
+async fn runtime_with_review_config() -> TaskRuntime {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("sqlite memory database should connect");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migration should apply");
+    TaskRuntime::new_with_config(
+        Arc::new(CrudStore::new(connection)),
+        TaskRuntimeConfig {
+            review: TaskReviewRuntimeConfig {
+                enabled: true,
+                allow_task_create_review_policy: true,
+                default_parent_review_for_immediate_attached_agent_tasks: false,
+                default_max_revision_rounds: 2,
+            },
+        },
+    )
+}
+
 #[tokio::test]
 async fn task_event_idempotency_rejects_conflicting_duplicate_key_for_task() {
     let connection = Database::connect("sqlite::memory:")
@@ -448,6 +471,132 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
         depth: 0,
         max_depth,
     }
+}
+
+async fn create_waiting_review_agent_task(
+    runtime: &TaskRuntime,
+    max_revision_rounds: u32,
+    candidate_round: u32,
+    candidate_status: TaskResultCandidateStatus,
+) -> (String, String, String) {
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(
+        max_revision_rounds,
+    ));
+    params.agent_spec = Some(spec);
+
+    let response = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("review task should create");
+    let run = response.run.expect("review task should have run");
+    let execution = runtime
+        .service()
+        .store()
+        .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
+        .await
+        .expect("execution should reserve");
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    let parent_thread_id = pioneer_protocol::generate_id(21);
+    let parent_turn_id = pioneer_protocol::generate_id(21);
+    let child_thread_id = pioneer_protocol::generate_id(21);
+    let child_turn_id = pioneer_protocol::generate_id(21);
+    let turn_id = format!("review_turn_{}", run.id);
+    let lineage = TaskThreadLineage {
+        child_thread_id: child_thread_id.clone(),
+        parent_thread_id: parent_thread_id.clone(),
+        root_thread_id: parent_thread_id.clone(),
+        depth: 1,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: Some(parent_thread_id),
+        created_by_turn_id: Some(parent_turn_id),
+        created_at: run.created_at,
+    };
+    let binding = TaskRunThreadBinding {
+        id: format!("review_binding_{}", run.id),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: child_thread_id.clone(),
+        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+        created_at: run.created_at,
+    };
+    let mut task_run_turn = TaskRunTurn {
+        id: turn_id,
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id),
+        thread_id: child_thread_id.clone(),
+        turn_id: child_turn_id.clone(),
+        kind: TaskRunTurnKind::Initial,
+        round: candidate_round,
+        sequence: candidate_round,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: None,
+        requested_by_review_event_id: None,
+        created_at: run.created_at,
+        started_at: Some(run.created_at),
+        completed_at: None,
+    };
+    handle
+        .link_child_thread_with_runtime(lineage, binding, task_run_turn.clone(), run.created_at)
+        .await
+        .expect("child runtime should link");
+
+    task_run_turn.status = TaskRunTurnStatus::CandidateCreated;
+    task_run_turn.completed_at = Some(run.created_at.saturating_add(1));
+    let candidate = TaskResultCandidate {
+        id: format!("candidate_{}", run.id),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        task_run_turn_id: task_run_turn.id.clone(),
+        thread_id: child_thread_id,
+        turn_id: child_turn_id,
+        round: candidate_round,
+        status: candidate_status,
+        result: (candidate_status == TaskResultCandidateStatus::PendingReview).then(|| {
+            TaskResult {
+                summary: Some("candidate summary".to_owned()),
+                data: Some(TaskValue::String("candidate result".to_owned())),
+                artifacts: Vec::new(),
+                completed_by_run_id: Some(run.id.clone()),
+            }
+        }),
+        extraction_error: (candidate_status == TaskResultCandidateStatus::ExtractionFailed).then(
+            || TaskError {
+                code: "extraction_failed".to_owned(),
+                message: "candidate extraction failed".to_owned(),
+                class: TaskErrorClass::Validation,
+                details: None,
+                failed_run_id: Some(run.id.clone()),
+            },
+        ),
+        summary: Some("candidate summary".to_owned()),
+        diagnostics: Vec::new(),
+        final_review_event_id: None,
+        created_at: run.created_at.saturating_add(1),
+        updated_at: run.created_at.saturating_add(1),
+        resolved_at: None,
+    };
+    let candidate_id = candidate.id.clone();
+    handle
+        .record_pending_review_result_candidate(
+            task_run_turn,
+            candidate,
+            run.created_at.saturating_add(1),
+        )
+        .await
+        .expect("pending review candidate should record");
+    (response.task.id, run.id, candidate_id)
 }
 
 #[tokio::test]
@@ -2977,6 +3126,155 @@ async fn wait_return_pending_false_still_waits_on_internal_pending_state() {
     assert_eq!(waited.total_count, 1);
     assert_eq!(waited.pending_count, 1);
     assert!(waited.pending.is_empty());
+}
+
+#[tokio::test]
+async fn wait_all_terminal_keeps_waiting_for_review_required_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext::default(),
+            TaskWaitParams {
+                task_ids: vec![task_id],
+                run_ids: Vec::new(),
+                timeout_ms: Some(5),
+                mode: TaskWaitMode::AllTerminal,
+                return_completed: true,
+                return_pending: true,
+            },
+        )
+        .await
+        .expect("wait should return timeout");
+
+    assert!(waited.timed_out);
+    assert_eq!(waited.terminal_count, 0);
+    assert_eq!(waited.pending_count, 0);
+    assert_eq!(waited.review_required_count, 1);
+    assert_eq!(waited.review_required.len(), 1);
+    assert_eq!(waited.review_required[0].candidate.id, candidate_id);
+}
+
+#[tokio::test]
+async fn wait_all_terminal_or_review_required_returns_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext::default(),
+            TaskWaitParams {
+                task_ids: vec![task_id],
+                run_ids: Vec::new(),
+                timeout_ms: Some(5_000),
+                mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                return_completed: true,
+                return_pending: true,
+            },
+        )
+        .await
+        .expect("wait should return review-required candidate");
+
+    assert!(!waited.timed_out);
+    assert_eq!(waited.terminal_count, 0);
+    assert_eq!(waited.pending_count, 0);
+    assert_eq!(waited.review_required_count, 1);
+    assert!(waited.completed.is_empty());
+    assert!(waited.pending.is_empty());
+    let review = &waited.review_required[0];
+    assert_eq!(review.candidate.id, candidate_id);
+    assert_eq!(review.item.task.status, TaskStatus::WaitingReview);
+    assert_eq!(
+        review.item.run.as_ref().map(|run| run.status),
+        Some(TaskRunStatus::WaitingReview)
+    );
+    assert!(review.item.child_thread_id.is_some());
+    assert!(review.item.child_turn_id.is_some());
+    assert_eq!(review.max_revision_rounds, 2);
+    assert_eq!(review.remaining_revision_rounds, 2);
+    assert_eq!(
+        review.allowed_actions,
+        vec![
+            TaskWaitReviewAction::TaskAccept,
+            TaskWaitReviewAction::TaskRevise,
+            TaskWaitReviewAction::TaskCancel,
+        ]
+    );
+    assert_eq!(review.revision_blocked_reason, None);
+}
+
+#[tokio::test]
+async fn wait_any_terminal_or_review_required_returns_on_review_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext::default(),
+            TaskWaitParams {
+                task_ids: vec![task_id],
+                run_ids: Vec::new(),
+                timeout_ms: Some(5_000),
+                mode: TaskWaitMode::AnyTerminalOrReviewRequired,
+                return_completed: true,
+                return_pending: true,
+            },
+        )
+        .await
+        .expect("wait should return review-required candidate");
+
+    assert!(!waited.timed_out);
+    assert_eq!(waited.review_required_count, 1);
+    assert_eq!(waited.review_required[0].candidate.id, candidate_id);
+    assert!(waited.completed.is_empty());
+}
+
+#[tokio::test]
+async fn wait_review_required_removes_revise_when_revision_limit_reached() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, _candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 2, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext::default(),
+            TaskWaitParams {
+                task_ids: vec![task_id],
+                run_ids: Vec::new(),
+                timeout_ms: Some(5_000),
+                mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                return_completed: true,
+                return_pending: true,
+            },
+        )
+        .await
+        .expect("wait should return review-required candidate");
+
+    let review = &waited.review_required[0];
+    assert_eq!(review.remaining_revision_rounds, 0);
+    assert_eq!(
+        review.allowed_actions,
+        vec![
+            TaskWaitReviewAction::TaskAccept,
+            TaskWaitReviewAction::TaskCancel,
+        ]
+    );
+    assert_eq!(
+        review.revision_blocked_reason,
+        Some(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
+    );
 }
 
 #[tokio::test]

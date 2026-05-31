@@ -494,7 +494,12 @@ impl TaskToolHandler {
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
-        if !duplicate_wait_should_block(&prior, state.terminal_count, state.pending_count) {
+        if !duplicate_wait_should_block(
+            &prior,
+            state.terminal_count,
+            state.pending_count,
+            state.review_required_count,
+        ) {
             return Ok(None);
         }
         let last = prior
@@ -507,6 +512,7 @@ impl TaskToolHandler {
             state.total_count,
             state.terminal_count,
             state.pending_count,
+            state.review_required_count,
             last.timed_out,
             prior.len(),
         )))
@@ -1324,9 +1330,9 @@ struct TaskWaitToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     timeout_ms: Option<u64>,
-    /// all_terminal waits for every target; any_terminal returns when one target reaches a terminal state.
-    #[serde(default)]
-    mode: TaskWaitMode,
+    /// all_terminal waits for every target to become terminal. By default this tool also returns when every target is terminal or ready for review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<TaskWaitMode>,
     /// Include terminal task results in the response. The handler enables this by default when both return flags are false.
     #[serde(default)]
     return_completed: bool,
@@ -1348,7 +1354,9 @@ impl TaskWaitToolInput {
             task_ids,
             run_ids,
             timeout_ms: self.timeout_ms,
-            mode: self.mode,
+            mode: self
+                .mode
+                .unwrap_or(TaskWaitMode::AllTerminalOrReviewRequired),
             return_completed: self.return_completed,
             return_pending: self.return_pending,
         })
@@ -1675,7 +1683,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; it blocks until all targets are terminal by default or timeout. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
+            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; by default it returns when all targets are terminal or ready for review, or on timeout. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -2218,8 +2226,8 @@ impl TaskWaitSignature {
     }
 
     fn from_arguments(arguments: &JsonValue) -> Option<Self> {
-        let params =
-            serde_json::from_value::<pioneer_protocol::TaskWaitParams>(arguments.clone()).ok()?;
+        let input = serde_json::from_value::<TaskWaitToolInput>(arguments.clone()).ok()?;
+        let params = input.into_params().ok()?;
         Some(Self::from_params(&params))
     }
 
@@ -2237,6 +2245,7 @@ struct PriorWaitCall {
     item_id: String,
     timed_out: bool,
     terminal_count: u32,
+    review_required_count: u32,
 }
 
 async fn prior_wait_calls_for_signature(
@@ -2305,6 +2314,7 @@ fn prior_wait_call_from_item(
             .and_then(JsonValue::as_bool)
             .unwrap_or(false),
         terminal_count: json_u32(&wait_result, "terminalCount"),
+        review_required_count: json_u32(&wait_result, "reviewRequiredCount"),
     })
 }
 
@@ -2312,14 +2322,15 @@ fn duplicate_wait_should_block(
     prior: &[PriorWaitCall],
     terminal_count: u32,
     pending_count: u32,
+    review_required_count: u32,
 ) -> bool {
-    if prior.is_empty() || pending_count == 0 {
+    if prior.is_empty() || pending_count == 0 || review_required_count > 0 {
         return false;
     }
     let last = prior
         .last()
         .expect("prior wait list checked as non-empty before last()");
-    if terminal_count > last.terminal_count {
+    if terminal_count > last.terminal_count || review_required_count > last.review_required_count {
         return false;
     }
     if last.timed_out {
@@ -2563,9 +2574,11 @@ fn task_wait_tool_output(
         "totalCount": response.total_count,
         "terminalCount": response.terminal_count,
         "pendingCount": response.pending_count,
+        "reviewRequiredCount": response.review_required_count,
         "completed": response.completed.iter().map(wait_item_output).collect::<Vec<_>>(),
         "failed": response.failed.iter().map(wait_item_output).collect::<Vec<_>>(),
         "cancelled": response.cancelled.iter().map(wait_item_output).collect::<Vec<_>>(),
+        "reviewRequired": response.review_required.iter().map(review_required_item_output).collect::<Vec<_>>(),
         "pending": response.pending.iter().map(wait_item_output).collect::<Vec<_>>(),
         "nonWaitable": response.non_waitable.iter().map(non_waitable_item_output).collect::<Vec<_>>(),
         "nonWaitableCount": response.non_waitable_count,
@@ -2579,6 +2592,7 @@ fn task_wait_guard_output(
     total_count: u32,
     terminal_count: u32,
     pending_count: u32,
+    review_required_count: u32,
     previous_timed_out: bool,
     prior_wait_count: usize,
 ) -> JsonValue {
@@ -2590,6 +2604,7 @@ fn task_wait_guard_output(
         "totalCount": total_count,
         "terminalCount": terminal_count,
         "pendingCount": pending_count,
+        "reviewRequiredCount": review_required_count,
         "previousTimedOut": previous_timed_out,
         "priorWaitCount": prior_wait_count,
         "recommendation": if previous_timed_out {
@@ -2692,6 +2707,12 @@ fn wait_mode_label(mode: pioneer_protocol::TaskWaitMode) -> &'static str {
     match mode {
         pioneer_protocol::TaskWaitMode::AllTerminal => "all_terminal",
         pioneer_protocol::TaskWaitMode::AnyTerminal => "any_terminal",
+        pioneer_protocol::TaskWaitMode::AllTerminalOrReviewRequired => {
+            "all_terminal_or_review_required"
+        }
+        pioneer_protocol::TaskWaitMode::AnyTerminalOrReviewRequired => {
+            "any_terminal_or_review_required"
+        }
     }
 }
 
@@ -2706,6 +2727,45 @@ fn wait_item_output(item: &pioneer_protocol::TaskWaitItem) -> JsonValue {
         "error": run.and_then(|run| run.error.clone()).or_else(|| item.task.error.clone()),
         "childThreadId": item.child_thread_id,
         "childTurnId": item.child_turn_id,
+    })
+}
+
+fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> JsonValue {
+    let run = item.item.run.as_ref();
+    let candidate = &item.candidate;
+    let summary = candidate.summary.clone().or_else(|| {
+        candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.clone())
+    });
+    let allowed_actions = item
+        .allowed_actions
+        .iter()
+        .copied()
+        .map(wait_review_action_label)
+        .collect::<Vec<_>>();
+    json!({
+        "taskId": item.item.task.id,
+        "runId": run.map(|run| run.id.clone()).unwrap_or_else(|| candidate.run_id.clone()),
+        "title": item.item.task.title,
+        "status": wait_item_status(&item.item.task, run),
+        "candidateId": candidate.id,
+        "candidateStatus": candidate_status_label(candidate.status),
+        "round": candidate.round,
+        "summary": summary,
+        "resultPreview": result_preview(candidate.result.as_ref()),
+        "result": candidate.result,
+        "extractionError": candidate.extraction_error,
+        "extractionErrorPreview": error_preview(candidate.extraction_error.as_ref()),
+        "diagnostics": candidate.diagnostics,
+        "childThreadId": item.item.child_thread_id,
+        "childTurnId": item.item.child_turn_id,
+        "maxRevisionRounds": item.max_revision_rounds,
+        "remainingRevisionRounds": item.remaining_revision_rounds,
+        "allowedActions": allowed_actions,
+        "revisionBlockedReason": item.revision_blocked_reason.map(wait_revision_blocked_reason_label),
+        "recommendation": review_required_recommendation(item),
     })
 }
 
@@ -2786,6 +2846,49 @@ fn wait_item_status(task: &Task, run: Option<&TaskRun>) -> String {
         return run_status_label(run.status);
     }
     task_status_label(task.status)
+}
+
+fn candidate_status_label(status: TaskResultCandidateStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{status:?}").to_ascii_lowercase())
+}
+
+fn wait_review_action_label(action: pioneer_protocol::TaskWaitReviewAction) -> &'static str {
+    match action {
+        pioneer_protocol::TaskWaitReviewAction::TaskAccept => "task_accept",
+        pioneer_protocol::TaskWaitReviewAction::TaskRevise => "task_revise",
+        pioneer_protocol::TaskWaitReviewAction::TaskCancel => "task_cancel",
+    }
+}
+
+fn wait_revision_blocked_reason_label(
+    reason: pioneer_protocol::TaskWaitRevisionBlockedReason,
+) -> &'static str {
+    match reason {
+        pioneer_protocol::TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached => {
+            "max_revision_rounds_reached"
+        }
+        pioneer_protocol::TaskWaitRevisionBlockedReason::CandidateNotRevisable => {
+            "candidate_not_revisable"
+        }
+    }
+}
+
+fn review_required_recommendation(item: &pioneer_protocol::TaskWaitReviewItem) -> &'static str {
+    let can_accept = item
+        .allowed_actions
+        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskAccept);
+    let can_revise = item
+        .allowed_actions
+        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise);
+    match (can_accept, can_revise) {
+        (true, true) => "call_task_accept_or_task_revise",
+        (true, false) => "call_task_accept_or_task_cancel",
+        (false, true) => "call_task_revise_or_task_cancel",
+        (false, false) => "call_task_cancel",
+    }
 }
 
 fn task_summary(task: &Task) -> JsonValue {
@@ -3000,6 +3103,20 @@ mod tests {
             item_id: "wait_item".to_owned(),
             timed_out,
             terminal_count,
+            review_required_count: 0,
+        }
+    }
+
+    fn prior_with_review(
+        timed_out: bool,
+        terminal_count: u32,
+        review_required_count: u32,
+    ) -> PriorWaitCall {
+        PriorWaitCall {
+            item_id: "wait_item".to_owned(),
+            timed_out,
+            terminal_count,
+            review_required_count,
         }
     }
 
@@ -3089,6 +3206,80 @@ mod tests {
         }
     }
 
+    fn sample_review_candidate(
+        status: TaskResultCandidateStatus,
+        round: u32,
+    ) -> pioneer_protocol::TaskResultCandidate {
+        pioneer_protocol::TaskResultCandidate {
+            id: "candidate_123456789012".to_owned(),
+            task_id: "task_1234567890123456".to_owned(),
+            run_id: "run_12345678901234567".to_owned(),
+            task_run_turn_id: "task_run_turn_123456".to_owned(),
+            thread_id: "thread_child12345678".to_owned(),
+            turn_id: "turn_child123456789".to_owned(),
+            round,
+            status,
+            result: (status == TaskResultCandidateStatus::PendingReview).then(|| TaskResult {
+                summary: Some("candidate summary".to_owned()),
+                data: Some(pioneer_protocol::TaskValue::String(
+                    "candidate data".to_owned(),
+                )),
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_12345678901234567".to_owned()),
+            }),
+            extraction_error: (status == TaskResultCandidateStatus::ExtractionFailed).then(|| {
+                TaskError {
+                    code: "extraction_failed".to_owned(),
+                    message: "could not extract task result".to_owned(),
+                    class: pioneer_protocol::TaskErrorClass::Validation,
+                    details: None,
+                    failed_run_id: Some("run_12345678901234567".to_owned()),
+                }
+            }),
+            summary: Some("candidate summary".to_owned()),
+            diagnostics: vec!["used fallback text result".to_owned()],
+            final_review_event_id: None,
+            created_at: 120,
+            updated_at: 120,
+            resolved_at: None,
+        }
+    }
+
+    fn sample_review_wait_response(
+        allowed_actions: Vec<pioneer_protocol::TaskWaitReviewAction>,
+        remaining_revision_rounds: u32,
+        revision_blocked_reason: Option<pioneer_protocol::TaskWaitRevisionBlockedReason>,
+        candidate_status: TaskResultCandidateStatus,
+    ) -> pioneer_protocol::TaskWaitResponse {
+        pioneer_protocol::TaskWaitResponse {
+            completed: Vec::new(),
+            failed: Vec::new(),
+            cancelled: Vec::new(),
+            review_required: vec![pioneer_protocol::TaskWaitReviewItem {
+                item: pioneer_protocol::TaskWaitItem {
+                    task: sample_task(TaskStatus::WaitingReview),
+                    run: Some(sample_run(TaskRunStatus::WaitingReview)),
+                    child_thread_id: Some("thread_child12345678".to_owned()),
+                    child_turn_id: Some("turn_child123456789".to_owned()),
+                },
+                candidate: sample_review_candidate(candidate_status, 2),
+                max_revision_rounds: 2,
+                remaining_revision_rounds,
+                allowed_actions,
+                revision_blocked_reason,
+            }],
+            pending: Vec::new(),
+            non_waitable: Vec::new(),
+            timed_out: false,
+            total_count: 1,
+            terminal_count: 0,
+            pending_count: 0,
+            review_required_count: 1,
+            non_waitable_count: 0,
+            mode: TaskWaitMode::AllTerminalOrReviewRequired,
+        }
+    }
+
     fn sample_task_response(
         task_status: TaskStatus,
         runs: Vec<TaskRun>,
@@ -3168,6 +3359,79 @@ mod tests {
         assert_eq!(output[0]["taskRunId"], response.runs[0].id);
     }
 
+    #[test]
+    fn task_wait_tool_output_renders_review_required_candidate() {
+        let response = sample_review_wait_response(
+            vec![
+                pioneer_protocol::TaskWaitReviewAction::TaskAccept,
+                pioneer_protocol::TaskWaitReviewAction::TaskRevise,
+                pioneer_protocol::TaskWaitReviewAction::TaskCancel,
+            ],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let signature = TaskWaitSignature {
+            task_ids: vec!["task_1234567890123456".to_owned()],
+            run_ids: Vec::new(),
+            mode: TaskWaitMode::AllTerminalOrReviewRequired,
+        };
+
+        let output = task_wait_tool_output(&response, &signature);
+
+        assert_eq!(output["reviewRequiredCount"], 1);
+        assert_eq!(output["completed"].as_array().unwrap().len(), 0);
+        let review = &output["reviewRequired"][0];
+        assert_eq!(review["taskId"], "task_1234567890123456");
+        assert_eq!(review["runId"], "run_12345678901234567");
+        assert_eq!(review["status"], "waiting_review");
+        assert_eq!(review["candidateId"], "candidate_123456789012");
+        assert_eq!(review["candidateStatus"], "pending_review");
+        assert_eq!(review["summary"], "candidate summary");
+        assert_eq!(review["childThreadId"], "thread_child12345678");
+        assert_eq!(review["childTurnId"], "turn_child123456789");
+        assert_eq!(review["remainingRevisionRounds"], 1);
+        assert_eq!(
+            review["allowedActions"],
+            json!(["task_accept", "task_revise", "task_cancel"])
+        );
+        assert_eq!(review["revisionBlockedReason"], JsonValue::Null);
+        assert_eq!(review["recommendation"], "call_task_accept_or_task_revise");
+        assert_eq!(review["diagnostics"], json!(["used fallback text result"]));
+    }
+
+    #[test]
+    fn task_wait_tool_output_removes_revise_when_revision_limit_reached() {
+        let response = sample_review_wait_response(
+            vec![
+                pioneer_protocol::TaskWaitReviewAction::TaskAccept,
+                pioneer_protocol::TaskWaitReviewAction::TaskCancel,
+            ],
+            0,
+            Some(pioneer_protocol::TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached),
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let signature = TaskWaitSignature {
+            task_ids: vec!["task_1234567890123456".to_owned()],
+            run_ids: Vec::new(),
+            mode: TaskWaitMode::AllTerminalOrReviewRequired,
+        };
+
+        let output = task_wait_tool_output(&response, &signature);
+        let review = &output["reviewRequired"][0];
+
+        assert_eq!(review["remainingRevisionRounds"], 0);
+        assert_eq!(
+            review["allowedActions"],
+            json!(["task_accept", "task_cancel"])
+        );
+        assert_eq!(
+            review["revisionBlockedReason"],
+            "max_revision_rounds_reached"
+        );
+        assert_eq!(review["recommendation"], "call_task_accept_or_task_cancel");
+    }
+
     fn sample_task_turn_item() -> TaskTurnItem {
         TaskTurnItem {
             id: "task_task_1234567890123456".to_owned(),
@@ -3194,22 +3458,56 @@ mod tests {
 
     #[test]
     fn duplicate_wait_guard_blocks_same_pending_state() {
-        assert!(duplicate_wait_should_block(&[prior(false, 0)], 0, 3));
+        assert!(duplicate_wait_should_block(&[prior(false, 0)], 0, 3, 0));
     }
 
     #[test]
     fn duplicate_wait_guard_allows_terminal_progress() {
-        assert!(!duplicate_wait_should_block(&[prior(false, 0)], 1, 2));
+        assert!(!duplicate_wait_should_block(&[prior(false, 0)], 1, 2, 0));
+    }
+
+    #[test]
+    fn duplicate_wait_guard_allows_review_required_progress() {
+        assert!(!duplicate_wait_should_block(&[prior(false, 0)], 0, 0, 1));
+        assert!(!duplicate_wait_should_block(
+            &[prior_with_review(false, 0, 0)],
+            0,
+            1,
+            1
+        ));
     }
 
     #[test]
     fn duplicate_wait_guard_allows_one_timeout_retry_then_blocks() {
-        assert!(!duplicate_wait_should_block(&[prior(true, 0)], 0, 3));
+        assert!(!duplicate_wait_should_block(&[prior(true, 0)], 0, 3, 0));
         assert!(duplicate_wait_should_block(
             &[prior(true, 0), prior(true, 0)],
             0,
-            3
+            3,
+            0
         ));
+    }
+
+    #[test]
+    fn task_wait_tool_input_defaults_to_review_aware_mode() {
+        let input: TaskWaitToolInput = serde_json::from_value(json!({
+            "taskIds": ["task_1234567890123456"]
+        }))
+        .expect("task_wait input should decode");
+
+        let params = input.into_params().expect("input should convert");
+
+        assert_eq!(params.mode, TaskWaitMode::AllTerminalOrReviewRequired);
+    }
+
+    #[test]
+    fn task_wait_signature_from_arguments_uses_tool_default_mode() {
+        let signature = TaskWaitSignature::from_arguments(&json!({
+            "taskIds": ["task_1234567890123456"]
+        }))
+        .expect("signature should decode");
+
+        assert_eq!(signature.mode, TaskWaitMode::AllTerminalOrReviewRequired);
     }
 
     #[test]

@@ -1,90 +1,47 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "TaskWaitResponse",
+  "title": "TaskWaitReviewItem",
   "type": "object",
   "properties": {
-    "cancelled": {
+    "allowedActions": {
       "type": "array",
       "default": [],
       "items": {
-        "$ref": "#/$defs/TaskWaitItem"
+        "$ref": "#/$defs/TaskWaitReviewAction"
       }
     },
-    "completed": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
+    "candidate": {
+      "$ref": "#/$defs/TaskResultCandidate"
     },
-    "failed": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
+    "item": {
+      "$ref": "#/$defs/TaskWaitItem"
     },
-    "mode": {
-      "$ref": "#/$defs/TaskWaitMode"
-    },
-    "nonWaitable": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitNonWaitableItem"
-      }
-    },
-    "nonWaitableCount": {
+    "maxRevisionRounds": {
       "type": "integer",
       "format": "uint32",
       "default": 0,
       "minimum": 0
     },
-    "pending": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
-    },
-    "pendingCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "reviewRequired": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitReviewItem"
-      }
-    },
-    "reviewRequiredCount": {
+    "remainingRevisionRounds": {
       "type": "integer",
       "format": "uint32",
       "default": 0,
       "minimum": 0
     },
-    "terminalCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "timedOut": {
-      "type": "boolean"
-    },
-    "totalCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
+    "revisionBlockedReason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskWaitRevisionBlockedReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
-    "timedOut",
-    "totalCount",
-    "terminalCount",
-    "pendingCount",
-    "mode"
+    "item",
+    "candidate"
   ],
   "$defs": {
     "Task": {
@@ -1042,93 +999,12 @@
         "task"
       ]
     },
-    "TaskWaitMode": {
-      "type": "string",
-      "enum": [
-        "all_terminal",
-        "any_terminal",
-        "all_terminal_or_review_required",
-        "any_terminal_or_review_required"
-      ]
-    },
-    "TaskWaitNonWaitableItem": {
-      "type": "object",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TaskWaitItem"
-        },
-        "nextFireAt": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "reason": {
-          "$ref": "#/$defs/TaskWaitNonWaitableReason"
-        }
-      },
-      "required": [
-        "item",
-        "reason"
-      ]
-    },
-    "TaskWaitNonWaitableReason": {
-      "type": "string",
-      "enum": [
-        "future_scheduled_task_without_active_run"
-      ]
-    },
     "TaskWaitReviewAction": {
       "type": "string",
       "enum": [
         "task_accept",
         "task_revise",
         "task_cancel"
-      ]
-    },
-    "TaskWaitReviewItem": {
-      "type": "object",
-      "properties": {
-        "allowedActions": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TaskWaitReviewAction"
-          }
-        },
-        "candidate": {
-          "$ref": "#/$defs/TaskResultCandidate"
-        },
-        "item": {
-          "$ref": "#/$defs/TaskWaitItem"
-        },
-        "maxRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "default": 0,
-          "minimum": 0
-        },
-        "remainingRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "default": 0,
-          "minimum": 0
-        },
-        "revisionBlockedReason": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TaskWaitRevisionBlockedReason"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "item",
-        "candidate"
       ]
     },
     "TaskWaitRevisionBlockedReason": {

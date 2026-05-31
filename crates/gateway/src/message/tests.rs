@@ -9897,6 +9897,7 @@ where
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name(name)
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("test runtime should build")

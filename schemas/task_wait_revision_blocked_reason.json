@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskWaitRevisionBlockedReason",
+  "type": "string",
+  "enum": [
+    "max_revision_rounds_reached",
+    "candidate_not_revisable"
+  ]
+}

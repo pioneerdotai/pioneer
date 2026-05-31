@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskWaitReviewAction",
+  "type": "string",
+  "enum": [
+    "task_accept",
+    "task_revise",
+    "task_cancel"
+  ]
+}

@@ -2227,6 +2227,8 @@ pub struct TaskWaitParams {
 pub enum TaskWaitMode {
     AllTerminal,
     AnyTerminal,
+    AllTerminalOrReviewRequired,
+    AnyTerminalOrReviewRequired,
 }
 
 impl Default for TaskWaitMode {
@@ -2245,6 +2247,36 @@ pub struct TaskWaitItem {
     pub child_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_turn_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWaitReviewAction {
+    TaskAccept,
+    TaskRevise,
+    TaskCancel,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWaitRevisionBlockedReason {
+    MaxRevisionRoundsReached,
+    CandidateNotRevisable,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskWaitReviewItem {
+    pub item: TaskWaitItem,
+    pub candidate: TaskResultCandidate,
+    #[serde(default)]
+    pub max_revision_rounds: u32,
+    #[serde(default)]
+    pub remaining_revision_rounds: u32,
+    #[serde(default)]
+    pub allowed_actions: Vec<TaskWaitReviewAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_blocked_reason: Option<TaskWaitRevisionBlockedReason>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -2272,6 +2304,8 @@ pub struct TaskWaitResponse {
     #[serde(default)]
     pub cancelled: Vec<TaskWaitItem>,
     #[serde(default)]
+    pub review_required: Vec<TaskWaitReviewItem>,
+    #[serde(default)]
     pub pending: Vec<TaskWaitItem>,
     #[serde(default)]
     pub non_waitable: Vec<TaskWaitNonWaitableItem>,
@@ -2279,6 +2313,8 @@ pub struct TaskWaitResponse {
     pub total_count: u32,
     pub terminal_count: u32,
     pub pending_count: u32,
+    #[serde(default)]
+    pub review_required_count: u32,
     #[serde(default)]
     pub non_waitable_count: u32,
     pub mode: TaskWaitMode,
@@ -2627,7 +2663,8 @@ mod tests {
     use super::{
         TaskAgentSpec, TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRescheduleReason,
         TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerSpec,
-        TaskTriggerStatus, TaskTurnItem,
+        TaskTriggerStatus, TaskTurnItem, TaskWaitMode, TaskWaitResponse, TaskWaitReviewAction,
+        TaskWaitRevisionBlockedReason,
     };
     use serde_json::json;
 
@@ -2744,6 +2781,121 @@ mod tests {
         assert!(!TaskStatus::WaitingReview.is_terminal());
         assert!(!TaskRunStatus::WaitingReview.is_terminal());
         assert!(!TaskRunExecutionStatus::WaitingReview.is_terminal());
+    }
+
+    #[test]
+    fn legacy_task_wait_response_without_review_fields_decodes() {
+        let decoded: TaskWaitResponse = serde_json::from_value(json!({
+            "completed": [],
+            "failed": [],
+            "cancelled": [],
+            "pending": [],
+            "nonWaitable": [],
+            "timedOut": false,
+            "totalCount": 0,
+            "terminalCount": 0,
+            "pendingCount": 0,
+            "mode": "all_terminal"
+        }))
+        .expect("legacy task wait response should decode");
+
+        assert!(decoded.review_required.is_empty());
+        assert_eq!(decoded.review_required_count, 0);
+        assert_eq!(decoded.mode, TaskWaitMode::AllTerminal);
+    }
+
+    #[test]
+    fn task_wait_review_response_round_trips() {
+        let decoded: TaskWaitResponse = serde_json::from_value(json!({
+            "completed": [],
+            "failed": [],
+            "cancelled": [],
+            "reviewRequired": [{
+                "item": {
+                    "task": {
+                        "id": "task_review00000001",
+                        "workspaceId": "workspace_default",
+                        "ownerKind": "thread",
+                        "ownerId": "thread_parent000001",
+                        "executorKind": "agent",
+                        "status": "waiting_review",
+                        "title": "Review child work",
+                        "goal": "Produce a result",
+                        "priority": 0,
+                        "revision": 1,
+                        "createdAt": 10,
+                        "updatedAt": 20
+                    },
+                    "childThreadId": "thread_child0000001",
+                    "childTurnId": "turn_child000000001"
+                },
+                "candidate": {
+                    "id": "candidate_review_0001",
+                    "taskId": "task_review00000001",
+                    "runId": "run_review000000001",
+                    "taskRunTurnId": "task_run_turn_000001",
+                    "threadId": "thread_child0000001",
+                    "turnId": "turn_child000000001",
+                    "round": 0,
+                    "status": "pending_review",
+                    "result": {
+                        "summary": "done",
+                        "data": {
+                            "kind": "string",
+                            "value": "result"
+                        }
+                    },
+                    "summary": "done",
+                    "diagnostics": [],
+                    "createdAt": 30,
+                    "updatedAt": 30
+                },
+                "maxRevisionRounds": 2,
+                "remainingRevisionRounds": 1,
+                "allowedActions": ["task_accept", "task_revise", "task_cancel"]
+            }],
+            "pending": [],
+            "nonWaitable": [],
+            "timedOut": false,
+            "totalCount": 1,
+            "terminalCount": 0,
+            "pendingCount": 0,
+            "reviewRequiredCount": 1,
+            "nonWaitableCount": 0,
+            "mode": "all_terminal_or_review_required"
+        }))
+        .expect("review task wait response should decode");
+
+        assert_eq!(decoded.review_required_count, 1);
+        assert_eq!(
+            decoded.review_required[0].candidate.summary.as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            decoded.review_required[0].allowed_actions,
+            vec![
+                TaskWaitReviewAction::TaskAccept,
+                TaskWaitReviewAction::TaskRevise,
+                TaskWaitReviewAction::TaskCancel,
+            ]
+        );
+        assert_eq!(decoded.mode, TaskWaitMode::AllTerminalOrReviewRequired);
+
+        let encoded = serde_json::to_value(&decoded).expect("response should encode");
+        assert_eq!(encoded["reviewRequiredCount"], json!(1));
+        assert_eq!(
+            encoded["reviewRequired"][0]["allowedActions"],
+            json!(["task_accept", "task_revise", "task_cancel"])
+        );
+    }
+
+    #[test]
+    fn task_wait_review_blocked_reason_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
+                .expect("blocked reason should encode"),
+            json!("max_revision_rounds_reached")
+        );
     }
 
     #[test]

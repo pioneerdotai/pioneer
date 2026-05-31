@@ -155,7 +155,8 @@ pub use task::{
     TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
     TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
     TaskValue, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason,
-    TaskWaitParams, TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
+    TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem,
+    TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
     TaskWriteLockStatus, ThreadLineage,
 };
 pub use thread::{

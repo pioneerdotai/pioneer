@@ -43,7 +43,9 @@
       "type": "string",
       "enum": [
         "all_terminal",
-        "any_terminal"
+        "any_terminal",
+        "all_terminal_or_review_required",
+        "any_terminal_or_review_required"
       ]
     }
   }
