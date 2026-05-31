@@ -12,6 +12,26 @@ pub struct TaskCreateContext {
 #[derive(Debug, Clone, Default)]
 pub struct TaskMutationContext {
     pub actor_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+impl TaskMutationContext {
+    pub fn parent_agent(thread_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
+        Self {
+            actor_id: None,
+            thread_id: Some(thread_id.into()),
+            turn_id: Some(turn_id.into()),
+        }
+    }
+
+    pub fn user(actor_id: impl Into<String>) -> Self {
+        Self {
+            actor_id: Some(actor_id.into()),
+            thread_id: None,
+            turn_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

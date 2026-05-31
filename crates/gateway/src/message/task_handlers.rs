@@ -162,6 +162,39 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn task_accept(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: TaskAcceptParams,
+    ) {
+        let context =
+            pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
+        match message_future(
+            self.task_runtime
+                .service()
+                .accept_task_result_candidate(context, params),
+        )
+        .await
+        {
+            Ok(response_payload) => {
+                self.send_task_response(connection_id, request_id, &response_payload)
+                    .await
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to accept task result: {error:#}"),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
     pub(super) async fn task_cancel(
         &self,
         connection_id: ConnectionId,

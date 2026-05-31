@@ -49,18 +49,19 @@ use pioneer_protocol::{
     SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy,
-    TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
-    TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
-    TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
-    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind,
-    TaskRetryPolicy, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
-    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams,
-    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
+    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
+    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
+    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput,
+    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
     ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
     ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
@@ -1214,6 +1215,7 @@ fn test_task_turn_preflight_response() -> ChatResponse {
     test_turn_preflight_response_with_visible_tools(&[
         "task_create",
         "task_wait",
+        "task_accept",
         "task_cancel",
         "task_update",
         "task_detach",
@@ -4159,6 +4161,231 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: r#"<task_result>{"summary":"ready for user approval","data":{"answer":"ok"}}</task_result>"#
+            .to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let parent_thread_id = "thr_user_review_accept";
+    let parent_turn_id = "turn_user_review_accept";
+    let parent_thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: parent_thread_id.to_owned(),
+        name: Some("User review accept parent".to_owned()),
+        preview: "review accept".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "test-model".to_owned(),
+        model_provider: "openai".to_owned(),
+        created_at,
+        updated_at: created_at,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let parent_turn = Turn {
+        id: parent_turn_id.to_owned(),
+        status: TurnStatus::Completed,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error: None,
+        prompt_manifest: None,
+    };
+    crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                status: TurnStatus::InProgress,
+                ..parent_turn.clone()
+            },
+            &[],
+        )
+        .await
+        .expect("parent turn start should persist");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
+                turn: parent_turn,
+            },
+            created_at,
+        )
+        .await
+        .expect("parent turn completion should persist");
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "User accepts child result",
+        3,
+    );
+    params.lifecycle_policy = Some(TaskLifecyclePolicy {
+        attachment: TaskAttachmentMode::Detached,
+        on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+        on_parent_failure: TaskParentTerminalAction::KeepRunning,
+        completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::OwnerThread,
+        thread_id: None,
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    let (_, occurrence_before_accept) = crud_store
+        .get_turn(parent_thread_id, run.id.as_str())
+        .await
+        .expect("occurrence turn lookup before accept should succeed")
+        .expect("occurrence turn should exist before accept");
+    assert_eq!(occurrence_before_accept.turn_kind, TurnKind::TaskRun);
+    assert_eq!(occurrence_before_accept.status, TurnStatus::InProgress);
+
+    let request_id = generate_test_request_id("taskaccept", "rpc");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id.clone(),
+        "method": pioneer_protocol::constants::methods::TASK_ACCEPT,
+        "params": {
+            "taskId": response.task.id,
+            "runId": run.id.clone(),
+            "candidateId": candidate.id.clone(),
+            "reason": "approved by user"
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let rpc_response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let accepted: TaskAcceptResponse =
+        serde_json::from_value(rpc_response.result).expect("task/accept response should decode");
+
+    assert!(accepted.accepted);
+    assert!(!accepted.already_accepted);
+    assert_eq!(
+        accepted.review_event.reviewer_kind,
+        TaskResultReviewerKind::User
+    );
+    let expected_user_id = format!("connection:{connection_id}");
+    assert_eq!(
+        accepted.review_event.reviewer_user_id.as_deref(),
+        Some(expected_user_id.as_str())
+    );
+    assert_eq!(accepted.run.status, TaskRunStatus::Succeeded);
+    assert_eq!(
+        accepted.task.status,
+        pioneer_protocol::TaskStatus::Completed
+    );
+    assert_eq!(
+        accepted.candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert_eq!(
+        accepted.result.summary.as_deref(),
+        Some("ready for user approval")
+    );
+
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(accepted.task.id.clone()),
+            run_id: Some(accepted.run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("task deliveries should list after accept");
+    assert_eq!(deliveries.deliveries.len(), 1);
+    assert_eq!(deliveries.deliveries[0].status, TaskDeliveryStatus::Pending);
+    assert_eq!(
+        deliveries.deliveries[0]
+            .result_snapshot
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("ready for user approval")
+    );
+    let run_completed_event = processor
+        .task_runtime
+        .service()
+        .list_task_events_after(accepted.task.id.as_str(), 0)
+        .await
+        .expect("task events should list after accept")
+        .into_iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                TaskEventPayload::RunCompleted { run_id, .. } if run_id == &accepted.run.id
+            )
+        })
+        .expect("accepted run should emit RunCompleted event");
+    processor
+        .emit_task_event(run_completed_event)
+        .await
+        .expect("run completed event should project occurrence turn");
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            parent_thread_id,
+            accepted.run.id.as_str(),
+            TurnStatus::Completed,
+        )
+        .await,
+        TurnStatus::Completed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
@@ -5466,6 +5693,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     for expected in [
         "task_create",
         "task_wait",
+        "task_accept",
         "task_cancel",
         "task_detach",
         "task_list",
@@ -16130,6 +16358,32 @@ async fn wait_for_run_status(
         .await
         .expect("task run query should succeed")
         .expect("task run should exist")
+        .status
+}
+
+async fn wait_for_turn_status(
+    crud_store: Arc<CrudStore>,
+    thread_id: &str,
+    turn_id: &str,
+    expected_status: TurnStatus,
+) -> TurnStatus {
+    for _ in 0..100 {
+        let (_, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn query should succeed")
+            .expect("turn should exist");
+        if turn.status == expected_status {
+            return turn.status;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn query should succeed")
+        .expect("turn should exist")
+        .1
         .status
 }
 

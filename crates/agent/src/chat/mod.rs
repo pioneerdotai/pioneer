@@ -1933,7 +1933,7 @@ async fn pending_attached_task_observation(
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "Attached tasks created by this turn are still active, so the turn cannot finish yet.\n{task_lines}\nCall exactly one of task_wait, task_cancel, or task_detach for these task ids before giving the final answer."
+        "Attached tasks created by this turn are still active or waiting for review, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, task_accept for acceptable review candidates, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
     ))
 }
 
@@ -2054,6 +2054,16 @@ fn record_observed_terminal_task_ids(
                 .get("task")
                 .and_then(|task| task.get("taskId"))
                 .and_then(JsonValue::as_str)
+            {
+                observed_task_ids.insert(task_id.to_owned());
+            }
+        }
+        "task_accept" => {
+            if value
+                .get("taskTerminal")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+                && let Some(task_id) = value.get("taskId").and_then(JsonValue::as_str)
             {
                 observed_task_ids.insert(task_id.to_owned());
             }
@@ -5320,6 +5330,7 @@ mod tests {
             [
                 "task_create",
                 "task_wait",
+                "task_accept",
                 "task_cancel",
                 "task_update",
                 "task_detach",

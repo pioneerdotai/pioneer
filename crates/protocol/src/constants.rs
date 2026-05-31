@@ -51,6 +51,7 @@ pub mod methods {
     pub const TASK_TREE: &str = "task/tree";
     pub const TASK_EVENTS: &str = "task/events";
     pub const TASK_WAIT: &str = "task/wait";
+    pub const TASK_ACCEPT: &str = "task/accept";
     pub const TASK_CANCEL: &str = "task/cancel";
     pub const TASK_UPDATE: &str = "task/update";
     pub const TASK_RESCHEDULE: &str = "task/reschedule";

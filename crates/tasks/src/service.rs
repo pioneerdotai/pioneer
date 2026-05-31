@@ -19,28 +19,30 @@ use crate::review::{
 use crate::scheduler::TaskScheduler;
 use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
-use pioneer_crud::{AppendedTaskEvent, CrudStore};
+use pioneer_crud::{AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore};
 use pioneer_protocol::{
-    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt, TaskAgentReviewPolicy,
-    TaskAgentSpec, TaskAgentWriteMode, TaskAttachmentMode, TaskCancelParams, TaskCancelResponse,
-    TaskCancelScope, TaskConcurrencyConflictPolicy, TaskCreateParams, TaskCreateResponse,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskDetachParams,
-    TaskDetachResponse, TaskError, TaskErrorClass, TaskEventPayload, TaskEventsParams,
-    TaskEventsResponse, TaskExecutorKind, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy,
-    TaskListParams, TaskListResponse, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams,
-    TaskPauseResponse, TaskRescheduleParams, TaskRescheduleResponse, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
-    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse,
-    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree,
-    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerKind, TaskTriggerStatus,
-    TaskUpdateParams, TaskUpdateResponse, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem,
-    TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction,
-    TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict,
-    TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
+    ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, Task, TaskAcceptParams,
+    TaskAcceptResponse, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentReviewPolicy, TaskAgentSpec, TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode,
+    TaskCancelParams, TaskCancelResponse, TaskCancelScope, TaskConcurrencyConflictPolicy,
+    TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams, TaskDeliveriesResponse,
+    TaskDelivery, TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliveryMode,
+    TaskDeliveryStatus, TaskDetachParams, TaskDetachResponse, TaskError, TaskErrorClass,
+    TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind, TaskGetParams,
+    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskListResponse, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse, TaskRescheduleParams,
+    TaskRescheduleResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
+    TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse, TaskRun, TaskRunExecutionStatus,
+    TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree, TaskTreeParams, TaskTreeResponse,
+    TaskTrigger, TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse,
+    TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
+    TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason,
+    TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
-use std::collections::VecDeque;
+use serde_json::{Value as JsonValue, json};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path};
 use std::pin::Pin;
@@ -62,6 +64,15 @@ where
     F: Future<Output = T> + Send + 'a,
 {
     Box::pin(future)
+}
+
+#[derive(Debug, Clone)]
+struct TaskAcceptValidationContext {
+    response: TaskGetResponse,
+    run: TaskRun,
+    candidate: TaskResultCandidate,
+    result: TaskResult,
+    actor: TaskResultReviewActor,
 }
 
 pub struct TaskRuntime {
@@ -410,6 +421,430 @@ impl TaskService {
             created_at: params.created_at,
         };
         self.record_task_result_review_event(record).await
+    }
+
+    async fn validate_task_result_candidate_accept(
+        &self,
+        context: TaskMutationContext,
+        params: &TaskAcceptParams,
+    ) -> TaskRuntimeResult<TaskAcceptValidationContext> {
+        let response = self
+            .store
+            .get_task(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
+        let run = response
+            .runs
+            .iter()
+            .find(|run| run.id == params.run_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "task run `{}` not found for task `{}`",
+                    params.run_id,
+                    params.task_id
+                )
+            })?;
+        let candidate = self
+            .store
+            .get_task_result_candidate(params.candidate_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task result candidate `{}` not found", params.candidate_id))?;
+
+        if candidate.task_id != params.task_id || candidate.run_id != params.run_id {
+            bail!(
+                "task result candidate `{}` does not belong to task `{}` run `{}`",
+                candidate.id,
+                params.task_id,
+                params.run_id
+            );
+        }
+        if response.task.status != TaskStatus::WaitingReview {
+            bail!("task `{}` is not waiting for review", response.task.id);
+        }
+        if run.status != TaskRunStatus::WaitingReview {
+            bail!("task run `{}` is not waiting for review", run.id);
+        }
+        match candidate.status {
+            TaskResultCandidateStatus::PendingReview => {}
+            TaskResultCandidateStatus::ExtractionFailed => {
+                bail!(
+                    "task result candidate `{}` has extraction_failed status and cannot be accepted",
+                    candidate.id
+                );
+            }
+            status => {
+                bail!(
+                    "task result candidate `{}` is not pending_review; current status is {:?}",
+                    candidate.id,
+                    status
+                );
+            }
+        }
+        let result = candidate.result.clone().ok_or_else(|| {
+            anyhow!(
+                "task result candidate `{}` has no result_json and cannot be accepted",
+                candidate.id
+            )
+        })?;
+
+        validate_no_active_candidate_child_turn(&response, &run)?;
+        let actor = resolve_accept_review_actor(&context, &response, &candidate)?;
+        if actor.reviewer_kind == TaskResultReviewerKind::User
+            && let Some(user_id) = actor.reviewer_user_id.as_deref()
+        {
+            validate_user_can_review_task(user_id, &response.task)?;
+        }
+        self.validate_accept_actor_allowed_by_policy(&response, &run, &candidate, &actor)
+            .await?;
+
+        Ok(TaskAcceptValidationContext {
+            response,
+            run,
+            candidate,
+            result,
+            actor,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn validate_task_result_candidate_accept_for_test(
+        &self,
+        context: TaskMutationContext,
+        params: TaskAcceptParams,
+    ) -> TaskRuntimeResult<()> {
+        self.validate_task_result_candidate_accept(context, &params)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn accept_task_result_candidate(
+        &self,
+        context: TaskMutationContext,
+        params: TaskAcceptParams,
+    ) -> TaskRuntimeResult<TaskAcceptResponse> {
+        if let Some(response) = self
+            .already_accepted_task_result_candidate_response(&context, &params)
+            .await?
+        {
+            return self
+                .finalize_accepted_task_result_candidate_response(response)
+                .await;
+        }
+
+        let validated = self
+            .validate_task_result_candidate_accept(context, &params)
+            .await?;
+        let recorded = self
+            .record_task_result_review_event(RecordTaskResultReviewEventParams {
+                candidate_id: validated.candidate.id.clone(),
+                review_event_id: None,
+                actor: validated.actor,
+                event_kind: TaskResultReviewEventKind::Decision,
+                decision: TaskResultReviewDecision::Accept,
+                feedback_text: params.reason.clone(),
+                feedback: None,
+                confidence: None,
+                supersedes_review_event_id: None,
+                next_task_run_turn_id: None,
+                created_at: Some(now_timestamp_secs()),
+            })
+            .await?;
+
+        let response = self
+            .store
+            .get_task(params.task_id.as_str())
+            .await?
+            .unwrap_or(validated.response);
+        let run = response
+            .runs
+            .iter()
+            .find(|run| run.id == params.run_id)
+            .cloned()
+            .unwrap_or(validated.run);
+        let result = recorded
+            .candidate
+            .result
+            .clone()
+            .unwrap_or(validated.result);
+
+        let response = task_accept_response(
+            response,
+            run,
+            recorded.candidate,
+            recorded.review_event,
+            result,
+            false,
+        );
+        self.finalize_accepted_task_result_candidate_response(response)
+            .await
+    }
+
+    async fn already_accepted_task_result_candidate_response(
+        &self,
+        context: &TaskMutationContext,
+        params: &TaskAcceptParams,
+    ) -> TaskRuntimeResult<Option<TaskAcceptResponse>> {
+        let Some(candidate) = self
+            .store
+            .get_task_result_candidate(params.candidate_id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if candidate.status != TaskResultCandidateStatus::Accepted {
+            return Ok(None);
+        }
+        if candidate.task_id != params.task_id || candidate.run_id != params.run_id {
+            bail!(
+                "task result candidate `{}` does not belong to task `{}` run `{}`",
+                candidate.id,
+                params.task_id,
+                params.run_id
+            );
+        }
+        let result = candidate.result.clone().ok_or_else(|| {
+            anyhow!(
+                "accepted task result candidate `{}` has no result_json",
+                candidate.id
+            )
+        })?;
+        let review_event_id = candidate.final_review_event_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "accepted task result candidate `{}` has no final_review_event_id",
+                candidate.id
+            )
+        })?;
+        let review_event = self
+            .store
+            .get_task_result_review_event(review_event_id)
+            .await?
+            .ok_or_else(|| anyhow!("review event `{review_event_id}` not found"))?;
+        let response = self
+            .store
+            .get_task(params.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
+        let run = response
+            .runs
+            .iter()
+            .find(|run| run.id == params.run_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "task run `{}` not found for task `{}`",
+                    params.run_id,
+                    params.task_id
+                )
+            })?;
+        let actor = resolve_accept_review_actor(context, &response, &candidate)?;
+        if actor.reviewer_kind == TaskResultReviewerKind::User
+            && let Some(user_id) = actor.reviewer_user_id.as_deref()
+        {
+            validate_user_can_review_task(user_id, &response.task)?;
+        }
+        self.validate_accept_actor_allowed_by_policy(&response, &run, &candidate, &actor)
+            .await?;
+        Ok(Some(task_accept_response(
+            response,
+            run,
+            candidate,
+            review_event,
+            result,
+            true,
+        )))
+    }
+
+    async fn finalize_accepted_task_result_candidate_response(
+        &self,
+        response: TaskAcceptResponse,
+    ) -> TaskRuntimeResult<TaskAcceptResponse> {
+        if response.candidate.status != TaskResultCandidateStatus::Accepted {
+            bail!(
+                "task result candidate `{}` must be accepted before finalization",
+                response.candidate.id
+            );
+        }
+        let task_id = response.task.id.clone();
+        let run_id = response.run.id.clone();
+        let candidate_id = response.candidate.id.clone();
+        let review_event_id = response.review_event.id.clone();
+        let result = response.result.clone();
+        let already_accepted = response.already_accepted;
+        let mut task_response = self
+            .store
+            .get_task(task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{task_id}` not found"))?;
+        let mut run = task_response
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("task run `{run_id}` not found for task `{task_id}`"))?;
+        let candidate = self
+            .store
+            .get_task_result_candidate(candidate_id.as_str())
+            .await?
+            .unwrap_or(response.candidate);
+        let review_event = self
+            .store
+            .get_task_result_review_event(review_event_id.as_str())
+            .await?
+            .unwrap_or(response.review_event);
+
+        if candidate.status != TaskResultCandidateStatus::Accepted {
+            bail!(
+                "task result candidate `{}` was not projected as accepted",
+                candidate.id
+            );
+        }
+        self.promote_accepted_candidate_artifacts(&task_response, &run, &candidate, &result)
+            .await?;
+
+        if run.status == TaskRunStatus::WaitingReview {
+            let completed_at = candidate
+                .resolved_at
+                .unwrap_or(review_event.created_at)
+                .max(review_event.created_at);
+            let handle = TaskExecutionHandle::new(
+                self.store.clone(),
+                self.event_bus.clone(),
+                task_id.clone(),
+                run_id.clone(),
+            );
+            handle
+                .complete_run(Some(result.clone()), completed_at)
+                .await?;
+            task_response = self
+                .store
+                .get_task(task_id.as_str())
+                .await?
+                .ok_or_else(|| anyhow!("task `{task_id}` not found after accept finalization"))?;
+            run = task_response
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("task run `{run_id}` not found for task `{task_id}` after finalization")
+                })?;
+        }
+
+        let candidate = self
+            .store
+            .get_task_result_candidate(candidate_id.as_str())
+            .await?
+            .unwrap_or(candidate);
+        Ok(task_accept_response(
+            task_response,
+            run,
+            candidate,
+            review_event,
+            result,
+            already_accepted,
+        ))
+    }
+
+    async fn promote_accepted_candidate_artifacts(
+        &self,
+        response: &TaskGetResponse,
+        run: &TaskRun,
+        candidate: &TaskResultCandidate,
+        result: &TaskResult,
+    ) -> TaskRuntimeResult<()> {
+        if result.artifacts.is_empty() {
+            return Ok(());
+        }
+        let task_run_turn = response
+            .task_run_turns
+            .iter()
+            .find(|turn| turn.id == candidate.task_run_turn_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "accepted candidate `{}` references missing task run turn `{}`",
+                    candidate.id,
+                    candidate.task_run_turn_id
+                )
+            })?;
+        let lineage = response
+            .thread_lineage
+            .iter()
+            .find(|lineage| lineage.child_thread_id == candidate.thread_id)
+            .cloned()
+            .unwrap_or_else(|| fallback_candidate_lineage(&response.task, candidate));
+
+        for (index, artifact) in result.artifacts.iter().enumerate() {
+            let Some(artifact_id) = artifact
+                .artifact_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let summary = self
+                .store
+                .get_artifact_summary(
+                    response.task.workspace_id.as_str(),
+                    artifact_id,
+                    artifact.version_id.as_deref(),
+                )
+                .await?;
+            if summary.bindings.iter().any(|binding| {
+                binding.binding_kind == ArtifactBindingKind::TaskResult
+                    && binding.task_id.as_deref() == Some(response.task.id.as_str())
+                    && binding.task_run_id.as_deref() == Some(run.id.as_str())
+                    && binding.item_index == Some(index as i64)
+            }) {
+                continue;
+            }
+            let version_id = artifact
+                .version_id
+                .as_deref()
+                .or(summary.artifact.version_id.as_deref());
+            self.store
+                .bind_artifact(
+                    response.task.workspace_id.as_str(),
+                    summary.artifact.artifact_id.as_str(),
+                    version_id,
+                    accepted_result_artifact_binding_target(
+                        &response.task,
+                        task_run_turn,
+                        &lineage,
+                        index,
+                    ),
+                    accepted_candidate_artifact_metadata(artifact, candidate),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_accept_actor_allowed_by_policy(
+        &self,
+        response: &TaskGetResponse,
+        run: &TaskRun,
+        candidate: &TaskResultCandidate,
+        actor: &TaskResultReviewActor,
+    ) -> TaskRuntimeResult<()> {
+        let prior_events = self
+            .store
+            .list_task_result_review_events(candidate.id.as_str())
+            .await?;
+        let state = evaluate_task_result_review_resolution(
+            wait_review_policy(response, run),
+            &prior_events,
+        );
+        if final_actor_allowed(final_actor_for_reviewer_kind(actor.reviewer_kind), &state) {
+            return Ok(());
+        }
+        bail!(
+            "{:?} final review is not allowed for candidate `{}` by policy {:?}",
+            actor.reviewer_kind,
+            candidate.id,
+            state.strategy
+        );
     }
 
     pub async fn create_task_result_reviewer_context(
@@ -3130,6 +3565,213 @@ fn validate_user_can_review_task(user_id: &str, task: &Task) -> TaskRuntimeResul
         bail!("user `{user_id}` cannot review task `{}`", task.id);
     }
     Ok(())
+}
+
+fn validate_no_active_candidate_child_turn(
+    response: &TaskGetResponse,
+    run: &TaskRun,
+) -> TaskRuntimeResult<()> {
+    if let Some(turn) = response.task_run_turns.iter().find(|turn| {
+        turn.run_id == run.id
+            && turn.kind != TaskRunTurnKind::Review
+            && turn.status == TaskRunTurnStatus::InProgress
+    }) {
+        bail!(
+            "task run `{}` has in-progress child turn `{}` and cannot accept a candidate yet",
+            run.id,
+            turn.turn_id
+        );
+    }
+    Ok(())
+}
+
+fn resolve_accept_review_actor(
+    context: &TaskMutationContext,
+    response: &TaskGetResponse,
+    candidate: &TaskResultCandidate,
+) -> TaskRuntimeResult<TaskResultReviewActor> {
+    if let (Some(thread_id), Some(turn_id)) =
+        (context.thread_id.as_deref(), context.turn_id.as_deref())
+    {
+        if thread_id == candidate.thread_id {
+            bail!(
+                "candidate source thread `{}` cannot accept its own result",
+                candidate.thread_id
+            );
+        }
+        if !parent_agent_can_accept_candidate(thread_id, turn_id, response, candidate) {
+            bail!(
+                "parent agent thread `{thread_id}` turn `{turn_id}` cannot accept candidate `{}`",
+                candidate.id
+            );
+        }
+        return Ok(TaskResultReviewActor {
+            reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer_thread_id: Some(thread_id.to_owned()),
+            reviewer_turn_id: Some(turn_id.to_owned()),
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+        });
+    }
+
+    if context.thread_id.is_some() || context.turn_id.is_some() {
+        bail!("parent-agent accept requires both thread_id and turn_id in mutation context");
+    }
+
+    let user_id = context
+        .actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("task accept requires parent-agent thread/turn or authenticated actor_id")
+        })?;
+    Ok(TaskResultReviewActor {
+        reviewer_kind: TaskResultReviewerKind::User,
+        reviewer_thread_id: None,
+        reviewer_turn_id: None,
+        reviewer_user_id: Some(user_id.to_owned()),
+        reviewer_agent_spec_id: None,
+    })
+}
+
+fn parent_agent_can_accept_candidate(
+    thread_id: &str,
+    turn_id: &str,
+    response: &TaskGetResponse,
+    candidate: &TaskResultCandidate,
+) -> bool {
+    if response.task.created_by_thread_id.as_deref() == Some(thread_id) {
+        return response
+            .task
+            .created_by_turn_id
+            .as_deref()
+            .map_or(true, |created_by_turn_id| created_by_turn_id == turn_id);
+    }
+
+    if response.task.owner_kind == TaskOwnerKind::Thread
+        && response.task.owner_id.as_deref() == Some(thread_id)
+        && response.task.created_by_turn_id.is_none()
+    {
+        return true;
+    }
+
+    response.thread_lineage.iter().any(|lineage| {
+        lineage.child_thread_id == candidate.thread_id
+            && lineage
+                .created_by_thread_id
+                .as_deref()
+                .unwrap_or(lineage.parent_thread_id.as_str())
+                == thread_id
+            && lineage.created_by_turn_id.as_deref() == Some(turn_id)
+    })
+}
+
+fn task_accept_response(
+    response: TaskGetResponse,
+    run: TaskRun,
+    candidate: TaskResultCandidate,
+    review_event: TaskResultReviewEvent,
+    result: TaskResult,
+    already_accepted: bool,
+) -> TaskAcceptResponse {
+    TaskAcceptResponse {
+        status: response.task.status,
+        task: response.task,
+        run,
+        child_thread_id: Some(candidate.thread_id.clone()),
+        child_turn_id: Some(candidate.turn_id.clone()),
+        candidate,
+        review_event,
+        result,
+        accepted: true,
+        already_accepted,
+    }
+}
+
+fn fallback_candidate_lineage(task: &Task, candidate: &TaskResultCandidate) -> TaskThreadLineage {
+    let parent_thread_id = task
+        .created_by_thread_id
+        .clone()
+        .or_else(|| {
+            (task.owner_kind == TaskOwnerKind::Thread)
+                .then(|| task.owner_id.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| candidate.thread_id.clone());
+    TaskThreadLineage {
+        child_thread_id: candidate.thread_id.clone(),
+        parent_thread_id: parent_thread_id.clone(),
+        root_thread_id: parent_thread_id,
+        depth: 0,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: task.created_by_thread_id.clone(),
+        created_by_turn_id: task.created_by_turn_id.clone(),
+        created_at: candidate.created_at,
+    }
+}
+
+fn accepted_result_artifact_binding_target(
+    task: &Task,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
+    index: usize,
+) -> ArtifactBindingTargetRecord {
+    let thread_id = task_result_thread_id(task, lineage);
+    let turn_id = task.created_by_turn_id.clone().or_else(|| {
+        (thread_id.as_deref() == lineage.created_by_thread_id.as_deref())
+            .then(|| lineage.created_by_turn_id.clone())
+            .flatten()
+    });
+    ArtifactBindingTargetRecord {
+        thread_id,
+        turn_id,
+        message_id: None,
+        turn_item_id: None,
+        tool_call_id: None,
+        task_id: Some(task.id.clone()),
+        task_run_id: Some(task_run_turn.run_id.clone()),
+        binding_kind: ArtifactBindingKind::TaskResult,
+        direction: ArtifactBindingDirection::Output,
+        role: Some(ArtifactRole::Task),
+        item_index: Some(index as i64),
+    }
+}
+
+fn task_result_thread_id(task: &Task, lineage: &TaskThreadLineage) -> Option<String> {
+    task.created_by_thread_id.clone().or_else(|| {
+        (task.owner_kind == TaskOwnerKind::Thread)
+            .then(|| task.owner_id.clone())
+            .flatten()
+            .or_else(|| {
+                lineage
+                    .created_by_thread_id
+                    .clone()
+                    .or_else(|| Some(lineage.parent_thread_id.clone()))
+            })
+    })
+}
+
+fn accepted_candidate_artifact_metadata(
+    artifact: &TaskArtifact,
+    candidate: &TaskResultCandidate,
+) -> BTreeMap<String, JsonValue> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("source_kind".to_owned(), json!("task_result"));
+    metadata.insert(
+        "accepted_task_result_candidate_id".to_owned(),
+        json!(candidate.id.as_str()),
+    );
+    if let Some(url) = artifact.url.as_deref() {
+        metadata.insert("source_url".to_owned(), json!(url));
+    }
+    if let Some(value) = artifact.metadata.as_ref() {
+        metadata.insert(
+            "task_artifact_metadata".to_owned(),
+            serde_json::to_value(value).unwrap_or(JsonValue::Null),
+        );
+    }
+    metadata
 }
 
 fn reviewer_fallback_lineage(task_run_turn: &TaskRunTurn) -> TaskThreadLineage {

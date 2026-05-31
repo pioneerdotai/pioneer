@@ -12,11 +12,12 @@ use pioneer_protocol::{
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
-    SkillsUpdateParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
-    TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams, TaskPauseParams,
-    TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
-    ThreadAgentsDocArchiveParams, ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams,
-    ThreadAgentsDocSaveParams, TurnCancelParams, TurnTimelineParams,
+    SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
+    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
+    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams,
+    TaskWaitParams, ThreadAgentsDocArchiveParams, ThreadAgentsDocGetParams,
+    ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams, TurnCancelParams,
+    TurnTimelineParams,
 };
 
 impl MessageProcessor {
@@ -1777,6 +1778,23 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::TASK_WAIT),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_ACCEPT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskAcceptParams>(params_value) {
+                    Ok(params) => self.task_accept(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_ACCEPT),
                             ),
                         )
                         .await;

@@ -2,7 +2,7 @@ use super::*;
 use anyhow::Result;
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskAttachmentMode, TaskEventPayload, TaskGetResponse,
-    TaskRescheduleReason, TaskTriggerKind,
+    TaskRescheduleReason, TaskRunThreadBindingKind, TaskThreadLineage, TaskTriggerKind, TurnKind,
 };
 
 impl MessageProcessor {
@@ -140,6 +140,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunCompleted { run_id, .. } => {
+                self.mark_task_run_occurrence_turn_completed(&task_response, run_id.as_str())
+                    .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_workspace_connections(
                         workspace_id.as_str(),
@@ -751,6 +753,73 @@ impl MessageProcessor {
     ) -> Option<(String, String)> {
         self.task_progress_parent_target(response, payload).await
     }
+}
+
+impl MessageProcessor {
+    async fn mark_task_run_occurrence_turn_completed(
+        &self,
+        response: &TaskGetResponse,
+        run_id: &str,
+    ) -> Result<()> {
+        let Some(lineage) = task_run_primary_thread_lineage(response, run_id) else {
+            return Ok(());
+        };
+        let Some(parent_turn_id) = lineage.created_by_turn_id.as_deref() else {
+            return Ok(());
+        };
+        let parent_thread_id = lineage
+            .created_by_thread_id
+            .as_deref()
+            .unwrap_or(lineage.parent_thread_id.as_str());
+        let Some((workspace_id, mut turn)) = self
+            .crud_store
+            .get_turn(parent_thread_id, parent_turn_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if turn.turn_kind != TurnKind::TaskRun || turn.status != TurnStatus::InProgress {
+            return Ok(());
+        }
+
+        turn.status = TurnStatus::Completed;
+        turn.error = None;
+        let completed_at = now_timestamp_secs();
+        let notification = TurnCompletedNotification {
+            workspace_id,
+            thread_id: parent_thread_id.to_owned(),
+            turn,
+        };
+        self.crud_store
+            .materialize_turn_completed(notification.clone(), completed_at)
+            .await?;
+        self.send_notification_to_thread_subscribers(
+            parent_thread_id,
+            events::TURN_COMPLETED,
+            &notification,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+fn task_run_primary_thread_lineage<'a>(
+    response: &'a TaskGetResponse,
+    run_id: &str,
+) -> Option<&'a TaskThreadLineage> {
+    response
+        .task_run_thread_bindings
+        .iter()
+        .find(|binding| {
+            binding.run_id == run_id
+                && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
+        })
+        .and_then(|binding| {
+            response
+                .thread_lineage
+                .iter()
+                .find(|lineage| lineage.child_thread_id == binding.thread_id)
+        })
 }
 
 fn should_refresh_parent_task_anchor(

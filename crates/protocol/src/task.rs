@@ -2216,6 +2216,33 @@ pub struct TaskDetachResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskAcceptParams {
+    pub task_id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAcceptResponse {
+    pub task: Task,
+    pub run: TaskRun,
+    pub candidate: TaskResultCandidate,
+    pub review_event: TaskResultReviewEvent,
+    pub result: TaskResult,
+    pub accepted: bool,
+    pub already_accepted: bool,
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_turn_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskWaitParams {
     #[serde(default)]
     pub task_ids: Vec<String>,

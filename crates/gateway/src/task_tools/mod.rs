@@ -5,17 +5,18 @@ use pioneer_agent::{
     TerminalTaskObservation,
 };
 use pioneer_protocol::{
-    ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAgentContextPolicy,
-    TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput,
-    TaskAttachmentMode, TaskCancelParams, TaskCancelScope, TaskCreateParams, TaskCreateResponse,
-    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
-    TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
-    TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
-    TaskResult, TaskResultCandidateStatus, TaskResumeParams, TaskRetryPolicy, TaskRun,
-    TaskRunStatus, TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger,
-    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem,
-    TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus, ToolStoragePayload,
-    TurnItem, TurnItemEventPayload, constants::events,
+    ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
+    TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
+    TaskCreateParams, TaskCreateResponse, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
+    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
+    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
+    TaskOwnerKind, TaskPauseParams, TaskRescheduleParams, TaskResult, TaskResultCandidateStatus,
+    TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus,
+    TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
+    TaskUpdateResponse, TaskWaitMode, ToolCallStatus, ToolStoragePayload, TurnItem,
+    TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -35,6 +36,7 @@ use tokio::task::JoinHandle;
 
 const TASK_CREATE_TOOL: &str = "task_create";
 const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_ACCEPT_TOOL: &str = "task_accept";
 const TASK_CANCEL_TOOL: &str = "task_cancel";
 const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
@@ -304,6 +306,7 @@ impl ToolHandler for TaskToolHandler {
         match invocation.tool_name.as_str() {
             TASK_CREATE_TOOL => task_tool_future(self.handle_create(invocation)).await,
             TASK_WAIT_TOOL => task_tool_future(self.handle_wait(invocation)).await,
+            TASK_ACCEPT_TOOL => task_tool_future(self.handle_accept(invocation)).await,
             TASK_CANCEL_TOOL => task_tool_future(self.handle_cancel(invocation)).await,
             TASK_UPDATE_TOOL => task_tool_future(self.handle_update(invocation)).await,
             TASK_DETACH_TOOL => task_tool_future(self.handle_detach(invocation)).await,
@@ -516,6 +519,65 @@ impl TaskToolHandler {
             last.timed_out,
             prior.len(),
         )))
+    }
+
+    async fn handle_accept(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskAcceptToolInput = decode_tool_args(invocation.clone())?;
+        let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
+
+        let service = self.processor.task_runtime.service();
+        let context = pioneer_tasks::TaskMutationContext::parent_agent(
+            self.context.thread_id.clone(),
+            self.context.turn_id.clone(),
+        );
+        let response = match task_tool_fresh_task(async move {
+            service.accept_task_result_candidate(context, params).await
+        })
+        .await
+        {
+            Ok(response) => {
+                response.map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+            }
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "task_accept worker failed: {error}"
+                )));
+            }
+        };
+        let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
+        let output = task_accept_tool_output(&response, final_answer_allowed);
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
+    }
+
+    async fn final_answer_allowed_after_accept(&self, response: &TaskAcceptResponse) -> bool {
+        if !response.task.status.is_terminal() {
+            return false;
+        }
+        attached_tasks_for_turn(&self.processor, &self.context)
+            .await
+            .map(|tasks| tasks.into_iter().all(|task| task.status.is_terminal()))
+            .unwrap_or(false)
     }
 
     async fn handle_cancel(
@@ -1365,6 +1427,42 @@ impl TaskWaitToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_accept. Use this only for a candidate returned by task_wait reviewRequired.
+struct TaskAcceptToolInput {
+    /// Task id that owns the candidate. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    run_id: String,
+    /// Candidate id to accept. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional short reason for the acceptance.
+    reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
+}
+
+impl TaskAcceptToolInput {
+    fn into_params(self) -> Result<TaskAcceptParams, ToolError> {
+        Ok(TaskAcceptParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            run_id: validate_entity_id(self.run_id, "runId")?,
+            candidate_id: validate_entity_id(self.candidate_id, "candidateId")?,
+            reason: clean_optional_string(self.reason),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_cancel.
 struct TaskCancelToolInput {
     /// Task id to cancel. Pioneer entity ids are exactly 21 characters.
@@ -1693,6 +1791,12 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
             },
         ),
         task_tool_spec(
+            TASK_ACCEPT_TOOL,
+            "Accept a pending review candidate returned by task_wait. This records the parent-agent approval, makes the candidate final, and completes the child task/run with that result.",
+            task_accept_schema(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_CANCEL_TOOL,
             "Cancel a task through the task service.",
             task_cancel_schema(),
@@ -1783,6 +1887,10 @@ fn task_wait_schema() -> JsonValue {
     tool_input_schema::<TaskWaitToolInput>()
 }
 
+fn task_accept_schema() -> JsonValue {
+    tool_input_schema::<TaskAcceptToolInput>()
+}
+
 fn task_cancel_schema() -> JsonValue {
     tool_input_schema::<TaskCancelToolInput>()
 }
@@ -1863,6 +1971,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
     match tool_name {
         TASK_CREATE_TOOL => task_create_schema(),
         TASK_WAIT_TOOL => task_wait_schema(),
+        TASK_ACCEPT_TOOL => task_accept_schema(),
         TASK_CANCEL_TOOL => task_cancel_schema(),
         TASK_UPDATE_TOOL => task_update_schema(),
         TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
@@ -1887,6 +1996,9 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         }
         TASK_WAIT_TOOL => {
             "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
+        }
+        TASK_ACCEPT_TOOL => {
+            "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_wait reviewRequired."
         }
         TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
         | TASK_RESUME_TOOL => {
@@ -2406,6 +2518,27 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
     })
 }
 
+fn task_accept_tool_output(response: &TaskAcceptResponse, final_answer_allowed: bool) -> JsonValue {
+    json!({
+        "accepted": response.accepted,
+        "alreadyAccepted": response.already_accepted,
+        "taskId": response.task.id,
+        "runId": response.run.id,
+        "candidateId": response.candidate.id,
+        "status": task_status_label(response.task.status),
+        "runStatus": run_status_label(response.run.status),
+        "candidateStatus": candidate_status_label(response.candidate.status),
+        "reviewEventId": response.review_event.id,
+        "reviewerKind": reviewer_kind_label(response.review_event.reviewer_kind),
+        "summary": response.result.summary,
+        "result": response.result,
+        "childThreadId": response.child_thread_id,
+        "childTurnId": response.child_turn_id,
+        "taskTerminal": response.task.status.is_terminal(),
+        "finalAnswerAllowed": final_answer_allowed,
+    })
+}
+
 fn task_trigger_model_output(trigger: &TaskTrigger) -> JsonValue {
     strip_json_nulls(match &trigger.spec {
         TaskTriggerSpec::Immediate => json!({
@@ -2853,6 +2986,13 @@ fn candidate_status_label(status: TaskResultCandidateStatus) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{status:?}").to_ascii_lowercase())
+}
+
+fn reviewer_kind_label(kind: TaskResultReviewerKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase())
 }
 
 fn wait_review_action_label(action: pioneer_protocol::TaskWaitReviewAction) -> &'static str {
@@ -3401,6 +3541,122 @@ mod tests {
     }
 
     #[test]
+    fn task_accept_tool_output_returns_parent_loop_fields() {
+        let result = TaskResult {
+            summary: Some("accepted summary".to_owned()),
+            data: Some(pioneer_protocol::TaskValue::String(
+                "accepted data".to_owned(),
+            )),
+            artifacts: Vec::new(),
+            completed_by_run_id: Some("run_12345678901234567".to_owned()),
+        };
+        let mut run = sample_run(TaskRunStatus::Succeeded);
+        run.result = Some(result.clone());
+        let mut candidate = sample_review_candidate(TaskResultCandidateStatus::Accepted, 2);
+        candidate.result = Some(result.clone());
+        candidate.final_review_event_id = Some("review_accept1234567".to_owned());
+        candidate.resolved_at = Some(130);
+        let response = TaskAcceptResponse {
+            task: sample_task(TaskStatus::Completed),
+            run,
+            candidate,
+            review_event: pioneer_protocol::TaskResultReviewEvent {
+                id: "review_accept1234567".to_owned(),
+                candidate_id: "candidate_123456789012".to_owned(),
+                task_id: "task_1234567890123456".to_owned(),
+                run_id: "run_12345678901234567".to_owned(),
+                task_run_turn_id: "task_run_turn_123456".to_owned(),
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("thread_parent1234567".to_owned()),
+                reviewer_turn_id: Some("turn_parent12345678".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+                event_kind: pioneer_protocol::TaskResultReviewEventKind::Decision,
+                decision: pioneer_protocol::TaskResultReviewDecision::Accept,
+                feedback_text: Some("good enough".to_owned()),
+                feedback: None,
+                confidence: None,
+                supersedes_review_event_id: None,
+                next_task_run_turn_id: None,
+                created_at: 130,
+            },
+            result,
+            accepted: true,
+            already_accepted: false,
+            status: TaskStatus::Completed,
+            child_thread_id: Some("thread_child12345678".to_owned()),
+            child_turn_id: Some("turn_child123456789".to_owned()),
+        };
+
+        let output = task_accept_tool_output(&response, true);
+
+        assert_eq!(output["accepted"], true);
+        assert_eq!(output["alreadyAccepted"], false);
+        assert_eq!(output["taskId"], "task_1234567890123456");
+        assert_eq!(output["runId"], "run_12345678901234567");
+        assert_eq!(output["candidateId"], "candidate_123456789012");
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["runStatus"], "succeeded");
+        assert_eq!(output["candidateStatus"], "accepted");
+        assert_eq!(output["reviewerKind"], "parent_agent");
+        assert_eq!(output["summary"], "accepted summary");
+        assert_eq!(output["childThreadId"], "thread_child12345678");
+        assert_eq!(output["childTurnId"], "turn_child123456789");
+        assert_eq!(output["taskTerminal"], true);
+        assert_eq!(output["finalAnswerAllowed"], true);
+    }
+
+    #[test]
+    fn task_accept_tool_output_can_block_final_answer_when_other_tasks_pending() {
+        let result = TaskResult {
+            summary: Some("accepted summary".to_owned()),
+            data: None,
+            artifacts: Vec::new(),
+            completed_by_run_id: Some("run_12345678901234567".to_owned()),
+        };
+        let mut run = sample_run(TaskRunStatus::Succeeded);
+        run.result = Some(result.clone());
+        let mut candidate = sample_review_candidate(TaskResultCandidateStatus::Accepted, 0);
+        candidate.result = Some(result.clone());
+        let response = TaskAcceptResponse {
+            task: sample_task(TaskStatus::Completed),
+            run,
+            candidate,
+            review_event: pioneer_protocol::TaskResultReviewEvent {
+                id: "review_accept1234567".to_owned(),
+                candidate_id: "candidate_123456789012".to_owned(),
+                task_id: "task_1234567890123456".to_owned(),
+                run_id: "run_12345678901234567".to_owned(),
+                task_run_turn_id: "task_run_turn_123456".to_owned(),
+                reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer_thread_id: Some("thread_parent1234567".to_owned()),
+                reviewer_turn_id: Some("turn_parent12345678".to_owned()),
+                reviewer_user_id: None,
+                reviewer_agent_spec_id: None,
+                event_kind: pioneer_protocol::TaskResultReviewEventKind::Decision,
+                decision: pioneer_protocol::TaskResultReviewDecision::Accept,
+                feedback_text: None,
+                feedback: None,
+                confidence: None,
+                supersedes_review_event_id: None,
+                next_task_run_turn_id: None,
+                created_at: 130,
+            },
+            result,
+            accepted: true,
+            already_accepted: false,
+            status: TaskStatus::Completed,
+            child_thread_id: Some("thread_child12345678".to_owned()),
+            child_turn_id: Some("turn_child123456789".to_owned()),
+        };
+
+        let output = task_accept_tool_output(&response, false);
+
+        assert_eq!(output["taskTerminal"], true);
+        assert_eq!(output["finalAnswerAllowed"], false);
+    }
+
+    #[test]
     fn task_wait_tool_output_removes_revise_when_revision_limit_reached() {
         let response = sample_review_wait_response(
             vec![
@@ -3731,6 +3987,20 @@ mod tests {
             assert!(
                 wait_schema.contains(expected),
                 "task_wait schema should include guidance `{expected}`, got: {wait_schema}"
+            );
+        }
+
+        let accept_schema = task_accept_schema().to_string();
+        for expected in [
+            "candidate returned by task_wait reviewRequired",
+            "taskId",
+            "runId",
+            "candidateId",
+            "Optional short reason",
+        ] {
+            assert!(
+                accept_schema.contains(expected),
+                "task_accept schema should include guidance `{expected}`, got: {accept_schema}"
             );
         }
 
