@@ -129,6 +129,24 @@ impl MessageProcessor {
         delivery: &TaskDelivery,
         target_thread_id: &str,
     ) -> Result<Option<String>> {
+        if let Some(binding) = self
+            .crud_store
+            .get_task_run_primary_thread_binding(delivery.run_id.as_str())
+            .await?
+            && let Some(lineage) = self
+                .crud_store
+                .get_task_thread_lineage(binding.thread_id.as_str())
+                .await?
+        {
+            let parent_thread_id = lineage
+                .created_by_thread_id
+                .as_deref()
+                .unwrap_or(lineage.parent_thread_id.as_str());
+            if parent_thread_id == target_thread_id {
+                return Ok(lineage.created_by_turn_id.or(lineage.parent_turn_id));
+            }
+        }
+
         let lineages = self
             .crud_store
             .list_thread_lineage_for_run(delivery.run_id.as_str())

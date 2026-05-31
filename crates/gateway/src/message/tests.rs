@@ -3821,6 +3821,19 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         TaskRunStatus::Waiting,
         "review-disabled auto-approve must not enter waiting_review/waiting run state"
     );
+    assert_eq!(stored_task.thread_lineage.len(), 1);
+    assert_eq!(
+        stored_task.thread_lineage[0].child_thread_id,
+        lineage.child_thread_id
+    );
+    assert_eq!(
+        stored_task.thread_lineage[0].created_by_turn_id.as_deref(),
+        Some("turn_parent_task_test")
+    );
+    assert_eq!(stored_task.task_run_thread_bindings.len(), 1);
+    assert_eq!(stored_task.task_run_thread_bindings[0], binding);
+    assert_eq!(stored_task.task_run_turns.len(), 1);
+    assert_eq!(stored_task.task_run_turns[0].turn_id, lineage.child_turn_id);
     let write_locks = crud_store
         .list_task_write_locks_by_run(run.id.as_str())
         .await
@@ -3916,6 +3929,15 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         accepted_candidate.final_review_event_id.as_deref(),
         Some(review_events[0].id.as_str())
     );
+    let stored_task = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("completed task should reload")
+        .expect("completed task should still exist");
+    assert_eq!(stored_task.result_candidates.len(), 1);
+    assert_eq!(stored_task.result_candidates[0], accepted_candidate);
+    assert_eq!(stored_task.result_review_events.len(), 1);
+    assert_eq!(stored_task.result_review_events[0], review_events[0]);
 
     let task_events = crud_store
         .get_task_events(response.task.id.as_str(), None)
@@ -5076,10 +5098,12 @@ async fn task_create_tool_persists_anchor_and_composed_timeline_impl() {
         pioneer_protocol::TaskStatus::Completed,
         "task anchor read model should be refreshed from task lifecycle events"
     );
-    let lineage = crud_store
-        .list_thread_lineage_for_task(anchor_task_id.as_str())
+    let task_response = crud_store
+        .get_task(anchor_task_id.as_str())
         .await
-        .expect("lineage query should succeed");
+        .expect("task_get should succeed")
+        .expect("task should exist");
+    let lineage = task_response.thread_lineage;
     assert!(
         !lineage.is_empty(),
         "agent task should create hidden child lineage"
@@ -5291,11 +5315,25 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .expect("occurrence turn completion should persist");
     connection
         .execute_unprepared(&format!(
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at) values ('child_delivery_thread_1', 'child_delivery_turn_1', '{owner_thread_id}', '{}', '{task_id}', '{}', '{owner_thread_id}', 0, '2096-10-02T07:06:40+00:00')",
-            run.id, run.id
+            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, origin_kind, created_by_thread_id, created_by_turn_id, created_at) values ('child_delivery_thread_1', 'child_delivery_turn_1', '{owner_thread_id}', '{}', '{task_id}', '{}', '{owner_thread_id}', 0, 'task_run', '{owner_thread_id}', '{}', '2096-10-02T07:06:40+00:00')",
+            run.id, run.id, run.id
         ))
         .await
         .expect("lineage should persist");
+    connection
+        .execute_unprepared(&format!(
+            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at) values ('binding_delivery_1', '{task_id}', '{}', null, 'child_delivery_thread_1', 'primary_executor', '2096-10-02T07:06:40+00:00')",
+            run.id
+        ))
+        .await
+        .expect("task run thread binding should persist");
+    connection
+        .execute_unprepared(&format!(
+            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at, started_at, completed_at) values ('turn_delivery_1', '{task_id}', '{}', null, 'child_delivery_thread_1', 'child_delivery_turn_1', 'initial', 0, 0, 'candidate_created', '2096-10-02T07:06:40+00:00', '2096-10-02T07:06:40+00:00', '2096-10-02T07:06:40+00:00')",
+            run.id
+        ))
+        .await
+        .expect("task run turn should persist");
 
     processor
         .process_due_task_deliveries(4_000_000_000, 10)
@@ -5326,7 +5364,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
     assert_eq!(
         delivered_turn_id,
         run.id.as_str(),
-        "owner thread delivery must use thread_lineage.parent_turn_id instead of creating a delivery turn"
+        "owner thread delivery must use target binding -> lineage created_by turn instead of creating a delivery turn"
     );
     let items = crud_store
         .get_turn_item_events(owner_thread_id, delivered_turn_id)

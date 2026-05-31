@@ -971,14 +971,10 @@ async fn resolve_parent_context(
         .unwrap_or_else(|| task.id.clone());
 
     if let Some(parent_task_id) = task.parent_task_id.as_deref()
-        && let Some(parent_lineage) = processor
-            .crud_store
-            .list_thread_lineage_for_task(parent_task_id)
-            .await?
-            .into_iter()
-            .last()
+        && let Some(parent_response) = processor.crud_store.get_task(parent_task_id).await?
+        && let Some(parent_lineage) = parent_response.thread_lineage.last()
     {
-        root_thread_id = parent_lineage.root_thread_id;
+        root_thread_id = parent_lineage.root_thread_id.clone();
     }
 
     let parent_thread_id = task

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskThreadLineage",
+  "type": "object",
+  "properties": {
+    "childThreadId": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "createdByThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "createdByTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "depth": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "originKind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parentThreadId": {
+      "type": "string"
+    },
+    "parentTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rootThreadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "childThreadId",
+    "parentThreadId",
+    "rootThreadId",
+    "depth",
+    "createdAt"
+  ]
+}

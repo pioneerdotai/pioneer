@@ -985,6 +985,24 @@ pub struct TaskRunThreadBinding {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskThreadLineage {
+    pub child_thread_id: String,
+    pub parent_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<String>,
+    pub root_thread_id: String,
+    pub depth: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_turn_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskRunTurn {
     pub id: String,
     pub task_id: String,
@@ -1933,6 +1951,16 @@ pub struct TaskGetResponse {
     pub dependencies: Vec<TaskDependency>,
     #[serde(default)]
     pub write_locks: Vec<TaskWriteLock>,
+    #[serde(default)]
+    pub thread_lineage: Vec<TaskThreadLineage>,
+    #[serde(default)]
+    pub task_run_thread_bindings: Vec<TaskRunThreadBinding>,
+    #[serde(default)]
+    pub task_run_turns: Vec<TaskRunTurn>,
+    #[serde(default)]
+    pub result_candidates: Vec<TaskResultCandidate>,
+    #[serde(default)]
+    pub result_review_events: Vec<TaskResultReviewEvent>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]

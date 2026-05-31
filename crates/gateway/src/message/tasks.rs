@@ -699,6 +699,22 @@ impl MessageProcessor {
         response: &TaskGetResponse,
         run_id: &str,
     ) -> Option<(String, String)> {
+        if let Ok(Some(binding)) = self
+            .crud_store
+            .get_task_run_primary_thread_binding(run_id)
+            .await
+            && let Ok(Some(lineage)) = self
+                .crud_store
+                .get_task_thread_lineage(binding.thread_id.as_str())
+                .await
+            && let Some(parent_turn_id) = lineage.created_by_turn_id.or(lineage.parent_turn_id)
+        {
+            let parent_thread_id = lineage
+                .created_by_thread_id
+                .unwrap_or(lineage.parent_thread_id);
+            return Some((parent_thread_id, parent_turn_id));
+        }
+
         if let Ok(lineages) = self.crud_store.list_thread_lineage_for_run(run_id).await {
             if let Some(lineage) = lineages
                 .into_iter()

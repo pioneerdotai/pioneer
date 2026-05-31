@@ -18,12 +18,12 @@ use pioneer_protocol::{
     TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
     TaskGetResponse, TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskTree,
-    TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
-    UserInput, generate_id,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus,
+    TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage,
+    ThreadPlacement, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
+    Turn, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsResponse, UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
@@ -2822,6 +2822,32 @@ impl CrudStore {
             .into_iter()
             .map(task_write_lock_from_db_model)
             .collect::<Result<Vec<_>>>()?;
+        let mut task_run_thread_bindings = Vec::new();
+        let mut task_run_turns = Vec::new();
+        let mut result_candidates = Vec::new();
+        let mut result_review_events = Vec::new();
+        for run in &runs {
+            task_run_thread_bindings.extend(self.list_task_run_thread_bindings(&run.id).await?);
+            task_run_turns.extend(self.list_task_run_turns(&run.id).await?);
+            result_candidates.extend(self.list_task_result_candidates(&run.id).await?);
+            result_review_events
+                .extend(self.list_task_result_review_events_for_run(&run.id).await?);
+        }
+        let mut thread_lineage = Vec::new();
+        for binding in &task_run_thread_bindings {
+            if thread_lineage
+                .iter()
+                .any(|lineage: &TaskThreadLineage| lineage.child_thread_id == binding.thread_id)
+            {
+                continue;
+            }
+            if let Some(lineage) =
+                thread_lineage::find_lineage_by_child_thread(&self.connection, &binding.thread_id)
+                    .await?
+            {
+                thread_lineage.push(task_thread_lineage_from_db_model(lineage));
+            }
+        }
 
         Ok(Some(TaskGetResponse {
             task,
@@ -2830,6 +2856,11 @@ impl CrudStore {
             agent_specs,
             dependencies,
             write_locks,
+            thread_lineage,
+            task_run_thread_bindings,
+            task_run_turns,
+            result_candidates,
+            result_review_events,
         }))
     }
 
@@ -3931,6 +3962,15 @@ impl CrudStore {
         Ok(row.map(thread_lineage_from_db_model))
     }
 
+    pub async fn get_task_thread_lineage(
+        &self,
+        child_thread_id: &str,
+    ) -> Result<Option<TaskThreadLineage>> {
+        let row =
+            thread_lineage::find_lineage_by_child_thread(&self.connection, child_thread_id).await?;
+        Ok(row.map(task_thread_lineage_from_db_model))
+    }
+
     pub async fn list_child_thread_lineage_for_parent(
         &self,
         parent_thread_id: &str,
@@ -3939,6 +3979,19 @@ impl CrudStore {
             thread_lineage::list_children_for_parent_thread(&self.connection, parent_thread_id)
                 .await?;
         Ok(rows.into_iter().map(thread_lineage_from_db_model).collect())
+    }
+
+    pub async fn list_task_thread_lineage_for_parent(
+        &self,
+        parent_thread_id: &str,
+    ) -> Result<Vec<TaskThreadLineage>> {
+        let rows =
+            thread_lineage::list_children_for_parent_thread(&self.connection, parent_thread_id)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
     }
 
     pub async fn list_thread_lineage_for_task(&self, task_id: &str) -> Result<Vec<ThreadLineage>> {
@@ -7390,6 +7443,22 @@ fn thread_lineage_from_db_model(model: pioneer_entity::thread_lineage::Model) ->
         task_run_id: model.task_run_id,
         root_thread_id: model.root_thread_id,
         depth: model.depth,
+        created_at: model.created_at.timestamp(),
+    }
+}
+
+fn task_thread_lineage_from_db_model(
+    model: pioneer_entity::thread_lineage::Model,
+) -> TaskThreadLineage {
+    TaskThreadLineage {
+        child_thread_id: model.child_thread_id,
+        parent_thread_id: model.parent_thread_id,
+        parent_turn_id: model.parent_turn_id,
+        root_thread_id: model.root_thread_id,
+        depth: model.depth,
+        origin_kind: model.origin_kind,
+        created_by_thread_id: model.created_by_thread_id,
+        created_by_turn_id: model.created_by_turn_id,
         created_at: model.created_at.timestamp(),
     }
 }

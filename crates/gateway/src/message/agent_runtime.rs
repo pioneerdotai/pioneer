@@ -138,6 +138,93 @@ impl MessageProcessor {
             }
         }
 
+        match message_future(
+            self.crud_store
+                .get_task_run_turn_by_turn(child_thread_id, child_turn_id),
+        )
+        .await
+        {
+            Ok(Some(task_run_turn)) => {
+                if let Ok(Some(lineage)) = message_future(
+                    self.crud_store
+                        .get_task_thread_lineage(task_run_turn.thread_id.as_str()),
+                )
+                .await
+                {
+                    let parent_turn_id = lineage.created_by_turn_id.or(lineage.parent_turn_id);
+                    if let Some(parent_turn_id) = parent_turn_id {
+                        let parent_thread_id = lineage
+                            .created_by_thread_id
+                            .unwrap_or(lineage.parent_thread_id);
+                        let workspace_id = if let Some(workspace_id) = workspace_id {
+                            workspace_id.to_owned()
+                        } else {
+                            match message_future(
+                                self.crud_store.get_thread_model(parent_thread_id.as_str()),
+                            )
+                            .await
+                            {
+                                Ok(Some(thread)) => thread.workspace_id,
+                                Ok(None) => {
+                                    match message_future(
+                                        self.crud_store
+                                            .get_thread_model(task_run_turn.thread_id.as_str()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(thread)) => thread.workspace_id,
+                                        Ok(None) => return None,
+                                        Err(error) => {
+                                            warn!(
+                                                child_thread_id,
+                                                child_turn_id,
+                                                error = %format!("{error:#}"),
+                                                "failed to load child thread workspace for parent timeline notification"
+                                            );
+                                            return None;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        parent_thread_id,
+                                        child_thread_id,
+                                        child_turn_id,
+                                        error = %format!("{error:#}"),
+                                        "failed to load parent thread workspace for parent timeline notification"
+                                    );
+                                    return None;
+                                }
+                            }
+                        };
+                        let target = ParentTimelineTarget {
+                            workspace_id,
+                            parent_thread_id,
+                            parent_turn_id,
+                            task_id: task_run_turn.task_id,
+                            run_id: task_run_turn.run_id,
+                            child_thread_id: task_run_turn.thread_id,
+                            child_turn_id: task_run_turn.turn_id,
+                        };
+                        self.parent_timeline_targets
+                            .lock()
+                            .await
+                            .insert(child_thread_id.to_owned(), target.clone());
+                        return Some(target);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    child_thread_id,
+                    child_turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load task run turn for parent timeline notification"
+                );
+            }
+        }
+
         let lineage =
             match message_future(self.crud_store.get_thread_lineage(child_thread_id)).await {
                 Ok(Some(lineage)) => lineage,

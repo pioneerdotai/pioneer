@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskResultReviewEvent",
+  "type": "object",
+  "properties": {
+    "candidateId": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "decision": {
+      "$ref": "#/$defs/TaskResultReviewDecision"
+    },
+    "eventKind": {
+      "$ref": "#/$defs/TaskResultReviewEventKind"
+    },
+    "feedback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskValue"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "feedbackText": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "nextTaskRunTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewerAgentSpecId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewerKind": {
+      "$ref": "#/$defs/TaskResultReviewerKind"
+    },
+    "reviewerThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewerTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewerUserId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runId": {
+      "type": "string"
+    },
+    "supersedesReviewEventId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "taskRunTurnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "candidateId",
+    "taskId",
+    "runId",
+    "taskRunTurnId",
+    "reviewerKind",
+    "eventKind",
+    "decision",
+    "createdAt"
+  ],
+  "$defs": {
+    "TaskResultReviewDecision": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "request_changes",
+        "reject",
+        "abstain",
+        "cancel"
+      ]
+    },
+    "TaskResultReviewEventKind": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "decision",
+        "override",
+        "system_auto"
+      ]
+    },
+    "TaskResultReviewerKind": {
+      "type": "string",
+      "enum": [
+        "runtime_auto",
+        "parent_agent",
+        "review_agent",
+        "user",
+        "system"
+      ]
+    },
+    "TaskValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "null"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bool"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integer"
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "number"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "list"
+            },
+            "value": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TaskValue"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "object"
+            },
+            "value": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/TaskValue"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    }
+  }
+}

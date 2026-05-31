@@ -11,10 +11,11 @@ use pioneer_protocol::{
     TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
     TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
     TaskManualActor, TaskMetadata, TaskOwnerKind, TaskPauseParams, TaskRescheduleParams,
-    TaskResult, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus, TaskStatus,
-    TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
-    ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload, constants::events,
+    TaskResult, TaskResultCandidateStatus, TaskResumeParams, TaskRetryPolicy, TaskRun,
+    TaskRunStatus, TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem,
+    TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, ToolCallStatus, ToolStoragePayload,
+    TurnItem, TurnItemEventPayload, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -200,14 +201,18 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                     .map_err(|error| format!("{error:#}"))?,
                 None => Default::default(),
             };
+            let accepted_result = run.and_then(|run| accepted_candidate_result(&response, run));
             observations.push(TerminalTaskObservation {
                 task_id: response.task.id.clone(),
                 run_id: run.map(|run| run.id.clone()),
                 title: response.task.title.clone(),
                 status: task_status_label(response.task.status),
-                summary: run
-                    .and_then(|run| run.result.as_ref())
+                summary: accepted_result
                     .and_then(|result| result.summary.clone())
+                    .or_else(|| {
+                        run.and_then(|run| run.result.as_ref())
+                            .and_then(|result| result.summary.clone())
+                    })
                     .or_else(|| {
                         response
                             .task
@@ -261,6 +266,20 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         }
         Ok(())
     }
+}
+
+fn accepted_candidate_result<'a>(
+    response: &'a TaskGetResponse,
+    run: &TaskRun,
+) -> Option<&'a TaskResult> {
+    response
+        .result_candidates
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.run_id == run.id && candidate.status == TaskResultCandidateStatus::Accepted
+        })
+        .and_then(|candidate| candidate.result.as_ref())
 }
 
 #[derive(Clone)]
@@ -629,16 +648,7 @@ impl TaskToolHandler {
             .get_task(params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let mut lineages = Vec::new();
-        for run in &response.runs {
-            let mut run_lineages = self
-                .processor
-                .crud_store
-                .list_thread_lineage_for_run(run.id.as_str())
-                .await
-                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-            lineages.append(&mut run_lineages);
-        }
+        let lineages = task_get_legacy_lineage_output(&response);
         let payload = json!({
             "task": response.task,
             "triggers": task_trigger_details_output(&response.triggers),
@@ -646,6 +656,11 @@ impl TaskToolHandler {
             "agentSpecs": response.agent_specs,
             "dependencies": response.dependencies,
             "lineage": lineages,
+            "threadLineage": response.thread_lineage,
+            "taskRunThreadBindings": response.task_run_thread_bindings,
+            "taskRunTurns": response.task_run_turns,
+            "resultCandidates": response.result_candidates,
+            "resultReviewEvents": response.result_review_events,
         });
         Ok(function_output(payload))
     }
@@ -2043,11 +2058,16 @@ async fn current_parent_task_id(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<Option<String>> {
-    Ok(processor
+    if let Some(binding) = processor
         .crud_store
-        .get_thread_lineage(context.thread_id.as_str())
+        .get_task_run_thread_binding_by_thread(context.thread_id.as_str())
         .await?
-        .map(|lineage| lineage.task_id))
+        && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
+    {
+        return Ok(Some(binding.task_id));
+    }
+
+    Ok(None)
 }
 
 async fn current_thread_model_identity(
@@ -2700,6 +2720,66 @@ fn non_waitable_item_output(item: &pioneer_protocol::TaskWaitNonWaitableItem) ->
     })
 }
 
+fn task_get_legacy_lineage_output(response: &TaskGetResponse) -> Vec<JsonValue> {
+    response
+        .task_run_thread_bindings
+        .iter()
+        .filter(|binding| binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor)
+        .filter_map(|binding| {
+            let lineage = response
+                .thread_lineage
+                .iter()
+                .find(|lineage| lineage.child_thread_id == binding.thread_id)?;
+            let child_turn_id = task_get_legacy_child_turn_id(response, binding);
+            Some(json!({
+                "childThreadId": lineage.child_thread_id.clone(),
+                "childTurnId": child_turn_id,
+                "parentThreadId": lineage.parent_thread_id.clone(),
+                "parentTurnId": lineage.parent_turn_id.clone(),
+                "taskId": binding.task_id.clone(),
+                "taskRunId": binding.run_id.clone(),
+                "rootThreadId": lineage.root_thread_id.clone(),
+                "depth": lineage.depth,
+                "createdAt": lineage.created_at,
+            }))
+        })
+        .collect()
+}
+
+fn task_get_legacy_child_turn_id(
+    response: &TaskGetResponse,
+    binding: &pioneer_protocol::TaskRunThreadBinding,
+) -> Option<String> {
+    response
+        .result_candidates
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.run_id == binding.run_id
+                && candidate.thread_id == binding.thread_id
+                && candidate.status == TaskResultCandidateStatus::Accepted
+        })
+        .map(|candidate| candidate.task_run_turn_id.as_str())
+        .and_then(|task_run_turn_id| {
+            response
+                .task_run_turns
+                .iter()
+                .find(|turn| turn.id == task_run_turn_id)
+        })
+        .or_else(|| {
+            response
+                .task_run_turns
+                .iter()
+                .filter(|turn| turn.run_id == binding.run_id && turn.thread_id == binding.thread_id)
+                .max_by(|left, right| {
+                    left.sequence
+                        .cmp(&right.sequence)
+                        .then_with(|| left.created_at.cmp(&right.created_at))
+                })
+        })
+        .map(|turn| turn.turn_id.clone())
+}
+
 fn wait_item_status(task: &Task, run: Option<&TaskRun>) -> String {
     if let Some(run) = run {
         return run_status_label(run.status);
@@ -3020,7 +3100,72 @@ mod tests {
             agent_specs: Vec::new(),
             dependencies: Vec::new(),
             write_locks: Vec::new(),
+            thread_lineage: Vec::new(),
+            task_run_thread_bindings: Vec::new(),
+            task_run_turns: Vec::new(),
+            result_candidates: Vec::new(),
+            result_review_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn task_get_legacy_lineage_output_is_derived_from_target_rows() {
+        let mut response = sample_task_response(
+            TaskStatus::Completed,
+            vec![sample_run(TaskRunStatus::Succeeded)],
+            None,
+        );
+        let run_id = response.runs[0].id.clone();
+        response
+            .thread_lineage
+            .push(pioneer_protocol::TaskThreadLineage {
+                child_thread_id: "child_thread_target".to_owned(),
+                parent_thread_id: "parent_thread".to_owned(),
+                parent_turn_id: Some("parent_turn".to_owned()),
+                root_thread_id: "parent_thread".to_owned(),
+                depth: 1,
+                origin_kind: Some("task_run".to_owned()),
+                created_by_thread_id: Some("parent_thread".to_owned()),
+                created_by_turn_id: Some("parent_turn".to_owned()),
+                created_at: 123,
+            });
+        response
+            .task_run_thread_bindings
+            .push(pioneer_protocol::TaskRunThreadBinding {
+                id: "binding_target".to_owned(),
+                task_id: response.task.id.clone(),
+                run_id: run_id.clone(),
+                execution_id: None,
+                thread_id: "child_thread_target".to_owned(),
+                binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+                created_at: 123,
+            });
+        response.task_run_turns.push(pioneer_protocol::TaskRunTurn {
+            id: "turn_target".to_owned(),
+            task_id: response.task.id.clone(),
+            run_id,
+            execution_id: None,
+            thread_id: "child_thread_target".to_owned(),
+            turn_id: "child_turn_target".to_owned(),
+            kind: pioneer_protocol::TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: pioneer_protocol::TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 123,
+            started_at: Some(123),
+            completed_at: Some(124),
+        });
+
+        let output = task_get_legacy_lineage_output(&response);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["childThreadId"], "child_thread_target");
+        assert_eq!(output[0]["childTurnId"], "child_turn_target");
+        assert_eq!(output[0]["taskId"], response.task.id);
+        assert_eq!(output[0]["taskRunId"], response.runs[0].id);
     }
 
     fn sample_task_turn_item() -> TaskTurnItem {

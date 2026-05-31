@@ -17,6 +17,20 @@
         "$ref": "#/$defs/TaskDependency"
       }
     },
+    "resultCandidates": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskResultCandidate"
+      }
+    },
+    "resultReviewEvents": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskResultReviewEvent"
+      }
+    },
     "runs": {
       "type": "array",
       "default": [],
@@ -26,6 +40,27 @@
     },
     "task": {
       "$ref": "#/$defs/Task"
+    },
+    "taskRunThreadBindings": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskRunThreadBinding"
+      }
+    },
+    "taskRunTurns": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskRunTurn"
+      }
+    },
+    "threadLineage": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskThreadLineage"
+      }
     },
     "triggers": {
       "type": "array",
@@ -1043,6 +1078,246 @@
         }
       }
     },
+    "TaskResultCandidate": {
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "diagnostics": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "extractionError": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finalReviewEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "resolvedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "round": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskResultCandidateStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "taskRunTurnId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runId",
+        "taskRunTurnId",
+        "threadId",
+        "turnId",
+        "round",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TaskResultCandidateStatus": {
+      "type": "string",
+      "enum": [
+        "pending_review",
+        "accepted",
+        "rejected",
+        "superseded",
+        "extraction_failed",
+        "cancelled"
+      ]
+    },
+    "TaskResultReviewDecision": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "request_changes",
+        "reject",
+        "abstain",
+        "cancel"
+      ]
+    },
+    "TaskResultReviewEvent": {
+      "type": "object",
+      "properties": {
+        "candidateId": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "$ref": "#/$defs/TaskResultReviewDecision"
+        },
+        "eventKind": {
+          "$ref": "#/$defs/TaskResultReviewEventKind"
+        },
+        "feedback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "feedbackText": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "nextTaskRunTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerAgentSpecId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerKind": {
+          "$ref": "#/$defs/TaskResultReviewerKind"
+        },
+        "reviewerThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerUserId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": "string"
+        },
+        "supersedesReviewEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "taskRunTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "candidateId",
+        "taskId",
+        "runId",
+        "taskRunTurnId",
+        "reviewerKind",
+        "eventKind",
+        "decision",
+        "createdAt"
+      ]
+    },
+    "TaskResultReviewEventKind": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "decision",
+        "override",
+        "system_auto"
+      ]
+    },
+    "TaskResultReviewerKind": {
+      "type": "string",
+      "enum": [
+        "runtime_auto",
+        "parent_agent",
+        "review_agent",
+        "user",
+        "system"
+      ]
+    },
     "TaskRetryBackoffKind": {
       "type": "string",
       "enum": [
@@ -1229,6 +1504,162 @@
         "timed_out"
       ]
     },
+    "TaskRunThreadBinding": {
+      "type": "object",
+      "properties": {
+        "bindingKind": {
+          "$ref": "#/$defs/TaskRunThreadBindingKind"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "executionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runId",
+        "threadId",
+        "bindingKind",
+        "createdAt"
+      ]
+    },
+    "TaskRunThreadBindingKind": {
+      "type": "string",
+      "enum": [
+        "primary_executor",
+        "reviewer",
+        "recovery"
+      ]
+    },
+    "TaskRunTurn": {
+      "type": "object",
+      "properties": {
+        "completedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "executionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskRunTurnKind"
+        },
+        "requestedByCandidateId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedByReviewEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewsCandidateId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "round": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runId": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "startedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskRunTurnStatus"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "runId",
+        "threadId",
+        "turnId",
+        "kind",
+        "round",
+        "sequence",
+        "status",
+        "createdAt"
+      ]
+    },
+    "TaskRunTurnKind": {
+      "type": "string",
+      "enum": [
+        "initial",
+        "revision",
+        "recovery",
+        "review"
+      ]
+    },
+    "TaskRunTurnStatus": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "candidate_created",
+        "review_recorded",
+        "failed",
+        "interrupted",
+        "cancelled"
+      ]
+    },
     "TaskSchema": {
       "type": "object",
       "properties": {
@@ -1263,6 +1694,59 @@
         "completed",
         "failed",
         "cancelled"
+      ]
+    },
+    "TaskThreadLineage": {
+      "type": "object",
+      "properties": {
+        "childThreadId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "createdByThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdByTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "originKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentThreadId": {
+          "type": "string"
+        },
+        "parentTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootThreadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "childThreadId",
+        "parentThreadId",
+        "rootThreadId",
+        "depth",
+        "createdAt"
       ]
     },
     "TaskTimeoutPolicy": {

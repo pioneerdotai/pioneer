@@ -1,6 +1,7 @@
 use super::*;
 use pioneer_protocol::{
-    TaskAttachmentMode, TaskEvent, TaskEventPayload, TaskGetResponse, ThreadLineage, TurnKind,
+    TaskAttachmentMode, TaskEvent, TaskEventPayload, TaskGetResponse, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskThreadLineage, ThreadLineage, TurnKind,
 };
 
 impl MessageProcessor {
@@ -854,15 +855,20 @@ impl MessageProcessor {
                 }
                 for lineage in self
                     .crud_store
-                    .list_child_thread_lineage_for_parent(params.thread_id.as_str())
+                    .list_task_thread_lineage_for_parent(params.thread_id.as_str())
                     .await?
                 {
-                    if lineage_targets_turn(
+                    if task_thread_lineage_targets_turn(
                         &lineage,
                         params.thread_id.as_str(),
                         params.turn_id.as_str(),
-                    ) {
-                        task_anchor_ids.insert(lineage.task_id);
+                    ) && let Some(binding) = self
+                        .crud_store
+                        .get_task_run_thread_binding_by_thread(lineage.child_thread_id.as_str())
+                        .await?
+                        && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
+                    {
+                        task_anchor_ids.insert(binding.task_id);
                     }
                 }
             }
@@ -903,10 +909,6 @@ impl MessageProcessor {
                     .cloned()
                     .unwrap_or_else(|| task_id.clone());
                 let task_response = self.crud_store.get_task(task_id.as_str()).await?;
-                let lineages = self
-                    .crud_store
-                    .list_thread_lineage_for_task(task_id.as_str())
-                    .await?;
                 let task_events = self
                     .crud_store
                     .get_task_events(task_id.as_str(), None)
@@ -918,7 +920,6 @@ impl MessageProcessor {
                         &requested_turn,
                         params.thread_id.as_str(),
                         params.turn_id.as_str(),
-                        lineages.as_slice(),
                     ) {
                         continue;
                     }
@@ -947,9 +948,13 @@ impl MessageProcessor {
                 }
 
                 let max_child_items = params.max_child_items_per_task.unwrap_or(100) as usize;
-                for lineage in lineages {
-                    if !lineage_targets_turn(
-                        &lineage,
+                let Some(task_response) = task_response.as_ref() else {
+                    continue;
+                };
+                for task_run_turn in &task_response.task_run_turns {
+                    if !task_run_turn_targets_turn(
+                        task_response,
+                        task_run_turn,
                         params.thread_id.as_str(),
                         params.turn_id.as_str(),
                     ) {
@@ -958,8 +963,8 @@ impl MessageProcessor {
                     let Some(mut child_items) = self
                         .crud_store
                         .get_turn_item_events(
-                            lineage.child_thread_id.as_str(),
-                            lineage.child_turn_id.as_str(),
+                            task_run_turn.thread_id.as_str(),
+                            task_run_turn.turn_id.as_str(),
                         )
                         .await?
                     else {
@@ -977,9 +982,9 @@ impl MessageProcessor {
                             TimelineOriginKind::ChildTurn,
                             lane,
                             Some(grouped_task_id.clone()),
-                            Some(lineage.task_run_id.clone()),
-                            Some(lineage.child_thread_id.clone()),
-                            Some(lineage.child_turn_id.clone()),
+                            Some(task_run_turn.run_id.clone()),
+                            Some(task_run_turn.thread_id.clone()),
+                            Some(task_run_turn.turn_id.clone()),
                             event,
                         ));
                     }
@@ -1031,19 +1036,16 @@ fn task_event_targets_turn(
     requested_turn: &pioneer_protocol::Turn,
     thread_id: &str,
     turn_id: &str,
-    lineages: &[ThreadLineage],
 ) -> bool {
     if let Some(run_id) = event.run_id.as_deref() {
         if requested_turn.turn_kind == TurnKind::TaskRun && run_id == turn_id {
             return true;
         }
-        if lineages.iter().any(|lineage| {
-            lineage.task_run_id == run_id && lineage_targets_turn(lineage, thread_id, turn_id)
-        }) {
-            return true;
-        }
         return response
-            .map(|response| task_run_uses_creation_turn(response, run_id, turn_id))
+            .map(|response| {
+                task_run_targets_turn(response, run_id, thread_id, turn_id)
+                    || task_run_uses_creation_turn(response, run_id, turn_id)
+            })
             .unwrap_or(false);
     }
 
@@ -1069,6 +1071,55 @@ fn task_event_targets_turn(
 
 fn lineage_targets_turn(lineage: &ThreadLineage, thread_id: &str, turn_id: &str) -> bool {
     lineage.parent_thread_id == thread_id && lineage.parent_turn_id.as_deref() == Some(turn_id)
+}
+
+fn task_run_targets_turn(
+    response: &TaskGetResponse,
+    run_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    response
+        .task_run_thread_bindings
+        .iter()
+        .filter(|binding| {
+            binding.run_id == run_id
+                && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
+        })
+        .any(|binding| {
+            response.thread_lineage.iter().any(|lineage| {
+                lineage.child_thread_id == binding.thread_id
+                    && task_thread_lineage_targets_turn(lineage, thread_id, turn_id)
+            })
+        })
+}
+
+fn task_run_turn_targets_turn(
+    response: &TaskGetResponse,
+    task_run_turn: &TaskRunTurn,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    response.thread_lineage.iter().any(|lineage| {
+        lineage.child_thread_id == task_run_turn.thread_id
+            && task_thread_lineage_targets_turn(lineage, thread_id, turn_id)
+    })
+}
+
+fn task_thread_lineage_targets_turn(
+    lineage: &TaskThreadLineage,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    let parent_thread_id = lineage
+        .created_by_thread_id
+        .as_deref()
+        .unwrap_or(lineage.parent_thread_id.as_str());
+    let parent_turn_id = lineage
+        .created_by_turn_id
+        .as_deref()
+        .or(lineage.parent_turn_id.as_deref());
+    parent_thread_id == thread_id && parent_turn_id == Some(turn_id)
 }
 
 fn task_run_uses_creation_turn(response: &TaskGetResponse, run_id: &str, turn_id: &str) -> bool {

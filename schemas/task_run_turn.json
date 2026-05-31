@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRunTurn",
+  "type": "object",
+  "properties": {
+    "completedAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "executionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/TaskRunTurnKind"
+    },
+    "requestedByCandidateId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requestedByReviewEventId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewsCandidateId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "round": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "runId": {
+      "type": "string"
+    },
+    "sequence": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "startedAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskRunTurnStatus"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "runId",
+    "threadId",
+    "turnId",
+    "kind",
+    "round",
+    "sequence",
+    "status",
+    "createdAt"
+  ],
+  "$defs": {
+    "TaskRunTurnKind": {
+      "type": "string",
+      "enum": [
+        "initial",
+        "revision",
+        "recovery",
+        "review"
+      ]
+    },
+    "TaskRunTurnStatus": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "candidate_created",
+        "review_recorded",
+        "failed",
+        "interrupted",
+        "cancelled"
+      ]
+    }
+  }
+}

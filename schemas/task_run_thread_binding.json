@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRunThreadBinding",
+  "type": "object",
+  "properties": {
+    "bindingKind": {
+      "$ref": "#/$defs/TaskRunThreadBindingKind"
+    },
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "executionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "runId",
+    "threadId",
+    "bindingKind",
+    "createdAt"
+  ],
+  "$defs": {
+    "TaskRunThreadBindingKind": {
+      "type": "string",
+      "enum": [
+        "primary_executor",
+        "reviewer",
+        "recovery"
+      ]
+    }
+  }
+}
