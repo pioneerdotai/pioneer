@@ -10,14 +10,17 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub task_id: String,
+    #[sea_orm(unique_key = "uidx_task_run_turn_run_sequence")]
     pub run_id: String,
     pub execution_id: Option<String>,
     pub thread_id: String,
     #[sea_orm(unique)]
     pub turn_id: String,
     pub kind: String,
-    pub round: i32,
-    pub sequence: i32,
+    #[sea_orm(unique_key = "uidx_task_run_turn_candidate_round")]
+    pub round: i64,
+    #[sea_orm(unique_key = "uidx_task_run_turn_run_sequence")]
+    pub sequence: i64,
     pub status: String,
     pub reviews_candidate_id: Option<String>,
     pub requested_by_candidate_id: Option<String>,

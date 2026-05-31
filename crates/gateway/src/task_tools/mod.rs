@@ -2735,7 +2735,7 @@ fn task_get_legacy_lineage_output(response: &TaskGetResponse) -> Vec<JsonValue> 
                 "childThreadId": lineage.child_thread_id.clone(),
                 "childTurnId": child_turn_id,
                 "parentThreadId": lineage.parent_thread_id.clone(),
-                "parentTurnId": lineage.parent_turn_id.clone(),
+                "parentTurnId": lineage.created_by_turn_id.clone(),
                 "taskId": binding.task_id.clone(),
                 "taskRunId": binding.run_id.clone(),
                 "rootThreadId": lineage.root_thread_id.clone(),
@@ -3121,7 +3121,6 @@ mod tests {
             .push(pioneer_protocol::TaskThreadLineage {
                 child_thread_id: "child_thread_target".to_owned(),
                 parent_thread_id: "parent_thread".to_owned(),
-                parent_turn_id: Some("parent_turn".to_owned()),
                 root_thread_id: "parent_thread".to_owned(),
                 depth: 1,
                 origin_kind: Some("task_run".to_owned()),

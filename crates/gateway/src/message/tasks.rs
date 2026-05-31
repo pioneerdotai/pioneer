@@ -341,7 +341,8 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TaskEventPayload::ChildThreadLinked { .. } => {
+            TaskEventPayload::ChildThreadLinked { .. }
+            | TaskEventPayload::TaskThreadLineageCreated { .. } => {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,
@@ -644,6 +645,17 @@ impl MessageProcessor {
                 .as_ref()
                 .map(|turn_id| (lineage.parent_thread_id.clone(), turn_id.clone()));
         }
+        if let TaskEventPayload::TaskThreadLineageCreated { lineage, .. } = payload {
+            return lineage.created_by_turn_id.as_ref().map(|turn_id| {
+                (
+                    lineage
+                        .created_by_thread_id
+                        .clone()
+                        .unwrap_or_else(|| lineage.parent_thread_id.clone()),
+                    turn_id.clone(),
+                )
+            });
+        }
 
         self.task_run_parent_target(response, payload.run_id()?)
             .await
@@ -707,22 +719,12 @@ impl MessageProcessor {
                 .crud_store
                 .get_task_thread_lineage(binding.thread_id.as_str())
                 .await
-            && let Some(parent_turn_id) = lineage.created_by_turn_id.or(lineage.parent_turn_id)
+            && let Some(parent_turn_id) = lineage.created_by_turn_id
         {
             let parent_thread_id = lineage
                 .created_by_thread_id
                 .unwrap_or(lineage.parent_thread_id);
             return Some((parent_thread_id, parent_turn_id));
-        }
-
-        if let Ok(lineages) = self.crud_store.list_thread_lineage_for_run(run_id).await {
-            if let Some(lineage) = lineages
-                .into_iter()
-                .rev()
-                .find(|lineage| lineage.parent_turn_id.is_some())
-            {
-                return Some((lineage.parent_thread_id, lineage.parent_turn_id?));
-            }
         }
 
         let parent_thread_id = response.task.created_by_thread_id.clone()?;
@@ -823,6 +825,9 @@ async fn task_event_child_lineage(
             Some(lineage.child_thread_id.clone()),
             Some(lineage.child_turn_id.clone()),
         );
+    }
+    if let TaskEventPayload::TaskThreadLineageCreated { lineage, .. } = payload {
+        return (Some(lineage.child_thread_id.clone()), None);
     }
 
     if payload.thread_id().is_some() || payload.turn_id().is_some() {

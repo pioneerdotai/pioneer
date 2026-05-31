@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use pioneer_protocol::{
     TaskError, TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRunStatus,
-    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskValue,
+    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskValue, ThreadLineage,
 };
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
@@ -27,6 +28,19 @@ where
     F: Future<Output = Result<()>> + Send + 'a,
 {
     Box::pin(future)
+}
+
+fn target_lineage_from_legacy(lineage: &ThreadLineage) -> TaskThreadLineage {
+    TaskThreadLineage {
+        child_thread_id: lineage.child_thread_id.clone(),
+        parent_thread_id: lineage.parent_thread_id.clone(),
+        root_thread_id: lineage.root_thread_id.clone(),
+        depth: lineage.depth,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: Some(lineage.parent_thread_id.clone()),
+        created_by_turn_id: lineage.parent_turn_id.clone(),
+        created_at: lineage.created_at,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -337,7 +351,7 @@ impl TaskProjector {
             }),
             TaskEventPayload::TaskRecovered { .. } => project_future(async { Ok(()) }),
             TaskEventPayload::ChildThreadLinked { lineage } => project_future(async move {
-                thread_lineage::upsert_lineage(db, lineage).await?;
+                thread_lineage::upsert_lineage(db, &target_lineage_from_legacy(lineage)).await?;
                 let execution =
                     task_run_execution::find_execution_by_run(db, lineage.task_run_id.as_str())
                         .await?;
@@ -379,6 +393,9 @@ impl TaskProjector {
                 .await?;
                 Ok(())
             }),
+            TaskEventPayload::TaskThreadLineageCreated { lineage, .. } => {
+                project_future(thread_lineage::upsert_lineage(db, lineage))
+            }
             TaskEventPayload::TaskRunThreadBindingCreated { binding } => {
                 project_future(async move {
                     task_run_thread_binding::upsert_binding(

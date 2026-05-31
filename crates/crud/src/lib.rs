@@ -20,15 +20,15 @@ use pioneer_protocol::{
     TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus,
     TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage,
-    ThreadPlacement, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload,
-    Turn, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, UserInput, generate_id,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
+    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
+    UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -58,6 +58,120 @@ use crate::convention::{
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantSnapshot {
+    pub thread_lineage: Vec<TaskReviewInvariantThreadLineageRecord>,
+    pub primary_bindings: Vec<TaskReviewInvariantBindingRecord>,
+    pub task_run_turns: Vec<TaskReviewInvariantTurnRecord>,
+    pub task_result_candidates: Vec<TaskReviewInvariantCandidateRecord>,
+    pub task_result_review_events: Vec<TaskReviewInvariantReviewEventRecord>,
+    pub task_runs: Vec<TaskReviewInvariantRunRecord>,
+    pub turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantThreadLineageRecord {
+    pub child_thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantBindingRecord {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub execution_id: Option<String>,
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantTurnRecord {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub kind: String,
+    pub round: i64,
+    pub sequence: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantCandidateRecord {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub task_run_turn_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub round: i64,
+    pub status: String,
+    pub result_json: Option<String>,
+    pub final_review_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantReviewEventRecord {
+    pub id: String,
+    pub candidate_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub task_run_turn_id: String,
+    pub decision: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantRunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub status: String,
+    pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRuntimeInvariantSnapshot {
+    pub task_events: Vec<TaskRuntimeInvariantEventRecord>,
+    pub delivered_task_results: Vec<TaskRuntimeInvariantDeliveryRecord>,
+    pub in_progress_turns: Vec<TaskRuntimeInvariantTurnRecord>,
+    pub stale_turn_item_attempts: Vec<TaskRuntimeInvariantStaleAttemptRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRuntimeInvariantEventRecord {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: Option<String>,
+    pub sequence: i64,
+    pub event_type: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRuntimeInvariantDeliveryRecord {
+    pub delivery_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub run_status: Option<String>,
+    pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRuntimeInvariantTurnRecord {
+    pub turn_id: String,
+    pub thread_id: Option<String>,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRuntimeInvariantStaleAttemptRecord {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_status: String,
+    pub attempt_id: String,
+    pub attempt_status: String,
+    pub attempt_number: i64,
+}
+
 pub use crate::repositories::artifact::{
     ArtifactBindingTargetRecord, ArtifactBlobRecord, ArtifactCrudError, ArtifactExternalRefKey,
     ArtifactExternalRefRecord, ArtifactGcBlobCandidateRecord, ArtifactGcPlanRecord,
@@ -165,12 +279,6 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
         );
     }
 
-    let (child_thread_id, child_turn_id) = if executor_kind == TaskExecutorKind::Agent {
-        (Some(generate_id(DB_ID_LEN)), Some(generate_id(DB_ID_LEN)))
-    } else {
-        (None, None)
-    };
-
     task_run_execution::insert_execution_if_absent(
         db,
         task_run_execution::NewTaskRunExecution {
@@ -182,8 +290,6 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
             worker_id: None,
             lease_until: None,
             heartbeat_at: None,
-            child_thread_id,
-            child_turn_id,
             started_at: None,
             completed_at: None,
             result: None,
@@ -3561,21 +3667,260 @@ impl CrudStore {
                 .map(|turn| turn.turn_id.clone())
                 .or_else(|| latest_turn.as_ref().map(|turn| turn.turn_id.clone())),
         };
-        if target_anchor.child_thread_id.is_some() || target_anchor.child_turn_id.is_some() {
-            return Ok(target_anchor);
-        }
+        Ok(target_anchor)
+    }
 
-        Ok(
-            thread_lineage::list_lineage_for_run(&self.connection, run_id)
-                .await?
-                .into_iter()
-                .last()
-                .map(|lineage| TaskRunChildAnchor {
-                    child_thread_id: Some(lineage.child_thread_id),
-                    child_turn_id: Some(lineage.child_turn_id),
+    pub async fn count_task_run_executions_for_run(&self, run_id: &str) -> Result<u64> {
+        task_run_execution::count_executions_by_run(&self.connection, run_id).await
+    }
+
+    pub async fn load_task_runtime_invariant_snapshot(
+        &self,
+    ) -> Result<TaskRuntimeInvariantSnapshot> {
+        let task_events = pioneer_entity::task_event::Entity::find()
+            .order_by_asc(pioneer_entity::task_event::Column::TaskId)
+            .order_by_asc(pioneer_entity::task_event::Column::Sequence)
+            .all(&self.connection)
+            .await
+            .context("failed to load task events for runtime invariant scan")?
+            .into_iter()
+            .map(|row| TaskRuntimeInvariantEventRecord {
+                id: row.id,
+                task_id: row.task_id,
+                run_id: row.run_id,
+                sequence: row.sequence,
+                event_type: row.event_type,
+                payload_json: row.payload_json,
+            })
+            .collect::<Vec<_>>();
+
+        let task_runs_by_id = pioneer_entity::task_run::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("failed to load task runs for runtime invariant scan")?
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let delivered_task_results = pioneer_entity::task_delivery::Entity::find()
+            .filter(pioneer_entity::task_delivery::Column::Status.eq("delivered"))
+            .order_by_asc(pioneer_entity::task_delivery::Column::CreatedAt)
+            .all(&self.connection)
+            .await
+            .context("failed to load delivered task deliveries for runtime invariant scan")?
+            .into_iter()
+            .map(|delivery| {
+                let run = task_runs_by_id.get(delivery.run_id.as_str());
+                TaskRuntimeInvariantDeliveryRecord {
+                    delivery_id: delivery.id,
+                    task_id: delivery.task_id,
+                    run_id: delivery.run_id,
+                    run_status: run.map(|run| run.status.clone()),
+                    result_json: run.and_then(|run| run.result_json.clone()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let in_progress_turns = pioneer_entity::turn::Entity::find()
+            .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
+            .order_by_asc(pioneer_entity::turn::Column::UpdatedAt)
+            .all(&self.connection)
+            .await
+            .context("failed to load in-progress turns for runtime invariant scan")?
+            .into_iter()
+            .map(|row| TaskRuntimeInvariantTurnRecord {
+                turn_id: row.id,
+                thread_id: Some(row.thread_id),
+                updated_at_unix: row.updated_at.timestamp(),
+            })
+            .collect::<Vec<_>>();
+
+        let terminal_items = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                TURN_ITEM_STATUS_COMPLETED,
+                TURN_ITEM_STATUS_FAILED,
+                TURN_ITEM_STATUS_TIMED_OUT,
+                TURN_ITEM_STATUS_CANCELLED,
+            ]))
+            .all(&self.connection)
+            .await
+            .context("failed to load terminal turn items for runtime invariant scan")?
+            .into_iter()
+            .filter_map(|row| {
+                let status = row.status?;
+                Some(((row.turn_id, row.item_id), status))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let stale_turn_item_attempts = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(
+                pioneer_entity::turn_item_attempt::Column::Status
+                    .is_in([ATTEMPT_STATUS_RUNNING, TURN_ITEM_STATUS_TIMED_OUT]),
+            )
+            .order_by_asc(pioneer_entity::turn_item_attempt::Column::TurnId)
+            .order_by_asc(pioneer_entity::turn_item_attempt::Column::ItemId)
+            .order_by_asc(pioneer_entity::turn_item_attempt::Column::AttemptNumber)
+            .all(&self.connection)
+            .await
+            .context("failed to load turn item attempts for runtime invariant scan")?
+            .into_iter()
+            .filter_map(|attempt| {
+                let key = (attempt.turn_id.clone(), attempt.item_id.clone());
+                let item_status = terminal_items.get(&key)?;
+                Some(TaskRuntimeInvariantStaleAttemptRecord {
+                    turn_id: attempt.turn_id,
+                    item_id: attempt.item_id,
+                    item_status: item_status.clone(),
+                    attempt_id: attempt.id,
+                    attempt_status: attempt.status,
+                    attempt_number: attempt.attempt_number,
                 })
-                .unwrap_or_default(),
-        )
+            })
+            .collect::<Vec<_>>();
+
+        Ok(TaskRuntimeInvariantSnapshot {
+            task_events,
+            delivered_task_results,
+            in_progress_turns,
+            stale_turn_item_attempts,
+        })
+    }
+
+    pub async fn load_task_review_invariant_snapshot(
+        &self,
+    ) -> Result<Option<TaskReviewInvariantSnapshot>> {
+        let thread_lineage = match pioneer_entity::thread_lineage::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantThreadLineageRecord {
+                    child_thread_id: row.child_thread_id,
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task review thread lineage"),
+        };
+        let primary_bindings = match pioneer_entity::task_run_thread_binding::Entity::find()
+            .filter(
+                pioneer_entity::task_run_thread_binding::Column::BindingKind.eq("primary_executor"),
+            )
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantBindingRecord {
+                    id: row.id,
+                    task_id: row.task_id,
+                    run_id: row.run_id,
+                    execution_id: row.execution_id,
+                    thread_id: row.thread_id,
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).context("failed to load task review thread bindings");
+            }
+        };
+        let task_run_turns = match pioneer_entity::task_run_turn::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantTurnRecord {
+                    id: row.id,
+                    task_id: row.task_id,
+                    run_id: row.run_id,
+                    thread_id: row.thread_id,
+                    turn_id: row.turn_id,
+                    kind: row.kind,
+                    round: i64::from(row.round),
+                    sequence: i64::from(row.sequence),
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task review turns"),
+        };
+        let task_result_candidates = match pioneer_entity::task_result_candidate::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantCandidateRecord {
+                    id: row.id,
+                    task_id: row.task_id,
+                    run_id: row.run_id,
+                    task_run_turn_id: row.task_run_turn_id,
+                    thread_id: row.thread_id,
+                    turn_id: row.turn_id,
+                    round: i64::from(row.round),
+                    status: row.status,
+                    result_json: row.result_json,
+                    final_review_event_id: row.final_review_event_id,
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task result candidates"),
+        };
+        let task_result_review_events =
+            match pioneer_entity::task_result_review_event::Entity::find()
+                .all(&self.connection)
+                .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| TaskReviewInvariantReviewEventRecord {
+                        id: row.id,
+                        candidate_id: row.candidate_id,
+                        task_id: row.task_id,
+                        run_id: row.run_id,
+                        task_run_turn_id: row.task_run_turn_id,
+                        decision: row.decision,
+                    })
+                    .collect(),
+                Err(error) if is_missing_table_error(&error) => return Ok(None),
+                Err(error) => {
+                    return Err(error).context("failed to load task result review events");
+                }
+            };
+        let task_runs = match pioneer_entity::task_run::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantRunRecord {
+                    id: row.id,
+                    task_id: row.task_id,
+                    status: row.status,
+                    result_json: row.result_json,
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task runs"),
+        };
+        let turn_ids = match pioneer_entity::turn::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load turn ids"),
+        };
+
+        Ok(Some(TaskReviewInvariantSnapshot {
+            thread_lineage,
+            primary_bindings,
+            task_run_turns,
+            task_result_candidates,
+            task_result_review_events,
+            task_runs,
+            turn_ids,
+        }))
     }
 
     pub async fn claim_task_run_for_dispatch(
@@ -3956,12 +4301,6 @@ impl CrudStore {
         Ok(TaskAgendaResponse { items })
     }
 
-    pub async fn get_thread_lineage(&self, child_thread_id: &str) -> Result<Option<ThreadLineage>> {
-        let row =
-            thread_lineage::find_lineage_by_child_thread(&self.connection, child_thread_id).await?;
-        Ok(row.map(thread_lineage_from_db_model))
-    }
-
     pub async fn get_task_thread_lineage(
         &self,
         child_thread_id: &str,
@@ -3969,16 +4308,6 @@ impl CrudStore {
         let row =
             thread_lineage::find_lineage_by_child_thread(&self.connection, child_thread_id).await?;
         Ok(row.map(task_thread_lineage_from_db_model))
-    }
-
-    pub async fn list_child_thread_lineage_for_parent(
-        &self,
-        parent_thread_id: &str,
-    ) -> Result<Vec<ThreadLineage>> {
-        let rows =
-            thread_lineage::list_children_for_parent_thread(&self.connection, parent_thread_id)
-                .await?;
-        Ok(rows.into_iter().map(thread_lineage_from_db_model).collect())
     }
 
     pub async fn list_task_thread_lineage_for_parent(
@@ -3994,23 +4323,16 @@ impl CrudStore {
             .collect())
     }
 
-    pub async fn list_thread_lineage_for_task(&self, task_id: &str) -> Result<Vec<ThreadLineage>> {
-        let rows = thread_lineage::list_lineage_for_task(&self.connection, task_id).await?;
-        Ok(rows.into_iter().map(thread_lineage_from_db_model).collect())
-    }
-
-    pub async fn list_thread_lineage_for_run(&self, run_id: &str) -> Result<Vec<ThreadLineage>> {
-        let rows = thread_lineage::list_lineage_for_run(&self.connection, run_id).await?;
-        Ok(rows.into_iter().map(thread_lineage_from_db_model).collect())
-    }
-
-    pub async fn list_thread_lineage_by_root_thread(
+    pub async fn list_task_thread_lineage_by_root_thread(
         &self,
         root_thread_id: &str,
-    ) -> Result<Vec<ThreadLineage>> {
+    ) -> Result<Vec<TaskThreadLineage>> {
         let rows =
             thread_lineage::list_lineage_by_root_thread(&self.connection, root_thread_id).await?;
-        Ok(rows.into_iter().map(thread_lineage_from_db_model).collect())
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
     }
 
     pub async fn get_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<(String, Turn)>> {
@@ -7218,8 +7540,6 @@ fn task_run_execution_from_db_model(
         worker_id: model.worker_id,
         lease_until: model.lease_until.map(|value| value.timestamp()),
         heartbeat_at: model.heartbeat_at.map(|value| value.timestamp()),
-        child_thread_id: model.child_thread_id,
-        child_turn_id: model.child_turn_id,
         started_at: model.started_at.map(|value| value.timestamp()),
         completed_at: model.completed_at.map(|value| value.timestamp()),
         result: optional_typed_json_from_db(model.result_json)?,
@@ -7433,27 +7753,12 @@ fn task_write_lock_from_db_model(
     })
 }
 
-fn thread_lineage_from_db_model(model: pioneer_entity::thread_lineage::Model) -> ThreadLineage {
-    ThreadLineage {
-        child_thread_id: model.child_thread_id,
-        child_turn_id: model.child_turn_id,
-        parent_thread_id: model.parent_thread_id,
-        parent_turn_id: model.parent_turn_id,
-        task_id: model.task_id,
-        task_run_id: model.task_run_id,
-        root_thread_id: model.root_thread_id,
-        depth: model.depth,
-        created_at: model.created_at.timestamp(),
-    }
-}
-
 fn task_thread_lineage_from_db_model(
     model: pioneer_entity::thread_lineage::Model,
 ) -> TaskThreadLineage {
     TaskThreadLineage {
         child_thread_id: model.child_thread_id,
         parent_thread_id: model.parent_thread_id,
-        parent_turn_id: model.parent_turn_id,
         root_thread_id: model.root_thread_id,
         depth: model.depth,
         origin_kind: model.origin_kind,
@@ -7461,6 +7766,11 @@ fn task_thread_lineage_from_db_model(
         created_by_turn_id: model.created_by_turn_id,
         created_at: model.created_at.timestamp(),
     }
+}
+
+fn is_missing_table_error(error: &DbErr) -> bool {
+    let message = error.to_string();
+    message.contains("no such table") || message.contains("no table found")
 }
 
 fn trigger_timezone(spec: &TaskTriggerSpec) -> Option<String> {
@@ -8497,30 +8807,6 @@ mod tests {
                 .map(|event| event.id)
                 .collect::<Vec<_>>(),
             vec!["review_helpers_first", "review_helpers_second"]
-        );
-    }
-
-    #[tokio::test]
-    async fn task_run_child_anchor_falls_back_to_legacy_lineage() {
-        let store = test_store_with_workspace("ws_task_review_anchor_fallback").await;
-        store
-            .database_connection()
-            .execute_unprepared(
-                "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-                 values ('child_thread_anchor_fallback', 'child_turn_anchor_fallback', 'parent_thread_anchor_fallback', 'parent_turn_anchor_fallback', 'task_anchor_fallback', 'run_anchor_fallback', 'root_thread_anchor_fallback', 1, '2026-05-15 00:00:00')"
-            )
-            .await
-            .expect("legacy lineage insert should succeed");
-
-        assert_eq!(
-            store
-                .get_task_run_child_anchor("run_anchor_fallback")
-                .await
-                .expect("fallback anchor should load"),
-            TaskRunChildAnchor {
-                child_thread_id: Some("child_thread_anchor_fallback".to_owned()),
-                child_turn_id: Some("child_turn_anchor_fallback".to_owned())
-            }
         );
     }
 

@@ -418,6 +418,7 @@ impl TaskEventPayload {
             | Self::TaskResumed { .. }
             | Self::TaskRecovered { .. }
             | Self::ChildThreadLinked { .. }
+            | Self::TaskThreadLineageCreated { .. }
             | Self::TaskRunThreadBindingCreated { .. }
             | Self::TaskRunTurnStarted { .. }
             | Self::TaskRunTurnCompleted { .. }

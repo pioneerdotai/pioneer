@@ -24,6 +24,7 @@ pub struct Model {
     pub feedback_text: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub feedback_json: Option<String>,
+    #[sea_orm(column_type = "Double", nullable)]
     pub confidence: Option<f64>,
     pub supersedes_review_event_id: Option<String>,
     pub next_task_run_turn_id: Option<String>,

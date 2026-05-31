@@ -10,12 +10,14 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub task_id: String,
+    #[sea_orm(unique)]
     pub run_id: String,
     #[sea_orm(unique)]
     pub task_run_turn_id: String,
     pub thread_id: String,
     pub turn_id: String,
-    pub round: i32,
+    #[sea_orm(unique_key = "uidx_task_result_candidate_run_round")]
+    pub round: i64,
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub result_json: Option<String>,

@@ -9,18 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub child_thread_id: String,
-    pub child_turn_id: String,
     pub parent_thread_id: String,
-    pub parent_turn_id: Option<String>,
-    pub task_id: String,
-    #[sea_orm(unique)]
-    pub task_run_id: String,
     pub root_thread_id: String,
     pub depth: i64,
+    pub created_at: DateTimeWithTimeZone,
     pub origin_kind: Option<String>,
     pub created_by_thread_id: Option<String>,
     pub created_by_turn_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

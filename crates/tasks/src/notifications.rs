@@ -66,6 +66,7 @@ impl TaskNotificationMapper {
             TaskEventPayload::DependencyCreated { .. }
             | TaskEventPayload::AgentSpecCreated { .. }
             | TaskEventPayload::ChildThreadLinked { .. }
+            | TaskEventPayload::TaskThreadLineageCreated { .. }
             | TaskEventPayload::DepthLimitExceeded { .. } => events::TASK_TREE_CHANGED,
         }
     }

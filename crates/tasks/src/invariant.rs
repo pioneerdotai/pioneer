@@ -1,13 +1,17 @@
 use anyhow::{Context, Result};
-use pioneer_crud::CrudStore;
+use pioneer_crud::{
+    CrudStore, TaskRuntimeInvariantDeliveryRecord, TaskRuntimeInvariantEventRecord,
+    TaskRuntimeInvariantSnapshot, TaskRuntimeInvariantStaleAttemptRecord,
+    TaskRuntimeInvariantTurnRecord,
+};
 use pioneer_protocol::{TaskEventPayload, TaskResult, TaskValue};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, QueryResult, Statement};
+use sea_orm::{ConnectOptions, Database};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
-mod task_review_migration;
+mod task_review_invariants;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,31 +81,6 @@ pub enum TaskRuntimeInvariantViolationKind {
         attempt_number: Option<i64>,
         reason: String,
     },
-    LineageMissingForChildLinkEvent {
-        task_id: String,
-        run_id: String,
-        event_id: String,
-        sequence: i64,
-        child_thread_id: String,
-        child_turn_id: String,
-    },
-    ChildLinkEventCanonicalLineageMismatch {
-        task_id: String,
-        run_id: String,
-        event_id: String,
-        sequence: i64,
-        event_child_thread_id: String,
-        event_child_turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        canonical_child_thread_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        canonical_child_turn_id: Option<String>,
-    },
-    MissingPrimaryExecutorBinding {
-        task_id: String,
-        run_id: String,
-        child_thread_id: String,
-    },
     PrimaryExecutorBindingMissingLineage {
         task_id: String,
         run_id: String,
@@ -114,80 +93,17 @@ pub enum TaskRuntimeInvariantViolationKind {
         binding_id: String,
         thread_id: String,
     },
-    PrimaryExecutorBindingLineageMismatch {
-        task_id: String,
-        run_id: String,
-        binding_id: String,
-        binding_thread_id: String,
-        lineage_child_thread_id: String,
-    },
-    PrimaryExecutorBindingExecutionMismatch {
-        task_id: String,
-        run_id: String,
-        execution_id: String,
-        binding_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        binding_execution_id: Option<String>,
-        binding_thread_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        execution_child_thread_id: Option<String>,
-    },
     MultiplePrimaryExecutorBindingsForRun {
         task_id: String,
         run_id: String,
         binding_ids: Vec<String>,
     },
-    LineageChildTurnMissingTurn {
-        task_id: String,
-        run_id: String,
-        child_thread_id: String,
-        child_turn_id: String,
-    },
-    ExecutionChildTurnMissingTurn {
-        task_id: String,
-        run_id: String,
-        execution_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        child_thread_id: Option<String>,
-        child_turn_id: String,
-    },
-    LineageMissingTaskRunTurn {
-        task_id: String,
-        run_id: String,
-        child_thread_id: String,
-        child_turn_id: String,
-    },
-    TaskRunTurnLineageMismatch {
+    TaskRunTurnMissingLineage {
         task_id: String,
         run_id: String,
         task_run_turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target_thread_id: Option<String>,
-        target_turn_id: String,
-        lineage_child_thread_id: String,
-        lineage_child_turn_id: String,
-    },
-    ExecutionMissingTaskRunTurn {
-        task_id: String,
-        run_id: String,
-        execution_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        child_thread_id: Option<String>,
-        child_turn_id: String,
-    },
-    TaskRunTurnExecutionMismatch {
-        task_id: String,
-        run_id: String,
-        execution_id: String,
-        task_run_turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target_execution_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target_thread_id: Option<String>,
-        target_turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        execution_child_thread_id: Option<String>,
-        child_turn_id: String,
+        thread_id: String,
+        turn_id: String,
     },
     TaskRunTurnMissingTurn {
         task_id: String,
@@ -305,32 +221,16 @@ impl TaskRuntimeInvariantViolationKind {
             Self::DeliveryPointsToInvalidResult { .. } => "delivery_points_to_invalid_result",
             Self::StaleInProgressTurn { .. } => "stale_in_progress_turn",
             Self::StaleTurnItemAttempt { .. } => "stale_turn_item_attempt",
-            Self::LineageMissingForChildLinkEvent { .. } => "lineage_missing_for_child_link_event",
-            Self::ChildLinkEventCanonicalLineageMismatch { .. } => {
-                "child_link_event_canonical_lineage_mismatch"
-            }
-            Self::MissingPrimaryExecutorBinding { .. } => "missing_primary_executor_binding",
             Self::PrimaryExecutorBindingMissingLineage { .. } => {
                 "primary_executor_binding_missing_lineage"
             }
             Self::PrimaryExecutorBindingMissingExecution { .. } => {
                 "primary_executor_binding_missing_execution"
             }
-            Self::PrimaryExecutorBindingLineageMismatch { .. } => {
-                "primary_executor_binding_lineage_mismatch"
-            }
-            Self::PrimaryExecutorBindingExecutionMismatch { .. } => {
-                "primary_executor_binding_execution_mismatch"
-            }
             Self::MultiplePrimaryExecutorBindingsForRun { .. } => {
                 "multiple_primary_executor_bindings_for_run"
             }
-            Self::LineageChildTurnMissingTurn { .. } => "lineage_child_turn_missing_turn",
-            Self::ExecutionChildTurnMissingTurn { .. } => "execution_child_turn_missing_turn",
-            Self::LineageMissingTaskRunTurn { .. } => "lineage_missing_task_run_turn",
-            Self::TaskRunTurnLineageMismatch { .. } => "task_run_turn_lineage_mismatch",
-            Self::ExecutionMissingTaskRunTurn { .. } => "execution_missing_task_run_turn",
-            Self::TaskRunTurnExecutionMismatch { .. } => "task_run_turn_execution_mismatch",
+            Self::TaskRunTurnMissingLineage { .. } => "task_run_turn_missing_lineage",
             Self::TaskRunTurnMissingTurn { .. } => "task_run_turn_missing_turn",
             Self::AcceptedCandidateMissingTurn { .. } => "accepted_candidate_missing_turn",
             Self::SucceededRunMissingAcceptedCandidate { .. } => {
@@ -368,20 +268,10 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::InvalidDeliveredTaskResult { .. }
             | Self::DeliveryPointsToInvalidResult { .. }
             | Self::StaleTurnItemAttempt { .. }
-            | Self::LineageMissingForChildLinkEvent { .. }
-            | Self::ChildLinkEventCanonicalLineageMismatch { .. }
-            | Self::MissingPrimaryExecutorBinding { .. }
             | Self::PrimaryExecutorBindingMissingLineage { .. }
             | Self::PrimaryExecutorBindingMissingExecution { .. }
-            | Self::PrimaryExecutorBindingLineageMismatch { .. }
-            | Self::PrimaryExecutorBindingExecutionMismatch { .. }
             | Self::MultiplePrimaryExecutorBindingsForRun { .. }
-            | Self::LineageChildTurnMissingTurn { .. }
-            | Self::ExecutionChildTurnMissingTurn { .. }
-            | Self::LineageMissingTaskRunTurn { .. }
-            | Self::TaskRunTurnLineageMismatch { .. }
-            | Self::ExecutionMissingTaskRunTurn { .. }
-            | Self::TaskRunTurnExecutionMismatch { .. }
+            | Self::TaskRunTurnMissingLineage { .. }
             | Self::TaskRunTurnMissingTurn { .. }
             | Self::AcceptedCandidateMissingTurn { .. }
             | Self::SucceededRunMissingAcceptedCandidate { .. }
@@ -409,20 +299,10 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::MultipleChildThreadLinksForRun { task_id, .. }
             | Self::InvalidDeliveredTaskResult { task_id, .. }
             | Self::DeliveryPointsToInvalidResult { task_id, .. }
-            | Self::LineageMissingForChildLinkEvent { task_id, .. }
-            | Self::ChildLinkEventCanonicalLineageMismatch { task_id, .. }
-            | Self::MissingPrimaryExecutorBinding { task_id, .. }
             | Self::PrimaryExecutorBindingMissingLineage { task_id, .. }
             | Self::PrimaryExecutorBindingMissingExecution { task_id, .. }
-            | Self::PrimaryExecutorBindingLineageMismatch { task_id, .. }
-            | Self::PrimaryExecutorBindingExecutionMismatch { task_id, .. }
             | Self::MultiplePrimaryExecutorBindingsForRun { task_id, .. }
-            | Self::LineageChildTurnMissingTurn { task_id, .. }
-            | Self::ExecutionChildTurnMissingTurn { task_id, .. }
-            | Self::LineageMissingTaskRunTurn { task_id, .. }
-            | Self::TaskRunTurnLineageMismatch { task_id, .. }
-            | Self::ExecutionMissingTaskRunTurn { task_id, .. }
-            | Self::TaskRunTurnExecutionMismatch { task_id, .. }
+            | Self::TaskRunTurnMissingLineage { task_id, .. }
             | Self::TaskRunTurnMissingTurn { task_id, .. }
             | Self::AcceptedCandidateMissingTurn { task_id, .. }
             | Self::SucceededRunMissingAcceptedCandidate { task_id, .. }
@@ -574,8 +454,10 @@ impl TaskRuntimeInvariantScanner {
         store: &CrudStore,
         observed_at_unix: i64,
     ) -> Result<TaskRuntimeInvariantReport> {
-        self.scan_connection(&store.database_connection(), observed_at_unix)
-            .await
+        let snapshot = store.load_task_runtime_invariant_snapshot().await?;
+        let mut report = self.scan_snapshot(&snapshot, observed_at_unix)?;
+        task_review_invariants::detect_task_review_violations(store, &mut report).await?;
+        Ok(report)
     }
 
     pub async fn scan_sqlite_path(
@@ -592,27 +474,31 @@ impl TaskRuntimeInvariantScanner {
                 db_path.display()
             )
         })?;
-        let mut report = self.scan_connection(&connection, observed_at_unix).await?;
+        let store = CrudStore::new(connection);
+        let mut report = self.scan_store(&store, observed_at_unix).await?;
         report.db_path = Some(db_path.display().to_string());
         Ok(report)
     }
 
-    pub async fn scan_connection<C: ConnectionTrait>(
+    fn scan_snapshot(
         &self,
-        db: &C,
+        snapshot: &TaskRuntimeInvariantSnapshot,
         observed_at_unix: i64,
     ) -> Result<TaskRuntimeInvariantReport> {
         let mut report = TaskRuntimeInvariantReport::new().with_generated_at(observed_at_unix);
-        let events = load_task_events(db).await?;
+        let events = load_task_events(snapshot.task_events.as_slice())?;
         self.detect_duplicate_lifecycle_events(&events, &mut report);
-        self.detect_child_link_violations(db, &events, &mut report)
-            .await?;
-        self.detect_invalid_deliveries(db, &mut report).await?;
-        self.detect_stale_turns(db, observed_at_unix, &mut report)
-            .await?;
-        self.detect_stale_turn_item_attempts(db, &mut report)
-            .await?;
-        task_review_migration::detect_migration_violations(db, &mut report).await?;
+        self.detect_child_link_violations(&events, &mut report);
+        self.detect_invalid_deliveries(snapshot.delivered_task_results.as_slice(), &mut report)?;
+        self.detect_stale_turns(
+            snapshot.in_progress_turns.as_slice(),
+            observed_at_unix,
+            &mut report,
+        );
+        self.detect_stale_turn_item_attempts(
+            snapshot.stale_turn_item_attempts.as_slice(),
+            &mut report,
+        );
         Ok(report)
     }
 
@@ -652,13 +538,11 @@ impl TaskRuntimeInvariantScanner {
         }
     }
 
-    async fn detect_child_link_violations<C: ConnectionTrait>(
+    fn detect_child_link_violations(
         &self,
-        db: &C,
         events: &[TaskEventScanRow],
         report: &mut TaskRuntimeInvariantReport,
-    ) -> Result<()> {
-        let lineage_by_run = load_thread_lineage_by_run(db).await?;
+    ) {
         let mut links_by_run: BTreeMap<String, Vec<(&TaskEventScanRow, TaskRuntimeChildLinkRef)>> =
             BTreeMap::new();
 
@@ -676,39 +560,6 @@ impl TaskRuntimeInvariantScanner {
                 .entry(lineage.task_run_id.clone())
                 .or_default()
                 .push((event, link));
-
-            match lineage_by_run.get(lineage.task_run_id.as_str()) {
-                None => report.push(TaskRuntimeInvariantViolation::new(
-                    TaskRuntimeInvariantViolationKind::LineageMissingForChildLinkEvent {
-                        task_id: lineage.task_id.clone(),
-                        run_id: lineage.task_run_id.clone(),
-                        event_id: event.id.clone(),
-                        sequence: event.sequence,
-                        child_thread_id: lineage.child_thread_id.clone(),
-                        child_turn_id: lineage.child_turn_id.clone(),
-                    },
-                    "task event child link has no canonical thread_lineage row for its run",
-                )),
-                Some(canonical)
-                    if canonical.child_thread_id != lineage.child_thread_id
-                        || canonical.child_turn_id != lineage.child_turn_id =>
-                {
-                    report.push(TaskRuntimeInvariantViolation::new(
-                        TaskRuntimeInvariantViolationKind::ChildLinkEventCanonicalLineageMismatch {
-                            task_id: lineage.task_id.clone(),
-                            run_id: lineage.task_run_id.clone(),
-                            event_id: event.id.clone(),
-                            sequence: event.sequence,
-                            event_child_thread_id: lineage.child_thread_id.clone(),
-                            event_child_turn_id: lineage.child_turn_id.clone(),
-                            canonical_child_thread_id: Some(canonical.child_thread_id.clone()),
-                            canonical_child_turn_id: Some(canonical.child_turn_id.clone()),
-                        },
-                        "task event child link does not match canonical thread_lineage row",
-                    ));
-                }
-                Some(_) => {}
-            }
         }
 
         for (run_id, links) in links_by_run {
@@ -725,49 +576,23 @@ impl TaskRuntimeInvariantScanner {
                 "one task run has multiple child thread link events",
             ));
         }
-
-        Ok(())
     }
 
-    async fn detect_invalid_deliveries<C: ConnectionTrait>(
+    fn detect_invalid_deliveries(
         &self,
-        db: &C,
+        delivered_task_results: &[TaskRuntimeInvariantDeliveryRecord],
         report: &mut TaskRuntimeInvariantReport,
     ) -> Result<()> {
-        let rows = query_all(
-            db,
-            r#"
-            select
-                d.id as delivery_id,
-                d.task_id as task_id,
-                d.run_id as run_id,
-                d.status as delivery_status,
-                r.status as run_status,
-                r.result_json as result_json
-            from task_delivery d
-            left join task_run r on r.id = d.run_id
-            where d.status = 'delivered'
-            order by d.created_at asc
-            "#,
-        )
-        .await?;
-
-        for row in rows {
-            let delivery_id = get_string(&row, "delivery_id")?;
-            let task_id = get_string(&row, "task_id")?;
-            let run_id = get_string(&row, "run_id")?;
-            let run_status = get_optional_string(&row, "run_status")?;
-            let result_json = get_optional_string(&row, "result_json")?;
-
-            if run_status.as_deref() != Some("succeeded") {
+        for row in delivered_task_results {
+            if row.run_status.as_deref() != Some("succeeded") {
                 report.push(TaskRuntimeInvariantViolation::new(
                     TaskRuntimeInvariantViolationKind::DeliveryPointsToInvalidResult {
-                        task_id,
-                        run_id,
-                        delivery_id,
+                        task_id: row.task_id.clone(),
+                        run_id: row.run_id.clone(),
+                        delivery_id: row.delivery_id.clone(),
                         reason: format!(
                             "delivered task_delivery points to run status `{}`",
-                            run_status.as_deref().unwrap_or("missing")
+                            row.run_status.as_deref().unwrap_or("missing")
                         ),
                     },
                     "delivered task_delivery does not point to a succeeded task_run",
@@ -775,12 +600,12 @@ impl TaskRuntimeInvariantScanner {
                 continue;
             }
 
-            let Some(result_json) = result_json else {
+            let Some(result_json) = row.result_json.as_deref() else {
                 report.push(TaskRuntimeInvariantViolation::new(
                     TaskRuntimeInvariantViolationKind::DeliveryPointsToInvalidResult {
-                        task_id,
-                        run_id,
-                        delivery_id,
+                        task_id: row.task_id.clone(),
+                        run_id: row.run_id.clone(),
+                        delivery_id: row.delivery_id.clone(),
                         reason: "succeeded run has no result_json".to_owned(),
                     },
                     "delivered task_delivery points to a run without result_json",
@@ -788,19 +613,21 @@ impl TaskRuntimeInvariantScanner {
                 continue;
             };
 
-            let result =
-                serde_json::from_str::<TaskResult>(result_json.as_str()).with_context(|| {
-                    format!("failed to decode task_run.result_json for run `{run_id}`")
-                })?;
+            let result = serde_json::from_str::<TaskResult>(result_json).with_context(|| {
+                format!(
+                    "failed to decode task_run.result_json for run `{}`",
+                    row.run_id
+                )
+            })?;
             let fallback_used = task_result_bool_flag(&result, "fallbackUsed");
             let schema_valid = task_result_bool_flag(&result, "schemaValid");
 
             if fallback_used == Some(true) || schema_valid == Some(false) {
                 report.push(TaskRuntimeInvariantViolation::new(
                     TaskRuntimeInvariantViolationKind::InvalidDeliveredTaskResult {
-                        task_id,
-                        run_id,
-                        delivery_id: Some(delivery_id),
+                        task_id: row.task_id.clone(),
+                        run_id: row.run_id.clone(),
+                        delivery_id: Some(row.delivery_id.clone()),
                         reason: "delivered task result is fallback or schema-invalid".to_owned(),
                         fallback_used,
                         schema_valid,
@@ -813,95 +640,53 @@ impl TaskRuntimeInvariantScanner {
         Ok(())
     }
 
-    async fn detect_stale_turns<C: ConnectionTrait>(
+    fn detect_stale_turns(
         &self,
-        db: &C,
+        in_progress_turns: &[TaskRuntimeInvariantTurnRecord],
         observed_at_unix: i64,
         report: &mut TaskRuntimeInvariantReport,
-    ) -> Result<()> {
-        let rows = query_all(
-            db,
-            r#"
-            select
-                id as turn_id,
-                thread_id as thread_id,
-                cast(strftime('%s', updated_at) as integer) as updated_at_unix
-            from turn
-            where status = 'in_progress'
-            order by updated_at asc
-            "#,
-        )
-        .await?;
-
-        for row in rows {
-            let updated_at_unix = get_i64(&row, "updated_at_unix")?;
-            let stale_for_seconds = observed_at_unix.saturating_sub(updated_at_unix);
+    ) {
+        for row in in_progress_turns {
+            let stale_for_seconds = observed_at_unix.saturating_sub(row.updated_at_unix);
             if stale_for_seconds < self.stale_turn_after_seconds {
                 continue;
             }
-            let turn_id = get_string(&row, "turn_id")?;
-            let thread_id = get_optional_string(&row, "thread_id")?;
             report.push(TaskRuntimeInvariantViolation::new(
                 TaskRuntimeInvariantViolationKind::StaleInProgressTurn {
-                    turn_id,
-                    thread_id,
+                    turn_id: row.turn_id.clone(),
+                    thread_id: row.thread_id.clone(),
                     stale_for_seconds,
                     observed_at_unix,
-                    updated_at_unix,
+                    updated_at_unix: row.updated_at_unix,
                 },
                 "turn remained in_progress past the stale threshold",
             ));
         }
-
-        Ok(())
     }
 
-    async fn detect_stale_turn_item_attempts<C: ConnectionTrait>(
+    fn detect_stale_turn_item_attempts(
         &self,
-        db: &C,
+        stale_turn_item_attempts: &[TaskRuntimeInvariantStaleAttemptRecord],
         report: &mut TaskRuntimeInvariantReport,
-    ) -> Result<()> {
-        let rows = query_all(
-            db,
-            r#"
-            select
-                ti.turn_id as turn_id,
-                ti.item_id as item_id,
-                ti.status as item_status,
-                tia.id as attempt_id,
-                tia.status as attempt_status,
-                tia.attempt_number as attempt_number
-            from turn_item ti
-            join turn_item_attempt tia
-                on tia.turn_id = ti.turn_id
-               and tia.item_id = ti.item_id
-            where ti.status in ('completed', 'failed', 'timed_out', 'cancelled')
-              and tia.status in ('running', 'timed_out')
-            order by ti.turn_id asc, ti.item_id asc, tia.attempt_number asc
-            "#,
-        )
-        .await?;
-
-        for row in rows {
-            let item_status = get_string(&row, "item_status")?;
-            let attempt_status = get_string(&row, "attempt_status")?;
-            let reason =
-                format!("terminal turn_item.status `{item_status}` has `{attempt_status}` attempt");
+    ) {
+        for row in stale_turn_item_attempts {
+            let reason = format!(
+                "terminal turn_item.status `{}` has `{}` attempt",
+                row.item_status, row.attempt_status
+            );
             report.push(TaskRuntimeInvariantViolation::new(
                 TaskRuntimeInvariantViolationKind::StaleTurnItemAttempt {
-                    turn_id: get_string(&row, "turn_id")?,
-                    item_id: get_string(&row, "item_id")?,
-                    attempt_id: get_string(&row, "attempt_id")?,
-                    item_status,
-                    attempt_status,
-                    attempt_number: Some(get_i64(&row, "attempt_number")?),
+                    turn_id: row.turn_id.clone(),
+                    item_id: row.item_id.clone(),
+                    attempt_id: row.attempt_id.clone(),
+                    item_status: row.item_status.clone(),
+                    attempt_status: row.attempt_status.clone(),
+                    attempt_number: Some(row.attempt_number),
                     reason,
                 },
                 "terminal turn_item has a nonterminal or stale attempt",
             ));
         }
-
-        Ok(())
     }
 }
 
@@ -915,65 +700,21 @@ struct TaskEventScanRow {
     payload: TaskEventPayload,
 }
 
-#[derive(Debug, Clone)]
-struct ThreadLineageScanRow {
-    child_thread_id: String,
-    child_turn_id: String,
-}
-
-async fn load_task_events<C: ConnectionTrait>(db: &C) -> Result<Vec<TaskEventScanRow>> {
-    let rows = query_all(
-        db,
-        r#"
-        select id, task_id, run_id, sequence, event_type, payload_json
-        from task_event
-        order by task_id asc, sequence asc
-        "#,
-    )
-    .await?;
-    rows.into_iter()
+fn load_task_events(rows: &[TaskRuntimeInvariantEventRecord]) -> Result<Vec<TaskEventScanRow>> {
+    rows.iter()
         .map(|row| {
-            let id = get_string(&row, "id")?;
-            let task_id = get_string(&row, "task_id")?;
-            let run_id = get_optional_string(&row, "run_id")?;
-            let sequence = get_i64(&row, "sequence")?;
-            let event_type = get_string(&row, "event_type")?;
-            let payload_json = get_string(&row, "payload_json")?;
-            let payload = serde_json::from_str::<TaskEventPayload>(payload_json.as_str())
-                .with_context(|| format!("failed to decode task_event payload `{id}`"))?;
+            let payload = serde_json::from_str::<TaskEventPayload>(row.payload_json.as_str())
+                .with_context(|| format!("failed to decode task_event payload `{}`", row.id))?;
             Ok(TaskEventScanRow {
-                id,
-                task_id,
-                run_id,
-                sequence,
-                event_type,
+                id: row.id.clone(),
+                task_id: row.task_id.clone(),
+                run_id: row.run_id.clone(),
+                sequence: row.sequence,
+                event_type: row.event_type.clone(),
                 payload,
             })
         })
         .collect()
-}
-
-async fn load_thread_lineage_by_run<C: ConnectionTrait>(
-    db: &C,
-) -> Result<BTreeMap<String, ThreadLineageScanRow>> {
-    let rows = query_all(
-        db,
-        r#"
-        select task_run_id, child_thread_id, child_turn_id
-        from thread_lineage
-        order by created_at asc
-        "#,
-    )
-    .await?;
-    let mut by_run = BTreeMap::new();
-    for row in rows {
-        let task_run_id = get_string(&row, "task_run_id")?;
-        by_run.entry(task_run_id).or_insert(ThreadLineageScanRow {
-            child_thread_id: get_string(&row, "child_thread_id")?,
-            child_turn_id: get_string(&row, "child_turn_id")?,
-        });
-    }
-    Ok(by_run)
 }
 
 fn lifecycle_semantic_key(payload: &TaskEventPayload) -> Option<String> {
@@ -988,43 +729,6 @@ fn task_result_bool_flag(result: &TaskResult, flag: &str) -> Option<bool> {
         Some(TaskValue::Bool(value)) => Some(*value),
         _ => None,
     }
-}
-
-async fn query_all<C: ConnectionTrait>(db: &C, sql: &str) -> Result<Vec<QueryResult>> {
-    db.query_all_raw(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
-        .await
-        .with_context(|| format!("failed to run invariant scanner query: {sql}"))
-}
-
-async fn table_exists<C: ConnectionTrait>(db: &C, table: &str) -> Result<bool> {
-    let sql = format!(
-        "select name from sqlite_master where type = 'table' and name = {}",
-        sqlite_string_literal(table)
-    );
-    let row = db
-        .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.clone()))
-        .await
-        .with_context(|| format!("failed to check whether table exists: {table}"))?;
-    Ok(row.is_some())
-}
-
-fn sqlite_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn get_string(row: &QueryResult, column: &str) -> Result<String> {
-    row.try_get::<String>("", column)
-        .with_context(|| format!("failed to read `{column}` as string"))
-}
-
-fn get_optional_string(row: &QueryResult, column: &str) -> Result<Option<String>> {
-    row.try_get::<Option<String>>("", column)
-        .with_context(|| format!("failed to read `{column}` as optional string"))
-}
-
-fn get_i64(row: &QueryResult, column: &str) -> Result<i64> {
-    row.try_get::<i64>("", column)
-        .with_context(|| format!("failed to read `{column}` as i64"))
 }
 
 fn sqlite_read_only_connection_url(path: &Path) -> String {
@@ -1046,15 +750,18 @@ fn sqlite_read_only_connection_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{TaskError, TaskErrorClass, ThreadLineage};
-    use sea_orm::{ConnectionTrait, Database};
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_protocol::{
+        TaskError, TaskErrorClass, TaskRunThreadBinding, TaskRunThreadBindingKind, ThreadLineage,
+    };
+    use sea_orm::Database;
 
     fn violation(kind: TaskRuntimeInvariantViolationKind) -> TaskRuntimeInvariantViolation {
         TaskRuntimeInvariantViolation::new(kind, "detected test invariant violation")
     }
 
     #[test]
-    fn constructs_every_violation_kind_with_debuggable_ids() {
+    fn constructs_core_violation_kinds_with_debuggable_ids() {
         let links = vec![
             TaskRuntimeChildLinkRef {
                 event_id: "event_child_1".to_owned(),
@@ -1128,31 +835,8 @@ mod tests {
                 reason: "terminal item has running attempt".to_owned(),
             },
         ));
-        report.push(violation(
-            TaskRuntimeInvariantViolationKind::LineageMissingForChildLinkEvent {
-                task_id: "task_4".to_owned(),
-                run_id: "run_4".to_owned(),
-                event_id: "event_3".to_owned(),
-                sequence: 7,
-                child_thread_id: "child_thread_3".to_owned(),
-                child_turn_id: "child_turn_3".to_owned(),
-            },
-        ));
-        report.push(violation(
-            TaskRuntimeInvariantViolationKind::ChildLinkEventCanonicalLineageMismatch {
-                task_id: "task_5".to_owned(),
-                run_id: "run_5".to_owned(),
-                event_id: "event_4".to_owned(),
-                sequence: 8,
-                event_child_thread_id: "child_thread_4".to_owned(),
-                event_child_turn_id: "child_turn_4".to_owned(),
-                canonical_child_thread_id: Some("child_thread_5".to_owned()),
-                canonical_child_turn_id: Some("child_turn_5".to_owned()),
-            },
-        ));
-
-        assert_eq!(report.violation_count(), 8);
-        assert_eq!(report.error_count(), 7);
+        assert_eq!(report.violation_count(), 6);
+        assert_eq!(report.error_count(), 5);
         assert_eq!(report.warning_count(), 1);
         assert!(format!("{report}").contains("duplicate_lifecycle_events task_1"));
         assert!(format!("{report}").contains("stale_in_progress_turn turn_1"));
@@ -1188,57 +872,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanner_detects_fixture_violations_without_repairing_rows() {
+    async fn scanner_reports_target_binding_violations_through_crud_store() {
         let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
+        Migrator::up(&db, None)
+            .await
+            .expect("migrations should run");
+        let store = CrudStore::new(db);
+        store
+            .upsert_task_run_thread_binding(TaskRunThreadBinding {
+                id: "binding_missing_target_refs".to_owned(),
+                task_id: "task_missing_target_refs".to_owned(),
+                run_id: "run_missing_target_refs".to_owned(),
+                execution_id: None,
+                thread_id: "child_thread_missing_target_refs".to_owned(),
+                binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+                created_at: 1,
+            })
+            .await
+            .expect("binding should insert through CrudStore");
 
-        insert_task_event(
-            &db,
-            "event_started_1",
-            1,
-            &TaskEventPayload::RunStarted {
-                task_id: "task_1".to_owned(),
-                run_id: "run_1".to_owned(),
-                started_at: 1,
-            },
-        )
-        .await;
-        insert_task_event(
-            &db,
-            "event_started_2",
-            2,
-            &TaskEventPayload::RunStarted {
-                task_id: "task_1".to_owned(),
-                run_id: "run_1".to_owned(),
-                started_at: 2,
-            },
-        )
-        .await;
-        insert_task_event(
-            &db,
-            "event_child_1",
-            3,
-            &TaskEventPayload::ChildThreadLinked {
-                lineage: lineage("child_thread_1", "child_turn_1"),
-            },
-        )
-        .await;
-        insert_task_event(
-            &db,
-            "event_child_2",
-            4,
-            &TaskEventPayload::ChildThreadLinked {
-                lineage: lineage("child_thread_2", "child_turn_2"),
-            },
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_1', 'child_turn_1', 'parent_thread', 'parent_turn', 'task_1', 'run_1', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
+        let report = TaskRuntimeInvariantScanner::new()
+            .scan_store(&store, 2)
+            .await
+            .expect("scan should run");
 
+        assert!(report.violations.iter().any(|violation| matches!(
+            &violation.kind,
+            TaskRuntimeInvariantViolationKind::PrimaryExecutorBindingMissingLineage { .. }
+        )));
+        assert!(report.violations.iter().any(|violation| matches!(
+            &violation.kind,
+            TaskRuntimeInvariantViolationKind::PrimaryExecutorBindingMissingExecution { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn scanner_detects_fixture_violations_without_repairing_rows() {
         let invalid_result = TaskResult {
             summary: Some("not a real result".to_owned()),
             data: Some(TaskValue::Object(BTreeMap::from([
@@ -1248,40 +917,66 @@ mod tests {
             artifacts: Vec::new(),
             completed_by_run_id: Some("run_2".to_owned()),
         };
-        execute(
-            &db,
-            format!(
-                "insert into task_run(id, task_id, status, result_json) values ('run_2', 'task_2', 'succeeded', {})",
-                sql_literal(&serde_json::to_string(&invalid_result).unwrap())
-            )
-            .as_str(),
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_delivery(id, task_id, run_id, status, created_at) values ('delivery_1', 'task_2', 'run_2', 'delivered', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at) values ('turn_stale', 'thread_1', 'in_progress', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn_item(id, turn_id, item_id, item_type, status) values ('turn_item_row', 'turn_2', 'item_1', 'dynamic_tool_call', 'completed')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn_item_attempt(id, turn_id, item_id, item_type, attempt_number, status) values ('attempt_1', 'turn_2', 'item_1', 'dynamic_tool_call', 1, 'running')",
-        )
-        .await;
+        let snapshot = TaskRuntimeInvariantSnapshot {
+            task_events: vec![
+                task_event_record(
+                    "event_started_1",
+                    1,
+                    TaskEventPayload::RunStarted {
+                        task_id: "task_1".to_owned(),
+                        run_id: "run_1".to_owned(),
+                        started_at: 1,
+                    },
+                ),
+                task_event_record(
+                    "event_started_2",
+                    2,
+                    TaskEventPayload::RunStarted {
+                        task_id: "task_1".to_owned(),
+                        run_id: "run_1".to_owned(),
+                        started_at: 2,
+                    },
+                ),
+                task_event_record(
+                    "event_child_1",
+                    3,
+                    TaskEventPayload::ChildThreadLinked {
+                        lineage: lineage("child_thread_1", "child_turn_1"),
+                    },
+                ),
+                task_event_record(
+                    "event_child_2",
+                    4,
+                    TaskEventPayload::ChildThreadLinked {
+                        lineage: lineage("child_thread_2", "child_turn_2"),
+                    },
+                ),
+            ],
+            delivered_task_results: vec![TaskRuntimeInvariantDeliveryRecord {
+                delivery_id: "delivery_1".to_owned(),
+                task_id: "task_2".to_owned(),
+                run_id: "run_2".to_owned(),
+                run_status: Some("succeeded".to_owned()),
+                result_json: Some(serde_json::to_string(&invalid_result).unwrap()),
+            }],
+            in_progress_turns: vec![TaskRuntimeInvariantTurnRecord {
+                turn_id: "turn_stale".to_owned(),
+                thread_id: Some("thread_1".to_owned()),
+                updated_at_unix: 1_700_000_000,
+            }],
+            stale_turn_item_attempts: vec![TaskRuntimeInvariantStaleAttemptRecord {
+                turn_id: "turn_2".to_owned(),
+                item_id: "item_1".to_owned(),
+                item_status: "completed".to_owned(),
+                attempt_id: "attempt_1".to_owned(),
+                attempt_status: "running".to_owned(),
+                attempt_number: 1,
+            }],
+        };
 
         let report = TaskRuntimeInvariantScanner::new()
             .with_stale_turn_after_seconds(60)
-            .scan_connection(&db, 2_000_000_000)
-            .await
+            .scan_snapshot(&snapshot, 2_000_000_000)
             .expect("scan should succeed");
         let codes = report
             .violations
@@ -1291,7 +986,6 @@ mod tests {
 
         assert!(codes.contains(&"duplicate_lifecycle_events"));
         assert!(codes.contains(&"multiple_child_thread_links_for_run"));
-        assert!(codes.contains(&"child_link_event_canonical_lineage_mismatch"));
         assert!(codes.contains(&"invalid_delivered_task_result"));
         assert!(codes.contains(&"stale_in_progress_turn"));
         assert!(codes.contains(&"stale_turn_item_attempt"));
@@ -1299,20 +993,6 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_clean_fixture_reports_success() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
-
-        insert_task_event(
-            &db,
-            "event_started_clean",
-            1,
-            &TaskEventPayload::RunStarted {
-                task_id: "task_clean".to_owned(),
-                run_id: "run_clean".to_owned(),
-                started_at: 1,
-            },
-        )
-        .await;
         let valid_result = TaskResult {
             summary: Some("valid result".to_owned()),
             data: Some(TaskValue::Object(BTreeMap::from([
@@ -1322,633 +1002,78 @@ mod tests {
             artifacts: Vec::new(),
             completed_by_run_id: Some("run_clean".to_owned()),
         };
-        execute(
-            &db,
-            format!(
-                "insert into task_run(id, task_id, status, result_json) values ('run_clean', 'task_clean', 'succeeded', {})",
-                sql_literal(&serde_json::to_string(&valid_result).unwrap())
-            )
-            .as_str(),
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_delivery(id, task_id, run_id, status, created_at) values ('delivery_clean', 'task_clean', 'run_clean', 'delivered', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at) values ('turn_clean', 'thread_clean', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-
-        let report = TaskRuntimeInvariantScanner::new()
-            .with_stale_turn_after_seconds(60)
-            .scan_connection(&db, 2_000_000_000)
-            .await
-            .expect("scan should succeed");
-
-        assert!(report.is_empty(), "{report}");
-    }
-
-    #[tokio::test]
-    async fn scanner_clean_task_review_migration_fixture_reports_success() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
-        create_task_review_migration_scanner_schema(&db).await;
-
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_review_clean', 'child_turn_review_clean', 'parent_thread', 'parent_turn', 'task_review_clean', 'run_review_clean', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at) values ('child_turn_review_clean', 'child_thread_review_clean', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_review_clean', 'task_review_clean', 'run_review_clean', 'execution_review_clean', 'child_thread_review_clean', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
-             values ('task_run_turn_review_clean', 'task_review_clean', 'run_review_clean', 'execution_review_clean', 'child_thread_review_clean', 'child_turn_review_clean', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, final_review_event_id, created_at)
-             values ('candidate_review_clean', 'task_review_clean', 'run_review_clean', 'task_run_turn_review_clean', 'child_thread_review_clean', 'child_turn_review_clean', 0, 'accepted', '{\"summary\":\"ok\"}', 'review_event_clean', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, decision, created_at)
-             values ('review_event_clean', 'candidate_review_clean', 'task_review_clean', 'run_review_clean', 'task_run_turn_review_clean', 'accept', '2026-05-15 00:00:00')",
-        )
-        .await;
-
-        let report = TaskRuntimeInvariantScanner::new()
-            .scan_connection(&db, 2_000_000_000)
-            .await
-            .expect("scan should succeed");
-
-        assert!(report.is_empty(), "{report}");
-    }
-
-    #[tokio::test]
-    async fn scanner_reports_task_review_migration_violations() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
-        create_task_review_migration_scanner_schema(&db).await;
-
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_missing_binding', 'child_turn_missing_binding', 'parent_thread', 'parent_turn', 'task_review_bad', 'run_review_bad', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_missing_execution', 'child_turn_missing_execution', 'parent_thread', 'parent_turn', 'task_review_missing_execution', 'run_review_missing_execution', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_missing_lineage', 'task_review_orphan', 'run_review_orphan', 'execution_review_orphan', 'child_thread_orphan', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_missing_execution', 'task_review_missing_execution', 'run_review_missing_execution', null, 'child_thread_missing_execution', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_binding_expected', 'child_turn_binding_expected', 'parent_thread', 'parent_turn', 'task_review_binding_mismatch', 'run_review_binding_mismatch', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_lineage_mismatch', 'task_review_binding_mismatch', 'run_review_binding_mismatch', 'execution_binding_mismatch', 'child_thread_binding_actual', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
-             values ('execution_missing_binding', 'task_review_execution_missing_binding', 'run_review_execution_missing_binding', 'agent', 'succeeded', 'child_thread_execution_missing_binding', 'child_turn_execution_missing_binding', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_duplicate_primary_one', 'task_review_duplicate_primary', 'run_review_duplicate_primary', 'execution_duplicate_primary_one', 'child_thread_duplicate_primary_one', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_duplicate_primary_two', 'task_review_duplicate_primary', 'run_review_duplicate_primary', 'execution_duplicate_primary_two', 'child_thread_duplicate_primary_two', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_lineage_no_trt', 'child_turn_lineage_no_trt', 'parent_thread', 'parent_turn', 'task_review_lineage_no_trt', 'run_review_lineage_no_trt', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('child_turn_lineage_no_trt', 'child_thread_lineage_no_trt', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_lineage_no_trt', 'task_review_lineage_no_trt', 'run_review_lineage_no_trt', 'execution_lineage_no_trt', 'child_thread_lineage_no_trt', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_turn_expected', 'child_turn_turn_mismatch', 'parent_thread', 'parent_turn', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('child_turn_turn_mismatch', 'child_thread_turn_expected', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_turn_mismatch', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'execution_turn_mismatch', 'child_thread_turn_expected', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
-             values ('task_run_turn_lineage_mismatch', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'execution_turn_mismatch', 'child_thread_turn_actual', 'child_turn_turn_mismatch', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
-             values ('execution_no_trt', 'task_review_execution_no_trt', 'run_review_execution_no_trt', 'agent', 'succeeded', 'child_thread_execution_no_trt', 'child_turn_execution_no_trt', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('child_turn_execution_no_trt', 'child_thread_execution_no_trt', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_execution_no_trt', 'task_review_execution_no_trt', 'run_review_execution_no_trt', 'execution_no_trt', 'child_thread_execution_no_trt', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
-             values ('execution_target_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'agent', 'succeeded', 'child_thread_execution_expected', 'child_turn_execution_mismatch', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('child_turn_execution_mismatch', 'child_thread_execution_expected', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_execution_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'execution_target_mismatch_wrong', 'child_thread_execution_actual', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
-             values ('task_run_turn_execution_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'execution_target_mismatch_wrong', 'child_thread_execution_actual', 'child_turn_execution_mismatch', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, turn_id, created_at)
-             values ('task_run_turn_missing_turn', 'task_review_bad', 'run_review_bad', 'missing_turn', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, status, final_review_event_id, created_at)
-             values ('candidate_missing_turn', 'task_review_bad', 'run_review_bad', 'missing_task_run_turn', 'accepted', 'missing_review_event', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, status, final_review_event_id, created_at)
-             values ('candidate_duplicate_one', 'task_review_dup', 'run_review_dup', 'missing_task_run_turn_1', 'accepted', null, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, status, final_review_event_id, created_at)
-             values ('candidate_duplicate_two', 'task_review_dup', 'run_review_dup', 'missing_task_run_turn_2', 'accepted', null, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run(id, task_id, status, result_json)
-             values ('run_review_missing_candidate', 'task_review_missing_candidate', 'succeeded', '{\"summary\":\"missing candidate\"}')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('turn_review_missing_candidate', 'thread_review_missing_candidate', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, turn_id, created_at)
-             values ('task_run_turn_missing_candidate', 'task_review_missing_candidate', 'run_review_missing_candidate', 'turn_review_missing_candidate', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at)
-             values ('turn_review_missing_result', 'thread_review_missing_result', 'completed', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, turn_id, created_at)
-             values ('task_run_turn_missing_result', 'task_review_missing_result', 'run_review_missing_result', 'turn_review_missing_result', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, status, result_json, final_review_event_id, created_at)
-             values ('candidate_missing_result', 'task_review_missing_result', 'run_review_missing_result', 'task_run_turn_missing_result', 'accepted', null, 'review_missing_result', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_review_event(id, candidate_id)
-             values ('review_missing_result', 'candidate_missing_result')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_candidate_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'thread_candidate_expected', 'turn_candidate_expected', 'initial', 1, 10, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
-             values ('binding_candidate_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'execution_candidate_mismatch', 'thread_candidate_expected', 'primary_executor', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, created_at)
-             values ('candidate_turn_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'task_run_turn_candidate_mismatch', 'thread_candidate_actual', 'turn_candidate_actual', 2, 'pending_review', '{\"summary\":\"mismatch\"}', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, created_at)
-             values ('review_missing_candidate', 'candidate_does_not_exist', 'task_review_missing_review_candidate', 'run_review_missing_review_candidate', null, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, created_at)
-             values ('review_missing_task_run_turn', 'candidate_turn_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'task_run_turn_does_not_exist', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'thread_decision_mismatch', 'turn_decision_mismatch', 'initial', 0, 0, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, final_review_event_id, created_at)
-             values ('candidate_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'task_run_turn_decision_mismatch', 'thread_decision_mismatch', 'turn_decision_mismatch', 0, 'accepted', '{\"summary\":\"accepted\"}', 'review_decision_mismatch', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, decision, created_at)
-             values ('review_decision_mismatch', 'candidate_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'task_run_turn_decision_mismatch', 'reject', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_duplicate_sequence_one', 'task_review_duplicate_sequence', 'run_review_duplicate_sequence', 'thread_duplicate_sequence', 'turn_duplicate_sequence_one', 'review', 0, 7, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_duplicate_sequence_two', 'task_review_duplicate_sequence', 'run_review_duplicate_sequence', 'thread_duplicate_sequence', 'turn_duplicate_sequence_two', 'review', 0, 7, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_duplicate_round_one', 'task_review_duplicate_round', 'run_review_duplicate_round', 'thread_duplicate_round', 'turn_duplicate_round_one', 'initial', 3, 30, '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
-             values ('task_run_turn_duplicate_round_two', 'task_review_duplicate_round', 'run_review_duplicate_round', 'thread_duplicate_round', 'turn_duplicate_round_two', 'revision', 3, 31, '2026-05-15 00:00:00')",
-        )
-        .await;
-
-        let report = TaskRuntimeInvariantScanner::new()
-            .scan_connection(&db, 2_000_000_000)
-            .await
-            .expect("scan should succeed");
-        let codes = report
-            .violations
-            .iter()
-            .map(|violation| violation.code.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(
-            codes.contains(&"missing_primary_executor_binding"),
-            "{report}"
-        );
-        assert!(
-            codes
-                .iter()
-                .filter(|code| **code == "missing_primary_executor_binding")
-                .count()
-                >= 2,
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"primary_executor_binding_missing_lineage"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"primary_executor_binding_missing_execution"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"primary_executor_binding_lineage_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"primary_executor_binding_execution_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"multiple_primary_executor_bindings_for_run"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"lineage_child_turn_missing_turn"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"execution_child_turn_missing_turn"),
-            "{report}"
-        );
-        assert!(codes.contains(&"lineage_missing_task_run_turn"), "{report}");
-        assert!(
-            codes.contains(&"task_run_turn_lineage_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"execution_missing_task_run_turn"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"task_run_turn_execution_mismatch"),
-            "{report}"
-        );
-        assert!(codes.contains(&"task_run_turn_missing_turn"), "{report}");
-        assert!(
-            codes.contains(&"accepted_candidate_missing_turn"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"succeeded_run_missing_accepted_candidate"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"accepted_candidate_missing_result"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"accepted_candidate_missing_final_review_event"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"multiple_accepted_candidates_for_run"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"task_result_candidate_turn_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"task_result_candidate_primary_binding_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"task_result_candidate_round_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"review_event_missing_candidate"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"review_event_missing_task_run_turn"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"final_review_event_decision_mismatch"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"duplicate_task_run_turn_sequence"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"non_contiguous_task_run_turn_sequence"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"duplicate_candidate_producing_round"),
-            "{report}"
-        );
-        assert!(
-            codes.contains(&"non_contiguous_candidate_producing_round"),
-            "{report}"
-        );
-    }
-
-    #[tokio::test]
-    async fn baseline_failure_fixture_reports_current_db_diagnosis() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
-
-        insert_task_event(
-            &db,
-            "event_child_current_1",
-            1,
-            &TaskEventPayload::ChildThreadLinked {
-                lineage: lineage("child_thread_current_1", "child_turn_current_1"),
-            },
-        )
-        .await;
-        insert_task_event(
-            &db,
-            "event_child_current_2",
-            2,
-            &TaskEventPayload::ChildThreadLinked {
-                lineage: lineage("child_thread_current_2", "child_turn_current_2"),
-            },
-        )
-        .await;
-        execute(
-            &db,
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
-             values ('child_thread_current_1', 'child_turn_current_1', 'parent_thread', 'parent_turn', 'task_1', 'run_1', 'root_thread', 1, '2026-05-15 00:00:00')",
-        )
-        .await;
-
-        let fallback_result = TaskResult {
-            summary: Some("fallback result".to_owned()),
-            data: Some(TaskValue::Object(BTreeMap::from([
-                ("fallbackUsed".to_owned(), TaskValue::Bool(true)),
-                ("schemaValid".to_owned(), TaskValue::Bool(false)),
-            ]))),
-            artifacts: Vec::new(),
-            completed_by_run_id: Some("run_fallback".to_owned()),
+        let snapshot = TaskRuntimeInvariantSnapshot {
+            task_events: vec![task_event_record(
+                "event_started_clean",
+                1,
+                TaskEventPayload::RunStarted {
+                    task_id: "task_clean".to_owned(),
+                    run_id: "run_clean".to_owned(),
+                    started_at: 1,
+                },
+            )],
+            delivered_task_results: vec![TaskRuntimeInvariantDeliveryRecord {
+                delivery_id: "delivery_clean".to_owned(),
+                task_id: "task_clean".to_owned(),
+                run_id: "run_clean".to_owned(),
+                run_status: Some("succeeded".to_owned()),
+                result_json: Some(serde_json::to_string(&valid_result).unwrap()),
+            }],
+            in_progress_turns: Vec::new(),
+            stale_turn_item_attempts: Vec::new(),
         };
-        execute(
-            &db,
-            format!(
-                "insert into task_run(id, task_id, status, result_json) values ('run_fallback', 'task_fallback', 'succeeded', {})",
-                sql_literal(&serde_json::to_string(&fallback_result).unwrap())
-            )
-            .as_str(),
-        )
-        .await;
-        execute(
-            &db,
-            "insert into task_delivery(id, task_id, run_id, status, created_at) values ('delivery_fallback', 'task_fallback', 'run_fallback', 'delivered', '2026-05-15 00:00:00')",
-        )
-        .await;
-        execute(
-            &db,
-            "insert into turn(id, thread_id, status, updated_at) values ('turn_current_stale', 'thread_current', 'in_progress', '2026-05-15 00:00:00')",
-        )
-        .await;
 
         let report = TaskRuntimeInvariantScanner::new()
             .with_stale_turn_after_seconds(60)
-            .scan_connection(&db, 2_000_000_000)
-            .await
+            .scan_snapshot(&snapshot, 2_000_000_000)
             .expect("scan should succeed");
 
-        assert!(
-            report.violations.iter().any(|violation| matches!(
-                violation.kind,
-                TaskRuntimeInvariantViolationKind::DuplicateLifecycleEvents { .. }
-            )),
-            "{report}"
-        );
-        assert!(
-            report.violations.iter().any(|violation| matches!(
-                violation.kind,
-                TaskRuntimeInvariantViolationKind::MultipleChildThreadLinksForRun { .. }
-            )),
-            "{report}"
-        );
-        assert!(
-            report.violations.iter().any(|violation| matches!(
-                violation.kind,
-                TaskRuntimeInvariantViolationKind::InvalidDeliveredTaskResult { .. }
-            )),
-            "{report}"
-        );
-        assert!(
-            report.violations.iter().any(|violation| matches!(
-                violation.kind,
-                TaskRuntimeInvariantViolationKind::StaleInProgressTurn { .. }
-            )),
-            "{report}"
-        );
+        assert!(report.is_empty(), "{report}");
     }
 
     #[tokio::test]
     async fn scanner_reports_contradictory_run_terminal_events() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        create_minimal_scanner_schema(&db).await;
-
-        insert_task_event(
-            &db,
-            "event_run_completed",
-            1,
-            &TaskEventPayload::RunCompleted {
-                task_id: "task_1".to_owned(),
-                run_id: "run_1".to_owned(),
-                result: Some(TaskResult {
-                    summary: Some("done".to_owned()),
-                    data: None,
-                    artifacts: Vec::new(),
-                    completed_by_run_id: Some("run_1".to_owned()),
-                }),
-                completed_at: 10,
-            },
-        )
-        .await;
-        insert_task_event(
-            &db,
-            "event_run_failed",
-            2,
-            &TaskEventPayload::RunFailed {
-                task_id: "task_1".to_owned(),
-                run_id: "run_1".to_owned(),
-                error: Some(TaskError {
-                    code: "late_failure".to_owned(),
-                    message: "late failure".to_owned(),
-                    class: TaskErrorClass::Internal,
-                    details: None,
-                    failed_run_id: Some("run_1".to_owned()),
-                }),
-                completed_at: 11,
-            },
-        )
-        .await;
+        let snapshot = TaskRuntimeInvariantSnapshot {
+            task_events: vec![
+                task_event_record(
+                    "event_run_completed",
+                    1,
+                    TaskEventPayload::RunCompleted {
+                        task_id: "task_1".to_owned(),
+                        run_id: "run_1".to_owned(),
+                        result: Some(TaskResult {
+                            summary: Some("done".to_owned()),
+                            data: None,
+                            artifacts: Vec::new(),
+                            completed_by_run_id: Some("run_1".to_owned()),
+                        }),
+                        completed_at: 10,
+                    },
+                ),
+                task_event_record(
+                    "event_run_failed",
+                    2,
+                    TaskEventPayload::RunFailed {
+                        task_id: "task_1".to_owned(),
+                        run_id: "run_1".to_owned(),
+                        error: Some(TaskError {
+                            code: "late_failure".to_owned(),
+                            message: "late failure".to_owned(),
+                            class: TaskErrorClass::Internal,
+                            details: None,
+                            failed_run_id: Some("run_1".to_owned()),
+                        }),
+                        completed_at: 11,
+                    },
+                ),
+            ],
+            delivered_task_results: Vec::new(),
+            in_progress_turns: Vec::new(),
+            stale_turn_item_attempts: Vec::new(),
+        };
 
         let report = TaskRuntimeInvariantScanner::new()
-            .scan_connection(&db, 2_000_000_000)
-            .await
+            .scan_snapshot(&snapshot, 2_000_000_000)
             .expect("scan should succeed");
 
         assert!(
@@ -1978,65 +1103,18 @@ mod tests {
         }
     }
 
-    async fn create_minimal_scanner_schema<C: ConnectionTrait>(db: &C) {
-        for statement in [
-            "create table task_event(id text primary key, task_id text not null, run_id text, thread_id text, turn_id text, sequence integer not null, event_type text not null, payload_json text not null, created_at text not null)",
-            "create table thread_lineage(child_thread_id text primary key, child_turn_id text not null, parent_thread_id text not null, parent_turn_id text, task_id text not null, task_run_id text not null, root_thread_id text not null, depth integer not null, created_at text not null)",
-            "create table task_run(id text primary key, task_id text not null, status text not null, result_json text)",
-            "create table task_run_execution(id text primary key, task_id text not null, task_run_id text not null, executor_kind text not null, status text not null, child_thread_id text, child_turn_id text, created_at text not null)",
-            "create table task_delivery(id text primary key, task_id text not null, run_id text not null, status text not null, created_at text not null)",
-            "create table turn(id text primary key, thread_id text not null, status text not null, updated_at text not null)",
-            "create table turn_item(id text primary key, turn_id text not null, item_id text not null, item_type text not null, status text)",
-            "create table turn_item_attempt(id text primary key, turn_id text not null, item_id text not null, item_type text not null, attempt_number integer not null, status text not null)",
-        ] {
-            execute(db, statement).await;
-        }
-    }
-
-    async fn create_task_review_migration_scanner_schema<C: ConnectionTrait>(db: &C) {
-        for statement in [
-            "create table task_run_thread_binding(id text primary key, task_id text not null, run_id text not null, execution_id text, thread_id text not null, binding_kind text not null, created_at text not null)",
-            "create table task_run_turn(id text primary key, task_id text not null, run_id text not null, execution_id text, thread_id text, turn_id text not null, kind text, round integer, sequence integer, status text, reviews_candidate_id text, requested_by_candidate_id text, requested_by_review_event_id text, created_at text not null, started_at text, completed_at text)",
-            "create table task_result_candidate(id text primary key, task_id text not null, run_id text not null, task_run_turn_id text not null, thread_id text, turn_id text, round integer, status text not null, result_json text, extraction_error_json text, summary text, diagnostics_json text, final_review_event_id text, created_at text not null, updated_at text, resolved_at text)",
-            "create table task_result_review_event(id text primary key, candidate_id text not null, task_id text, run_id text, task_run_turn_id text, reviewer_kind text, reviewer_thread_id text, reviewer_turn_id text, reviewer_user_id text, reviewer_agent_spec_id text, event_kind text, decision text, feedback_text text, feedback_json text, confidence real, supersedes_review_event_id text, next_task_run_turn_id text, created_at text)",
-        ] {
-            execute(db, statement).await;
-        }
-    }
-
-    async fn insert_task_event<C: ConnectionTrait>(
-        db: &C,
+    fn task_event_record(
         event_id: &str,
         sequence: i64,
-        payload: &TaskEventPayload,
-    ) {
-        execute(
-            db,
-            format!(
-                "insert into task_event(id, task_id, run_id, thread_id, turn_id, sequence, event_type, payload_json, created_at)
-                 values ({}, {}, {}, null, null, {sequence}, {}, {}, '2026-05-15 00:00:00')",
-                sql_literal(event_id),
-                sql_literal(payload.task_id()),
-                optional_sql_literal(payload.run_id()),
-                sql_literal(payload.event_type()),
-                sql_literal(&serde_json::to_string(payload).unwrap())
-            )
-            .as_str(),
-        )
-        .await;
-    }
-
-    async fn execute<C: ConnectionTrait>(db: &C, sql: &str) {
-        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
-            .await
-            .unwrap_or_else(|error| panic!("failed SQL `{sql}`: {error}"));
-    }
-
-    fn optional_sql_literal(value: Option<&str>) -> String {
-        value.map(sql_literal).unwrap_or_else(|| "null".to_owned())
-    }
-
-    fn sql_literal(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
+        payload: TaskEventPayload,
+    ) -> TaskRuntimeInvariantEventRecord {
+        TaskRuntimeInvariantEventRecord {
+            id: event_id.to_owned(),
+            task_id: payload.task_id().to_owned(),
+            run_id: payload.run_id().map(str::to_owned),
+            sequence,
+            event_type: payload.event_type().to_owned(),
+            payload_json: serde_json::to_string(&payload).unwrap(),
+        }
     }
 }

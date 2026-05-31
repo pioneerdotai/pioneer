@@ -1052,6 +1052,9 @@ fn task_event_targets_turn(
     if let TaskEventPayload::ChildThreadLinked { lineage } = &event.payload {
         return lineage_targets_turn(lineage, thread_id, turn_id);
     }
+    if let TaskEventPayload::TaskThreadLineageCreated { lineage, .. } = &event.payload {
+        return task_thread_lineage_targets_turn(lineage, thread_id, turn_id);
+    }
 
     match requested_turn.turn_kind {
         TurnKind::Conversation => response
@@ -1115,10 +1118,7 @@ fn task_thread_lineage_targets_turn(
         .created_by_thread_id
         .as_deref()
         .unwrap_or(lineage.parent_thread_id.as_str());
-    let parent_turn_id = lineage
-        .created_by_turn_id
-        .as_deref()
-        .or(lineage.parent_turn_id.as_deref());
+    let parent_turn_id = lineage.created_by_turn_id.as_deref();
     parent_thread_id == thread_id && parent_turn_id == Some(turn_id)
 }
 

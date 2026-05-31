@@ -3864,6 +3864,38 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_thread_lineage_created"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "lineage": {
+                  "$ref": "#/$defs/TaskThreadLineage"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "lineage"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_run_thread_binding_created"
             },
             "payload": {
@@ -5259,6 +5291,53 @@
         "completed",
         "failed",
         "cancelled"
+      ]
+    },
+    "TaskThreadLineage": {
+      "type": "object",
+      "properties": {
+        "childThreadId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "createdByThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdByTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "originKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentThreadId": {
+          "type": "string"
+        },
+        "rootThreadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "childThreadId",
+        "parentThreadId",
+        "rootThreadId",
+        "depth",
+        "createdAt"
       ]
     },
     "TaskTimeoutPolicy": {

@@ -17,10 +17,6 @@ pub struct Model {
     pub worker_id: Option<String>,
     pub lease_until: Option<DateTimeWithTimeZone>,
     pub heartbeat_at: Option<DateTimeWithTimeZone>,
-    #[sea_orm(unique)]
-    pub child_thread_id: Option<String>,
-    #[sea_orm(unique)]
-    pub child_turn_id: Option<String>,
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]

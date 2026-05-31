@@ -10,6 +10,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub task_id: String,
+    #[sea_orm(unique)]
     pub run_id: String,
     pub execution_id: Option<String>,
     #[sea_orm(unique)]

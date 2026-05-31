@@ -3,18 +3,6 @@
   "title": "TaskRunExecution",
   "type": "object",
   "properties": {
-    "childThreadId": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "childTurnId": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "completedAt": {
       "type": [
         "integer",

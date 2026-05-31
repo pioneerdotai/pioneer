@@ -10,10 +10,10 @@ use pioneer_protocol::{
     TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskRun, TaskRunExecution, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskTrigger,
-    TaskTriggerKind, TaskValue, ThreadLineage, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification,
-    TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
+    TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
+    TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
     TASK_EXECUTION_LEASE_SECONDS, TaskExecutionContext, TaskExecutionHandle, TaskExecutor,
@@ -89,29 +89,6 @@ impl TaskAgentExecutor {
                 .await;
         }
 
-        if let Some(lineage) = processor
-            .crud_store
-            .list_thread_lineage_for_run(run.id.as_str())
-            .await?
-            .into_iter()
-            .last()
-        {
-            let child_runtime =
-                ensure_child_runtime_from_lineage(&processor, lineage, Some(execution.id.clone()))
-                    .await?;
-            return self
-                .recover_existing_child_turn(
-                    &processor,
-                    &task_response,
-                    &run,
-                    &agent_spec,
-                    &execution,
-                    child_runtime,
-                    handle,
-                )
-                .await;
-        }
-
         let parent = resolve_parent_context(&processor, &task_response.task).await?;
         match self
             .acquire_write_locks(&processor, &task_response.task, &run, handle.clone())
@@ -122,30 +99,6 @@ impl TaskAgentExecutor {
         }
         let parent =
             ensure_task_run_occurrence_context(&processor, &task_response, &run, parent).await?;
-        if let Some(child_runtime) = self
-            .rebuild_missing_lineage_from_execution(
-                &processor,
-                &task_response.task,
-                &run,
-                &agent_spec,
-                &parent,
-                &execution,
-                handle.clone(),
-            )
-            .await?
-        {
-            return self
-                .recover_existing_child_turn(
-                    &processor,
-                    &task_response,
-                    &run,
-                    &agent_spec,
-                    &execution,
-                    child_runtime,
-                    handle,
-                )
-                .await;
-        }
         self.start_new_child_turn(
             &processor,
             &context,
@@ -195,44 +148,6 @@ impl TaskAgentExecutor {
         Ok(claimed)
     }
 
-    async fn rebuild_missing_lineage_from_execution(
-        &self,
-        processor: &Arc<MessageProcessor>,
-        task: &Task,
-        run: &TaskRun,
-        agent_spec: &TaskAgentSpec,
-        parent: &TaskParentRuntimeContext,
-        execution: &TaskRunExecution,
-        handle: TaskExecutionHandle,
-    ) -> Result<Option<TaskRunChildRuntime>> {
-        let Some(child_thread_id) = execution.child_thread_id.as_deref() else {
-            return Ok(None);
-        };
-        let Some(child_turn_id) = execution.child_turn_id.as_deref() else {
-            return Ok(None);
-        };
-        if processor
-            .crud_store
-            .get_turn(child_thread_id, child_turn_id)
-            .await?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let now = now_timestamp_secs();
-        let binding = task_run_primary_binding_from_execution(task, run, execution, now)?;
-        let task_run_turn = initial_task_run_turn_from_execution(task, run, execution, now)?;
-        let lineage =
-            lineage_from_task_run_turn(task, run, agent_spec, parent, &task_run_turn, now);
-        handle
-            .link_child_thread_with_runtime(lineage.clone(), binding, task_run_turn.clone(), now)
-            .await?;
-        Ok(Some(TaskRunChildRuntime {
-            lineage,
-            task_run_turn,
-        }))
-    }
-
     async fn start_new_child_turn(
         &self,
         processor: &Arc<MessageProcessor>,
@@ -246,8 +161,9 @@ impl TaskAgentExecutor {
     ) -> Result<TaskExecutorStartOutcome> {
         let task = &task_response.task;
         let now = now_timestamp_secs();
-        let binding = task_run_primary_binding_from_execution(task, run, &execution, now)?;
-        let task_run_turn = initial_task_run_turn_from_execution(task, run, &execution, now)?;
+        let task_run_turn = initial_task_run_turn_from_execution(task, run, &execution, now);
+        let binding =
+            task_run_primary_binding_from_turn(task, run, &execution, &task_run_turn, now);
         let child_runtime = TaskRunChildRuntime {
             lineage: lineage_from_task_run_turn(task, run, agent_spec, parent, &task_run_turn, now),
             task_run_turn,
@@ -784,7 +700,13 @@ impl TaskAgentExecutor {
             return Ok(());
         }
 
-        match TaskAgentResultExtractor::extract(processor, &child_runtime.lineage).await? {
+        match TaskAgentResultExtractor::extract(
+            processor,
+            &child_runtime.task_run_turn,
+            &child_runtime.lineage,
+        )
+        .await?
+        {
             Ok(result) => {
                 let completed_at = now_timestamp_secs();
                 let completed_turn =
@@ -1184,7 +1106,7 @@ async fn ensure_task_run_occurrence_anchor(
 
 async fn mark_task_run_occurrence_turn_completed(
     processor: &Arc<MessageProcessor>,
-    lineage: &ThreadLineage,
+    lineage: &TaskThreadLineage,
 ) -> Result<()> {
     mark_task_run_occurrence_turn_terminal(
         processor,
@@ -1198,7 +1120,7 @@ async fn mark_task_run_occurrence_turn_completed(
 
 async fn mark_task_run_occurrence_turn_failed(
     processor: &Arc<MessageProcessor>,
-    lineage: &ThreadLineage,
+    lineage: &TaskThreadLineage,
     error_message: &str,
 ) -> Result<()> {
     mark_task_run_occurrence_turn_terminal(
@@ -1213,17 +1135,21 @@ async fn mark_task_run_occurrence_turn_failed(
 
 async fn mark_task_run_occurrence_turn_terminal(
     processor: &Arc<MessageProcessor>,
-    lineage: &ThreadLineage,
+    lineage: &TaskThreadLineage,
     status: TurnStatus,
     error: Option<String>,
     completed_at: i64,
 ) -> Result<()> {
-    let Some(parent_turn_id) = lineage.parent_turn_id.as_deref() else {
+    let Some(parent_turn_id) = lineage.created_by_turn_id.as_deref() else {
         return Ok(());
     };
+    let parent_thread_id = lineage
+        .created_by_thread_id
+        .as_deref()
+        .unwrap_or(lineage.parent_thread_id.as_str());
     let Some((workspace_id, mut turn)) = processor
         .crud_store
-        .get_turn(lineage.parent_thread_id.as_str(), parent_turn_id)
+        .get_turn(parent_thread_id, parent_turn_id)
         .await?
     else {
         return Ok(());
@@ -1237,7 +1163,7 @@ async fn mark_task_run_occurrence_turn_terminal(
         TurnStatus::Completed => {
             let notification = TurnCompletedNotification {
                 workspace_id,
-                thread_id: lineage.parent_thread_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
                 turn,
             };
             processor
@@ -1246,7 +1172,7 @@ async fn mark_task_run_occurrence_turn_terminal(
                 .await?;
             processor
                 .send_notification_to_thread_subscribers(
-                    lineage.parent_thread_id.as_str(),
+                    parent_thread_id,
                     events::TURN_COMPLETED,
                     &notification,
                 )
@@ -1255,7 +1181,7 @@ async fn mark_task_run_occurrence_turn_terminal(
         TurnStatus::Failed | TurnStatus::Interrupted => {
             let notification = TurnFailedNotification {
                 workspace_id,
-                thread_id: lineage.parent_thread_id.clone(),
+                thread_id: parent_thread_id.to_owned(),
                 turn,
             };
             processor
@@ -1264,7 +1190,7 @@ async fn mark_task_run_occurrence_turn_terminal(
                 .await?;
             processor
                 .send_notification_to_thread_subscribers(
-                    lineage.parent_thread_id.as_str(),
+                    parent_thread_id,
                     events::TURN_FAILED,
                     &notification,
                 )
@@ -1277,7 +1203,7 @@ async fn mark_task_run_occurrence_turn_terminal(
 
 #[derive(Debug, Clone)]
 struct TaskRunChildRuntime {
-    lineage: ThreadLineage,
+    lineage: TaskThreadLineage,
     task_run_turn: TaskRunTurn,
 }
 
@@ -1302,28 +1228,9 @@ async fn list_child_runtimes_for_run(
     run_id: &str,
 ) -> Result<Vec<TaskRunChildRuntime>> {
     let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
-    if !task_run_turns.is_empty() {
-        let mut runtimes = Vec::with_capacity(task_run_turns.len());
-        for task_run_turn in task_run_turns {
-            runtimes.push(load_child_runtime_from_task_run_turn(processor, task_run_turn).await?);
-        }
-        return Ok(runtimes);
-    }
-
-    let mut runtimes = Vec::new();
-    let execution_id = processor
-        .crud_store
-        .load_execution_for_run(run_id)
-        .await?
-        .map(|execution| execution.id);
-    for lineage in processor
-        .crud_store
-        .list_thread_lineage_for_run(run_id)
-        .await?
-    {
-        runtimes.push(
-            ensure_child_runtime_from_lineage(processor, lineage, execution_id.clone()).await?,
-        );
+    let mut runtimes = Vec::with_capacity(task_run_turns.len());
+    for task_run_turn in task_run_turns {
+        runtimes.push(load_child_runtime_from_task_run_turn(processor, task_run_turn).await?);
     }
     Ok(runtimes)
 }
@@ -1342,21 +1249,7 @@ async fn load_child_runtime_for_turn(
             .await
             .map(Some);
     }
-
-    let Some(lineage) = processor.crud_store.get_thread_lineage(thread_id).await? else {
-        return Ok(None);
-    };
-    if lineage.child_turn_id != turn_id {
-        return Ok(None);
-    }
-    let execution_id = processor
-        .crud_store
-        .load_execution_for_run(lineage.task_run_id.as_str())
-        .await?
-        .map(|execution| execution.id);
-    ensure_child_runtime_from_lineage(processor, lineage, execution_id)
-        .await
-        .map(Some)
+    Ok(None)
 }
 
 async fn load_child_runtime_from_task_run_turn(
@@ -1380,9 +1273,8 @@ async fn load_child_runtime_from_task_run_turn(
 
     let lineage = processor
         .crud_store
-        .get_thread_lineage(task_run_turn.thread_id.as_str())
+        .get_task_thread_lineage(task_run_turn.thread_id.as_str())
         .await?
-        .map(|lineage| lineage_for_task_run_turn(lineage, &task_run_turn))
         .unwrap_or_else(|| fallback_lineage_for_task_run_turn(&task_run_turn));
     Ok(TaskRunChildRuntime {
         lineage,
@@ -1390,87 +1282,22 @@ async fn load_child_runtime_from_task_run_turn(
     })
 }
 
-async fn ensure_child_runtime_from_lineage(
-    processor: &Arc<MessageProcessor>,
-    lineage: ThreadLineage,
-    execution_id: Option<String>,
-) -> Result<TaskRunChildRuntime> {
-    let binding = TaskRunThreadBinding {
-        id: primary_task_run_thread_binding_id(lineage.task_run_id.as_str()),
-        task_id: lineage.task_id.clone(),
-        run_id: lineage.task_run_id.clone(),
-        execution_id,
-        thread_id: lineage.child_thread_id.clone(),
-        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
-        created_at: lineage.created_at,
-    };
-    processor
-        .crud_store
-        .upsert_task_run_thread_binding(binding)
-        .await?;
-
-    let task_run_turn = if let Some(existing) = processor
-        .crud_store
-        .get_task_run_turn_by_turn(
-            lineage.child_thread_id.as_str(),
-            lineage.child_turn_id.as_str(),
-        )
-        .await?
-    {
-        existing
-    } else {
-        processor
-            .crud_store
-            .upsert_task_run_turn(TaskRunTurn {
-                id: task_run_turn_id_for_turn(lineage.child_turn_id.as_str()),
-                task_id: lineage.task_id.clone(),
-                run_id: lineage.task_run_id.clone(),
-                execution_id: processor
-                    .crud_store
-                    .load_execution_for_run(lineage.task_run_id.as_str())
-                    .await?
-                    .map(|execution| execution.id),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                kind: TaskRunTurnKind::Initial,
-                round: 0,
-                sequence: 0,
-                status: TaskRunTurnStatus::InProgress,
-                reviews_candidate_id: None,
-                requested_by_candidate_id: None,
-                requested_by_review_event_id: None,
-                created_at: lineage.created_at,
-                started_at: Some(lineage.created_at),
-                completed_at: None,
-            })
-            .await?
-    };
-
-    Ok(TaskRunChildRuntime {
-        lineage: lineage_for_task_run_turn(lineage, &task_run_turn),
-        task_run_turn,
-    })
-}
-
-fn task_run_primary_binding_from_execution(
+fn task_run_primary_binding_from_turn(
     task: &Task,
     run: &TaskRun,
     execution: &TaskRunExecution,
+    task_run_turn: &TaskRunTurn,
     created_at: i64,
-) -> Result<TaskRunThreadBinding> {
-    let child_thread_id = execution
-        .child_thread_id
-        .clone()
-        .ok_or_else(|| anyhow!("agent task execution has no child thread id"))?;
-    Ok(TaskRunThreadBinding {
+) -> TaskRunThreadBinding {
+    TaskRunThreadBinding {
         id: primary_task_run_thread_binding_id(run.id.as_str()),
         task_id: task.id.clone(),
         run_id: run.id.clone(),
         execution_id: Some(execution.id.clone()),
-        thread_id: child_thread_id,
+        thread_id: task_run_turn.thread_id.clone(),
         binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
         created_at,
-    })
+    }
 }
 
 fn initial_task_run_turn_from_execution(
@@ -1478,16 +1305,10 @@ fn initial_task_run_turn_from_execution(
     run: &TaskRun,
     execution: &TaskRunExecution,
     created_at: i64,
-) -> Result<TaskRunTurn> {
-    let child_thread_id = execution
-        .child_thread_id
-        .clone()
-        .ok_or_else(|| anyhow!("agent task execution has no child thread id"))?;
-    let child_turn_id = execution
-        .child_turn_id
-        .clone()
-        .ok_or_else(|| anyhow!("agent task execution has no child turn id"))?;
-    Ok(TaskRunTurn {
+) -> TaskRunTurn {
+    let child_thread_id = pioneer_protocol::generate_id(21);
+    let child_turn_id = pioneer_protocol::generate_id(21);
+    TaskRunTurn {
         id: task_run_turn_id_for_turn(child_turn_id.as_str()),
         task_id: task.id.clone(),
         run_id: run.id.clone(),
@@ -1504,51 +1325,38 @@ fn initial_task_run_turn_from_execution(
         created_at,
         started_at: Some(created_at),
         completed_at: None,
-    })
+    }
 }
 
 fn lineage_from_task_run_turn(
-    task: &Task,
-    run: &TaskRun,
+    _task: &Task,
+    _run: &TaskRun,
     agent_spec: &TaskAgentSpec,
     parent: &TaskParentRuntimeContext,
     task_run_turn: &TaskRunTurn,
     created_at: i64,
-) -> ThreadLineage {
-    ThreadLineage {
+) -> TaskThreadLineage {
+    TaskThreadLineage {
         child_thread_id: task_run_turn.thread_id.clone(),
-        child_turn_id: task_run_turn.turn_id.clone(),
         parent_thread_id: parent.parent_thread_id.clone(),
-        parent_turn_id: parent.parent_turn_id.clone(),
-        task_id: task.id.clone(),
-        task_run_id: run.id.clone(),
         root_thread_id: parent.root_thread_id.clone(),
         depth: agent_spec.depth,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: Some(parent.parent_thread_id.clone()),
+        created_by_turn_id: parent.parent_turn_id.clone(),
         created_at,
     }
 }
 
-fn lineage_for_task_run_turn(
-    mut lineage: ThreadLineage,
-    task_run_turn: &TaskRunTurn,
-) -> ThreadLineage {
-    lineage.child_thread_id = task_run_turn.thread_id.clone();
-    lineage.child_turn_id = task_run_turn.turn_id.clone();
-    lineage.task_id = task_run_turn.task_id.clone();
-    lineage.task_run_id = task_run_turn.run_id.clone();
-    lineage
-}
-
-fn fallback_lineage_for_task_run_turn(task_run_turn: &TaskRunTurn) -> ThreadLineage {
-    ThreadLineage {
+fn fallback_lineage_for_task_run_turn(task_run_turn: &TaskRunTurn) -> TaskThreadLineage {
+    TaskThreadLineage {
         child_thread_id: task_run_turn.thread_id.clone(),
-        child_turn_id: task_run_turn.turn_id.clone(),
         parent_thread_id: task_run_turn.thread_id.clone(),
-        parent_turn_id: None,
-        task_id: task_run_turn.task_id.clone(),
-        task_run_id: task_run_turn.run_id.clone(),
         root_thread_id: task_run_turn.thread_id.clone(),
         depth: 0,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: None,
+        created_by_turn_id: None,
         created_at: task_run_turn.created_at,
     }
 }
@@ -2004,11 +1812,12 @@ struct StructuredResultCandidate {
 impl TaskAgentResultExtractor {
     async fn extract(
         processor: &Arc<MessageProcessor>,
-        lineage: &ThreadLineage,
+        task_run_turn: &TaskRunTurn,
+        lineage: &TaskThreadLineage,
     ) -> Result<TaskAgentResultExtraction> {
         let task_response = match processor
             .crud_store
-            .get_task(lineage.task_id.as_str())
+            .get_task(task_run_turn.task_id.as_str())
             .await?
         {
             Some(response) => response,
@@ -2017,19 +1826,19 @@ impl TaskAgentResultExtractor {
                     "task_missing",
                     format!(
                         "task `{}` was not found for result extraction",
-                        lineage.task_id
+                        task_run_turn.task_id
                     ),
                     TaskErrorClass::Internal,
-                    Some(lineage.task_run_id.clone()),
+                    Some(task_run_turn.run_id.clone()),
                 )));
             }
         };
-        let contract = select_agent_spec(&task_response, lineage.task_run_id.as_str())
+        let contract = select_agent_spec(&task_response, task_run_turn.run_id.as_str())
             .and_then(|spec| spec.result_contract);
 
         let messages = processor
             .crud_store
-            .list_completed_agent_messages(lineage.child_turn_id.as_str())
+            .list_completed_agent_messages(task_run_turn.turn_id.as_str())
             .await?;
         let final_message = messages.into_iter().rev().find_map(|item| match item {
             TurnItem::AgentMessage { id, text, .. } => Some((id, text)),
@@ -2040,15 +1849,21 @@ impl TaskAgentResultExtractor {
                 "task_agent_result_missing",
                 "child task turn completed without a final agent message".to_owned(),
                 TaskErrorClass::Validation,
-                Some(lineage.task_run_id.clone()),
+                Some(task_run_turn.run_id.clone()),
             )));
         };
 
-        match Self::normalize_final_message(raw_text, source_item_id, lineage, contract.as_ref()) {
+        match Self::normalize_final_message(
+            raw_text,
+            source_item_id,
+            task_run_turn,
+            contract.as_ref(),
+        ) {
             Ok(result) => {
                 task_artifacts::normalize_task_result_artifacts(
                     processor,
                     &task_response.task,
+                    task_run_turn,
                     lineage,
                     result,
                 )
@@ -2061,7 +1876,7 @@ impl TaskAgentResultExtractor {
     fn normalize_final_message(
         raw_text: String,
         source_item_id: String,
-        lineage: &ThreadLineage,
+        task_run_turn: &TaskRunTurn,
         contract: Option<&TaskAgentResultContract>,
     ) -> TaskAgentResultExtraction {
         let mut diagnostics = Vec::new();
@@ -2073,7 +1888,7 @@ impl TaskAgentResultExtractor {
                 return Ok(task_result_from_structured_candidate(
                     candidate,
                     raw_text.as_str(),
-                    lineage,
+                    task_run_turn,
                 ));
             }
             diagnostics.extend(schema_errors);
@@ -2082,7 +1897,7 @@ impl TaskAgentResultExtractor {
         Ok(fallback_text_task_result(
             raw_text.as_str(),
             source_item_id,
-            lineage,
+            task_run_turn,
             diagnostics,
         ))
     }
@@ -2091,7 +1906,7 @@ impl TaskAgentResultExtractor {
 fn task_result_from_structured_candidate(
     candidate: StructuredResultCandidate,
     raw_text: &str,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
 ) -> TaskResult {
     let (summary, data, artifacts) = match candidate.value {
         TaskValue::Object(mut object) => {
@@ -2123,7 +1938,7 @@ fn task_result_from_structured_candidate(
         summary,
         data,
         artifacts,
-        completed_by_run_id: Some(lineage.task_run_id.clone()),
+        completed_by_run_id: Some(task_run_turn.run_id.clone()),
     };
     if let Some(TaskValue::Object(object)) = &result.data
         && let Some(TaskValue::List(artifact_values)) = object.get("artifacts")
@@ -2136,7 +1951,7 @@ fn task_result_from_structured_candidate(
 fn fallback_text_task_result(
     raw_text: &str,
     source_item_id: String,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
     diagnostics: Vec<String>,
 ) -> TaskResult {
     let plain_text = strip_structured_result_blocks(raw_text);
@@ -2158,11 +1973,11 @@ fn fallback_text_task_result(
         ),
         (
             "sourceThreadId".to_owned(),
-            TaskValue::String(lineage.child_thread_id.clone()),
+            TaskValue::String(task_run_turn.thread_id.clone()),
         ),
         (
             "sourceTurnId".to_owned(),
-            TaskValue::String(lineage.child_turn_id.clone()),
+            TaskValue::String(task_run_turn.turn_id.clone()),
         ),
         ("sourceItemId".to_owned(), TaskValue::String(source_item_id)),
     ]));
@@ -2170,7 +1985,7 @@ fn fallback_text_task_result(
         summary: first_meaningful_line(fallback_text.as_str()),
         data: Some(data),
         artifacts: Vec::new(),
-        completed_by_run_id: Some(lineage.task_run_id.clone()),
+        completed_by_run_id: Some(task_run_turn.run_id.clone()),
     }
 }
 
@@ -2633,17 +2448,24 @@ mod tests {
     };
     use sea_orm::Database;
 
-    fn test_lineage() -> ThreadLineage {
-        ThreadLineage {
-            child_thread_id: "child_thread".to_owned(),
-            child_turn_id: "child_turn".to_owned(),
-            parent_thread_id: "parent_thread".to_owned(),
-            parent_turn_id: Some("parent_turn".to_owned()),
+    fn test_task_run_turn() -> TaskRunTurn {
+        TaskRunTurn {
+            id: "task_run_turn".to_owned(),
             task_id: "task".to_owned(),
-            task_run_id: "run".to_owned(),
-            root_thread_id: "parent_thread".to_owned(),
-            depth: 1,
+            run_id: "run".to_owned(),
+            execution_id: Some("execution".to_owned()),
+            thread_id: "child_thread".to_owned(),
+            turn_id: "child_turn".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
             created_at: 1,
+            started_at: Some(1),
+            completed_at: Some(2),
         }
     }
 
@@ -2659,7 +2481,9 @@ mod tests {
         assert!(framed.contains("create a daily scheduled task"));
     }
 
-    async fn task_artifact_harness(name: &str) -> (Arc<MessageProcessor>, Task, ThreadLineage) {
+    async fn task_artifact_harness(
+        name: &str,
+    ) -> (Arc<MessageProcessor>, Task, TaskRunTurn, TaskThreadLineage) {
         let connection = Database::connect("sqlite::memory:").await.expect("sqlite");
         Migrator::up(&connection, None).await.expect("migrate");
         crate::bootstrap::bootstrap(&connection)
@@ -2724,18 +2548,35 @@ mod tests {
             updated_at: 1,
             completed_at: None,
         };
-        let lineage = ThreadLineage {
-            child_thread_id: format!("child_{name}"),
-            child_turn_id: format!("child_turn_{name}"),
-            parent_thread_id: format!("thread_{name}"),
-            parent_turn_id: Some(format!("turn_{name}")),
+        let task_run_turn = TaskRunTurn {
+            id: format!("task_run_turn_{name}"),
             task_id: task.id.clone(),
-            task_run_id: format!("run_{name}"),
+            run_id: format!("run_{name}"),
+            execution_id: Some(format!("execution_{name}")),
+            thread_id: format!("child_{name}"),
+            turn_id: format!("child_turn_{name}"),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 1,
+            started_at: Some(1),
+            completed_at: Some(2),
+        };
+        let lineage = TaskThreadLineage {
+            child_thread_id: format!("child_{name}"),
+            parent_thread_id: format!("thread_{name}"),
             root_thread_id: format!("thread_{name}"),
             depth: 1,
+            origin_kind: Some("task_run".to_owned()),
+            created_by_thread_id: Some(format!("thread_{name}")),
+            created_by_turn_id: Some(format!("turn_{name}")),
             created_at: 1,
         };
-        (processor, task, lineage)
+        (processor, task, task_run_turn, lineage)
     }
 
     fn test_tool_loop_config_for_task_artifacts() -> ToolLoopConfig {
@@ -2894,7 +2735,7 @@ mod tests {
         let result = TaskAgentResultExtractor::normalize_final_message(
             raw_text.to_owned(),
             "item".to_owned(),
-            &test_lineage(),
+            &test_task_run_turn(),
             Some(&json_answer_contract()),
         )
         .expect("structured result should be valid");
@@ -2986,7 +2827,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_artifact_existing_id_gets_task_result_binding() {
-        let (processor, task, lineage) = task_artifact_harness("existing").await;
+        let (processor, task, task_run_turn, lineage) = task_artifact_harness("existing").await;
         let source =
             ingest_task_test_artifact(&processor, task.workspace_id.as_str(), None, "source.txt")
                 .await;
@@ -3001,14 +2842,19 @@ mod tests {
                 mime_type: None,
                 metadata: None,
             }],
-            completed_by_run_id: Some(lineage.task_run_id.clone()),
+            completed_by_run_id: Some(task_run_turn.run_id.clone()),
         };
 
-        let normalized =
-            task_artifacts::normalize_task_result_artifacts(&processor, &task, &lineage, result)
-                .await
-                .expect("normalize")
-                .expect("valid result");
+        let normalized = task_artifacts::normalize_task_result_artifacts(
+            &processor,
+            &task,
+            &task_run_turn,
+            &lineage,
+            result,
+        )
+        .await
+        .expect("normalize")
+        .expect("valid result");
 
         assert_eq!(
             normalized.artifacts[0].artifact_id.as_deref(),
@@ -3026,19 +2872,19 @@ mod tests {
         assert!(summary.bindings.iter().any(|binding| {
             binding.binding_kind == ArtifactBindingKind::TaskResult
                 && binding.task_id.as_deref() == Some(task.id.as_str())
-                && binding.task_run_id.as_deref() == Some(lineage.task_run_id.as_str())
+                && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
                 && binding.thread_id.as_deref() == task.created_by_thread_id.as_deref()
         }));
     }
 
     #[tokio::test]
     async fn task_artifact_path_is_ingested_and_listable_by_task() {
-        let (processor, task, lineage) = task_artifact_harness("path").await;
+        let (processor, task, task_run_turn, lineage) = task_artifact_harness("path").await;
         let output_dir = std::env::current_dir()
             .expect("cwd")
             .join("target")
             .join("task-artifact-tests")
-            .join(lineage.task_run_id.as_str());
+            .join(task_run_turn.run_id.as_str());
         tokio::fs::create_dir_all(output_dir.as_path())
             .await
             .expect("mkdir");
@@ -3057,14 +2903,19 @@ mod tests {
                 mime_type: Some("text/plain".to_owned()),
                 metadata: None,
             }],
-            completed_by_run_id: Some(lineage.task_run_id.clone()),
+            completed_by_run_id: Some(task_run_turn.run_id.clone()),
         };
 
-        let normalized =
-            task_artifacts::normalize_task_result_artifacts(&processor, &task, &lineage, result)
-                .await
-                .expect("normalize")
-                .expect("valid result");
+        let normalized = task_artifacts::normalize_task_result_artifacts(
+            &processor,
+            &task,
+            &task_run_turn,
+            &lineage,
+            result,
+        )
+        .await
+        .expect("normalize")
+        .expect("valid result");
 
         assert!(normalized.artifacts[0].artifact_id.is_some());
         let page = processor
@@ -3073,7 +2924,7 @@ mod tests {
                 task.workspace_id.as_str(),
                 ArtifactListFilter {
                     task_id: Some(task.id.clone()),
-                    task_run_id: Some(lineage.task_run_id.clone()),
+                    task_run_id: Some(task_run_turn.run_id.clone()),
                     ..ArtifactListFilter::default()
                 },
             )
@@ -3086,7 +2937,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_artifact_rejects_cross_workspace_id() {
-        let (processor, task, lineage) = task_artifact_harness("foreign").await;
+        let (processor, task, task_run_turn, lineage) = task_artifact_harness("foreign").await;
         let other_workspace = processor
             .workspace_manager
             .create_workspace("task_artifact_other", Some("Task Artifact Other"))
@@ -3106,21 +2957,26 @@ mod tests {
                 mime_type: None,
                 metadata: None,
             }],
-            completed_by_run_id: Some(lineage.task_run_id.clone()),
+            completed_by_run_id: Some(task_run_turn.run_id.clone()),
         };
 
-        let error =
-            task_artifacts::normalize_task_result_artifacts(&processor, &task, &lineage, result)
-                .await
-                .expect("normalization should return task error")
-                .expect_err("foreign artifact should fail result");
+        let error = task_artifacts::normalize_task_result_artifacts(
+            &processor,
+            &task,
+            &task_run_turn,
+            &lineage,
+            result,
+        )
+        .await
+        .expect("normalization should return task error")
+        .expect_err("foreign artifact should fail result");
 
         assert_eq!(error.code, "task_artifact_invalid");
     }
 
     #[tokio::test]
     async fn include_artifacts_context_renders_refs_without_paths() {
-        let (processor, task, lineage) = task_artifact_harness("context").await;
+        let (processor, task, _task_run_turn, lineage) = task_artifact_harness("context").await;
         let source = ingest_task_test_artifact(
             &processor,
             task.workspace_id.as_str(),
@@ -3133,7 +2989,7 @@ mod tests {
             task.workspace_id.as_str(),
             &TaskParentRuntimeContext {
                 parent_thread_id: lineage.parent_thread_id,
-                parent_turn_id: lineage.parent_turn_id,
+                parent_turn_id: lineage.created_by_turn_id,
                 root_thread_id: lineage.root_thread_id,
             },
         )
@@ -3156,7 +3012,7 @@ mod tests {
         let result = TaskAgentResultExtractor::normalize_final_message(
             raw_text.to_owned(),
             "item".to_owned(),
-            &test_lineage(),
+            &test_task_run_turn(),
             Some(&json_answer_contract()),
         )
         .expect("invalid structured result should fallback to text");

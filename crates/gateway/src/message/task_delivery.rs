@@ -143,21 +143,11 @@ impl MessageProcessor {
                 .as_deref()
                 .unwrap_or(lineage.parent_thread_id.as_str());
             if parent_thread_id == target_thread_id {
-                return Ok(lineage.created_by_turn_id.or(lineage.parent_turn_id));
+                return Ok(lineage.created_by_turn_id);
             }
         }
 
-        let lineages = self
-            .crud_store
-            .list_thread_lineage_for_run(delivery.run_id.as_str())
-            .await?;
-        Ok(lineages.into_iter().rev().find_map(|lineage| {
-            if lineage.parent_thread_id == target_thread_id {
-                lineage.parent_turn_id
-            } else {
-                None
-            }
-        }))
+        Ok(None)
     }
 
     async fn deliver_to_thread(&self, delivery: &TaskDelivery) -> Result<String> {

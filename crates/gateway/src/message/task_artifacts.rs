@@ -8,8 +8,8 @@ use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
     ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ArtifactSummary, Task,
     TaskAgentContext, TaskAgentInput, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
-    TaskArtifact, TaskError, TaskErrorClass, TaskResult, TaskValue,
-    ThreadArtifactsChangedNotification, ThreadLineage, UserInput, constants::events,
+    TaskArtifact, TaskError, TaskErrorClass, TaskResult, TaskRunTurn, TaskThreadLineage, TaskValue,
+    ThreadArtifactsChangedNotification, UserInput, constants::events,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
@@ -123,18 +123,28 @@ pub(super) async fn render_parent_artifact_refs(
 pub(super) async fn normalize_task_result_artifacts(
     processor: &Arc<MessageProcessor>,
     task: &Task,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
     mut result: TaskResult,
 ) -> Result<std::result::Result<TaskResult, TaskError>> {
     let mut changed_artifact_ids = Vec::new();
     for (index, artifact) in result.artifacts.iter_mut().enumerate() {
-        match normalize_task_result_artifact(processor, task, lineage, artifact, index).await {
+        match normalize_task_result_artifact(
+            processor,
+            task,
+            task_run_turn,
+            lineage,
+            artifact,
+            index,
+        )
+        .await
+        {
             Ok(Some(artifact_id)) => changed_artifact_ids.push(artifact_id),
             Ok(None) => {}
             Err(error) => {
                 return Ok(Err(task_artifact_error(
                     format!("task result artifact {index} is invalid: {error:#}"),
-                    Some(lineage.task_run_id.clone()),
+                    Some(task_run_turn.run_id.clone()),
                 )));
             }
         }
@@ -147,7 +157,8 @@ pub(super) async fn normalize_task_result_artifacts(
 async fn normalize_task_result_artifact(
     processor: &Arc<MessageProcessor>,
     task: &Task,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
     artifact: &mut TaskArtifact,
     index: usize,
 ) -> Result<Option<String>> {
@@ -176,7 +187,7 @@ async fn normalize_task_result_artifact(
         if artifact.mime_type.is_none() {
             artifact.mime_type = summary.artifact.mime_type.clone();
         }
-        bind_task_result_artifact(processor, task, lineage, artifact, index).await?;
+        bind_task_result_artifact(processor, task, task_run_turn, lineage, artifact, index).await?;
         return Ok(Some(summary.artifact.artifact_id));
     }
 
@@ -190,8 +201,16 @@ async fn normalize_task_result_artifact(
         return Ok(None);
     };
 
-    let summary =
-        ingest_task_result_path(processor, task, lineage, artifact, path.as_str(), index).await?;
+    let summary = ingest_task_result_path(
+        processor,
+        task,
+        task_run_turn,
+        lineage,
+        artifact,
+        path.as_str(),
+        index,
+    )
+    .await?;
     artifact.artifact_id = Some(summary.artifact.artifact_id.clone());
     artifact.version_id = summary.artifact.version_id.clone();
     if artifact.mime_type.is_none() {
@@ -203,7 +222,8 @@ async fn normalize_task_result_artifact(
 async fn ingest_task_result_path(
     processor: &Arc<MessageProcessor>,
     task: &Task,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
     artifact: &TaskArtifact,
     path: &str,
     index: usize,
@@ -222,7 +242,12 @@ async fn ingest_task_result_path(
             mime_type: artifact.mime_type.clone(),
             created_by_kind: ArtifactCreatedByKind::Task,
             created_by_actor_id: Some(task.id.clone()),
-            binding: Some(task_result_binding_target(task, lineage, index)),
+            binding: Some(task_result_binding_target(
+                task,
+                task_run_turn,
+                lineage,
+                index,
+            )),
             metadata,
             local_path_policy: Some(ArtifactLocalPathPolicy::new(vec![allowed_root])),
         })
@@ -246,7 +271,8 @@ async fn ingest_task_result_path(
 async fn bind_task_result_artifact(
     processor: &Arc<MessageProcessor>,
     task: &Task,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
     artifact: &TaskArtifact,
     index: usize,
 ) -> Result<()> {
@@ -265,7 +291,7 @@ async fn bind_task_result_artifact(
     if summary.bindings.iter().any(|binding| {
         binding.binding_kind == ArtifactBindingKind::TaskResult
             && binding.task_id.as_deref() == Some(task.id.as_str())
-            && binding.task_run_id.as_deref() == Some(lineage.task_run_id.as_str())
+            && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
             && binding.item_index == Some(index as i64)
     }) {
         return Ok(());
@@ -277,7 +303,7 @@ async fn bind_task_result_artifact(
             workspace_id: task.workspace_id.clone(),
             artifact_id: artifact_id.to_owned(),
             version_id: artifact.version_id.clone(),
-            target: task_result_binding_target(task, lineage, index),
+            target: task_result_binding_target(task, task_run_turn, lineage, index),
             metadata: task_result_artifact_metadata(artifact),
         })
         .await
@@ -288,7 +314,7 @@ async fn bind_task_result_artifact(
 async fn notify_task_artifacts_changed(
     processor: &Arc<MessageProcessor>,
     task: &Task,
-    lineage: &ThreadLineage,
+    lineage: &TaskThreadLineage,
     artifact_ids: Vec<String>,
 ) {
     if artifact_ids.is_empty() {
@@ -314,20 +340,23 @@ async fn notify_task_artifacts_changed(
 
 fn task_result_binding_target(
     task: &Task,
-    lineage: &ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
     index: usize,
 ) -> ArtifactBindingTarget {
     ArtifactBindingTarget {
         thread_id: task_result_thread_id(task, lineage),
-        turn_id: task
-            .created_by_turn_id
-            .clone()
-            .or(lineage.parent_turn_id.clone()),
+        turn_id: task.created_by_turn_id.clone().or_else(|| {
+            (task_result_thread_id(task, lineage).as_deref()
+                == lineage.created_by_thread_id.as_deref())
+            .then(|| lineage.created_by_turn_id.clone())
+            .flatten()
+        }),
         message_id: None,
         turn_item_id: None,
         tool_call_id: None,
         task_id: Some(task.id.clone()),
-        task_run_id: Some(lineage.task_run_id.clone()),
+        task_run_id: Some(task_run_turn.run_id.clone()),
         binding_kind: ArtifactBindingKind::TaskResult,
         direction: ArtifactBindingDirection::Output,
         role: Some(ArtifactRole::Task),
@@ -335,12 +364,17 @@ fn task_result_binding_target(
     }
 }
 
-fn task_result_thread_id(task: &Task, lineage: &ThreadLineage) -> Option<String> {
+fn task_result_thread_id(task: &Task, lineage: &TaskThreadLineage) -> Option<String> {
     task.created_by_thread_id.clone().or_else(|| {
         (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
             .then(|| task.owner_id.clone())
             .flatten()
-            .or_else(|| Some(lineage.parent_thread_id.clone()))
+            .or_else(|| {
+                lineage
+                    .created_by_thread_id
+                    .clone()
+                    .or_else(|| Some(lineage.parent_thread_id.clone()))
+            })
     })
 }
 

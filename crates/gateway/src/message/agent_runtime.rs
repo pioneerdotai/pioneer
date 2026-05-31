@@ -151,8 +151,7 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    let parent_turn_id = lineage.created_by_turn_id.or(lineage.parent_turn_id);
-                    if let Some(parent_turn_id) = parent_turn_id {
+                    if let Some(parent_turn_id) = lineage.created_by_turn_id {
                         let parent_thread_id = lineage
                             .created_by_thread_id
                             .unwrap_or(lineage.parent_thread_id);
@@ -225,76 +224,7 @@ impl MessageProcessor {
             }
         }
 
-        let lineage =
-            match message_future(self.crud_store.get_thread_lineage(child_thread_id)).await {
-                Ok(Some(lineage)) => lineage,
-                Ok(None) => return None,
-                Err(error) => {
-                    warn!(
-                        child_thread_id,
-                        child_turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to load child thread lineage for parent timeline notification"
-                    );
-                    return None;
-                }
-            };
-        if lineage.child_turn_id != child_turn_id {
-            return None;
-        }
-        let parent_turn_id = lineage.parent_turn_id.clone()?;
-        let workspace_id = if let Some(workspace_id) = workspace_id {
-            workspace_id.to_owned()
-        } else {
-            match message_future(
-                self.crud_store
-                    .get_thread_model(lineage.parent_thread_id.as_str()),
-            )
-            .await
-            {
-                Ok(Some(thread)) => thread.workspace_id,
-                Ok(None) => {
-                    match message_future(self.crud_store.get_thread_model(child_thread_id)).await {
-                        Ok(Some(thread)) => thread.workspace_id,
-                        Ok(None) => return None,
-                        Err(error) => {
-                            warn!(
-                                child_thread_id,
-                                child_turn_id,
-                                error = %format!("{error:#}"),
-                                "failed to load child thread workspace for parent timeline notification"
-                            );
-                            return None;
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        parent_thread_id = lineage.parent_thread_id,
-                        child_thread_id,
-                        child_turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to load parent thread workspace for parent timeline notification"
-                    );
-                    return None;
-                }
-            }
-        };
-
-        let target = ParentTimelineTarget {
-            workspace_id,
-            parent_thread_id: lineage.parent_thread_id,
-            parent_turn_id,
-            task_id: lineage.task_id,
-            run_id: lineage.task_run_id,
-            child_thread_id: lineage.child_thread_id,
-            child_turn_id: lineage.child_turn_id,
-        };
-        self.parent_timeline_targets
-            .lock()
-            .await
-            .insert(child_thread_id.to_owned(), target.clone());
-        Some(target)
+        None
     }
 
     pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) {
@@ -2901,7 +2831,7 @@ impl MessageProcessor {
         if thread.origin_kind != pioneer_protocol::ThreadOriginKind::User
             || self
                 .crud_store
-                .get_thread_lineage(thread_id)
+                .get_task_thread_lineage(thread_id)
                 .await?
                 .is_some()
         {

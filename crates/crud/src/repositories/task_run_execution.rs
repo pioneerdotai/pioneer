@@ -6,7 +6,8 @@ use pioneer_protocol::{TaskError, TaskExecutorKind, TaskResult, TaskRunExecution
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Condition, Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -24,8 +25,6 @@ pub struct NewTaskRunExecution {
     pub worker_id: Option<String>,
     pub lease_until: Option<i64>,
     pub heartbeat_at: Option<i64>,
-    pub child_thread_id: Option<String>,
-    pub child_turn_id: Option<String>,
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub result: Option<TaskResult>,
@@ -69,6 +68,14 @@ pub async fn find_execution_by_run<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query task run execution by run")
+}
+
+pub async fn count_executions_by_run<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<u64> {
+    task_run_execution::Entity::find()
+        .filter(task_run_execution::Column::TaskRunId.eq(run_id.to_owned()))
+        .count(db)
+        .await
+        .context("failed to count task run executions by run")
 }
 
 pub async fn list_executions_by_status<C: ConnectionTrait>(
@@ -273,8 +280,6 @@ fn active_model_from_new_execution(
         worker_id: Set(execution.worker_id),
         lease_until: Set(execution.lease_until.map(unix_to_datetime)),
         heartbeat_at: Set(execution.heartbeat_at.map(unix_to_datetime)),
-        child_thread_id: Set(execution.child_thread_id),
-        child_turn_id: Set(execution.child_turn_id),
         started_at: Set(execution.started_at.map(unix_to_datetime)),
         completed_at: Set(execution.completed_at.map(unix_to_datetime)),
         result_json: Set(optional_typed_json_to_db(&execution.result)?),

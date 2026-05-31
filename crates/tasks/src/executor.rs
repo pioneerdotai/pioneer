@@ -9,7 +9,7 @@ use pioneer_protocol::{
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskProgressDetails,
     TaskResult, TaskResultCandidate, TaskResultReviewEvent, TaskRetryBackoffKind, TaskRun,
     TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunTurn,
-    TaskWriteLockStatus, ThreadLineage, generate_id,
+    TaskThreadLineage, TaskWriteLockStatus, generate_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -60,22 +60,9 @@ impl TaskExecutionHandle {
         self.run_id.as_str()
     }
 
-    pub async fn link_child_thread(
-        &self,
-        lineage: ThreadLineage,
-        event_timestamp_secs: i64,
-    ) -> TaskRuntimeResult<()> {
-        self.ensure_execution_exists_for_child_runtime().await?;
-        self.append_and_publish(
-            vec![TaskEventPayload::ChildThreadLinked { lineage }],
-            event_timestamp_secs,
-        )
-        .await
-    }
-
     pub async fn link_child_thread_with_runtime(
         &self,
-        lineage: ThreadLineage,
+        lineage: TaskThreadLineage,
         binding: TaskRunThreadBinding,
         task_run_turn: TaskRunTurn,
         event_timestamp_secs: i64,
@@ -83,7 +70,11 @@ impl TaskExecutionHandle {
         self.ensure_execution_exists_for_child_runtime().await?;
         self.append_and_publish(
             vec![
-                TaskEventPayload::ChildThreadLinked { lineage },
+                TaskEventPayload::TaskThreadLineageCreated {
+                    task_id: binding.task_id.clone(),
+                    run_id: binding.run_id.clone(),
+                    lineage,
+                },
                 TaskEventPayload::TaskRunThreadBindingCreated { binding },
                 TaskEventPayload::TaskRunTurnStarted { task_run_turn },
             ],

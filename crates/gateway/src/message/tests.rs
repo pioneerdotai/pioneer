@@ -56,23 +56,24 @@ use pioneer_protocol::{
     TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
     TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
-    TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
-    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
-    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
-    TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
-    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
-    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
-    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
+    TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
+    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
+    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
+    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -3718,7 +3719,7 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
     assert!(!lineage.child_turn_id.is_empty());
     assert_eq!(
-        lineage.parent_turn_id.as_deref(),
+        lineage.created_by_turn_id.as_deref(),
         Some("turn_parent_task_test"),
         "immediate attached subagent should stay under the live parent turn"
     );
@@ -4109,17 +4110,6 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
         .await
         .expect("execution lease should be made stale for startup recovery");
-    crud_store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "update task_run_execution \
-             set child_thread_id = 'stale_exec_thread', child_turn_id = 'stale_exec_turn' \
-             where id = '{}'",
-            execution.id
-        ))
-        .await
-        .expect("legacy execution child ids should be made stale for recovery test");
-
     let recovery_provider = Arc::new(PreflightCaptureProvider::new(
         "recovered hidden child completed",
     ));
@@ -4174,11 +4164,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .await
         .expect("execution reload should succeed")
         .expect("execution should still exist");
-    assert_ne!(
-        recovered_execution.child_turn_id.as_deref(),
-        Some(lineage.child_turn_id.as_str()),
-        "recovery should not require legacy execution child_turn_id to match target turn"
-    );
+    assert_eq!(recovered_execution.id, execution.id);
 
     let requests = recovery_provider.snapshot_requests();
     let preflight_pos = requests
@@ -4409,8 +4395,11 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .expect("scheduled run should exist");
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
     assert_eq!(lineage.parent_thread_id, parent_thread_id);
-    assert_eq!(lineage.parent_turn_id.as_deref(), Some(run.id.as_str()));
-    assert_ne!(lineage.parent_turn_id.as_deref(), Some(creation_turn_id));
+    assert_eq!(lineage.created_by_turn_id.as_deref(), Some(run.id.as_str()));
+    assert_ne!(
+        lineage.created_by_turn_id.as_deref(),
+        Some(creation_turn_id)
+    );
 
     let (_, occurrence_turn) = crud_store
         .get_turn(parent_thread_id, run.id.as_str())
@@ -5313,25 +5302,60 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         )
         .await
         .expect("occurrence turn completion should persist");
-    connection
-        .execute_unprepared(&format!(
-            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, origin_kind, created_by_thread_id, created_by_turn_id, created_at) values ('child_delivery_thread_1', 'child_delivery_turn_1', '{owner_thread_id}', '{}', '{task_id}', '{}', '{owner_thread_id}', 0, 'task_run', '{owner_thread_id}', '{}', '2096-10-02T07:06:40+00:00')",
-            run.id, run.id, run.id
-        ))
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: task_id.clone(),
+                run_id: run.id.clone(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: "child_delivery_thread_1".to_owned(),
+                    parent_thread_id: owner_thread_id.to_owned(),
+                    root_thread_id: owner_thread_id.to_owned(),
+                    depth: 0,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(owner_thread_id.to_owned()),
+                    created_by_turn_id: Some(run.id.clone()),
+                    created_at: 4_000_000_000,
+                },
+            },
+            4_000_000_000,
+        )
         .await
         .expect("lineage should persist");
-    connection
-        .execute_unprepared(&format!(
-            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at) values ('binding_delivery_1', '{task_id}', '{}', null, 'child_delivery_thread_1', 'primary_executor', '2096-10-02T07:06:40+00:00')",
-            run.id
-        ))
+    processor
+        .crud_store
+        .upsert_task_run_thread_binding(TaskRunThreadBinding {
+            id: "binding_delivery_1".to_owned(),
+            task_id: task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: "child_delivery_thread_1".to_owned(),
+            binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+            created_at: 4_000_000_000,
+        })
         .await
         .expect("task run thread binding should persist");
-    connection
-        .execute_unprepared(&format!(
-            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at, started_at, completed_at) values ('turn_delivery_1', '{task_id}', '{}', null, 'child_delivery_thread_1', 'child_delivery_turn_1', 'initial', 0, 0, 'candidate_created', '2096-10-02T07:06:40+00:00', '2096-10-02T07:06:40+00:00', '2096-10-02T07:06:40+00:00')",
-            run.id
-        ))
+    processor
+        .crud_store
+        .upsert_task_run_turn(TaskRunTurn {
+            id: "turn_delivery_1".to_owned(),
+            task_id: task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: "child_delivery_thread_1".to_owned(),
+            turn_id: "child_delivery_turn_1".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 4_000_000_000,
+            started_at: Some(4_000_000_000),
+            completed_at: Some(4_000_000_000),
+        })
         .await
         .expect("task run turn should persist");
 
@@ -15343,18 +15367,38 @@ async fn wait_for_task_anchor(
     panic!("timed out waiting for task anchor");
 }
 
+struct TestChildRuntimeAnchor {
+    child_thread_id: String,
+    child_turn_id: String,
+    parent_thread_id: String,
+    created_by_turn_id: Option<String>,
+}
+
 async fn wait_for_child_lineage_for_run(
     crud_store: Arc<CrudStore>,
     run_id: &str,
-) -> pioneer_protocol::ThreadLineage {
+) -> TestChildRuntimeAnchor {
     for _ in 0..100 {
-        if let Some(lineage) = crud_store
-            .list_thread_lineage_for_run(run_id)
+        if let Some(binding) = crud_store
+            .get_task_run_primary_thread_binding(run_id)
             .await
-            .expect("lineage query should succeed")
-            .pop()
+            .expect("primary binding query should succeed")
+            && let Some(task_run_turn) = crud_store
+                .get_latest_task_run_turn(run_id)
+                .await
+                .expect("task run turn query should succeed")
+            && task_run_turn.thread_id == binding.thread_id
+            && let Some(lineage) = crud_store
+                .get_task_thread_lineage(binding.thread_id.as_str())
+                .await
+                .expect("thread lineage query should succeed")
         {
-            return lineage;
+            return TestChildRuntimeAnchor {
+                child_thread_id: lineage.child_thread_id,
+                child_turn_id: task_run_turn.turn_id,
+                parent_thread_id: lineage.parent_thread_id,
+                created_by_turn_id: lineage.created_by_turn_id,
+            };
         }
         sleep(Duration::from_millis(25)).await;
     }

@@ -14,11 +14,12 @@ use pioneer_protocol::{
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
     TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
     TaskRescheduleReason, TaskResult, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy,
-    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerCatchUpPolicy,
-    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue,
-    TaskWaitMode, TaskWaitParams, ThreadLineage,
+    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
+    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, ThreadLineage,
 };
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::Database;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -198,27 +199,47 @@ impl TaskExecutor for LineageRecordingAgentExecutor {
             .await?
             .expect("agent execution should be reserved before start");
         handle.mark_started(run.created_at).await?;
+        let child_thread_id = pioneer_protocol::generate_id(21);
+        let child_turn_id = pioneer_protocol::generate_id(21);
+        let lineage = TaskThreadLineage {
+            child_thread_id: child_thread_id.clone(),
+            parent_thread_id: "parent_thread".to_owned(),
+            root_thread_id: "parent_thread".to_owned(),
+            depth: 1,
+            origin_kind: Some("task_run".to_owned()),
+            created_by_thread_id: Some("parent_thread".to_owned()),
+            created_by_turn_id: Some("parent_turn".to_owned()),
+            created_at: run.created_at,
+        };
+        let binding = TaskRunThreadBinding {
+            id: format!("test_binding_{}", run.id),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: Some(execution.id.clone()),
+            thread_id: child_thread_id.clone(),
+            binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+            created_at: run.created_at,
+        };
+        let task_run_turn = TaskRunTurn {
+            id: format!("test_turn_{child_turn_id}"),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: Some(execution.id),
+            thread_id: child_thread_id,
+            turn_id: child_turn_id,
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::InProgress,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: run.created_at,
+            started_at: Some(run.created_at),
+            completed_at: None,
+        };
         handle
-            .link_child_thread(
-                ThreadLineage {
-                    child_thread_id: execution
-                        .child_thread_id
-                        .clone()
-                        .expect("agent execution should have child thread"),
-                    child_turn_id: execution
-                        .child_turn_id
-                        .clone()
-                        .expect("agent execution should have child turn"),
-                    parent_thread_id: "parent_thread".to_owned(),
-                    parent_turn_id: Some("parent_turn".to_owned()),
-                    task_id: run.task_id.clone(),
-                    task_run_id: run.id.clone(),
-                    root_thread_id: "parent_thread".to_owned(),
-                    depth: 1,
-                    created_at: run.created_at,
-                },
-                run.created_at,
-            )
+            .link_child_thread_with_runtime(lineage, binding, task_run_turn, run.created_at)
             .await?;
         self.release.notified().await;
         handle
@@ -310,67 +331,79 @@ async fn runtime() -> TaskRuntime {
 }
 
 #[tokio::test]
-async fn task_event_idempotency_index_rejects_duplicate_key_for_task() {
+async fn task_event_idempotency_rejects_conflicting_duplicate_key_for_task() {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
     Migrator::up(&connection, None)
         .await
         .expect("migration should apply");
+    let store = CrudStore::new(connection);
+    let run = idempotency_test_run(TaskRunStatus::Queued, 1);
 
-    connection
-        .execute_unprepared(
-            r#"
-            insert into task_event (
-                id,
-                task_id,
-                sequence,
-                event_type,
-                idempotency_key,
-                payload_json,
-                created_at
-            ) values (
-                'event_00000000000001',
-                'task_0000000000001',
-                1,
-                'task/run/started',
-                'run:run_00000000000001:started',
-                '{}',
-                CURRENT_TIMESTAMP
-            )
-            "#,
+    let inserted = store
+        .append_task_event(
+            TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: None,
+            },
+            1_700_000_000,
         )
         .await
         .expect("first keyed event should insert");
+    assert_eq!(inserted.append_status, TaskEventAppendStatus::Inserted);
 
-    let duplicate = connection
-        .execute_unprepared(
-            r#"
-            insert into task_event (
-                id,
-                task_id,
-                sequence,
-                event_type,
-                idempotency_key,
-                payload_json,
-                created_at
-            ) values (
-                'event_00000000000002',
-                'task_0000000000001',
-                2,
-                'task/run/started',
-                'run:run_00000000000001:started',
-                '{}',
-                CURRENT_TIMESTAMP
-            )
-            "#,
+    let replay = store
+        .append_task_event(
+            TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: None,
+            },
+            1_700_000_001,
+        )
+        .await
+        .expect("identical keyed event should be idempotent");
+    assert_eq!(replay.append_status, TaskEventAppendStatus::AlreadyExists);
+
+    let duplicate = store
+        .append_task_event(
+            TaskEventPayload::RunCreated {
+                run: idempotency_test_run(TaskRunStatus::Queued, 2),
+                agent_spec: None,
+            },
+            1_700_000_002,
         )
         .await;
 
     assert!(
         duplicate.is_err(),
-        "task_event(task_id, idempotency_key) must reject duplicate non-null keys"
+        "task event idempotency must reject a different payload for the same key"
     );
+}
+
+fn idempotency_test_run(status: TaskRunStatus, run_number: i64) -> TaskRun {
+    TaskRun {
+        id: "run_00000000000001".to_owned(),
+        task_id: "task_0000000000001".to_owned(),
+        trigger_id: None,
+        parent_run_id: None,
+        run_group_id: "run_group_00000001".to_owned(),
+        attempt_number: 1,
+        retry_of_run_id: None,
+        ready_at: Some(1_700_000_000),
+        run_number,
+        status,
+        executor_kind: TaskExecutorKind::System,
+        started_at: None,
+        completed_at: None,
+        heartbeat_at: None,
+        locked_by: None,
+        lock_expires_at: None,
+        result: None,
+        error: None,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+    }
 }
 
 fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
@@ -534,8 +567,6 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
         .expect("execution should load")
         .expect("execution should exist");
     assert_eq!(execution.status, TaskRunExecutionStatus::Starting);
-    assert!(execution.child_thread_id.is_some());
-    assert!(execution.child_turn_id.is_some());
 
     release.notify_waiters();
     timeout(Duration::from_secs(2), async {
@@ -587,9 +618,9 @@ async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
                 && !runtime
                     .service()
                     .store()
-                    .list_thread_lineage_for_run(run.id.as_str())
+                    .list_task_run_turns(run.id.as_str())
                     .await
-                    .expect("lineage should load")
+                    .expect("task run turns should load")
                     .is_empty()
             {
                 break;
@@ -638,34 +669,24 @@ async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
         .await
         .expect("execution should load")
         .expect("execution should exist");
-    let lineage = store
-        .list_thread_lineage_for_run(run.id.as_str())
+    let binding = store
+        .get_task_run_primary_thread_binding(run.id.as_str())
         .await
-        .expect("lineage should load");
+        .expect("binding should load")
+        .expect("primary binding should exist");
+    let turns = store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should load");
     assert_eq!(starts.load(Ordering::SeqCst), 1);
-    assert_eq!(lineage.len(), 1);
-    assert_eq!(
-        lineage[0].child_thread_id,
-        execution.child_thread_id.unwrap()
-    );
-    assert_eq!(lineage[0].child_turn_id, execution.child_turn_id.unwrap());
-    let row = store
-        .database_connection()
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            format!(
-                "select count(*) as execution_count from task_run_execution where task_run_id = '{}'",
-                run.id.replace('\'', "''")
-            ),
-        ))
+    assert_eq!(binding.execution_id.as_deref(), Some(execution.id.as_str()));
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].thread_id, binding.thread_id);
+    let execution_count = store
+        .count_task_run_executions_for_run(run.id.as_str())
         .await
-        .expect("execution count query should work")
-        .expect("execution count row should exist");
-    assert_eq!(
-        row.try_get::<i64>("", "execution_count")
-            .expect("execution count should decode"),
-        1
-    );
+        .expect("execution count query should work");
+    assert_eq!(execution_count, 1);
 
     release.notify_waiters();
     timeout(Duration::from_secs(2), async {
@@ -741,8 +762,6 @@ async fn starting_agent_recovery_reuses_reserved_execution_identity() {
         .expect("execution should load")
         .expect("execution should exist");
     assert_eq!(recovered.id, reserved.id);
-    assert_eq!(recovered.child_thread_id, reserved.child_thread_id);
-    assert_eq!(recovered.child_turn_id, reserved.child_turn_id);
 }
 
 #[tokio::test]
@@ -822,10 +841,6 @@ async fn concurrent_execution_reservations_reuse_one_child_identity() {
     assert_eq!(left.task_run_id, run.id);
     assert_eq!(right.task_run_id, run.id);
     assert_eq!(left.status, TaskRunExecutionStatus::Reserved);
-    assert_eq!(left.child_thread_id, right.child_thread_id);
-    assert_eq!(left.child_turn_id, right.child_turn_id);
-    assert!(left.child_thread_id.is_some());
-    assert!(left.child_turn_id.is_some());
 
     let loaded = store
         .load_execution_for_run(run.id.as_str())
@@ -833,24 +848,11 @@ async fn concurrent_execution_reservations_reuse_one_child_identity() {
         .expect("execution should load")
         .expect("execution should exist");
     assert_eq!(loaded.id, left.id);
-    assert_eq!(loaded.child_thread_id, left.child_thread_id);
-    assert_eq!(loaded.child_turn_id, left.child_turn_id);
 
-    let row = store
-        .database_connection()
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            format!(
-                "select count(*) as execution_count from task_run_execution where task_run_id = '{}'",
-                run.id.replace('\'', "''")
-            ),
-        ))
+    let count = store
+        .count_task_run_executions_for_run(run.id.as_str())
         .await
-        .expect("count query should work")
-        .expect("count row should exist");
-    let count = row
-        .try_get::<i64>("", "execution_count")
-        .expect("count should decode");
+        .expect("count query should work");
     assert_eq!(count, 1);
 }
 
@@ -873,8 +875,6 @@ async fn execution_repository_tracks_claim_running_heartbeat_and_terminal_state(
         .expect("execution should reserve");
 
     assert_eq!(execution.status, TaskRunExecutionStatus::Reserved);
-    assert!(execution.child_thread_id.is_none());
-    assert!(execution.child_turn_id.is_none());
 
     let claimed = store
         .claim_execution(execution.id.as_str(), "worker_1", run.created_at + 60)
@@ -961,41 +961,96 @@ async fn one_task_run_can_link_only_one_child_thread() {
     let parent_thread_id = pioneer_protocol::generate_id(21);
     let parent_turn_id = pioneer_protocol::generate_id(21);
     let root_thread_id = parent_thread_id.clone();
-    let first = pioneer_protocol::ThreadLineage {
-        child_thread_id: execution
-            .child_thread_id
-            .clone()
-            .expect("execution should reserve child thread"),
-        child_turn_id: execution
-            .child_turn_id
-            .clone()
-            .expect("execution should reserve child turn"),
+    let child_thread_id = pioneer_protocol::generate_id(21);
+    let child_turn_id = pioneer_protocol::generate_id(21);
+    let first_lineage = TaskThreadLineage {
+        child_thread_id: child_thread_id.clone(),
         parent_thread_id: parent_thread_id.clone(),
-        parent_turn_id: Some(parent_turn_id.clone()),
-        task_id: run.task_id.clone(),
-        task_run_id: run.id.clone(),
         root_thread_id: root_thread_id.clone(),
         depth: 1,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: Some(parent_thread_id.clone()),
+        created_by_turn_id: Some(parent_turn_id.clone()),
         created_at: run.created_at,
     };
+    let first_binding = TaskRunThreadBinding {
+        id: "binding_first".to_owned(),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: child_thread_id.clone(),
+        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+        created_at: run.created_at,
+    };
+    let first_turn = TaskRunTurn {
+        id: "turn_first".to_owned(),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: child_thread_id,
+        turn_id: child_turn_id,
+        kind: TaskRunTurnKind::Initial,
+        round: 0,
+        sequence: 0,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: None,
+        requested_by_review_event_id: None,
+        created_at: run.created_at,
+        started_at: Some(run.created_at),
+        completed_at: None,
+    };
     handle
-        .link_child_thread(first, run.created_at)
+        .link_child_thread_with_runtime(first_lineage, first_binding, first_turn, run.created_at)
         .await
         .expect("first lineage should link");
 
-    let duplicate = pioneer_protocol::ThreadLineage {
-        child_thread_id: pioneer_protocol::generate_id(21),
-        child_turn_id: pioneer_protocol::generate_id(21),
-        parent_thread_id,
-        parent_turn_id: Some(parent_turn_id),
-        task_id: run.task_id.clone(),
-        task_run_id: run.id.clone(),
+    let duplicate_child_thread_id = pioneer_protocol::generate_id(21);
+    let duplicate_child_turn_id = pioneer_protocol::generate_id(21);
+    let duplicate_lineage = TaskThreadLineage {
+        child_thread_id: duplicate_child_thread_id.clone(),
+        parent_thread_id: parent_thread_id.clone(),
         root_thread_id,
         depth: 1,
+        origin_kind: Some("task_run".to_owned()),
+        created_by_thread_id: Some(parent_thread_id),
+        created_by_turn_id: Some(parent_turn_id),
         created_at: run.created_at,
     };
+    let duplicate_binding = TaskRunThreadBinding {
+        id: "binding_duplicate".to_owned(),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: duplicate_child_thread_id.clone(),
+        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+        created_at: run.created_at,
+    };
+    let duplicate_turn = TaskRunTurn {
+        id: "turn_duplicate".to_owned(),
+        task_id: run.task_id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id),
+        thread_id: duplicate_child_thread_id,
+        turn_id: duplicate_child_turn_id,
+        kind: TaskRunTurnKind::Initial,
+        round: 0,
+        sequence: 0,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: None,
+        requested_by_review_event_id: None,
+        created_at: run.created_at,
+        started_at: Some(run.created_at),
+        completed_at: None,
+    };
     let error = handle
-        .link_child_thread(duplicate, run.created_at)
+        .link_child_thread_with_runtime(
+            duplicate_lineage,
+            duplicate_binding,
+            duplicate_turn,
+            run.created_at,
+        )
         .await
         .expect_err("second lineage for same run must fail");
     assert!(

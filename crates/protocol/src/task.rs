@@ -955,10 +955,6 @@ pub struct TaskRunExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
@@ -988,8 +984,6 @@ pub struct TaskRunThreadBinding {
 pub struct TaskThreadLineage {
     pub child_thread_id: String,
     pub parent_thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_turn_id: Option<String>,
     pub root_thread_id: String,
     pub depth: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1316,6 +1310,11 @@ pub enum TaskEventPayload {
     ChildThreadLinked {
         lineage: ThreadLineage,
     },
+    TaskThreadLineageCreated {
+        task_id: String,
+        run_id: String,
+        lineage: TaskThreadLineage,
+    },
     TaskRunThreadBindingCreated {
         binding: TaskRunThreadBinding,
     },
@@ -1445,6 +1444,7 @@ impl TaskEventPayload {
             Self::RunCreated { run, .. } => run.task_id.as_str(),
             Self::TaskDetached { task, .. } => task.id.as_str(),
             Self::ChildThreadLinked { lineage } => lineage.task_id.as_str(),
+            Self::TaskThreadLineageCreated { task_id, .. } => task_id.as_str(),
             Self::TaskRunThreadBindingCreated { binding } => binding.task_id.as_str(),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
@@ -1485,6 +1485,7 @@ impl TaskEventPayload {
             | Self::TaskCancelled { .. }
             | Self::TaskDetached { .. } => None,
             Self::ChildThreadLinked { lineage } => Some(lineage.task_run_id.as_str()),
+            Self::TaskThreadLineageCreated { run_id, .. } => Some(run_id.as_str()),
             Self::TaskRunThreadBindingCreated { binding } => Some(binding.run_id.as_str()),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
@@ -1514,6 +1515,9 @@ impl TaskEventPayload {
     pub fn thread_id(&self) -> Option<&str> {
         match self {
             Self::ChildThreadLinked { lineage } => Some(lineage.child_thread_id.as_str()),
+            Self::TaskThreadLineageCreated { lineage, .. } => {
+                Some(lineage.child_thread_id.as_str())
+            }
             Self::TaskRunThreadBindingCreated { binding } => Some(binding.thread_id.as_str()),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
@@ -1586,6 +1590,7 @@ impl TaskEventPayload {
             Self::TaskResumed { .. } => events::TASK_RESUMED,
             Self::TaskRecovered { .. } => events::TASK_RECOVERED,
             Self::ChildThreadLinked { .. } => events::TASK_TREE_CHANGED,
+            Self::TaskThreadLineageCreated { .. } => events::TASK_TREE_CHANGED,
             Self::TaskRunThreadBindingCreated { .. } => events::TASK_RUN_THREAD_BINDING_CREATED,
             Self::TaskRunTurnStarted { .. } => events::TASK_RUN_TURN_STARTED,
             Self::TaskRunTurnCompleted { .. } => events::TASK_RUN_TURN_COMPLETED,
@@ -1677,6 +1682,12 @@ impl TaskEventPayload {
             Self::ChildThreadLinked { lineage } => {
                 Some(format!("run:{}:child_thread_linked", lineage.task_run_id))
             }
+            Self::TaskThreadLineageCreated {
+                run_id, lineage, ..
+            } => Some(format!(
+                "run:{run_id}:thread:{}:lineage_created",
+                lineage.child_thread_id
+            )),
             Self::TaskRunThreadBindingCreated { binding } => Some(format!(
                 "run:{}:thread:{}:binding:{}",
                 binding.run_id,

@@ -35,12 +35,6 @@
     "parentThreadId": {
       "type": "string"
     },
-    "parentTurnId": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "rootThreadId": {
       "type": "string"
     }
