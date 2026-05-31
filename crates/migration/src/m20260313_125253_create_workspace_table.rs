@@ -606,6 +606,7 @@ impl MigrationTrait for Migration {
                     .col(text("context_policy_json").null())
                     .col(text("tool_policy_json").null())
                     .col(text("result_contract_json").null())
+                    .col(text("review_policy_json").null())
                     .col(integer("depth"))
                     .col(integer("max_depth"))
                     .col(timestamp_with_time_zone("created_at").default(Expr::current_timestamp()))

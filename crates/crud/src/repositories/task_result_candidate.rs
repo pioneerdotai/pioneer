@@ -153,8 +153,7 @@ fn active_model_from_new_candidate(
         task_run_turn_id: Set(candidate.task_run_turn_id),
         thread_id: Set(candidate.thread_id),
         turn_id: Set(candidate.turn_id),
-        round: Set(i32::try_from(candidate.round)
-            .context("task result candidate round is out of range")?),
+        round: Set(i64::from(candidate.round)),
         status: Set(task_result_candidate_status_to_db(candidate.status)),
         result_json: Set(optional_typed_json_to_db(&candidate.result)?),
         extraction_error_json: Set(optional_typed_json_to_db(&candidate.extraction_error)?),

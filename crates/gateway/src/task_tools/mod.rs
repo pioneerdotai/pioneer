@@ -823,6 +823,7 @@ impl TaskToolHandler {
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
             result_contract: input.result_contract,
+            review_policy: None,
             depth: 0,
             max_depth: requested_max_depth,
         });

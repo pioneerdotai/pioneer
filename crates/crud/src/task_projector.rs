@@ -512,6 +512,23 @@ impl TaskProjector {
                 .await?;
                 Ok(())
             }),
+            TaskEventPayload::TaskResultCandidateCancelled {
+                candidate,
+                review_event_id,
+            } => project_future(async move {
+                upsert_task_result_candidate(db, candidate).await?;
+                let resolved_at = candidate.resolved_at.unwrap_or(created_at.timestamp());
+                task_result_candidate::update_candidate_resolution(
+                    db,
+                    candidate.id.as_str(),
+                    TaskResultCandidateStatus::Cancelled,
+                    Some(review_event_id.as_str()),
+                    Some(resolved_at),
+                    candidate.updated_at.max(resolved_at),
+                )
+                .await?;
+                Ok(())
+            }),
             TaskEventPayload::TaskRevisionRequested {
                 task_id,
                 run_id,
@@ -548,16 +565,31 @@ impl TaskProjector {
                 .await
             }),
             TaskEventPayload::TaskRunEnteredReview {
-                run_id, entered_at, ..
+                task_id,
+                run_id,
+                entered_at,
+                ..
             } => project_future(async move {
-                let outcome = task_run::update_run_status(
+                let entered_at = unix_to_datetime(*entered_at);
+                let run_outcome = task_run::update_run_status(
                     db,
                     run_id,
-                    TaskRunStatus::Waiting,
-                    unix_to_datetime(*entered_at),
+                    TaskRunStatus::WaitingReview,
+                    entered_at,
                 )
                 .await?;
-                handle_projection_outcome("task_run_entered_review", run_id, &outcome)?;
+                handle_projection_outcome("task_run_entered_review", run_id, &run_outcome)?;
+                let task_outcome = task::update_task_status(
+                    db,
+                    task_id,
+                    TaskStatus::WaitingReview,
+                    entered_at,
+                    None,
+                )
+                .await?;
+                handle_projection_outcome("task_entered_review", task_id, &task_outcome)?;
+                task_run_execution::mark_execution_waiting_review_by_run(db, run_id, entered_at)
+                    .await?;
                 Ok(())
             }),
             TaskEventPayload::DepthLimitExceeded {
@@ -612,6 +644,7 @@ impl TaskProjector {
                 })
             }
             TaskEventPayload::WriteLockAcquired { lock }
+            | TaskEventPayload::WriteLockExtended { lock, .. }
             | TaskEventPayload::WriteLockReleased { lock, .. }
             | TaskEventPayload::WriteLockExpired { lock, .. } => {
                 project_future(task_write_lock::upsert_lock(db, lock))

@@ -721,6 +721,7 @@
         "starting",
         "running",
         "waiting",
+        "waiting_review",
         "succeeded",
         "failed",
         "cancelled",
@@ -735,6 +736,7 @@
         "queued",
         "running",
         "waiting",
+        "waiting_review",
         "completed",
         "failed",
         "cancelled"

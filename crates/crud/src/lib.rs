@@ -63,10 +63,12 @@ use crate::projector::TurnProjector;
 pub struct TaskReviewInvariantSnapshot {
     pub thread_lineage: Vec<TaskReviewInvariantThreadLineageRecord>,
     pub primary_bindings: Vec<TaskReviewInvariantBindingRecord>,
+    pub agent_specs: Vec<TaskReviewInvariantAgentSpecRecord>,
     pub task_run_turns: Vec<TaskReviewInvariantTurnRecord>,
     pub task_result_candidates: Vec<TaskReviewInvariantCandidateRecord>,
     pub task_result_review_events: Vec<TaskReviewInvariantReviewEventRecord>,
     pub task_runs: Vec<TaskReviewInvariantRunRecord>,
+    pub write_locks: Vec<TaskReviewInvariantWriteLockRecord>,
     pub turn_ids: Vec<String>,
 }
 
@@ -82,6 +84,13 @@ pub struct TaskReviewInvariantBindingRecord {
     pub run_id: String,
     pub execution_id: Option<String>,
     pub thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantAgentSpecRecord {
+    pub task_id: String,
+    pub run_id: Option<String>,
+    pub tool_policy_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +135,14 @@ pub struct TaskReviewInvariantRunRecord {
     pub task_id: String,
     pub status: String,
     pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReviewInvariantWriteLockRecord {
+    pub task_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub expires_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -3824,6 +3841,21 @@ impl CrudStore {
                 return Err(error).context("failed to load task review thread bindings");
             }
         };
+        let agent_specs = match pioneer_entity::task_agent_spec::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantAgentSpecRecord {
+                    task_id: row.task_id,
+                    run_id: row.run_id,
+                    tool_policy_json: row.tool_policy_json,
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task review agent specs"),
+        };
         let task_run_turns = match pioneer_entity::task_run_turn::Entity::find()
             .all(&self.connection)
             .await
@@ -3903,6 +3935,22 @@ impl CrudStore {
             Err(error) if is_missing_table_error(&error) => return Ok(None),
             Err(error) => return Err(error).context("failed to load task runs"),
         };
+        let write_locks = match pioneer_entity::task_write_lock::Entity::find()
+            .all(&self.connection)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| TaskReviewInvariantWriteLockRecord {
+                    task_id: row.task_id,
+                    run_id: row.run_id,
+                    status: row.status,
+                    expires_at_unix: row.expires_at.map(|value| value.timestamp()),
+                })
+                .collect(),
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(error).context("failed to load task review write locks"),
+        };
         let turn_ids = match pioneer_entity::turn::Entity::find()
             .all(&self.connection)
             .await
@@ -3915,10 +3963,12 @@ impl CrudStore {
         Ok(Some(TaskReviewInvariantSnapshot {
             thread_lineage,
             primary_bindings,
+            agent_specs,
             task_run_turns,
             task_result_candidates,
             task_result_review_events,
             task_runs,
+            write_locks,
             turn_ids,
         }))
     }
@@ -7701,6 +7751,7 @@ fn task_agent_spec_from_db_model(
         context_policy: optional_typed_json_from_db(model.context_policy_json)?,
         tool_policy: optional_typed_json_from_db(model.tool_policy_json)?,
         result_contract: optional_typed_json_from_db(model.result_contract_json)?,
+        review_policy: optional_typed_json_from_db(model.review_policy_json)?,
         depth: model.depth,
         max_depth: model.max_depth,
         created_at: model.created_at.timestamp(),
@@ -8301,17 +8352,18 @@ mod tests {
         Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
         TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate,
         TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
-        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunStatus,
-        TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-        TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus,
-        TaskValue, Thread, ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
-        ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
-        ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-        ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-        ToolRetryResolution, ToolStoragePayload, Turn, TurnCompletedNotification, TurnItem,
-        TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnOrigin,
-        TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
+        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus,
+        TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn,
+        TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec,
+        TaskTriggerStatus, TaskValue, Thread, ThreadHistoryEventPayload, ThreadMode,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+        ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
+        ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+        ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
+        ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+        TurnCompletedNotification, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
+        TurnItemType, TurnKind, TurnOrigin, TurnStatus, TurnToolLoopBudgetExceededNotification,
+        UserInput,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter, Set,
@@ -8900,17 +8952,38 @@ mod tests {
     async fn task_review_projector_replays_new_runtime_events_idempotently() {
         let store = test_store_with_workspace("ws_task_review_projector").await;
         let timestamp = 1_700_002_000;
+        let mut task = sample_task(timestamp);
+        task.id = "task_projector".to_owned();
+        task.workspace_id = "ws_task_review_projector".to_owned();
         let mut run = sample_task_run(timestamp);
         run.id = "run_projector".to_owned();
-        run.task_id = "task_projector".to_owned();
+        run.task_id = task.id.clone();
         run.trigger_id = None;
         run.run_group_id = run.id.clone();
+
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("task and run should project");
+        let execution = store
+            .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
+            .await
+            .expect("execution should reserve");
 
         let binding = TaskRunThreadBinding {
             id: "binding_projector".to_owned(),
             task_id: run.task_id.clone(),
             run_id: run.id.clone(),
-            execution_id: Some("execution_projector".to_owned()),
+            execution_id: Some(execution.id.clone()),
             thread_id: "thread_projector".to_owned(),
             binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
             created_at: timestamp + 1,
@@ -8919,7 +8992,7 @@ mod tests {
             id: "task_run_turn_projector".to_owned(),
             task_id: run.task_id.clone(),
             run_id: run.id.clone(),
-            execution_id: Some("execution_projector".to_owned()),
+            execution_id: Some(execution.id.clone()),
             thread_id: binding.thread_id.clone(),
             turn_id: "turn_projector".to_owned(),
             kind: TaskRunTurnKind::Initial,
@@ -8985,10 +9058,6 @@ mod tests {
         };
 
         let events = vec![
-            TaskEventPayload::RunCreated {
-                run: run.clone(),
-                agent_spec: None,
-            },
             TaskEventPayload::TaskRunThreadBindingCreated {
                 binding: binding.clone(),
             },
@@ -9065,7 +9134,26 @@ mod tests {
                 .expect("run lookup should succeed")
                 .expect("run should exist")
                 .status,
-            TaskRunStatus::Waiting
+            TaskRunStatus::WaitingReview
+        );
+        assert_eq!(
+            store
+                .get_task(task.id.as_str())
+                .await
+                .expect("task lookup should succeed")
+                .expect("task should exist")
+                .task
+                .status,
+            TaskStatus::WaitingReview
+        );
+        assert_eq!(
+            store
+                .load_execution_for_run(run.id.as_str())
+                .await
+                .expect("execution lookup should succeed")
+                .expect("execution should exist")
+                .status,
+            TaskRunExecutionStatus::WaitingReview
         );
     }
 
@@ -9683,6 +9771,7 @@ mod tests {
                     ])),
                 }),
             }),
+            review_policy: None,
             depth: 0,
             max_depth: 3,
             created_at: timestamp,

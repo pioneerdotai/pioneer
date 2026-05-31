@@ -235,6 +235,7 @@
         "reserved",
         "starting",
         "running",
+        "waiting_review",
         "succeeded",
         "failed",
         "cancelled",

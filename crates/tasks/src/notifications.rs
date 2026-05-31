@@ -52,6 +52,9 @@ impl TaskNotificationMapper {
             TaskEventPayload::TaskResultCandidateRejected { .. } => {
                 events::TASK_RESULT_CANDIDATE_REJECTED
             }
+            TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+                events::TASK_RESULT_CANDIDATE_CANCELLED
+            }
             TaskEventPayload::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
             TaskEventPayload::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             TaskEventPayload::DeliveryQueued { .. } => events::TASK_DELIVERY_QUEUED,
@@ -60,6 +63,7 @@ impl TaskNotificationMapper {
             TaskEventPayload::DeliveryFailed { .. } => events::TASK_DELIVERY_FAILED,
             TaskEventPayload::DeliveryCancelled { .. } => events::TASK_DELIVERY_CANCELLED,
             TaskEventPayload::WriteLockAcquired { .. } => events::TASK_WRITE_LOCK_ACQUIRED,
+            TaskEventPayload::WriteLockExtended { .. } => events::TASK_WRITE_LOCK_EXTENDED,
             TaskEventPayload::WriteLockReleased { .. } => events::TASK_WRITE_LOCK_RELEASED,
             TaskEventPayload::WriteLockBlocked { .. } => events::TASK_WRITE_LOCK_BLOCKED,
             TaskEventPayload::WriteLockExpired { .. } => events::TASK_WRITE_LOCK_EXPIRED,

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskResultReviewResolutionStrategy",
+  "type": "string",
+  "enum": [
+    "parent_final",
+    "user_final",
+    "require_all_required_reviewers_then_parent",
+    "quorum_then_parent",
+    "any_required_reviewer_can_request_changes"
+  ]
+}

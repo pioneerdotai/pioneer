@@ -210,6 +210,10 @@ pub enum TaskRuntimeInvariantViolationKind {
         expected_round: i64,
         actual_round: i64,
     },
+    WaitingReviewRunMissingActiveWriteLock {
+        task_id: String,
+        run_id: String,
+    },
 }
 
 impl TaskRuntimeInvariantViolationKind {
@@ -257,6 +261,9 @@ impl TaskRuntimeInvariantViolationKind {
             Self::NonContiguousCandidateProducingRound { .. } => {
                 "non_contiguous_candidate_producing_round"
             }
+            Self::WaitingReviewRunMissingActiveWriteLock { .. } => {
+                "waiting_review_run_missing_active_write_lock"
+            }
         }
     }
 
@@ -287,7 +294,8 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::DuplicateTaskRunTurnSequence { .. }
             | Self::NonContiguousTaskRunTurnSequence { .. }
             | Self::DuplicateCandidateProducingRound { .. }
-            | Self::NonContiguousCandidateProducingRound { .. } => {
+            | Self::NonContiguousCandidateProducingRound { .. }
+            | Self::WaitingReviewRunMissingActiveWriteLock { .. } => {
                 TaskRuntimeInvariantSeverity::Error
             }
         }
@@ -318,7 +326,8 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::DuplicateTaskRunTurnSequence { task_id, .. }
             | Self::NonContiguousTaskRunTurnSequence { task_id, .. }
             | Self::DuplicateCandidateProducingRound { task_id, .. }
-            | Self::NonContiguousCandidateProducingRound { task_id, .. } => task_id.as_str(),
+            | Self::NonContiguousCandidateProducingRound { task_id, .. }
+            | Self::WaitingReviewRunMissingActiveWriteLock { task_id, .. } => task_id.as_str(),
             Self::StaleInProgressTurn { turn_id, .. } => turn_id.as_str(),
             Self::StaleTurnItemAttempt { item_id, .. } => item_id.as_str(),
         }
@@ -456,7 +465,8 @@ impl TaskRuntimeInvariantScanner {
     ) -> Result<TaskRuntimeInvariantReport> {
         let snapshot = store.load_task_runtime_invariant_snapshot().await?;
         let mut report = self.scan_snapshot(&snapshot, observed_at_unix)?;
-        task_review_invariants::detect_task_review_violations(store, &mut report).await?;
+        task_review_invariants::detect_task_review_violations(store, observed_at_unix, &mut report)
+            .await?;
         Ok(report)
     }
 

@@ -399,6 +399,7 @@ mod tests {
                 network_access: true,
             }),
             result_contract: None,
+            review_policy: None,
             depth,
             max_depth,
             created_at: NOW,

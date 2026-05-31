@@ -444,6 +444,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
         context_policy: None,
         tool_policy: None,
         result_contract: None,
+        review_policy: None,
         depth: 0,
         max_depth,
     }
@@ -1724,6 +1725,134 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
         .await
         .expect("second run should acquire after release");
     assert!(matches!(second_decision, WriteLockDecision::Acquired(_)));
+}
+
+#[tokio::test]
+async fn waiting_review_recovery_preserves_stale_write_lock() {
+    let runtime = runtime().await;
+
+    let mut first = create_params(TaskTriggerSpec::Immediate);
+    first.executor_kind = TaskExecutorKind::Agent;
+    let mut first_spec = agent_spec(3);
+    first_spec.tool_policy = Some(TaskAgentToolPolicy {
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        write_mode: TaskAgentWriteMode::ScopedWrite,
+        allowed_paths: vec!["src".to_owned()],
+        network_access: false,
+    });
+    first.agent_spec = Some(first_spec);
+    first.concurrency_policy = Some(TaskConcurrencyPolicy {
+        key: None,
+        max_parallel_runs: 1,
+        on_conflict: TaskConcurrencyConflictPolicy::Queue,
+    });
+    let first = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), first)
+        .await
+        .expect("first agent task should create");
+    let first_run_id = first.run.expect("first run should exist").id;
+
+    let mut second = create_params(TaskTriggerSpec::Immediate);
+    second.executor_kind = TaskExecutorKind::Agent;
+    let mut second_spec = agent_spec(3);
+    second_spec.tool_policy = Some(TaskAgentToolPolicy {
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        write_mode: TaskAgentWriteMode::ScopedWrite,
+        allowed_paths: vec!["src/lib.rs".to_owned()],
+        network_access: false,
+    });
+    second.agent_spec = Some(second_spec);
+    second.concurrency_policy = Some(TaskConcurrencyPolicy {
+        key: None,
+        max_parallel_runs: 1,
+        on_conflict: TaskConcurrencyConflictPolicy::Queue,
+    });
+    let second = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), second)
+        .await
+        .expect("second agent task should create");
+    let second_run_id = second.run.expect("second run should exist").id;
+
+    let first_decision = runtime
+        .service()
+        .acquire_write_locks_for_run(first_run_id.as_str(), 100)
+        .await
+        .expect("first run should acquire lock");
+    assert!(matches!(first_decision, WriteLockDecision::Acquired(_)));
+
+    let entered_review = runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRunEnteredReview {
+                task_id: first.task.id.clone(),
+                run_id: first_run_id.clone(),
+                candidate_id: "candidate_waiting_review_lock".to_owned(),
+                entered_at: 200,
+            },
+            200,
+        )
+        .await
+        .expect("waiting review event should append");
+    runtime
+        .service()
+        .publish_and_wake(vec![entered_review])
+        .await;
+
+    let recovered = runtime
+        .service()
+        .recover_retry_and_lock_state(3_701)
+        .await
+        .expect("lock recovery should preserve waiting review lock");
+    assert_eq!(recovered, 1);
+
+    let locks = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: first.task.id.clone(),
+        })
+        .await
+        .expect("task should read")
+        .write_locks;
+    assert_eq!(locks.len(), 1);
+    assert_eq!(
+        locks[0].status,
+        pioneer_protocol::TaskWriteLockStatus::Acquired
+    );
+    assert_eq!(locks[0].expires_at, None);
+
+    let second_decision = runtime
+        .service()
+        .acquire_write_locks_for_run(second_run_id.as_str(), 3_702)
+        .await
+        .expect("second run should still queue while first waits for review");
+    assert!(matches!(second_decision, WriteLockDecision::Queued));
+
+    let first_events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: first.task.id,
+            after_sequence: None,
+        })
+        .await
+        .expect("first task events should read");
+    assert!(first_events.events.iter().any(|event| {
+        matches!(
+            event.payload,
+            TaskEventPayload::WriteLockExtended { ref lock, .. }
+                if lock.run_id == first_run_id
+        )
+    }));
+    assert!(!first_events.events.iter().any(|event| {
+        matches!(
+            event.payload,
+            TaskEventPayload::WriteLockExpired { ref lock, .. }
+                if lock.run_id == first_run_id
+        )
+    }));
 }
 
 #[tokio::test]

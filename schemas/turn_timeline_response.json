@@ -1282,6 +1282,47 @@
         "artifact"
       ]
     },
+    "TaskAgentReviewMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "parent_agent",
+        "parent_agent_with_reviewers",
+        "user_approval"
+      ]
+    },
+    "TaskAgentReviewPolicy": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskAgentReviewMode"
+        },
+        "requireExplicitAcceptance": {
+          "type": "boolean"
+        },
+        "resolutionStrategy": {
+          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
+        },
+        "reviewers": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskResultReviewerSpec"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "maxRevisionRounds",
+        "requireExplicitAcceptance",
+        "resolutionStrategy"
+      ]
+    },
     "TaskAgentSpec": {
       "type": "object",
       "properties": {
@@ -1341,6 +1382,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskAgentResultContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentReviewPolicy"
             },
             {
               "type": "null"
@@ -3088,6 +3139,34 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_result_candidate_cancelled"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "candidate": {
+                  "$ref": "#/$defs/TaskResultCandidate"
+                },
+                "review_event_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "candidate",
+                "review_event_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_revision_requested"
             },
             "payload": {
@@ -3377,6 +3456,35 @@
               },
               "required": [
                 "lock"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "write_lock_extended"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "extended_at": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "lock": {
+                  "$ref": "#/$defs/TaskWriteLock"
+                }
+              },
+              "required": [
+                "lock",
+                "extended_at"
               ]
             }
           },
@@ -3887,6 +3995,16 @@
         "system_auto"
       ]
     },
+    "TaskResultReviewResolutionStrategy": {
+      "type": "string",
+      "enum": [
+        "parent_final",
+        "user_final",
+        "require_all_required_reviewers_then_parent",
+        "quorum_then_parent",
+        "any_required_reviewer_can_request_changes"
+      ]
+    },
     "TaskResultReviewerKind": {
       "type": "string",
       "enum": [
@@ -3895,6 +4013,40 @@
         "review_agent",
         "user",
         "system"
+      ]
+    },
+    "TaskResultReviewerSpec": {
+      "type": "object",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "reviewerKind": {
+          "$ref": "#/$defs/TaskResultReviewerKind"
+        },
+        "weight": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "reviewerKind",
+        "required"
       ]
     },
     "TaskRetryBackoffKind": {
@@ -4077,6 +4229,7 @@
         "starting",
         "running",
         "waiting",
+        "waiting_review",
         "succeeded",
         "failed",
         "cancelled",
@@ -4270,6 +4423,7 @@
         "queued",
         "running",
         "waiting",
+        "waiting_review",
         "completed",
         "failed",
         "cancelled"

@@ -125,6 +125,46 @@ pub(super) async fn normalize_task_result_artifacts(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    result: TaskResult,
+) -> Result<std::result::Result<TaskResult, TaskError>> {
+    normalize_task_result_artifacts_with_binding(
+        processor,
+        task,
+        task_run_turn,
+        lineage,
+        &TaskResultArtifactBinding::FinalResult,
+        result,
+    )
+    .await
+}
+
+pub(super) async fn normalize_task_result_candidate_artifacts(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
+    candidate_id: &str,
+    result: TaskResult,
+) -> Result<std::result::Result<TaskResult, TaskError>> {
+    normalize_task_result_artifacts_with_binding(
+        processor,
+        task,
+        task_run_turn,
+        lineage,
+        &TaskResultArtifactBinding::ResultCandidate {
+            candidate_id: candidate_id.to_owned(),
+        },
+        result,
+    )
+    .await
+}
+
+async fn normalize_task_result_artifacts_with_binding(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    task_run_turn: &TaskRunTurn,
+    lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     mut result: TaskResult,
 ) -> Result<std::result::Result<TaskResult, TaskError>> {
     let mut changed_artifact_ids = Vec::new();
@@ -134,6 +174,7 @@ pub(super) async fn normalize_task_result_artifacts(
             task,
             task_run_turn,
             lineage,
+            binding,
             artifact,
             index,
         )
@@ -150,8 +191,14 @@ pub(super) async fn normalize_task_result_artifacts(
         }
     }
 
-    notify_task_artifacts_changed(processor, task, lineage, changed_artifact_ids).await;
+    notify_task_artifacts_changed(processor, task, lineage, binding, changed_artifact_ids).await;
     Ok(Ok(result))
+}
+
+#[derive(Debug, Clone)]
+enum TaskResultArtifactBinding {
+    FinalResult,
+    ResultCandidate { candidate_id: String },
 }
 
 async fn normalize_task_result_artifact(
@@ -159,6 +206,7 @@ async fn normalize_task_result_artifact(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     artifact: &mut TaskArtifact,
     index: usize,
 ) -> Result<Option<String>> {
@@ -187,7 +235,16 @@ async fn normalize_task_result_artifact(
         if artifact.mime_type.is_none() {
             artifact.mime_type = summary.artifact.mime_type.clone();
         }
-        bind_task_result_artifact(processor, task, task_run_turn, lineage, artifact, index).await?;
+        bind_task_result_artifact(
+            processor,
+            task,
+            task_run_turn,
+            lineage,
+            binding,
+            artifact,
+            index,
+        )
+        .await?;
         return Ok(Some(summary.artifact.artifact_id));
     }
 
@@ -206,6 +263,7 @@ async fn normalize_task_result_artifact(
         task,
         task_run_turn,
         lineage,
+        binding,
         artifact,
         path.as_str(),
         index,
@@ -224,12 +282,13 @@ async fn ingest_task_result_path(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     artifact: &TaskArtifact,
     path: &str,
     index: usize,
 ) -> Result<ArtifactSummary> {
     let allowed_root = std::env::current_dir().context("failed to resolve task artifact root")?;
-    let mut metadata = task_result_artifact_metadata(artifact);
+    let mut metadata = task_result_artifact_metadata(artifact, binding);
     metadata.insert("source_path".to_owned(), json!(path));
     let summary = processor
         .artifact_service
@@ -246,6 +305,7 @@ async fn ingest_task_result_path(
                 task,
                 task_run_turn,
                 lineage,
+                binding,
                 index,
             )),
             metadata,
@@ -273,6 +333,7 @@ async fn bind_task_result_artifact(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     artifact: &TaskArtifact,
     index: usize,
 ) -> Result<()> {
@@ -288,11 +349,11 @@ async fn bind_task_result_artifact(
             artifact.version_id.as_deref(),
         )
         .await?;
-    if summary.bindings.iter().any(|binding| {
-        binding.binding_kind == ArtifactBindingKind::TaskResult
-            && binding.task_id.as_deref() == Some(task.id.as_str())
-            && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
-            && binding.item_index == Some(index as i64)
+    if summary.bindings.iter().any(|existing| {
+        existing.binding_kind == artifact_binding_kind(binding)
+            && existing.task_id.as_deref() == Some(task.id.as_str())
+            && existing.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
+            && existing.item_index == Some(index as i64)
     }) {
         return Ok(());
     }
@@ -303,8 +364,8 @@ async fn bind_task_result_artifact(
             workspace_id: task.workspace_id.clone(),
             artifact_id: artifact_id.to_owned(),
             version_id: artifact.version_id.clone(),
-            target: task_result_binding_target(task, task_run_turn, lineage, index),
-            metadata: task_result_artifact_metadata(artifact),
+            target: task_result_binding_target(task, task_run_turn, lineage, binding, index),
+            metadata: task_result_artifact_metadata(artifact, binding),
         })
         .await
         .with_context(|| format!("failed to bind artifact `{artifact_id}` to task result"))?;
@@ -315,6 +376,7 @@ async fn notify_task_artifacts_changed(
     processor: &Arc<MessageProcessor>,
     task: &Task,
     lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     artifact_ids: Vec<String>,
 ) {
     if artifact_ids.is_empty() {
@@ -331,7 +393,7 @@ async fn notify_task_artifacts_changed(
                 workspace_id: task.workspace_id.clone(),
                 thread_id: thread_id.clone(),
                 artifact_ids,
-                reason: "task_result".to_owned(),
+                reason: task_artifacts_changed_reason(binding).to_owned(),
                 generated_at: now_timestamp_secs(),
             },
         )
@@ -342,6 +404,7 @@ fn task_result_binding_target(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    binding: &TaskResultArtifactBinding,
     index: usize,
 ) -> ArtifactBindingTarget {
     ArtifactBindingTarget {
@@ -357,7 +420,7 @@ fn task_result_binding_target(
         tool_call_id: None,
         task_id: Some(task.id.clone()),
         task_run_id: Some(task_run_turn.run_id.clone()),
-        binding_kind: ArtifactBindingKind::TaskResult,
+        binding_kind: artifact_binding_kind(binding),
         direction: ArtifactBindingDirection::Output,
         role: Some(ArtifactRole::Task),
         item_index: Some(index as i64),
@@ -378,9 +441,18 @@ fn task_result_thread_id(task: &Task, lineage: &TaskThreadLineage) -> Option<Str
     })
 }
 
-fn task_result_artifact_metadata(artifact: &TaskArtifact) -> BTreeMap<String, JsonValue> {
+fn task_result_artifact_metadata(
+    artifact: &TaskArtifact,
+    binding: &TaskResultArtifactBinding,
+) -> BTreeMap<String, JsonValue> {
     let mut metadata = BTreeMap::new();
-    metadata.insert("source_kind".to_owned(), json!("task_result"));
+    metadata.insert(
+        "source_kind".to_owned(),
+        json!(task_artifacts_changed_reason(binding)),
+    );
+    if let TaskResultArtifactBinding::ResultCandidate { candidate_id } = binding {
+        metadata.insert("task_result_candidate_id".to_owned(), json!(candidate_id));
+    }
     if let Some(url) = artifact.url.as_deref() {
         metadata.insert("source_url".to_owned(), json!(url));
     }
@@ -391,6 +463,22 @@ fn task_result_artifact_metadata(artifact: &TaskArtifact) -> BTreeMap<String, Js
         );
     }
     metadata
+}
+
+fn artifact_binding_kind(binding: &TaskResultArtifactBinding) -> ArtifactBindingKind {
+    match binding {
+        TaskResultArtifactBinding::FinalResult => ArtifactBindingKind::TaskResult,
+        TaskResultArtifactBinding::ResultCandidate { .. } => {
+            ArtifactBindingKind::TaskResultCandidate
+        }
+    }
+}
+
+fn task_artifacts_changed_reason(binding: &TaskResultArtifactBinding) -> &'static str {
+    match binding {
+        TaskResultArtifactBinding::FinalResult => "task_result",
+        TaskResultArtifactBinding::ResultCandidate { .. } => "task_result_candidate",
+    }
 }
 
 fn display_name_from_task_artifact_path(path: &str) -> Option<String> {

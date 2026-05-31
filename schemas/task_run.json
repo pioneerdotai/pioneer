@@ -272,6 +272,7 @@
         "starting",
         "running",
         "waiting",
+        "waiting_review",
         "succeeded",
         "failed",
         "cancelled",

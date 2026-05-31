@@ -49,31 +49,32 @@ use pioneer_protocol::{
     SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
-    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
-    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
+    SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy,
+    TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode,
+    TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
     TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
-    TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
-    TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
-    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
-    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
-    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind,
+    TaskRetryPolicy, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
+    TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams,
+    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
+    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
+    TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
+    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
+    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
+    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -1617,6 +1618,7 @@ fn test_task_create_params(
             context_policy: None,
             tool_policy: None,
             result_contract: None,
+            review_policy: None,
             depth: 0,
             max_depth,
         }),
@@ -1658,6 +1660,40 @@ async fn create_task_for_test(
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
+    pioneer_tasks::TaskRuntimeConfig {
+        review: pioneer_tasks::TaskReviewRuntimeConfig {
+            enabled: true,
+            allow_task_create_review_policy: true,
+            default_parent_review_for_immediate_attached_agent_tasks: false,
+            default_max_revision_rounds: 2,
+        },
+    }
+}
+
+fn review_enabled_processor(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    session_manager: Arc<SessionManager>,
+    workspace_manager: Arc<WorkspaceManager>,
+    crud_store: Arc<CrudStore>,
+) -> Arc<MessageProcessor> {
+    Arc::new(MessageProcessor::new_with_memory_runtime_and_task_config(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+        Arc::new(GatewayMemoryRuntime::disabled(crud_store)),
+        std::env::temp_dir().join("pioneer-message-review-tests"),
+        pioneer_config::GatewayArtifactsConfig::default(),
+        review_enabled_task_runtime_config(),
+    ))
 }
 
 async fn wait_tasks_for_test(
@@ -3666,7 +3702,7 @@ fn force_fail_tool_item_marks_in_progress_tool_as_failed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
+async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, _rx) = mpsc::channel(8);
     let connection_id = session_manager.register_connection(tx).await;
@@ -3811,6 +3847,11 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         stored_task.task.status,
         pioneer_protocol::TaskStatus::Completed
     );
+    assert_ne!(
+        stored_task.task.status,
+        pioneer_protocol::TaskStatus::WaitingReview,
+        "review-disabled auto-approve must not enter waiting_review task state"
+    );
     let stored_run = stored_task
         .runs
         .iter()
@@ -3821,6 +3862,21 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         stored_run.status,
         TaskRunStatus::Waiting,
         "review-disabled auto-approve must not enter waiting_review/waiting run state"
+    );
+    assert_ne!(
+        stored_run.status,
+        TaskRunStatus::WaitingReview,
+        "review-disabled auto-approve must not enter waiting_review run state"
+    );
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_ne!(
+        execution.status,
+        TaskRunExecutionStatus::WaitingReview,
+        "review-disabled auto-approve must not leave execution waiting for review"
     );
     assert_eq!(stored_task.thread_lineage.len(), 1);
     assert_eq!(
@@ -3897,6 +3953,14 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         accepted_candidate.status,
         TaskResultCandidateStatus::Accepted
     );
+    assert!(
+        crud_store
+            .get_pending_task_result_candidate(run.id.as_str())
+            .await
+            .expect("pending candidate query should succeed")
+            .is_none(),
+        "review-disabled auto-approve must not create a pending review candidate"
+    );
     assert_eq!(accepted_candidate.task_run_turn_id, task_run_turns[0].id);
     assert_eq!(accepted_candidate.thread_id, lineage.child_thread_id);
     assert_eq!(accepted_candidate.turn_id, lineage.child_turn_id);
@@ -3960,6 +4024,591 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_ACCEPTED));
     assert!(event_types.contains(&events::TASK_RUN_COMPLETED));
     assert!(event_types.contains(&events::TASK_COMPLETED));
+    assert!(!event_types.contains(&events::TASK_RUN_ENTERED_REVIEW));
+    assert!(!event_types.contains(&events::TASK_RESULT_CANDIDATE_CANCELLED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: r#"<task_result>{"summary":"ready for parent review","data":{"answer":"ok"}}</task_result>"#
+            .to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_success",
+        "turn_parent_review_success",
+        "Review child result",
+        3,
+    );
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::OwnerThread,
+        thread_id: None,
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    assert_eq!(candidate.thread_id, lineage.child_thread_id);
+    assert_eq!(candidate.turn_id, lineage.child_turn_id);
+    assert_eq!(
+        candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("ready for parent review")
+    );
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            response.task.id.as_str(),
+            pioneer_protocol::TaskStatus::WaitingReview,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::WaitingReview
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::WaitingReview,
+        )
+        .await,
+        TaskRunStatus::WaitingReview
+    );
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::WaitingReview);
+    let stored_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("task run should load")
+        .expect("task run should exist");
+    assert!(stored_run.result.is_none());
+    assert!(
+        crud_store
+            .get_accepted_task_result_candidate(run.id.as_str())
+            .await
+            .expect("accepted candidate query should succeed")
+            .is_none()
+    );
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(response.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("task deliveries should list");
+    assert!(deliveries.deliveries.is_empty());
+    let event_types = crud_store
+        .get_task_events(response.task.id.as_str(), None)
+        .await
+        .expect("task events should load")
+        .events
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&events::TASK_RUN_TURN_COMPLETED.to_owned()));
+    assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_CREATED.to_owned()));
+    assert!(event_types.contains(&events::TASK_RUN_ENTERED_REVIEW.to_owned()));
+    assert!(!event_types.contains(&events::TASK_RESULT_CANDIDATE_ACCEPTED.to_owned()));
+    assert!(!event_types.contains(&events::TASK_RUN_COMPLETED.to_owned()));
+    assert!(!event_types.contains(&events::TASK_COMPLETED.to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: "plain text that does not satisfy required json".to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_extraction",
+        "turn_parent_review_extraction",
+        "Review invalid child result",
+        3,
+    );
+    let agent_spec = params.agent_spec.as_mut().expect("agent spec should exist");
+    agent_spec.review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(1));
+    agent_spec.result_contract = Some(TaskAgentResultContract {
+        format: TaskAgentResultFormat::Json,
+        required: true,
+        schema: None,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::ExtractionFailed,
+    )
+    .await;
+
+    assert!(candidate.result.is_none());
+    assert!(candidate.extraction_error.is_some());
+    assert!(
+        candidate
+            .extraction_error
+            .as_ref()
+            .is_some_and(|error| error.code == "task_agent_result_extraction_failed")
+    );
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            response.task.id.as_str(),
+            pioneer_protocol::TaskStatus::WaitingReview,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::WaitingReview
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::WaitingReview,
+        )
+        .await,
+        TaskRunStatus::WaitingReview
+    );
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::WaitingReview);
+    let candidates = crud_store
+        .list_task_result_candidates(run.id.as_str())
+        .await
+        .expect("candidate list should load");
+    assert_eq!(candidates.len(), 1);
+    let event_types = crud_store
+        .get_task_events(response.task.id.as_str(), None)
+        .await
+        .expect("task events should load")
+        .events
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_CREATED.to_owned()));
+    assert!(event_types.contains(&events::TASK_RUN_ENTERED_REVIEW.to_owned()));
+    assert!(!event_types.contains(&events::TASK_RUN_COMPLETED.to_owned()));
+    assert!(!event_types.contains(&events::TASK_RUN_FAILED.to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: r#"<task_result>{"summary":"cancel me","data":{"answer":"ok"}}</task_result>"#
+            .to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_cancel",
+        "turn_parent_review_cancel",
+        "Cancel review child result",
+        3,
+    );
+    let agent_spec = params.agent_spec.as_mut().expect("agent spec should exist");
+    agent_spec.review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+    agent_spec.tool_policy = Some(TaskAgentToolPolicy {
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        write_mode: TaskAgentWriteMode::ScopedWrite,
+        allowed_paths: vec!["src".to_owned()],
+        network_access: false,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    assert!(
+        crud_store
+            .list_task_write_locks_by_run(run.id.as_str())
+            .await
+            .expect("write locks should list")
+            .iter()
+            .any(|lock| lock.status == TaskWriteLockStatus::Acquired),
+        "waiting_review run should keep scoped write lock acquired"
+    );
+
+    cancel_task_for_test(
+        &processor,
+        pioneer_protocol::TaskCancelParams {
+            task_id: response.task.id.clone(),
+            reason: Some("review cancelled by test".to_owned()),
+            scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+        },
+    )
+    .await
+    .expect("waiting_review task_cancel should succeed");
+
+    let stored_task = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task should reload")
+        .expect("task should exist");
+    assert_eq!(
+        stored_task.task.status,
+        pioneer_protocol::TaskStatus::Cancelled
+    );
+    let stored_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("run should reload")
+        .expect("run should exist");
+    assert_eq!(stored_run.status, TaskRunStatus::Cancelled);
+    let cancelled_candidate = crud_store
+        .get_task_result_candidate(candidate.id.as_str())
+        .await
+        .expect("candidate should reload")
+        .expect("candidate should exist");
+    assert_eq!(
+        cancelled_candidate.status,
+        TaskResultCandidateStatus::Cancelled
+    );
+    assert!(cancelled_candidate.final_review_event_id.is_some());
+    assert!(cancelled_candidate.resolved_at.is_some());
+    let review_events = crud_store
+        .list_task_result_review_events(candidate.id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(review_events.len(), 1);
+    assert_eq!(
+        review_events[0].event_kind,
+        TaskResultReviewEventKind::Decision
+    );
+    assert_eq!(
+        review_events[0].reviewer_kind,
+        TaskResultReviewerKind::System
+    );
+    assert_eq!(review_events[0].decision, TaskResultReviewDecision::Cancel);
+    assert_eq!(
+        cancelled_candidate.final_review_event_id.as_deref(),
+        Some(review_events[0].id.as_str())
+    );
+    assert!(
+        crud_store
+            .list_task_write_locks_by_run(run.id.as_str())
+            .await
+            .expect("write locks should list")
+            .iter()
+            .all(|lock| lock.status == TaskWriteLockStatus::Cancelled),
+        "task_cancel should release waiting_review locks as cancelled"
+    );
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::Cancelled);
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(response.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("task deliveries should list");
+    assert!(deliveries.deliveries.is_empty());
+    let event_types = crud_store
+        .get_task_events(response.task.id.as_str(), None)
+        .await
+        .expect("task events should load")
+        .events
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&events::TASK_RESULT_REVIEW_EVENT_RECORDED.to_owned()));
+    assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_CANCELLED.to_owned()));
+    assert!(event_types.contains(&events::TASK_RUN_CANCELLED.to_owned()));
+    assert!(event_types.contains(&events::TASK_CANCELLED.to_owned()));
+    assert!(!event_types.contains(&events::TASK_DELIVERY_QUEUED.to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: r#"<task_result>{"summary":"child waits for review"}</task_result>"#.to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut parent_params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_parent_cancel",
+        "turn_parent_review_parent_cancel",
+        "Parent task",
+        3,
+    );
+    parent_params.trigger = TaskTriggerInput {
+        spec: TaskTriggerSpec::Manual {
+            allowed_actor: None,
+        },
+    };
+    let parent = create_task_for_test(&processor, parent_params)
+        .await
+        .expect("parent task should create");
+
+    let mut child_params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_parent_cancel",
+        "turn_parent_review_parent_cancel",
+        "Child task waits for review",
+        3,
+    );
+    child_params.parent_task_id = Some(parent.task.id.clone());
+    child_params
+        .agent_spec
+        .as_mut()
+        .expect("child agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+    let child = create_task_for_test(&processor, child_params)
+        .await
+        .expect("child task should create");
+    let child_run = child
+        .run
+        .clone()
+        .expect("child immediate task should create run");
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        child_run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    cancel_task_for_test(
+        &processor,
+        pioneer_protocol::TaskCancelParams {
+            task_id: parent.task.id.clone(),
+            reason: Some("parent cancelled by test".to_owned()),
+            scope: pioneer_protocol::TaskCancelScope::AttachedSubtree,
+        },
+    )
+    .await
+    .expect("parent cancellation should cancel attached waiting_review child");
+
+    let child_task = crud_store
+        .get_task(child.task.id.as_str())
+        .await
+        .expect("child task should reload")
+        .expect("child task should exist");
+    assert_eq!(
+        child_task.task.status,
+        pioneer_protocol::TaskStatus::Cancelled
+    );
+    let child_run = crud_store
+        .get_task_run(child_run.id.as_str())
+        .await
+        .expect("child run should reload")
+        .expect("child run should exist");
+    assert_eq!(child_run.status, TaskRunStatus::Cancelled);
+    let candidate = crud_store
+        .get_task_result_candidate(candidate.id.as_str())
+        .await
+        .expect("candidate should reload")
+        .expect("candidate should exist");
+    assert_eq!(candidate.status, TaskResultCandidateStatus::Cancelled);
+    let review_events = crud_store
+        .list_task_result_review_events(candidate.id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(review_events.len(), 1);
+    assert_eq!(review_events[0].decision, TaskResultReviewDecision::Cancel);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
+    let provider = Arc::new(DelayedProvider {
+        delay: Duration::from_millis(0),
+        text: r#"<task_result>{"summary":"do not detach yet"}</task_result>"#.to_owned(),
+    });
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_review_detach",
+        "turn_parent_review_detach",
+        "Detach blocked review child",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(2));
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let error = detach_task_for_test(
+        &processor,
+        pioneer_protocol::TaskDetachParams {
+            task_id: response.task.id.clone(),
+        },
+    )
+    .await
+    .expect_err("waiting_review detach should be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("waiting for review; accept, revise, or cancel")
+    );
+
+    let stored_task = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task should reload")
+        .expect("task should exist");
+    assert_eq!(
+        stored_task.task.status,
+        pioneer_protocol::TaskStatus::WaitingReview
+    );
+    assert_eq!(
+        stored_task
+            .task
+            .lifecycle_policy
+            .as_ref()
+            .expect("lifecycle policy")
+            .attachment,
+        TaskAttachmentMode::Attached
+    );
+    let stored_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("run should reload")
+        .expect("run should exist");
+    assert_eq!(stored_run.status, TaskRunStatus::WaitingReview);
+    let stored_candidate = crud_store
+        .get_task_result_candidate(candidate.id.as_str())
+        .await
+        .expect("candidate should reload")
+        .expect("candidate should exist");
+    assert_eq!(
+        stored_candidate.status,
+        TaskResultCandidateStatus::PendingReview
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15457,6 +16106,57 @@ async fn wait_for_task_status(
         .expect("task should exist")
         .task
         .status
+}
+
+async fn wait_for_run_status(
+    crud_store: Arc<CrudStore>,
+    run_id: &str,
+    expected_status: TaskRunStatus,
+) -> TaskRunStatus {
+    for _ in 0..100 {
+        let run = crud_store
+            .get_task_run(run_id)
+            .await
+            .expect("task run query should succeed")
+            .expect("task run should exist");
+        if run.status == expected_status {
+            return run.status;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    crud_store
+        .get_task_run(run_id)
+        .await
+        .expect("task run query should succeed")
+        .expect("task run should exist")
+        .status
+}
+
+async fn wait_for_result_candidate_status(
+    crud_store: Arc<CrudStore>,
+    run_id: &str,
+    expected_status: TaskResultCandidateStatus,
+) -> TaskResultCandidate {
+    for _ in 0..100 {
+        let candidates = crud_store
+            .list_task_result_candidates(run_id)
+            .await
+            .expect("task result candidates should list");
+        if let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.status == expected_status)
+        {
+            return candidate;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    let candidates = crud_store
+        .list_task_result_candidates(run_id)
+        .await
+        .expect("task result candidates should list");
+    panic!(
+        "timed out waiting for candidate status `{expected_status:?}` for run `{run_id}`, last={candidates:?}"
+    );
 }
 
 async fn wait_for_thread_name_equals(

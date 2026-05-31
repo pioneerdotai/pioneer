@@ -427,6 +427,7 @@ impl TaskEventPayload {
             | Self::TaskResultReviewEventRecorded { .. }
             | Self::TaskResultCandidateAccepted { .. }
             | Self::TaskResultCandidateRejected { .. }
+            | Self::TaskResultCandidateCancelled { .. }
             | Self::TaskRevisionRequested { .. }
             | Self::TaskRunEnteredReview { .. }
             | Self::DepthLimitExceeded { .. }
@@ -436,6 +437,7 @@ impl TaskEventPayload {
             | Self::DeliveryFailed { .. }
             | Self::DeliveryCancelled { .. }
             | Self::WriteLockAcquired { .. }
+            | Self::WriteLockExtended { .. }
             | Self::WriteLockReleased { .. }
             | Self::WriteLockBlocked { .. }
             | Self::WriteLockExpired { .. } => ProtocolEventClass::Durable,

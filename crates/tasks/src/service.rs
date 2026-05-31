@@ -14,20 +14,22 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{anyhow, bail};
 use pioneer_crud::{AppendedTaskEvent, CrudStore};
 use pioneer_protocol::{
-    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpec, TaskAgentWriteMode,
-    TaskAttachmentMode, TaskCancelParams, TaskCancelResponse, TaskCancelScope,
-    TaskConcurrencyConflictPolicy, TaskCreateParams, TaskCreateResponse, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskDeliveryAttemptStatus,
-    TaskDeliveryMode, TaskDeliveryStatus, TaskDetachParams, TaskDetachResponse, TaskError,
-    TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind,
-    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskListResponse,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse,
-    TaskRescheduleParams, TaskRescheduleResponse, TaskResumeParams, TaskResumeResponse, TaskRun,
-    TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams, TaskTreeResponse, TaskTrigger,
-    TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse, TaskWaitItem,
-    TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
-    TaskWaitResponse, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
-    TaskWriteLockStatus, generate_id,
+    Task, TaskAgendaParams, TaskAgendaResponse, TaskAgentPrompt, TaskAgentReviewPolicy,
+    TaskAgentSpec, TaskAgentWriteMode, TaskAttachmentMode, TaskCancelParams, TaskCancelResponse,
+    TaskCancelScope, TaskConcurrencyConflictPolicy, TaskCreateParams, TaskCreateResponse,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskDetachParams,
+    TaskDetachResponse, TaskError, TaskErrorClass, TaskEventPayload, TaskEventsParams,
+    TaskEventsResponse, TaskExecutorKind, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy,
+    TaskListParams, TaskListResponse, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams,
+    TaskPauseResponse, TaskRescheduleParams, TaskRescheduleResponse, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse,
+    TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTree, TaskTreeParams,
+    TaskTreeResponse, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams,
+    TaskUpdateResponse, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem,
+    TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWriteLock,
+    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use std::collections::VecDeque;
 use std::future::Future;
@@ -62,14 +64,51 @@ pub struct TaskRuntime {
     scheduler_task: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRuntimeConfig {
+    pub review: TaskReviewRuntimeConfig,
+}
+
+impl Default for TaskRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            review: TaskReviewRuntimeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReviewRuntimeConfig {
+    pub enabled: bool,
+    pub allow_task_create_review_policy: bool,
+    pub default_parent_review_for_immediate_attached_agent_tasks: bool,
+    pub default_max_revision_rounds: u32,
+}
+
+impl Default for TaskReviewRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_task_create_review_policy: false,
+            default_parent_review_for_immediate_attached_agent_tasks: false,
+            default_max_revision_rounds: 2,
+        }
+    }
+}
+
 impl TaskRuntime {
     pub fn new(store: Arc<CrudStore>) -> Self {
+        Self::new_with_config(store, TaskRuntimeConfig::default())
+    }
+
+    pub fn new_with_config(store: Arc<CrudStore>, config: TaskRuntimeConfig) -> Self {
         let event_bus = Arc::new(TaskEventBus::new());
         let executors = Arc::new(TaskExecutorRegistry::new());
-        let service = Arc::new(TaskService::new(
+        let service = Arc::new(TaskService::new_with_config(
             store.clone(),
             event_bus.clone(),
             executors.clone(),
+            config.clone(),
         ));
         let scheduler = Arc::new(TaskScheduler::new(
             store.clone(),
@@ -132,6 +171,7 @@ pub struct TaskService {
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
     scheduler: RwLock<Option<Weak<TaskScheduler>>>,
+    config: TaskRuntimeConfig,
 }
 
 impl TaskService {
@@ -140,6 +180,15 @@ impl TaskService {
         event_bus: Arc<TaskEventBus>,
         executors: Arc<TaskExecutorRegistry>,
     ) -> Self {
+        Self::new_with_config(store, event_bus, executors, TaskRuntimeConfig::default())
+    }
+
+    pub fn new_with_config(
+        store: Arc<CrudStore>,
+        event_bus: Arc<TaskEventBus>,
+        executors: Arc<TaskExecutorRegistry>,
+        config: TaskRuntimeConfig,
+    ) -> Self {
         let projector = TaskProjector::new(store.clone());
         Self {
             store,
@@ -147,6 +196,7 @@ impl TaskService {
             event_bus,
             executors,
             scheduler: RwLock::new(None),
+            config,
         }
     }
 
@@ -167,6 +217,7 @@ impl TaskService {
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
         validate_create_params(&params)?;
+        self.validate_review_policy_create_gate(&params)?;
         let now = now_timestamp_secs();
         let parent = self
             .parent_context(params.parent_task_id.as_deref())
@@ -183,6 +234,11 @@ impl TaskService {
         let task_id = generate_id(ID_LEN);
         let trigger_id = generate_id(ID_LEN);
         let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
+        let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
+            default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
+        });
+        let agent_review_policy =
+            self.effective_agent_review_policy_for_create(&params, trigger_kind, &lifecycle_policy);
         let task = Task {
             id: task_id.clone(),
             workspace_id: params.workspace_id.clone(),
@@ -197,9 +253,7 @@ impl TaskService {
             title: required_trimmed(&params.title, "title")?,
             goal: required_trimmed(&params.goal, "goal")?,
             priority: params.priority,
-            lifecycle_policy: Some(params.lifecycle_policy.clone().unwrap_or_else(|| {
-                default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
-            })),
+            lifecycle_policy: Some(lifecycle_policy),
             delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
                 default_delivery_policy(
                     trigger_kind,
@@ -268,6 +322,7 @@ impl TaskService {
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
             result_contract: input.result_contract,
+            review_policy: agent_review_policy,
             depth,
             max_depth,
             created_at: now,
@@ -466,6 +521,7 @@ impl TaskService {
         let mut events = Vec::new();
         let mut cancelled_runs = Vec::new();
         let mut cancelled_deliveries = Vec::new();
+        let mut cancelled_executions = Vec::new();
 
         for task in &plan.cancelled_tasks {
             let Some(response) = self.store.get_task(task.id.as_str()).await? else {
@@ -478,6 +534,7 @@ impl TaskService {
                 &mut events,
                 &mut cancelled_runs,
                 &mut cancelled_deliveries,
+                &mut cancelled_executions,
             )
             .await?;
         }
@@ -506,6 +563,18 @@ impl TaskService {
         }
 
         let appended = self.append_events(events, now).await?;
+        for (execution_id, error) in cancelled_executions {
+            let _ = self
+                .store
+                .mark_execution_terminal(
+                    execution_id.as_str(),
+                    TaskRunExecutionStatus::Cancelled,
+                    now,
+                    None,
+                    error.as_ref(),
+                )
+                .await?;
+        }
         self.publish_and_wake(appended).await;
         let task = self
             .store
@@ -534,6 +603,17 @@ impl TaskService {
         let mut task = response.task;
         if is_terminal_task(task.status) {
             return Ok(TaskDetachResponse { task });
+        }
+        if task.status == TaskStatus::WaitingReview
+            || response
+                .runs
+                .iter()
+                .any(|run| run.status == TaskRunStatus::WaitingReview)
+        {
+            bail!(
+                "task `{}` is waiting for review; accept, revise, or cancel the active review candidate before detaching",
+                task.id
+            );
         }
         let mut lifecycle = task.lifecycle_policy.clone().unwrap_or_else(|| {
             default_lifecycle_policy(
@@ -1267,6 +1347,59 @@ impl TaskService {
         self.store.list_task_event_task_ids().await
     }
 
+    fn validate_review_policy_create_gate(
+        &self,
+        params: &TaskCreateParams,
+    ) -> TaskRuntimeResult<()> {
+        let Some(review_policy) = params.agent_spec.as_ref().and_then(|spec| {
+            spec.review_policy
+                .as_ref()
+                .filter(|policy| policy.is_enabled())
+        }) else {
+            return Ok(());
+        };
+        if !self.config.review.enabled || !self.config.review.allow_task_create_review_policy {
+            bail!(
+                "task review policy `{}` is not enabled for task_create",
+                serde_json::to_value(review_policy.mode)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned())
+            );
+        }
+        Ok(())
+    }
+
+    fn effective_agent_review_policy_for_create(
+        &self,
+        params: &TaskCreateParams,
+        trigger_kind: TaskTriggerKind,
+        lifecycle_policy: &TaskLifecyclePolicy,
+    ) -> Option<TaskAgentReviewPolicy> {
+        let explicit_policy = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.review_policy.clone());
+        if explicit_policy.is_some() {
+            return explicit_policy;
+        }
+        if params.agent_spec.is_none()
+            || params.executor_kind != TaskExecutorKind::Agent
+            || trigger_kind != TaskTriggerKind::Immediate
+            || lifecycle_policy.attachment != TaskAttachmentMode::Attached
+            || !self.config.review.enabled
+            || !self
+                .config
+                .review
+                .default_parent_review_for_immediate_attached_agent_tasks
+        {
+            return None;
+        }
+        Some(TaskAgentReviewPolicy::parent_agent_default(
+            self.config.review.default_max_revision_rounds,
+        ))
+    }
+
     pub async fn acquire_write_locks_for_run(
         &self,
         run_id: &str,
@@ -1399,6 +1532,22 @@ impl TaskService {
         let mut recovered = 0usize;
         let mut events = Vec::new();
         for mut lock in self.store.list_stale_task_write_locks(now, 1024).await? {
+            if self
+                .store
+                .get_task_run(lock.run_id.as_str())
+                .await?
+                .is_some_and(|run| run.status == TaskRunStatus::WaitingReview)
+            {
+                lock.expires_at = None;
+                lock.reason = Some("write lock held while task waits for review".to_owned());
+                lock.updated_at = now;
+                events.push(TaskEventPayload::WriteLockExtended {
+                    lock,
+                    extended_at: now,
+                });
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
             lock.status = TaskWriteLockStatus::Expired;
             lock.released_at = Some(now);
             lock.reason = Some("write lock expired during startup recovery".to_owned());
@@ -1709,6 +1858,7 @@ impl TaskService {
         events: &mut Vec<TaskEventPayload>,
         cancelled_runs: &mut Vec<TaskRun>,
         cancelled_deliveries: &mut Vec<TaskDelivery>,
+        cancelled_executions: &mut Vec<(String, Option<TaskError>)>,
     ) -> TaskRuntimeResult<()> {
         if is_terminal_task(response.task.status) {
             return Ok(());
@@ -1718,6 +1868,19 @@ impl TaskService {
             .iter()
             .filter(|run| !is_terminal_run(run.status))
         {
+            if run.status == TaskRunStatus::WaitingReview {
+                self.push_cancel_waiting_review_run_events(
+                    response,
+                    run,
+                    reason,
+                    now,
+                    events,
+                    cancelled_runs,
+                    cancelled_executions,
+                )
+                .await?;
+                continue;
+            }
             if let Some(executor) = self.executors.get(run.executor_kind).await {
                 let handle = TaskExecutionHandle::new(
                     self.store.clone(),
@@ -1805,6 +1968,81 @@ impl TaskService {
             completed_at: now,
         });
         Ok(())
+    }
+
+    async fn push_cancel_waiting_review_run_events(
+        &self,
+        response: &TaskGetResponse,
+        run: &TaskRun,
+        reason: &str,
+        now: i64,
+        events: &mut Vec<TaskEventPayload>,
+        cancelled_runs: &mut Vec<TaskRun>,
+        cancelled_executions: &mut Vec<(String, Option<TaskError>)>,
+    ) -> TaskRuntimeResult<()> {
+        if let Some(candidate) = self
+            .active_review_candidate_for_run(run.id.as_str())
+            .await?
+        {
+            let review_event = cancel_review_event_for_candidate(&candidate, reason, now);
+            let review_event_id = review_event.id.clone();
+            let mut cancelled_candidate = candidate;
+            cancelled_candidate.status = TaskResultCandidateStatus::Cancelled;
+            cancelled_candidate.final_review_event_id = Some(review_event_id.clone());
+            cancelled_candidate.updated_at = now;
+            cancelled_candidate.resolved_at = Some(now);
+            events.push(TaskEventPayload::TaskResultReviewEventRecorded { review_event });
+            events.push(TaskEventPayload::TaskResultCandidateCancelled {
+                candidate: cancelled_candidate,
+                review_event_id,
+            });
+        }
+
+        events.push(TaskEventPayload::RunCancelled {
+            task_id: response.task.id.clone(),
+            run_id: run.id.clone(),
+            reason: Some(reason.to_owned()),
+            cancelled_at: now,
+        });
+        cancelled_runs.push(run.clone());
+        self.push_cancelled_write_locks_for_run(run.id.as_str(), reason, now, events)
+            .await?;
+        if let Some(execution) = self.store.load_execution_for_run(run.id.as_str()).await?
+            && !execution.status.is_terminal()
+        {
+            cancelled_executions.push((
+                execution.id,
+                Some(TaskError {
+                    code: "task_run_cancelled".to_owned(),
+                    message: reason.to_owned(),
+                    class: TaskErrorClass::Cancelled,
+                    details: None,
+                    failed_run_id: Some(run.id.clone()),
+                }),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn active_review_candidate_for_run(
+        &self,
+        run_id: &str,
+    ) -> TaskRuntimeResult<Option<TaskResultCandidate>> {
+        let mut candidates = self.store.list_task_result_candidates(run_id).await?;
+        candidates.retain(|candidate| {
+            matches!(
+                candidate.status,
+                TaskResultCandidateStatus::PendingReview
+                    | TaskResultCandidateStatus::ExtractionFailed
+            )
+        });
+        candidates.sort_by(|left, right| {
+            right
+                .round
+                .cmp(&left.round)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+        });
+        Ok(candidates.into_iter().next())
     }
 
     async fn push_cancelled_write_locks_for_run(
@@ -2366,6 +2604,33 @@ fn required_trimmed(value: &str, field: &str) -> TaskRuntimeResult<String> {
         bail!("`{field}` is required");
     }
     Ok(trimmed.to_owned())
+}
+
+fn cancel_review_event_for_candidate(
+    candidate: &TaskResultCandidate,
+    reason: &str,
+    created_at: i64,
+) -> TaskResultReviewEvent {
+    TaskResultReviewEvent {
+        id: format!("task_result_review_cancel_{}", candidate.id),
+        candidate_id: candidate.id.clone(),
+        task_id: candidate.task_id.clone(),
+        run_id: candidate.run_id.clone(),
+        task_run_turn_id: candidate.task_run_turn_id.clone(),
+        reviewer_kind: TaskResultReviewerKind::System,
+        reviewer_thread_id: None,
+        reviewer_turn_id: None,
+        reviewer_user_id: None,
+        reviewer_agent_spec_id: None,
+        event_kind: TaskResultReviewEventKind::Decision,
+        decision: TaskResultReviewDecision::Cancel,
+        feedback_text: Some(reason.to_owned()),
+        feedback: None,
+        confidence: None,
+        supersedes_review_event_id: candidate.final_review_event_id.clone(),
+        next_task_run_turn_id: None,
+        created_at,
+    }
 }
 
 pub(crate) fn now_timestamp_secs() -> i64 {

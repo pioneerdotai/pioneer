@@ -1567,6 +1567,7 @@
         "queued",
         "running",
         "waiting",
+        "waiting_review",
         "completed",
         "failed",
         "cancelled"

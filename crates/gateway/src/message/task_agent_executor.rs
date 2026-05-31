@@ -6,8 +6,8 @@ use pioneer_promt::{TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
     ItemCompletedNotification, ItemStartedNotification, SandboxMode, Task, TaskAgentContext,
     TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract, TaskAgentResultFormat,
-    TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind,
-    TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass,
+    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskRun, TaskRunExecution, TaskRunStatus, TaskRunThreadBinding,
     TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
@@ -683,6 +683,20 @@ impl TaskAgentExecutor {
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        let task_response = processor
+            .crud_store
+            .get_task(child_runtime.task_run_turn.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", child_runtime.task_run_turn.task_id))?;
+        let agent_spec =
+            select_agent_spec(&task_response, child_runtime.task_run_turn.run_id.as_str())
+                .ok_or_else(|| {
+                    anyhow!("agent task `{}` has no agent spec", task_response.task.id)
+                })?;
+        let review_policy = agent_spec
+            .review_policy
+            .clone()
+            .filter(|policy| policy.is_enabled());
         if let Some(candidate) = processor
             .crud_store
             .get_accepted_task_result_candidate(child_runtime.task_run_turn.run_id.as_str())
@@ -699,14 +713,77 @@ impl TaskAgentExecutor {
             mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             return Ok(());
         }
+        if let Some(candidate) = processor
+            .crud_store
+            .get_task_result_candidate_by_turn(child_runtime.task_run_turn.id.as_str())
+            .await?
+            && matches!(
+                candidate.status,
+                TaskResultCandidateStatus::PendingReview
+                    | TaskResultCandidateStatus::ExtractionFailed
+                    | TaskResultCandidateStatus::Rejected
+                    | TaskResultCandidateStatus::Superseded
+                    | TaskResultCandidateStatus::Cancelled
+            )
+        {
+            return Ok(());
+        }
 
-        match TaskAgentResultExtractor::extract(
+        let artifact_mode = if review_policy.is_some() {
+            TaskAgentResultArtifactMode::ResultCandidate {
+                candidate_id: task_result_candidate_id(
+                    child_runtime.task_run_turn.run_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                ),
+            }
+        } else {
+            TaskAgentResultArtifactMode::FinalResult
+        };
+        match TaskAgentResultExtractor::extract_with_artifact_mode(
             processor,
             &child_runtime.task_run_turn,
             &child_runtime.lineage,
+            artifact_mode,
         )
         .await?
         {
+            Ok(result) if review_policy.is_some() => {
+                let review_policy = review_policy.as_ref().expect("review policy checked");
+                let completed_at = now_timestamp_secs();
+                let completed_turn =
+                    candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
+                let candidate = match invalid_structured_result_error(
+                    &result,
+                    &agent_spec,
+                    child_runtime.task_run_turn.run_id.as_str(),
+                ) {
+                    Some(error) if revision_possible(review_policy, &completed_turn) => {
+                        extraction_failed_result_candidate(&completed_turn, error, completed_at)
+                    }
+                    Some(error) => {
+                        record_task_run_turn_failure(
+                            &handle,
+                            &child_runtime.task_run_turn,
+                            TaskRunTurnStatus::Failed,
+                            Some(error.clone()),
+                            completed_at,
+                        )
+                        .await?;
+                        handle.fail_run(Some(error), completed_at).await?;
+                        mark_task_run_occurrence_turn_failed(
+                            processor,
+                            &child_runtime.lineage,
+                            "child task result extraction failed",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    None => pending_review_result_candidate(&completed_turn, result, completed_at),
+                };
+                handle
+                    .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
+                    .await?;
+            }
             Ok(result) => {
                 let completed_at = now_timestamp_secs();
                 let completed_turn =
@@ -724,6 +801,20 @@ impl TaskAgentExecutor {
                     .await?;
                 handle.complete_run(Some(result), completed_at).await?;
                 mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+            }
+            Err(error)
+                if review_policy.as_ref().is_some_and(|policy| {
+                    revision_possible(policy, &child_runtime.task_run_turn)
+                }) =>
+            {
+                let completed_at = now_timestamp_secs();
+                let completed_turn =
+                    candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
+                let candidate =
+                    extraction_failed_result_candidate(&completed_turn, error, completed_at);
+                handle
+                    .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
+                    .await?;
             }
             Err(error) => {
                 let failed_at = now_timestamp_secs();
@@ -1436,6 +1527,135 @@ fn accepted_result_candidate(
     }
 }
 
+fn pending_review_result_candidate(
+    task_run_turn: &TaskRunTurn,
+    result: TaskResult,
+    created_at: i64,
+) -> TaskResultCandidate {
+    TaskResultCandidate {
+        id: task_result_candidate_id(
+            task_run_turn.run_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+        ),
+        task_id: task_run_turn.task_id.clone(),
+        run_id: task_run_turn.run_id.clone(),
+        task_run_turn_id: task_run_turn.id.clone(),
+        thread_id: task_run_turn.thread_id.clone(),
+        turn_id: task_run_turn.turn_id.clone(),
+        round: task_run_turn.round,
+        status: TaskResultCandidateStatus::PendingReview,
+        summary: result.summary.clone(),
+        result: Some(result),
+        extraction_error: None,
+        diagnostics: Vec::new(),
+        final_review_event_id: None,
+        created_at,
+        updated_at: created_at,
+        resolved_at: None,
+    }
+}
+
+fn extraction_failed_result_candidate(
+    task_run_turn: &TaskRunTurn,
+    error: TaskError,
+    created_at: i64,
+) -> TaskResultCandidate {
+    let diagnostics = error
+        .details
+        .as_ref()
+        .and_then(extraction_diagnostics_from_error_details)
+        .unwrap_or_default();
+    TaskResultCandidate {
+        id: task_result_candidate_id(
+            task_run_turn.run_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+        ),
+        task_id: task_run_turn.task_id.clone(),
+        run_id: task_run_turn.run_id.clone(),
+        task_run_turn_id: task_run_turn.id.clone(),
+        thread_id: task_run_turn.thread_id.clone(),
+        turn_id: task_run_turn.turn_id.clone(),
+        round: task_run_turn.round,
+        status: TaskResultCandidateStatus::ExtractionFailed,
+        summary: Some(error.message.clone()),
+        result: None,
+        extraction_error: Some(error),
+        diagnostics,
+        final_review_event_id: None,
+        created_at,
+        updated_at: created_at,
+        resolved_at: None,
+    }
+}
+
+fn revision_possible(review_policy: &TaskAgentReviewPolicy, task_run_turn: &TaskRunTurn) -> bool {
+    task_run_turn.round < review_policy.max_revision_rounds
+}
+
+fn invalid_structured_result_error(
+    result: &TaskResult,
+    agent_spec: &TaskAgentSpec,
+    run_id: &str,
+) -> Option<TaskError> {
+    agent_spec.result_contract.as_ref()?;
+    let TaskValue::Object(data) = result.data.as_ref()? else {
+        return None;
+    };
+    let fallback_used = matches!(data.get("fallbackUsed"), Some(TaskValue::Bool(true)));
+    let schema_invalid = matches!(data.get("schemaValid"), Some(TaskValue::Bool(false)));
+    if !fallback_used && !schema_invalid {
+        return None;
+    }
+    let diagnostics = data
+        .get("diagnostics")
+        .and_then(task_value_string_list)
+        .unwrap_or_default();
+    let message = if diagnostics.is_empty() {
+        "child task result did not satisfy the result contract".to_owned()
+    } else {
+        format!(
+            "child task result did not satisfy the result contract: {}",
+            diagnostics.join("; ")
+        )
+    };
+    Some(TaskError {
+        code: "task_agent_result_extraction_failed".to_owned(),
+        message,
+        class: TaskErrorClass::Validation,
+        details: Some(TaskValue::Object(BTreeMap::from([
+            ("schemaValid".to_owned(), TaskValue::Bool(!schema_invalid)),
+            ("fallbackUsed".to_owned(), TaskValue::Bool(fallback_used)),
+            (
+                "diagnostics".to_owned(),
+                TaskValue::List(diagnostics.into_iter().map(TaskValue::String).collect()),
+            ),
+        ]))),
+        failed_run_id: Some(run_id.to_owned()),
+    })
+}
+
+fn task_value_string_list(value: &TaskValue) -> Option<Vec<String>> {
+    let TaskValue::List(items) = value else {
+        return None;
+    };
+    Some(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                TaskValue::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+fn extraction_diagnostics_from_error_details(details: &TaskValue) -> Option<Vec<String>> {
+    let TaskValue::Object(object) = details else {
+        return None;
+    };
+    object.get("diagnostics").and_then(task_value_string_list)
+}
+
 fn runtime_auto_accept_review_event(
     candidate: &TaskResultCandidate,
     accepted_at: i64,
@@ -1805,15 +2025,21 @@ struct TaskAgentResultExtractor;
 
 type TaskAgentResultExtraction = std::result::Result<TaskResult, TaskError>;
 
+enum TaskAgentResultArtifactMode {
+    FinalResult,
+    ResultCandidate { candidate_id: String },
+}
+
 struct StructuredResultCandidate {
     value: TaskValue,
 }
 
 impl TaskAgentResultExtractor {
-    async fn extract(
+    async fn extract_with_artifact_mode(
         processor: &Arc<MessageProcessor>,
         task_run_turn: &TaskRunTurn,
         lineage: &TaskThreadLineage,
+        artifact_mode: TaskAgentResultArtifactMode,
     ) -> Result<TaskAgentResultExtraction> {
         let task_response = match processor
             .crud_store
@@ -1860,6 +2086,30 @@ impl TaskAgentResultExtractor {
             contract.as_ref(),
         ) {
             Ok(result) => {
+                Self::normalize_result_artifacts(
+                    processor,
+                    &task_response,
+                    task_run_turn,
+                    lineage,
+                    result,
+                    artifact_mode,
+                )
+                .await
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    async fn normalize_result_artifacts(
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+        task_run_turn: &TaskRunTurn,
+        lineage: &TaskThreadLineage,
+        result: TaskResult,
+        artifact_mode: TaskAgentResultArtifactMode,
+    ) -> Result<TaskAgentResultExtraction> {
+        match artifact_mode {
+            TaskAgentResultArtifactMode::FinalResult => {
                 task_artifacts::normalize_task_result_artifacts(
                     processor,
                     &task_response.task,
@@ -1869,7 +2119,17 @@ impl TaskAgentResultExtractor {
                 )
                 .await
             }
-            Err(error) => Ok(Err(error)),
+            TaskAgentResultArtifactMode::ResultCandidate { candidate_id } => {
+                task_artifacts::normalize_task_result_candidate_artifacts(
+                    processor,
+                    &task_response.task,
+                    task_run_turn,
+                    lineage,
+                    candidate_id.as_str(),
+                    result,
+                )
+                .await
+            }
         }
     }
 
@@ -2786,6 +3046,7 @@ mod tests {
             context_policy: None,
             tool_policy: None,
             result_contract: None,
+            review_policy: None,
             depth: 0,
             max_depth: 1,
             created_at: 1,
@@ -2875,6 +3136,90 @@ mod tests {
                 && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
                 && binding.thread_id.as_deref() == task.created_by_thread_id.as_deref()
         }));
+    }
+
+    #[tokio::test]
+    async fn review_candidate_artifact_existing_id_gets_task_result_candidate_binding() {
+        let (processor, task, task_run_turn, lineage) =
+            task_artifact_harness("candidate_existing").await;
+        let source = ingest_task_test_artifact(
+            &processor,
+            task.workspace_id.as_str(),
+            None,
+            "candidate-source.txt",
+        )
+        .await;
+        let candidate_id = "candidate_artifact_binding";
+        let result = TaskResult {
+            summary: Some("candidate".to_owned()),
+            data: None,
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some(source.artifact.artifact_id.clone()),
+                version_id: source.artifact.version_id.clone(),
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some(task_run_turn.run_id.clone()),
+        };
+
+        let normalized = task_artifacts::normalize_task_result_candidate_artifacts(
+            &processor,
+            &task,
+            &task_run_turn,
+            &lineage,
+            candidate_id,
+            result,
+        )
+        .await
+        .expect("normalize")
+        .expect("valid result");
+
+        assert_eq!(
+            normalized.artifacts[0].artifact_id.as_deref(),
+            Some(source.artifact.artifact_id.as_str())
+        );
+        let summary = processor
+            .artifact_service
+            .get_artifact(
+                task.workspace_id.as_str(),
+                source.artifact.artifact_id.as_str(),
+                None,
+            )
+            .await
+            .expect("artifact");
+        assert!(summary.bindings.iter().any(|binding| {
+            binding.binding_kind == ArtifactBindingKind::TaskResultCandidate
+                && binding.task_id.as_deref() == Some(task.id.as_str())
+                && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
+                && binding.thread_id.as_deref() == task.created_by_thread_id.as_deref()
+                && binding.item_index == Some(0)
+        }));
+        assert!(!summary.bindings.iter().any(|binding| {
+            binding.binding_kind == ArtifactBindingKind::TaskResult
+                && binding.task_id.as_deref() == Some(task.id.as_str())
+                && binding.task_run_id.as_deref() == Some(task_run_turn.run_id.as_str())
+        }));
+        let page = processor
+            .artifact_service
+            .list_artifacts(
+                task.workspace_id.as_str(),
+                ArtifactListFilter {
+                    task_id: Some(task.id.clone()),
+                    task_run_id: Some(task_run_turn.run_id.clone()),
+                    ..ArtifactListFilter::default()
+                },
+            )
+            .await
+            .expect("list task artifacts");
+        assert_eq!(page.items.len(), 1);
+        assert!(
+            page.items[0]
+                .bindings
+                .iter()
+                .any(|binding| binding.binding_kind == ArtifactBindingKind::TaskResultCandidate)
+        );
     }
 
     #[tokio::test]

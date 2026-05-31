@@ -156,6 +156,7 @@ pub mod events {
     pub const TASK_RESULT_REVIEW_EVENT_RECORDED: &str = "task/result_review_event/recorded";
     pub const TASK_RESULT_CANDIDATE_ACCEPTED: &str = "task/result_candidate/accepted";
     pub const TASK_RESULT_CANDIDATE_REJECTED: &str = "task/result_candidate/rejected";
+    pub const TASK_RESULT_CANDIDATE_CANCELLED: &str = "task/result_candidate/cancelled";
     pub const TASK_REVISION_REQUESTED: &str = "task/revision/requested";
     pub const TASK_RUN_ENTERED_REVIEW: &str = "task/run/entered_review";
     pub const TASK_DELIVERY_QUEUED: &str = "task/delivery/queued";
@@ -164,6 +165,7 @@ pub mod events {
     pub const TASK_DELIVERY_FAILED: &str = "task/delivery/failed";
     pub const TASK_DELIVERY_CANCELLED: &str = "task/delivery/cancelled";
     pub const TASK_WRITE_LOCK_ACQUIRED: &str = "task/write_lock/acquired";
+    pub const TASK_WRITE_LOCK_EXTENDED: &str = "task/write_lock/extended";
     pub const TASK_WRITE_LOCK_RELEASED: &str = "task/write_lock/released";
     pub const TASK_WRITE_LOCK_BLOCKED: &str = "task/write_lock/blocked";
     pub const TASK_WRITE_LOCK_EXPIRED: &str = "task/write_lock/expired";

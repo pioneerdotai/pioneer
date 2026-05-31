@@ -1092,6 +1092,7 @@
         "agent_output",
         "tool_output",
         "task_result",
+        "task_result_candidate",
         "context_attachment",
         "derived_from",
         "preview",
@@ -4268,6 +4269,47 @@
         "artifact"
       ]
     },
+    "TaskAgentReviewMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "parent_agent",
+        "parent_agent_with_reviewers",
+        "user_approval"
+      ]
+    },
+    "TaskAgentReviewPolicy": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskAgentReviewMode"
+        },
+        "requireExplicitAcceptance": {
+          "type": "boolean"
+        },
+        "resolutionStrategy": {
+          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
+        },
+        "reviewers": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskResultReviewerSpec"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "maxRevisionRounds",
+        "requireExplicitAcceptance",
+        "resolutionStrategy"
+      ]
+    },
     "TaskAgentSpec": {
       "type": "object",
       "properties": {
@@ -4327,6 +4369,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskAgentResultContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentReviewPolicy"
             },
             {
               "type": "null"
@@ -5363,6 +5415,60 @@
         }
       }
     },
+    "TaskResultReviewResolutionStrategy": {
+      "type": "string",
+      "enum": [
+        "parent_final",
+        "user_final",
+        "require_all_required_reviewers_then_parent",
+        "quorum_then_parent",
+        "any_required_reviewer_can_request_changes"
+      ]
+    },
+    "TaskResultReviewerKind": {
+      "type": "string",
+      "enum": [
+        "runtime_auto",
+        "parent_agent",
+        "review_agent",
+        "user",
+        "system"
+      ]
+    },
+    "TaskResultReviewerSpec": {
+      "type": "object",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "reviewerKind": {
+          "$ref": "#/$defs/TaskResultReviewerKind"
+        },
+        "weight": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "reviewerKind",
+        "required"
+      ]
+    },
     "TaskResumedNotification": {
       "type": "object",
       "properties": {
@@ -5631,6 +5737,7 @@
         "starting",
         "running",
         "waiting",
+        "waiting_review",
         "succeeded",
         "failed",
         "cancelled",
@@ -5683,6 +5790,7 @@
         "queued",
         "running",
         "waiting",
+        "waiting_review",
         "completed",
         "failed",
         "cancelled"

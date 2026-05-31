@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskResultReviewerSpec",
+  "type": "object",
+  "properties": {
+    "agentNickname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentRole": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "required": {
+      "type": "boolean"
+    },
+    "reviewerKind": {
+      "$ref": "#/$defs/TaskResultReviewerKind"
+    },
+    "weight": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    }
+  },
+  "required": [
+    "reviewerKind",
+    "required"
+  ],
+  "$defs": {
+    "TaskResultReviewerKind": {
+      "type": "string",
+      "enum": [
+        "runtime_auto",
+        "parent_agent",
+        "review_agent",
+        "user",
+        "system"
+      ]
+    }
+  }
+}

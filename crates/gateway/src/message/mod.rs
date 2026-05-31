@@ -89,7 +89,7 @@ use pioneer_protocol::{
     constants::{events, methods},
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
-use pioneer_tasks::TaskRuntime;
+use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
@@ -220,6 +220,38 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
+        Self::new_with_memory_runtime_and_task_config(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store,
+            gateway_secrets,
+            summary_config,
+            context_budget,
+            tool_loop_config,
+            memory_runtime,
+            runtime_home,
+            artifacts_config,
+            TaskRuntimeConfig::default(),
+        )
+    }
+
+    pub(crate) fn new_with_memory_runtime_and_task_config(
+        thread_manager: Arc<ThreadManager>,
+        provider_registry: Arc<ProviderRegistry>,
+        session_manager: Arc<SessionManager>,
+        workspace_manager: Arc<WorkspaceManager>,
+        crud_store: Arc<CrudStore>,
+        gateway_secrets: Arc<GatewaySecrets>,
+        summary_config: summary::SummaryConfig,
+        context_budget: ContextBudget,
+        tool_loop_config: ToolLoopConfig,
+        memory_runtime: Arc<GatewayMemoryRuntime>,
+        runtime_home: PathBuf,
+        artifacts_config: GatewayArtifactsConfig,
+        task_runtime_config: TaskRuntimeConfig,
+    ) -> Self {
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
             Ok(duration) => duration.as_secs(),
@@ -227,7 +259,10 @@ impl MessageProcessor {
         };
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
-        let task_runtime = Arc::new(TaskRuntime::new(crud_store.clone()));
+        let task_runtime = Arc::new(TaskRuntime::new_with_config(
+            crud_store.clone(),
+            task_runtime_config,
+        ));
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),

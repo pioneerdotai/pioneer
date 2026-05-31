@@ -59,6 +59,7 @@ pub enum TaskStatus {
     Queued,
     Running,
     Waiting,
+    WaitingReview,
     Completed,
     Failed,
     Cancelled,
@@ -252,6 +253,7 @@ pub enum TaskRunStatus {
     Starting,
     Running,
     Waiting,
+    WaitingReview,
     Succeeded,
     Failed,
     Cancelled,
@@ -273,6 +275,7 @@ pub enum TaskRunExecutionStatus {
     Reserved,
     Starting,
     Running,
+    WaitingReview,
     Succeeded,
     Failed,
     Cancelled,
@@ -354,6 +357,65 @@ pub enum TaskResultReviewDecision {
     Reject,
     Abstain,
     Cancel,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAgentReviewMode {
+    None,
+    ParentAgent,
+    ParentAgentWithReviewers,
+    UserApproval,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultReviewResolutionStrategy {
+    ParentFinal,
+    UserFinal,
+    RequireAllRequiredReviewersThenParent,
+    QuorumThenParent,
+    AnyRequiredReviewerCanRequestChanges,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResultReviewerSpec {
+    pub reviewer_kind: TaskResultReviewerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAgentReviewPolicy {
+    pub mode: TaskAgentReviewMode,
+    pub max_revision_rounds: u32,
+    pub require_explicit_acceptance: bool,
+    #[serde(default)]
+    pub reviewers: Vec<TaskResultReviewerSpec>,
+    pub resolution_strategy: TaskResultReviewResolutionStrategy,
+}
+
+impl TaskAgentReviewPolicy {
+    pub fn parent_agent_default(max_revision_rounds: u32) -> Self {
+        Self {
+            mode: TaskAgentReviewMode::ParentAgent,
+            max_revision_rounds,
+            require_explicit_acceptance: true,
+            reviewers: Vec::new(),
+            resolution_strategy: TaskResultReviewResolutionStrategy::ParentFinal,
+        }
+    }
+
+    pub const fn is_enabled(&self) -> bool {
+        !matches!(self.mode, TaskAgentReviewMode::None)
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1103,6 +1165,8 @@ pub struct TaskAgentSpec {
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<TaskAgentReviewPolicy>,
     pub depth: i64,
     pub max_depth: i64,
     pub created_at: i64,
@@ -1343,6 +1407,10 @@ pub enum TaskEventPayload {
         candidate: TaskResultCandidate,
         review_event_id: String,
     },
+    TaskResultCandidateCancelled {
+        candidate: TaskResultCandidate,
+        review_event_id: String,
+    },
     TaskRevisionRequested {
         task_id: String,
         run_id: String,
@@ -1390,6 +1458,10 @@ pub enum TaskEventPayload {
     },
     WriteLockAcquired {
         lock: TaskWriteLock,
+    },
+    WriteLockExtended {
+        lock: TaskWriteLock,
+        extended_at: i64,
     },
     WriteLockReleased {
         lock: TaskWriteLock,
@@ -1439,6 +1511,7 @@ impl TaskEventPayload {
             | Self::DeliveryFailed { delivery, .. }
             | Self::DeliveryCancelled { delivery, .. } => delivery.task_id.as_str(),
             Self::WriteLockAcquired { lock }
+            | Self::WriteLockExtended { lock, .. }
             | Self::WriteLockReleased { lock, .. }
             | Self::WriteLockExpired { lock, .. } => lock.task_id.as_str(),
             Self::RunCreated { run, .. } => run.task_id.as_str(),
@@ -1451,7 +1524,8 @@ impl TaskEventPayload {
             | Self::TaskRunTurnFailed { task_run_turn, .. } => task_run_turn.task_id.as_str(),
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
-            | Self::TaskResultCandidateRejected { candidate, .. } => candidate.task_id.as_str(),
+            | Self::TaskResultCandidateRejected { candidate, .. }
+            | Self::TaskResultCandidateCancelled { candidate, .. } => candidate.task_id.as_str(),
             Self::TaskResultReviewEventRecorded { review_event } => review_event.task_id.as_str(),
             Self::TaskRevisionRequested { task_id, .. }
             | Self::TaskRunEnteredReview { task_id, .. } => task_id.as_str(),
@@ -1492,7 +1566,8 @@ impl TaskEventPayload {
             | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.run_id.as_str()),
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
-            | Self::TaskResultCandidateRejected { candidate, .. } => {
+            | Self::TaskResultCandidateRejected { candidate, .. }
+            | Self::TaskResultCandidateCancelled { candidate, .. } => {
                 Some(candidate.run_id.as_str())
             }
             Self::TaskResultReviewEventRecorded { review_event } => {
@@ -1506,6 +1581,7 @@ impl TaskEventPayload {
             | Self::DeliveryFailed { delivery, .. }
             | Self::DeliveryCancelled { delivery, .. } => Some(delivery.run_id.as_str()),
             Self::WriteLockAcquired { lock }
+            | Self::WriteLockExtended { lock, .. }
             | Self::WriteLockReleased { lock, .. }
             | Self::WriteLockExpired { lock, .. } => Some(lock.run_id.as_str()),
             Self::WriteLockBlocked { run_id, .. } => Some(run_id.as_str()),
@@ -1526,7 +1602,8 @@ impl TaskEventPayload {
             }
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
-            | Self::TaskResultCandidateRejected { candidate, .. } => {
+            | Self::TaskResultCandidateRejected { candidate, .. }
+            | Self::TaskResultCandidateCancelled { candidate, .. } => {
                 Some(candidate.thread_id.as_str())
             }
             Self::TaskResultReviewEventRecorded { review_event } => {
@@ -1550,7 +1627,8 @@ impl TaskEventPayload {
             | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.turn_id.as_str()),
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
-            | Self::TaskResultCandidateRejected { candidate, .. } => {
+            | Self::TaskResultCandidateRejected { candidate, .. }
+            | Self::TaskResultCandidateCancelled { candidate, .. } => {
                 Some(candidate.turn_id.as_str())
             }
             Self::TaskResultReviewEventRecorded { review_event } => {
@@ -1599,6 +1677,7 @@ impl TaskEventPayload {
             Self::TaskResultReviewEventRecorded { .. } => events::TASK_RESULT_REVIEW_EVENT_RECORDED,
             Self::TaskResultCandidateAccepted { .. } => events::TASK_RESULT_CANDIDATE_ACCEPTED,
             Self::TaskResultCandidateRejected { .. } => events::TASK_RESULT_CANDIDATE_REJECTED,
+            Self::TaskResultCandidateCancelled { .. } => events::TASK_RESULT_CANDIDATE_CANCELLED,
             Self::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
             Self::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             Self::DepthLimitExceeded { .. } => events::TASK_FAILED,
@@ -1608,6 +1687,7 @@ impl TaskEventPayload {
             Self::DeliveryFailed { .. } => events::TASK_DELIVERY_FAILED,
             Self::DeliveryCancelled { .. } => events::TASK_DELIVERY_CANCELLED,
             Self::WriteLockAcquired { .. } => events::TASK_WRITE_LOCK_ACQUIRED,
+            Self::WriteLockExtended { .. } => events::TASK_WRITE_LOCK_EXTENDED,
             Self::WriteLockReleased { .. } => events::TASK_WRITE_LOCK_RELEASED,
             Self::WriteLockBlocked { .. } => events::TASK_WRITE_LOCK_BLOCKED,
             Self::WriteLockExpired { .. } => events::TASK_WRITE_LOCK_EXPIRED,
@@ -1725,6 +1805,10 @@ impl TaskEventPayload {
                 "run:{}:candidate:{}:rejected",
                 candidate.run_id, candidate.id
             )),
+            Self::TaskResultCandidateCancelled { candidate, .. } => Some(format!(
+                "run:{}:candidate:{}:cancelled",
+                candidate.run_id, candidate.id
+            )),
             Self::TaskRevisionRequested {
                 run_id, turn_id, ..
             } => Some(format!("run:{run_id}:revision:{turn_id}:requested")),
@@ -1760,6 +1844,13 @@ impl TaskEventPayload {
                 Some(format!("delivery:{}:cancelled", delivery.id))
             }
             Self::WriteLockAcquired { lock } => Some(format!("write_lock:{}:acquired", lock.id)),
+            Self::WriteLockExtended { lock, extended_at } => Some(format!(
+                "write_lock:{}:extended:{extended_at}:{}",
+                lock.id,
+                lock.expires_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            )),
             Self::WriteLockReleased { lock, released_at } => {
                 Some(format!("write_lock:{}:released:{released_at}", lock.id))
             }
@@ -1814,6 +1905,8 @@ pub struct TaskAgentSpecInput {
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<TaskAgentReviewPolicy>,
     pub depth: i64,
     pub max_depth: i64,
 }
@@ -2532,8 +2625,9 @@ pub struct TaskTurnItem {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRescheduleReason, TaskStatus,
-        TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
+        TaskAgentSpec, TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRescheduleReason,
+        TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerSpec,
+        TaskTriggerStatus, TaskTurnItem,
     };
     use serde_json::json;
 
@@ -2643,5 +2737,41 @@ mod tests {
         let decoded: TaskOwnerKind =
             serde_json::from_value(json!("workspace")).expect("owner should decode");
         assert_eq!(decoded, TaskOwnerKind::Workspace);
+    }
+
+    #[test]
+    fn waiting_review_statuses_are_nonterminal() {
+        assert!(!TaskStatus::WaitingReview.is_terminal());
+        assert!(!TaskRunStatus::WaitingReview.is_terminal());
+        assert!(!TaskRunExecutionStatus::WaitingReview.is_terminal());
+    }
+
+    #[test]
+    fn legacy_task_agent_spec_without_review_policy_decodes() {
+        let decoded: TaskAgentSpec = serde_json::from_value(json!({
+            "id": "agent_spec_legacy01",
+            "taskId": "task_legacy0000001",
+            "runId": null,
+            "agentRole": "worker",
+            "agentNickname": "Worker",
+            "model": "test-model",
+            "modelProvider": "openai",
+            "prompt": {
+                "goal": "Do work",
+                "instructions": [],
+                "input": null,
+                "outputInstructions": null
+            },
+            "contextPolicy": null,
+            "toolPolicy": null,
+            "resultContract": null,
+            "depth": 1,
+            "maxDepth": 3,
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .expect("legacy task agent spec should decode");
+
+        assert!(decoded.review_policy.is_none());
     }
 }

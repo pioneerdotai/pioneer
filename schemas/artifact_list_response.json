@@ -34,6 +34,7 @@
         "agent_output",
         "tool_output",
         "task_result",
+        "task_result_candidate",
         "context_attachment",
         "derived_from",
         "preview",

@@ -140,10 +140,8 @@ fn active_model_from_new_turn(turn: NewTaskRunTurn) -> Result<task_run_turn::Act
         thread_id: Set(turn.thread_id),
         turn_id: Set(turn.turn_id),
         kind: Set(task_run_turn_kind_to_db(turn.kind)),
-        round: Set(i32::try_from(turn.round).context("task run turn round is out of range")?),
-        sequence: Set(
-            i32::try_from(turn.sequence).context("task run turn sequence is out of range")?
-        ),
+        round: Set(i64::from(turn.round)),
+        sequence: Set(i64::from(turn.sequence)),
         status: Set(task_run_turn_status_to_db(turn.status)),
         reviews_candidate_id: Set(turn.reviews_candidate_id),
         requested_by_candidate_id: Set(turn.requested_by_candidate_id),

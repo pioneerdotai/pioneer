@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskAgentReviewMode",
+  "type": "string",
+  "enum": [
+    "none",
+    "parent_agent",
+    "parent_agent_with_reviewers",
+    "user_approval"
+  ]
+}

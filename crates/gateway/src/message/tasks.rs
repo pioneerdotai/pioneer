@@ -431,9 +431,11 @@ impl MessageProcessor {
             | TaskEventPayload::TaskResultReviewEventRecorded { .. }
             | TaskEventPayload::TaskResultCandidateAccepted { .. }
             | TaskEventPayload::TaskResultCandidateRejected { .. }
+            | TaskEventPayload::TaskResultCandidateCancelled { .. }
             | TaskEventPayload::TaskRevisionRequested { .. }
             | TaskEventPayload::TaskRunEnteredReview { .. }
-            | TaskEventPayload::DepthLimitExceeded { .. } => {
+            | TaskEventPayload::DepthLimitExceeded { .. }
+            | TaskEventPayload::WriteLockExtended { .. } => {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
                     events::TASK_TREE_CHANGED,

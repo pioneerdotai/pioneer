@@ -186,6 +186,42 @@ pub async fn mark_execution_running<C: ConnectionTrait>(
     find_execution_by_id(db, execution_id).await
 }
 
+pub async fn mark_execution_waiting_review_by_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    entered_at: DateTimeWithTimeZone,
+) -> Result<Option<task_run_execution::Model>> {
+    let terminal_statuses = terminal_status_values();
+    let result = task_run_execution::Entity::update_many()
+        .filter(task_run_execution::Column::TaskRunId.eq(run_id.to_owned()))
+        .filter(task_run_execution::Column::Status.is_not_in(terminal_statuses))
+        .col_expr(
+            task_run_execution::Column::Status,
+            Expr::value(task_run_execution_status_to_db(
+                TaskRunExecutionStatus::WaitingReview,
+            )),
+        )
+        .col_expr(
+            task_run_execution::Column::LeaseUntil,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            task_run_execution::Column::HeartbeatAt,
+            Expr::value(Some(entered_at)),
+        )
+        .col_expr(
+            task_run_execution::Column::UpdatedAt,
+            Expr::value(entered_at),
+        )
+        .exec(db)
+        .await
+        .context("failed to mark task run execution waiting review")?;
+    if result.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_execution_by_run(db, run_id).await
+}
+
 pub async fn mark_execution_terminal<C: ConnectionTrait>(
     db: &C,
     execution_id: &str,

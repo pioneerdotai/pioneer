@@ -124,6 +124,30 @@ impl TaskExecutionHandle {
         .await
     }
 
+    pub async fn record_pending_review_result_candidate(
+        &self,
+        task_run_turn: TaskRunTurn,
+        candidate: TaskResultCandidate,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        let task_id = candidate.task_id.clone();
+        let run_id = candidate.run_id.clone();
+        let candidate_id = candidate.id.clone();
+        let mut events = vec![
+            TaskEventPayload::TaskRunTurnCompleted { task_run_turn },
+            TaskEventPayload::TaskResultCandidateCreated { candidate },
+            TaskEventPayload::TaskRunEnteredReview {
+                task_id,
+                run_id,
+                candidate_id,
+                entered_at: event_timestamp_secs,
+            },
+        ];
+        self.push_waiting_review_write_lock_extensions(&mut events, event_timestamp_secs)
+            .await?;
+        self.append_and_publish(events, event_timestamp_secs).await
+    }
+
     pub async fn mark_started(&self, started_at: i64) -> TaskRuntimeResult<()> {
         if let Some(appended) = self
             .store
@@ -642,6 +666,29 @@ impl TaskExecutionHandle {
             lock.reason = reason.clone();
             lock.updated_at = released_at;
             events.push(TaskEventPayload::WriteLockReleased { lock, released_at });
+        }
+        Ok(())
+    }
+
+    async fn push_waiting_review_write_lock_extensions(
+        &self,
+        events: &mut Vec<TaskEventPayload>,
+        extended_at: i64,
+    ) -> TaskRuntimeResult<()> {
+        for mut lock in self
+            .store
+            .list_task_write_locks_by_run(self.run_id.as_str())
+            .await?
+            .into_iter()
+            .filter(|lock| lock.status == TaskWriteLockStatus::Acquired)
+        {
+            if lock.expires_at.is_none() {
+                continue;
+            }
+            lock.expires_at = None;
+            lock.reason = Some("write lock held while task waits for review".to_owned());
+            lock.updated_at = extended_at;
+            events.push(TaskEventPayload::WriteLockExtended { lock, extended_at });
         }
         Ok(())
     }

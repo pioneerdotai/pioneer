@@ -1,5 +1,6 @@
 use anyhow::Result;
 use pioneer_crud::{CrudStore, TaskReviewInvariantSnapshot};
+use pioneer_protocol::{TaskAgentToolPolicy, TaskAgentWriteMode};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{
@@ -8,6 +9,7 @@ use super::{
 
 pub(super) async fn detect_task_review_violations(
     store: &CrudStore,
+    observed_at_unix: i64,
     report: &mut TaskRuntimeInvariantReport,
 ) -> Result<()> {
     let Some(snapshot) = store.load_task_review_invariant_snapshot().await? else {
@@ -17,6 +19,7 @@ pub(super) async fn detect_task_review_violations(
     detect_primary_executor_binding_violations(&snapshot, report);
     detect_task_run_turn_reference_violations(&snapshot, report);
     detect_accepted_candidate_violations(&snapshot, report);
+    detect_waiting_review_write_lock_violations(&snapshot, observed_at_unix, report);
     detect_target_model_violations(&snapshot, report);
     Ok(())
 }
@@ -243,6 +246,59 @@ fn detect_target_model_violations(
     detect_candidate_turn_mismatches(snapshot, report);
     detect_review_reference_violations(snapshot, report);
     detect_task_run_turn_order_violations(snapshot, report);
+}
+
+fn detect_waiting_review_write_lock_violations(
+    snapshot: &TaskReviewInvariantSnapshot,
+    observed_at_unix: i64,
+    report: &mut TaskRuntimeInvariantReport,
+) {
+    for run in snapshot
+        .task_runs
+        .iter()
+        .filter(|run| run.status == "waiting_review")
+    {
+        if !run_has_scoped_write_policy(snapshot, run.task_id.as_str(), run.id.as_str()) {
+            continue;
+        }
+        let has_active_lock = snapshot.write_locks.iter().any(|lock| {
+            lock.run_id == run.id
+                && lock.status == "acquired"
+                && lock
+                    .expires_at_unix
+                    .is_none_or(|expires_at| expires_at > observed_at_unix)
+        });
+        if has_active_lock {
+            continue;
+        }
+        report.push(TaskRuntimeInvariantViolation::new(
+            TaskRuntimeInvariantViolationKind::WaitingReviewRunMissingActiveWriteLock {
+                task_id: run.task_id.clone(),
+                run_id: run.id.clone(),
+            },
+            "waiting_review task_run with scoped write policy has no active write lock",
+        ));
+    }
+}
+
+fn run_has_scoped_write_policy(
+    snapshot: &TaskReviewInvariantSnapshot,
+    task_id: &str,
+    run_id: &str,
+) -> bool {
+    snapshot.agent_specs.iter().any(|spec| {
+        spec.task_id == task_id
+            && (spec.run_id.as_deref() == Some(run_id) || spec.run_id.is_none())
+            && spec
+                .tool_policy_json
+                .as_deref()
+                .is_some_and(tool_policy_is_scoped_write)
+    })
+}
+
+fn tool_policy_is_scoped_write(value: &str) -> bool {
+    serde_json::from_str::<TaskAgentToolPolicy>(value)
+        .is_ok_and(|policy| policy.write_mode == TaskAgentWriteMode::ScopedWrite)
 }
 
 fn detect_candidate_turn_mismatches(

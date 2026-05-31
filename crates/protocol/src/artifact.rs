@@ -51,6 +51,7 @@ pub enum ArtifactBindingKind {
     AgentOutput,
     ToolOutput,
     TaskResult,
+    TaskResultCandidate,
     ContextAttachment,
     DerivedFrom,
     Preview,
