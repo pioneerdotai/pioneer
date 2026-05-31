@@ -36,6 +36,9 @@ pub async fn upsert_lineage<C: ConnectionTrait>(db: &C, lineage: &ThreadLineage)
         task_run_id: Set(lineage.task_run_id.clone()),
         root_thread_id: Set(lineage.root_thread_id.clone()),
         depth: Set(lineage.depth),
+        origin_kind: Set(Some("task_run".to_owned())),
+        created_by_thread_id: Set(Some(lineage.parent_thread_id.clone())),
+        created_by_turn_id: Set(lineage.parent_turn_id.clone()),
         created_at: Set(unix_to_datetime(lineage.created_at)),
     })
     .on_conflict(
@@ -48,6 +51,9 @@ pub async fn upsert_lineage<C: ConnectionTrait>(db: &C, lineage: &ThreadLineage)
                 thread_lineage::Column::TaskRunId,
                 thread_lineage::Column::RootThreadId,
                 thread_lineage::Column::Depth,
+                thread_lineage::Column::OriginKind,
+                thread_lineage::Column::CreatedByThreadId,
+                thread_lineage::Column::CreatedByTurnId,
             ])
             .to_owned(),
     )

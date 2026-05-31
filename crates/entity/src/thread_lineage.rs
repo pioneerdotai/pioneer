@@ -17,6 +17,9 @@ pub struct Model {
     pub task_run_id: String,
     pub root_thread_id: String,
     pub depth: i64,
+    pub origin_kind: Option<String>,
+    pub created_by_thread_id: Option<String>,
+    pub created_by_turn_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
 }
 
