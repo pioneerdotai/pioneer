@@ -1554,24 +1554,19 @@ impl TaskService {
                 continue;
             };
             let run = select_wait_run(&response.runs, &params.run_ids);
-            let lineage = match run.as_ref() {
-                Some(run) => self
-                    .store
-                    .list_thread_lineage_for_run(run.id.as_str())
-                    .await?
-                    .into_iter()
-                    .last(),
-                None => None,
+            let child_anchor = match run.as_ref() {
+                Some(run) => {
+                    self.store
+                        .get_task_run_child_anchor(run.id.as_str())
+                        .await?
+                }
+                None => Default::default(),
             };
             let item = TaskWaitItem {
                 task: response.task,
                 run,
-                child_thread_id: lineage
-                    .as_ref()
-                    .map(|lineage| lineage.child_thread_id.clone()),
-                child_turn_id: lineage
-                    .as_ref()
-                    .map(|lineage| lineage.child_turn_id.clone()),
+                child_thread_id: child_anchor.child_thread_id,
+                child_turn_id: child_anchor.child_turn_id,
             };
             total_count = total_count.saturating_add(1);
             match wait_item_state(&item) {

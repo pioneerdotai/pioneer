@@ -34,6 +34,26 @@ impl TaskNotificationMapper {
             TaskEventPayload::TaskPaused { .. } => events::TASK_PAUSED,
             TaskEventPayload::TaskResumed { .. } => events::TASK_RESUMED,
             TaskEventPayload::TaskRecovered { .. } => events::TASK_RECOVERED,
+            TaskEventPayload::TaskRunThreadBindingCreated { .. } => {
+                events::TASK_RUN_THREAD_BINDING_CREATED
+            }
+            TaskEventPayload::TaskRunTurnStarted { .. } => events::TASK_RUN_TURN_STARTED,
+            TaskEventPayload::TaskRunTurnCompleted { .. } => events::TASK_RUN_TURN_COMPLETED,
+            TaskEventPayload::TaskRunTurnFailed { .. } => events::TASK_RUN_TURN_FAILED,
+            TaskEventPayload::TaskResultCandidateCreated { .. } => {
+                events::TASK_RESULT_CANDIDATE_CREATED
+            }
+            TaskEventPayload::TaskResultReviewEventRecorded { .. } => {
+                events::TASK_RESULT_REVIEW_EVENT_RECORDED
+            }
+            TaskEventPayload::TaskResultCandidateAccepted { .. } => {
+                events::TASK_RESULT_CANDIDATE_ACCEPTED
+            }
+            TaskEventPayload::TaskResultCandidateRejected { .. } => {
+                events::TASK_RESULT_CANDIDATE_REJECTED
+            }
+            TaskEventPayload::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
+            TaskEventPayload::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             TaskEventPayload::DeliveryQueued { .. } => events::TASK_DELIVERY_QUEUED,
             TaskEventPayload::DeliveryStarted { .. } => events::TASK_DELIVERY_STARTED,
             TaskEventPayload::DeliveryDelivered { .. } => events::TASK_DELIVERY_DELIVERED,

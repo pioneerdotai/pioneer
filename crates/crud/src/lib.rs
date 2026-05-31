@@ -16,9 +16,11 @@ use pioneer_protocol::{
     RecoveryTrigger, SandboxMode, StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams,
     TaskAgendaResponse, TaskAgentSpec, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
     TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
-    TaskGetResponse, TaskListParams, TaskResult, TaskRun, TaskRunExecution, TaskRunExecutionStatus,
-    TaskRunStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread,
-    ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
+    TaskGetResponse, TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskTree,
+    TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock, Thread, ThreadFolder,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadLineage, ThreadPlacement,
     TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
     UserInput, generate_id,
@@ -45,8 +47,11 @@ use crate::convention::{
     recovery_trigger_from_db, task_concurrency_conflict_policy_from_db,
     task_delivery_attempt_status_from_db, task_delivery_mode_from_db, task_delivery_status_from_db,
     task_executor_kind_from_db, task_owner_kind_from_db, task_owner_kind_to_db,
-    task_run_execution_status_from_db, task_run_status_from_db, task_status_from_db,
-    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
+    task_result_candidate_status_from_db, task_result_review_decision_from_db,
+    task_result_review_event_kind_from_db, task_result_reviewer_kind_from_db,
+    task_run_execution_status_from_db, task_run_status_from_db,
+    task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db, task_run_turn_status_from_db,
+    task_status_from_db, task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
     task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
     turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
@@ -72,10 +77,11 @@ use crate::repositories::{
     agent_memory_repair_job, artifact as artifact_repository, hook_run, mcp_audit_event,
     mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job, skill_audit_event,
     skill_dependency_snapshot, skill_installation, skill_upload_session, skill_workspace_policy,
-    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event, task_run,
-    task_run_execution, task_trigger, task_write_lock, thread, thread_agents_doc, thread_lineage,
-    thread_tree, turn, turn_event, turn_item_attempt, turn_llm_context, turn_mcp_binding,
-    turn_skill_binding,
+    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
+    task_result_candidate, task_result_review_event, task_run, task_run_execution,
+    task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
+    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_item_attempt,
+    turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -104,6 +110,12 @@ pub use crate::repositories::hook_run::{
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRunChildAnchor {
+    pub child_thread_id: Option<String>,
+    pub child_turn_id: Option<String>,
+}
 
 fn memory_candidate_status_event_kind(status: MemoryCandidateStatus) -> &'static str {
     match status {
@@ -3155,6 +3167,384 @@ impl CrudStore {
             .transpose()
         })
         .await
+    }
+
+    pub async fn upsert_task_run_thread_binding(
+        &self,
+        binding: TaskRunThreadBinding,
+    ) -> Result<TaskRunThreadBinding> {
+        self.run_serialized_write(|| async {
+            task_run_thread_binding::upsert_binding(
+                &self.connection,
+                task_run_thread_binding::NewTaskRunThreadBinding {
+                    id: binding.id.clone(),
+                    task_id: binding.task_id.clone(),
+                    run_id: binding.run_id.clone(),
+                    execution_id: binding.execution_id.clone(),
+                    thread_id: binding.thread_id.clone(),
+                    binding_kind: binding.binding_kind,
+                    created_at: binding.created_at,
+                },
+            )
+            .await?;
+            let row = task_run_thread_binding::find_binding_by_id(&self.connection, &binding.id)
+                .await?
+                .context("task run thread binding missing after upsert")?;
+            task_run_thread_binding_from_db_model(row)
+        })
+        .await
+    }
+
+    pub async fn get_task_run_thread_binding(
+        &self,
+        id: &str,
+    ) -> Result<Option<TaskRunThreadBinding>> {
+        task_run_thread_binding::find_binding_by_id(&self.connection, id)
+            .await?
+            .map(task_run_thread_binding_from_db_model)
+            .transpose()
+    }
+
+    pub async fn get_task_run_primary_thread_binding(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<TaskRunThreadBinding>> {
+        task_run_thread_binding::find_binding_by_run_and_kind(
+            &self.connection,
+            run_id,
+            TaskRunThreadBindingKind::PrimaryExecutor,
+        )
+        .await?
+        .map(task_run_thread_binding_from_db_model)
+        .transpose()
+    }
+
+    pub async fn get_task_run_thread_binding_by_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<TaskRunThreadBinding>> {
+        task_run_thread_binding::find_binding_by_thread(&self.connection, thread_id)
+            .await?
+            .map(task_run_thread_binding_from_db_model)
+            .transpose()
+    }
+
+    pub async fn list_task_run_thread_bindings(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TaskRunThreadBinding>> {
+        task_run_thread_binding::list_bindings_by_run(&self.connection, run_id)
+            .await?
+            .into_iter()
+            .map(task_run_thread_binding_from_db_model)
+            .collect()
+    }
+
+    pub async fn upsert_task_run_turn(&self, turn: TaskRunTurn) -> Result<TaskRunTurn> {
+        self.run_serialized_write(|| async {
+            task_run_turn::upsert_turn(
+                &self.connection,
+                task_run_turn::NewTaskRunTurn {
+                    id: turn.id.clone(),
+                    task_id: turn.task_id.clone(),
+                    run_id: turn.run_id.clone(),
+                    execution_id: turn.execution_id.clone(),
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    kind: turn.kind,
+                    round: turn.round,
+                    sequence: turn.sequence,
+                    status: turn.status,
+                    reviews_candidate_id: turn.reviews_candidate_id.clone(),
+                    requested_by_candidate_id: turn.requested_by_candidate_id.clone(),
+                    requested_by_review_event_id: turn.requested_by_review_event_id.clone(),
+                    created_at: turn.created_at,
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                },
+            )
+            .await?;
+            let row = task_run_turn::find_turn_by_id(&self.connection, &turn.id)
+                .await?
+                .context("task run turn missing after upsert")?;
+            task_run_turn_from_db_model(row)
+        })
+        .await
+    }
+
+    pub async fn get_task_run_turn(&self, id: &str) -> Result<Option<TaskRunTurn>> {
+        task_run_turn::find_turn_by_id(&self.connection, id)
+            .await?
+            .map(task_run_turn_from_db_model)
+            .transpose()
+    }
+
+    pub async fn get_task_run_turn_by_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TaskRunTurn>> {
+        task_run_turn::find_turn_by_thread_and_turn(&self.connection, thread_id, turn_id)
+            .await?
+            .map(task_run_turn_from_db_model)
+            .transpose()
+    }
+
+    pub async fn list_task_run_turns(&self, run_id: &str) -> Result<Vec<TaskRunTurn>> {
+        task_run_turn::list_turns_by_run(&self.connection, run_id)
+            .await?
+            .into_iter()
+            .map(task_run_turn_from_db_model)
+            .collect()
+    }
+
+    pub async fn get_latest_task_run_turn(&self, run_id: &str) -> Result<Option<TaskRunTurn>> {
+        task_run_turn::find_latest_turn_by_run(&self.connection, run_id)
+            .await?
+            .map(task_run_turn_from_db_model)
+            .transpose()
+    }
+
+    pub async fn update_task_run_turn_status(
+        &self,
+        id: &str,
+        status: TaskRunTurnStatus,
+        completed_at: Option<i64>,
+    ) -> Result<Option<TaskRunTurn>> {
+        self.run_serialized_write(|| async {
+            task_run_turn::update_turn_status(&self.connection, id, status, completed_at)
+                .await?
+                .map(task_run_turn_from_db_model)
+                .transpose()
+        })
+        .await
+    }
+
+    pub async fn upsert_task_result_candidate(
+        &self,
+        candidate: TaskResultCandidate,
+    ) -> Result<TaskResultCandidate> {
+        self.run_serialized_write(|| async {
+            task_result_candidate::upsert_candidate(
+                &self.connection,
+                task_result_candidate::NewTaskResultCandidate {
+                    id: candidate.id.clone(),
+                    task_id: candidate.task_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    task_run_turn_id: candidate.task_run_turn_id.clone(),
+                    thread_id: candidate.thread_id.clone(),
+                    turn_id: candidate.turn_id.clone(),
+                    round: candidate.round,
+                    status: candidate.status,
+                    result: candidate.result.clone(),
+                    extraction_error: candidate.extraction_error.clone(),
+                    summary: candidate.summary.clone(),
+                    diagnostics: candidate.diagnostics.clone(),
+                    final_review_event_id: candidate.final_review_event_id.clone(),
+                    created_at: candidate.created_at,
+                    updated_at: candidate.updated_at,
+                    resolved_at: candidate.resolved_at,
+                },
+            )
+            .await?;
+            let row = task_result_candidate::find_candidate_by_id(&self.connection, &candidate.id)
+                .await?
+                .context("task result candidate missing after upsert")?;
+            task_result_candidate_from_db_model(row)
+        })
+        .await
+    }
+
+    pub async fn get_task_result_candidate(&self, id: &str) -> Result<Option<TaskResultCandidate>> {
+        task_result_candidate::find_candidate_by_id(&self.connection, id)
+            .await?
+            .map(task_result_candidate_from_db_model)
+            .transpose()
+    }
+
+    pub async fn get_task_result_candidate_by_turn(
+        &self,
+        task_run_turn_id: &str,
+    ) -> Result<Option<TaskResultCandidate>> {
+        task_result_candidate::find_candidate_by_turn(&self.connection, task_run_turn_id)
+            .await?
+            .map(task_result_candidate_from_db_model)
+            .transpose()
+    }
+
+    pub async fn list_task_result_candidates(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TaskResultCandidate>> {
+        task_result_candidate::list_candidates_by_run(&self.connection, run_id)
+            .await?
+            .into_iter()
+            .map(task_result_candidate_from_db_model)
+            .collect()
+    }
+
+    pub async fn get_accepted_task_result_candidate(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<TaskResultCandidate>> {
+        task_result_candidate::find_candidate_by_run_and_status(
+            &self.connection,
+            run_id,
+            TaskResultCandidateStatus::Accepted,
+        )
+        .await?
+        .map(task_result_candidate_from_db_model)
+        .transpose()
+    }
+
+    pub async fn get_pending_task_result_candidate(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<TaskResultCandidate>> {
+        task_result_candidate::find_candidate_by_run_and_status(
+            &self.connection,
+            run_id,
+            TaskResultCandidateStatus::PendingReview,
+        )
+        .await?
+        .map(task_result_candidate_from_db_model)
+        .transpose()
+    }
+
+    pub async fn update_task_result_candidate_resolution(
+        &self,
+        id: &str,
+        status: TaskResultCandidateStatus,
+        final_review_event_id: Option<&str>,
+        resolved_at: Option<i64>,
+        updated_at: i64,
+    ) -> Result<Option<TaskResultCandidate>> {
+        self.run_serialized_write(|| async {
+            task_result_candidate::update_candidate_resolution(
+                &self.connection,
+                id,
+                status,
+                final_review_event_id,
+                resolved_at,
+                updated_at,
+            )
+            .await?
+            .map(task_result_candidate_from_db_model)
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn upsert_task_result_review_event(
+        &self,
+        review_event: TaskResultReviewEvent,
+    ) -> Result<TaskResultReviewEvent> {
+        self.run_serialized_write(|| async {
+            task_result_review_event::upsert_review_event(
+                &self.connection,
+                task_result_review_event::NewTaskResultReviewEvent {
+                    id: review_event.id.clone(),
+                    candidate_id: review_event.candidate_id.clone(),
+                    task_id: review_event.task_id.clone(),
+                    run_id: review_event.run_id.clone(),
+                    task_run_turn_id: review_event.task_run_turn_id.clone(),
+                    reviewer_kind: review_event.reviewer_kind,
+                    reviewer_thread_id: review_event.reviewer_thread_id.clone(),
+                    reviewer_turn_id: review_event.reviewer_turn_id.clone(),
+                    reviewer_user_id: review_event.reviewer_user_id.clone(),
+                    reviewer_agent_spec_id: review_event.reviewer_agent_spec_id.clone(),
+                    event_kind: review_event.event_kind,
+                    decision: review_event.decision,
+                    feedback_text: review_event.feedback_text.clone(),
+                    feedback: review_event.feedback.clone(),
+                    confidence: review_event.confidence,
+                    supersedes_review_event_id: review_event.supersedes_review_event_id.clone(),
+                    next_task_run_turn_id: review_event.next_task_run_turn_id.clone(),
+                    created_at: review_event.created_at,
+                },
+            )
+            .await?;
+            let row = task_result_review_event::find_review_event_by_id(
+                &self.connection,
+                &review_event.id,
+            )
+            .await?
+            .context("task result review event missing after upsert")?;
+            task_result_review_event_from_db_model(row)
+        })
+        .await
+    }
+
+    pub async fn get_task_result_review_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<TaskResultReviewEvent>> {
+        task_result_review_event::find_review_event_by_id(&self.connection, id)
+            .await?
+            .map(task_result_review_event_from_db_model)
+            .transpose()
+    }
+
+    pub async fn list_task_result_review_events(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Vec<TaskResultReviewEvent>> {
+        task_result_review_event::list_review_events_by_candidate(&self.connection, candidate_id)
+            .await?
+            .into_iter()
+            .map(task_result_review_event_from_db_model)
+            .collect()
+    }
+
+    pub async fn list_task_result_review_events_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TaskResultReviewEvent>> {
+        task_result_review_event::list_review_events_by_run(&self.connection, run_id)
+            .await?
+            .into_iter()
+            .map(task_result_review_event_from_db_model)
+            .collect()
+    }
+
+    pub async fn get_task_run_child_anchor(&self, run_id: &str) -> Result<TaskRunChildAnchor> {
+        let primary_binding = self.get_task_run_primary_thread_binding(run_id).await?;
+        let accepted_candidate = self.get_accepted_task_result_candidate(run_id).await?;
+        let accepted_turn = match accepted_candidate.as_ref() {
+            Some(candidate) => {
+                self.get_task_run_turn(candidate.task_run_turn_id.as_str())
+                    .await?
+            }
+            None => None,
+        };
+        let latest_turn = self.get_latest_task_run_turn(run_id).await?;
+
+        let target_anchor = TaskRunChildAnchor {
+            child_thread_id: primary_binding
+                .as_ref()
+                .map(|binding| binding.thread_id.clone())
+                .or_else(|| accepted_turn.as_ref().map(|turn| turn.thread_id.clone()))
+                .or_else(|| latest_turn.as_ref().map(|turn| turn.thread_id.clone())),
+            child_turn_id: accepted_turn
+                .as_ref()
+                .map(|turn| turn.turn_id.clone())
+                .or_else(|| latest_turn.as_ref().map(|turn| turn.turn_id.clone())),
+        };
+        if target_anchor.child_thread_id.is_some() || target_anchor.child_turn_id.is_some() {
+            return Ok(target_anchor);
+        }
+
+        Ok(
+            thread_lineage::list_lineage_for_run(&self.connection, run_id)
+                .await?
+                .into_iter()
+                .last()
+                .map(|lineage| TaskRunChildAnchor {
+                    child_thread_id: Some(lineage.child_thread_id),
+                    child_turn_id: Some(lineage.child_turn_id),
+                })
+                .unwrap_or_default(),
+        )
     }
 
     pub async fn claim_task_run_for_dispatch(
@@ -6786,6 +7176,90 @@ fn task_run_execution_from_db_model(
     })
 }
 
+fn task_run_thread_binding_from_db_model(
+    model: pioneer_entity::task_run_thread_binding::Model,
+) -> Result<TaskRunThreadBinding> {
+    Ok(TaskRunThreadBinding {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        execution_id: model.execution_id,
+        thread_id: model.thread_id,
+        binding_kind: task_run_thread_binding_kind_from_db(model.binding_kind.as_str())?,
+        created_at: model.created_at.timestamp(),
+    })
+}
+
+fn task_run_turn_from_db_model(model: pioneer_entity::task_run_turn::Model) -> Result<TaskRunTurn> {
+    Ok(TaskRunTurn {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        execution_id: model.execution_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        kind: task_run_turn_kind_from_db(model.kind.as_str())?,
+        round: u32::try_from(model.round).context("task run turn round is out of range")?,
+        sequence: u32::try_from(model.sequence)
+            .context("task run turn sequence is out of range")?,
+        status: task_run_turn_status_from_db(model.status.as_str())?,
+        reviews_candidate_id: model.reviews_candidate_id,
+        requested_by_candidate_id: model.requested_by_candidate_id,
+        requested_by_review_event_id: model.requested_by_review_event_id,
+        created_at: model.created_at.timestamp(),
+        started_at: model.started_at.map(|value| value.timestamp()),
+        completed_at: model.completed_at.map(|value| value.timestamp()),
+    })
+}
+
+fn task_result_candidate_from_db_model(
+    model: pioneer_entity::task_result_candidate::Model,
+) -> Result<TaskResultCandidate> {
+    Ok(TaskResultCandidate {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        task_run_turn_id: model.task_run_turn_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        round: u32::try_from(model.round).context("task result candidate round is out of range")?,
+        status: task_result_candidate_status_from_db(model.status.as_str())?,
+        result: optional_typed_json_from_db(model.result_json)?,
+        extraction_error: optional_typed_json_from_db(model.extraction_error_json)?,
+        summary: model.summary,
+        diagnostics: optional_typed_json_from_db(model.diagnostics_json)?.unwrap_or_default(),
+        final_review_event_id: model.final_review_event_id,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+        resolved_at: model.resolved_at.map(|value| value.timestamp()),
+    })
+}
+
+fn task_result_review_event_from_db_model(
+    model: pioneer_entity::task_result_review_event::Model,
+) -> Result<TaskResultReviewEvent> {
+    Ok(TaskResultReviewEvent {
+        id: model.id,
+        candidate_id: model.candidate_id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        task_run_turn_id: model.task_run_turn_id,
+        reviewer_kind: task_result_reviewer_kind_from_db(model.reviewer_kind.as_str())?,
+        reviewer_thread_id: model.reviewer_thread_id,
+        reviewer_turn_id: model.reviewer_turn_id,
+        reviewer_user_id: model.reviewer_user_id,
+        reviewer_agent_spec_id: model.reviewer_agent_spec_id,
+        event_kind: task_result_review_event_kind_from_db(model.event_kind.as_str())?,
+        decision: task_result_review_decision_from_db(model.decision.as_str())?,
+        feedback_text: model.feedback_text,
+        feedback: optional_typed_json_from_db(model.feedback_json)?,
+        confidence: model.confidence,
+        supersedes_review_event_id: model.supersedes_review_event_id,
+        next_task_run_turn_id: model.next_task_run_turn_id,
+        created_at: model.created_at.timestamp(),
+    })
+}
+
 fn task_delivery_from_db_model(
     model: pioneer_entity::task_delivery::Model,
 ) -> Result<TaskDelivery> {
@@ -7429,9 +7903,9 @@ mod tests {
     use super::{
         ClaimedRecoveryActivation, CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
         McpServerInstallationRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
-        SkillInstallationRecord, TaskEventPayload, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
-        ThreadAgentsDocStatus, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
-        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
+        SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError,
+        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, TurnItemAttemptDeadlines,
+        TurnMcpBindingRecord, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -7446,11 +7920,14 @@ mod tests {
         PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
         PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
         Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
-        TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskRun, TaskRunStatus,
-        TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus, TaskValue, Thread,
-        ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-        ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
-        ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
+        TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate,
+        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunStatus,
+        TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+        TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus,
+        TaskValue, Thread, ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
+        ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
         ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
         ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
         ToolRetryResolution, ToolStoragePayload, Turn, TurnCompletedNotification, TurnItem,
@@ -7518,6 +7995,976 @@ mod tests {
             agent_role: None,
             turns: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn task_review_target_repositories_round_trip_and_update() {
+        let store = test_store_with_workspace("ws_task_review_target_round_trip").await;
+        let binding = TaskRunThreadBinding {
+            id: "binding_round_trip".to_owned(),
+            task_id: "task_round_trip".to_owned(),
+            run_id: "run_round_trip".to_owned(),
+            execution_id: Some("execution_round_trip".to_owned()),
+            thread_id: "thread_round_trip".to_owned(),
+            binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+            created_at: 1_700_000_010,
+        };
+        let inserted_binding = store
+            .upsert_task_run_thread_binding(binding.clone())
+            .await
+            .expect("binding upsert should succeed");
+        assert_eq!(inserted_binding, binding);
+
+        let turn = TaskRunTurn {
+            id: "task_run_turn_round_trip".to_owned(),
+            task_id: "task_round_trip".to_owned(),
+            run_id: "run_round_trip".to_owned(),
+            execution_id: Some("execution_round_trip".to_owned()),
+            thread_id: "thread_round_trip".to_owned(),
+            turn_id: "turn_round_trip".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::InProgress,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 1_700_000_011,
+            started_at: Some(1_700_000_011),
+            completed_at: None,
+        };
+        store
+            .upsert_task_run_turn(turn.clone())
+            .await
+            .expect("turn upsert should succeed");
+        let completed_turn = store
+            .update_task_run_turn_status(
+                turn.id.as_str(),
+                TaskRunTurnStatus::CandidateCreated,
+                Some(1_700_000_012),
+            )
+            .await
+            .expect("turn status update should succeed")
+            .expect("turn should exist");
+        assert_eq!(completed_turn.status, TaskRunTurnStatus::CandidateCreated);
+        assert_eq!(completed_turn.completed_at, Some(1_700_000_012));
+
+        let candidate = TaskResultCandidate {
+            id: "candidate_round_trip".to_owned(),
+            task_id: "task_round_trip".to_owned(),
+            run_id: "run_round_trip".to_owned(),
+            task_run_turn_id: turn.id.clone(),
+            thread_id: "thread_round_trip".to_owned(),
+            turn_id: "turn_round_trip".to_owned(),
+            round: 0,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("done".to_owned()),
+                data: Some(TaskValue::String("ok".to_owned())),
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_round_trip".to_owned()),
+            }),
+            extraction_error: None,
+            summary: Some("done".to_owned()),
+            diagnostics: vec!["parsed".to_owned()],
+            final_review_event_id: None,
+            created_at: 1_700_000_013,
+            updated_at: 1_700_000_013,
+            resolved_at: None,
+        };
+        store
+            .upsert_task_result_candidate(candidate.clone())
+            .await
+            .expect("candidate upsert should succeed");
+
+        let review_event = TaskResultReviewEvent {
+            id: "review_event_round_trip".to_owned(),
+            candidate_id: candidate.id.clone(),
+            task_id: "task_round_trip".to_owned(),
+            run_id: "run_round_trip".to_owned(),
+            task_run_turn_id: turn.id.clone(),
+            reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer_thread_id: None,
+            reviewer_turn_id: None,
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::SystemAuto,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: None,
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: 1_700_000_014,
+        };
+        store
+            .upsert_task_result_review_event(review_event.clone())
+            .await
+            .expect("review event upsert should succeed");
+        let accepted = store
+            .update_task_result_candidate_resolution(
+                candidate.id.as_str(),
+                TaskResultCandidateStatus::Accepted,
+                Some(review_event.id.as_str()),
+                Some(1_700_000_014),
+                1_700_000_014,
+            )
+            .await
+            .expect("candidate resolution update should succeed")
+            .expect("candidate should exist");
+        assert_eq!(accepted.status, TaskResultCandidateStatus::Accepted);
+        assert_eq!(
+            accepted.final_review_event_id.as_deref(),
+            Some(review_event.id.as_str())
+        );
+        assert_eq!(accepted.resolved_at, Some(1_700_000_014));
+        assert_eq!(
+            store
+                .get_task_result_review_event(review_event.id.as_str())
+                .await
+                .expect("review lookup should succeed"),
+            Some(review_event)
+        );
+    }
+
+    #[tokio::test]
+    async fn task_review_canonical_helpers_return_target_rows_and_ordering() {
+        let store = test_store_with_workspace("ws_task_review_helpers").await;
+        assert_eq!(
+            store
+                .get_task_run_primary_thread_binding("run_helpers")
+                .await
+                .expect("missing primary binding lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_task_run_thread_binding_by_thread("thread_helpers")
+                .await
+                .expect("missing thread binding lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_task_run_turn_by_turn("thread_helpers", "turn_helpers_initial")
+                .await
+                .expect("missing turn lookup should succeed"),
+            None
+        );
+        assert!(
+            store
+                .list_task_run_turns("run_helpers")
+                .await
+                .expect("missing run turn list should succeed")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_latest_task_run_turn("run_helpers")
+                .await
+                .expect("missing latest turn lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_pending_task_result_candidate("run_helpers")
+                .await
+                .expect("missing pending candidate lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_accepted_task_result_candidate("run_helpers")
+                .await
+                .expect("missing accepted candidate lookup should succeed"),
+            None
+        );
+        assert!(
+            store
+                .list_task_result_review_events("candidate_helpers_accepted")
+                .await
+                .expect("missing candidate review list should succeed")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_task_result_review_events_for_run("run_helpers")
+                .await
+                .expect("missing run review list should succeed")
+                .is_empty()
+        );
+
+        let binding = TaskRunThreadBinding {
+            id: "binding_helpers".to_owned(),
+            task_id: "task_helpers".to_owned(),
+            run_id: "run_helpers".to_owned(),
+            execution_id: None,
+            thread_id: "thread_helpers".to_owned(),
+            binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+            created_at: 1_700_001_000,
+        };
+        store
+            .upsert_task_run_thread_binding(binding.clone())
+            .await
+            .expect("binding upsert should succeed");
+        assert_eq!(
+            store
+                .get_task_run_primary_thread_binding("run_helpers")
+                .await
+                .expect("primary binding lookup should succeed"),
+            Some(binding.clone())
+        );
+        assert_eq!(
+            store
+                .get_task_run_thread_binding_by_thread("thread_helpers")
+                .await
+                .expect("thread binding lookup should succeed"),
+            Some(binding)
+        );
+        let duplicate_primary = store
+            .upsert_task_run_thread_binding(TaskRunThreadBinding {
+                id: "binding_helpers_duplicate_primary".to_owned(),
+                task_id: "task_helpers".to_owned(),
+                run_id: "run_helpers".to_owned(),
+                execution_id: None,
+                thread_id: "thread_helpers_duplicate_primary".to_owned(),
+                binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+                created_at: 1_700_001_000,
+            })
+            .await;
+        assert!(
+            duplicate_primary.is_err(),
+            "duplicate primary_executor binding should be rejected"
+        );
+
+        for (index, turn_id) in ["turn_helpers_initial", "turn_helpers_revision"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .upsert_task_run_turn(TaskRunTurn {
+                    id: format!("task_run_turn_helpers_{index}"),
+                    task_id: "task_helpers".to_owned(),
+                    run_id: "run_helpers".to_owned(),
+                    execution_id: None,
+                    thread_id: "thread_helpers".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    kind: if index == 0 {
+                        TaskRunTurnKind::Initial
+                    } else {
+                        TaskRunTurnKind::Revision
+                    },
+                    round: u32::try_from(index).expect("index should fit"),
+                    sequence: u32::try_from(index).expect("index should fit"),
+                    status: TaskRunTurnStatus::CandidateCreated,
+                    reviews_candidate_id: None,
+                    requested_by_candidate_id: None,
+                    requested_by_review_event_id: None,
+                    created_at: 1_700_001_001 + i64::try_from(index).expect("index should fit"),
+                    started_at: None,
+                    completed_at: None,
+                })
+                .await
+                .expect("turn upsert should succeed");
+        }
+        assert!(
+            store
+                .upsert_task_run_turn(TaskRunTurn {
+                    id: "task_run_turn_helpers_duplicate_sequence".to_owned(),
+                    task_id: "task_helpers".to_owned(),
+                    run_id: "run_helpers".to_owned(),
+                    execution_id: None,
+                    thread_id: "thread_helpers".to_owned(),
+                    turn_id: "turn_helpers_duplicate_sequence".to_owned(),
+                    kind: TaskRunTurnKind::Review,
+                    round: 99,
+                    sequence: 1,
+                    status: TaskRunTurnStatus::ReviewRecorded,
+                    reviews_candidate_id: None,
+                    requested_by_candidate_id: None,
+                    requested_by_review_event_id: None,
+                    created_at: 1_700_001_009,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .await
+                .is_err(),
+            "duplicate run/sequence turn should be rejected"
+        );
+        let turns = store
+            .list_task_run_turns("run_helpers")
+            .await
+            .expect("turn list should succeed");
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn_helpers_initial", "turn_helpers_revision"]
+        );
+        assert_eq!(
+            store
+                .get_latest_task_run_turn("run_helpers")
+                .await
+                .expect("latest turn lookup should succeed")
+                .map(|turn| turn.turn_id),
+            Some("turn_helpers_revision".to_owned())
+        );
+
+        let pending = TaskResultCandidate {
+            id: "candidate_helpers_pending".to_owned(),
+            task_id: "task_helpers".to_owned(),
+            run_id: "run_helpers".to_owned(),
+            task_run_turn_id: "task_run_turn_helpers_0".to_owned(),
+            thread_id: "thread_helpers".to_owned(),
+            turn_id: "turn_helpers_initial".to_owned(),
+            round: 0,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("pending".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: None,
+            }),
+            extraction_error: None,
+            summary: Some("pending".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: 1_700_001_010,
+            updated_at: 1_700_001_010,
+            resolved_at: None,
+        };
+        let accepted = TaskResultCandidate {
+            id: "candidate_helpers_accepted".to_owned(),
+            status: TaskResultCandidateStatus::Accepted,
+            task_run_turn_id: "task_run_turn_helpers_1".to_owned(),
+            turn_id: "turn_helpers_revision".to_owned(),
+            round: 1,
+            final_review_event_id: Some("review_helpers_accept".to_owned()),
+            created_at: 1_700_001_020,
+            updated_at: 1_700_001_021,
+            resolved_at: Some(1_700_001_021),
+            ..pending.clone()
+        };
+        store
+            .upsert_task_result_candidate(pending.clone())
+            .await
+            .expect("pending candidate upsert should succeed");
+        store
+            .upsert_task_result_candidate(accepted.clone())
+            .await
+            .expect("accepted candidate upsert should succeed");
+        assert_eq!(
+            store
+                .get_pending_task_result_candidate("run_helpers")
+                .await
+                .expect("pending candidate lookup should succeed")
+                .map(|candidate| candidate.id),
+            Some(pending.id)
+        );
+        assert_eq!(
+            store
+                .get_accepted_task_result_candidate("run_helpers")
+                .await
+                .expect("accepted candidate lookup should succeed")
+                .map(|candidate| candidate.id),
+            Some(accepted.id.clone())
+        );
+        assert_eq!(
+            store
+                .get_task_run_child_anchor("run_helpers")
+                .await
+                .expect("child anchor should load"),
+            TaskRunChildAnchor {
+                child_thread_id: Some("thread_helpers".to_owned()),
+                child_turn_id: Some("turn_helpers_revision".to_owned())
+            }
+        );
+
+        for (id, created_at) in [
+            ("review_helpers_first", 1_700_001_030),
+            ("review_helpers_second", 1_700_001_031),
+        ] {
+            store
+                .upsert_task_result_review_event(TaskResultReviewEvent {
+                    id: id.to_owned(),
+                    candidate_id: accepted.id.clone(),
+                    task_id: "task_helpers".to_owned(),
+                    run_id: "run_helpers".to_owned(),
+                    task_run_turn_id: "task_run_turn_helpers_1".to_owned(),
+                    reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                    reviewer_thread_id: Some("parent_thread_helpers".to_owned()),
+                    reviewer_turn_id: Some("parent_turn_helpers".to_owned()),
+                    reviewer_user_id: None,
+                    reviewer_agent_spec_id: None,
+                    event_kind: TaskResultReviewEventKind::Decision,
+                    decision: TaskResultReviewDecision::Accept,
+                    feedback_text: None,
+                    feedback: None,
+                    confidence: None,
+                    supersedes_review_event_id: None,
+                    next_task_run_turn_id: None,
+                    created_at,
+                })
+                .await
+                .expect("review event upsert should succeed");
+        }
+        assert_eq!(
+            store
+                .list_task_result_review_events(accepted.id.as_str())
+                .await
+                .expect("candidate reviews should list")
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec!["review_helpers_first", "review_helpers_second"]
+        );
+        assert_eq!(
+            store
+                .list_task_result_review_events_for_run("run_helpers")
+                .await
+                .expect("run reviews should list")
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec!["review_helpers_first", "review_helpers_second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_run_child_anchor_falls_back_to_legacy_lineage() {
+        let store = test_store_with_workspace("ws_task_review_anchor_fallback").await;
+        store
+            .database_connection()
+            .execute_unprepared(
+                "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
+                 values ('child_thread_anchor_fallback', 'child_turn_anchor_fallback', 'parent_thread_anchor_fallback', 'parent_turn_anchor_fallback', 'task_anchor_fallback', 'run_anchor_fallback', 'root_thread_anchor_fallback', 1, '2026-05-15 00:00:00')"
+            )
+            .await
+            .expect("legacy lineage insert should succeed");
+
+        assert_eq!(
+            store
+                .get_task_run_child_anchor("run_anchor_fallback")
+                .await
+                .expect("fallback anchor should load"),
+            TaskRunChildAnchor {
+                child_thread_id: Some("child_thread_anchor_fallback".to_owned()),
+                child_turn_id: Some("child_turn_anchor_fallback".to_owned())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn task_run_child_anchor_uses_accepted_task_run_turn() {
+        let store = test_store_with_workspace("ws_task_review_anchor_accepted_turn").await;
+        store
+            .upsert_task_run_thread_binding(TaskRunThreadBinding {
+                id: "binding_anchor_accepted_turn".to_owned(),
+                task_id: "task_anchor_accepted_turn".to_owned(),
+                run_id: "run_anchor_accepted_turn".to_owned(),
+                execution_id: None,
+                thread_id: "thread_anchor_accepted_turn".to_owned(),
+                binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+                created_at: 1_700_001_100,
+            })
+            .await
+            .expect("binding upsert should succeed");
+
+        for (id, turn_id, sequence) in [
+            ("task_run_turn_anchor_accepted", "turn_anchor_accepted", 0),
+            ("task_run_turn_anchor_latest", "turn_anchor_latest", 1),
+        ] {
+            store
+                .upsert_task_run_turn(TaskRunTurn {
+                    id: id.to_owned(),
+                    task_id: "task_anchor_accepted_turn".to_owned(),
+                    run_id: "run_anchor_accepted_turn".to_owned(),
+                    execution_id: None,
+                    thread_id: "thread_anchor_accepted_turn".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    kind: if sequence == 0 {
+                        TaskRunTurnKind::Initial
+                    } else {
+                        TaskRunTurnKind::Revision
+                    },
+                    round: sequence,
+                    sequence,
+                    status: TaskRunTurnStatus::CandidateCreated,
+                    reviews_candidate_id: None,
+                    requested_by_candidate_id: None,
+                    requested_by_review_event_id: None,
+                    created_at: 1_700_001_101 + i64::from(sequence),
+                    started_at: None,
+                    completed_at: None,
+                })
+                .await
+                .expect("turn upsert should succeed");
+        }
+
+        store
+            .upsert_task_result_candidate(TaskResultCandidate {
+                id: "candidate_anchor_accepted_turn".to_owned(),
+                task_id: "task_anchor_accepted_turn".to_owned(),
+                run_id: "run_anchor_accepted_turn".to_owned(),
+                task_run_turn_id: "task_run_turn_anchor_accepted".to_owned(),
+                thread_id: "thread_anchor_accepted_turn".to_owned(),
+                turn_id: "stale_denormalized_candidate_turn".to_owned(),
+                round: 0,
+                status: TaskResultCandidateStatus::Accepted,
+                result: Some(TaskResult {
+                    summary: Some("accepted".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some("run_anchor_accepted_turn".to_owned()),
+                }),
+                extraction_error: None,
+                summary: Some("accepted".to_owned()),
+                diagnostics: Vec::new(),
+                final_review_event_id: Some("review_anchor_accepted_turn".to_owned()),
+                created_at: 1_700_001_110,
+                updated_at: 1_700_001_111,
+                resolved_at: Some(1_700_001_111),
+            })
+            .await
+            .expect("candidate upsert should succeed");
+
+        assert_eq!(
+            store
+                .get_task_run_child_anchor("run_anchor_accepted_turn")
+                .await
+                .expect("child anchor should load"),
+            TaskRunChildAnchor {
+                child_thread_id: Some("thread_anchor_accepted_turn".to_owned()),
+                child_turn_id: Some("turn_anchor_accepted".to_owned())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn task_review_projector_replays_new_runtime_events_idempotently() {
+        let store = test_store_with_workspace("ws_task_review_projector").await;
+        let timestamp = 1_700_002_000;
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_projector".to_owned();
+        run.task_id = "task_projector".to_owned();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+
+        let binding = TaskRunThreadBinding {
+            id: "binding_projector".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: Some("execution_projector".to_owned()),
+            thread_id: "thread_projector".to_owned(),
+            binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+            created_at: timestamp + 1,
+        };
+        let turn = TaskRunTurn {
+            id: "task_run_turn_projector".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: Some("execution_projector".to_owned()),
+            thread_id: binding.thread_id.clone(),
+            turn_id: "turn_projector".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: timestamp + 2,
+            started_at: Some(timestamp + 2),
+            completed_at: Some(timestamp + 3),
+        };
+        let candidate = TaskResultCandidate {
+            id: "candidate_projector".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            task_run_turn_id: turn.id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            round: 0,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("candidate".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: Some(run.id.clone()),
+            }),
+            extraction_error: None,
+            summary: Some("candidate".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: timestamp + 4,
+            updated_at: timestamp + 4,
+            resolved_at: None,
+        };
+        let review_event = TaskResultReviewEvent {
+            id: "review_projector_accept".to_owned(),
+            candidate_id: candidate.id.clone(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            task_run_turn_id: turn.id.clone(),
+            reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer_thread_id: None,
+            reviewer_turn_id: None,
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::SystemAuto,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: None,
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: timestamp + 5,
+        };
+        let accepted_candidate = TaskResultCandidate {
+            status: TaskResultCandidateStatus::Accepted,
+            final_review_event_id: Some(review_event.id.clone()),
+            updated_at: timestamp + 5,
+            resolved_at: Some(timestamp + 5),
+            ..candidate.clone()
+        };
+
+        let events = vec![
+            TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: None,
+            },
+            TaskEventPayload::TaskRunThreadBindingCreated {
+                binding: binding.clone(),
+            },
+            TaskEventPayload::TaskRunTurnStarted {
+                task_run_turn: TaskRunTurn {
+                    status: TaskRunTurnStatus::InProgress,
+                    completed_at: None,
+                    ..turn.clone()
+                },
+            },
+            TaskEventPayload::TaskRunTurnCompleted {
+                task_run_turn: turn.clone(),
+            },
+            TaskEventPayload::TaskResultCandidateCreated {
+                candidate: candidate.clone(),
+            },
+            TaskEventPayload::TaskRunEnteredReview {
+                task_id: run.task_id.clone(),
+                run_id: run.id.clone(),
+                candidate_id: candidate.id.clone(),
+                entered_at: timestamp + 4,
+            },
+            TaskEventPayload::TaskResultReviewEventRecorded {
+                review_event: review_event.clone(),
+            },
+            TaskEventPayload::TaskResultCandidateAccepted {
+                candidate: accepted_candidate.clone(),
+                review_event_id: review_event.id.clone(),
+            },
+        ];
+
+        store
+            .append_task_events(events.clone(), timestamp + 10)
+            .await
+            .expect("new runtime events should project");
+        store
+            .append_task_events(events, timestamp + 10)
+            .await
+            .expect("replay should be idempotent");
+
+        assert_eq!(
+            store
+                .get_task_run_primary_thread_binding(run.id.as_str())
+                .await
+                .expect("primary binding should load"),
+            Some(binding)
+        );
+        assert_eq!(
+            store
+                .list_task_run_turns(run.id.as_str())
+                .await
+                .expect("turns should list"),
+            vec![turn]
+        );
+        assert_eq!(
+            store
+                .get_accepted_task_result_candidate(run.id.as_str())
+                .await
+                .expect("accepted candidate should load")
+                .map(|candidate| candidate.final_review_event_id),
+            Some(Some(review_event.id.clone()))
+        );
+        assert_eq!(
+            store
+                .list_task_result_review_events(candidate.id.as_str())
+                .await
+                .expect("review events should list"),
+            vec![review_event]
+        );
+        assert_eq!(
+            store
+                .get_task_run(run.id.as_str())
+                .await
+                .expect("run lookup should succeed")
+                .expect("run should exist")
+                .status,
+            TaskRunStatus::Waiting
+        );
+    }
+
+    #[tokio::test]
+    async fn task_review_projector_replays_legacy_child_thread_linked_json() {
+        let store = test_store_with_workspace("ws_task_review_legacy_projector").await;
+        let timestamp = 1_700_003_000;
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_legacy_projector".to_owned();
+        run.task_id = "task_legacy_projector".to_owned();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+
+        let legacy_link_json = serde_json::json!({
+            "kind": "child_thread_linked",
+            "payload": {
+                "lineage": {
+                    "childThreadId": "child_thread_legacy_projector",
+                    "childTurnId": "child_turn_legacy_projector",
+                    "parentThreadId": "parent_thread_legacy_projector",
+                    "parentTurnId": "parent_turn_legacy_projector",
+                    "taskId": run.task_id.clone(),
+                    "taskRunId": run.id.clone(),
+                    "rootThreadId": "root_thread_legacy_projector",
+                    "depth": 1,
+                    "createdAt": timestamp + 1
+                }
+            }
+        });
+        let legacy_link: TaskEventPayload =
+            serde_json::from_value(legacy_link_json).expect("legacy child link should decode");
+
+        let completed_result = TaskResult {
+            summary: Some("legacy accepted".to_owned()),
+            data: Some(TaskValue::String("legacy".to_owned())),
+            artifacts: Vec::new(),
+            completed_by_run_id: Some(run.id.clone()),
+        };
+        let events = vec![
+            TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: None,
+            },
+            legacy_link,
+            TaskEventPayload::RunCompleted {
+                task_id: run.task_id.clone(),
+                run_id: run.id.clone(),
+                result: Some(completed_result.clone()),
+                completed_at: timestamp + 2,
+            },
+        ];
+        store
+            .append_task_events(events.clone(), timestamp + 10)
+            .await
+            .expect("legacy events should project");
+        store
+            .append_task_events(events, timestamp + 10)
+            .await
+            .expect("legacy replay should be idempotent");
+
+        let binding = store
+            .get_task_run_primary_thread_binding(run.id.as_str())
+            .await
+            .expect("legacy binding should load")
+            .expect("legacy binding should exist");
+        assert_eq!(binding.execution_id, None);
+        assert_eq!(binding.thread_id, "child_thread_legacy_projector");
+
+        let turns = store
+            .list_task_run_turns(run.id.as_str())
+            .await
+            .expect("legacy turns should list");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, "child_turn_legacy_projector");
+        assert_eq!(turns[0].status, TaskRunTurnStatus::InProgress);
+
+        let accepted = store
+            .get_accepted_task_result_candidate(run.id.as_str())
+            .await
+            .expect("legacy accepted candidate should load")
+            .expect("legacy accepted candidate should exist");
+        assert_eq!(accepted.result, Some(completed_result));
+        assert_eq!(
+            store
+                .list_task_result_review_events(accepted.id.as_str())
+                .await
+                .expect("legacy auto review should list")
+                .into_iter()
+                .map(|event| (event.event_kind, event.reviewer_kind, event.decision))
+                .collect::<Vec<_>>(),
+            vec![(
+                TaskResultReviewEventKind::SystemAuto,
+                TaskResultReviewerKind::RuntimeAuto,
+                TaskResultReviewDecision::Accept
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_review_projector_replays_rejection_revision_and_failed_turn_events() {
+        let store = test_store_with_workspace("ws_task_review_revision_projector").await;
+        let timestamp = 1_700_004_000;
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_revision_projector".to_owned();
+        run.task_id = "task_revision_projector".to_owned();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+
+        let initial_turn = TaskRunTurn {
+            id: "task_run_turn_revision_initial".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: "thread_revision_projector".to_owned(),
+            turn_id: "turn_revision_initial".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: timestamp + 1,
+            started_at: Some(timestamp + 1),
+            completed_at: Some(timestamp + 2),
+        };
+        let candidate = TaskResultCandidate {
+            id: "candidate_revision_projector".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            task_run_turn_id: initial_turn.id.clone(),
+            thread_id: initial_turn.thread_id.clone(),
+            turn_id: initial_turn.turn_id.clone(),
+            round: 0,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("needs changes".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: Some(run.id.clone()),
+            }),
+            extraction_error: None,
+            summary: Some("needs changes".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: timestamp + 3,
+            updated_at: timestamp + 3,
+            resolved_at: None,
+        };
+        let review_event = TaskResultReviewEvent {
+            id: "review_revision_projector".to_owned(),
+            candidate_id: candidate.id.clone(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            task_run_turn_id: initial_turn.id.clone(),
+            reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer_thread_id: Some("parent_thread_revision_projector".to_owned()),
+            reviewer_turn_id: Some("parent_turn_revision_projector".to_owned()),
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::RequestChanges,
+            feedback_text: Some("tighten result".to_owned()),
+            feedback: None,
+            confidence: Some(0.8),
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: Some("task_run_turn_revision_retry".to_owned()),
+            created_at: timestamp + 4,
+        };
+        let rejected_candidate = TaskResultCandidate {
+            status: TaskResultCandidateStatus::Rejected,
+            final_review_event_id: Some(review_event.id.clone()),
+            updated_at: timestamp + 4,
+            resolved_at: Some(timestamp + 4),
+            ..candidate.clone()
+        };
+        let failed_revision_turn = TaskRunTurn {
+            id: "task_run_turn_revision_retry".to_owned(),
+            task_id: run.task_id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: initial_turn.thread_id.clone(),
+            turn_id: "turn_revision_retry".to_owned(),
+            kind: TaskRunTurnKind::Revision,
+            round: 1,
+            sequence: 1,
+            status: TaskRunTurnStatus::Failed,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: Some(candidate.id.clone()),
+            requested_by_review_event_id: Some(review_event.id.clone()),
+            created_at: timestamp + 5,
+            started_at: Some(timestamp + 5),
+            completed_at: Some(timestamp + 6),
+        };
+
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                    TaskEventPayload::TaskRunTurnCompleted {
+                        task_run_turn: initial_turn,
+                    },
+                    TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: candidate.clone(),
+                    },
+                    TaskEventPayload::TaskResultReviewEventRecorded {
+                        review_event: review_event.clone(),
+                    },
+                    TaskEventPayload::TaskResultCandidateRejected {
+                        candidate: rejected_candidate,
+                        review_event_id: review_event.id.clone(),
+                    },
+                    TaskEventPayload::TaskRevisionRequested {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        previous_candidate_id: candidate.id.clone(),
+                        requested_by_review_event_id: review_event.id.clone(),
+                        task_run_turn_id: failed_revision_turn.id.clone(),
+                        thread_id: failed_revision_turn.thread_id.clone(),
+                        turn_id: failed_revision_turn.turn_id.clone(),
+                        round: failed_revision_turn.round,
+                        feedback: "tighten result".to_owned(),
+                        requested_at: timestamp + 5,
+                    },
+                    TaskEventPayload::TaskRunTurnFailed {
+                        task_run_turn: failed_revision_turn.clone(),
+                        error: None,
+                    },
+                ],
+                timestamp + 10,
+            )
+            .await
+            .expect("revision events should project");
+
+        let rejected = store
+            .get_task_result_candidate(candidate.id.as_str())
+            .await
+            .expect("candidate lookup should succeed")
+            .expect("candidate should exist");
+        assert_eq!(rejected.status, TaskResultCandidateStatus::Rejected);
+        assert_eq!(
+            rejected.final_review_event_id.as_deref(),
+            Some(review_event.id.as_str())
+        );
+        assert_eq!(
+            store
+                .get_latest_task_run_turn(run.id.as_str())
+                .await
+                .expect("latest turn should load"),
+            Some(failed_revision_turn)
+        );
     }
 
     #[tokio::test]

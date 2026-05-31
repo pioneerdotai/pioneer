@@ -312,12 +312,10 @@ impl MessageProcessor {
     }
 
     async fn webhook_payload(&self, delivery: &TaskDelivery) -> Result<JsonValue> {
-        let lineage = self
+        let child_anchor = self
             .crud_store
-            .list_thread_lineage_for_run(delivery.run_id.as_str())
-            .await?
-            .into_iter()
-            .last();
+            .get_task_run_child_anchor(delivery.run_id.as_str())
+            .await?;
         Ok(json!({
             "event": if delivery.error_snapshot.is_some() { "task.run.failed" } else { "task.run.completed" },
             "deliveryId": delivery.id.clone(),
@@ -326,8 +324,8 @@ impl MessageProcessor {
             "status": if delivery.error_snapshot.is_some() { "failed" } else { "completed" },
             "result": delivery.result_snapshot.clone(),
             "error": delivery.error_snapshot.clone(),
-            "childThreadId": lineage.as_ref().map(|lineage| lineage.child_thread_id.clone()),
-            "childTurnId": lineage.as_ref().map(|lineage| lineage.child_turn_id.clone()),
+            "childThreadId": child_anchor.child_thread_id,
+            "childTurnId": child_anchor.child_turn_id,
             "occurredAt": delivery.updated_at,
         }))
     }

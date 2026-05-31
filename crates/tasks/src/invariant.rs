@@ -114,6 +114,24 @@ pub enum TaskRuntimeInvariantViolationKind {
         binding_id: String,
         thread_id: String,
     },
+    PrimaryExecutorBindingLineageMismatch {
+        task_id: String,
+        run_id: String,
+        binding_id: String,
+        binding_thread_id: String,
+        lineage_child_thread_id: String,
+    },
+    PrimaryExecutorBindingExecutionMismatch {
+        task_id: String,
+        run_id: String,
+        execution_id: String,
+        binding_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_execution_id: Option<String>,
+        binding_thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_child_thread_id: Option<String>,
+    },
     MultiplePrimaryExecutorBindingsForRun {
         task_id: String,
         run_id: String,
@@ -139,12 +157,36 @@ pub enum TaskRuntimeInvariantViolationKind {
         child_thread_id: String,
         child_turn_id: String,
     },
+    TaskRunTurnLineageMismatch {
+        task_id: String,
+        run_id: String,
+        task_run_turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_thread_id: Option<String>,
+        target_turn_id: String,
+        lineage_child_thread_id: String,
+        lineage_child_turn_id: String,
+    },
     ExecutionMissingTaskRunTurn {
         task_id: String,
         run_id: String,
         execution_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child_thread_id: Option<String>,
+        child_turn_id: String,
+    },
+    TaskRunTurnExecutionMismatch {
+        task_id: String,
+        run_id: String,
+        execution_id: String,
+        task_run_turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_execution_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_thread_id: Option<String>,
+        target_turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_child_thread_id: Option<String>,
         child_turn_id: String,
     },
     TaskRunTurnMissingTurn {
@@ -180,6 +222,78 @@ pub enum TaskRuntimeInvariantViolationKind {
         run_id: String,
         candidate_ids: Vec<String>,
     },
+    TaskResultCandidateTurnMismatch {
+        task_id: String,
+        run_id: String,
+        candidate_id: String,
+        task_run_turn_id: String,
+        candidate_thread_id: String,
+        turn_thread_id: String,
+        candidate_turn_id: String,
+        turn_turn_id: String,
+    },
+    TaskResultCandidatePrimaryBindingMismatch {
+        task_id: String,
+        run_id: String,
+        candidate_id: String,
+        binding_id: String,
+        candidate_thread_id: String,
+        binding_thread_id: String,
+    },
+    TaskResultCandidateRoundMismatch {
+        task_id: String,
+        run_id: String,
+        candidate_id: String,
+        task_run_turn_id: String,
+        candidate_round: i64,
+        turn_round: i64,
+    },
+    ReviewEventMissingCandidate {
+        task_id: String,
+        run_id: String,
+        review_event_id: String,
+        candidate_id: String,
+    },
+    ReviewEventMissingTaskRunTurn {
+        task_id: String,
+        run_id: String,
+        review_event_id: String,
+        task_run_turn_id: String,
+    },
+    FinalReviewEventDecisionMismatch {
+        task_id: String,
+        run_id: String,
+        candidate_id: String,
+        review_event_id: String,
+        candidate_status: String,
+        review_decision: String,
+    },
+    DuplicateTaskRunTurnSequence {
+        task_id: String,
+        run_id: String,
+        sequence: i64,
+        task_run_turn_ids: Vec<String>,
+    },
+    NonContiguousTaskRunTurnSequence {
+        task_id: String,
+        run_id: String,
+        task_run_turn_id: String,
+        expected_sequence: i64,
+        actual_sequence: i64,
+    },
+    DuplicateCandidateProducingRound {
+        task_id: String,
+        run_id: String,
+        round: i64,
+        task_run_turn_ids: Vec<String>,
+    },
+    NonContiguousCandidateProducingRound {
+        task_id: String,
+        run_id: String,
+        task_run_turn_id: String,
+        expected_round: i64,
+        actual_round: i64,
+    },
 }
 
 impl TaskRuntimeInvariantViolationKind {
@@ -202,13 +316,21 @@ impl TaskRuntimeInvariantViolationKind {
             Self::PrimaryExecutorBindingMissingExecution { .. } => {
                 "primary_executor_binding_missing_execution"
             }
+            Self::PrimaryExecutorBindingLineageMismatch { .. } => {
+                "primary_executor_binding_lineage_mismatch"
+            }
+            Self::PrimaryExecutorBindingExecutionMismatch { .. } => {
+                "primary_executor_binding_execution_mismatch"
+            }
             Self::MultiplePrimaryExecutorBindingsForRun { .. } => {
                 "multiple_primary_executor_bindings_for_run"
             }
             Self::LineageChildTurnMissingTurn { .. } => "lineage_child_turn_missing_turn",
             Self::ExecutionChildTurnMissingTurn { .. } => "execution_child_turn_missing_turn",
             Self::LineageMissingTaskRunTurn { .. } => "lineage_missing_task_run_turn",
+            Self::TaskRunTurnLineageMismatch { .. } => "task_run_turn_lineage_mismatch",
             Self::ExecutionMissingTaskRunTurn { .. } => "execution_missing_task_run_turn",
+            Self::TaskRunTurnExecutionMismatch { .. } => "task_run_turn_execution_mismatch",
             Self::TaskRunTurnMissingTurn { .. } => "task_run_turn_missing_turn",
             Self::AcceptedCandidateMissingTurn { .. } => "accepted_candidate_missing_turn",
             Self::SucceededRunMissingAcceptedCandidate { .. } => {
@@ -219,6 +341,22 @@ impl TaskRuntimeInvariantViolationKind {
                 "accepted_candidate_missing_final_review_event"
             }
             Self::MultipleAcceptedCandidatesForRun { .. } => "multiple_accepted_candidates_for_run",
+            Self::TaskResultCandidateTurnMismatch { .. } => "task_result_candidate_turn_mismatch",
+            Self::TaskResultCandidatePrimaryBindingMismatch { .. } => {
+                "task_result_candidate_primary_binding_mismatch"
+            }
+            Self::TaskResultCandidateRoundMismatch { .. } => "task_result_candidate_round_mismatch",
+            Self::ReviewEventMissingCandidate { .. } => "review_event_missing_candidate",
+            Self::ReviewEventMissingTaskRunTurn { .. } => "review_event_missing_task_run_turn",
+            Self::FinalReviewEventDecisionMismatch { .. } => "final_review_event_decision_mismatch",
+            Self::DuplicateTaskRunTurnSequence { .. } => "duplicate_task_run_turn_sequence",
+            Self::NonContiguousTaskRunTurnSequence { .. } => {
+                "non_contiguous_task_run_turn_sequence"
+            }
+            Self::DuplicateCandidateProducingRound { .. } => "duplicate_candidate_producing_round",
+            Self::NonContiguousCandidateProducingRound { .. } => {
+                "non_contiguous_candidate_producing_round"
+            }
         }
     }
 
@@ -235,17 +373,33 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::MissingPrimaryExecutorBinding { .. }
             | Self::PrimaryExecutorBindingMissingLineage { .. }
             | Self::PrimaryExecutorBindingMissingExecution { .. }
+            | Self::PrimaryExecutorBindingLineageMismatch { .. }
+            | Self::PrimaryExecutorBindingExecutionMismatch { .. }
             | Self::MultiplePrimaryExecutorBindingsForRun { .. }
             | Self::LineageChildTurnMissingTurn { .. }
             | Self::ExecutionChildTurnMissingTurn { .. }
             | Self::LineageMissingTaskRunTurn { .. }
+            | Self::TaskRunTurnLineageMismatch { .. }
             | Self::ExecutionMissingTaskRunTurn { .. }
+            | Self::TaskRunTurnExecutionMismatch { .. }
             | Self::TaskRunTurnMissingTurn { .. }
             | Self::AcceptedCandidateMissingTurn { .. }
             | Self::SucceededRunMissingAcceptedCandidate { .. }
             | Self::AcceptedCandidateMissingResult { .. }
             | Self::AcceptedCandidateMissingFinalReviewEvent { .. }
-            | Self::MultipleAcceptedCandidatesForRun { .. } => TaskRuntimeInvariantSeverity::Error,
+            | Self::MultipleAcceptedCandidatesForRun { .. }
+            | Self::TaskResultCandidateTurnMismatch { .. }
+            | Self::TaskResultCandidatePrimaryBindingMismatch { .. }
+            | Self::TaskResultCandidateRoundMismatch { .. }
+            | Self::ReviewEventMissingCandidate { .. }
+            | Self::ReviewEventMissingTaskRunTurn { .. }
+            | Self::FinalReviewEventDecisionMismatch { .. }
+            | Self::DuplicateTaskRunTurnSequence { .. }
+            | Self::NonContiguousTaskRunTurnSequence { .. }
+            | Self::DuplicateCandidateProducingRound { .. }
+            | Self::NonContiguousCandidateProducingRound { .. } => {
+                TaskRuntimeInvariantSeverity::Error
+            }
         }
     }
 
@@ -260,17 +414,31 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::MissingPrimaryExecutorBinding { task_id, .. }
             | Self::PrimaryExecutorBindingMissingLineage { task_id, .. }
             | Self::PrimaryExecutorBindingMissingExecution { task_id, .. }
+            | Self::PrimaryExecutorBindingLineageMismatch { task_id, .. }
+            | Self::PrimaryExecutorBindingExecutionMismatch { task_id, .. }
             | Self::MultiplePrimaryExecutorBindingsForRun { task_id, .. }
             | Self::LineageChildTurnMissingTurn { task_id, .. }
             | Self::ExecutionChildTurnMissingTurn { task_id, .. }
             | Self::LineageMissingTaskRunTurn { task_id, .. }
+            | Self::TaskRunTurnLineageMismatch { task_id, .. }
             | Self::ExecutionMissingTaskRunTurn { task_id, .. }
+            | Self::TaskRunTurnExecutionMismatch { task_id, .. }
             | Self::TaskRunTurnMissingTurn { task_id, .. }
             | Self::AcceptedCandidateMissingTurn { task_id, .. }
             | Self::SucceededRunMissingAcceptedCandidate { task_id, .. }
             | Self::AcceptedCandidateMissingResult { task_id, .. }
             | Self::AcceptedCandidateMissingFinalReviewEvent { task_id, .. }
-            | Self::MultipleAcceptedCandidatesForRun { task_id, .. } => task_id.as_str(),
+            | Self::MultipleAcceptedCandidatesForRun { task_id, .. }
+            | Self::TaskResultCandidateTurnMismatch { task_id, .. }
+            | Self::TaskResultCandidatePrimaryBindingMismatch { task_id, .. }
+            | Self::TaskResultCandidateRoundMismatch { task_id, .. }
+            | Self::ReviewEventMissingCandidate { task_id, .. }
+            | Self::ReviewEventMissingTaskRunTurn { task_id, .. }
+            | Self::FinalReviewEventDecisionMismatch { task_id, .. }
+            | Self::DuplicateTaskRunTurnSequence { task_id, .. }
+            | Self::NonContiguousTaskRunTurnSequence { task_id, .. }
+            | Self::DuplicateCandidateProducingRound { task_id, .. }
+            | Self::NonContiguousCandidateProducingRound { task_id, .. } => task_id.as_str(),
             Self::StaleInProgressTurn { turn_id, .. } => turn_id.as_str(),
             Self::StaleTurnItemAttempt { item_id, .. } => item_id.as_str(),
         }
@@ -1208,20 +1376,20 @@ mod tests {
         .await;
         execute(
             &db,
-            "insert into task_run_turn(id, task_id, run_id, turn_id, created_at)
-             values ('task_run_turn_review_clean', 'task_review_clean', 'run_review_clean', 'child_turn_review_clean', '2026-05-15 00:00:00')",
+            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
+             values ('task_run_turn_review_clean', 'task_review_clean', 'run_review_clean', 'execution_review_clean', 'child_thread_review_clean', 'child_turn_review_clean', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
         )
         .await;
         execute(
             &db,
-            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, status, result_json, final_review_event_id, created_at)
-             values ('candidate_review_clean', 'task_review_clean', 'run_review_clean', 'task_run_turn_review_clean', 'accepted', '{\"summary\":\"ok\"}', 'review_event_clean', '2026-05-15 00:00:00')",
+            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, final_review_event_id, created_at)
+             values ('candidate_review_clean', 'task_review_clean', 'run_review_clean', 'task_run_turn_review_clean', 'child_thread_review_clean', 'child_turn_review_clean', 0, 'accepted', '{\"summary\":\"ok\"}', 'review_event_clean', '2026-05-15 00:00:00')",
         )
         .await;
         execute(
             &db,
-            "insert into task_result_review_event(id, candidate_id)
-             values ('review_event_clean', 'candidate_review_clean')",
+            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, decision, created_at)
+             values ('review_event_clean', 'candidate_review_clean', 'task_review_clean', 'run_review_clean', 'task_run_turn_review_clean', 'accept', '2026-05-15 00:00:00')",
         )
         .await;
 
@@ -1265,6 +1433,18 @@ mod tests {
         .await;
         execute(
             &db,
+            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
+             values ('child_thread_binding_expected', 'child_turn_binding_expected', 'parent_thread', 'parent_turn', 'task_review_binding_mismatch', 'run_review_binding_mismatch', 'root_thread', 1, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
+             values ('binding_lineage_mismatch', 'task_review_binding_mismatch', 'run_review_binding_mismatch', 'execution_binding_mismatch', 'child_thread_binding_actual', 'primary_executor', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
             "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
              values ('execution_missing_binding', 'task_review_execution_missing_binding', 'run_review_execution_missing_binding', 'agent', 'succeeded', 'child_thread_execution_missing_binding', 'child_turn_execution_missing_binding', '2026-05-15 00:00:00')",
         )
@@ -1301,6 +1481,30 @@ mod tests {
         .await;
         execute(
             &db,
+            "insert into thread_lineage(child_thread_id, child_turn_id, parent_thread_id, parent_turn_id, task_id, task_run_id, root_thread_id, depth, created_at)
+             values ('child_thread_turn_expected', 'child_turn_turn_mismatch', 'parent_thread', 'parent_turn', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'root_thread', 1, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into turn(id, thread_id, status, updated_at)
+             values ('child_turn_turn_mismatch', 'child_thread_turn_expected', 'completed', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
+             values ('binding_turn_mismatch', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'execution_turn_mismatch', 'child_thread_turn_expected', 'primary_executor', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
+             values ('task_run_turn_lineage_mismatch', 'task_review_turn_mismatch', 'run_review_turn_mismatch', 'execution_turn_mismatch', 'child_thread_turn_actual', 'child_turn_turn_mismatch', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
             "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
              values ('execution_no_trt', 'task_review_execution_no_trt', 'run_review_execution_no_trt', 'agent', 'succeeded', 'child_thread_execution_no_trt', 'child_turn_execution_no_trt', '2026-05-15 00:00:00')",
         )
@@ -1315,6 +1519,30 @@ mod tests {
             &db,
             "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
              values ('binding_execution_no_trt', 'task_review_execution_no_trt', 'run_review_execution_no_trt', 'execution_no_trt', 'child_thread_execution_no_trt', 'primary_executor', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_execution(id, task_id, task_run_id, executor_kind, status, child_thread_id, child_turn_id, created_at)
+             values ('execution_target_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'agent', 'succeeded', 'child_thread_execution_expected', 'child_turn_execution_mismatch', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into turn(id, thread_id, status, updated_at)
+             values ('child_turn_execution_mismatch', 'child_thread_execution_expected', 'completed', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
+             values ('binding_execution_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'execution_target_mismatch_wrong', 'child_thread_execution_actual', 'primary_executor', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, execution_id, thread_id, turn_id, kind, round, sequence, status, created_at)
+             values ('task_run_turn_execution_mismatch', 'task_review_execution_mismatch', 'run_review_execution_mismatch', 'execution_target_mismatch_wrong', 'child_thread_execution_actual', 'child_turn_execution_mismatch', 'initial', 0, 0, 'candidate_created', '2026-05-15 00:00:00')",
         )
         .await;
         execute(
@@ -1383,6 +1611,78 @@ mod tests {
              values ('review_missing_result', 'candidate_missing_result')",
         )
         .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_candidate_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'thread_candidate_expected', 'turn_candidate_expected', 'initial', 1, 10, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_thread_binding(id, task_id, run_id, execution_id, thread_id, binding_kind, created_at)
+             values ('binding_candidate_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'execution_candidate_mismatch', 'thread_candidate_expected', 'primary_executor', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, created_at)
+             values ('candidate_turn_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'task_run_turn_candidate_mismatch', 'thread_candidate_actual', 'turn_candidate_actual', 2, 'pending_review', '{\"summary\":\"mismatch\"}', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, created_at)
+             values ('review_missing_candidate', 'candidate_does_not_exist', 'task_review_missing_review_candidate', 'run_review_missing_review_candidate', null, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, created_at)
+             values ('review_missing_task_run_turn', 'candidate_turn_mismatch', 'task_review_candidate_mismatch', 'run_review_candidate_mismatch', 'task_run_turn_does_not_exist', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'thread_decision_mismatch', 'turn_decision_mismatch', 'initial', 0, 0, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_result_candidate(id, task_id, run_id, task_run_turn_id, thread_id, turn_id, round, status, result_json, final_review_event_id, created_at)
+             values ('candidate_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'task_run_turn_decision_mismatch', 'thread_decision_mismatch', 'turn_decision_mismatch', 0, 'accepted', '{\"summary\":\"accepted\"}', 'review_decision_mismatch', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_result_review_event(id, candidate_id, task_id, run_id, task_run_turn_id, decision, created_at)
+             values ('review_decision_mismatch', 'candidate_decision_mismatch', 'task_review_decision_mismatch', 'run_review_decision_mismatch', 'task_run_turn_decision_mismatch', 'reject', '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_duplicate_sequence_one', 'task_review_duplicate_sequence', 'run_review_duplicate_sequence', 'thread_duplicate_sequence', 'turn_duplicate_sequence_one', 'review', 0, 7, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_duplicate_sequence_two', 'task_review_duplicate_sequence', 'run_review_duplicate_sequence', 'thread_duplicate_sequence', 'turn_duplicate_sequence_two', 'review', 0, 7, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_duplicate_round_one', 'task_review_duplicate_round', 'run_review_duplicate_round', 'thread_duplicate_round', 'turn_duplicate_round_one', 'initial', 3, 30, '2026-05-15 00:00:00')",
+        )
+        .await;
+        execute(
+            &db,
+            "insert into task_run_turn(id, task_id, run_id, thread_id, turn_id, kind, round, sequence, created_at)
+             values ('task_run_turn_duplicate_round_two', 'task_review_duplicate_round', 'run_review_duplicate_round', 'thread_duplicate_round', 'turn_duplicate_round_two', 'revision', 3, 31, '2026-05-15 00:00:00')",
+        )
+        .await;
 
         let report = TaskRuntimeInvariantScanner::new()
             .scan_connection(&db, 2_000_000_000)
@@ -1415,6 +1715,14 @@ mod tests {
             "{report}"
         );
         assert!(
+            codes.contains(&"primary_executor_binding_lineage_mismatch"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"primary_executor_binding_execution_mismatch"),
+            "{report}"
+        );
+        assert!(
             codes.contains(&"multiple_primary_executor_bindings_for_run"),
             "{report}"
         );
@@ -1428,7 +1736,15 @@ mod tests {
         );
         assert!(codes.contains(&"lineage_missing_task_run_turn"), "{report}");
         assert!(
+            codes.contains(&"task_run_turn_lineage_mismatch"),
+            "{report}"
+        );
+        assert!(
             codes.contains(&"execution_missing_task_run_turn"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"task_run_turn_execution_mismatch"),
             "{report}"
         );
         assert!(codes.contains(&"task_run_turn_missing_turn"), "{report}");
@@ -1450,6 +1766,46 @@ mod tests {
         );
         assert!(
             codes.contains(&"multiple_accepted_candidates_for_run"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"task_result_candidate_turn_mismatch"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"task_result_candidate_primary_binding_mismatch"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"task_result_candidate_round_mismatch"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"review_event_missing_candidate"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"review_event_missing_task_run_turn"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"final_review_event_decision_mismatch"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"duplicate_task_run_turn_sequence"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"non_contiguous_task_run_turn_sequence"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"duplicate_candidate_producing_round"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(&"non_contiguous_candidate_producing_round"),
             "{report}"
         );
     }
@@ -1640,9 +1996,9 @@ mod tests {
     async fn create_task_review_migration_scanner_schema<C: ConnectionTrait>(db: &C) {
         for statement in [
             "create table task_run_thread_binding(id text primary key, task_id text not null, run_id text not null, execution_id text, thread_id text not null, binding_kind text not null, created_at text not null)",
-            "create table task_run_turn(id text primary key, task_id text not null, run_id text not null, turn_id text not null, created_at text not null)",
-            "create table task_result_candidate(id text primary key, task_id text not null, run_id text not null, task_run_turn_id text not null, status text not null, result_json text, final_review_event_id text, created_at text not null)",
-            "create table task_result_review_event(id text primary key, candidate_id text not null)",
+            "create table task_run_turn(id text primary key, task_id text not null, run_id text not null, execution_id text, thread_id text, turn_id text not null, kind text, round integer, sequence integer, status text, reviews_candidate_id text, requested_by_candidate_id text, requested_by_review_event_id text, created_at text not null, started_at text, completed_at text)",
+            "create table task_result_candidate(id text primary key, task_id text not null, run_id text not null, task_run_turn_id text not null, thread_id text, turn_id text, round integer, status text not null, result_json text, extraction_error_json text, summary text, diagnostics_json text, final_review_event_id text, created_at text not null, updated_at text, resolved_at text)",
+            "create table task_result_review_event(id text primary key, candidate_id text not null, task_id text, run_id text, task_run_turn_id text, reviewer_kind text, reviewer_thread_id text, reviewer_turn_id text, reviewer_user_id text, reviewer_agent_spec_id text, event_kind text, decision text, feedback_text text, feedback_json text, confidence real, supersedes_review_event_id text, next_task_run_turn_id text, created_at text)",
         ] {
             execute(db, statement).await;
         }

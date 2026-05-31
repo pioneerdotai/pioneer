@@ -418,6 +418,16 @@ impl TaskEventPayload {
             | Self::TaskResumed { .. }
             | Self::TaskRecovered { .. }
             | Self::ChildThreadLinked { .. }
+            | Self::TaskRunThreadBindingCreated { .. }
+            | Self::TaskRunTurnStarted { .. }
+            | Self::TaskRunTurnCompleted { .. }
+            | Self::TaskRunTurnFailed { .. }
+            | Self::TaskResultCandidateCreated { .. }
+            | Self::TaskResultReviewEventRecorded { .. }
+            | Self::TaskResultCandidateAccepted { .. }
+            | Self::TaskResultCandidateRejected { .. }
+            | Self::TaskRevisionRequested { .. }
+            | Self::TaskRunEnteredReview { .. }
             | Self::DepthLimitExceeded { .. }
             | Self::DeliveryQueued { .. }
             | Self::DeliveryStarted { .. }

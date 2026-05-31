@@ -290,6 +290,74 @@ impl TaskRunExecutionStatus {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskRunThreadBindingKind {
+    PrimaryExecutor,
+    Reviewer,
+    Recovery,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunTurnKind {
+    Initial,
+    Revision,
+    Recovery,
+    Review,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunTurnStatus {
+    InProgress,
+    CandidateCreated,
+    ReviewRecorded,
+    Failed,
+    Interrupted,
+    Cancelled,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultCandidateStatus {
+    PendingReview,
+    Accepted,
+    Rejected,
+    Superseded,
+    ExtractionFailed,
+    Cancelled,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultReviewerKind {
+    RuntimeAuto,
+    ParentAgent,
+    ReviewAgent,
+    User,
+    System,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultReviewEventKind {
+    Advisory,
+    Decision,
+    Override,
+    SystemAuto,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultReviewDecision {
+    Accept,
+    RequestChanges,
+    Reject,
+    Abstain,
+    Cancel,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskOwnerKind {
     User,
     Thread,
@@ -902,6 +970,105 @@ pub struct TaskRunExecution {
     pub updated_at: i64,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunThreadBinding {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    pub thread_id: String,
+    pub binding_kind: TaskRunThreadBindingKind,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunTurn {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub kind: TaskRunTurnKind,
+    pub round: u32,
+    pub sequence: u32,
+    pub status: TaskRunTurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews_candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_review_event_id: Option<String>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResultCandidate {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub task_run_turn_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub round: u32,
+    pub status: TaskResultCandidateStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_error: Option<TaskError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_review_event_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResultReviewEvent {
+    pub id: String,
+    pub candidate_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub task_run_turn_id: String,
+    pub reviewer_kind: TaskResultReviewerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_agent_spec_id: Option<String>,
+    pub event_kind: TaskResultReviewEventKind,
+    pub decision: TaskResultReviewDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<TaskValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_review_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_task_run_turn_id: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskAgentSpec {
@@ -1131,6 +1298,52 @@ pub enum TaskEventPayload {
     ChildThreadLinked {
         lineage: ThreadLineage,
     },
+    TaskRunThreadBindingCreated {
+        binding: TaskRunThreadBinding,
+    },
+    TaskRunTurnStarted {
+        task_run_turn: TaskRunTurn,
+    },
+    TaskRunTurnCompleted {
+        task_run_turn: TaskRunTurn,
+    },
+    TaskRunTurnFailed {
+        task_run_turn: TaskRunTurn,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TaskError>,
+    },
+    TaskResultCandidateCreated {
+        candidate: TaskResultCandidate,
+    },
+    TaskResultReviewEventRecorded {
+        review_event: TaskResultReviewEvent,
+    },
+    TaskResultCandidateAccepted {
+        candidate: TaskResultCandidate,
+        review_event_id: String,
+    },
+    TaskResultCandidateRejected {
+        candidate: TaskResultCandidate,
+        review_event_id: String,
+    },
+    TaskRevisionRequested {
+        task_id: String,
+        run_id: String,
+        previous_candidate_id: String,
+        requested_by_review_event_id: String,
+        task_run_turn_id: String,
+        thread_id: String,
+        turn_id: String,
+        round: u32,
+        feedback: String,
+        requested_at: i64,
+    },
+    TaskRunEnteredReview {
+        task_id: String,
+        run_id: String,
+        candidate_id: String,
+        entered_at: i64,
+    },
     DepthLimitExceeded {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1214,6 +1427,16 @@ impl TaskEventPayload {
             Self::RunCreated { run, .. } => run.task_id.as_str(),
             Self::TaskDetached { task, .. } => task.id.as_str(),
             Self::ChildThreadLinked { lineage } => lineage.task_id.as_str(),
+            Self::TaskRunThreadBindingCreated { binding } => binding.task_id.as_str(),
+            Self::TaskRunTurnStarted { task_run_turn }
+            | Self::TaskRunTurnCompleted { task_run_turn }
+            | Self::TaskRunTurnFailed { task_run_turn, .. } => task_run_turn.task_id.as_str(),
+            Self::TaskResultCandidateCreated { candidate }
+            | Self::TaskResultCandidateAccepted { candidate, .. }
+            | Self::TaskResultCandidateRejected { candidate, .. } => candidate.task_id.as_str(),
+            Self::TaskResultReviewEventRecorded { review_event } => review_event.task_id.as_str(),
+            Self::TaskRevisionRequested { task_id, .. }
+            | Self::TaskRunEnteredReview { task_id, .. } => task_id.as_str(),
         }
     }
 
@@ -1244,6 +1467,20 @@ impl TaskEventPayload {
             | Self::TaskCancelled { .. }
             | Self::TaskDetached { .. } => None,
             Self::ChildThreadLinked { lineage } => Some(lineage.task_run_id.as_str()),
+            Self::TaskRunThreadBindingCreated { binding } => Some(binding.run_id.as_str()),
+            Self::TaskRunTurnStarted { task_run_turn }
+            | Self::TaskRunTurnCompleted { task_run_turn }
+            | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.run_id.as_str()),
+            Self::TaskResultCandidateCreated { candidate }
+            | Self::TaskResultCandidateAccepted { candidate, .. }
+            | Self::TaskResultCandidateRejected { candidate, .. } => {
+                Some(candidate.run_id.as_str())
+            }
+            Self::TaskResultReviewEventRecorded { review_event } => {
+                Some(review_event.run_id.as_str())
+            }
+            Self::TaskRevisionRequested { run_id, .. }
+            | Self::TaskRunEnteredReview { run_id, .. } => Some(run_id.as_str()),
             Self::DeliveryQueued { delivery }
             | Self::DeliveryStarted { delivery, .. }
             | Self::DeliveryDelivered { delivery, .. }
@@ -1259,6 +1496,21 @@ impl TaskEventPayload {
     pub fn thread_id(&self) -> Option<&str> {
         match self {
             Self::ChildThreadLinked { lineage } => Some(lineage.child_thread_id.as_str()),
+            Self::TaskRunThreadBindingCreated { binding } => Some(binding.thread_id.as_str()),
+            Self::TaskRunTurnStarted { task_run_turn }
+            | Self::TaskRunTurnCompleted { task_run_turn }
+            | Self::TaskRunTurnFailed { task_run_turn, .. } => {
+                Some(task_run_turn.thread_id.as_str())
+            }
+            Self::TaskResultCandidateCreated { candidate }
+            | Self::TaskResultCandidateAccepted { candidate, .. }
+            | Self::TaskResultCandidateRejected { candidate, .. } => {
+                Some(candidate.thread_id.as_str())
+            }
+            Self::TaskResultReviewEventRecorded { review_event } => {
+                review_event.reviewer_thread_id.as_deref()
+            }
+            Self::TaskRevisionRequested { thread_id, .. } => Some(thread_id.as_str()),
             Self::DeliveryQueued { delivery }
             | Self::DeliveryStarted { delivery, .. }
             | Self::DeliveryDelivered { delivery, .. }
@@ -1271,6 +1523,18 @@ impl TaskEventPayload {
     pub fn turn_id(&self) -> Option<&str> {
         match self {
             Self::ChildThreadLinked { lineage } => Some(lineage.child_turn_id.as_str()),
+            Self::TaskRunTurnStarted { task_run_turn }
+            | Self::TaskRunTurnCompleted { task_run_turn }
+            | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.turn_id.as_str()),
+            Self::TaskResultCandidateCreated { candidate }
+            | Self::TaskResultCandidateAccepted { candidate, .. }
+            | Self::TaskResultCandidateRejected { candidate, .. } => {
+                Some(candidate.turn_id.as_str())
+            }
+            Self::TaskResultReviewEventRecorded { review_event } => {
+                review_event.reviewer_turn_id.as_deref()
+            }
+            Self::TaskRevisionRequested { turn_id, .. } => Some(turn_id.as_str()),
             _ => None,
         }
     }
@@ -1304,6 +1568,16 @@ impl TaskEventPayload {
             Self::TaskResumed { .. } => events::TASK_RESUMED,
             Self::TaskRecovered { .. } => events::TASK_RECOVERED,
             Self::ChildThreadLinked { .. } => events::TASK_TREE_CHANGED,
+            Self::TaskRunThreadBindingCreated { .. } => events::TASK_RUN_THREAD_BINDING_CREATED,
+            Self::TaskRunTurnStarted { .. } => events::TASK_RUN_TURN_STARTED,
+            Self::TaskRunTurnCompleted { .. } => events::TASK_RUN_TURN_COMPLETED,
+            Self::TaskRunTurnFailed { .. } => events::TASK_RUN_TURN_FAILED,
+            Self::TaskResultCandidateCreated { .. } => events::TASK_RESULT_CANDIDATE_CREATED,
+            Self::TaskResultReviewEventRecorded { .. } => events::TASK_RESULT_REVIEW_EVENT_RECORDED,
+            Self::TaskResultCandidateAccepted { .. } => events::TASK_RESULT_CANDIDATE_ACCEPTED,
+            Self::TaskResultCandidateRejected { .. } => events::TASK_RESULT_CANDIDATE_REJECTED,
+            Self::TaskRevisionRequested { .. } => events::TASK_REVISION_REQUESTED,
+            Self::TaskRunEnteredReview { .. } => events::TASK_RUN_ENTERED_REVIEW,
             Self::DepthLimitExceeded { .. } => events::TASK_FAILED,
             Self::DeliveryQueued { .. } => events::TASK_DELIVERY_QUEUED,
             Self::DeliveryStarted { .. } => events::TASK_DELIVERY_STARTED,
@@ -1385,6 +1659,53 @@ impl TaskEventPayload {
             Self::ChildThreadLinked { lineage } => {
                 Some(format!("run:{}:child_thread_linked", lineage.task_run_id))
             }
+            Self::TaskRunThreadBindingCreated { binding } => Some(format!(
+                "run:{}:thread:{}:binding:{}",
+                binding.run_id,
+                binding.thread_id,
+                serde_json::to_value(binding.binding_kind)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned())
+            )),
+            Self::TaskRunTurnStarted { task_run_turn } => Some(format!(
+                "run:{}:turn:{}:started",
+                task_run_turn.run_id, task_run_turn.turn_id
+            )),
+            Self::TaskRunTurnCompleted { task_run_turn } => Some(format!(
+                "run:{}:turn:{}:completed",
+                task_run_turn.run_id, task_run_turn.turn_id
+            )),
+            Self::TaskRunTurnFailed { task_run_turn, .. } => Some(format!(
+                "run:{}:turn:{}:failed",
+                task_run_turn.run_id, task_run_turn.turn_id
+            )),
+            Self::TaskResultCandidateCreated { candidate } => Some(format!(
+                "run:{}:candidate:{}:created",
+                candidate.run_id, candidate.turn_id
+            )),
+            Self::TaskResultReviewEventRecorded { review_event } => Some(format!(
+                "run:{}:candidate:{}:review:{}",
+                review_event.run_id, review_event.candidate_id, review_event.id
+            )),
+            Self::TaskResultCandidateAccepted { candidate, .. } => Some(format!(
+                "run:{}:candidate:{}:accepted",
+                candidate.run_id, candidate.id
+            )),
+            Self::TaskResultCandidateRejected { candidate, .. } => Some(format!(
+                "run:{}:candidate:{}:rejected",
+                candidate.run_id, candidate.id
+            )),
+            Self::TaskRevisionRequested {
+                run_id, turn_id, ..
+            } => Some(format!("run:{run_id}:revision:{turn_id}:requested")),
+            Self::TaskRunEnteredReview {
+                run_id,
+                candidate_id,
+                ..
+            } => Some(format!(
+                "run:{run_id}:candidate:{candidate_id}:entered_review"
+            )),
             Self::DepthLimitExceeded {
                 task_id,
                 run_id,

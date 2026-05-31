@@ -148,6 +148,16 @@ pub mod events {
     pub const TASK_RECOVERED: &str = "task/recovered";
     pub const TASK_PAUSED: &str = "task/paused";
     pub const TASK_RESUMED: &str = "task/resumed";
+    pub const TASK_RUN_THREAD_BINDING_CREATED: &str = "task/run/thread_binding/created";
+    pub const TASK_RUN_TURN_STARTED: &str = "task/run/turn/started";
+    pub const TASK_RUN_TURN_COMPLETED: &str = "task/run/turn/completed";
+    pub const TASK_RUN_TURN_FAILED: &str = "task/run/turn/failed";
+    pub const TASK_RESULT_CANDIDATE_CREATED: &str = "task/result_candidate/created";
+    pub const TASK_RESULT_REVIEW_EVENT_RECORDED: &str = "task/result_review_event/recorded";
+    pub const TASK_RESULT_CANDIDATE_ACCEPTED: &str = "task/result_candidate/accepted";
+    pub const TASK_RESULT_CANDIDATE_REJECTED: &str = "task/result_candidate/rejected";
+    pub const TASK_REVISION_REQUESTED: &str = "task/revision/requested";
+    pub const TASK_RUN_ENTERED_REVIEW: &str = "task/run/entered_review";
     pub const TASK_DELIVERY_QUEUED: &str = "task/delivery/queued";
     pub const TASK_DELIVERY_STARTED: &str = "task/delivery/started";
     pub const TASK_DELIVERY_DELIVERED: &str = "task/delivery/delivered";

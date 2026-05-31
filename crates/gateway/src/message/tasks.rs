@@ -422,6 +422,16 @@ impl MessageProcessor {
             }
             TaskEventPayload::DependencyCreated { .. }
             | TaskEventPayload::AgentSpecCreated { .. }
+            | TaskEventPayload::TaskRunThreadBindingCreated { .. }
+            | TaskEventPayload::TaskRunTurnStarted { .. }
+            | TaskEventPayload::TaskRunTurnCompleted { .. }
+            | TaskEventPayload::TaskRunTurnFailed { .. }
+            | TaskEventPayload::TaskResultCandidateCreated { .. }
+            | TaskEventPayload::TaskResultReviewEventRecorded { .. }
+            | TaskEventPayload::TaskResultCandidateAccepted { .. }
+            | TaskEventPayload::TaskResultCandidateRejected { .. }
+            | TaskEventPayload::TaskRevisionRequested { .. }
+            | TaskEventPayload::TaskRunEnteredReview { .. }
             | TaskEventPayload::DepthLimitExceeded { .. } => {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
@@ -816,12 +826,8 @@ async fn task_delivery_child_lineage(
     store: &std::sync::Arc<pioneer_crud::CrudStore>,
     run_id: &str,
 ) -> (Option<String>, Option<String>) {
-    match store.list_thread_lineage_for_run(run_id).await {
-        Ok(lineage) => lineage
-            .into_iter()
-            .last()
-            .map(|lineage| (Some(lineage.child_thread_id), Some(lineage.child_turn_id)))
-            .unwrap_or((None, None)),
+    match store.get_task_run_child_anchor(run_id).await {
+        Ok(anchor) => (anchor.child_thread_id, anchor.child_turn_id),
         Err(error) => {
             warn!(
                 run_id,

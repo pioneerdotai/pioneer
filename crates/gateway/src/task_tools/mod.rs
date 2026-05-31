@@ -192,15 +192,13 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 .map_err(|error| format!("{error:#}"))?
                 .ok_or_else(|| format!("task `{}` disappeared", task.id))?;
             let run = response.runs.last();
-            let lineage = match run {
+            let child_anchor = match run {
                 Some(run) => processor
                     .crud_store
-                    .list_thread_lineage_for_run(run.id.as_str())
+                    .get_task_run_child_anchor(run.id.as_str())
                     .await
-                    .map_err(|error| format!("{error:#}"))?
-                    .into_iter()
-                    .last(),
-                None => None,
+                    .map_err(|error| format!("{error:#}"))?,
+                None => Default::default(),
             };
             observations.push(TerminalTaskObservation {
                 task_id: response.task.id.clone(),
@@ -227,12 +225,8 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                             .as_ref()
                             .map(|error| error.message.clone())
                     }),
-                child_thread_id: lineage
-                    .as_ref()
-                    .map(|lineage| lineage.child_thread_id.clone()),
-                child_turn_id: lineage
-                    .as_ref()
-                    .map(|lineage| lineage.child_turn_id.clone()),
+                child_thread_id: child_anchor.child_thread_id,
+                child_turn_id: child_anchor.child_turn_id,
             });
         }
         Ok(observations)
@@ -2783,14 +2777,14 @@ async fn task_turn_item_from_response_with_run(
         })
         .or_else(|| response.triggers.last());
     let agent_spec = select_anchor_agent_spec(response, run);
-    let lineage = match run {
-        Some(run) => processor
-            .crud_store
-            .list_thread_lineage_for_run(run.id.as_str())
-            .await?
-            .into_iter()
-            .last(),
-        None => None,
+    let child_anchor = match run {
+        Some(run) => {
+            processor
+                .crud_store
+                .get_task_run_child_anchor(run.id.as_str())
+                .await?
+        }
+        None => Default::default(),
     };
     Ok(TaskTurnItem {
         id: item_id,
@@ -2804,12 +2798,8 @@ async fn task_turn_item_from_response_with_run(
             .map(TaskTrigger::kind)
             .unwrap_or(TaskTriggerKind::Manual),
         executor_kind: task.executor_kind,
-        child_thread_id: lineage
-            .as_ref()
-            .map(|lineage| lineage.child_thread_id.clone()),
-        child_turn_id: lineage
-            .as_ref()
-            .map(|lineage| lineage.child_turn_id.clone()),
+        child_thread_id: child_anchor.child_thread_id,
+        child_turn_id: child_anchor.child_turn_id,
         agent_role: agent_spec.and_then(|spec| spec.agent_role.clone()),
         depth: agent_spec.map(|spec| spec.depth).unwrap_or(0),
         max_depth: agent_spec
