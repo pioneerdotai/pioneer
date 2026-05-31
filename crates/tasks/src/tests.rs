@@ -1001,6 +1001,8 @@ async fn one_task_run_can_link_only_one_child_thread() {
     assert!(
         format!("{error:#}").contains("thread lineage")
             || format!("{error:#}").contains("UNIQUE")
+            || format!("{error:#}").contains("constraint failed")
+            || format!("{error:#}").contains("already exists")
             || format!("{error:#}").contains("reserved task run execution")
     );
 }

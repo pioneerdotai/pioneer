@@ -7,8 +7,9 @@ use pioneer_crud::CrudStore;
 use pioneer_protocol::{
     TaskCompletionBehavior, TaskDeliveriesParams, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskProgressDetails,
-    TaskResult, TaskRetryBackoffKind, TaskRun, TaskRunExecution, TaskRunExecutionStatus,
-    TaskRunStatus, TaskWriteLockStatus, ThreadLineage, generate_id,
+    TaskResult, TaskResultCandidate, TaskResultReviewEvent, TaskRetryBackoffKind, TaskRun,
+    TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunTurn,
+    TaskWriteLockStatus, ThreadLineage, generate_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -64,27 +65,69 @@ impl TaskExecutionHandle {
         lineage: ThreadLineage,
         event_timestamp_secs: i64,
     ) -> TaskRuntimeResult<()> {
-        let Some(execution) = self
-            .store
-            .load_execution_for_run(self.run_id.as_str())
-            .await?
-        else {
-            bail!(
-                "cannot link child thread for task run `{}` without task run execution",
-                self.run_id
-            );
-        };
-        if execution.child_thread_id.as_deref() != Some(lineage.child_thread_id.as_str())
-            || execution.child_turn_id.as_deref() != Some(lineage.child_turn_id.as_str())
-        {
-            bail!(
-                "child lineage for task run `{}` does not match reserved task run execution `{}`",
-                self.run_id,
-                execution.id
-            );
-        }
+        self.ensure_execution_exists_for_child_runtime().await?;
         self.append_and_publish(
             vec![TaskEventPayload::ChildThreadLinked { lineage }],
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn link_child_thread_with_runtime(
+        &self,
+        lineage: ThreadLineage,
+        binding: TaskRunThreadBinding,
+        task_run_turn: TaskRunTurn,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.ensure_execution_exists_for_child_runtime().await?;
+        self.append_and_publish(
+            vec![
+                TaskEventPayload::ChildThreadLinked { lineage },
+                TaskEventPayload::TaskRunThreadBindingCreated { binding },
+                TaskEventPayload::TaskRunTurnStarted { task_run_turn },
+            ],
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn record_task_run_turn_failed(
+        &self,
+        task_run_turn: TaskRunTurn,
+        error: Option<TaskError>,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.append_and_publish(
+            vec![TaskEventPayload::TaskRunTurnFailed {
+                task_run_turn,
+                error,
+            }],
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn record_auto_accepted_result_candidate(
+        &self,
+        task_run_turn: TaskRunTurn,
+        candidate: TaskResultCandidate,
+        review_event: TaskResultReviewEvent,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        let review_event_id = review_event.id.clone();
+        self.append_and_publish(
+            vec![
+                TaskEventPayload::TaskRunTurnCompleted { task_run_turn },
+                TaskEventPayload::TaskResultCandidateCreated {
+                    candidate: candidate.clone(),
+                },
+                TaskEventPayload::TaskResultReviewEventRecorded { review_event },
+                TaskEventPayload::TaskResultCandidateAccepted {
+                    candidate,
+                    review_event_id,
+                },
+            ],
             event_timestamp_secs,
         )
         .await
@@ -325,6 +368,21 @@ impl TaskExecutionHandle {
         self.store
             .load_execution_for_run(self.run_id.as_str())
             .await
+    }
+
+    async fn ensure_execution_exists_for_child_runtime(&self) -> TaskRuntimeResult<()> {
+        if self
+            .store
+            .load_execution_for_run(self.run_id.as_str())
+            .await?
+            .is_none()
+        {
+            bail!(
+                "cannot record child runtime for task run `{}` without task run execution",
+                self.run_id
+            );
+        }
+        Ok(())
     }
 
     async fn append_and_publish(

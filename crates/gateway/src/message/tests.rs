@@ -50,27 +50,29 @@ use pioneer_protocol::{
     SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
     SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
     SkillsUploadStartResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentSpecInput,
-    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
-    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResumeResponse,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskRun, TaskTriggerInput, TaskTriggerSpec,
-    TaskTriggerStatus, TaskValue, TaskWaitParams, Thread, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
-    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
-    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
-    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
+    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
+    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
+    TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
+    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
+    TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskTriggerInput,
+    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
+    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
+    TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
+    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
+    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
+    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -3683,18 +3685,32 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
     processor.bind_task_bridge().await;
 
     let child_title = "Summarize child result";
-    let response = create_task_for_test(
-        &processor,
-        test_task_create_params(
-            workspace_id.as_str(),
-            "thr_parent_task_test",
-            "turn_parent_task_test",
-            child_title,
-            3,
-        ),
-    )
-    .await
-    .expect("task_create should start immediate child task");
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_parent_task_test",
+        "turn_parent_task_test",
+        child_title,
+        3,
+    );
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::OwnerThread,
+        thread_id: None,
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::Summary,
+    });
+    if let Some(agent_spec) = params.agent_spec.as_mut() {
+        agent_spec.tool_policy = Some(TaskAgentToolPolicy {
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            write_mode: TaskAgentWriteMode::ScopedWrite,
+            allowed_paths: vec!["src".to_owned()],
+            network_access: false,
+        });
+    }
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("task_create should start immediate child task");
     let run = response
         .run
         .clone()
@@ -3706,6 +3722,31 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         Some("turn_parent_task_test"),
         "immediate attached subagent should stay under the live parent turn"
     );
+    let binding = crud_store
+        .get_task_run_primary_thread_binding(run.id.as_str())
+        .await
+        .expect("primary task run binding query should succeed")
+        .expect("agent task start should create primary thread binding");
+    assert_eq!(
+        binding.binding_kind,
+        TaskRunThreadBindingKind::PrimaryExecutor
+    );
+    assert_eq!(binding.thread_id, lineage.child_thread_id);
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn query should succeed")
+        .expect("agent task start should create initial task_run_turn");
+    assert_eq!(task_run_turn.kind, TaskRunTurnKind::Initial);
+    assert_eq!(task_run_turn.round, 0);
+    assert_eq!(task_run_turn.sequence, 0);
+    assert!(matches!(
+        task_run_turn.status,
+        TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+    ));
 
     let child_thread = crud_store
         .get_thread_model(lineage.child_thread_id.as_str())
@@ -3760,6 +3801,121 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
             .is_some(),
         "task_wait should return normalized run result"
     );
+    let stored_task = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("completed task should load")
+        .expect("completed task should exist");
+    assert_eq!(
+        stored_task.task.status,
+        pioneer_protocol::TaskStatus::Completed
+    );
+    let stored_run = stored_task
+        .runs
+        .iter()
+        .find(|stored_run| stored_run.id == run.id)
+        .expect("completed run should remain visible");
+    assert_eq!(stored_run.status, TaskRunStatus::Succeeded);
+    assert_ne!(
+        stored_run.status,
+        TaskRunStatus::Waiting,
+        "review-disabled auto-approve must not enter waiting_review/waiting run state"
+    );
+    let write_locks = crud_store
+        .list_task_write_locks_by_run(run.id.as_str())
+        .await
+        .expect("write locks should list");
+    assert!(
+        !write_locks.is_empty(),
+        "scoped-write task should acquire write locks"
+    );
+    assert!(
+        write_locks
+            .iter()
+            .all(|lock| lock.status == TaskWriteLockStatus::Released),
+        "auto-approved completion should release write locks through existing finalization"
+    );
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(response.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("task deliveries should list");
+    assert_eq!(deliveries.deliveries.len(), 1);
+    assert_eq!(deliveries.deliveries[0].status, TaskDeliveryStatus::Pending);
+    assert_eq!(
+        deliveries.deliveries[0]
+            .result_snapshot
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        completed
+            .run
+            .as_ref()
+            .and_then(|run| run.result.as_ref())
+            .and_then(|result| result.summary.as_deref())
+    );
+    let task_run_turns = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should list");
+    assert_eq!(
+        task_run_turns.len(),
+        1,
+        "auto-approved initial run must not create duplicate task_run_turn rows"
+    );
+    assert_eq!(
+        task_run_turns[0].status,
+        TaskRunTurnStatus::CandidateCreated,
+        "completed child turn should become a result candidate source"
+    );
+    let accepted_candidate = crud_store
+        .get_accepted_task_result_candidate(run.id.as_str())
+        .await
+        .expect("accepted candidate query should succeed")
+        .expect("auto-approved child result should create an accepted candidate");
+    assert_eq!(
+        accepted_candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert_eq!(accepted_candidate.task_run_turn_id, task_run_turns[0].id);
+    assert_eq!(accepted_candidate.thread_id, lineage.child_thread_id);
+    assert_eq!(accepted_candidate.turn_id, lineage.child_turn_id);
+    assert_eq!(
+        accepted_candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        completed
+            .run
+            .as_ref()
+            .and_then(|run| run.result.as_ref())
+            .and_then(|result| result.summary.as_deref())
+    );
+    assert!(accepted_candidate.final_review_event_id.is_some());
+    let review_events = crud_store
+        .list_task_result_review_events(accepted_candidate.id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(review_events.len(), 1);
+    assert_eq!(
+        review_events[0].event_kind,
+        TaskResultReviewEventKind::SystemAuto
+    );
+    assert_eq!(
+        review_events[0].reviewer_kind,
+        TaskResultReviewerKind::RuntimeAuto
+    );
+    assert_eq!(review_events[0].decision, TaskResultReviewDecision::Accept);
+    assert_eq!(
+        accepted_candidate.final_review_event_id.as_deref(),
+        Some(review_events[0].id.as_str())
+    );
 
     let task_events = crud_store
         .get_task_events(response.task.id.as_str(), None)
@@ -3772,7 +3928,13 @@ async fn immediate_task_agent_run_creates_child_thread_and_wait_returns_result()
         .collect::<Vec<_>>();
     assert!(event_types.contains(&events::TASK_CREATED));
     assert!(event_types.contains(&events::TASK_RUN_CREATED));
+    assert!(event_types.contains(&events::TASK_RUN_THREAD_BINDING_CREATED));
+    assert!(event_types.contains(&events::TASK_RUN_TURN_STARTED));
     assert!(event_types.contains(&events::TASK_RUN_STARTED));
+    assert!(event_types.contains(&events::TASK_RUN_TURN_COMPLETED));
+    assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_CREATED));
+    assert!(event_types.contains(&events::TASK_RESULT_REVIEW_EVENT_RECORDED));
+    assert!(event_types.contains(&events::TASK_RESULT_CANDIDATE_ACCEPTED));
     assert!(event_types.contains(&events::TASK_RUN_COMPLETED));
     assert!(event_types.contains(&events::TASK_COMPLETED));
 }
@@ -3925,6 +4087,16 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
         .await
         .expect("execution lease should be made stale for startup recovery");
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "update task_run_execution \
+             set child_thread_id = 'stale_exec_thread', child_turn_id = 'stale_exec_turn' \
+             where id = '{}'",
+            execution.id
+        ))
+        .await
+        .expect("legacy execution child ids should be made stale for recovery test");
 
     let recovery_provider = Arc::new(PreflightCaptureProvider::new(
         "recovered hidden child completed",
@@ -3966,6 +4138,25 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .expect("child turn lookup should succeed")
         .expect("child turn should exist");
     assert_eq!(child_turn.status, TurnStatus::Completed);
+    let recovered_task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("recovery should find child turn through target task_run_turn");
+    assert_eq!(recovered_task_run_turn.run_id, run.id);
+    let recovered_execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution reload should succeed")
+        .expect("execution should still exist");
+    assert_ne!(
+        recovered_execution.child_turn_id.as_deref(),
+        Some(lineage.child_turn_id.as_str()),
+        "recovery should not require legacy execution child_turn_id to match target turn"
+    );
 
     let requests = recovery_provider.snapshot_requests();
     let preflight_pos = requests
@@ -3982,6 +4173,90 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
     assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
+    let provider = Arc::new(HangingChildProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_failed_task",
+            "turn_parent_failed_task",
+            "Failed hidden child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        provider.child_main_call_count() > 0,
+        "child provider should be hanging before synthetic failure"
+    );
+
+    processor
+        .mark_turn_failed(
+            lineage.child_thread_id.clone(),
+            lineage.child_turn_id.clone(),
+            "synthetic child failure".to_owned(),
+        )
+        .await;
+
+    wait_for_task_status(
+        crud_store.clone(),
+        response.task.id.as_str(),
+        pioneer_protocol::TaskStatus::Failed,
+    )
+    .await;
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("target task_run_turn should exist");
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::Failed);
+    assert!(
+        crud_store
+            .get_accepted_task_result_candidate(run.id.as_str())
+            .await
+            .expect("accepted candidate lookup should succeed")
+            .is_none(),
+        "failed child turn must not create an accepted candidate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4544,6 +4819,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
             "agent mode should expose {expected}"
         );
     }
+    assert!(
+        tool_names
+            .iter()
+            .all(|name| !name.contains("review") && !name.contains("approval")),
+        "review-disabled Phase 3 must not expose review/approval tools"
+    );
 
     let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -5526,6 +5807,28 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .expect("task should load")
         .expect("task should exist");
     assert_eq!(task.task.status, pioneer_protocol::TaskStatus::Cancelled);
+    let run = task
+        .runs
+        .last()
+        .expect("cancelled attached child task should have a run");
+    let task_run_turns = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("cancelled task run turns should list");
+    assert!(
+        task_run_turns
+            .iter()
+            .any(|turn| turn.status == TaskRunTurnStatus::Cancelled),
+        "cancelled child task should mark its target task_run_turn cancelled"
+    );
+    assert!(
+        crud_store
+            .get_accepted_task_result_candidate(run.id.as_str())
+            .await
+            .expect("accepted candidate lookup should succeed")
+            .is_none(),
+        "cancelled child task must not create an accepted candidate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

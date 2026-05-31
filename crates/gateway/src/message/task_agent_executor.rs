@@ -7,7 +7,10 @@ use pioneer_protocol::{
     ItemCompletedNotification, ItemStartedNotification, SandboxMode, Task, TaskAgentContext,
     TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract, TaskAgentResultFormat,
     TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind,
-    TaskGetResponse, TaskResult, TaskRun, TaskRunExecution, TaskRunStatus, TaskTrigger,
+    TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
+    TaskResultReviewerKind, TaskRun, TaskRunExecution, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskTrigger,
     TaskTriggerKind, TaskValue, ThreadLineage, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification,
     TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
@@ -71,14 +74,8 @@ impl TaskAgentExecutor {
             return Ok(TaskExecutorStartOutcome::Queued);
         };
 
-        if let Some(lineage) = processor
-            .crud_store
-            .list_thread_lineage_for_run(run.id.as_str())
-            .await?
-            .into_iter()
-            .last()
+        if let Some(child_runtime) = load_child_runtime_for_run(&processor, run.id.as_str()).await?
         {
-            ensure_lineage_matches_execution(&lineage, &execution)?;
             return self
                 .recover_existing_child_turn(
                     &processor,
@@ -86,7 +83,30 @@ impl TaskAgentExecutor {
                     &run,
                     &agent_spec,
                     &execution,
-                    lineage,
+                    child_runtime,
+                    handle,
+                )
+                .await;
+        }
+
+        if let Some(lineage) = processor
+            .crud_store
+            .list_thread_lineage_for_run(run.id.as_str())
+            .await?
+            .into_iter()
+            .last()
+        {
+            let child_runtime =
+                ensure_child_runtime_from_lineage(&processor, lineage, Some(execution.id.clone()))
+                    .await?;
+            return self
+                .recover_existing_child_turn(
+                    &processor,
+                    &task_response,
+                    &run,
+                    &agent_spec,
+                    &execution,
+                    child_runtime,
                     handle,
                 )
                 .await;
@@ -102,7 +122,7 @@ impl TaskAgentExecutor {
         }
         let parent =
             ensure_task_run_occurrence_context(&processor, &task_response, &run, parent).await?;
-        if let Some(lineage) = self
+        if let Some(child_runtime) = self
             .rebuild_missing_lineage_from_execution(
                 &processor,
                 &task_response.task,
@@ -121,7 +141,7 @@ impl TaskAgentExecutor {
                     &run,
                     &agent_spec,
                     &execution,
-                    lineage,
+                    child_runtime,
                     handle,
                 )
                 .await;
@@ -184,7 +204,7 @@ impl TaskAgentExecutor {
         parent: &TaskParentRuntimeContext,
         execution: &TaskRunExecution,
         handle: TaskExecutionHandle,
-    ) -> Result<Option<ThreadLineage>> {
+    ) -> Result<Option<TaskRunChildRuntime>> {
         let Some(child_thread_id) = execution.child_thread_id.as_deref() else {
             return Ok(None);
         };
@@ -200,9 +220,17 @@ impl TaskAgentExecutor {
             return Ok(None);
         }
         let now = now_timestamp_secs();
-        let lineage = lineage_from_execution(task, run, agent_spec, parent, execution, now)?;
-        handle.link_child_thread(lineage.clone(), now).await?;
-        Ok(Some(lineage))
+        let binding = task_run_primary_binding_from_execution(task, run, execution, now)?;
+        let task_run_turn = initial_task_run_turn_from_execution(task, run, execution, now)?;
+        let lineage =
+            lineage_from_task_run_turn(task, run, agent_spec, parent, &task_run_turn, now);
+        handle
+            .link_child_thread_with_runtime(lineage.clone(), binding, task_run_turn.clone(), now)
+            .await?;
+        Ok(Some(TaskRunChildRuntime {
+            lineage,
+            task_run_turn,
+        }))
     }
 
     async fn start_new_child_turn(
@@ -217,14 +245,15 @@ impl TaskAgentExecutor {
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         let task = &task_response.task;
-        let child_thread_id = execution
-            .child_thread_id
-            .clone()
-            .ok_or_else(|| anyhow!("agent task execution has no reserved child thread id"))?;
-        let child_turn_id = execution
-            .child_turn_id
-            .clone()
-            .ok_or_else(|| anyhow!("agent task execution has no reserved child turn id"))?;
+        let now = now_timestamp_secs();
+        let binding = task_run_primary_binding_from_execution(task, run, &execution, now)?;
+        let task_run_turn = initial_task_run_turn_from_execution(task, run, &execution, now)?;
+        let child_runtime = TaskRunChildRuntime {
+            lineage: lineage_from_task_run_turn(task, run, agent_spec, parent, &task_run_turn, now),
+            task_run_turn,
+        };
+        let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
+        let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
         let effective_model = effective_agent_model(agent_spec)?;
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
@@ -294,9 +323,14 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden task turn");
         }
-        let now = now_timestamp_secs();
-        let lineage = lineage_from_execution(task, run, agent_spec, parent, &execution, now)?;
-        handle.link_child_thread(lineage, now).await?;
+        handle
+            .link_child_thread_with_runtime(
+                child_runtime.lineage.clone(),
+                binding,
+                child_runtime.task_run_turn.clone(),
+                now,
+            )
+            .await?;
 
         processor.ensure_hook_runtime_with_run_store().await;
         processor
@@ -383,14 +417,14 @@ impl TaskAgentExecutor {
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
         execution: &TaskRunExecution,
-        lineage: ThreadLineage,
+        child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         let Some((_, turn)) = processor
             .crud_store
             .get_turn(
-                lineage.child_thread_id.as_str(),
-                lineage.child_turn_id.as_str(),
+                child_runtime.task_run_turn.thread_id.as_str(),
+                child_runtime.task_run_turn.turn_id.as_str(),
             )
             .await?
         else {
@@ -411,13 +445,14 @@ impl TaskAgentExecutor {
 
         match turn.status {
             TurnStatus::Completed => {
-                self.complete_child_turn(processor, &lineage, handle)
+                self.complete_child_turn(processor, child_runtime, handle)
                     .await?;
                 Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::Failed | TurnStatus::Interrupted => {
                 let error_message = turn.error.unwrap_or_else(|| "child turn failed".to_owned());
-                self.fail_child_turn(&lineage, error_message.as_str(), handle)
+                let target_status = task_run_turn_status_from_child_turn_status(turn.status);
+                self.fail_child_turn(child_runtime, error_message.as_str(), target_status, handle)
                     .await?;
                 Ok(TaskExecutorStartOutcome::Started)
             }
@@ -428,7 +463,7 @@ impl TaskAgentExecutor {
                     run,
                     agent_spec,
                     execution,
-                    &lineage,
+                    &child_runtime,
                     handle,
                 )
                 .await
@@ -443,10 +478,12 @@ impl TaskAgentExecutor {
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
         execution: &TaskRunExecution,
-        lineage: &ThreadLineage,
+        child_runtime: &TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         let task = &task_response.task;
+        let child_thread_id = child_runtime.task_run_turn.thread_id.as_str();
+        let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
         match self
             .acquire_write_locks(processor, task, run, handle.clone())
             .await?
@@ -456,7 +493,7 @@ impl TaskAgentExecutor {
         }
         let Some(seed_thread) = processor
             .crud_store
-            .get_thread_model(lineage.child_thread_id.as_str())
+            .get_thread_model(child_thread_id)
             .await?
         else {
             let now = now_timestamp_secs();
@@ -475,7 +512,7 @@ impl TaskAgentExecutor {
         };
         let seed_sandbox_mode = processor
             .crud_store
-            .get_thread_sandbox_mode(lineage.child_thread_id.as_str())
+            .get_thread_sandbox_mode(child_thread_id)
             .await?;
         let parent = resolve_parent_context(processor, task).await?;
         let effective_model = effective_agent_model(agent_spec)?;
@@ -484,7 +521,7 @@ impl TaskAgentExecutor {
             .system_thread_start_seeded(
                 task.workspace_id.clone(),
                 pioneer_protocol::ThreadStartParams {
-                    thread_id: lineage.child_thread_id.clone(),
+                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
                     workspace_id: task.workspace_id.clone(),
                     name: thread_name_from_task(task),
                     model: Some(effective_model.model.clone()),
@@ -509,8 +546,8 @@ impl TaskAgentExecutor {
         let turn_outcome = match processor
             .thread_manager
             .system_turn_start(TurnStartParams {
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
+                thread_id: child_runtime.task_run_turn.thread_id.clone(),
+                turn_id: child_runtime.task_run_turn.turn_id.clone(),
                 input,
                 capabilities: Vec::new(),
                 model: Some(effective_model.model),
@@ -522,14 +559,12 @@ impl TaskAgentExecutor {
         {
             Ok(outcome) => outcome,
             Err(error) if format!("{error:#}").contains("already has a running turn") => {
-                processor
-                    .ensure_agent_listener_task(lineage.child_thread_id.as_str())
-                    .await;
+                processor.ensure_agent_listener_task(child_thread_id).await;
                 spawn_execution_heartbeat(
                     processor,
                     execution.id.clone(),
-                    lineage.child_thread_id.clone(),
-                    lineage.child_turn_id.clone(),
+                    child_runtime.task_run_turn.thread_id.clone(),
+                    child_runtime.task_run_turn.turn_id.clone(),
                     run.id.clone(),
                 );
                 return Ok(TaskExecutorStartOutcome::Queued);
@@ -554,12 +589,10 @@ impl TaskAgentExecutor {
         processor.ensure_hook_runtime_with_run_store().await;
         processor
             .agent_manager
-            .ensure_thread(lineage.child_thread_id.as_str(), task.workspace_id.as_str())
+            .ensure_thread(child_thread_id, task.workspace_id.as_str())
             .await
             .map_err(|error| anyhow!("failed to restore child agent runtime: {error}"))?;
-        processor
-            .ensure_agent_listener_task(lineage.child_thread_id.as_str())
-            .await;
+        processor.ensure_agent_listener_task(child_thread_id).await;
 
         if run.status != TaskRunStatus::Running {
             let started_at = now_timestamp_secs();
@@ -586,8 +619,8 @@ impl TaskAgentExecutor {
         let runtime_environment = processor
             .create_artifact_output_environment(
                 task.workspace_id.as_str(),
-                lineage.child_thread_id.as_str(),
-                lineage.child_turn_id.as_str(),
+                child_thread_id,
+                child_turn_id,
             )
             .await
             .context("failed to prepare restored task artifact output directory")?
@@ -596,8 +629,8 @@ impl TaskAgentExecutor {
         processor
             .agent_manager
             .start_turn_with_hook_context(
-                lineage.child_thread_id.as_str(),
-                lineage.child_turn_id.as_str(),
+                child_thread_id,
+                child_turn_id,
                 ThreadMode::Agent,
                 AgentTurnHookRuntimeContext::task(task.id.clone()),
                 &thread_outcome.started_notification.thread.model,
@@ -614,8 +647,8 @@ impl TaskAgentExecutor {
         spawn_execution_heartbeat(
             processor,
             execution.id.clone(),
-            lineage.child_thread_id.clone(),
-            lineage.child_turn_id.clone(),
+            child_runtime.task_run_turn.thread_id.clone(),
+            child_runtime.task_run_turn.turn_id.clone(),
             run.id.clone(),
         );
 
@@ -663,15 +696,14 @@ impl TaskAgentExecutor {
         turn_id: &str,
     ) -> Result<bool> {
         let processor = self.processor()?;
-        let Some(lineage) = processor.crud_store.get_thread_lineage(thread_id).await? else {
+        let Some(child_runtime) =
+            load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
+        else {
             return Ok(false);
         };
-        if lineage.child_turn_id != turn_id {
-            return Ok(false);
-        }
         let Some(task_response) = processor
             .crud_store
-            .get_task(lineage.task_id.as_str())
+            .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
             return Ok(true);
@@ -682,10 +714,10 @@ impl TaskAgentExecutor {
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
             processor.task_runtime.event_bus(),
-            lineage.task_id.clone(),
-            lineage.task_run_id.clone(),
+            child_runtime.task_run_turn.task_id.clone(),
+            child_runtime.task_run_turn.run_id.clone(),
         );
-        self.complete_child_turn(&processor, &lineage, handle)
+        self.complete_child_turn(&processor, child_runtime, handle)
             .await?;
         Ok(true)
     }
@@ -697,15 +729,14 @@ impl TaskAgentExecutor {
         error_message: &str,
     ) -> Result<bool> {
         let processor = self.processor()?;
-        let Some(lineage) = processor.crud_store.get_thread_lineage(thread_id).await? else {
+        let Some(child_runtime) =
+            load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
+        else {
             return Ok(false);
         };
-        if lineage.child_turn_id != turn_id {
-            return Ok(false);
-        }
         let Some(task_response) = processor
             .crud_store
-            .get_task(lineage.task_id.as_str())
+            .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
             return Ok(true);
@@ -716,10 +747,16 @@ impl TaskAgentExecutor {
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
             processor.task_runtime.event_bus(),
-            lineage.task_id.clone(),
-            lineage.task_run_id.clone(),
+            child_runtime.task_run_turn.task_id.clone(),
+            child_runtime.task_run_turn.run_id.clone(),
         );
-        self.fail_child_turn(&lineage, error_message, handle)
+        let target_status = processor
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await?
+            .map(|(_, turn)| task_run_turn_status_from_child_turn_status(turn.status))
+            .unwrap_or(TaskRunTurnStatus::Failed);
+        self.fail_child_turn(child_runtime, error_message, target_status, handle)
             .await?;
         Ok(true)
     }
@@ -727,21 +764,59 @@ impl TaskAgentExecutor {
     async fn complete_child_turn(
         &self,
         processor: &Arc<MessageProcessor>,
-        lineage: &ThreadLineage,
+        child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
-        match TaskAgentResultExtractor::extract(processor, lineage).await? {
+        if let Some(candidate) = processor
+            .crud_store
+            .get_accepted_task_result_candidate(child_runtime.task_run_turn.run_id.as_str())
+            .await?
+            && candidate.task_run_turn_id == child_runtime.task_run_turn.id
+            && let Some(result) = candidate.result
+        {
+            handle
+                .complete_run(
+                    Some(result),
+                    candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
+                )
+                .await?;
+            mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+            return Ok(());
+        }
+
+        match TaskAgentResultExtractor::extract(processor, &child_runtime.lineage).await? {
             Ok(result) => {
+                let completed_at = now_timestamp_secs();
+                let completed_turn =
+                    candidate_created_task_run_turn(&child_runtime.task_run_turn, completed_at);
+                let candidate =
+                    accepted_result_candidate(&completed_turn, result.clone(), completed_at);
+                let review_event = runtime_auto_accept_review_event(&candidate, completed_at);
                 handle
-                    .complete_run(Some(result), now_timestamp_secs())
+                    .record_auto_accepted_result_candidate(
+                        completed_turn,
+                        candidate,
+                        review_event,
+                        completed_at,
+                    )
                     .await?;
-                mark_task_run_occurrence_turn_completed(processor, lineage).await?;
+                handle.complete_run(Some(result), completed_at).await?;
+                mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             }
             Err(error) => {
-                handle.fail_run(Some(error), now_timestamp_secs()).await?;
+                let failed_at = now_timestamp_secs();
+                record_task_run_turn_failure(
+                    &handle,
+                    &child_runtime.task_run_turn,
+                    TaskRunTurnStatus::Failed,
+                    Some(error.clone()),
+                    failed_at,
+                )
+                .await?;
+                handle.fail_run(Some(error), failed_at).await?;
                 mark_task_run_occurrence_turn_failed(
                     processor,
-                    lineage,
+                    &child_runtime.lineage,
                     "child task result extraction failed",
                 )
                 .await?;
@@ -752,23 +827,30 @@ impl TaskAgentExecutor {
 
     async fn fail_child_turn(
         &self,
-        lineage: &ThreadLineage,
+        child_runtime: TaskRunChildRuntime,
         error_message: &str,
+        target_status: TaskRunTurnStatus,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
         let processor = self.processor()?;
-        handle
-            .fail_run(
-                Some(task_error(
-                    "child_turn_failed",
-                    error_message.to_owned(),
-                    TaskErrorClass::Unknown,
-                    Some(lineage.task_run_id.clone()),
-                )),
-                now_timestamp_secs(),
-            )
+        let failed_at = now_timestamp_secs();
+        let error = task_error(
+            "child_turn_failed",
+            error_message.to_owned(),
+            TaskErrorClass::Unknown,
+            Some(child_runtime.task_run_turn.run_id.clone()),
+        );
+        record_task_run_turn_failure(
+            &handle,
+            &child_runtime.task_run_turn,
+            target_status,
+            Some(error.clone()),
+            failed_at,
+        )
+        .await?;
+        handle.fail_run(Some(error), failed_at).await?;
+        mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, error_message)
             .await?;
-        mark_task_run_occurrence_turn_failed(&processor, lineage, error_message).await?;
         Ok(())
     }
 }
@@ -793,23 +875,36 @@ impl TaskExecutor for TaskAgentExecutor {
         _context: TaskExecutionContext,
         run_id: &str,
         reason: &str,
-        _handle: TaskExecutionHandle,
+        handle: TaskExecutionHandle,
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
         let processor = self.processor()?;
-        for lineage in processor
-            .crud_store
-            .list_thread_lineage_for_run(run_id)
-            .await?
-        {
+        let child_runtimes = list_child_runtimes_for_run(&processor, run_id).await?;
+        for child_runtime in child_runtimes {
             let _ = processor
                 .agent_manager
                 .cancel_turn(
-                    lineage.child_thread_id.as_str(),
-                    lineage.child_turn_id.as_str(),
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
                     reason,
                 )
                 .await;
-            mark_task_run_occurrence_turn_failed(&processor, &lineage, reason).await?;
+            let cancelled_at = now_timestamp_secs();
+            let error = task_error(
+                "task_run_cancelled",
+                reason.to_owned(),
+                TaskErrorClass::Cancelled,
+                Some(run_id.to_owned()),
+            );
+            record_task_run_turn_failure(
+                &handle,
+                &child_runtime.task_run_turn,
+                TaskRunTurnStatus::Cancelled,
+                Some(error),
+                cancelled_at,
+            )
+            .await?;
+            mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, reason)
+                .await?;
         }
         if let Some(execution) = processor.crud_store.load_execution_for_run(run_id).await?
             && !execution.status.is_terminal()
@@ -1184,14 +1279,210 @@ async fn mark_task_run_occurrence_turn_terminal(
     Ok(())
 }
 
-fn lineage_from_execution(
+#[derive(Debug, Clone)]
+struct TaskRunChildRuntime {
+    lineage: ThreadLineage,
+    task_run_turn: TaskRunTurn,
+}
+
+async fn load_child_runtime_for_run(
+    processor: &Arc<MessageProcessor>,
+    run_id: &str,
+) -> Result<Option<TaskRunChildRuntime>> {
+    let Some(task_run_turn) = processor
+        .crud_store
+        .get_latest_task_run_turn(run_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    load_child_runtime_from_task_run_turn(processor, task_run_turn)
+        .await
+        .map(Some)
+}
+
+async fn list_child_runtimes_for_run(
+    processor: &Arc<MessageProcessor>,
+    run_id: &str,
+) -> Result<Vec<TaskRunChildRuntime>> {
+    let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
+    if !task_run_turns.is_empty() {
+        let mut runtimes = Vec::with_capacity(task_run_turns.len());
+        for task_run_turn in task_run_turns {
+            runtimes.push(load_child_runtime_from_task_run_turn(processor, task_run_turn).await?);
+        }
+        return Ok(runtimes);
+    }
+
+    let mut runtimes = Vec::new();
+    let execution_id = processor
+        .crud_store
+        .load_execution_for_run(run_id)
+        .await?
+        .map(|execution| execution.id);
+    for lineage in processor
+        .crud_store
+        .list_thread_lineage_for_run(run_id)
+        .await?
+    {
+        runtimes.push(
+            ensure_child_runtime_from_lineage(processor, lineage, execution_id.clone()).await?,
+        );
+    }
+    Ok(runtimes)
+}
+
+async fn load_child_runtime_for_turn(
+    processor: &Arc<MessageProcessor>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TaskRunChildRuntime>> {
+    if let Some(task_run_turn) = processor
+        .crud_store
+        .get_task_run_turn_by_turn(thread_id, turn_id)
+        .await?
+    {
+        return load_child_runtime_from_task_run_turn(processor, task_run_turn)
+            .await
+            .map(Some);
+    }
+
+    let Some(lineage) = processor.crud_store.get_thread_lineage(thread_id).await? else {
+        return Ok(None);
+    };
+    if lineage.child_turn_id != turn_id {
+        return Ok(None);
+    }
+    let execution_id = processor
+        .crud_store
+        .load_execution_for_run(lineage.task_run_id.as_str())
+        .await?
+        .map(|execution| execution.id);
+    ensure_child_runtime_from_lineage(processor, lineage, execution_id)
+        .await
+        .map(Some)
+}
+
+async fn load_child_runtime_from_task_run_turn(
+    processor: &Arc<MessageProcessor>,
+    task_run_turn: TaskRunTurn,
+) -> Result<TaskRunChildRuntime> {
+    if let Some(binding) = processor
+        .crud_store
+        .get_task_run_primary_thread_binding(task_run_turn.run_id.as_str())
+        .await?
+        && binding.thread_id != task_run_turn.thread_id
+    {
+        bail!(
+            "primary task run thread binding `{}` points to `{}`, but task run turn `{}` points to `{}`",
+            binding.id,
+            binding.thread_id,
+            task_run_turn.id,
+            task_run_turn.thread_id
+        );
+    }
+
+    let lineage = processor
+        .crud_store
+        .get_thread_lineage(task_run_turn.thread_id.as_str())
+        .await?
+        .map(|lineage| lineage_for_task_run_turn(lineage, &task_run_turn))
+        .unwrap_or_else(|| fallback_lineage_for_task_run_turn(&task_run_turn));
+    Ok(TaskRunChildRuntime {
+        lineage,
+        task_run_turn,
+    })
+}
+
+async fn ensure_child_runtime_from_lineage(
+    processor: &Arc<MessageProcessor>,
+    lineage: ThreadLineage,
+    execution_id: Option<String>,
+) -> Result<TaskRunChildRuntime> {
+    let binding = TaskRunThreadBinding {
+        id: primary_task_run_thread_binding_id(lineage.task_run_id.as_str()),
+        task_id: lineage.task_id.clone(),
+        run_id: lineage.task_run_id.clone(),
+        execution_id,
+        thread_id: lineage.child_thread_id.clone(),
+        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+        created_at: lineage.created_at,
+    };
+    processor
+        .crud_store
+        .upsert_task_run_thread_binding(binding)
+        .await?;
+
+    let task_run_turn = if let Some(existing) = processor
+        .crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await?
+    {
+        existing
+    } else {
+        processor
+            .crud_store
+            .upsert_task_run_turn(TaskRunTurn {
+                id: task_run_turn_id_for_turn(lineage.child_turn_id.as_str()),
+                task_id: lineage.task_id.clone(),
+                run_id: lineage.task_run_id.clone(),
+                execution_id: processor
+                    .crud_store
+                    .load_execution_for_run(lineage.task_run_id.as_str())
+                    .await?
+                    .map(|execution| execution.id),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::InProgress,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: lineage.created_at,
+                started_at: Some(lineage.created_at),
+                completed_at: None,
+            })
+            .await?
+    };
+
+    Ok(TaskRunChildRuntime {
+        lineage: lineage_for_task_run_turn(lineage, &task_run_turn),
+        task_run_turn,
+    })
+}
+
+fn task_run_primary_binding_from_execution(
     task: &Task,
     run: &TaskRun,
-    agent_spec: &TaskAgentSpec,
-    parent: &TaskParentRuntimeContext,
     execution: &TaskRunExecution,
     created_at: i64,
-) -> Result<ThreadLineage> {
+) -> Result<TaskRunThreadBinding> {
+    let child_thread_id = execution
+        .child_thread_id
+        .clone()
+        .ok_or_else(|| anyhow!("agent task execution has no child thread id"))?;
+    Ok(TaskRunThreadBinding {
+        id: primary_task_run_thread_binding_id(run.id.as_str()),
+        task_id: task.id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: child_thread_id,
+        binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
+        created_at,
+    })
+}
+
+fn initial_task_run_turn_from_execution(
+    task: &Task,
+    run: &TaskRun,
+    execution: &TaskRunExecution,
+    created_at: i64,
+) -> Result<TaskRunTurn> {
     let child_thread_id = execution
         .child_thread_id
         .clone()
@@ -1200,9 +1491,37 @@ fn lineage_from_execution(
         .child_turn_id
         .clone()
         .ok_or_else(|| anyhow!("agent task execution has no child turn id"))?;
-    Ok(ThreadLineage {
-        child_thread_id,
-        child_turn_id,
+    Ok(TaskRunTurn {
+        id: task_run_turn_id_for_turn(child_turn_id.as_str()),
+        task_id: task.id.clone(),
+        run_id: run.id.clone(),
+        execution_id: Some(execution.id.clone()),
+        thread_id: child_thread_id,
+        turn_id: child_turn_id,
+        kind: TaskRunTurnKind::Initial,
+        round: 0,
+        sequence: 0,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: None,
+        requested_by_review_event_id: None,
+        created_at,
+        started_at: Some(created_at),
+        completed_at: None,
+    })
+}
+
+fn lineage_from_task_run_turn(
+    task: &Task,
+    run: &TaskRun,
+    agent_spec: &TaskAgentSpec,
+    parent: &TaskParentRuntimeContext,
+    task_run_turn: &TaskRunTurn,
+    created_at: i64,
+) -> ThreadLineage {
+    ThreadLineage {
+        child_thread_id: task_run_turn.thread_id.clone(),
+        child_turn_id: task_run_turn.turn_id.clone(),
         parent_thread_id: parent.parent_thread_id.clone(),
         parent_turn_id: parent.parent_turn_id.clone(),
         task_id: task.id.clone(),
@@ -1210,23 +1529,155 @@ fn lineage_from_execution(
         root_thread_id: parent.root_thread_id.clone(),
         depth: agent_spec.depth,
         created_at,
-    })
+    }
 }
 
-fn ensure_lineage_matches_execution(
-    lineage: &ThreadLineage,
-    execution: &TaskRunExecution,
-) -> Result<()> {
-    if execution.child_thread_id.as_deref() != Some(lineage.child_thread_id.as_str())
-        || execution.child_turn_id.as_deref() != Some(lineage.child_turn_id.as_str())
-    {
-        bail!(
-            "thread lineage for run `{}` does not match task run execution `{}`",
-            lineage.task_run_id,
-            execution.id
-        );
+fn lineage_for_task_run_turn(
+    mut lineage: ThreadLineage,
+    task_run_turn: &TaskRunTurn,
+) -> ThreadLineage {
+    lineage.child_thread_id = task_run_turn.thread_id.clone();
+    lineage.child_turn_id = task_run_turn.turn_id.clone();
+    lineage.task_id = task_run_turn.task_id.clone();
+    lineage.task_run_id = task_run_turn.run_id.clone();
+    lineage
+}
+
+fn fallback_lineage_for_task_run_turn(task_run_turn: &TaskRunTurn) -> ThreadLineage {
+    ThreadLineage {
+        child_thread_id: task_run_turn.thread_id.clone(),
+        child_turn_id: task_run_turn.turn_id.clone(),
+        parent_thread_id: task_run_turn.thread_id.clone(),
+        parent_turn_id: None,
+        task_id: task_run_turn.task_id.clone(),
+        task_run_id: task_run_turn.run_id.clone(),
+        root_thread_id: task_run_turn.thread_id.clone(),
+        depth: 0,
+        created_at: task_run_turn.created_at,
     }
+}
+
+fn primary_task_run_thread_binding_id(run_id: &str) -> String {
+    format!("trb_primary_{run_id}")
+}
+
+fn task_run_turn_id_for_turn(turn_id: &str) -> String {
+    format!("trt_{turn_id}")
+}
+
+fn candidate_created_task_run_turn(task_run_turn: &TaskRunTurn, completed_at: i64) -> TaskRunTurn {
+    let mut completed = task_run_turn.clone();
+    completed.status = TaskRunTurnStatus::CandidateCreated;
+    completed.completed_at = Some(completed_at);
+    completed
+}
+
+fn failed_task_run_turn(
+    task_run_turn: &TaskRunTurn,
+    status: TaskRunTurnStatus,
+    completed_at: i64,
+) -> TaskRunTurn {
+    let mut failed = task_run_turn.clone();
+    failed.status = status;
+    failed.completed_at = Some(completed_at);
+    failed
+}
+
+async fn record_task_run_turn_failure(
+    handle: &TaskExecutionHandle,
+    task_run_turn: &TaskRunTurn,
+    status: TaskRunTurnStatus,
+    error: Option<TaskError>,
+    completed_at: i64,
+) -> Result<()> {
+    handle
+        .record_task_run_turn_failed(
+            failed_task_run_turn(task_run_turn, status, completed_at),
+            error,
+            completed_at,
+        )
+        .await?;
     Ok(())
+}
+
+fn accepted_result_candidate(
+    task_run_turn: &TaskRunTurn,
+    result: TaskResult,
+    accepted_at: i64,
+) -> TaskResultCandidate {
+    let review_event_id = runtime_auto_accept_review_event_id(
+        task_run_turn.run_id.as_str(),
+        task_run_turn.turn_id.as_str(),
+    );
+    TaskResultCandidate {
+        id: task_result_candidate_id(
+            task_run_turn.run_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+        ),
+        task_id: task_run_turn.task_id.clone(),
+        run_id: task_run_turn.run_id.clone(),
+        task_run_turn_id: task_run_turn.id.clone(),
+        thread_id: task_run_turn.thread_id.clone(),
+        turn_id: task_run_turn.turn_id.clone(),
+        round: task_run_turn.round,
+        status: TaskResultCandidateStatus::Accepted,
+        summary: result.summary.clone(),
+        result: Some(result),
+        extraction_error: None,
+        diagnostics: Vec::new(),
+        final_review_event_id: Some(review_event_id),
+        created_at: accepted_at,
+        updated_at: accepted_at,
+        resolved_at: Some(accepted_at),
+    }
+}
+
+fn runtime_auto_accept_review_event(
+    candidate: &TaskResultCandidate,
+    accepted_at: i64,
+) -> TaskResultReviewEvent {
+    TaskResultReviewEvent {
+        id: candidate.final_review_event_id.clone().unwrap_or_else(|| {
+            runtime_auto_accept_review_event_id(
+                candidate.run_id.as_str(),
+                candidate.turn_id.as_str(),
+            )
+        }),
+        candidate_id: candidate.id.clone(),
+        task_id: candidate.task_id.clone(),
+        run_id: candidate.run_id.clone(),
+        task_run_turn_id: candidate.task_run_turn_id.clone(),
+        reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+        reviewer_thread_id: None,
+        reviewer_turn_id: None,
+        reviewer_user_id: None,
+        reviewer_agent_spec_id: None,
+        event_kind: TaskResultReviewEventKind::SystemAuto,
+        decision: TaskResultReviewDecision::Accept,
+        feedback_text: None,
+        feedback: None,
+        confidence: None,
+        supersedes_review_event_id: None,
+        next_task_run_turn_id: None,
+        created_at: accepted_at,
+    }
+}
+
+fn task_result_candidate_id(run_id: &str, turn_id: &str) -> String {
+    format!("trc_{run_id}_{turn_id}")
+}
+
+fn runtime_auto_accept_review_event_id(run_id: &str, turn_id: &str) -> String {
+    format!("trre_auto_{run_id}_{turn_id}")
+}
+
+fn task_run_turn_status_from_child_turn_status(status: TurnStatus) -> TaskRunTurnStatus {
+    match status {
+        TurnStatus::Completed => TaskRunTurnStatus::CandidateCreated,
+        TurnStatus::Failed => TaskRunTurnStatus::Failed,
+        TurnStatus::Interrupted => TaskRunTurnStatus::Interrupted,
+        TurnStatus::InProgress => TaskRunTurnStatus::InProgress,
+    }
 }
 
 fn spawn_execution_heartbeat(
