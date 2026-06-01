@@ -1540,8 +1540,8 @@ struct TaskAcceptToolInput {
     /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     run_id: String,
-    /// Candidate id to accept. Pioneer entity ids are exactly 21 characters.
-    #[schemars(length(min = 21, max = 21))]
+    /// Candidate id to accept. Use the exact candidateId returned by task_wait reviewRequired.
+    #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional short reason for the acceptance.
@@ -1560,7 +1560,7 @@ impl TaskAcceptToolInput {
         Ok(TaskAcceptParams {
             task_id: validate_entity_id(self.task_id, "taskId")?,
             run_id: validate_entity_id(self.run_id, "runId")?,
-            candidate_id: validate_entity_id(self.candidate_id, "candidateId")?,
+            candidate_id: validate_candidate_id(self.candidate_id, "candidateId")?,
             reason: clean_optional_string(self.reason),
         })
     }
@@ -1576,8 +1576,8 @@ struct TaskReviseToolInput {
     /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     run_id: String,
-    /// Candidate id to reject and revise. Pioneer entity ids are exactly 21 characters.
-    #[schemars(length(min = 21, max = 21))]
+    /// Candidate id to reject and revise. Use the exact candidateId returned by task_wait reviewRequired.
+    #[schemars(length(min = 1, max = 128))]
     candidate_id: String,
     /// Concrete feedback explaining what is wrong and what the child must fix.
     #[schemars(length(min = 1, max = 16000))]
@@ -1603,7 +1603,7 @@ impl TaskReviseToolInput {
         Ok(TaskReviseParams {
             task_id: validate_entity_id(self.task_id, "taskId")?,
             run_id: validate_entity_id(self.run_id, "runId")?,
-            candidate_id: validate_entity_id(self.candidate_id, "candidateId")?,
+            candidate_id: validate_candidate_id(self.candidate_id, "candidateId")?,
             feedback,
             additional_instructions: self
                 .additional_instructions
@@ -2205,6 +2205,17 @@ fn validate_entity_id(value: String, field: &str) -> Result<String, ToolError> {
     if char_count != 21 {
         return Err(ToolError::invalid_arguments(format!(
             "`{field}` must be a Pioneer entity id with exactly 21 characters, got {char_count}"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_candidate_id(value: String, field: &str) -> Result<String, ToolError> {
+    let value = required_tool_string(Some(value.as_str()), field)?;
+    let char_count = value.chars().count();
+    if char_count > 128 {
+        return Err(ToolError::invalid_arguments(format!(
+            "`{field}` must be at most 128 characters, got {char_count}"
         )));
     }
     Ok(value)
@@ -3801,6 +3812,41 @@ mod tests {
     }
 
     #[test]
+    fn task_accept_tool_input_accepts_review_candidate_id() {
+        let candidate_id = "trc_TBsmD0lIlHbX5Nlhxfz0u_VaygfHZgOuehGCuL7yyow".to_owned();
+
+        let params = TaskAcceptToolInput {
+            task_id: "GHN2SSkCdoTJmqCwTTjyI".to_owned(),
+            run_id: "TBsmD0lIlHbX5Nlhxfz0u".to_owned(),
+            candidate_id: candidate_id.clone(),
+            reason: Some("accepted".to_owned()),
+            idempotency_key: None,
+        }
+        .into_params()
+        .expect("review candidate ids returned by task_wait should be valid");
+
+        assert_eq!(params.candidate_id, candidate_id);
+    }
+
+    #[test]
+    fn task_revise_tool_input_accepts_review_candidate_id() {
+        let candidate_id = "trc_M502Yo7M0fytkc5sFHMvJ_SyvPgFxzLtOtI9IVQ6eLG".to_owned();
+
+        let params = TaskReviseToolInput {
+            task_id: "mssjiLzl12AKQx3FnawmX".to_owned(),
+            run_id: "M502Yo7M0fytkc5sFHMvJ".to_owned(),
+            candidate_id: candidate_id.clone(),
+            feedback: "Add missing details.".to_owned(),
+            additional_instructions: Vec::new(),
+            idempotency_key: None,
+        }
+        .into_params()
+        .expect("review candidate ids returned by task_wait should be valid");
+
+        assert_eq!(params.candidate_id, candidate_id);
+    }
+
+    #[test]
     fn task_accept_tool_output_returns_parent_loop_fields() {
         let result = TaskResult {
             summary: Some("accepted summary".to_owned()),
@@ -4250,12 +4296,24 @@ mod tests {
             );
         }
 
-        let accept_schema = task_accept_schema().to_string();
+        let accept_schema_value = task_accept_schema();
+        let accept_candidate_schema = accept_schema_value
+            .pointer("/properties/candidateId")
+            .expect("task_accept candidateId schema should exist");
+        assert_eq!(
+            accept_candidate_schema
+                .get("maxLength")
+                .and_then(JsonValue::as_u64),
+            Some(128),
+            "task_accept candidateId must accept review candidate ids, not only 21-char entity ids"
+        );
+        let accept_schema = accept_schema_value.to_string();
         for expected in [
             "candidate returned by task_wait reviewRequired",
             "taskId",
             "runId",
             "candidateId",
+            "Use the exact candidateId",
             "Optional short reason",
         ] {
             assert!(
@@ -4263,6 +4321,18 @@ mod tests {
                 "task_accept schema should include guidance `{expected}`, got: {accept_schema}"
             );
         }
+
+        let revise_schema_value = task_revise_schema();
+        let revise_candidate_schema = revise_schema_value
+            .pointer("/properties/candidateId")
+            .expect("task_revise candidateId schema should exist");
+        assert_eq!(
+            revise_candidate_schema
+                .get("maxLength")
+                .and_then(JsonValue::as_u64),
+            Some(128),
+            "task_revise candidateId must accept review candidate ids, not only 21-char entity ids"
+        );
 
         let reschedule_schema = task_reschedule_schema().to_string();
         assert!(
