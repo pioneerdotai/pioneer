@@ -6431,8 +6431,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     for expected in [
         "task_create",
         "task_wait",
-        "task_accept",
-        "task_revise",
         "task_cancel",
         "task_detach",
         "task_list",
@@ -6444,6 +6442,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
+        );
+    }
+    for hidden_until_review in ["task_accept", "task_revise"] {
+        assert!(
+            !tool_names.contains(&hidden_until_review),
+            "agent mode should expose {hidden_until_review} only after a review-required candidate is observed"
         );
     }
     assert!(

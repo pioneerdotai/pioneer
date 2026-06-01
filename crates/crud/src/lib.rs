@@ -9256,9 +9256,12 @@ mod tests {
     async fn task_review_projector_replays_rejection_revision_and_failed_turn_events() {
         let store = test_store_with_workspace("ws_task_review_revision_projector").await;
         let timestamp = 1_700_004_000;
+        let mut task = sample_task(timestamp);
+        task.id = "task_revision_projector".to_owned();
+        task.workspace_id = "ws_task_review_revision_projector".to_owned();
         let mut run = sample_task_run(timestamp);
         run.id = "run_revision_projector".to_owned();
-        run.task_id = "task_revision_projector".to_owned();
+        run.task_id = task.id.clone();
         run.trigger_id = None;
         run.run_group_id = run.id.clone();
 
@@ -9352,6 +9355,7 @@ mod tests {
         store
             .append_task_events(
                 vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
                     TaskEventPayload::RunCreated {
                         run: run.clone(),
                         agent_spec: None,
