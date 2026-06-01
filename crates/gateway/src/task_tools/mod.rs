@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
 const TASK_CREATE_TOOL: &str = "task_create";
@@ -340,6 +340,7 @@ struct TaskToolHandler {
 #[derive(Default)]
 struct TaskToolMutationCache {
     outputs: Mutex<HashMap<String, JsonValue>>,
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[async_trait]
@@ -348,6 +349,24 @@ impl ToolHandler for TaskToolHandler {
         &self,
         invocation: ToolInvocation,
         _trace: pioneer_tools::ToolEventTrace,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let handler = self.clone();
+        match task_tool_fresh_task(async move { handler.handle_in_fresh_task(invocation).await })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(ToolError::execution_failed(format!(
+                "task tool handler failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl TaskToolHandler {
+    async fn handle_in_fresh_task(
+        &self,
+        invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         match invocation.tool_name.as_str() {
             TASK_CREATE_TOOL => task_tool_future(self.handle_create(invocation)).await,
@@ -377,23 +396,60 @@ impl TaskToolHandler {
             .map(|value| format!("{}:{value}", invocation.tool_name))
     }
 
+    async fn mutation_key_guard(&self, cache_key: Option<&str>) -> Option<OwnedMutexGuard<()>> {
+        let key = cache_key?;
+        let lock = {
+            let mut locks = self.mutation_cache.locks.lock().await;
+            locks
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        Some(lock.lock_owned().await)
+    }
+
+    async fn cached_mutation_output(&self, cache_key: Option<&str>) -> Option<JsonValue> {
+        let key = cache_key?;
+        let mutation_outputs = self.mutation_cache.outputs.lock().await;
+        mutation_outputs.get(key).cloned()
+    }
+
+    async fn cache_mutation_output(&self, cache_key: Option<&str>, output: &JsonValue) {
+        if let Some(key) = cache_key {
+            let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+            mutation_outputs.insert(key.to_owned(), output.clone());
+        }
+    }
+
+    async fn cached_or_prior_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: Option<&str>,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        let Some(cache_key) = cache_key else {
+            return Ok(None);
+        };
+        if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
+            return Ok(Some(output));
+        }
+        let Some(output) = self.prior_successful_mutation_output(invocation).await? else {
+            return Ok(None);
+        };
+        self.cache_mutation_output(Some(cache_key), &output).await;
+        Ok(Some(output))
+    }
+
     async fn handle_create(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input: TaskCreateToolInput = decode_tool_args(invocation.clone())?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let params = self.create_params(input).await?;
@@ -417,9 +473,8 @@ impl TaskToolHandler {
         };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
         let output = task_create_tool_output(&response, &anchor);
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -575,17 +630,11 @@ impl TaskToolHandler {
         let input: TaskAcceptToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
 
@@ -611,9 +660,8 @@ impl TaskToolHandler {
         };
         let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
         let output = task_accept_tool_output(&response, final_answer_allowed);
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -634,17 +682,11 @@ impl TaskToolHandler {
         let input: TaskReviseToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
 
@@ -673,9 +715,8 @@ impl TaskToolHandler {
             }
         };
         let output = task_revise_tool_output(&response);
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -686,17 +727,11 @@ impl TaskToolHandler {
         let input: TaskCancelToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let response = self
@@ -707,9 +742,8 @@ impl TaskToolHandler {
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({ "task": task_summary(&response.task) });
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -720,17 +754,11 @@ impl TaskToolHandler {
         let input: TaskUpdateToolInput = decode_tool_args(invocation.clone())?;
         let params = self.update_params(input).await?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let response = self
@@ -741,9 +769,8 @@ impl TaskToolHandler {
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = task_update_tool_output(&response);
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -839,17 +866,11 @@ impl TaskToolHandler {
         let input: TaskRescheduleToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let response = self
@@ -863,9 +884,8 @@ impl TaskToolHandler {
             "task": task_summary(&response.task),
             "trigger": task_trigger_model_output(&response.trigger),
         });
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -876,17 +896,11 @@ impl TaskToolHandler {
         let input: TaskPauseToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let response = self
@@ -900,9 +914,8 @@ impl TaskToolHandler {
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
@@ -913,17 +926,11 @@ impl TaskToolHandler {
         let input: TaskResumeToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_params()?;
         let cache_key = self.mutation_cache_key(&invocation);
-        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-        if let Some(output) = cache_key
-            .as_ref()
-            .and_then(|key| mutation_outputs.get(key).cloned())
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
         {
-            return Ok(function_output(output));
-        }
-        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
-            if let Some(key) = cache_key.as_ref() {
-                mutation_outputs.insert(key.clone(), output.clone());
-            }
             return Ok(function_output(output));
         }
         let response = self
@@ -937,9 +944,8 @@ impl TaskToolHandler {
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
-        if let Some(key) = cache_key {
-            mutation_outputs.insert(key, output.clone());
-        }
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
         Ok(function_output(output))
     }
 
