@@ -1930,6 +1930,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::RequiresKey,
                 max_attempts: 1,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         task_tool_spec(
@@ -1941,6 +1942,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: true,
+                max_wall_clock_secs: Some(3_600),
             },
         ),
         task_tool_spec(
@@ -2026,6 +2028,7 @@ fn safe_read_recovery() -> ToolRecoveryMetadata {
         idempotency_mode: ToolIdempotencyMode::Safe,
         max_attempts: 2,
         can_resume: true,
+        max_wall_clock_secs: None,
     }
 }
 
@@ -2035,6 +2038,7 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
         idempotency_mode: ToolIdempotencyMode::RequiresKey,
         max_attempts: 1,
         can_resume: false,
+        max_wall_clock_secs: None,
     }
 }
 
@@ -3540,6 +3544,17 @@ mod tests {
             actual.as_slice(),
             pioneer_tools::BuiltinToolDomain::Task.tool_names()
         );
+    }
+
+    #[test]
+    fn task_wait_has_long_wall_clock_recovery_budget() {
+        let specs = task_tool_specs();
+        let task_wait = specs
+            .iter()
+            .find(|configured| configured.spec.name == TASK_WAIT_TOOL)
+            .expect("task_wait spec should exist");
+
+        assert_eq!(task_wait.spec.recovery.max_wall_clock_secs, Some(3_600));
     }
 
     fn sample_task(status: TaskStatus) -> Task {

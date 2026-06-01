@@ -540,6 +540,7 @@ impl ArtifactRepository {
         let offset = decode_list_cursor(filter.cursor.as_deref())?;
         let query_limit = limit.saturating_add(1);
         let has_binding_filter = filter.thread_id.is_some()
+            || !filter.thread_ids.is_empty()
             || filter.turn_id.is_some()
             || filter.message_id.is_some()
             || filter.task_id.is_some()
@@ -549,8 +550,16 @@ impl ArtifactRepository {
             let mut query = artifact_binding::Entity::find()
                 .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id.to_owned()));
 
+            let mut thread_ids = filter.thread_ids.clone();
             if let Some(thread_id) = &filter.thread_id {
-                query = query.filter(artifact_binding::Column::ThreadId.eq(thread_id.clone()));
+                thread_ids.push(thread_id.clone());
+            }
+            thread_ids.sort();
+            thread_ids.dedup();
+            if thread_ids.len() == 1 {
+                query = query.filter(artifact_binding::Column::ThreadId.eq(thread_ids.remove(0)));
+            } else if !thread_ids.is_empty() {
+                query = query.filter(artifact_binding::Column::ThreadId.is_in(thread_ids));
             }
             if let Some(turn_id) = &filter.turn_id {
                 query = query.filter(artifact_binding::Column::TurnId.eq(turn_id.clone()));
@@ -717,6 +726,7 @@ pub struct ArtifactListFilterRecord {
     pub include_deleted: bool,
     pub kinds: Vec<ArtifactKind>,
     pub thread_id: Option<String>,
+    pub thread_ids: Vec<String>,
     pub turn_id: Option<String>,
     pub message_id: Option<String>,
     pub task_id: Option<String>,

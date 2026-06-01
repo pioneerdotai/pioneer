@@ -65,6 +65,7 @@ pub struct ArtifactListFilter {
     pub include_deleted: bool,
     pub kinds: Vec<ArtifactKind>,
     pub thread_id: Option<String>,
+    pub thread_ids: Vec<String>,
     pub turn_id: Option<String>,
     pub message_id: Option<String>,
     pub task_id: Option<String>,

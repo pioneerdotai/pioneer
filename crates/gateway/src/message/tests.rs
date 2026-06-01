@@ -3694,6 +3694,184 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_list_for_thread_includes_child_thread_subtree() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_parent",
+        "turn_artifact_parent",
+    )
+    .await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_child",
+        "turn_artifact_child",
+    )
+    .await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thr_artifact_grandchild",
+        "turn_artifact_grandchild",
+    )
+    .await;
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_artifact_child".to_owned(),
+                run_id: "run_artifact_child".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: "thr_artifact_child".to_owned(),
+                    parent_thread_id: "thr_artifact_parent".to_owned(),
+                    root_thread_id: "thr_artifact_parent".to_owned(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some("thr_artifact_parent".to_owned()),
+                    created_by_turn_id: Some("turn_artifact_parent".to_owned()),
+                    created_at: 10,
+                },
+            },
+            10,
+        )
+        .await
+        .expect("child lineage should persist");
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_artifact_grandchild".to_owned(),
+                run_id: "run_artifact_grandchild".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: "thr_artifact_grandchild".to_owned(),
+                    parent_thread_id: "thr_artifact_child".to_owned(),
+                    root_thread_id: "thr_artifact_parent".to_owned(),
+                    depth: 2,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some("thr_artifact_child".to_owned()),
+                    created_by_turn_id: Some("turn_artifact_child".to_owned()),
+                    created_at: 11,
+                },
+            },
+            11,
+        )
+        .await
+        .expect("grandchild lineage should persist");
+
+    let parent_artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        "thr_artifact_parent",
+        "turn_artifact_parent",
+        "msg_artifact_parent",
+        "parent.txt",
+        b"parent".to_vec(),
+    )
+    .await;
+    let child_artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        "thr_artifact_child",
+        "turn_artifact_child",
+        "msg_artifact_child",
+        "child.txt",
+        b"child".to_vec(),
+    )
+    .await;
+    let grandchild_artifact = ingest_bound_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        "thr_artifact_grandchild",
+        "turn_artifact_grandchild",
+        "msg_artifact_grandchild",
+        "grandchild.txt",
+        b"grandchild".to_vec(),
+    )
+    .await;
+
+    let parent_list_id = generate_test_request_id("artifacttree", "parent");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": parent_list_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_LIST_FOR_THREAD,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thr_artifact_parent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let parent_response = recv_response_by_id(&mut rx, parent_list_id.as_str()).await;
+    let parent_list: pioneer_protocol::ArtifactListResponse =
+        serde_json::from_value(parent_response.result).expect("parent artifact list decodes");
+    let mut parent_ids: Vec<_> = parent_list
+        .items
+        .iter()
+        .map(|item| item.artifact.artifact_id.as_str())
+        .collect();
+    parent_ids.sort_unstable();
+    let mut expected_parent_ids = vec![
+        parent_artifact.artifact_id.as_str(),
+        child_artifact.artifact_id.as_str(),
+        grandchild_artifact.artifact_id.as_str(),
+    ];
+    expected_parent_ids.sort_unstable();
+    assert_eq!(parent_ids, expected_parent_ids);
+
+    let child_list_id = generate_test_request_id("artifacttree", "child");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": child_list_id,
+                "method": pioneer_protocol::constants::methods::ARTIFACT_LIST_FOR_THREAD,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thr_artifact_child"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let child_response = recv_response_by_id(&mut rx, child_list_id.as_str()).await;
+    let child_list: pioneer_protocol::ArtifactListResponse =
+        serde_json::from_value(child_response.result).expect("child artifact list decodes");
+    let mut child_ids: Vec<_> = child_list
+        .items
+        .iter()
+        .map(|item| item.artifact.artifact_id.as_str())
+        .collect();
+    child_ids.sort_unstable();
+    let mut expected_child_ids = vec![
+        child_artifact.artifact_id.as_str(),
+        grandchild_artifact.artifact_id.as_str(),
+    ];
+    expected_child_ids.sort_unstable();
+    assert_eq!(child_ids, expected_child_ids);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_read_caps_oversized_json_request() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());

@@ -504,16 +504,12 @@ impl MessageProcessor {
                 },
             )
             .await;
-            self.send_notification_to_thread_subscribers(
+            self.send_thread_artifacts_changed_to_thread_and_ancestors(
+                session.workspace_id.as_str(),
                 thread_id,
-                events::THREAD_ARTIFACTS_CHANGED,
-                &ThreadArtifactsChangedNotification {
-                    workspace_id: session.workspace_id.clone(),
-                    thread_id: thread_id.to_owned(),
-                    artifact_ids: vec![artifact.artifact_id.clone()],
-                    reason: "user_upload".to_owned(),
-                    generated_at: now_timestamp_secs(),
-                },
+                vec![artifact.artifact_id.clone()],
+                "user_upload",
+                now_timestamp_secs(),
             )
             .await;
         }

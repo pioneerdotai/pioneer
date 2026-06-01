@@ -77,16 +77,12 @@ impl MessageProcessor {
         }
 
         if !artifact_ids.is_empty() {
-            self.send_notification_to_thread_subscribers(
+            self.send_thread_artifacts_changed_to_thread_and_ancestors(
+                notification.workspace_id.as_str(),
                 notification.thread_id.as_str(),
-                events::THREAD_ARTIFACTS_CHANGED,
-                &ThreadArtifactsChangedNotification {
-                    workspace_id: notification.workspace_id.clone(),
-                    thread_id: notification.thread_id.clone(),
-                    artifact_ids,
-                    reason: "tool_output_registration".to_owned(),
-                    generated_at: now_timestamp_secs(),
-                },
+                artifact_ids,
+                "tool_output_registration",
+                now_timestamp_secs(),
             )
             .await;
         }

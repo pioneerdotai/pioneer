@@ -114,8 +114,19 @@ impl ArtifactToolNotificationSink for GatewayArtifactToolNotificationSink {
                     .await;
             }
             ArtifactToolNotification::ThreadArtifactsChanged(payload) => {
+                let workspace_id = payload.workspace_id;
+                let source_thread_id = payload.thread_id;
+                let artifact_ids = payload.artifact_ids;
+                let reason = payload.reason;
+                let generated_at = payload.generated_at;
                 self.processor
-                    .send_notification_to_thread_subscribers(thread_id, event_name, &payload)
+                    .send_thread_artifacts_changed_to_thread_and_ancestors(
+                        workspace_id.as_str(),
+                        source_thread_id.as_str(),
+                        artifact_ids,
+                        reason.as_str(),
+                        generated_at,
+                    )
                     .await;
             }
             ArtifactToolNotification::ArtifactProjectionUpdated(payload) => {

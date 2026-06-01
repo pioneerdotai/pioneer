@@ -9,7 +9,7 @@ use pioneer_protocol::{
     ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ArtifactSummary, Task,
     TaskAgentContext, TaskAgentInput, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
     TaskArtifact, TaskError, TaskErrorClass, TaskResult, TaskRunTurn, TaskThreadLineage, TaskValue,
-    ThreadArtifactsChangedNotification, UserInput, constants::events,
+    UserInput, constants::events,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
@@ -386,16 +386,12 @@ async fn notify_task_artifacts_changed(
         return;
     };
     processor
-        .send_notification_to_thread_subscribers(
+        .send_thread_artifacts_changed_to_thread_and_ancestors(
+            task.workspace_id.as_str(),
             thread_id.as_str(),
-            events::THREAD_ARTIFACTS_CHANGED,
-            &ThreadArtifactsChangedNotification {
-                workspace_id: task.workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                artifact_ids,
-                reason: task_artifacts_changed_reason(binding).to_owned(),
-                generated_at: now_timestamp_secs(),
-            },
+            artifact_ids,
+            task_artifacts_changed_reason(binding),
+            now_timestamp_secs(),
         )
         .await;
 }

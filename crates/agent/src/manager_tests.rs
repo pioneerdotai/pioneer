@@ -1425,6 +1425,7 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
             idempotency_mode: ToolIdempotencyMode::RequiresKey,
             max_attempts: 1,
             can_resume: false,
+            max_wall_clock_secs: None,
         });
         let configured = ConfiguredToolSpec::new(
             spec,

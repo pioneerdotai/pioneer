@@ -3,7 +3,7 @@ use pioneer_artifacts::ArtifactListFilter;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactDeleteParams, ArtifactDeleteResponse,
     ArtifactGetParams, ArtifactGetResponse, ArtifactListParams, ArtifactListResponse,
-    ArtifactRestoreParams, ArtifactRestoreResponse,
+    ArtifactRestoreParams, ArtifactRestoreResponse, ThreadArtifactsChangedNotification,
 };
 
 impl MessageProcessor {
@@ -39,7 +39,21 @@ impl MessageProcessor {
             return;
         }
 
-        let filter = filter_from_params(params);
+        let filter = match self.filter_from_artifact_list_params(params, method).await {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resolve artifact list scope for `{method}`: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let page = match self
             .artifact_service
             .list_artifacts(&workspace_id, filter)
@@ -330,6 +344,126 @@ impl MessageProcessor {
         }
         Ok(())
     }
+
+    async fn filter_from_artifact_list_params(
+        &self,
+        params: ArtifactListParams,
+        method: &'static str,
+    ) -> anyhow::Result<ArtifactListFilter> {
+        let mut filter = filter_from_params(params);
+        if method == methods::ARTIFACT_LIST_FOR_THREAD {
+            if let Some(thread_id) = filter.thread_id.as_deref() {
+                let thread_ids = self.artifact_thread_scope_ids(thread_id).await?;
+                if thread_ids.len() > 1 {
+                    filter.thread_id = None;
+                    filter.thread_ids = thread_ids;
+                }
+            }
+        }
+        Ok(filter)
+    }
+
+    pub(crate) async fn artifact_thread_scope_ids(
+        &self,
+        thread_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let root_thread_id = self
+            .crud_store
+            .get_task_thread_lineage(thread_id)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| thread_id.to_owned());
+        let lineage_rows = self
+            .crud_store
+            .list_task_thread_lineage_by_root_thread(root_thread_id.as_str())
+            .await?;
+
+        let mut parent_by_child = HashMap::<String, String>::new();
+        for lineage in &lineage_rows {
+            parent_by_child.insert(
+                lineage.child_thread_id.clone(),
+                lineage.parent_thread_id.clone(),
+            );
+        }
+
+        let mut seen = HashSet::<String>::new();
+        let mut thread_ids = Vec::new();
+        push_unique_thread_id(&mut thread_ids, &mut seen, thread_id.to_owned());
+        for lineage in lineage_rows {
+            if lineage_descends_from(
+                lineage.child_thread_id.as_str(),
+                thread_id,
+                &parent_by_child,
+            ) {
+                push_unique_thread_id(&mut thread_ids, &mut seen, lineage.child_thread_id);
+            }
+        }
+        Ok(thread_ids)
+    }
+
+    pub(crate) async fn send_thread_artifacts_changed_to_thread_and_ancestors(
+        &self,
+        workspace_id: &str,
+        source_thread_id: &str,
+        artifact_ids: Vec<String>,
+        reason: &str,
+        generated_at: i64,
+    ) {
+        if artifact_ids.is_empty() {
+            return;
+        }
+        let target_thread_ids = self
+            .artifact_thread_change_target_ids(source_thread_id)
+            .await;
+        for target_thread_id in target_thread_ids {
+            self.send_notification_to_thread_subscribers(
+                target_thread_id.as_str(),
+                events::THREAD_ARTIFACTS_CHANGED,
+                &ThreadArtifactsChangedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: target_thread_id.clone(),
+                    artifact_ids: artifact_ids.clone(),
+                    reason: reason.to_owned(),
+                    generated_at,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn artifact_thread_change_target_ids(&self, thread_id: &str) -> Vec<String> {
+        let mut seen = HashSet::<String>::new();
+        let mut thread_ids = Vec::new();
+        push_unique_thread_id(&mut thread_ids, &mut seen, thread_id.to_owned());
+
+        let mut current = thread_id.to_owned();
+        for _ in 0..64 {
+            let lineage = match self
+                .crud_store
+                .get_task_thread_lineage(current.as_str())
+                .await
+            {
+                Ok(Some(lineage)) => lineage,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        thread_id = current,
+                        error = %error,
+                        "failed to resolve ancestor thread artifact notification targets"
+                    );
+                    break;
+                }
+            };
+            let parent_thread_id = lineage.parent_thread_id;
+            if !seen.insert(parent_thread_id.clone()) {
+                break;
+            }
+            thread_ids.push(parent_thread_id.clone());
+            current = parent_thread_id;
+        }
+
+        thread_ids
+    }
 }
 
 fn filter_from_params(params: ArtifactListParams) -> ArtifactListFilter {
@@ -339,6 +473,7 @@ fn filter_from_params(params: ArtifactListParams) -> ArtifactListFilter {
         include_deleted: params.include_deleted,
         kinds: params.kinds,
         thread_id: params.thread_id,
+        thread_ids: Vec::new(),
         turn_id: params.turn_id,
         message_id: params.message_id,
         task_id: params.task_id,
@@ -351,6 +486,37 @@ fn required_scope<'a>(field: &str, value: Option<&'a str>) -> Result<&'a str, Ar
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ArtifactScopeError(format!("`{field}` is required")))
+}
+
+fn lineage_descends_from(
+    child_thread_id: &str,
+    ancestor_thread_id: &str,
+    parent_by_child: &HashMap<String, String>,
+) -> bool {
+    let mut current = child_thread_id;
+    for _ in 0..=parent_by_child.len() {
+        let Some(parent) = parent_by_child.get(current) else {
+            return false;
+        };
+        if parent == ancestor_thread_id {
+            return true;
+        }
+        if parent == current {
+            return false;
+        }
+        current = parent.as_str();
+    }
+    false
+}
+
+fn push_unique_thread_id(
+    thread_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    thread_id: String,
+) {
+    if seen.insert(thread_id.clone()) {
+        thread_ids.push(thread_id);
+    }
 }
 
 struct ArtifactScopeError(String);

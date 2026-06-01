@@ -1022,6 +1022,7 @@ fn safe_read_recovery() -> ToolRecoveryMetadata {
         idempotency_mode: ToolIdempotencyMode::Safe,
         max_attempts: 2,
         can_resume: true,
+        max_wall_clock_secs: None,
     }
 }
 
@@ -1031,6 +1032,7 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
         idempotency_mode: ToolIdempotencyMode::RequiresKey,
         max_attempts: 1,
         can_resume: false,
+        max_wall_clock_secs: None,
     }
 }
 

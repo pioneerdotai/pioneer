@@ -29,7 +29,9 @@ pub(super) fn snapshot_for_tool_metadata(
         can_resume: metadata.can_resume,
         resolved_action: action_for_retry_class(metadata.retry_class),
         base_backoff_secs: base_backoff_secs_for_retry_class(metadata.retry_class),
-        max_wall_clock_secs: base.max_wall_clock_secs,
+        max_wall_clock_secs: metadata
+            .max_wall_clock_secs
+            .unwrap_or(base.max_wall_clock_secs),
         no_progress_limit: base.no_progress_limit,
     }
 }
@@ -137,6 +139,7 @@ mod tests {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 9,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         );
 
@@ -159,6 +162,7 @@ mod tests {
                 idempotency_mode: ToolIdempotencyMode::None,
                 max_attempts: 3,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         );
 
@@ -167,6 +171,22 @@ mod tests {
         assert_eq!(snapshot.base_backoff_secs, 2);
         assert_eq!(snapshot.max_wall_clock_secs, 300);
         assert_eq!(snapshot.no_progress_limit, 3);
+    }
+
+    #[test]
+    fn tool_metadata_can_override_wall_clock_budget() {
+        let snapshot = snapshot_for_tool_metadata(
+            TurnItemType::DynamicToolCall,
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Transient,
+                idempotency_mode: ToolIdempotencyMode::Safe,
+                max_attempts: 2,
+                can_resume: true,
+                max_wall_clock_secs: Some(3_600),
+            },
+        );
+
+        assert_eq!(snapshot.max_wall_clock_secs, 3_600);
     }
 
     #[test]

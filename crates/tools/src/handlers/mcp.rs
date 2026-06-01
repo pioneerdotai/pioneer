@@ -234,6 +234,7 @@ fn recovery_for_annotations(annotations: &McpDynamicToolAnnotations) -> ToolReco
             idempotency_mode: ToolIdempotencyMode::Safe,
             max_attempts: 2,
             can_resume: false,
+            max_wall_clock_secs: None,
         };
     }
 
@@ -243,6 +244,7 @@ fn recovery_for_annotations(annotations: &McpDynamicToolAnnotations) -> ToolReco
             idempotency_mode: ToolIdempotencyMode::Safe,
             max_attempts: 2,
             can_resume: false,
+            max_wall_clock_secs: None,
         };
     }
 
@@ -251,6 +253,7 @@ fn recovery_for_annotations(annotations: &McpDynamicToolAnnotations) -> ToolReco
         idempotency_mode: ToolIdempotencyMode::None,
         max_attempts: 1,
         can_resume: false,
+        max_wall_clock_secs: None,
     }
 }
 

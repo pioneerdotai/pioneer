@@ -72,14 +72,14 @@ use pioneer_protocol::{
     ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
-    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadArtifactsChangedNotification,
-    ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
-    ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
-    ThreadGetResponse, ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams,
-    ThreadMoveResponse, ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams,
-    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse,
-    ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin, TimelineOriginKind,
-    TimelinePayload, ToolCallStatus, ToolStoragePayload, TurnCancelParams, TurnCancelResponse,
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolderCreateParams,
+    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
+    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
+    ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
+    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
+    ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    TimelineItem, TimelineLane, TimelineOrigin, TimelineOriginKind, TimelinePayload,
+    ToolCallStatus, ToolStoragePayload, TurnCancelParams, TurnCancelResponse,
     TurnCompletedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem,
     TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnStartParams,
     TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
@@ -1068,16 +1068,12 @@ impl MessageProcessor {
         }
 
         if !bound_artifact_ids.is_empty() {
-            self.send_notification_to_thread_subscribers(
+            self.send_thread_artifacts_changed_to_thread_and_ancestors(
+                workspace_id,
                 thread_id,
-                events::THREAD_ARTIFACTS_CHANGED,
-                &ThreadArtifactsChangedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    artifact_ids: bound_artifact_ids,
-                    reason: "user_input_binding".to_owned(),
-                    generated_at: now_timestamp_secs(),
-                },
+                bound_artifact_ids,
+                "user_input_binding",
+                now_timestamp_secs(),
             )
             .await;
         }

@@ -874,6 +874,7 @@ fn list_filter_record(filter: ArtifactListFilter) -> ArtifactListFilterRecord {
         include_deleted: filter.include_deleted,
         kinds: filter.kinds,
         thread_id: filter.thread_id,
+        thread_ids: filter.thread_ids,
         turn_id: filter.turn_id,
         message_id: filter.message_id,
         task_id: filter.task_id,

@@ -69,6 +69,8 @@ pub struct ToolRecoveryMetadata {
     pub idempotency_mode: ToolIdempotencyMode,
     pub max_attempts: u8,
     pub can_resume: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_clock_secs: Option<u64>,
 }
 
 impl Default for ToolRecoveryMetadata {
@@ -78,6 +80,7 @@ impl Default for ToolRecoveryMetadata {
             idempotency_mode: ToolIdempotencyMode::None,
             max_attempts: 2,
             can_resume: false,
+            max_wall_clock_secs: None,
         }
     }
 }
@@ -171,6 +174,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::SessionBound,
                 max_attempts: 3,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -184,6 +188,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::SessionBound,
                 max_attempts: 3,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -197,6 +202,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -210,6 +216,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -223,6 +230,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -236,6 +244,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::RequiresKey,
                 max_attempts: 1,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -249,6 +258,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 3,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -262,6 +272,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 3,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -275,6 +286,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 3,
                 can_resume: true,
+                max_wall_clock_secs: None,
             },
         ),
         configured_builtin_spec(
@@ -288,6 +300,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
     ]
@@ -329,6 +342,7 @@ pub(crate) fn computer_use_configured_spec() -> ConfiguredToolSpec {
             idempotency_mode: ToolIdempotencyMode::SessionBound,
             max_attempts: 2,
             can_resume: true,
+            max_wall_clock_secs: None,
         },
     )
 }

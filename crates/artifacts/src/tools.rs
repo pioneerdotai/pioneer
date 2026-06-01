@@ -392,6 +392,7 @@ pub fn artifact_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 1,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
         artifact_tool_spec(
@@ -403,6 +404,7 @@ pub fn artifact_tool_specs() -> Vec<ConfiguredToolSpec> {
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 1,
                 can_resume: false,
+                max_wall_clock_secs: None,
             },
         ),
     ]
