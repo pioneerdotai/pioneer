@@ -2243,6 +2243,36 @@ pub struct TaskAcceptResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskReviseParams {
+    pub task_id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub feedback: String,
+    #[serde(default)]
+    pub additional_instructions: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskReviseResponse {
+    pub task: Task,
+    pub run: TaskRun,
+    pub candidate: TaskResultCandidate,
+    pub review_event: TaskResultReviewEvent,
+    pub task_run_turn: TaskRunTurn,
+    pub requested: bool,
+    pub already_requested: bool,
+    pub status: TaskStatus,
+    pub child_thread_id: String,
+    pub child_turn_id: String,
+    pub round: u32,
+    pub feedback: String,
+    #[serde(default)]
+    pub additional_instructions: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskWaitParams {
     #[serde(default)]
     pub task_ids: Vec<String>,
@@ -2305,6 +2335,8 @@ pub enum TaskWaitRevisionBlockedReason {
 pub struct TaskWaitReviewItem {
     pub item: TaskWaitItem,
     pub candidate: TaskResultCandidate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<TaskAgentReviewPolicy>,
     #[serde(default)]
     pub max_revision_rounds: u32,
     #[serde(default)]
@@ -2841,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn task_wait_review_response_round_trips() {
+    fn phase_12_task_wait_review_response_round_trips() {
         let decoded: TaskWaitResponse = serde_json::from_value(json!({
             "completed": [],
             "failed": [],

@@ -8,7 +8,10 @@ use crate::workspace::WorkspaceManager;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use migration::{Migrator, MigratorTrait};
-use pioneer_agent::{AgentManager, AgentMcpToolProvider, SkillsLoopConfig, ToolLoopConfig};
+use pioneer_agent::{
+    AgentManager, AgentMcpToolProvider, SkillsLoopConfig, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig,
+};
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
@@ -57,25 +60,26 @@ use pioneer_protocol::{
     TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
     TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
-    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy, TaskRun,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
-    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
-    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
-    TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
-    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
-    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
-    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
+    TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
+    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
+    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
+    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -97,7 +101,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -176,6 +180,16 @@ struct DelayedProvider {
     text: String,
 }
 
+struct RevisionProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+}
+
+struct RevisionHangingProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    revision_calls: AtomicUsize,
+    release_revision: Arc<Notify>,
+}
+
 struct CountingDelayedProvider {
     delay: Duration,
     text: String,
@@ -247,6 +261,161 @@ impl Provider for DelayedProvider {
             Ok(StreamChunk::final_chunk()),
         ])
         .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RevisionProvider {
+    fn name(&self) -> &str {
+        "revision"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let is_revision = request
+            .compiled_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.full_system_text.contains("REVISION REQUEST"))
+            || request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("REVISION REQUEST"));
+        self.requests
+            .lock()
+            .expect("revision provider lock poisoned")
+            .push(request);
+        let text = if is_revision {
+            r#"<task_result>{"summary":"fixed after review","data":{"ok":true,"precipitationChance":"present"}}</task_result>"#
+        } else {
+            r#"<task_result>{"summary":"missing precipitation chance","data":{"ok":false}}</task_result>"#
+        };
+        Ok(ChatResponse {
+            text: text.to_owned(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+impl RevisionProvider {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("revision provider lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RevisionHangingProvider {
+    fn name(&self) -> &str {
+        "revision-hanging"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let is_revision = request
+            .compiled_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.full_system_text.contains("REVISION REQUEST"))
+            || request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("REVISION REQUEST"));
+        self.requests
+            .lock()
+            .expect("revision hanging provider lock poisoned")
+            .push(request);
+        if is_revision {
+            self.revision_calls.fetch_add(1, Ordering::SeqCst);
+            self.release_revision.notified().await;
+        }
+        let text = if is_revision {
+            r#"<task_result>{"summary":"released revision","data":{"ok":true}}</task_result>"#
+        } else {
+            r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#
+        };
+        Ok(ChatResponse {
+            text: text.to_owned(),
+            usage: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed())
+    }
+}
+
+impl RevisionHangingProvider {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            revision_calls: AtomicUsize::new(0),
+            release_revision: Arc::new(Notify::new()),
+        }
+    }
+
+    fn revision_call_count(&self) -> usize {
+        self.revision_calls.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_revision_call(&self) {
+        for _ in 0..100 {
+            if self.revision_call_count() > 0 {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for revision provider call");
+    }
+
+    fn release_revision(&self) {
+        self.release_revision.notify_waiters();
     }
 }
 
@@ -1216,6 +1385,7 @@ fn test_task_turn_preflight_response() -> ChatResponse {
         "task_create",
         "task_wait",
         "task_accept",
+        "task_revise",
         "task_cancel",
         "task_update",
         "task_detach",
@@ -1671,6 +1841,7 @@ fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
             allow_task_create_review_policy: true,
             default_parent_review_for_immediate_attached_agent_tasks: false,
             default_max_revision_rounds: 2,
+            auto_accept_after_seconds: 300,
         },
     }
 }
@@ -4386,6 +4557,573 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn() {
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(RevisionProvider::new()),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params_a = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_review_scope_a",
+        "turn_review_scope_a",
+        "Review scope task A",
+        3,
+    );
+    params_a
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+    let response_a = create_task_for_test(&processor, params_a)
+        .await
+        .expect("review-enabled task A should start");
+    let run_a = response_a
+        .run
+        .clone()
+        .expect("task A should create immediate run");
+    let candidate_a = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run_a.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let mut params_b = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_review_scope_b",
+        "turn_review_scope_b",
+        "Review scope task B",
+        3,
+    );
+    params_b
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+    let response_b = create_task_for_test(&processor, params_b)
+        .await
+        .expect("review-enabled task B should start");
+    let run_b = response_b
+        .run
+        .clone()
+        .expect("task B should create immediate run");
+    let candidate_b = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run_b.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let task_provider = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor));
+    let observations_a = task_provider
+        .review_required_attached_task_observations(TaskTurnContext {
+            workspace_id: workspace_id.clone(),
+            thread_id: "thr_review_scope_a".to_owned(),
+            turn_id: "turn_review_scope_a".to_owned(),
+        })
+        .await
+        .expect("review observations for parent A should load");
+    assert_eq!(observations_a.len(), 1);
+    let observation_a = &observations_a[0];
+    assert_eq!(observation_a.task_id, response_a.task.id);
+    assert_eq!(observation_a.run_id, run_a.id);
+    assert_eq!(observation_a.candidate_id, candidate_a.id);
+    assert_eq!(observation_a.status, "waiting_review");
+    assert_eq!(observation_a.candidate_status, "pending_review");
+    assert_eq!(observation_a.round, 0);
+    assert_eq!(
+        observation_a.summary.as_deref(),
+        Some("missing precipitation chance")
+    );
+    assert_eq!(
+        observation_a.child_thread_id.as_deref(),
+        Some(candidate_a.thread_id.as_str())
+    );
+    assert_eq!(
+        observation_a.child_turn_id.as_deref(),
+        Some(candidate_a.turn_id.as_str())
+    );
+    assert_eq!(observation_a.max_revision_rounds, 2);
+    assert_eq!(observation_a.remaining_revision_rounds, 2);
+    assert!(
+        observation_a
+            .allowed_actions
+            .iter()
+            .any(|action| action == "task_accept")
+    );
+    assert!(
+        observation_a
+            .allowed_actions
+            .iter()
+            .any(|action| action == "task_revise")
+    );
+    assert!(
+        observation_a
+            .allowed_actions
+            .iter()
+            .any(|action| action == "task_cancel")
+    );
+    assert_ne!(observation_a.candidate_id, candidate_b.id);
+
+    let observations_b = task_provider
+        .review_required_attached_task_observations(TaskTurnContext {
+            workspace_id: workspace_id.clone(),
+            thread_id: "thr_review_scope_b".to_owned(),
+            turn_id: "turn_review_scope_b".to_owned(),
+        })
+        .await
+        .expect("review observations for parent B should load");
+    assert_eq!(observations_b.len(), 1);
+    assert_eq!(observations_b[0].task_id, response_b.task.id);
+    assert_eq!(observations_b[0].run_id, run_b.id);
+    assert_eq!(observations_b[0].candidate_id, candidate_b.id);
+
+    let wrong_turn_observations = task_provider
+        .review_required_attached_task_observations(TaskTurnContext {
+            workspace_id,
+            thread_id: "thr_review_scope_a".to_owned(),
+            turn_id: "turn_review_scope_other".to_owned(),
+        })
+        .await
+        .expect("wrong parent turn review observations should load");
+    assert!(wrong_turn_observations.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision() {
+    let provider = Arc::new(RevisionProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_user_review_revise",
+        "turn_user_review_revise",
+        "Revise child result",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let first_candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    assert_eq!(first_candidate.round, 0);
+
+    let request_id = generate_test_request_id("taskrevise", "rpc");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id.clone(),
+        "method": pioneer_protocol::constants::methods::TASK_REVISE,
+        "params": {
+            "taskId": response.task.id.clone(),
+            "runId": run.id.clone(),
+            "candidateId": first_candidate.id,
+            "feedback": "Add precipitation chance and return a complete corrected result.",
+            "additionalInstructions": ["Preserve the original task objective."]
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let rpc_response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let revised: TaskReviseResponse =
+        serde_json::from_value(rpc_response.result).expect("task/revise response should decode");
+
+    assert!(revised.requested);
+    assert_eq!(
+        revised.review_event.decision,
+        TaskResultReviewDecision::RequestChanges
+    );
+    assert_eq!(
+        revised.review_event.next_task_run_turn_id.as_deref(),
+        Some(revised.task_run_turn.id.as_str())
+    );
+    assert_eq!(revised.task_run_turn.kind, TaskRunTurnKind::Revision);
+    assert_eq!(revised.task_run_turn.round, 1);
+    assert_eq!(revised.child_thread_id, revised.candidate.thread_id);
+    assert_ne!(revised.child_turn_id, revised.candidate.turn_id);
+
+    let next_candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    assert_eq!(next_candidate.round, 1);
+    assert_eq!(next_candidate.thread_id, revised.child_thread_id);
+    assert_eq!(next_candidate.turn_id, revised.child_turn_id);
+    assert_eq!(next_candidate.task_run_turn_id, revised.task_run_turn.id);
+    assert_eq!(
+        next_candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("fixed after review")
+    );
+
+    let candidates = crud_store
+        .list_task_result_candidates(run.id.as_str())
+        .await
+        .expect("candidates should list after revision");
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().any(|candidate| {
+        candidate.id == revised.candidate.id
+            && candidate.status == TaskResultCandidateStatus::Rejected
+    }));
+    assert!(candidates.iter().any(|candidate| {
+        candidate.id == next_candidate.id
+            && candidate.status == TaskResultCandidateStatus::PendingReview
+    }));
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            response.task.id.as_str(),
+            pioneer_protocol::TaskStatus::WaitingReview,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::WaitingReview
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::WaitingReview
+        )
+        .await,
+        TaskRunStatus::WaitingReview
+    );
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::WaitingReview);
+
+    assert!(
+        provider.snapshot_requests().len() >= 2,
+        "initial and revision child turns should both reach the provider"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_revise_dispatch_failure_marks_revision_turn_and_run_failed() {
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_millis(0),
+            text: r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#
+                .to_owned(),
+        }),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_revision_fail01",
+        "turn_revision_fail1",
+        "Revision dispatch failure",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let first_candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let revised = processor
+        .task_runtime
+        .service()
+        .revise_task_result_candidate(
+            pioneer_tasks::TaskMutationContext::user("connection:revision-dispatch-failure"),
+            TaskReviseParams {
+                task_id: response.task.id.clone(),
+                run_id: run.id.clone(),
+                candidate_id: first_candidate.id.clone(),
+                feedback: "Fix the missing details before finalizing.".to_owned(),
+                additional_instructions: Vec::new(),
+            },
+        )
+        .await
+        .expect("revise should reserve revision turn before dispatch");
+
+    let deleted = thread::Entity::delete_by_id(revised.child_thread_id.clone())
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("test should delete child thread to force dispatch failure");
+    assert_eq!(deleted.rows_affected, 1);
+
+    processor
+        .task_agent_executor
+        .dispatch_revision_turn(revised.clone())
+        .await
+        .expect("dispatch failure should be converted into task failure");
+
+    assert_eq!(
+        wait_for_task_status(
+            crud_store.clone(),
+            response.task.id.as_str(),
+            pioneer_protocol::TaskStatus::Failed,
+        )
+        .await,
+        pioneer_protocol::TaskStatus::Failed
+    );
+    assert_eq!(
+        wait_for_run_status(crud_store.clone(), run.id.as_str(), TaskRunStatus::Failed).await,
+        TaskRunStatus::Failed
+    );
+    let failed_turn = crud_store
+        .get_task_run_turn(revised.task_run_turn.id.as_str())
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("revision turn should exist");
+    assert_eq!(failed_turn.status, TaskRunTurnStatus::Failed);
+    assert_eq!(
+        failed_turn.requested_by_candidate_id.as_deref(),
+        Some(first_candidate.id.as_str())
+    );
+    assert_eq!(
+        failed_turn.requested_by_review_event_id.as_deref(),
+        Some(revised.review_event.id.as_str())
+    );
+    let rejected = crud_store
+        .get_task_result_candidate(first_candidate.id.as_str())
+        .await
+        .expect("candidate lookup should succeed")
+        .expect("candidate should exist");
+    assert_eq!(rejected.status, TaskResultCandidateStatus::Rejected);
+    assert_eq!(
+        rejected.final_review_event_id.as_deref(),
+        Some(revised.review_event.id.as_str())
+    );
+
+    let failed_response = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task lookup should succeed")
+        .expect("task should exist");
+    let failed_run = failed_response
+        .runs
+        .iter()
+        .find(|run| run.id == revised.run.id)
+        .expect("failed run should exist");
+    let error = failed_run.error.as_ref().expect("run should store failure");
+    assert_eq!(error.code, "child_thread_missing");
+    let details = error
+        .details
+        .as_ref()
+        .expect("failure should include details");
+    match details {
+        TaskValue::Object(details) => {
+            assert_eq!(
+                details.get("previousCandidateId"),
+                Some(&TaskValue::String(first_candidate.id.clone()))
+            );
+            assert_eq!(
+                details.get("requestedByReviewEventId"),
+                Some(&TaskValue::String(revised.review_event.id.clone()))
+            );
+        }
+        other => panic!("unexpected revision failure details: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_revise_restart_reuses_in_progress_revision_turn() {
+    let provider = Arc::new(RevisionHangingProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_revision_restart",
+        "turn_revision_restar",
+        "Revision restart",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::UserApproval,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: Vec::new(),
+        resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
+    });
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let first_candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+
+    let revised = processor
+        .task_runtime
+        .service()
+        .revise_task_result_candidate(
+            pioneer_tasks::TaskMutationContext::user("connection:revision-restart"),
+            TaskReviseParams {
+                task_id: response.task.id.clone(),
+                run_id: run.id.clone(),
+                candidate_id: first_candidate.id,
+                feedback: "Keep working in the same child thread and fix the result.".to_owned(),
+                additional_instructions: vec!["Do not create a new task.".to_owned()],
+            },
+        )
+        .await
+        .expect("revise should reserve revision turn");
+
+    let dispatched = processor
+        .task_agent_executor
+        .dispatch_revision_turn(revised)
+        .await
+        .expect("revision dispatch should start");
+    provider.wait_for_revision_call().await;
+    assert_eq!(provider.revision_call_count(), 1);
+
+    let recovered = processor
+        .task_agent_executor
+        .dispatch_revision_turn(dispatched.clone())
+        .await
+        .expect("restart recovery should reuse existing turn");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        provider.revision_call_count(),
+        1,
+        "restart must not dispatch a duplicate revision provider call"
+    );
+    assert_eq!(recovered.child_thread_id, dispatched.child_thread_id);
+    assert_eq!(recovered.child_turn_id, dispatched.child_turn_id);
+
+    let in_progress_turn = crud_store
+        .get_task_run_turn(dispatched.task_run_turn.id.as_str())
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("revision turn should exist");
+    assert_eq!(in_progress_turn.status, TaskRunTurnStatus::InProgress);
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution lookup should succeed")
+        .expect("execution should exist");
+    assert_eq!(execution.status, TaskRunExecutionStatus::Running);
+
+    provider.release_revision();
+    let next_candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    assert_eq!(next_candidate.round, 1);
+    assert_eq!(next_candidate.thread_id, dispatched.child_thread_id);
+    assert_eq!(next_candidate.turn_id, dispatched.child_turn_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
@@ -5694,6 +6432,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_create",
         "task_wait",
         "task_accept",
+        "task_revise",
         "task_cancel",
         "task_detach",
         "task_list",

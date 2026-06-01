@@ -15,7 +15,7 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{TaskStatus, TurnItem};
 use pioneer_tools::default_favicon_url;
 
 pub(super) fn now_unix_ms() -> i64 {
@@ -262,7 +262,7 @@ impl PioneerDesktop {
         is_last_row: bool,
         content_width: Pixels,
     ) -> AnyElement {
-        let status = format!("{:?}", task_item.status);
+        let status = task_status_label(task_item.status);
         let content = h_flex()
             .w_full()
             .items_center()
@@ -330,5 +330,32 @@ impl PioneerDesktop {
         result.push('\n');
         result.push_str(&t!("timeline.common.truncated").to_string());
         result
+    }
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Draft => "Draft",
+        TaskStatus::Scheduled => "Scheduled",
+        TaskStatus::Queued => "Queued",
+        TaskStatus::Running => "Running",
+        TaskStatus::Waiting => "Waiting",
+        TaskStatus::WaitingReview => "Needs review",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::Failed => "Failed",
+        TaskStatus::Cancelled => "Cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_status_label;
+    use pioneer_protocol::TaskStatus;
+
+    #[test]
+    fn phase_12_waiting_review_task_status_label_requires_review() {
+        assert_eq!(task_status_label(TaskStatus::WaitingReview), "Needs review");
+        assert_eq!(task_status_label(TaskStatus::Running), "Running");
+        assert_eq!(task_status_label(TaskStatus::Completed), "Completed");
     }
 }

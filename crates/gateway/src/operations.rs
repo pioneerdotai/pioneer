@@ -709,6 +709,7 @@ mod tests {
                     budget: GatewayToolLoopBudgetConfig::default(),
                     retry: GatewayToolRetryBudgetConfig::default(),
                 },
+                tasks: Default::default(),
                 skills: GatewaySkillsConfig::default(),
                 provider: GatewayProviderConfig {
                     default_timeout_secs: 120,

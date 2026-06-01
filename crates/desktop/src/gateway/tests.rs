@@ -524,6 +524,7 @@ pub(crate) fn test_config() -> AppConfig {
                 budget: GatewayToolLoopBudgetConfig::default(),
                 retry: GatewayToolRetryBudgetConfig::default(),
             },
+            tasks: Default::default(),
             skills: GatewaySkillsConfig::default(),
             memory: GatewayMemoryConfig::default(),
             hooks: Default::default(),

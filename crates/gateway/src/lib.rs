@@ -27,7 +27,7 @@ mod workspace;
 use anyhow::{Context, Result};
 use attachment::CrudArtifactExternalRefCacheBackend;
 use pioneer_agent::ToolLoopConfig;
-use pioneer_config::{AppConfig, GatewayMemoryConfig};
+use pioneer_config::{AppConfig, GatewayMemoryConfig, GatewayTasksConfig};
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
 use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
@@ -38,6 +38,7 @@ use pioneer_provider::{
     set_default_attachment_pipeline_config,
 };
 use pioneer_skills::SkillTrustLevel;
+use pioneer_tasks::{TaskReviewRuntimeConfig, TaskRuntimeConfig};
 use pioneer_tools::{
     ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
@@ -378,7 +379,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         &config.gateway.memory,
     )?);
 
-    let message_processor = Arc::new(MessageProcessor::new_with_memory_runtime(
+    let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
+
+    let message_processor = Arc::new(MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry,
         session_manager.clone(),
@@ -391,6 +394,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         memory_runtime,
         runtime_home.clone(),
         config.gateway.artifacts.clone(),
+        task_runtime_config,
     ));
 
     message_processor
@@ -518,6 +522,20 @@ fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -
     memory
 }
 
+fn task_runtime_config_from_gateway_tasks_config(config: &GatewayTasksConfig) -> TaskRuntimeConfig {
+    TaskRuntimeConfig {
+        review: TaskReviewRuntimeConfig {
+            enabled: config.review.enabled,
+            allow_task_create_review_policy: config.review.allow_task_create_review_policy,
+            default_parent_review_for_immediate_attached_agent_tasks: config
+                .review
+                .default_parent_review_for_immediate_attached_agent_tasks,
+            default_max_revision_rounds: config.review.default_max_revision_rounds,
+            auto_accept_after_seconds: config.review.auto_accept_after_seconds,
+        },
+    }
+}
+
 pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     settings: &GatewayMemorySettings,
 ) -> MemoryLoopConfig {
@@ -615,10 +633,12 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 mod tests {
     use super::{
         expand_home_directory_templates, memory_loop_config_from_gateway_memory_config,
-        parse_skill_trust_level,
+        parse_skill_trust_level, task_runtime_config_from_gateway_tasks_config,
     };
     use crate::secrets::GatewaySecrets;
-    use pioneer_config::{GatewayMemoryConfig, GatewayMemoryModelSelectionConfig};
+    use pioneer_config::{
+        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayTasksConfig,
+    };
     use pioneer_hooks::HookAwaitPolicy;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_memory::hooks::MemoryActiveRecallMode;
@@ -764,6 +784,22 @@ mod tests {
             loop_config.post_turn_extractor.model.as_deref(),
             Some("extractor-model")
         );
+    }
+
+    #[test]
+    fn gateway_tasks_review_config_maps_to_task_runtime_config() {
+        let runtime_config =
+            task_runtime_config_from_gateway_tasks_config(&GatewayTasksConfig::default());
+
+        assert!(runtime_config.review.enabled);
+        assert!(!runtime_config.review.allow_task_create_review_policy);
+        assert!(
+            runtime_config
+                .review
+                .default_parent_review_for_immediate_attached_agent_tasks
+        );
+        assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
+        assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
     }
 
     #[test]

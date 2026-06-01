@@ -513,6 +513,8 @@ pub struct PioneerDesktop {
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
+    pub(super) task_review_actions_in_flight: HashSet<String>,
+    pub(super) task_review_action_errors: HashMap<String, String>,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) show_thread_artifacts_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,

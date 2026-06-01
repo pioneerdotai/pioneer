@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use pioneer_protocol::{
-    Task, TaskAgentInput, TaskAgentPrompt, TaskAgentSpec, TaskAgentToolPolicy, TaskRun,
+    Task, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract, TaskAgentSpec,
+    TaskAgentToolPolicy, TaskResultCandidate, TaskResultReviewEvent, TaskRun, TaskRunTurn,
     TaskTrigger, TaskTriggerSpec, TaskValue,
 };
 
@@ -13,6 +14,15 @@ pub struct TaskRunPromptInput<'a> {
     pub now: i64,
     pub parent_context: Option<&'a str>,
     pub output_instructions: Option<&'a str>,
+    pub revision: Option<TaskRevisionPromptInput<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TaskRevisionPromptInput<'a> {
+    pub task_run_turn: &'a TaskRunTurn,
+    pub previous_candidate: &'a TaskResultCandidate,
+    pub review_event: &'a TaskResultReviewEvent,
+    pub additional_instructions: &'a [String],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -30,6 +40,9 @@ impl TaskRunPromptCompiler {
         sections.push(render_durable_task_definition(input));
         sections.push(render_schedule_and_time(input));
         sections.push(render_task_instructions(&input.agent_spec.prompt));
+        if let Some(revision) = input.revision {
+            sections.push(render_revision_request(input.agent_spec, revision));
+        }
         if let Some(context) = render_parent_context(input.parent_context) {
             sections.push(context);
         }
@@ -135,6 +148,66 @@ fn render_task_instructions(prompt: &TaskAgentPrompt) -> String {
     }
 }
 
+fn render_revision_request(
+    agent_spec: &TaskAgentSpec,
+    revision: TaskRevisionPromptInput<'_>,
+) -> String {
+    let mut lines = vec![
+        "You are revising a prior result for the same durable task run. Continue in this thread and produce a corrected candidate result.".to_owned(),
+        format!("- revision_round: {}", revision.task_run_turn.round),
+        format!("- revision_turn_id: {}", revision.task_run_turn.turn_id),
+        format!(
+            "- previous_candidate_id: {}",
+            revision.previous_candidate.id
+        ),
+        format!(
+            "- previous_candidate_round: {}",
+            revision.previous_candidate.round
+        ),
+        format!(
+            "- previous_candidate_status: {:?}",
+            revision.previous_candidate.status
+        ),
+        format!("- review_event_id: {}", revision.review_event.id),
+        format!("- review_decision: {:?}", revision.review_event.decision),
+        "Review feedback:".to_owned(),
+        revision
+            .review_event
+            .feedback_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("No textual review feedback was supplied.")
+            .to_owned(),
+    ];
+    if !revision.additional_instructions.is_empty() {
+        lines.push("Additional revision instructions:".to_owned());
+        lines.extend(
+            revision
+                .additional_instructions
+                .iter()
+                .map(|instruction| format!("- {}", instruction.trim())),
+        );
+    }
+    if let Some(summary) = revision.previous_candidate.summary.as_deref() {
+        lines.push("Previous candidate summary:".to_owned());
+        lines.push(summary.to_owned());
+    }
+    if let Some(result) = revision.previous_candidate.result.as_ref() {
+        lines.push("Previous candidate result_json:".to_owned());
+        lines.push(serde_json::to_string(result).unwrap_or_else(|_| "<unserializable>".to_owned()));
+    }
+    if let Some(error) = revision.previous_candidate.extraction_error.as_ref() {
+        lines.push("Previous candidate extraction_error_json:".to_owned());
+        lines.push(serde_json::to_string(error).unwrap_or_else(|_| "<unserializable>".to_owned()));
+    }
+    if let Some(contract) = agent_spec.result_contract.as_ref() {
+        lines.push("Output contract reminder:".to_owned());
+        lines.push(render_result_contract(contract));
+    }
+    format!("REVISION REQUEST\n{}", lines.join("\n"))
+}
+
 fn render_parent_context(parent_context: Option<&str>) -> Option<String> {
     let context = parent_context?.trim();
     if context.is_empty() {
@@ -203,6 +276,10 @@ fn render_output_instructions(output_instructions: Option<&str>) -> Option<Strin
     } else {
         Some(format!("OUTPUT INSTRUCTIONS\n{output}"))
     }
+}
+
+fn render_result_contract(contract: &TaskAgentResultContract) -> String {
+    serde_json::to_string(contract).unwrap_or_else(|_| format!("{contract:?}"))
 }
 
 fn render_agent_input(input: &TaskAgentInput) -> Option<String> {
@@ -282,8 +359,11 @@ fn format_timestamp(timestamp: i64) -> String {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        TaskAgentInputVariable, TaskAgentWriteMode, TaskExecutorKind, TaskOwnerKind, TaskRunStatus,
-        TaskStatus, TaskTriggerStatus,
+        TaskAgentInputVariable, TaskAgentResultFormat, TaskAgentWriteMode, TaskError,
+        TaskErrorClass, TaskExecutorKind, TaskOwnerKind, TaskResult, TaskResultCandidate,
+        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRunStatus, TaskRunTurn,
+        TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTriggerStatus,
     };
     use std::collections::BTreeMap;
 
@@ -422,6 +502,120 @@ mod tests {
             now: NOW,
             parent_context,
             output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+            revision: None,
+        })
+    }
+
+    fn sample_revision_turn() -> TaskRunTurn {
+        TaskRunTurn {
+            id: "trt_revision00000001".to_owned(),
+            task_id: "task_weather_daily01".to_owned(),
+            run_id: "run_weather_000000001".to_owned(),
+            execution_id: Some("execution_revision1".to_owned()),
+            thread_id: "thread_child0000001".to_owned(),
+            turn_id: "turn_revision000001".to_owned(),
+            kind: TaskRunTurnKind::Revision,
+            round: 1,
+            sequence: 2,
+            status: TaskRunTurnStatus::InProgress,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: Some("candidate_previous01".to_owned()),
+            requested_by_review_event_id: Some("review_event0000001".to_owned()),
+            created_at: NOW + 10,
+            started_at: Some(NOW + 10),
+            completed_at: None,
+        }
+    }
+
+    fn sample_previous_candidate() -> TaskResultCandidate {
+        TaskResultCandidate {
+            id: "candidate_previous01".to_owned(),
+            task_id: "task_weather_daily01".to_owned(),
+            run_id: "run_weather_000000001".to_owned(),
+            task_run_turn_id: "trt_initial000000001".to_owned(),
+            thread_id: "thread_child0000001".to_owned(),
+            turn_id: "turn_initial0000001".to_owned(),
+            round: 0,
+            status: TaskResultCandidateStatus::Rejected,
+            summary: Some("Forecast omitted precipitation chances.".to_owned()),
+            result: Some(TaskResult {
+                summary: Some("Forecast omitted precipitation chances.".to_owned()),
+                data: Some(TaskValue::Object(BTreeMap::from([(
+                    "city".to_owned(),
+                    TaskValue::String("Moscow".to_owned()),
+                )]))),
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_weather_000000001".to_owned()),
+            }),
+            extraction_error: None,
+            diagnostics: Vec::new(),
+            final_review_event_id: Some("review_event0000001".to_owned()),
+            created_at: NOW + 5,
+            updated_at: NOW + 9,
+            resolved_at: Some(NOW + 9),
+        }
+    }
+
+    fn sample_extraction_failed_previous_candidate() -> TaskResultCandidate {
+        let mut candidate = sample_previous_candidate();
+        candidate.status = TaskResultCandidateStatus::ExtractionFailed;
+        candidate.summary =
+            Some("Child output did not contain a valid task_result block.".to_owned());
+        candidate.result = None;
+        candidate.extraction_error = Some(TaskError {
+            code: "task_result_extraction_failed".to_owned(),
+            message: "No valid task_result block was found.".to_owned(),
+            class: TaskErrorClass::Validation,
+            details: Some(TaskValue::Object(BTreeMap::from([(
+                "parser".to_owned(),
+                TaskValue::String("task_result".to_owned()),
+            )]))),
+            failed_run_id: Some("run_weather_000000001".to_owned()),
+        });
+        candidate
+    }
+
+    fn sample_revision_review_event() -> TaskResultReviewEvent {
+        TaskResultReviewEvent {
+            id: "review_event0000001".to_owned(),
+            candidate_id: "candidate_previous01".to_owned(),
+            task_id: "task_weather_daily01".to_owned(),
+            run_id: "run_weather_000000001".to_owned(),
+            task_run_turn_id: "trt_initial000000001".to_owned(),
+            reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer_thread_id: Some("thread_parent000001".to_owned()),
+            reviewer_turn_id: Some("turn_create00000001".to_owned()),
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::Decision,
+            decision: TaskResultReviewDecision::RequestChanges,
+            feedback_text: Some(
+                "Add precipitation chance for each city and verify the output contract.".to_owned(),
+            ),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: Some("trt_revision00000001".to_owned()),
+            created_at: NOW + 9,
+        }
+    }
+
+    fn compile_revision(
+        task: &Task,
+        run: &TaskRun,
+        trigger: Option<&TaskTrigger>,
+        agent_spec: &TaskAgentSpec,
+        revision: TaskRevisionPromptInput<'_>,
+    ) -> String {
+        TaskRunPromptCompiler::new().compile(TaskRunPromptInput {
+            task,
+            run,
+            trigger,
+            agent_spec,
+            now: NOW,
+            parent_context: Some("Parent thread asked for a weather report."),
+            output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+            revision: Some(revision),
         })
     }
 
@@ -514,6 +708,98 @@ mod tests {
             prompt,
             include_str!("../../tests/fixtures/prompt_compiler/immediate_attached_subagent.golden")
                 .trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn revision_prompt_includes_review_feedback_previous_candidate_and_contract() {
+        let task = sample_task();
+        let run = sample_run();
+        let trigger = sample_trigger();
+        let mut agent_spec = sample_agent_spec(0, 3);
+        agent_spec.result_contract = Some(TaskAgentResultContract {
+            format: TaskAgentResultFormat::Json,
+            required: true,
+            schema: Some(TaskSchema {
+                name: Some("weather_report".to_owned()),
+                description: Some("Weather report by city".to_owned()),
+                schema: TaskValue::Object(BTreeMap::from([(
+                    "required".to_owned(),
+                    TaskValue::List(vec![TaskValue::String("precipitationChance".to_owned())]),
+                )])),
+            }),
+        });
+        let revision_turn = sample_revision_turn();
+        let previous_candidate = sample_previous_candidate();
+        let review_event = sample_revision_review_event();
+        let additional_instructions = vec![
+            "Keep the original city list.".to_owned(),
+            "Return only the corrected result.".to_owned(),
+        ];
+
+        let prompt = compile_revision(
+            &task,
+            &run,
+            Some(&trigger),
+            &agent_spec,
+            TaskRevisionPromptInput {
+                task_run_turn: &revision_turn,
+                previous_candidate: &previous_candidate,
+                review_event: &review_event,
+                additional_instructions: &additional_instructions,
+            },
+        );
+
+        assert!(prompt.contains("REVISION REQUEST"));
+        assert!(prompt.contains("Review feedback:"));
+        assert!(prompt.contains("Add precipitation chance for each city"));
+        assert!(prompt.contains("Previous candidate result_json:"));
+        assert!(prompt.contains("Output contract reminder:"));
+        assert_eq!(
+            prompt,
+            include_str!("../../tests/fixtures/prompt_compiler/revision_request.golden")
+                .trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn revision_prompt_includes_extraction_failed_candidate_error() {
+        let task = sample_task();
+        let run = sample_run();
+        let trigger = sample_trigger();
+        let mut agent_spec = sample_agent_spec(0, 3);
+        agent_spec.result_contract = Some(TaskAgentResultContract {
+            format: TaskAgentResultFormat::Json,
+            required: true,
+            schema: None,
+        });
+        let revision_turn = sample_revision_turn();
+        let previous_candidate = sample_extraction_failed_previous_candidate();
+        let review_event = sample_revision_review_event();
+        let additional_instructions = vec!["Return a valid task-result JSON block.".to_owned()];
+
+        let prompt = compile_revision(
+            &task,
+            &run,
+            Some(&trigger),
+            &agent_spec,
+            TaskRevisionPromptInput {
+                task_run_turn: &revision_turn,
+                previous_candidate: &previous_candidate,
+                review_event: &review_event,
+                additional_instructions: &additional_instructions,
+            },
+        );
+
+        assert!(prompt.contains("previous_candidate_status: ExtractionFailed"));
+        assert!(prompt.contains("Previous candidate extraction_error_json:"));
+        assert!(!prompt.contains("Previous candidate result_json:"));
+        assert_eq!(
+            prompt,
+            include_str!(
+                "../../tests/fixtures/prompt_compiler/revision_request_extraction_failed.golden"
+            )
+            .trim_end_matches('\n')
         );
     }
 

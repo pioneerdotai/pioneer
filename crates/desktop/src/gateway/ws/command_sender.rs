@@ -411,6 +411,39 @@ impl GatewayWsCommandSender {
         self.send_request_typed(methods::TURN_TIMELINE, &params, RPC_REQUEST_TIMEOUT)
     }
 
+    pub fn task_accept(&self, params: TaskAcceptParams) -> Result<TaskAcceptResponse> {
+        validate_task_review_target(
+            params.task_id.as_str(),
+            params.run_id.as_str(),
+            params.candidate_id.as_str(),
+            "task/accept",
+        )?;
+
+        self.send_request_typed(methods::TASK_ACCEPT, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn task_revise(&self, params: TaskReviseParams) -> Result<TaskReviseResponse> {
+        validate_task_review_target(
+            params.task_id.as_str(),
+            params.run_id.as_str(),
+            params.candidate_id.as_str(),
+            "task/revise",
+        )?;
+        if params.feedback.trim().is_empty() {
+            return Err(anyhow!("feedback is required for task/revise"));
+        }
+
+        self.send_request_typed(methods::TASK_REVISE, &params, RPC_REQUEST_TIMEOUT)
+    }
+
+    pub fn task_cancel(&self, params: TaskCancelParams) -> Result<TaskCancelResponse> {
+        if params.task_id.trim().is_empty() {
+            return Err(anyhow!("task_id is required for task/cancel"));
+        }
+
+        self.send_request_typed(methods::TASK_CANCEL, &params, RPC_REQUEST_TIMEOUT)
+    }
+
     pub fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         if params.workspace_id.trim().is_empty() {
             return Err(anyhow!("workspace_id is required for skills/list"));
@@ -1237,6 +1270,24 @@ impl GatewayWsCommandSender {
             serde_json::to_string(&request).context("failed to serialize JSON-RPC request")?;
         Ok((request_id, payload))
     }
+}
+
+fn validate_task_review_target(
+    task_id: &str,
+    run_id: &str,
+    candidate_id: &str,
+    method: &str,
+) -> Result<()> {
+    if task_id.trim().is_empty() {
+        return Err(anyhow!("task_id is required for {method}"));
+    }
+    if run_id.trim().is_empty() {
+        return Err(anyhow!("run_id is required for {method}"));
+    }
+    if candidate_id.trim().is_empty() {
+        return Err(anyhow!("candidate_id is required for {method}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_artifact_upload_chunk_frame(

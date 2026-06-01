@@ -953,6 +953,67 @@ fn task_event_message(event: &TaskEvent) -> String {
         pioneer_protocol::TaskEventPayload::WriteLockExpired { lock, .. } => {
             format!("Write lock expired: {}", lock.scope_path)
         }
+        pioneer_protocol::TaskEventPayload::TaskRunThreadBindingCreated { binding } => {
+            format!("Task execution thread linked: {}", binding.thread_id)
+        }
+        pioneer_protocol::TaskEventPayload::TaskRunTurnStarted { task_run_turn } => format!(
+            "Task {} turn started: round {}",
+            task_run_turn_kind_label(task_run_turn.kind),
+            task_run_turn.round
+        ),
+        pioneer_protocol::TaskEventPayload::TaskRunTurnCompleted { task_run_turn } => format!(
+            "Task {} turn completed: {}",
+            task_run_turn_kind_label(task_run_turn.kind),
+            task_run_turn_status_label(task_run_turn.status)
+        ),
+        pioneer_protocol::TaskEventPayload::TaskRunTurnFailed {
+            task_run_turn,
+            error,
+        } => error
+            .as_ref()
+            .map(|error| {
+                format!(
+                    "Task {} turn failed: {}",
+                    task_run_turn_kind_label(task_run_turn.kind),
+                    error.message
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "Task {} turn failed",
+                    task_run_turn_kind_label(task_run_turn.kind)
+                )
+            }),
+        pioneer_protocol::TaskEventPayload::TaskResultCandidateCreated { candidate } => format!(
+            "Task result candidate created: round {}, {}",
+            candidate.round,
+            task_result_candidate_status_label(candidate.status)
+        ),
+        pioneer_protocol::TaskEventPayload::TaskResultReviewEventRecorded { review_event } => {
+            format!(
+                "Review {} recorded: {} {}",
+                task_review_event_kind_label(review_event.event_kind),
+                task_result_reviewer_kind_label(review_event.reviewer_kind),
+                task_review_decision_label(review_event.decision)
+            )
+        }
+        pioneer_protocol::TaskEventPayload::TaskResultCandidateAccepted { candidate, .. } => {
+            format!("Task result candidate accepted: {}", candidate.id)
+        }
+        pioneer_protocol::TaskEventPayload::TaskResultCandidateRejected { candidate, .. } => {
+            format!("Task result candidate rejected: {}", candidate.id)
+        }
+        pioneer_protocol::TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => {
+            format!("Task result candidate cancelled: {}", candidate.id)
+        }
+        pioneer_protocol::TaskEventPayload::TaskRevisionRequested {
+            round,
+            task_run_turn_id,
+            ..
+        } => format!("Task revision requested: round {round}, turn {task_run_turn_id}"),
+        pioneer_protocol::TaskEventPayload::TaskRunEnteredReview { candidate_id, .. } => {
+            format!("Task run waiting for review: candidate {candidate_id}")
+        }
         _ => match event.event_type.as_str() {
             pioneer_protocol::constants::events::TASK_QUEUED => "Task queued".to_owned(),
             pioneer_protocol::constants::events::TASK_RUN_STARTED => "Task run started".to_owned(),
@@ -987,6 +1048,25 @@ fn task_event_message(event: &TaskEvent) -> String {
 }
 
 fn task_event_level(event: &TaskEvent) -> SystemEventLevel {
+    match &event.payload {
+        pioneer_protocol::TaskEventPayload::TaskRunTurnFailed { .. }
+        | pioneer_protocol::TaskEventPayload::TaskResultCandidateRejected { .. }
+        | pioneer_protocol::TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+            return SystemEventLevel::Warning;
+        }
+        pioneer_protocol::TaskEventPayload::TaskResultReviewEventRecorded { review_event }
+            if matches!(
+                review_event.decision,
+                pioneer_protocol::TaskResultReviewDecision::RequestChanges
+                    | pioneer_protocol::TaskResultReviewDecision::Reject
+                    | pioneer_protocol::TaskResultReviewDecision::Cancel
+            ) =>
+        {
+            return SystemEventLevel::Warning;
+        }
+        _ => {}
+    }
+
     match event.event_type.as_str() {
         pioneer_protocol::constants::events::TASK_FAILED
         | pioneer_protocol::constants::events::TASK_RUN_FAILED
@@ -997,10 +1077,202 @@ fn task_event_level(event: &TaskEvent) -> SystemEventLevel {
     }
 }
 
+fn task_run_turn_kind_label(kind: pioneer_protocol::TaskRunTurnKind) -> &'static str {
+    match kind {
+        pioneer_protocol::TaskRunTurnKind::Initial => "initial",
+        pioneer_protocol::TaskRunTurnKind::Revision => "revision",
+        pioneer_protocol::TaskRunTurnKind::Recovery => "recovery",
+        pioneer_protocol::TaskRunTurnKind::Review => "review",
+    }
+}
+
+fn task_run_turn_status_label(status: pioneer_protocol::TaskRunTurnStatus) -> &'static str {
+    match status {
+        pioneer_protocol::TaskRunTurnStatus::InProgress => "in progress",
+        pioneer_protocol::TaskRunTurnStatus::CandidateCreated => "candidate created",
+        pioneer_protocol::TaskRunTurnStatus::ReviewRecorded => "review recorded",
+        pioneer_protocol::TaskRunTurnStatus::Failed => "failed",
+        pioneer_protocol::TaskRunTurnStatus::Interrupted => "interrupted",
+        pioneer_protocol::TaskRunTurnStatus::Cancelled => "cancelled",
+    }
+}
+
+fn task_result_candidate_status_label(
+    status: pioneer_protocol::TaskResultCandidateStatus,
+) -> &'static str {
+    match status {
+        pioneer_protocol::TaskResultCandidateStatus::PendingReview => "pending review",
+        pioneer_protocol::TaskResultCandidateStatus::Accepted => "accepted",
+        pioneer_protocol::TaskResultCandidateStatus::Rejected => "rejected",
+        pioneer_protocol::TaskResultCandidateStatus::Superseded => "superseded",
+        pioneer_protocol::TaskResultCandidateStatus::Cancelled => "cancelled",
+        pioneer_protocol::TaskResultCandidateStatus::ExtractionFailed => "extraction failed",
+    }
+}
+
+fn task_result_reviewer_kind_label(kind: pioneer_protocol::TaskResultReviewerKind) -> &'static str {
+    match kind {
+        pioneer_protocol::TaskResultReviewerKind::RuntimeAuto => "runtime auto",
+        pioneer_protocol::TaskResultReviewerKind::ParentAgent => "parent agent",
+        pioneer_protocol::TaskResultReviewerKind::ReviewAgent => "review agent",
+        pioneer_protocol::TaskResultReviewerKind::User => "user",
+        pioneer_protocol::TaskResultReviewerKind::System => "system",
+    }
+}
+
+fn task_review_event_kind_label(kind: pioneer_protocol::TaskResultReviewEventKind) -> &'static str {
+    match kind {
+        pioneer_protocol::TaskResultReviewEventKind::Advisory => "advisory",
+        pioneer_protocol::TaskResultReviewEventKind::Decision => "decision",
+        pioneer_protocol::TaskResultReviewEventKind::Override => "override",
+        pioneer_protocol::TaskResultReviewEventKind::SystemAuto => "system auto",
+    }
+}
+
+fn task_review_decision_label(
+    decision: pioneer_protocol::TaskResultReviewDecision,
+) -> &'static str {
+    match decision {
+        pioneer_protocol::TaskResultReviewDecision::Accept => "accepted",
+        pioneer_protocol::TaskResultReviewDecision::RequestChanges => "requested changes",
+        pioneer_protocol::TaskResultReviewDecision::Reject => "rejected",
+        pioneer_protocol::TaskResultReviewDecision::Abstain => "abstained",
+        pioneer_protocol::TaskResultReviewDecision::Cancel => "cancelled",
+    }
+}
+
 fn task_event_timestamp_ms(event: &TaskEvent) -> i64 {
     if event.created_at > 1_000_000_000_000 {
         event.created_at
     } else {
         event.created_at.saturating_mul(1000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{task_event_level, task_event_message};
+    use pioneer_protocol::{
+        SystemEventLevel, TaskEvent, TaskEventPayload, TaskResultCandidate,
+        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+        TaskResultReviewEventKind, TaskResultReviewerKind, constants::events,
+    };
+
+    fn task_event(payload: TaskEventPayload) -> TaskEvent {
+        TaskEvent {
+            id: "event_review0000001".to_owned(),
+            task_id: "task_review00000001".to_owned(),
+            run_id: Some("run_review000000001".to_owned()),
+            thread_id: Some("thread_child0000001".to_owned()),
+            turn_id: Some("turn_child000000001".to_owned()),
+            sequence: 1,
+            event_type: payload.event_type().to_owned(),
+            idempotency_key: None,
+            payload,
+            created_at: 20,
+        }
+    }
+
+    fn candidate(status: TaskResultCandidateStatus) -> TaskResultCandidate {
+        TaskResultCandidate {
+            id: "candidate_review0001".to_owned(),
+            task_id: "task_review00000001".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            task_run_turn_id: "run_turn_initial001".to_owned(),
+            thread_id: "thread_child0000001".to_owned(),
+            turn_id: "turn_child000000001".to_owned(),
+            round: 0,
+            status,
+            result: None,
+            extraction_error: None,
+            summary: Some("child result".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: 20,
+            updated_at: 20,
+            resolved_at: None,
+        }
+    }
+
+    fn review_event(
+        event_kind: TaskResultReviewEventKind,
+        decision: TaskResultReviewDecision,
+    ) -> TaskResultReviewEvent {
+        TaskResultReviewEvent {
+            id: "review_event0000001".to_owned(),
+            candidate_id: "candidate_review0001".to_owned(),
+            task_id: "task_review00000001".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            task_run_turn_id: "run_turn_initial001".to_owned(),
+            reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            reviewer_thread_id: Some("thread_reviewer0001".to_owned()),
+            reviewer_turn_id: Some("turn_reviewer00001".to_owned()),
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: Some("agent_spec_review01".to_owned()),
+            event_kind,
+            decision,
+            feedback_text: Some("tighten the result".to_owned()),
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: 21,
+        }
+    }
+
+    #[test]
+    fn phase_12_advisory_review_event_renders_as_review_history() {
+        let event = task_event(TaskEventPayload::TaskResultReviewEventRecorded {
+            review_event: review_event(
+                TaskResultReviewEventKind::Advisory,
+                TaskResultReviewDecision::RequestChanges,
+            ),
+        });
+
+        assert_eq!(
+            task_event_message(&event),
+            "Review advisory recorded: review agent requested changes"
+        );
+        assert_eq!(task_event_level(&event), SystemEventLevel::Warning);
+    }
+
+    #[test]
+    fn phase_12_candidate_and_revision_events_render_specific_history_labels() {
+        let created = task_event(TaskEventPayload::TaskResultCandidateCreated {
+            candidate: candidate(TaskResultCandidateStatus::PendingReview),
+        });
+        assert_eq!(
+            task_event_message(&created),
+            "Task result candidate created: round 0, pending review"
+        );
+
+        let revision = task_event(TaskEventPayload::TaskRevisionRequested {
+            task_id: "task_review00000001".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            previous_candidate_id: "candidate_review0001".to_owned(),
+            requested_by_review_event_id: "review_event0000001".to_owned(),
+            task_run_turn_id: "run_turn_revision01".to_owned(),
+            thread_id: "thread_child0000001".to_owned(),
+            turn_id: "turn_child000000002".to_owned(),
+            round: 1,
+            feedback: "fix it".to_owned(),
+            requested_at: 22,
+        });
+        assert_eq!(
+            task_event_message(&revision),
+            "Task revision requested: round 1, turn run_turn_revision01"
+        );
+
+        let entered = task_event(TaskEventPayload::TaskRunEnteredReview {
+            task_id: "task_review00000001".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            candidate_id: "candidate_review0001".to_owned(),
+            entered_at: 20,
+        });
+        assert_eq!(
+            task_event_message(&entered),
+            "Task run waiting for review: candidate candidate_review0001"
+        );
+        assert_eq!(entered.event_type, events::TASK_RUN_ENTERED_REVIEW);
     }
 }

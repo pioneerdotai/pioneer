@@ -14,10 +14,10 @@ use pioneer_protocol::{
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
     TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskTreeParams as TaskTreeTaskParams,
-    TaskWaitParams, ThreadAgentsDocArchiveParams, ThreadAgentsDocGetParams,
-    ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams, TurnCancelParams,
-    TurnTimelineParams,
+    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
+    ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
+    TurnCancelParams, TurnTimelineParams,
 };
 
 impl MessageProcessor {
@@ -1795,6 +1795,23 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::TASK_ACCEPT),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TASK_REVISE => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TaskReviseParams>(params_value) {
+                    Ok(params) => self.task_revise(connection_id, request.id, params).await,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TASK_REVISE),
                             ),
                         )
                         .await;

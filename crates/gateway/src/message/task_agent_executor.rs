@@ -2,19 +2,19 @@ use super::*;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_agent::AgentTurnHookRuntimeContext;
-use pioneer_promt::{TaskRunPromptCompiler, TaskRunPromptInput};
+use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
     ItemCompletedNotification, ItemStartedNotification, SandboxMode, Task, TaskAgentContext,
     TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract, TaskAgentResultFormat,
     TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass,
     TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskResultReviewerSpec, TaskRun, TaskRunExecution, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskThreadLineage, TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnCompletedNotification,
-    TurnFailedNotification, TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification,
-    TurnStatus, UserInput,
+    TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTrigger,
+    TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
+    TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
     CreateTaskResultReviewerContextParams, RecordTaskResultReviewEventParams,
@@ -30,7 +30,7 @@ use tokio::time::{Duration, sleep};
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
 #[derive(Default)]
-pub(super) struct TaskAgentExecutor {
+pub(crate) struct TaskAgentExecutor {
     processor: StdRwLock<Option<Weak<MessageProcessor>>>,
 }
 
@@ -244,7 +244,7 @@ impl TaskAgentExecutor {
             .context("failed to create hidden task thread")?;
 
         let prompt =
-            materialize_child_task_prompt(processor, task_response, run, agent_spec, parent)
+            materialize_child_task_prompt(processor, task_response, run, agent_spec, parent, None)
                 .await?;
         let child_input = materialize_child_task_input(prompt, agent_spec);
         let turn_outcome = processor
@@ -379,6 +379,390 @@ impl TaskAgentExecutor {
         Ok(TaskExecutorStartOutcome::Started)
     }
 
+    pub(crate) async fn dispatch_revision_turn(
+        &self,
+        response: TaskReviseResponse,
+    ) -> Result<TaskReviseResponse> {
+        let processor = self.processor()?;
+        let task_response = processor
+            .crud_store
+            .get_task(response.task.id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", response.task.id))?;
+        let run = task_response
+            .runs
+            .iter()
+            .find(|run| run.id == response.run.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("task run `{}` not found", response.run.id))?;
+        let agent_spec = select_agent_spec(&task_response, run.id.as_str())
+            .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", task_response.task.id))?;
+        let execution = match processor
+            .crud_store
+            .load_execution_for_run(run.id.as_str())
+            .await?
+        {
+            Some(execution) => execution,
+            None => {
+                processor
+                    .crud_store
+                    .reserve_execution_for_run(
+                        run.id.as_str(),
+                        TaskExecutorKind::Agent,
+                        now_timestamp_secs(),
+                    )
+                    .await?
+            }
+        };
+        let child_runtime =
+            load_child_runtime_from_task_run_turn(&processor, response.task_run_turn.clone())
+                .await?;
+        let handle = TaskExecutionHandle::new(
+            processor.crud_store.clone(),
+            processor.task_runtime.event_bus(),
+            run.task_id.clone(),
+            run.id.clone(),
+        );
+        self.dispatch_existing_revision_turn(
+            &processor,
+            &task_response,
+            &run,
+            &agent_spec,
+            &execution,
+            child_runtime,
+            handle,
+        )
+        .await?;
+        task_revise_response_from_store(&processor, response).await
+    }
+
+    async fn dispatch_existing_revision_turn(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        task_response: &TaskGetResponse,
+        run: &TaskRun,
+        agent_spec: &TaskAgentSpec,
+        execution: &TaskRunExecution,
+        child_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
+        let task = &task_response.task;
+        let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
+        let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
+        match self
+            .acquire_write_locks(processor, task, run, handle.clone())
+            .await?
+        {
+            TaskExecutorStartOutcome::Started => {}
+            TaskExecutorStartOutcome::Queued => return Ok(()),
+            TaskExecutorStartOutcome::Rejected => return Ok(()),
+        }
+
+        if let Some((_, turn)) = processor
+            .crud_store
+            .get_turn(child_thread_id.as_str(), child_turn_id.as_str())
+            .await?
+        {
+            match turn.status {
+                TurnStatus::Completed => {
+                    self.complete_child_turn(processor, child_runtime, handle)
+                        .await?;
+                }
+                TurnStatus::Failed | TurnStatus::Interrupted => {
+                    let error_message = turn
+                        .error
+                        .unwrap_or_else(|| "revision child turn failed".to_owned());
+                    let target_status = task_run_turn_status_from_child_turn_status(turn.status);
+                    self.fail_child_turn(
+                        child_runtime,
+                        error_message.as_str(),
+                        target_status,
+                        handle,
+                    )
+                    .await?;
+                }
+                TurnStatus::InProgress => {
+                    let started_at = now_timestamp_secs();
+                    processor
+                        .crud_store
+                        .mark_execution_running(
+                            execution.id.as_str(),
+                            started_at,
+                            Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                        )
+                        .await
+                        .context("failed to mark revision task run execution running")?;
+                    processor
+                        .ensure_agent_listener_task(child_thread_id.as_str())
+                        .await;
+                    spawn_execution_heartbeat(
+                        processor,
+                        execution.id.clone(),
+                        child_runtime.task_run_turn.thread_id.clone(),
+                        child_runtime.task_run_turn.turn_id.clone(),
+                        run.id.clone(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let Some(seed_thread) = processor
+            .crud_store
+            .get_thread_model(child_thread_id.as_str())
+            .await?
+        else {
+            self.fail_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "child_thread_missing",
+                    "revision child task thread is missing".to_owned(),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        };
+        let seed_sandbox_mode = processor
+            .crud_store
+            .get_thread_sandbox_mode(child_thread_id.as_str())
+            .await?;
+        let parent = resolve_parent_context(processor, task).await?;
+        let effective_model = effective_agent_model(agent_spec)?;
+        let thread_outcome = processor
+            .thread_manager
+            .system_thread_start_seeded(
+                task.workspace_id.clone(),
+                pioneer_protocol::ThreadStartParams {
+                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
+                    workspace_id: task.workspace_id.clone(),
+                    name: thread_name_from_task(task),
+                    model: Some(effective_model.model.clone()),
+                    model_provider: Some(effective_model.model_provider.clone()),
+                    sandbox: seed_sandbox_mode,
+                    mode: Some(ThreadMode::Agent),
+                    origin_kind: Some(ThreadOriginKind::TaskRun),
+                    sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                    agent_nickname: agent_spec.agent_nickname.clone(),
+                    agent_role: agent_spec.agent_role.clone(),
+                },
+                Some(seed_thread),
+                seed_sandbox_mode,
+            )
+            .await
+            .context("failed to restore revision task thread")?;
+        let input = materialize_child_task_input(
+            materialize_child_task_prompt(
+                processor,
+                task_response,
+                run,
+                agent_spec,
+                &parent,
+                Some(&child_runtime.task_run_turn),
+            )
+            .await?,
+            agent_spec,
+        );
+        let turn_outcome = match processor
+            .thread_manager
+            .system_turn_start(TurnStartParams {
+                thread_id: child_runtime.task_run_turn.thread_id.clone(),
+                turn_id: child_runtime.task_run_turn.turn_id.clone(),
+                input,
+                capabilities: Vec::new(),
+                model: Some(effective_model.model),
+                model_provider: Some(effective_model.model_provider),
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) if format!("{error:#}").contains("already has a running turn") => {
+                let started_at = now_timestamp_secs();
+                processor
+                    .crud_store
+                    .mark_execution_running(
+                        execution.id.as_str(),
+                        started_at,
+                        Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                    )
+                    .await
+                    .context("failed to mark revision task run execution running")?;
+                processor
+                    .ensure_agent_listener_task(child_thread_id.as_str())
+                    .await;
+                spawn_execution_heartbeat(
+                    processor,
+                    execution.id.clone(),
+                    child_runtime.task_run_turn.thread_id,
+                    child_runtime.task_run_turn.turn_id,
+                    run.id.clone(),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                self.fail_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_turn_start_failed",
+                        format!("failed to create revision task turn: {error:#}"),
+                        TaskErrorClass::Internal,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if let Err(error) = processor
+            .validate_artifact_user_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            self.fail_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_artifact_input_invalid",
+                    format!("failed to validate revision task artifact input: {error:#}"),
+                    TaskErrorClass::Validation,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Err(error) = processor
+            .crud_store
+            .materialize_turn_start(
+                &turn_outcome.materialization.thread,
+                turn_outcome.materialization.sandbox_mode,
+                &turn_outcome.materialization.turn,
+                &turn_outcome.materialization.input,
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            self.fail_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_turn_persist_failed",
+                    format!("failed to persist revision task turn: {error:#}"),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        processor.ensure_hook_runtime_with_run_store().await;
+        processor
+            .agent_manager
+            .ensure_thread(child_thread_id.as_str(), task.workspace_id.as_str())
+            .await
+            .map_err(|error| anyhow!("failed to prepare revision child agent runtime: {error}"))?;
+        processor
+            .ensure_agent_listener_task(child_thread_id.as_str())
+            .await;
+
+        let started_at = now_timestamp_secs();
+        processor
+            .crud_store
+            .mark_execution_running(
+                execution.id.as_str(),
+                started_at,
+                Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+            )
+            .await
+            .context("failed to mark revision task run execution running")?;
+        let workspace_skill_policies =
+            load_workspace_skill_policies(processor, task.workspace_id.as_str()).await;
+        let resolved_artifacts = processor
+            .resolve_provider_artifact_inputs(
+                task.workspace_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+            .context("failed to resolve revision task artifact input for provider")?;
+        let runtime_environment = processor
+            .create_artifact_output_environment(
+                task.workspace_id.as_str(),
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to prepare revision task artifact output directory")?
+            .into_iter()
+            .collect();
+        if let Err(error) = processor
+            .agent_manager
+            .start_turn_with_hook_context(
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                ThreadMode::Agent,
+                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                workspace_skill_policies,
+                turn_outcome.materialization.input,
+                turn_outcome.materialization.capabilities,
+                resolved_artifacts,
+                runtime_environment,
+                Vec::new(),
+            )
+            .await
+        {
+            processor
+                .mark_turn_failed(
+                    child_thread_id.clone(),
+                    child_turn_id.clone(),
+                    format!("failed to dispatch revision task turn: {error}"),
+                )
+                .await;
+            self.fail_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_dispatch_failed",
+                    format!("failed to dispatch revision task turn: {error:#}"),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        spawn_execution_heartbeat(
+            processor,
+            execution.id.clone(),
+            child_runtime.task_run_turn.thread_id,
+            child_runtime.task_run_turn.turn_id,
+            run.id.clone(),
+        );
+        Ok(())
+    }
+
     async fn recover_existing_child_turn(
         &self,
         processor: &Arc<MessageProcessor>,
@@ -508,8 +892,15 @@ impl TaskAgentExecutor {
             .await
             .context("failed to restore hidden task thread")?;
         let input = materialize_child_task_input(
-            materialize_child_task_prompt(processor, task_response, run, agent_spec, &parent)
-                .await?,
+            materialize_child_task_prompt(
+                processor,
+                task_response,
+                run,
+                agent_spec,
+                &parent,
+                Some(&child_runtime.task_run_turn),
+            )
+            .await?,
             agent_spec,
         );
         let turn_outcome = match processor
@@ -563,7 +954,9 @@ impl TaskAgentExecutor {
             .map_err(|error| anyhow!("failed to restore child agent runtime: {error}"))?;
         processor.ensure_agent_listener_task(child_thread_id).await;
 
-        if run.status != TaskRunStatus::Running {
+        if run.status != TaskRunStatus::Running
+            || execution.status != TaskRunExecutionStatus::Running
+        {
             let started_at = now_timestamp_secs();
             handle.mark_started(started_at).await?;
             processor
@@ -1295,6 +1688,32 @@ impl TaskAgentExecutor {
             .await?;
         Ok(())
     }
+
+    async fn fail_revision_dispatch_turn(
+        &self,
+        processor: &Arc<MessageProcessor>,
+        child_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
+        mut error: TaskError,
+    ) -> Result<()> {
+        let failed_at = now_timestamp_secs();
+        error.details = Some(revision_dispatch_error_details(
+            &child_runtime.task_run_turn,
+        ));
+        let message = error.message.clone();
+        record_task_run_turn_failure(
+            &handle,
+            &child_runtime.task_run_turn,
+            TaskRunTurnStatus::Failed,
+            Some(error.clone()),
+            failed_at,
+        )
+        .await?;
+        handle.fail_run(Some(error), failed_at).await?;
+        mark_task_run_occurrence_turn_failed(processor, &child_runtime.lineage, message.as_str())
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1913,6 +2332,39 @@ fn failed_task_run_turn(
     failed
 }
 
+fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
+    TaskValue::Object(BTreeMap::from([
+        (
+            "taskRunTurnId".to_owned(),
+            TaskValue::String(task_run_turn.id.clone()),
+        ),
+        (
+            "threadId".to_owned(),
+            TaskValue::String(task_run_turn.thread_id.clone()),
+        ),
+        (
+            "turnId".to_owned(),
+            TaskValue::String(task_run_turn.turn_id.clone()),
+        ),
+        (
+            "previousCandidateId".to_owned(),
+            task_run_turn
+                .requested_by_candidate_id
+                .clone()
+                .map(TaskValue::String)
+                .unwrap_or(TaskValue::Null),
+        ),
+        (
+            "requestedByReviewEventId".to_owned(),
+            task_run_turn
+                .requested_by_review_event_id
+                .clone()
+                .map(TaskValue::String)
+                .unwrap_or(TaskValue::Null),
+        ),
+    ]))
+}
+
 async fn record_task_run_turn_failure(
     handle: &TaskExecutionHandle,
     task_run_turn: &TaskRunTurn,
@@ -2224,12 +2676,131 @@ fn select_agent_spec(response: &TaskGetResponse, run_id: &str) -> Option<TaskAge
         .cloned()
 }
 
+#[derive(Debug, Clone)]
+struct RevisionPromptContext {
+    task_run_turn: TaskRunTurn,
+    previous_candidate: TaskResultCandidate,
+    review_event: TaskResultReviewEvent,
+    additional_instructions: Vec<String>,
+}
+
+async fn load_revision_prompt_context(
+    processor: &Arc<MessageProcessor>,
+    task_run_turn: &TaskRunTurn,
+) -> Result<RevisionPromptContext> {
+    let candidate_id = task_run_turn
+        .requested_by_candidate_id
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "revision task run turn `{}` has no requested_by_candidate_id",
+                task_run_turn.id
+            )
+        })?;
+    let previous_candidate = processor
+        .crud_store
+        .get_task_result_candidate(candidate_id)
+        .await?
+        .ok_or_else(|| anyhow!("revision candidate `{candidate_id}` not found"))?;
+    let review_event = match task_run_turn.requested_by_review_event_id.as_deref() {
+        Some(review_event_id) => processor
+            .crud_store
+            .get_task_result_review_event(review_event_id)
+            .await?
+            .ok_or_else(|| anyhow!("revision review event `{review_event_id}` not found"))?,
+        None => processor
+            .crud_store
+            .list_task_result_review_events(candidate_id)
+            .await?
+            .into_iter()
+            .find(|event| event.next_task_run_turn_id.as_deref() == Some(task_run_turn.id.as_str()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "revision task run turn `{}` has no matching review event",
+                    task_run_turn.id
+                )
+            })?,
+    };
+    Ok(RevisionPromptContext {
+        task_run_turn: task_run_turn.clone(),
+        additional_instructions: revision_additional_instructions_from_feedback(
+            review_event.feedback.as_ref(),
+        ),
+        previous_candidate,
+        review_event,
+    })
+}
+
+fn revision_additional_instructions_from_feedback(feedback: Option<&TaskValue>) -> Vec<String> {
+    let Some(TaskValue::Object(object)) = feedback else {
+        return Vec::new();
+    };
+    let Some(TaskValue::List(values)) = object.get("additionalInstructions") else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(|value| match value {
+            TaskValue::String(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn task_revise_response_from_store(
+    processor: &Arc<MessageProcessor>,
+    response: TaskReviseResponse,
+) -> Result<TaskReviseResponse> {
+    let task_response = processor
+        .crud_store
+        .get_task(response.task.id.as_str())
+        .await?
+        .ok_or_else(|| anyhow!("task `{}` not found", response.task.id))?;
+    let run = task_response
+        .runs
+        .iter()
+        .find(|run| run.id == response.run.id)
+        .cloned()
+        .ok_or_else(|| anyhow!("task run `{}` not found", response.run.id))?;
+    let candidate = processor
+        .crud_store
+        .get_task_result_candidate(response.candidate.id.as_str())
+        .await?
+        .unwrap_or(response.candidate);
+    let review_event = processor
+        .crud_store
+        .get_task_result_review_event(response.review_event.id.as_str())
+        .await?
+        .unwrap_or(response.review_event);
+    let task_run_turn = processor
+        .crud_store
+        .get_task_run_turn(response.task_run_turn.id.as_str())
+        .await?
+        .unwrap_or(response.task_run_turn);
+    Ok(TaskReviseResponse {
+        status: task_response.task.status,
+        task: task_response.task,
+        run,
+        candidate,
+        review_event,
+        child_thread_id: task_run_turn.thread_id.clone(),
+        child_turn_id: task_run_turn.turn_id.clone(),
+        round: task_run_turn.round,
+        task_run_turn,
+        requested: response.requested,
+        already_requested: response.already_requested,
+        feedback: response.feedback,
+        additional_instructions: response.additional_instructions,
+    })
+}
+
 async fn materialize_child_task_prompt(
     processor: &Arc<MessageProcessor>,
     task_response: &TaskGetResponse,
     run: &TaskRun,
     agent_spec: &TaskAgentSpec,
     parent: &TaskParentRuntimeContext,
+    task_run_turn: Option<&TaskRunTurn>,
 ) -> Result<String> {
     let parent_context = render_context_policy(
         processor,
@@ -2242,6 +2813,20 @@ async fn materialize_child_task_prompt(
         .trigger_id
         .as_deref()
         .and_then(|trigger_id| find_task_run_trigger(task_response, trigger_id));
+    let revision_context = match task_run_turn {
+        Some(task_run_turn) if task_run_turn.kind == TaskRunTurnKind::Revision => {
+            Some(load_revision_prompt_context(processor, task_run_turn).await?)
+        }
+        _ => None,
+    };
+    let revision = revision_context
+        .as_ref()
+        .map(|context| TaskRevisionPromptInput {
+            task_run_turn: &context.task_run_turn,
+            previous_candidate: &context.previous_candidate,
+            review_event: &context.review_event,
+            additional_instructions: &context.additional_instructions,
+        });
     Ok(TaskRunPromptCompiler::new().compile(TaskRunPromptInput {
         task: &task_response.task,
         run,
@@ -2250,6 +2835,7 @@ async fn materialize_child_task_prompt(
         now: now_timestamp_secs(),
         parent_context: parent_context.as_deref(),
         output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+        revision,
     }))
 }
 

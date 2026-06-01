@@ -132,6 +132,8 @@ impl PioneerDesktop {
             thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
             thread_timeline_item_expanded: RefCell::new(HashSet::new()),
             thread_timeline_terminal_item: RefCell::new(HashMap::new()),
+            task_review_actions_in_flight: HashSet::new(),
+            task_review_action_errors: HashMap::new(),
             thread_artifacts: ThreadArtifactsState::default(),
             show_thread_artifacts_sidebar: false,
             thread_artifacts_sidebar_width: px(340.),

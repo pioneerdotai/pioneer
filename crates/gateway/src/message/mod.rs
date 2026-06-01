@@ -66,9 +66,10 @@ use pioneer_protocol::{
     TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
     TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams,
     TaskGetParams, TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
-    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    TaskReviseParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadArtifactsChangedNotification,
@@ -186,7 +187,7 @@ pub struct MessageProcessor {
     mcp_service: Arc<McpService>,
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
+    pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
     memory_runtime: Arc<GatewayMemoryRuntime>,
     memory_bridge_providers: Arc<RwLock<Option<MemoryBridgeProviders>>>,
@@ -206,6 +207,7 @@ struct MemoryBridgeProviders {
 }
 
 impl MessageProcessor {
+    #[cfg(test)]
     pub fn new_with_memory_runtime(
         thread_manager: Arc<ThreadManager>,
         provider_registry: Arc<ProviderRegistry>,

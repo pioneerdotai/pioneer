@@ -298,6 +298,27 @@ pub struct PendingAttachedTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRequiredTaskObservation {
+    pub task_id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub title: String,
+    pub status: String,
+    pub candidate_status: String,
+    pub round: u32,
+    pub summary: Option<String>,
+    pub result_preview: Option<String>,
+    pub extraction_error_preview: Option<String>,
+    pub diagnostics: Vec<String>,
+    pub child_thread_id: Option<String>,
+    pub child_turn_id: Option<String>,
+    pub max_revision_rounds: u32,
+    pub remaining_revision_rounds: u32,
+    pub allowed_actions: Vec<String>,
+    pub revision_blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalTaskObservation {
     pub task_id: String,
     pub run_id: Option<String>,
@@ -370,6 +391,11 @@ pub trait TaskToolProvider: Send + Sync {
         &self,
         context: TaskTurnContext,
     ) -> Result<Vec<PendingAttachedTask>, String>;
+
+    async fn review_required_attached_task_observations(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String>;
 
     async fn terminal_attached_task_observations(
         &self,

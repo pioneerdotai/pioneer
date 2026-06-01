@@ -1,8 +1,8 @@
 use crate::message::{MessageProcessor, now_timestamp_secs};
 use async_trait::async_trait;
 use pioneer_agent::{
-    PendingAttachedTask, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    TerminalTaskObservation,
+    PendingAttachedTask, ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider,
+    TaskTurnContext, TerminalTaskObservation,
 };
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
@@ -12,11 +12,12 @@ use pioneer_protocol::{
     TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
     TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
     TaskOwnerKind, TaskPauseParams, TaskRescheduleParams, TaskResult, TaskResultCandidateStatus,
-    TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy, TaskRun, TaskRunStatus,
-    TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
-    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
-    TaskUpdateResponse, TaskWaitMode, ToolCallStatus, ToolStoragePayload, TurnItem,
-    TurnItemEventPayload, constants::events,
+    TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy, TaskReviseParams,
+    TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind, TaskStatus,
+    TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskWaitMode,
+    TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem, TurnItemEventPayload,
+    constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -37,6 +38,7 @@ use tokio::task::JoinHandle;
 const TASK_CREATE_TOOL: &str = "task_create";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_ACCEPT_TOOL: &str = "task_accept";
+const TASK_REVISE_TOOL: &str = "task_revise";
 const TASK_CANCEL_TOOL: &str = "task_cancel";
 const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
@@ -153,7 +155,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             .map_err(|error| format!("{error:#}"))?;
         let mut pending = Vec::new();
         for task in tasks {
-            if task.status.is_terminal() {
+            if task.status.is_terminal() || task.status == TaskStatus::WaitingReview {
                 continue;
             }
             let run_id = processor
@@ -170,6 +172,50 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             });
         }
         Ok(pending)
+    }
+
+    async fn review_required_attached_task_observations(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        let processor = self.processor()?;
+        let tasks = attached_tasks_for_turn(&processor, &context)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let task_ids = tasks
+            .iter()
+            .filter(|task| !task.status.is_terminal())
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let wait_state = processor
+            .task_runtime
+            .service()
+            .get_wait_state_snapshot(TaskWaitParams {
+                task_ids,
+                run_ids: Vec::new(),
+                timeout_ms: Some(0),
+                mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                return_completed: false,
+                return_pending: false,
+            })
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let mut observations = wait_state
+            .review_required
+            .iter()
+            .map(review_required_task_observation)
+            .collect::<Vec<_>>();
+        observations.sort_by(|left, right| {
+            left.task_id
+                .cmp(&right.task_id)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+                .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+        });
+        Ok(observations)
     }
 
     async fn terminal_attached_task_observations(
@@ -307,6 +353,7 @@ impl ToolHandler for TaskToolHandler {
             TASK_CREATE_TOOL => task_tool_future(self.handle_create(invocation)).await,
             TASK_WAIT_TOOL => task_tool_future(self.handle_wait(invocation)).await,
             TASK_ACCEPT_TOOL => task_tool_future(self.handle_accept(invocation)).await,
+            TASK_REVISE_TOOL => task_tool_future(self.handle_revise(invocation)).await,
             TASK_CANCEL_TOOL => task_tool_future(self.handle_cancel(invocation)).await,
             TASK_UPDATE_TOOL => task_tool_future(self.handle_update(invocation)).await,
             TASK_DETACH_TOOL => task_tool_future(self.handle_detach(invocation)).await,
@@ -578,6 +625,58 @@ impl TaskToolHandler {
             .await
             .map(|tasks| tasks.into_iter().all(|task| task.status.is_terminal()))
             .unwrap_or(false)
+    }
+
+    async fn handle_revise(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskReviseToolInput = decode_tool_args(invocation.clone())?;
+        let params = input.into_params()?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
+        if let Some(output) = cache_key
+            .as_ref()
+            .and_then(|key| mutation_outputs.get(key).cloned())
+        {
+            return Ok(function_output(output));
+        }
+        if let Some(output) = self.prior_successful_mutation_output(&invocation).await? {
+            if let Some(key) = cache_key.as_ref() {
+                mutation_outputs.insert(key.clone(), output.clone());
+            }
+            return Ok(function_output(output));
+        }
+
+        let service = self.processor.task_runtime.service();
+        let executor = self.processor.task_agent_executor.clone();
+        let context = pioneer_tasks::TaskMutationContext::parent_agent(
+            self.context.thread_id.clone(),
+            self.context.turn_id.clone(),
+        );
+        let response = match task_tool_fresh_task(async move {
+            let revised = service
+                .revise_task_result_candidate(context, params)
+                .await?;
+            executor.dispatch_revision_turn(revised).await
+        })
+        .await
+        {
+            Ok(response) => {
+                response.map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+            }
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "task_revise worker failed: {error}"
+                )));
+            }
+        };
+        let output = task_revise_tool_output(&response);
+        if let Some(key) = cache_key {
+            mutation_outputs.insert(key, output.clone());
+        }
+        Ok(function_output(output))
     }
 
     async fn handle_cancel(
@@ -1463,6 +1562,54 @@ impl TaskAcceptToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_revise. Use this only for a candidate returned by task_wait reviewRequired.
+struct TaskReviseToolInput {
+    /// Task id that owns the candidate. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    /// Task run id that produced the candidate. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    run_id: String,
+    /// Candidate id to reject and revise. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    candidate_id: String,
+    /// Concrete feedback explaining what is wrong and what the child must fix.
+    #[schemars(length(min = 1, max = 16000))]
+    feedback: String,
+    #[serde(default)]
+    /// Optional additional instructions for the revision turn.
+    additional_instructions: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
+}
+
+impl TaskReviseToolInput {
+    fn into_params(self) -> Result<TaskReviseParams, ToolError> {
+        let feedback = self.feedback.trim().to_owned();
+        if feedback.is_empty() {
+            return Err(ToolError::invalid_arguments("feedback must be non-empty"));
+        }
+        Ok(TaskReviseParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            run_id: validate_entity_id(self.run_id, "runId")?,
+            candidate_id: validate_entity_id(self.candidate_id, "candidateId")?,
+            feedback,
+            additional_instructions: self
+                .additional_instructions
+                .into_iter()
+                .filter_map(|value| clean_optional_string(Some(value)))
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_cancel.
 struct TaskCancelToolInput {
     /// Task id to cancel. Pioneer entity ids are exactly 21 characters.
@@ -1797,6 +1944,12 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
             safe_mutation_recovery(),
         ),
         task_tool_spec(
+            TASK_REVISE_TOOL,
+            "Reject a review candidate returned by task_wait and send concrete feedback to the same child thread for another revision turn.",
+            task_revise_schema(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_CANCEL_TOOL,
             "Cancel a task through the task service.",
             task_cancel_schema(),
@@ -1891,6 +2044,10 @@ fn task_accept_schema() -> JsonValue {
     tool_input_schema::<TaskAcceptToolInput>()
 }
 
+fn task_revise_schema() -> JsonValue {
+    tool_input_schema::<TaskReviseToolInput>()
+}
+
 fn task_cancel_schema() -> JsonValue {
     tool_input_schema::<TaskCancelToolInput>()
 }
@@ -1972,6 +2129,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
         TASK_CREATE_TOOL => task_create_schema(),
         TASK_WAIT_TOOL => task_wait_schema(),
         TASK_ACCEPT_TOOL => task_accept_schema(),
+        TASK_REVISE_TOOL => task_revise_schema(),
         TASK_CANCEL_TOOL => task_cancel_schema(),
         TASK_UPDATE_TOOL => task_update_schema(),
         TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
@@ -1999,6 +2157,9 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         }
         TASK_ACCEPT_TOOL => {
             "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_wait reviewRequired."
+        }
+        TASK_REVISE_TOOL => {
+            "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_wait reviewRequired and provide concrete fix instructions."
         }
         TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
         | TASK_RESUME_TOOL => {
@@ -2539,6 +2700,27 @@ fn task_accept_tool_output(response: &TaskAcceptResponse, final_answer_allowed: 
     })
 }
 
+fn task_revise_tool_output(response: &TaskReviseResponse) -> JsonValue {
+    json!({
+        "requested": response.requested,
+        "alreadyRequested": response.already_requested,
+        "taskId": response.task.id,
+        "runId": response.run.id,
+        "candidateId": response.candidate.id,
+        "status": task_status_label(response.task.status),
+        "runStatus": run_status_label(response.run.status),
+        "candidateStatus": candidate_status_label(response.candidate.status),
+        "reviewEventId": response.review_event.id,
+        "revisionTaskRunTurnId": response.task_run_turn.id,
+        "round": response.round,
+        "childThreadId": response.child_thread_id,
+        "childTurnId": response.child_turn_id,
+        "feedback": response.feedback,
+        "additionalInstructions": response.additional_instructions,
+        "waitForRevision": true,
+    })
+}
+
 fn task_trigger_model_output(trigger: &TaskTrigger) -> JsonValue {
     strip_json_nulls(match &trigger.spec {
         TaskTriggerSpec::Immediate => json!({
@@ -2866,6 +3048,14 @@ fn wait_item_output(item: &pioneer_protocol::TaskWaitItem) -> JsonValue {
 fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> JsonValue {
     let run = item.item.run.as_ref();
     let candidate = &item.candidate;
+    let review_mode = item
+        .review_policy
+        .as_ref()
+        .map(|policy| review_mode_label(policy.mode));
+    let user_approval_required = item
+        .review_policy
+        .as_ref()
+        .is_some_and(|policy| policy.mode == pioneer_protocol::TaskAgentReviewMode::UserApproval);
     let summary = candidate.summary.clone().or_else(|| {
         candidate
             .result
@@ -2885,6 +3075,9 @@ fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> J
         "status": wait_item_status(&item.item.task, run),
         "candidateId": candidate.id,
         "candidateStatus": candidate_status_label(candidate.status),
+        "reviewMode": review_mode,
+        "userApprovalRequired": user_approval_required,
+        "reviewPolicy": item.review_policy,
         "round": candidate.round,
         "summary": summary,
         "resultPreview": result_preview(candidate.result.as_ref()),
@@ -2900,6 +3093,49 @@ fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> J
         "revisionBlockedReason": item.revision_blocked_reason.map(wait_revision_blocked_reason_label),
         "recommendation": review_required_recommendation(item),
     })
+}
+
+fn review_required_task_observation(
+    item: &pioneer_protocol::TaskWaitReviewItem,
+) -> ReviewRequiredTaskObservation {
+    let run = item.item.run.as_ref();
+    let candidate = &item.candidate;
+    let summary = candidate.summary.as_deref().or_else(|| {
+        candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref())
+    });
+    ReviewRequiredTaskObservation {
+        task_id: item.item.task.id.clone(),
+        run_id: run
+            .map(|run| run.id.clone())
+            .unwrap_or_else(|| candidate.run_id.clone()),
+        candidate_id: candidate.id.clone(),
+        title: bounded_preview(item.item.task.title.as_str(), 160),
+        status: wait_item_status(&item.item.task, run),
+        candidate_status: candidate_status_label(candidate.status),
+        round: candidate.round,
+        summary: summary.map(|summary| bounded_preview(summary, 240)),
+        result_preview: result_preview(candidate.result.as_ref()),
+        extraction_error_preview: error_preview(candidate.extraction_error.as_ref()),
+        diagnostics: bounded_diagnostics(candidate.diagnostics.as_slice()),
+        child_thread_id: item.item.child_thread_id.clone(),
+        child_turn_id: item.item.child_turn_id.clone(),
+        max_revision_rounds: item.max_revision_rounds,
+        remaining_revision_rounds: item.remaining_revision_rounds,
+        allowed_actions: item
+            .allowed_actions
+            .iter()
+            .copied()
+            .map(wait_review_action_label)
+            .map(str::to_owned)
+            .collect(),
+        revision_blocked_reason: item
+            .revision_blocked_reason
+            .map(wait_revision_blocked_reason_label)
+            .map(str::to_owned),
+    }
 }
 
 fn non_waitable_item_output(item: &pioneer_protocol::TaskWaitNonWaitableItem) -> JsonValue {
@@ -2993,6 +3229,13 @@ fn reviewer_kind_label(kind: TaskResultReviewerKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase())
+}
+
+fn review_mode_label(mode: pioneer_protocol::TaskAgentReviewMode) -> String {
+    serde_json::to_value(mode)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{mode:?}").to_ascii_lowercase())
 }
 
 fn wait_review_action_label(action: pioneer_protocol::TaskWaitReviewAction) -> &'static str {
@@ -3205,6 +3448,14 @@ fn bounded_preview(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn bounded_diagnostics(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .take(5)
+        .map(|value| bounded_preview(value, 240))
+        .collect()
+}
+
 fn task_status_label(status: TaskStatus) -> String {
     serde_json::to_value(status)
         .ok()
@@ -3403,6 +3654,9 @@ mod tests {
                     child_turn_id: Some("turn_child123456789".to_owned()),
                 },
                 candidate: sample_review_candidate(candidate_status, 2),
+                review_policy: Some(
+                    pioneer_protocol::TaskAgentReviewPolicy::parent_agent_default(2),
+                ),
                 max_revision_rounds: 2,
                 remaining_revision_rounds,
                 allowed_actions,

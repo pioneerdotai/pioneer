@@ -786,6 +786,18 @@ mod tests {
         );
         assert!(compiled.dynamic_system_text.contains("task_create"));
         assert!(compiled.dynamic_system_text.contains("task_wait"));
+        assert!(compiled.dynamic_system_text.contains("task_accept"));
+        assert!(compiled.dynamic_system_text.contains("task_revise"));
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("do not use a review-required candidate as final accepted work")
+        );
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("do not finish the parent turn while attached tasks")
+        );
     }
 
     #[test]

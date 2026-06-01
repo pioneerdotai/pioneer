@@ -23,10 +23,10 @@ use pioneer_protocol::{
     TaskRescheduleReason, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
     TaskResultReviewerKind, TaskResultReviewerSpec, TaskResumeParams, TaskRetryBackoffKind,
-    TaskRetryPolicy, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus,
-    TaskThreadLineage, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec,
-    TaskTriggerStatus, TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams,
+    TaskRetryPolicy, TaskReviseParams, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerCatchUpPolicy, TaskTriggerInput,
+    TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams,
     TaskWaitReviewAction, TaskWaitRevisionBlockedReason, ThreadLineage,
 };
 use sea_orm::Database;
@@ -356,6 +356,7 @@ async fn runtime_with_review_config() -> TaskRuntime {
                 allow_task_create_review_policy: true,
                 default_parent_review_for_immediate_attached_agent_tasks: false,
                 default_max_revision_rounds: 2,
+                auto_accept_after_seconds: 300,
             },
         },
     )
@@ -626,6 +627,17 @@ fn accept_params(task_id: String, run_id: String, candidate_id: String) -> TaskA
         run_id,
         candidate_id,
         reason: Some("accepted by test".to_owned()),
+    }
+}
+
+fn revise_params(task_id: String, run_id: String, candidate_id: String) -> TaskReviseParams {
+    TaskReviseParams {
+        task_id,
+        run_id,
+        candidate_id,
+        feedback: "Please fix the missing acceptance criteria and return an updated result."
+            .to_owned(),
+        additional_instructions: Vec::new(),
     }
 }
 
@@ -1316,6 +1328,396 @@ async fn accept_validation_rejects_active_child_turn() {
 }
 
 #[tokio::test]
+async fn revise_validation_rejects_missing_actor() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+
+    let error = runtime
+        .service()
+        .validate_task_result_candidate_revise_for_test(
+            TaskMutationContext::default(),
+            revise_params(task_id, run_id, candidate_id),
+        )
+        .await
+        .expect_err("revise without actor should fail");
+    assert!(
+        format!("{error:#}").contains("requires parent-agent thread/turn"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn revise_validation_rejects_max_revision_rounds() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 2, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+
+    let error = runtime
+        .service()
+        .validate_task_result_candidate_revise_for_test(
+            context,
+            revise_params(task_id, run_id, candidate_id),
+        )
+        .await
+        .expect_err("max revision rounds should fail");
+    assert!(
+        format!("{error:#}").contains("max_revision_rounds"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn revise_validation_rejects_empty_feedback() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+    let mut params = revise_params(task_id, run_id, candidate_id);
+    params.feedback = "   ".to_owned();
+
+    let error = runtime
+        .service()
+        .validate_task_result_candidate_revise_for_test(context, params)
+        .await
+        .expect_err("empty feedback should fail");
+    assert!(
+        format!("{error:#}").contains("feedback must be non-empty"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn revise_validation_rejects_active_child_turn() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+    let response = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: task_id.clone(),
+        })
+        .await
+        .expect("task should read");
+    let candidate = response
+        .result_candidates
+        .iter()
+        .find(|candidate| candidate.id == candidate_id)
+        .expect("candidate should exist");
+    let active_turn = TaskRunTurn {
+        id: "active_revise_validation_turn".to_owned(),
+        task_id: task_id.clone(),
+        run_id: run_id.clone(),
+        execution_id: None,
+        thread_id: candidate.thread_id.clone(),
+        turn_id: "active_revise_validation_child_turn".to_owned(),
+        kind: TaskRunTurnKind::Revision,
+        round: candidate.round.saturating_add(1),
+        sequence: 99,
+        status: TaskRunTurnStatus::InProgress,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: Some(candidate.id.clone()),
+        requested_by_review_event_id: None,
+        created_at: 50_000,
+        started_at: Some(50_000),
+        completed_at: None,
+    };
+    let appended = runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRunTurnStarted {
+                task_run_turn: active_turn,
+            },
+            50_000,
+        )
+        .await
+        .expect("active turn should append");
+    runtime.service().publish_and_wake(vec![appended]).await;
+
+    let error = runtime
+        .service()
+        .validate_task_result_candidate_revise_for_test(
+            context,
+            revise_params(task_id, run_id, candidate_id),
+        )
+        .await
+        .expect_err("active child turn should block revise");
+    assert!(
+        format!("{error:#}").contains("in-progress child turn"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn revise_validation_rejects_terminal_run() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        task_id.clone(),
+        run_id.clone(),
+    );
+    handle
+        .complete_run(
+            Some(TaskResult {
+                summary: Some("already completed".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: Some(run_id.clone()),
+            }),
+            40_000,
+        )
+        .await
+        .expect("test run should complete");
+
+    let error = runtime
+        .service()
+        .validate_task_result_candidate_revise_for_test(
+            context,
+            revise_params(task_id, run_id, candidate_id),
+        )
+        .await
+        .expect_err("terminal run should fail revise validation");
+    assert!(
+        format!("{error:#}").contains("not waiting for review"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn revise_task_result_candidate_records_rejection_and_revision_turn_idempotently() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+    let params = revise_params(task_id.clone(), run_id.clone(), candidate_id.clone());
+
+    let revised = runtime
+        .service()
+        .revise_task_result_candidate(context.clone(), params.clone())
+        .await
+        .expect("parent revise should reject candidate and reserve revision turn");
+
+    assert!(revised.requested);
+    assert!(!revised.already_requested);
+    assert_eq!(revised.task.status, TaskStatus::Running);
+    assert_eq!(revised.run.status, TaskRunStatus::Running);
+    assert_eq!(
+        revised.candidate.status,
+        TaskResultCandidateStatus::Rejected
+    );
+    assert_eq!(
+        revised.review_event.decision,
+        TaskResultReviewDecision::RequestChanges
+    );
+    assert_eq!(
+        revised.review_event.next_task_run_turn_id.as_deref(),
+        Some(revised.task_run_turn.id.as_str())
+    );
+    assert_eq!(revised.task_run_turn.kind, TaskRunTurnKind::Revision);
+    assert_eq!(revised.task_run_turn.round, 1);
+    assert_eq!(
+        revised.task_run_turn.requested_by_candidate_id.as_deref(),
+        Some(candidate_id.as_str())
+    );
+    assert_eq!(
+        revised
+            .task_run_turn
+            .requested_by_review_event_id
+            .as_deref(),
+        Some(revised.review_event.id.as_str())
+    );
+    assert_eq!(revised.child_thread_id, revised.candidate.thread_id);
+
+    let review_events = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(review_events.len(), 1);
+    let revision_turns = runtime
+        .service()
+        .store()
+        .list_task_run_turns(run_id.as_str())
+        .await
+        .expect("turns should list")
+        .into_iter()
+        .filter(|turn| turn.kind == TaskRunTurnKind::Revision)
+        .collect::<Vec<_>>();
+    assert_eq!(revision_turns, vec![revised.task_run_turn.clone()]);
+    let task_events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: task_id.clone(),
+            after_sequence: None,
+        })
+        .await
+        .expect("events should list");
+    assert!(task_events.events.iter().any(|event| matches!(
+        event.payload,
+        TaskEventPayload::TaskRevisionRequested { .. }
+    )));
+
+    let duplicate = runtime
+        .service()
+        .revise_task_result_candidate(context, params)
+        .await
+        .expect("duplicate parent revise should be idempotent");
+    assert!(duplicate.already_requested);
+    assert_eq!(duplicate.review_event.id, revised.review_event.id);
+    assert_eq!(duplicate.task_run_turn.id, revised.task_run_turn.id);
+    let review_events_after_duplicate = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list after duplicate");
+    assert_eq!(review_events_after_duplicate.len(), 1);
+    let revision_turns_after_duplicate = runtime
+        .service()
+        .store()
+        .list_task_run_turns(run_id.as_str())
+        .await
+        .expect("turns should list after duplicate")
+        .into_iter()
+        .filter(|turn| turn.kind == TaskRunTurnKind::Revision)
+        .count();
+    assert_eq!(revision_turns_after_duplicate, 1);
+}
+
+#[tokio::test]
+async fn revision_completion_creates_next_round_pending_review_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+
+    let revised = runtime
+        .service()
+        .revise_task_result_candidate(
+            context,
+            revise_params(task_id.clone(), run_id.clone(), candidate_id.clone()),
+        )
+        .await
+        .expect("parent revise should reserve revision turn");
+    let completed_at = revised.task_run_turn.created_at.saturating_add(10);
+    let mut completed_turn = revised.task_run_turn.clone();
+    completed_turn.status = TaskRunTurnStatus::CandidateCreated;
+    completed_turn.completed_at = Some(completed_at);
+    let next_candidate = TaskResultCandidate {
+        id: format!("candidate_revision_{}", run_id),
+        task_id: task_id.clone(),
+        run_id: run_id.clone(),
+        task_run_turn_id: completed_turn.id.clone(),
+        thread_id: completed_turn.thread_id.clone(),
+        turn_id: completed_turn.turn_id.clone(),
+        round: completed_turn.round,
+        status: TaskResultCandidateStatus::PendingReview,
+        result: Some(TaskResult {
+            summary: Some("revised candidate summary".to_owned()),
+            data: Some(TaskValue::String("revised candidate result".to_owned())),
+            artifacts: Vec::new(),
+            completed_by_run_id: Some(run_id.clone()),
+        }),
+        extraction_error: None,
+        summary: Some("revised candidate summary".to_owned()),
+        diagnostics: Vec::new(),
+        final_review_event_id: None,
+        created_at: completed_at,
+        updated_at: completed_at,
+        resolved_at: None,
+    };
+    let handle = TaskExecutionHandle::new(
+        runtime.service().store(),
+        runtime.event_bus(),
+        task_id.clone(),
+        run_id.clone(),
+    );
+    handle
+        .record_pending_review_result_candidate(
+            completed_turn,
+            next_candidate.clone(),
+            completed_at,
+        )
+        .await
+        .expect("revision candidate should enter review");
+
+    let response = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: task_id.clone(),
+        })
+        .await
+        .expect("task should read");
+    assert_eq!(response.task.status, TaskStatus::WaitingReview);
+    assert_eq!(
+        response
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .expect("run should exist")
+            .status,
+        TaskRunStatus::WaitingReview
+    );
+    let previous = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(candidate_id.as_str())
+        .await
+        .expect("previous candidate lookup should succeed")
+        .expect("previous candidate should exist");
+    assert_eq!(previous.status, TaskResultCandidateStatus::Rejected);
+    let pending = runtime
+        .service()
+        .store()
+        .get_pending_task_result_candidate(run_id.as_str())
+        .await
+        .expect("pending candidate lookup should succeed")
+        .expect("revision candidate should be pending review");
+    assert_eq!(pending.id, next_candidate.id);
+    assert_eq!(pending.round, 1);
+    assert_eq!(
+        pending.task_run_turn_id, revised.task_run_turn.id,
+        "new candidate must stay linked to the revision turn"
+    );
+    assert!(
+        runtime
+            .service()
+            .store()
+            .get_accepted_task_result_candidate(run_id.as_str())
+            .await
+            .expect("accepted candidate lookup should succeed")
+            .is_none(),
+        "review-enabled revision result must not auto-accept"
+    );
+}
+
+#[tokio::test]
 async fn accept_task_result_candidate_parent_records_accept_and_finalizes_run() {
     let runtime = runtime_with_review_config().await;
     let (task_id, run_id, candidate_id) =
@@ -1402,6 +1804,140 @@ async fn accept_task_result_candidate_parent_records_accept_and_finalizes_run() 
         .await
         .expect("review events should list after duplicate");
     assert_eq!(events_after_duplicate.len(), 1);
+}
+
+#[tokio::test]
+async fn auto_accept_expired_review_candidates_accepts_pending_candidate_after_timeout() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let candidate = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(candidate_id.as_str())
+        .await
+        .expect("candidate lookup should succeed")
+        .expect("candidate should exist");
+
+    let before_timeout = runtime
+        .service()
+        .auto_accept_expired_review_candidates(candidate.created_at.saturating_add(299), 1024)
+        .await
+        .expect("before-timeout scan should succeed");
+    assert_eq!(before_timeout, 0);
+
+    let accepted = runtime
+        .service()
+        .auto_accept_expired_review_candidates(candidate.created_at.saturating_add(300), 1024)
+        .await
+        .expect("timeout scan should accept candidate");
+    assert_eq!(accepted, 1);
+
+    let response = runtime
+        .service()
+        .store()
+        .get_task(task_id.as_str())
+        .await
+        .expect("task lookup should succeed")
+        .expect("task should exist");
+    assert_eq!(response.task.status, TaskStatus::Completed);
+    let run = response
+        .runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .expect("run should exist");
+    assert_eq!(run.status, TaskRunStatus::Succeeded);
+    assert_eq!(
+        run.result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("candidate summary")
+    );
+    let accepted_candidate = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(candidate_id.as_str())
+        .await
+        .expect("candidate lookup should succeed after accept")
+        .expect("candidate should exist after accept");
+    assert_eq!(
+        accepted_candidate.status,
+        TaskResultCandidateStatus::Accepted
+    );
+    assert!(accepted_candidate.final_review_event_id.is_some());
+
+    let events = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_kind, TaskResultReviewEventKind::SystemAuto);
+    assert_eq!(events[0].reviewer_kind, TaskResultReviewerKind::RuntimeAuto);
+    assert_eq!(events[0].decision, TaskResultReviewDecision::Accept);
+    assert_eq!(
+        accepted_candidate.final_review_event_id.as_deref(),
+        Some(events[0].id.as_str())
+    );
+    assert_eq!(
+        events[0].created_at,
+        candidate.created_at.saturating_add(300)
+    );
+}
+
+#[tokio::test]
+async fn auto_accept_expired_review_candidates_skips_extraction_failed_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) = create_waiting_review_agent_task(
+        &runtime,
+        2,
+        0,
+        TaskResultCandidateStatus::ExtractionFailed,
+    )
+    .await;
+    let candidate = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(candidate_id.as_str())
+        .await
+        .expect("candidate lookup should succeed")
+        .expect("candidate should exist");
+
+    let accepted = runtime
+        .service()
+        .auto_accept_expired_review_candidates(candidate.created_at.saturating_add(300), 1024)
+        .await
+        .expect("timeout scan should succeed");
+    assert_eq!(accepted, 0);
+
+    let response = runtime
+        .service()
+        .store()
+        .get_task(task_id.as_str())
+        .await
+        .expect("task lookup should succeed")
+        .expect("task should exist");
+    assert_eq!(response.task.status, TaskStatus::WaitingReview);
+    let candidate_after = runtime
+        .service()
+        .store()
+        .get_task_result_candidate(candidate_id.as_str())
+        .await
+        .expect("candidate lookup should succeed after scan")
+        .expect("candidate should exist after scan");
+    assert_eq!(
+        candidate_after.status,
+        TaskResultCandidateStatus::ExtractionFailed
+    );
+    let events = runtime
+        .service()
+        .store()
+        .list_task_result_review_events(candidate_id.as_str())
+        .await
+        .expect("review events should list");
+    assert!(events.is_empty());
 }
 
 #[tokio::test]

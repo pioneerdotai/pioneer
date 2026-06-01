@@ -470,7 +470,6 @@ fn quorum_state(
         .max(1.0);
     let mut accept = 0.0;
     let mut request_changes = 0.0;
-    let mut voted = 0.0;
 
     for (index, spec) in policy.reviewers.iter().enumerate() {
         let key = task_result_reviewer_spec_key(index, spec);
@@ -483,9 +482,6 @@ fn quorum_state(
             AdvisoryClass::RequestChanges => request_changes += weight,
             AdvisoryClass::Abstain => {}
         }
-        if event.decision != TaskResultReviewDecision::Abstain {
-            voted += weight;
-        }
     }
 
     let threshold = total_weight / 2.0;
@@ -495,7 +491,7 @@ fn quorum_state(
     if request_changes > threshold {
         return (true, Some(TaskResultReviewDecision::RequestChanges));
     }
-    (voted > threshold, None)
+    (false, None)
 }
 
 fn advisory_class(decision: TaskResultReviewDecision) -> AdvisoryClass {

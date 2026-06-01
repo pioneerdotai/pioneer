@@ -4,9 +4,9 @@ use super::{
     AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
     AgentTurnHookRuntimeContext, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
     MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, RecoveryAttemptRequest,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
+    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
     TurnFinalizationProvider,
 };
 use futures_util::StreamExt;
@@ -1183,6 +1183,39 @@ struct StaticTaskToolProvider {
     bundle: ToolExtensionBundle,
 }
 
+struct ReviewGuardProvider {
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
+    steps: std::sync::Mutex<VecDeque<ReviewGuardProviderStep>>,
+}
+
+enum ReviewGuardProviderStep {
+    Text(String),
+    Tool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+#[derive(Clone)]
+struct ReviewGuardTaskToolProvider {
+    state: Arc<std::sync::Mutex<ReviewGuardTaskState>>,
+    bundle: ToolExtensionBundle,
+}
+
+struct ReviewGuardTaskState {
+    review_query_skip_remaining: usize,
+    observations: Vec<ReviewRequiredTaskObservation>,
+    pending: Vec<PendingAttachedTask>,
+    revision_observation: ReviewRequiredTaskObservation,
+    accept_calls: usize,
+    revise_calls: usize,
+    wait_calls: usize,
+}
+
+struct ReviewGuardTaskHandler {
+    state: Arc<std::sync::Mutex<ReviewGuardTaskState>>,
+}
+
 #[derive(Default)]
 struct FailingTaskCreateHandler {
     calls: AtomicUsize,
@@ -1191,6 +1224,89 @@ struct FailingTaskCreateHandler {
 impl FailingTaskCreateHandler {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ReviewGuardProvider {
+    fn new(steps: Vec<ReviewGuardProviderStep>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            steps: std::sync::Mutex::new(VecDeque::from(steps)),
+        }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        visible_test_requests(
+            self.requests
+                .lock()
+                .expect("review guard provider lock poisoned")
+                .clone(),
+        )
+    }
+}
+
+impl ReviewGuardProviderStep {
+    fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    fn tool(name: impl Into<String>, arguments: serde_json::Value) -> Self {
+        Self::Tool {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+impl ReviewGuardTaskToolProvider {
+    fn new(initial_observation: ReviewRequiredTaskObservation) -> Self {
+        let state = Arc::new(std::sync::Mutex::new(ReviewGuardTaskState {
+            review_query_skip_remaining: 0,
+            observations: vec![initial_observation],
+            pending: Vec::new(),
+            revision_observation: review_guard_observation(
+                "candidate_review_guard_revision",
+                1,
+                1,
+                &["task_accept", "task_cancel"],
+                Some("fixed after revision"),
+            ),
+            accept_calls: 0,
+            revise_calls: 0,
+            wait_calls: 0,
+        }));
+        let handler: Arc<dyn ToolHandler> = Arc::new(ReviewGuardTaskHandler {
+            state: state.clone(),
+        });
+        Self {
+            state,
+            bundle: fake_task_tool_bundle_for_names(
+                &[
+                    "task_wait",
+                    "task_get",
+                    "task_accept",
+                    "task_revise",
+                    "task_cancel",
+                ],
+                handler,
+            ),
+        }
+    }
+
+    fn with_review_query_skip(self, skip: usize) -> Self {
+        self.state
+            .lock()
+            .expect("review guard task state lock poisoned")
+            .review_query_skip_remaining = skip;
+        self
+    }
+
+    fn call_counts(&self) -> (usize, usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .expect("review guard task state lock poisoned");
+        (state.accept_calls, state.revise_calls, state.wait_calls)
     }
 }
 
@@ -1205,6 +1321,78 @@ impl ToolHandler for FailingTaskCreateHandler {
         Err(ToolError::invalid_arguments(
             "`trigger` must be a JSON object with shape {\"kind\":\"cron\",\"cronExpr\":\"0 7 * * *\",\"timezone\":\"Europe/Moscow\"}",
         ))
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for ReviewGuardTaskHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, ToolError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("review guard task state lock poisoned");
+        let output = match invocation.tool_name.as_str() {
+            "task_accept" => {
+                state.accept_calls += 1;
+                state.observations.clear();
+                state.pending.clear();
+                json!({
+                    "taskId": "task_review_guard",
+                    "runId": "run_review_guard",
+                    "candidateId": "candidate_review_guard",
+                    "accepted": true,
+                    "taskTerminal": true
+                })
+            }
+            "task_revise" => {
+                state.revise_calls += 1;
+                state.observations.clear();
+                state.pending = vec![PendingAttachedTask {
+                    task_id: "task_review_guard".to_owned(),
+                    run_id: Some("run_review_guard".to_owned()),
+                    title: "Review guard task".to_owned(),
+                    status: "running".to_owned(),
+                }];
+                json!({
+                    "taskId": "task_review_guard",
+                    "runId": "run_review_guard",
+                    "candidateId": "candidate_review_guard",
+                    "requested": true,
+                    "nextAction": "task_wait"
+                })
+            }
+            "task_wait" => {
+                state.wait_calls += 1;
+                state.pending.clear();
+                let revision_observation = state.revision_observation.clone();
+                state.observations = vec![revision_observation.clone()];
+                json!({
+                    "reviewRequired": [{
+                        "taskId": "task_review_guard",
+                        "runId": "run_review_guard",
+                        "candidateId": revision_observation.candidate_id,
+                        "allowedActions": revision_observation.allowed_actions
+                    }]
+                })
+            }
+            "task_cancel" => {
+                state.observations.clear();
+                state.pending.clear();
+                json!({ "cancelled": true })
+            }
+            "task_get" => json!({
+                "task": {
+                    "id": "task_review_guard",
+                    "status": if state.observations.is_empty() { "completed" } else { "waiting_review" }
+                }
+            }),
+            _ => json!({ "ok": true }),
+        };
+        Ok(Box::new(FunctionToolOutput::new(output.to_string(), true)))
     }
 }
 
@@ -1259,6 +1447,13 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
         Ok(Vec::new())
     }
 
+    async fn review_required_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
     async fn terminal_attached_task_observations(
         &self,
         _context: TaskTurnContext,
@@ -1271,6 +1466,67 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
         _context: TaskTurnContext,
         _reason: String,
     ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskToolProvider for ReviewGuardTaskToolProvider {
+    async fn materialize_task_tools(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        Ok(TaskToolMaterialization {
+            bundles: vec![self.bundle.clone()],
+            diagnostics: Vec::new(),
+        })
+    }
+
+    async fn pending_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<PendingAttachedTask>, String> {
+        Ok(self
+            .state
+            .lock()
+            .expect("review guard task state lock poisoned")
+            .pending
+            .clone())
+    }
+
+    async fn review_required_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("review guard task state lock poisoned");
+        if state.review_query_skip_remaining > 0 {
+            state.review_query_skip_remaining -= 1;
+            return Ok(Vec::new());
+        }
+        Ok(state.observations.clone())
+    }
+
+    async fn terminal_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn cleanup_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+        _reason: String,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("review guard task state lock poisoned");
+        state.observations.clear();
+        state.pending.clear();
         Ok(())
     }
 }
@@ -1291,6 +1547,13 @@ impl TaskToolProvider for StaticTaskToolProvider {
         &self,
         _context: TaskTurnContext,
     ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn review_required_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
         Ok(Vec::new())
     }
 
@@ -1648,6 +1911,71 @@ fn fake_memory_tool_spec(name: &str) -> ConfiguredToolSpec {
         ExecutionClass::Shared,
         dynamic_unknown_output_policy(),
     )
+}
+
+fn fake_task_tool_spec(name: &str) -> ConfiguredToolSpec {
+    ConfiguredToolSpec::new(
+        ToolSpec::new(
+            name,
+            "test-only task tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }),
+            PayloadKind::Function,
+        ),
+        ExecutionClass::Shared,
+        dynamic_unknown_output_policy(),
+    )
+}
+
+fn fake_task_tool_bundle_for_names(
+    names: &[&str],
+    handler: Arc<dyn ToolHandler>,
+) -> ToolExtensionBundle {
+    ToolExtensionBundle {
+        specs: names.iter().map(|name| fake_task_tool_spec(name)).collect(),
+        handlers: names
+            .iter()
+            .map(|name| ((*name).to_owned(), handler.clone()))
+            .collect(),
+    }
+}
+
+fn review_guard_observation(
+    candidate_id: &str,
+    round: u32,
+    remaining_revision_rounds: u32,
+    allowed_actions: &[&str],
+    summary: Option<&str>,
+) -> ReviewRequiredTaskObservation {
+    ReviewRequiredTaskObservation {
+        task_id: "task_review_guard".to_owned(),
+        run_id: "run_review_guard".to_owned(),
+        candidate_id: candidate_id.to_owned(),
+        title: "Review guard task".to_owned(),
+        status: "waiting_review".to_owned(),
+        candidate_status: "pending_review".to_owned(),
+        round,
+        summary: summary.map(str::to_owned),
+        result_preview: Some("candidate output preview".to_owned()),
+        extraction_error_preview: None,
+        diagnostics: vec!["candidate diagnostic".to_owned()],
+        child_thread_id: Some("child_thread_review_guard".to_owned()),
+        child_turn_id: Some(format!("child_turn_review_guard_{round}")),
+        max_revision_rounds: 2,
+        remaining_revision_rounds,
+        allowed_actions: allowed_actions
+            .iter()
+            .map(|action| (*action).to_owned())
+            .collect(),
+        revision_blocked_reason: if allowed_actions.contains(&"task_revise") {
+            None
+        } else {
+            Some("max_revision_rounds_reached".to_owned())
+        },
+    }
 }
 
 fn fake_memory_tool_bundle_for_names(
@@ -2186,6 +2514,75 @@ impl Provider for CaptureAgentProvider {
 }
 
 #[async_trait::async_trait]
+impl Provider for ReviewGuardProvider {
+    fn name(&self) -> &str {
+        "review-guard"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let preflight = is_turn_preflight_request(&request);
+        self.requests
+            .lock()
+            .expect("review guard provider lock poisoned")
+            .push(request);
+        if preflight {
+            return Ok(test_preflight_response());
+        }
+
+        let step = self
+            .steps
+            .lock()
+            .expect("review guard steps lock poisoned")
+            .pop_front()
+            .unwrap_or_else(|| ReviewGuardProviderStep::text("done"));
+        let response = match step {
+            ReviewGuardProviderStep::Text(text) => ChatResponse {
+                text,
+                usage: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            },
+            ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                tool_calls: vec![ProviderToolCall {
+                    id: format!("call_review_guard_{name}"),
+                    name,
+                    arguments: arguments.to_string(),
+                }],
+            },
+        };
+        Ok(response)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk()));
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for EmptyNoToolRoundProvider {
     fn name(&self) -> &str {
         "empty-no-tool-round"
@@ -2612,6 +3009,21 @@ fn completed_agent_message_text(observed: &[AgentEvent]) -> Option<String> {
         };
         Some(text.clone())
     })
+}
+
+fn completed_system_event_codes(observed: &[AgentEvent]) -> Vec<String> {
+    observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(ItemCompletedNotification { item, .. }) = event else {
+                return None;
+            };
+            let TurnItem::SystemEvent { code, .. } = item else {
+                return None;
+            };
+            code.clone()
+        })
+        .collect()
 }
 
 async fn start_simple_turn(
@@ -4809,6 +5221,226 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
     }
     assert!(!request_tool_names.contains(&"tool_search"));
     assert!(!request_tool_names.contains(&"tool_suggest"));
+}
+
+#[tokio::test]
+async fn phase_11_review_guard_injects_after_final_answer_attempt_and_allows_accept() {
+    let provider = Arc::new(ReviewGuardProvider::new(vec![
+        ReviewGuardProviderStep::text("premature final answer"),
+        ReviewGuardProviderStep::tool(
+            "task_accept",
+            json!({
+                "taskId": "task_review_guard",
+                "runId": "run_review_guard",
+                "candidateId": "candidate_review_guard"
+            }),
+        ),
+        ReviewGuardProviderStep::text("accepted child result"),
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "review-guard",
+        provider.clone(),
+    ));
+    let task_provider = ReviewGuardTaskToolProvider::new(review_guard_observation(
+        "candidate_review_guard",
+        0,
+        2,
+        &["task_accept", "task_revise", "task_cancel"],
+        Some("initial candidate"),
+    ))
+    .with_review_query_skip(1);
+    let task_provider_for_assert = task_provider.clone();
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(task_provider)))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_review_accept_after_guard",
+        "ws_phase11_review_accept_after_guard",
+        "turn_phase11_review_accept_after_guard",
+        ThreadMode::Agent,
+        "review-guard",
+        "Review the attached child result.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(
+        completed_agent_message_text(&observed).as_deref(),
+        Some("accepted child result")
+    );
+    assert_eq!(task_provider_for_assert.call_counts(), (1, 0, 0));
+
+    let codes = completed_system_event_codes(&observed);
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| code.as_str() == "task.review_required.observed")
+            .count(),
+        1
+    );
+    assert!(
+        !codes
+            .iter()
+            .any(|code| code.as_str() == "task.terminal.observed"),
+        "review-required observation must not be recorded as a terminal task observation"
+    );
+    let requests = provider.snapshot_requests();
+    assert!(
+        requests.len() >= 3,
+        "guard should loop after injecting review observation before accept"
+    );
+}
+
+#[tokio::test]
+async fn phase_11_review_guard_revise_waits_for_revision_candidate_then_accepts() {
+    let provider = Arc::new(ReviewGuardProvider::new(vec![
+        ReviewGuardProviderStep::tool(
+            "task_revise",
+            json!({
+                "taskId": "task_review_guard",
+                "runId": "run_review_guard",
+                "candidateId": "candidate_review_guard",
+                "feedback": "Fix the missing detail."
+            }),
+        ),
+        ReviewGuardProviderStep::tool("task_wait", json!({ "taskIds": ["task_review_guard"] })),
+        ReviewGuardProviderStep::tool(
+            "task_accept",
+            json!({
+                "taskId": "task_review_guard",
+                "runId": "run_review_guard",
+                "candidateId": "candidate_review_guard_revision"
+            }),
+        ),
+        ReviewGuardProviderStep::text("accepted revised child result"),
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "review-guard",
+        provider.clone(),
+    ));
+    let task_provider = ReviewGuardTaskToolProvider::new(review_guard_observation(
+        "candidate_review_guard",
+        0,
+        2,
+        &["task_accept", "task_revise", "task_cancel"],
+        Some("initial candidate"),
+    ));
+    let task_provider_for_assert = task_provider.clone();
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(task_provider)))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_review_revise_wait_accept",
+        "ws_phase11_review_revise_wait_accept",
+        "turn_phase11_review_revise_wait_accept",
+        ThreadMode::Agent,
+        "review-guard",
+        "Review and revise the attached child result if needed.",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(
+        completed_agent_message_text(&observed).as_deref(),
+        Some("accepted revised child result")
+    );
+    assert_eq!(task_provider_for_assert.call_counts(), (1, 1, 1));
+
+    let codes = completed_system_event_codes(&observed);
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| code.as_str() == "task.review_required.observed")
+            .count(),
+        2
+    );
+    assert!(
+        !codes
+            .iter()
+            .any(|code| code.as_str() == "task.terminal.observed"),
+        "review-required observation must not be recorded as a terminal task observation"
+    );
+    let requests = provider.snapshot_requests();
+    let revision_review_request = requests
+        .iter()
+        .find(|request| {
+            request.messages.iter().any(|message| {
+                message.content.contains("candidate_review_guard_revision")
+                    && message.content.contains("max_revision_rounds_reached")
+            })
+        })
+        .expect("revision candidate observation should be sent to provider");
+    let visible_tool_names = revision_review_request
+        .tools
+        .as_ref()
+        .expect("review request should include tool schemas")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(visible_tool_names.contains(&"task_accept"));
+    assert!(visible_tool_names.contains(&"task_cancel"));
+    assert!(visible_tool_names.contains(&"task_wait"));
+    assert!(
+        !visible_tool_names.contains(&"task_revise"),
+        "task_revise must stay hidden when the candidate no longer allows revisions"
+    );
+}
+
+#[tokio::test]
+async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
+    let provider = Arc::new(ReviewGuardProvider::new(vec![
+        ReviewGuardProviderStep::text("ignoring review and answering anyway"),
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "review-guard",
+        provider.clone(),
+    ));
+    let task_provider = ReviewGuardTaskToolProvider::new(review_guard_observation(
+        "candidate_review_guard",
+        0,
+        2,
+        &["task_accept", "task_revise", "task_cancel"],
+        Some("initial candidate"),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(task_provider)))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_review_no_spam",
+        "ws_phase11_review_no_spam",
+        "turn_phase11_review_no_spam",
+        ThreadMode::Agent,
+        "review-guard",
+        "Review the attached child result.",
+    )
+    .await;
+    assert_turn_failed(
+        &observed,
+        "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.",
+    );
+
+    let codes = completed_system_event_codes(&observed);
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| code.as_str() == "task.review_required.observed")
+            .count(),
+        1
+    );
+    assert!(
+        !codes
+            .iter()
+            .any(|code| code.as_str() == "task.terminal.observed"),
+        "review-required observation must not be recorded as a terminal task observation"
+    );
+    assert!(completed_agent_message_text(&observed).is_none());
 }
 
 #[tokio::test]

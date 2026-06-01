@@ -75,6 +75,7 @@ fn status_for_task(status: TaskStatus) -> TimelineEntryStatus {
         | TaskStatus::Scheduled
         | TaskStatus::Queued
         | TaskStatus::Running
+        | TaskStatus::WaitingReview
         | TaskStatus::Waiting => TimelineEntryStatus::Running,
     }
 }

@@ -562,7 +562,25 @@ impl TaskProjector {
                         completed_at: None,
                     },
                 )
-                .await
+                .await?;
+                let requested_at = unix_to_datetime(*requested_at);
+                let run_outcome =
+                    task_run::update_run_status(db, run_id, TaskRunStatus::Running, requested_at)
+                        .await?;
+                handle_projection_outcome(
+                    "task_revision_requested_run_status",
+                    run_id,
+                    &run_outcome,
+                )?;
+                let task_outcome =
+                    task::update_task_status(db, task_id, TaskStatus::Running, requested_at, None)
+                        .await?;
+                handle_projection_outcome(
+                    "task_revision_requested_task_status",
+                    task_id,
+                    &task_outcome,
+                )?;
+                Ok(())
             }),
             TaskEventPayload::TaskRunEnteredReview {
                 task_id,

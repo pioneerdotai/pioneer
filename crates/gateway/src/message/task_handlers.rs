@@ -195,6 +195,44 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn task_revise(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: TaskReviseParams,
+    ) {
+        let context =
+            pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
+        match message_future(async {
+            let revised = self
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(context, params)
+                .await?;
+            self.task_agent_executor
+                .dispatch_revision_turn(revised)
+                .await
+        })
+        .await
+        {
+            Ok(response_payload) => {
+                self.send_task_response(connection_id, request_id, &response_payload)
+                    .await
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to revise task result: {error:#}"),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
     pub(super) async fn task_cancel(
         &self,
         connection_id: ConnectionId,

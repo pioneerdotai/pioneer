@@ -30,9 +30,10 @@ use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
     AgentMcpMaterializationRequest, AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
     AgentTurnHookRuntimeContext, ResolvedArtifactInput, RetainedToolLlmContext,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
-    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
-    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext,
+    TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization,
+    TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -93,6 +94,7 @@ use tracing::warn;
 const TURN_ITEM_ID_LEN: usize = 21;
 const PROVIDER_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDER_INTER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS: usize = 20;
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
 const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
 const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
@@ -176,6 +178,14 @@ struct RenderedTaskObservation {
     details: JsonValue,
 }
 
+#[derive(Debug)]
+struct RenderedReviewRequiredObservation {
+    signatures: Vec<String>,
+    observations: Vec<ReviewRequiredTaskObservation>,
+    message: String,
+    details: JsonValue,
+}
+
 impl ExecutedToolResult {
     fn retry_observation(&self) -> ToolRetryObservation {
         ToolRetryObservation::from_tool_outcome(
@@ -248,6 +258,52 @@ fn apply_request_tools_results_to_visible_tools(
         ));
     }
     added
+}
+
+fn apply_review_required_tools_to_visible_tools(
+    visible_tool_names: &mut Vec<String>,
+    observations: &[ReviewRequiredTaskObservation],
+    router: &pioneer_tools::ToolRouter,
+) -> Vec<String> {
+    let mut wanted = BTreeSet::from(["task_get".to_owned(), "task_wait".to_owned()]);
+    for observation in observations {
+        wanted.extend(observation.allowed_actions.iter().cloned());
+    }
+
+    let mut visible = visible_tool_names.iter().cloned().collect::<BTreeSet<_>>();
+    let mut added = Vec::new();
+    for tool_name in wanted {
+        if visible.contains(tool_name.as_str()) || router.find_spec(tool_name.as_str()).is_none() {
+            continue;
+        }
+        visible.insert(tool_name.clone());
+        visible_tool_names.push(tool_name.clone());
+        added.push(tool_name);
+    }
+    added
+}
+
+fn sync_review_action_tools_to_observations(
+    visible_tool_names: &mut Vec<String>,
+    observations: &[ReviewRequiredTaskObservation],
+) -> Vec<String> {
+    let allowed_review_actions = observations
+        .iter()
+        .flat_map(|observation| observation.allowed_actions.iter().map(String::as_str))
+        .filter(|tool_name| matches!(*tool_name, "task_accept" | "task_revise"))
+        .collect::<BTreeSet<_>>();
+    let mut removed = Vec::new();
+    visible_tool_names.retain(|tool_name| {
+        if matches!(tool_name.as_str(), "task_accept" | "task_revise")
+            && !allowed_review_actions.contains(tool_name.as_str())
+        {
+            removed.push(tool_name.clone());
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 impl TaskMutationFinalizationGuard {
@@ -1887,6 +1943,116 @@ async fn materialize_turn_tooling(
     }
 }
 
+async fn review_required_attached_task_observation(
+    provider: Option<&Arc<dyn TaskToolProvider>>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Option<RenderedReviewRequiredObservation> {
+    let provider = provider?;
+    let observations = match provider
+        .review_required_attached_task_observations(TaskTurnContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        })
+        .await
+    {
+        Ok(observations) => observations,
+        Err(error) => {
+            warn!(
+                thread_id,
+                turn_id,
+                error = error.as_str(),
+                "failed to query review-required attached tasks before parent turn completion"
+            );
+            return None;
+        }
+    };
+
+    let mut observations = observations
+        .into_iter()
+        .take(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS)
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return None;
+    }
+    observations.sort_by(|left, right| {
+        left.task_id
+            .cmp(&right.task_id)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+    });
+
+    let signatures = observations
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<Vec<_>>();
+    let payload = observations
+        .iter()
+        .map(review_required_observation_payload)
+        .collect::<Vec<_>>();
+    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
+    let message = format!(
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+    );
+    let details = json!({
+        "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
+        "observations": payload,
+    });
+
+    Some(RenderedReviewRequiredObservation {
+        signatures,
+        observations,
+        message,
+        details,
+    })
+}
+
+fn review_required_observation_signature(observation: &ReviewRequiredTaskObservation) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        observation.task_id,
+        observation.run_id,
+        observation.candidate_id,
+        observation.candidate_status,
+        observation.round,
+        observation.remaining_revision_rounds,
+        observation.allowed_actions.join(","),
+        observation.revision_blocked_reason.as_deref().unwrap_or("")
+    )
+}
+
+fn review_required_observation_payload(observation: &ReviewRequiredTaskObservation) -> JsonValue {
+    json!({
+        "taskId": observation.task_id,
+        "runId": observation.run_id,
+        "candidateId": observation.candidate_id,
+        "title": observation.title,
+        "status": observation.status,
+        "candidateStatus": observation.candidate_status,
+        "round": observation.round,
+        "summary": observation.summary.as_deref().map(|summary| bounded_task_text(summary, 800)),
+        "resultPreview": observation.result_preview.as_deref().map(|preview| bounded_task_text(preview, 1200)),
+        "extractionErrorPreview": observation.extraction_error_preview.as_deref().map(|preview| bounded_task_text(preview, 800)),
+        "diagnostics": observation
+            .diagnostics
+            .iter()
+            .map(|diagnostic| bounded_task_text(diagnostic, 400))
+            .collect::<Vec<_>>(),
+        "childThreadId": observation.child_thread_id,
+        "childTurnId": observation.child_turn_id,
+        "maxRevisionRounds": observation.max_revision_rounds,
+        "remainingRevisionRounds": observation.remaining_revision_rounds,
+        "allowedActions": observation.allowed_actions,
+        "revisionBlockedReason": observation.revision_blocked_reason,
+    })
+}
+
+fn review_required_final_answer_block_message() -> String {
+    "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.".to_owned()
+}
+
 async fn pending_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -1933,7 +2099,7 @@ async fn pending_attached_task_observation(
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "Attached tasks created by this turn are still active or waiting for review, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, task_accept for acceptable review candidates, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
+        "Attached tasks created by this turn are still active, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
     ))
 }
 
@@ -2803,6 +2969,7 @@ async fn execute_agent_provider_response(
 
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
+    let mut observed_review_required_signatures = BTreeSet::<String>::new();
     let mut observed_terminal_task_ids = BTreeSet::<String>::new();
     let mut tool_loop_guard = ToolLoopGuard::new(
         tool_loop_config.budget.clone(),
@@ -2821,6 +2988,55 @@ async fn execute_agent_provider_response(
 
         loop {
             retain_agent_attachment_messages(&mut messages);
+
+            let review_observation = review_required_attached_task_observation(
+                task_tool_provider.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await;
+            if let Some(observation) = review_observation {
+                sync_review_action_tools_to_observations(
+                    &mut visible_tool_names,
+                    observation.observations.as_slice(),
+                );
+                let has_new_signature = observation
+                    .signatures
+                    .iter()
+                    .any(|signature| !observed_review_required_signatures.contains(signature));
+                if has_new_signature {
+                    observed_review_required_signatures.extend(observation.signatures.clone());
+                    apply_review_required_tools_to_visible_tools(
+                        &mut visible_tool_names,
+                        observation.observations.as_slice(),
+                        router.as_ref(),
+                    );
+                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
+                    emit_durable_event(
+                        event_tx.as_ref(),
+                        AgentDurableEvent::ItemCompleted {
+                            notification: ItemCompletedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::SystemEvent {
+                                    id: event_item_id,
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: observation.message.clone(),
+                                    code: Some("task.review_required.observed".to_owned()),
+                                    details: Some(observation.details),
+                                },
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    messages.push(ChatMessage::user(observation.message));
+                }
+            } else {
+                sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
+            }
 
             if let Some(observation) = terminal_attached_task_observation(
                 task_tool_provider.as_ref(),
@@ -3190,6 +3406,74 @@ async fn execute_agent_provider_response(
 
             if round.tool_calls.is_empty() {
                 if round_plan.tools_enabled && pending_retry_instruction.take().is_some() {
+                    consecutive_empty_no_tool_rounds = 0;
+                    continue;
+                }
+
+                if let Some(observation) = review_required_attached_task_observation(
+                    task_tool_provider.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                )
+                .await
+                {
+                    let has_new_signature = observation
+                        .signatures
+                        .iter()
+                        .any(|signature| !observed_review_required_signatures.contains(signature));
+                    if !has_new_signature {
+                        return Err((
+                            ChatTurnError::Terminal(review_required_final_answer_block_message()),
+                            current_thinking_id.clone(),
+                        ));
+                    }
+
+                    observed_review_required_signatures.extend(observation.signatures.clone());
+                    sync_review_action_tools_to_observations(
+                        &mut visible_tool_names,
+                        observation.observations.as_slice(),
+                    );
+                    apply_review_required_tools_to_visible_tools(
+                        &mut visible_tool_names,
+                        observation.observations.as_slice(),
+                        router.as_ref(),
+                    );
+                    send_reasoning_completed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        current_thinking_id.as_str(),
+                        round.reasoning.as_str(),
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
+                    emit_durable_event(
+                        event_tx.as_ref(),
+                        AgentDurableEvent::ItemCompleted {
+                            notification: ItemCompletedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::SystemEvent {
+                                    id: event_item_id,
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: observation.message.clone(),
+                                    code: Some("task.review_required.observed".to_owned()),
+                                    details: Some(observation.details),
+                                },
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    messages.push(ChatMessage::user(observation.message));
+                    current_thinking_id =
+                        start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                            .await
+                            .map_err(|error| (error, current_thinking_id.clone()))?;
                     consecutive_empty_no_tool_rounds = 0;
                     continue;
                 }
@@ -4342,12 +4626,14 @@ mod tests {
     use super::{
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
         apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
-        build_user_message, compile_agent_prompt_bundle_with_prompt_root,
-        normalize_turn_capabilities, resolve_skill_capability_summary,
-        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
-        retain_chat_mode_attachment_messages,
+        apply_review_required_tools_to_visible_tools, build_user_message,
+        compile_agent_prompt_bundle_with_prompt_root, normalize_turn_capabilities,
+        resolve_skill_capability_summary, retain_agent_attachment_messages,
+        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
+        review_required_observation_payload, review_required_observation_signature,
+        sync_review_action_tools_to_observations,
     };
-    use crate::{ResolvedArtifactInput, RetainedToolLlmContext};
+    use crate::{ResolvedArtifactInput, RetainedToolLlmContext, ReviewRequiredTaskObservation};
     use pioneer_promt::{
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
@@ -4388,6 +4674,80 @@ mod tests {
         ) -> Result<Box<dyn ToolOutput>, ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
+    }
+
+    #[test]
+    fn phase_11_review_required_observation_payload_is_bounded_and_actionable() {
+        let observation = ReviewRequiredTaskObservation {
+            task_id: "task_review_payload".to_owned(),
+            run_id: "run_review_payload".to_owned(),
+            candidate_id: "candidate_review_payload".to_owned(),
+            title: "Review payload".to_owned(),
+            status: "waiting_review".to_owned(),
+            candidate_status: "pending_review".to_owned(),
+            round: 2,
+            summary: Some("candidate summary".to_owned()),
+            result_preview: Some("r".repeat(1400)),
+            extraction_error_preview: Some("e".repeat(900)),
+            diagnostics: vec!["d".repeat(500), "diagnostic two".to_owned()],
+            child_thread_id: Some("child_thread_review_payload".to_owned()),
+            child_turn_id: Some("child_turn_review_payload".to_owned()),
+            max_revision_rounds: 2,
+            remaining_revision_rounds: 0,
+            allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
+            revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
+        };
+
+        let payload = review_required_observation_payload(&observation);
+        assert_eq!(payload["taskId"], "task_review_payload");
+        assert_eq!(payload["runId"], "run_review_payload");
+        assert_eq!(payload["candidateId"], "candidate_review_payload");
+        assert_eq!(payload["status"], "waiting_review");
+        assert_eq!(payload["candidateStatus"], "pending_review");
+        assert_eq!(payload["round"], 2);
+        assert_eq!(payload["summary"], "candidate summary");
+        assert_eq!(payload["childThreadId"], "child_thread_review_payload");
+        assert_eq!(payload["childTurnId"], "child_turn_review_payload");
+        assert_eq!(payload["maxRevisionRounds"], 2);
+        assert_eq!(payload["remainingRevisionRounds"], 0);
+        assert_eq!(
+            payload["allowedActions"],
+            serde_json::json!(["task_accept", "task_cancel"])
+        );
+        assert_eq!(
+            payload["revisionBlockedReason"],
+            "max_revision_rounds_reached"
+        );
+        assert!(
+            payload["resultPreview"]
+                .as_str()
+                .expect("result preview should be present")
+                .chars()
+                .count()
+                <= 1203
+        );
+        assert!(
+            payload["extractionErrorPreview"]
+                .as_str()
+                .expect("error preview should be present")
+                .chars()
+                .count()
+                <= 803
+        );
+        assert!(
+            payload["diagnostics"][0]
+                .as_str()
+                .expect("diagnostic should be present")
+                .chars()
+                .count()
+                <= 403
+        );
+
+        let signature = review_required_observation_signature(&observation);
+        assert!(signature.contains("task_review_payload"));
+        assert!(signature.contains("candidate_review_payload"));
+        assert!(signature.contains("task_accept,task_cancel"));
+        assert!(signature.contains("max_revision_rounds_reached"));
     }
 
     fn skill_capability(id: &str, slug: &str) -> TurnCapability {
@@ -5005,6 +5365,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase_11_review_required_visibility_exposes_only_allowed_review_tools() {
+        let built = build_tools_with_extension_names(&[
+            "task_get",
+            "task_wait",
+            "task_accept",
+            "task_revise",
+            "task_cancel",
+        ]);
+        let mut no_review_visible = vec![
+            "request_tools".to_owned(),
+            "task_accept".to_owned(),
+            "task_revise".to_owned(),
+            "task_cancel".to_owned(),
+        ];
+        let removed_without_review =
+            sync_review_action_tools_to_observations(&mut no_review_visible, &[]);
+        assert_eq!(
+            removed_without_review,
+            vec!["task_accept".to_owned(), "task_revise".to_owned()]
+        );
+        assert!(no_review_visible.contains(&"task_cancel".to_owned()));
+
+        let mut visible_tool_names = vec![
+            "request_tools".to_owned(),
+            "read_file".to_owned(),
+            "task_revise".to_owned(),
+        ];
+        let observations = vec![ReviewRequiredTaskObservation {
+            task_id: "task_review_visibility".to_owned(),
+            run_id: "run_review_visibility".to_owned(),
+            candidate_id: "candidate_review_visibility".to_owned(),
+            title: "Review visibility".to_owned(),
+            status: "waiting_review".to_owned(),
+            candidate_status: "pending_review".to_owned(),
+            round: 2,
+            summary: None,
+            result_preview: None,
+            extraction_error_preview: None,
+            diagnostics: Vec::new(),
+            child_thread_id: None,
+            child_turn_id: None,
+            max_revision_rounds: 2,
+            remaining_revision_rounds: 0,
+            allowed_actions: vec!["task_accept".to_owned(), "task_cancel".to_owned()],
+            revision_blocked_reason: Some("max_revision_rounds_reached".to_owned()),
+        }];
+
+        let removed = sync_review_action_tools_to_observations(
+            &mut visible_tool_names,
+            observations.as_slice(),
+        );
+        assert_eq!(removed, vec!["task_revise".to_owned()]);
+        let added = apply_review_required_tools_to_visible_tools(
+            &mut visible_tool_names,
+            observations.as_slice(),
+            built.router.as_ref(),
+        );
+        built
+            .router
+            .set_model_visible_tools(&visible_tool_names)
+            .await;
+        let visible = built
+            .router
+            .model_visible_specs()
+            .await
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            added,
+            vec![
+                "task_accept".to_owned(),
+                "task_cancel".to_owned(),
+                "task_get".to_owned(),
+                "task_wait".to_owned()
+            ]
+        );
+        assert!(visible.contains(&"request_tools".to_owned()));
+        assert!(visible.contains(&"read_file".to_owned()));
+        assert!(visible.contains(&"task_accept".to_owned()));
+        assert!(visible.contains(&"task_cancel".to_owned()));
+        assert!(visible.contains(&"task_get".to_owned()));
+        assert!(visible.contains(&"task_wait".to_owned()));
+        assert!(!visible.contains(&"task_revise".to_owned()));
+    }
+
+    #[tokio::test]
     async fn request_tools_visibility_expansion_exposes_all_memory_tools_next_round() {
         let memory_tools = BuiltinToolDomain::Memory.tool_names();
         let built = build_tools_with_extension_names(memory_tools);
@@ -5331,6 +5779,7 @@ mod tests {
                 "task_create",
                 "task_wait",
                 "task_accept",
+                "task_revise",
                 "task_cancel",
                 "task_update",
                 "task_detach",

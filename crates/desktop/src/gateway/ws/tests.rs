@@ -7,9 +7,10 @@ use crate::gateway::timings::GatewayWsTimings;
 use crate::gateway::types::GatewayEndpointKind;
 use futures_util::{SinkExt, StreamExt};
 use pioneer_protocol::{
-    GatewayNotification, ThreadStartParams, ThreadUnsubscribeStatus, TurnStartParams, TurnStatus,
-    UserInput, WorkspaceChangeKind, WorkspaceCreateParams, WorkspaceSelectParams,
-    WorkspaceUpdateParams, constants::events, generate_id,
+    GatewayNotification, TaskAcceptParams, TaskCancelParams, TaskCancelScope, TaskGetResponse,
+    TaskReviseParams, TaskStatus, TaskWaitResponse, ThreadStartParams, ThreadUnsubscribeStatus,
+    TurnItem, TurnStartParams, TurnStatus, UserInput, WorkspaceChangeKind, WorkspaceCreateParams,
+    WorkspaceSelectParams, WorkspaceUpdateParams, constants::events, generate_id,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -27,6 +28,49 @@ use tokio_tungstenite::tungstenite::Message;
 
 const TEST_WORKSPACE_ID: &str = "ws_000000000000000001";
 const THREAD_ID_LEN: usize = 21;
+
+fn waiting_review_task_json() -> serde_json::Value {
+    json!({
+        "id": "task_review00000001",
+        "workspaceId": TEST_WORKSPACE_ID,
+        "ownerKind": "thread",
+        "ownerId": "thread_parent000001",
+        "createdByThreadId": "thread_parent000001",
+        "createdByTurnId": "turn_parent0000001",
+        "executorKind": "agent",
+        "status": "waiting_review",
+        "title": "Review child work",
+        "goal": "Produce a result",
+        "priority": 0,
+        "revision": 1,
+        "createdAt": 10,
+        "updatedAt": 20
+    })
+}
+
+fn pending_review_candidate_json() -> serde_json::Value {
+    json!({
+        "id": "candidate_review0001",
+        "taskId": "task_review00000001",
+        "runId": "run_review000000001",
+        "taskRunTurnId": "run_turn_initial001",
+        "threadId": "thread_child0000001",
+        "turnId": "turn_child000000001",
+        "round": 0,
+        "status": "pending_review",
+        "result": {
+            "summary": "child result",
+            "data": {
+                "kind": "string",
+                "value": "result body"
+            }
+        },
+        "summary": "child result",
+        "diagnostics": ["schema matched"],
+        "createdAt": 20,
+        "updatedAt": 20
+    })
+}
 
 #[test]
 fn normalize_ws_url_keeps_existing_scheme() {
@@ -108,6 +152,192 @@ fn process_text_payload_maps_unknown_agent_notifications() {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[test]
+fn phase_12_process_text_payload_decodes_waiting_review_task_item() {
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut pending_requests = HashMap::new();
+    let mut pending_upload_chunks = HashMap::new();
+    let mut pending_artifact_upload_chunks = HashMap::new();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": events::ITEM_COMPLETED,
+        "params": {
+            "workspace_id": TEST_WORKSPACE_ID,
+            "thread_id": "thread_parent000001",
+            "turn_id": "turn_parent0000001",
+            "item": {
+                "type": "task",
+                "id": "task_item_review001",
+                "taskId": "task_review00000001",
+                "runId": "run_review000000001",
+                "parentTaskId": null,
+                "rootTaskId": null,
+                "title": "Review child work",
+                "status": "waiting_review",
+                "triggerKind": "immediate",
+                "executorKind": "agent",
+                "childThreadId": "thread_child0000001",
+                "childTurnId": "turn_child000000001",
+                "agentRole": "worker",
+                "depth": 0,
+                "maxDepth": 3,
+                "nextFireAt": null,
+                "resultPreview": null,
+                "errorPreview": null,
+                "createdAt": 10,
+                "updatedAt": 20
+            }
+        }
+    })
+    .to_string();
+
+    process_text_payload(
+        &payload,
+        17,
+        &mut pending_requests,
+        &mut pending_upload_chunks,
+        &mut pending_artifact_upload_chunks,
+        &event_tx,
+    );
+
+    let event = event_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expected websocket event");
+    match event {
+        GatewayWsEvent::Notification {
+            connection_id,
+            notification: GatewayNotification::ItemCompleted(notification),
+        } => {
+            assert_eq!(connection_id, 17);
+            let TurnItem::Task { item } = notification.item else {
+                panic!("expected task item");
+            };
+            assert_eq!(item.status, TaskStatus::WaitingReview);
+            assert_eq!(item.child_thread_id.as_deref(), Some("thread_child0000001"));
+            assert_eq!(item.child_turn_id.as_deref(), Some("turn_child000000001"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn phase_12_desktop_decodes_task_wait_review_required_payload() {
+    let decoded: TaskWaitResponse = serde_json::from_value(json!({
+        "completed": [],
+        "failed": [],
+        "cancelled": [],
+        "reviewRequired": [{
+            "item": {
+                "task": waiting_review_task_json(),
+                "childThreadId": "thread_child0000001",
+                "childTurnId": "turn_child000000001"
+            },
+            "candidate": pending_review_candidate_json(),
+            "reviewPolicy": {
+                "mode": "user_approval",
+                "maxRevisionRounds": 2,
+                "requireExplicitAcceptance": true,
+                "reviewers": [],
+                "resolutionStrategy": "user_final"
+            },
+            "maxRevisionRounds": 2,
+            "remainingRevisionRounds": 1,
+            "allowedActions": ["task_accept", "task_revise", "task_cancel"]
+        }],
+        "pending": [],
+        "nonWaitable": [],
+        "timedOut": false,
+        "totalCount": 1,
+        "terminalCount": 0,
+        "pendingCount": 0,
+        "reviewRequiredCount": 1,
+        "nonWaitableCount": 0,
+        "mode": "all_terminal_or_review_required"
+    }))
+    .expect("desktop should decode review-required wait payload");
+
+    assert_eq!(decoded.review_required_count, 1);
+    assert_eq!(
+        decoded.review_required[0]
+            .review_policy
+            .as_ref()
+            .map(|policy| policy.mode),
+        Some(pioneer_protocol::TaskAgentReviewMode::UserApproval)
+    );
+    assert_eq!(
+        decoded.review_required[0].candidate.summary.as_deref(),
+        Some("child result")
+    );
+}
+
+#[test]
+fn phase_12_desktop_decodes_candidate_and_review_history_payload() {
+    let decoded: TaskGetResponse = serde_json::from_value(json!({
+        "task": waiting_review_task_json(),
+        "triggers": [],
+        "runs": [],
+        "agentSpecs": [],
+        "dependencies": [],
+        "writeLocks": [],
+        "threadLineage": [],
+        "taskRunThreadBindings": [],
+        "taskRunTurns": [{
+            "id": "run_turn_initial001",
+            "taskId": "task_review00000001",
+            "runId": "run_review000000001",
+            "executionId": null,
+            "threadId": "thread_child0000001",
+            "turnId": "turn_child000000001",
+            "kind": "initial",
+            "round": 0,
+            "sequence": 0,
+            "status": "candidate_created",
+            "createdAt": 10,
+            "startedAt": 11,
+            "completedAt": 20
+        }, {
+            "id": "run_turn_revision01",
+            "taskId": "task_review00000001",
+            "runId": "run_review000000001",
+            "executionId": null,
+            "threadId": "thread_child0000001",
+            "turnId": "turn_child000000002",
+            "kind": "revision",
+            "round": 1,
+            "sequence": 1,
+            "status": "in_progress",
+            "requestedByCandidateId": "candidate_review0001",
+            "requestedByReviewEventId": "review_event0000001",
+            "createdAt": 21,
+            "startedAt": 22
+        }],
+        "resultCandidates": [pending_review_candidate_json()],
+        "resultReviewEvents": [{
+            "id": "review_event0000001",
+            "candidateId": "candidate_review0001",
+            "taskId": "task_review00000001",
+            "runId": "run_review000000001",
+            "taskRunTurnId": "run_turn_initial001",
+            "reviewerKind": "review_agent",
+            "reviewerThreadId": "thread_reviewer0001",
+            "reviewerTurnId": "turn_reviewer00001",
+            "eventKind": "advisory",
+            "decision": "request_changes",
+            "feedbackText": "tighten the result",
+            "nextTaskRunTurnId": "run_turn_revision01",
+            "createdAt": 21
+        }]
+    }))
+    .expect("desktop should decode candidate and review history payload");
+
+    assert_eq!(decoded.task_run_turns.len(), 2);
+    assert_eq!(decoded.result_candidates[0].id, "candidate_review0001");
+    assert_eq!(
+        decoded.result_review_events[0].reviewer_kind,
+        pioneer_protocol::TaskResultReviewerKind::ReviewAgent
+    );
 }
 
 #[test]
@@ -724,6 +954,63 @@ fn thread_start_rejects_missing_workspace_id_before_request() {
         })
         .expect_err("empty workspace_id must fail before JSON-RPC send");
     assert!(format!("{error:#}").contains("workspace_id"));
+
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn phase_12_task_review_requests_reject_missing_ids_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let accept_error = sender
+        .task_accept(TaskAcceptParams {
+            task_id: " ".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            candidate_id: "candidate_review0001".to_owned(),
+            reason: None,
+        })
+        .expect_err("empty task id must fail before JSON-RPC send");
+    assert!(format!("{accept_error:#}").contains("task_id"));
+
+    let revise_error = sender
+        .task_revise(TaskReviseParams {
+            task_id: "task_review00000001".to_owned(),
+            run_id: " ".to_owned(),
+            candidate_id: "candidate_review0001".to_owned(),
+            feedback: "fix it".to_owned(),
+            additional_instructions: Vec::new(),
+        })
+        .expect_err("empty run id must fail before JSON-RPC send");
+    assert!(format!("{revise_error:#}").contains("run_id"));
+
+    let cancel_error = sender
+        .task_cancel(TaskCancelParams {
+            task_id: " ".to_owned(),
+            reason: None,
+            scope: TaskCancelScope::AttachedSubtree,
+        })
+        .expect_err("empty task id must fail before JSON-RPC send");
+    assert!(format!("{cancel_error:#}").contains("task_id"));
+
+    let _ = sender.shutdown();
+}
+
+#[test]
+fn phase_12_task_revise_rejects_blank_feedback_before_request() {
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let error = sender
+        .task_revise(TaskReviseParams {
+            task_id: "task_review00000001".to_owned(),
+            run_id: "run_review000000001".to_owned(),
+            candidate_id: "candidate_review0001".to_owned(),
+            feedback: "   ".to_owned(),
+            additional_instructions: Vec::new(),
+        })
+        .expect_err("blank feedback must fail before JSON-RPC send");
+    assert!(format!("{error:#}").contains("feedback"));
 
     let _ = sender.shutdown();
 }
