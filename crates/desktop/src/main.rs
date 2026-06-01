@@ -148,8 +148,21 @@ fn init_locale() {
 }
 
 fn init_tracing() {
+    use tracing_subscriber::{
+        filter::{LevelFilter, Targets},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
+
+    let filter = Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("rmcp::service", LevelFilter::WARN);
+
     let _ = tracing_subscriber::fmt()
         .with_target(false)
         .without_time()
+        .with_max_level(LevelFilter::TRACE)
+        .finish()
+        .with(filter)
         .try_init();
 }
