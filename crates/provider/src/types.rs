@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +96,51 @@ pub struct ProviderInputCapabilities {
     pub audio: InputTypeSupport,
     #[serde(default)]
     pub video: InputTypeSupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderTimeoutPolicy {
+    pub connect_timeout: Duration,
+    pub first_chunk_timeout: Duration,
+    pub inter_chunk_idle_timeout: Duration,
+    pub non_stream_request_timeout: Duration,
+    pub max_stream_duration: Option<Duration>,
+}
+
+impl ProviderTimeoutPolicy {
+    pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+    pub const DEFAULT_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
+    pub const DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
+    pub const DEFAULT_NON_STREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+    pub fn from_secs(
+        connect_timeout_secs: u64,
+        first_chunk_timeout_secs: u64,
+        inter_chunk_idle_timeout_secs: u64,
+        non_stream_request_timeout_secs: u64,
+        max_stream_duration_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(connect_timeout_secs.max(1)),
+            first_chunk_timeout: Duration::from_secs(first_chunk_timeout_secs.max(1)),
+            inter_chunk_idle_timeout: Duration::from_secs(inter_chunk_idle_timeout_secs.max(1)),
+            non_stream_request_timeout: Duration::from_secs(non_stream_request_timeout_secs.max(1)),
+            max_stream_duration: max_stream_duration_secs
+                .map(|secs| Duration::from_secs(secs.max(1))),
+        }
+    }
+}
+
+impl Default for ProviderTimeoutPolicy {
+    fn default() -> Self {
+        Self::from_secs(
+            Self::DEFAULT_CONNECT_TIMEOUT_SECS,
+            Self::DEFAULT_FIRST_CHUNK_TIMEOUT_SECS,
+            Self::DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS,
+            Self::DEFAULT_NON_STREAM_REQUEST_TIMEOUT_SECS,
+            None,
+        )
+    }
 }
 
 impl ProviderInputCapabilities {

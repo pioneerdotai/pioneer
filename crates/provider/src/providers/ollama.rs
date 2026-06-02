@@ -4,7 +4,8 @@ use crate::attachments::{
 };
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderToolCall, Role, StreamChunk, TokenUsage, ToolDefinition,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
+    TokenUsage, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -14,15 +15,14 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct OllamaProvider {
     base_url: String,
+    timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
 
@@ -146,18 +146,28 @@ struct OllamaStreamChunk {
 
 impl OllamaProvider {
     pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_BASE_URL)
+        Self::with_timeout_policy(ProviderTimeoutPolicy::default())
+    }
+
+    pub fn with_timeout_policy(timeout_policy: ProviderTimeoutPolicy) -> Self {
+        Self::with_base_url_and_timeout_policy(DEFAULT_BASE_URL, timeout_policy)
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self::with_base_url_and_timeout_policy(base_url, ProviderTimeoutPolicy::default())
+    }
+
+    pub fn with_base_url_and_timeout_policy(
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         let base_url = normalize_base_url(base_url.into());
 
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
-
-        Self { base_url, client }
+        Self {
+            base_url,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
+        }
     }
 
     fn convert_messages(prepared: &PreparedProviderMessages) -> Result<Vec<OllamaMessage>> {
@@ -328,10 +338,8 @@ impl crate::traits::Provider for OllamaProvider {
             options,
         };
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .json(&api_request)
+        let request_builder = self.client.post(self.chat_url()).json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 
@@ -391,12 +399,9 @@ impl crate::traits::Provider for OllamaProvider {
             options,
         };
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .json(&api_request)
-            .send()
-            .await?;
+        let request_builder = self.client.post(self.chat_url()).json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -488,7 +493,10 @@ impl crate::traits::Provider for OllamaProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self.client.get(self.tags_url()).send().await?;
+        let request_builder = self.client.get(self.tags_url());
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);

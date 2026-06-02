@@ -3,8 +3,9 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
-use crate::factory::create_provider;
+use crate::factory::create_provider_with_timeout_policy;
 use crate::traits::Provider;
+use crate::types::ProviderTimeoutPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderCacheKey {
@@ -37,6 +38,7 @@ impl ProviderCacheKey {
 pub struct ProviderRegistry {
     cache: RwLock<HashMap<ProviderCacheKey, Arc<dyn Provider>>>,
     key_resolver: Box<dyn Fn(Option<&str>, &str) -> String + Send + Sync>,
+    timeout_policy: ProviderTimeoutPolicy,
 }
 
 impl ProviderRegistry {
@@ -45,18 +47,34 @@ impl ProviderRegistry {
     /// `key_resolver` maps a provider name (e.g. `"openai"`) to the API key
     /// string. It is called at most once per provider name.
     pub fn new(key_resolver: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        Self::new_with_timeout_policy(key_resolver, ProviderTimeoutPolicy::default())
+    }
+
+    pub fn new_with_timeout_policy(
+        key_resolver: impl Fn(&str) -> String + Send + Sync + 'static,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             key_resolver: Box::new(move |_, provider_name| key_resolver(provider_name)),
+            timeout_policy,
         }
     }
 
     pub fn new_scoped(
         key_resolver: impl Fn(Option<&str>, &str) -> String + Send + Sync + 'static,
     ) -> Self {
+        Self::new_scoped_with_timeout_policy(key_resolver, ProviderTimeoutPolicy::default())
+    }
+
+    pub fn new_scoped_with_timeout_policy(
+        key_resolver: impl Fn(Option<&str>, &str) -> String + Send + Sync + 'static,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             key_resolver: Box::new(key_resolver),
+            timeout_policy,
         }
     }
 
@@ -96,7 +114,11 @@ impl ProviderRegistry {
         }
 
         let api_key = (self.key_resolver)(key.workspace_id.as_deref(), key.provider_name.as_str());
-        let provider: Arc<dyn Provider> = Arc::from(create_provider(&key.provider_name, &api_key)?);
+        let provider: Arc<dyn Provider> = Arc::from(create_provider_with_timeout_policy(
+            &key.provider_name,
+            &api_key,
+            self.timeout_policy,
+        )?);
         cache.insert(key, provider.clone());
         Ok(provider)
     }
@@ -121,6 +143,7 @@ impl ProviderRegistry {
         Self {
             cache: RwLock::new(cache),
             key_resolver: Box::new(|_, _| String::new()),
+            timeout_policy: ProviderTimeoutPolicy::default(),
         }
     }
 }

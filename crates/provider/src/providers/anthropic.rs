@@ -4,8 +4,8 @@ use crate::attachments::{
 };
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice,
-    ToolDefinition,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
+    TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -15,18 +15,17 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 const BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
+    timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
 
@@ -197,19 +196,30 @@ struct AnthropicModelEntry {
 
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, BASE_URL)
+        Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
+    }
+
+    pub fn with_timeout_policy(
+        api_key: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
+        Self::with_base_url_and_timeout_policy(api_key, BASE_URL, timeout_policy)
     }
 
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
+        Self::with_base_url_and_timeout_policy(api_key, base_url, ProviderTimeoutPolicy::default())
+    }
 
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -439,13 +449,14 @@ impl crate::traits::Provider for AnthropicProvider {
             stream: false,
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(&api_request)
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 
@@ -538,15 +549,15 @@ impl crate::traits::Provider for AnthropicProvider {
             stream: true,
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(&api_request)
-            .send()
-            .await?;
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -703,11 +714,12 @@ impl crate::traits::Provider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self
+        let request_builder = self
             .client
             .get(self.models_url())
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 

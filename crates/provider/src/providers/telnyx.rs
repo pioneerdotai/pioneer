@@ -7,7 +7,8 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatRequest, ChatResponse, InputContentType, ProviderCapabilities,
-        ProviderInputCapabilities, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -18,15 +19,14 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct TelnyxProvider {
     api_key: String,
+    timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
 
@@ -195,17 +195,21 @@ struct ApiUsage {
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    error: Option<StreamError>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: StreamDelta,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
@@ -217,6 +221,42 @@ struct StreamDelta {
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[serde(default)]
     function_call: Option<StreamToolFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
+}
+
+impl StreamError {
+    fn description(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(message) = self.message.filter(|message| !message.is_empty()) {
+            parts.push(message);
+        }
+        if let Some(error_type) = self.error_type.filter(|error_type| !error_type.is_empty()) {
+            parts.push(format!("type={error_type}"));
+        }
+        if let Some(code) = self.code {
+            let code = code
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| code.to_string());
+            if !code.is_empty() {
+                parts.push(format!("code={code}"));
+            }
+        }
+        if parts.is_empty() {
+            "unknown stream error".to_owned()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 // ── List models response types ─────────────────────────────────────────────
@@ -239,14 +279,17 @@ struct ApiModelEntry {
 
 impl TelnyxProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
+        Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
+    }
 
+    pub fn with_timeout_policy(
+        api_key: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -483,11 +526,12 @@ impl crate::traits::Provider for TelnyxProvider {
             stream: false,
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request)
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 
@@ -564,13 +608,13 @@ impl crate::traits::Provider for TelnyxProvider {
             stream: true,
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&api_request)
-            .send()
-            .await?;
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -621,7 +665,24 @@ impl crate::traits::Provider for TelnyxProvider {
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
+                            if let Some(error) = resp.error {
+                                let _ = tx
+                                    .send(Err(anyhow!(
+                                        "Telnyx stream error: {}",
+                                        error.description()
+                                    )))
+                                    .await;
+                                return;
+                            }
                             for choice in resp.choices {
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "Telnyx stream finished with provider error"
+                                        )))
+                                        .await;
+                                    return;
+                                }
                                 if let Some(reasoning) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
@@ -677,10 +738,11 @@ impl crate::traits::Provider for TelnyxProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self
+        let request_builder = self
             .client
             .get(self.models_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key));
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 

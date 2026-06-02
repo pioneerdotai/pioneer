@@ -281,7 +281,9 @@ impl MessageProcessor {
         ));
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
             crud_store.clone(),
-            TimeoutPolicyRegistry::default(),
+            TimeoutPolicyRegistry::with_provider_timeout_policy(
+                normalized_tool_loop_config.provider,
+            ),
         ));
         let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
             crud_store.clone(),
@@ -1203,6 +1205,7 @@ impl MessageProcessor {
         let artifact_downloads =
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         let normalized_tool_loop_config = ToolLoopConfig {
+            provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
                 default_timeout_ms: web.default_timeout_ms,

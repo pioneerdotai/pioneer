@@ -35,8 +35,8 @@ use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
-    AttachmentSecurityPolicy, ProviderRegistry, set_artifact_external_ref_cache_backend,
-    set_default_attachment_pipeline_config,
+    AttachmentSecurityPolicy, ProviderRegistry, ProviderTimeoutPolicy,
+    set_artifact_external_ref_cache_backend, set_default_attachment_pipeline_config,
 };
 use pioneer_skills::SkillTrustLevel;
 use pioneer_tasks::{TaskReviewRuntimeConfig, TaskRuntimeConfig};
@@ -150,16 +150,28 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         crud_store.clone(),
     )));
 
-    let provider_registry = Arc::new(ProviderRegistry::new_scoped({
-        let gateway_secrets = gateway_secrets.clone();
-        move |workspace_id, provider_name| {
-            workspace_id
-                .map(|workspace_id| {
-                    gateway_secrets.resolve_workspace_provider_api_key(workspace_id, provider_name)
-                })
-                .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
-        }
-    }));
+    let provider_timeout_policy = ProviderTimeoutPolicy::from_secs(
+        config.gateway.provider.connect_timeout_secs,
+        config.gateway.provider.first_chunk_timeout_secs,
+        config.gateway.provider.inter_chunk_idle_timeout_secs,
+        config.gateway.provider.non_stream_request_timeout_secs,
+        config.gateway.provider.max_stream_duration_secs,
+    );
+
+    let provider_registry = Arc::new(ProviderRegistry::new_scoped_with_timeout_policy(
+        {
+            let gateway_secrets = gateway_secrets.clone();
+            move |workspace_id, provider_name| {
+                workspace_id
+                    .map(|workspace_id| {
+                        gateway_secrets
+                            .resolve_workspace_provider_api_key(workspace_id, provider_name)
+                    })
+                    .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
+            }
+        },
+        provider_timeout_policy,
+    ));
 
     let summary_config = SummaryConfig {
         summary_model: config.gateway.thread.summary_model.clone(),
@@ -268,6 +280,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     )?;
 
     let tool_loop_config = ToolLoopConfig {
+        provider: provider_timeout_policy,
         preflight: pioneer_agent::PreflightLoopConfig {
             provider_name: config.gateway.preflight_model.model_provider_override(),
             model: config.gateway.preflight_model.model_override(),

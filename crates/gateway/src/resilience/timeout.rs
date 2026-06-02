@@ -1,10 +1,11 @@
 use anyhow::Result;
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
 use pioneer_protocol::TurnItemType;
+use pioneer_provider::ProviderTimeoutPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutPolicy {
     pub lease_secs: u64,
     pub idle_secs: u64,
@@ -115,6 +116,33 @@ impl Default for TimeoutPolicyRegistry {
 }
 
 impl TimeoutPolicyRegistry {
+    pub fn with_provider_timeout_policy(provider_policy: ProviderTimeoutPolicy) -> Self {
+        use TurnItemType::{AgentMessage, Reasoning};
+
+        let mut registry = Self::default();
+        let provider_idle_secs = provider_policy
+            .first_chunk_timeout
+            .as_secs()
+            .max(provider_policy.inter_chunk_idle_timeout.as_secs())
+            .saturating_add(30)
+            .max(30);
+        let lease_secs = provider_idle_secs.saturating_add(60).max(180);
+        let hard_secs = provider_policy
+            .max_stream_duration
+            .map(|duration| duration.as_secs().saturating_add(120))
+            .unwrap_or(10 * 60)
+            .max(lease_secs.saturating_add(60));
+        let timeout_policy = TimeoutPolicy {
+            lease_secs,
+            idle_secs: provider_idle_secs,
+            hard_secs,
+        };
+
+        registry.by_item_type.insert(AgentMessage, timeout_policy);
+        registry.by_item_type.insert(Reasoning, timeout_policy);
+        registry
+    }
+
     pub fn policy_for(&self, item_type: TurnItemType) -> TimeoutPolicy {
         self.by_item_type
             .get(&item_type)
@@ -225,4 +253,35 @@ impl TimeoutSupervisor {
 
 fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
     base.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::TurnItemType;
+
+    #[test]
+    fn provider_timeout_policy_extends_agent_message_idle_deadlines() {
+        let provider_policy = ProviderTimeoutPolicy::from_secs(5, 180, 180, 120, None);
+        let registry = TimeoutPolicyRegistry::with_provider_timeout_policy(provider_policy);
+
+        let reasoning = registry.policy_for(TurnItemType::Reasoning);
+        let agent_message = registry.policy_for(TurnItemType::AgentMessage);
+
+        assert_eq!(reasoning, agent_message);
+        assert_eq!(reasoning.idle_secs, 210);
+        assert!(reasoning.lease_secs > reasoning.idle_secs);
+        assert!(reasoning.hard_secs > reasoning.lease_secs);
+    }
+
+    #[test]
+    fn provider_timeout_policy_uses_configured_max_stream_duration_for_hard_deadline() {
+        let provider_policy = ProviderTimeoutPolicy::from_secs(5, 30, 45, 120, Some(900));
+        let registry = TimeoutPolicyRegistry::with_provider_timeout_policy(provider_policy);
+
+        let reasoning = registry.policy_for(TurnItemType::Reasoning);
+
+        assert_eq!(reasoning.idle_secs, 75);
+        assert_eq!(reasoning.hard_secs, 1020);
+    }
 }

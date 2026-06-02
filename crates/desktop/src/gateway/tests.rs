@@ -529,10 +529,7 @@ pub(crate) fn test_config() -> AppConfig {
             memory: GatewayMemoryConfig::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
-            provider: GatewayProviderConfig {
-                default_timeout_secs: 120,
-                attachments: Default::default(),
-            },
+            provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 file_name: "gateway.db".to_owned(),
                 max_connections: 10,

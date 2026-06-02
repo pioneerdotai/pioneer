@@ -1,7 +1,4 @@
-use super::{
-    AgentRoundResponse, ChatTurnError, PROVIDER_FIRST_CHUNK_TIMEOUT,
-    PROVIDER_INTER_CHUNK_IDLE_TIMEOUT,
-};
+use super::{AgentRoundResponse, ChatTurnError};
 use crate::AgentEventHub;
 use futures_util::{Stream, StreamExt};
 use pioneer_protocol::{
@@ -9,7 +6,9 @@ use pioneer_protocol::{
     ItemStartedNotification, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
     ProviderTransportKind, TurnItem, TurnItemType,
 };
-use pioneer_provider::{ChatRequest, Provider, ProviderToolCall, StreamChunk};
+use pioneer_provider::{
+    ChatRequest, Provider, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk,
+};
 use std::sync::Arc;
 use tokio::time::timeout;
 
@@ -33,6 +32,7 @@ pub(super) async fn request_agent_round(
     turn_id: &str,
     thinking_item_id: &str,
     force_non_stream: bool,
+    provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     if provider.capabilities().streaming && !force_non_stream {
@@ -62,6 +62,7 @@ pub(super) async fn request_agent_round(
             target,
             provider_name.as_str(),
             model_name.as_str(),
+            provider_timeout_policy,
         )
         .await?
         {
@@ -171,6 +172,7 @@ pub(super) async fn stream_provider_response(
     turn_id: &str,
     thinking_item_id: &str,
     message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
     let provider_name = provider.name().to_owned();
@@ -200,6 +202,7 @@ pub(super) async fn stream_provider_response(
         response_stream_target(message_started, thinking_item_id, message_item_id),
         provider_name.as_str(),
         model_name.as_str(),
+        provider_timeout_policy,
     )
     .await?
     {
@@ -627,6 +630,7 @@ async fn read_next_stream_chunk<S>(
     target: FailureTarget<'_>,
     provider_name: &str,
     model_name: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
     S: Stream<Item = anyhow::Result<StreamChunk>> + Unpin,
@@ -638,9 +642,9 @@ where
     };
 
     let wait = if *seen_any_chunk {
-        PROVIDER_INTER_CHUNK_IDLE_TIMEOUT
+        provider_timeout_policy.inter_chunk_idle_timeout
     } else {
-        PROVIDER_FIRST_CHUNK_TIMEOUT
+        provider_timeout_policy.first_chunk_timeout
     };
 
     let next_chunk = timeout(wait, stream.next()).await.map_err(|_| {

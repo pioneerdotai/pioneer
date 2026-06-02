@@ -153,7 +153,10 @@ allow_http_tools = true
 allow_function_proxy_tools = true
 
 [gateway.provider]
-default_timeout_secs = 120
+non_stream_request_timeout_secs = 120
+connect_timeout_secs = 30
+first_chunk_timeout_secs = 180
+inter_chunk_idle_timeout_secs = 180
 
 [gateway.provider.attachments]
 max_bytes_per_attachment = 104857600

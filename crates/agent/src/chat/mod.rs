@@ -70,7 +70,7 @@ use pioneer_protocol::{
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
     MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderRegistry,
-    ProviderToolCall, ToolDefinition, infer_mime_from_reference,
+    ProviderTimeoutPolicy, ProviderToolCall, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -92,8 +92,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const TURN_ITEM_ID_LEN: usize = 21;
-const PROVIDER_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_INTER_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS: usize = 20;
 const MAX_TERMINAL_TASK_OBSERVATIONS: usize = 20;
 const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
@@ -1726,6 +1724,7 @@ pub(super) async fn execute_chat_turn_flow(
                 &turn_id,
                 &thinking_item_id,
                 &message_item_id,
+                tool_loop_config.provider,
                 event_tx.clone(),
             )
             .await;
@@ -1778,6 +1777,7 @@ async fn execute_standard_provider_response(
     turn_id: &str,
     thinking_item_id: &str,
     message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<String, ChatTurnError> {
     let mut messages = history;
@@ -1809,6 +1809,7 @@ async fn execute_standard_provider_response(
             turn_id,
             thinking_item_id,
             message_item_id,
+            provider_timeout_policy,
             event_tx.as_ref(),
         )
         .await
@@ -2585,6 +2586,7 @@ async fn execute_agent_provider_response(
             turn_id,
             initial_thinking_item_id.as_str(),
             message_item_id,
+            tool_loop_config.provider,
             event_tx.clone(),
         )
         .await;
@@ -3224,6 +3226,7 @@ async fn execute_agent_provider_response(
                 turn_id,
                 current_thinking_id.as_str(),
                 force_non_stream,
+                tool_loop_config.provider,
                 event_tx.as_ref(),
             )
             .await

@@ -1928,6 +1928,7 @@ fn test_context_budget() -> super::ContextBudget {
 fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
+        provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: web.default_timeout_ms,

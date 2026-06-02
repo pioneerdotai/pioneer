@@ -57,6 +57,7 @@ use tokio::time::{Duration, Instant, advance, sleep, timeout};
 
 fn test_tool_loop_config() -> ToolLoopConfig {
     ToolLoopConfig {
+        provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
         web: WebToolsConfig {
             default_timeout_ms: 20_000,

@@ -420,9 +420,34 @@ pub struct GatewayThreadConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayProviderConfig {
-    pub default_timeout_secs: u64,
+    #[serde(
+        default = "default_provider_non_stream_request_timeout_secs",
+        alias = "default_timeout_secs"
+    )]
+    pub non_stream_request_timeout_secs: u64,
+    #[serde(default = "default_provider_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_provider_first_chunk_timeout_secs")]
+    pub first_chunk_timeout_secs: u64,
+    #[serde(default = "default_provider_inter_chunk_idle_timeout_secs")]
+    pub inter_chunk_idle_timeout_secs: u64,
+    #[serde(default)]
+    pub max_stream_duration_secs: Option<u64>,
     #[serde(default)]
     pub attachments: GatewayProviderAttachmentsConfig,
+}
+
+impl Default for GatewayProviderConfig {
+    fn default() -> Self {
+        Self {
+            non_stream_request_timeout_secs: default_provider_non_stream_request_timeout_secs(),
+            connect_timeout_secs: default_provider_connect_timeout_secs(),
+            first_chunk_timeout_secs: default_provider_first_chunk_timeout_secs(),
+            inter_chunk_idle_timeout_secs: default_provider_inter_chunk_idle_timeout_secs(),
+            max_stream_duration_secs: None,
+            attachments: GatewayProviderAttachmentsConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1136,6 +1161,22 @@ const fn default_computer_use_max_recovery_attempts_per_step() -> u32 {
 
 const fn default_computer_use_max_recovery_attempts_per_run() -> u32 {
     12
+}
+
+const fn default_provider_non_stream_request_timeout_secs() -> u64 {
+    120
+}
+
+const fn default_provider_connect_timeout_secs() -> u64 {
+    30
+}
+
+const fn default_provider_first_chunk_timeout_secs() -> u64 {
+    180
+}
+
+const fn default_provider_inter_chunk_idle_timeout_secs() -> u64 {
+    180
 }
 
 const fn default_provider_attachments_max_bytes_per_attachment() -> usize {

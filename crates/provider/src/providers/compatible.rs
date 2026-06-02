@@ -7,8 +7,8 @@ use crate::{
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
-        ProviderCapabilities, ProviderInputCapabilities, Role, StreamChunk, TokenUsage, ToolChoice,
-        ToolDefinition,
+        ProviderCapabilities, ProviderInputCapabilities, ProviderTimeoutPolicy, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -20,11 +20,8 @@ use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How to pass the credential in HTTP requests.
 #[derive(Debug, Clone)]
@@ -50,7 +47,7 @@ pub struct OpenAiCompatibleProvider {
     input_types: ProviderInputCapabilities,
     merge_system_into_user: bool,
     replay_reasoning_content: bool,
-    timeout: Duration,
+    timeout_policy: ProviderTimeoutPolicy,
     extra_headers: HashMap<String, String>,
     client: Client,
 }
@@ -225,17 +222,21 @@ struct ApiUsage {
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    error: Option<StreamError>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: StreamDelta,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
@@ -247,6 +248,42 @@ struct StreamDelta {
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[serde(default)]
     function_call: Option<StreamToolFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
+}
+
+impl StreamError {
+    fn description(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(message) = self.message.filter(|message| !message.is_empty()) {
+            parts.push(message);
+        }
+        if let Some(error_type) = self.error_type.filter(|error_type| !error_type.is_empty()) {
+            parts.push(format!("type={error_type}"));
+        }
+        if let Some(code) = self.code {
+            let code = code
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| code.to_string());
+            if !code.is_empty() {
+                parts.push(format!("code={code}"));
+            }
+        }
+        if parts.is_empty() {
+            "unknown stream error".to_owned()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 // ── List models response types ─────────────────────────────────────────────
@@ -291,6 +328,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         let base_url = base_url.into();
+        let timeout_policy = ProviderTimeoutPolicy::default();
         Self {
             name: name.into(),
             base_url,
@@ -299,12 +337,9 @@ impl OpenAiCompatibleProvider {
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
             merge_system_into_user: false,
             replay_reasoning_content: true,
-            timeout: DEFAULT_TIMEOUT,
+            timeout_policy,
             extra_headers: HashMap::new(),
-            client: Client::builder()
-                .timeout(DEFAULT_TIMEOUT)
-                .build()
-                .expect("failed to build HTTP client"),
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -344,11 +379,15 @@ impl OpenAiCompatibleProvider {
 
     /// Override the default request timeout.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout = Duration::from_secs(secs);
-        self.client = Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .expect("failed to build HTTP client");
+        self.timeout_policy.non_stream_request_timeout =
+            std::time::Duration::from_secs(secs.max(1));
+        self.client = crate::http::build_client(self.timeout_policy);
+        self
+    }
+
+    pub fn with_timeout_policy(mut self, timeout_policy: ProviderTimeoutPolicy) -> Self {
+        self.timeout_policy = timeout_policy;
+        self.client = crate::http::build_client(timeout_policy);
         self
     }
 
@@ -866,9 +905,10 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             stream: false,
         };
 
-        let response = self
+        let request_builder = self
             .authorized_post(&self.chat_completions_url())
-            .json(&api_request)
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 
@@ -946,11 +986,11 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             stream: true,
         };
 
-        let response = self
+        let request_builder = self
             .authorized_post(&self.chat_completions_url())
-            .json(&api_request)
-            .send()
-            .await?;
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
             return Err(self.api_error(response).await);
@@ -1002,7 +1042,26 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
+                            if let Some(error) = resp.error {
+                                let _ = tx
+                                    .send(Err(anyhow!(
+                                        "{} stream error: {}",
+                                        provider_name,
+                                        error.description()
+                                    )))
+                                    .await;
+                                return;
+                            }
                             for choice in resp.choices {
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    let _ = tx
+                                        .send(Err(anyhow!(
+                                            "{} stream finished with provider error",
+                                            provider_name
+                                        )))
+                                        .await;
+                                    return;
+                                }
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
@@ -1060,7 +1119,10 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self.authorized_get(&self.models_url()).send().await?;
+        let request_builder = self.authorized_get(&self.models_url());
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(self.api_error(response).await);
@@ -1152,7 +1214,10 @@ mod tests {
 
         assert!(provider.input_types.image.is_supported());
         assert!(provider.merge_system_into_user);
-        assert_eq!(provider.timeout, Duration::from_secs(60));
+        assert_eq!(
+            provider.timeout_policy.non_stream_request_timeout,
+            std::time::Duration::from_secs(60)
+        );
         assert_eq!(
             provider.extra_headers.get("User-Agent").unwrap(),
             "pioneer/1.0"
@@ -1518,6 +1583,19 @@ mod tests {
         let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn stream_response_deserializes_error_envelope_without_delta() {
+        let json = r#"{"error":{"message":"upstream failed","type":"provider_error","code":"overloaded"},"choices":[{"finish_reason":"error"}]}"#;
+        let response: StreamResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            response.error.unwrap().description(),
+            "upstream failed, type=provider_error, code=overloaded"
+        );
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("error"));
+        assert!(response.choices[0].delta.content.is_none());
     }
 
     #[test]

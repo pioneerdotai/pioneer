@@ -4,29 +4,61 @@ use crate::providers::{
     OpenRouterProvider, TelnyxProvider,
 };
 use crate::traits::Provider;
-use crate::types::{InputTypeSupport, ProviderInputCapabilities};
+use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
 use anyhow::{Result, bail};
 
 pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Provider>> {
+    create_provider_with_timeout_policy(provider_name, api_key, ProviderTimeoutPolicy::default())
+}
+
+pub fn create_provider_with_timeout_policy(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+) -> Result<Box<dyn Provider>> {
+    let compat = |name: &str, base_url: &str, api_key: &str| {
+        compat(name, base_url, api_key).with_timeout_policy(timeout_policy)
+    };
+
     match provider_name {
         // ── Primary providers with custom implementations ────────────────
-        "openrouter" => Ok(Box::new(OpenRouterProvider::new(api_key))),
-        "anthropic" => Ok(Box::new(AnthropicProvider::new(api_key))),
-        "openai" => Ok(Box::new(OpenAiProvider::new(api_key))),
-        "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::new(api_key))),
-        "ollama" => Ok(Box::new(OllamaProvider::new())),
-        "telnyx" => Ok(Box::new(TelnyxProvider::new(api_key))),
-        "copilot" | "github-copilot" => Ok(Box::new(CopilotProvider::new(api_key))),
-        "bedrock" | "aws-bedrock" => {
-            Ok(Box::new(BedrockProvider::from_env().unwrap_or_else(|_| {
-                BedrockProvider::new(api_key, "", "us-east-1")
-            })))
-        }
+        "openrouter" => Ok(Box::new(OpenRouterProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "anthropic" => Ok(Box::new(AnthropicProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "openai" => Ok(Box::new(OpenAiProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "ollama" => Ok(Box::new(OllamaProvider::with_timeout_policy(
+            timeout_policy,
+        ))),
+        "telnyx" => Ok(Box::new(TelnyxProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "copilot" | "github-copilot" => Ok(Box::new(CopilotProvider::with_timeout_policy(
+            api_key,
+            timeout_policy,
+        ))),
+        "bedrock" | "aws-bedrock" => Ok(Box::new(
+            BedrockProvider::from_env_with_timeout_policy(timeout_policy).unwrap_or_else(|_| {
+                BedrockProvider::with_timeout_policy(api_key, "", "us-east-1", timeout_policy)
+            }),
+        )),
 
         // ── GLM / Zhipu ─────────────────────────────────────────────────
-        "glm" | "zhipu" | "bigmodel" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" => {
-            Ok(Box::new(GlmProvider::new(api_key)))
-        }
+        "glm" | "zhipu" | "bigmodel" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" => Ok(
+            Box::new(GlmProvider::with_timeout_policy(api_key, timeout_policy)),
+        ),
 
         // ── Azure OpenAI ────────────────────────────────────────────────
         "azure_openai" | "azure-openai" | "azure" => {
@@ -35,8 +67,11 @@ pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Pro
             // configuration for the rest.
             let resource = std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_default();
             let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_default();
-            Ok(Box::new(AzureOpenAiProvider::new(
-                api_key, resource, deployment,
+            Ok(Box::new(AzureOpenAiProvider::with_timeout_policy(
+                api_key,
+                resource,
+                deployment,
+                timeout_policy,
             )))
         }
 

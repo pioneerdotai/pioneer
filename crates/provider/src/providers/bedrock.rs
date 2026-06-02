@@ -4,8 +4,8 @@ use crate::attachments::{
 };
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice,
-    ToolDefinition,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
+    TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -16,11 +16,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SERVICE: &str = "bedrock";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -252,6 +250,7 @@ pub struct BedrockProvider {
     secret_access_key: String,
     session_token: Option<String>,
     region: String,
+    timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
 
@@ -345,17 +344,27 @@ impl BedrockProvider {
         secret_access_key: impl Into<String>,
         region: impl Into<String>,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
+        Self::with_timeout_policy(
+            access_key_id,
+            secret_access_key,
+            region,
+            ProviderTimeoutPolicy::default(),
+        )
+    }
 
+    pub fn with_timeout_policy(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        region: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: None,
             region: region.into(),
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -365,17 +374,29 @@ impl BedrockProvider {
         region: impl Into<String>,
         session_token: impl Into<String>,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
+        Self::with_session_token_and_timeout_policy(
+            access_key_id,
+            secret_access_key,
+            region,
+            session_token,
+            ProviderTimeoutPolicy::default(),
+        )
+    }
 
+    pub fn with_session_token_and_timeout_policy(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        region: impl Into<String>,
+        session_token: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: Some(session_token.into()),
             region: region.into(),
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -384,6 +405,10 @@ impl BedrockProvider {
     /// Reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
     /// (optional), and `AWS_REGION` (defaults to `us-east-1`).
     pub fn from_env() -> Result<Self> {
+        Self::from_env_with_timeout_policy(ProviderTimeoutPolicy::default())
+    }
+
+    pub fn from_env_with_timeout_policy(timeout_policy: ProviderTimeoutPolicy) -> Result<Self> {
         let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
             .map_err(|_| anyhow!("AWS_ACCESS_KEY_ID environment variable not set"))?;
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -391,17 +416,13 @@ impl BedrockProvider {
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
-
         Ok(Self {
             access_key_id,
             secret_access_key,
             session_token,
             region,
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         })
     }
 
@@ -788,7 +809,9 @@ impl crate::traits::Provider for BedrockProvider {
             req = req.header("X-Amz-Security-Token", token);
         }
 
-        let response = req.body(body).send().await?;
+        let response = crate::http::non_stream_request(req.body(body), self.timeout_policy)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -899,7 +922,9 @@ impl crate::traits::Provider for BedrockProvider {
             req = req.header("X-Amz-Security-Token", token);
         }
 
-        let response = req.send().await?;
+        let response = crate::http::non_stream_request(req, self.timeout_policy)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);

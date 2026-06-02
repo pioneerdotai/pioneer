@@ -711,10 +711,7 @@ mod tests {
                 },
                 tasks: Default::default(),
                 skills: GatewaySkillsConfig::default(),
-                provider: GatewayProviderConfig {
-                    default_timeout_secs: 120,
-                    attachments: Default::default(),
-                },
+                provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
                     file_name: "gateway.db".to_owned(),
                     max_connections: 10,

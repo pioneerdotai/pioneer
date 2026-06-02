@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod factory;
+mod http;
 pub mod providers;
 pub mod registry;
 pub mod tools;
@@ -23,6 +24,6 @@ pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse,
     CompiledPromptPayload, InputContentType, InputTypeSupport, MessageAttachment,
     MessageContentPart, ModelInputItem, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
-    ToolDefinition,
+    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
+    TokenUsage, ToolChoice, ToolDefinition,
 };

@@ -251,7 +251,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 2,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 600,
                 no_progress_limit: 2,
             },
         );
@@ -261,7 +261,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 2,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 600,
                 no_progress_limit: 2,
             },
         );
@@ -271,7 +271,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryWithBackoff,
                 max_attempts: 2,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 300,
                 no_progress_limit: 2,
             },
         );
@@ -1870,6 +1870,7 @@ mod tests {
 
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
+            provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
                 default_timeout_ms: 20_000,

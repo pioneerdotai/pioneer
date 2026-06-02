@@ -4,7 +4,8 @@ use crate::attachments::{
 };
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderToolCall, Role, StreamChunk, TokenUsage, ToolChoice,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
+    TokenUsage, ToolChoice,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -14,15 +15,14 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct GeminiProvider {
     api_key: String,
+    timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
 
@@ -190,14 +190,17 @@ struct GeminiModelEntry {
 
 impl GeminiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("failed to build HTTP client");
+        Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
+    }
 
+    pub fn with_timeout_policy(
+        api_key: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
-            client,
+            timeout_policy,
+            client: crate::http::build_client(timeout_policy),
         }
     }
 
@@ -543,10 +546,11 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.generate_content_url(&model))
-            .json(&api_request)
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
 
@@ -591,12 +595,12 @@ impl crate::traits::Provider for GeminiProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.stream_generate_content_url(&model))
-            .json(&api_request)
-            .send()
-            .await?;
+            .json(&api_request);
+        let response =
+            crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -669,7 +673,10 @@ impl crate::traits::Provider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let response = self.client.get(self.list_models_url()).send().await?;
+        let request_builder = self.client.get(self.list_models_url());
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);

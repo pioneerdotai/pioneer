@@ -17,7 +17,9 @@ use pioneer_protocol::{
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, PromptManifest,
     ToolOutputPolicySnapshot, TurnToolLoopBudgetExceededNotification,
 };
-use pioneer_provider::{ChatMessage, InputContentType, MessageAttachment, ProviderRegistry};
+use pioneer_provider::{
+    ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, ProviderTimeoutPolicy,
+};
 #[cfg(test)]
 use pioneer_skills::SkillAuditEvent;
 use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
@@ -67,6 +69,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ToolLoopConfig {
+    pub provider: ProviderTimeoutPolicy,
     pub preflight: PreflightLoopConfig,
     pub web: WebToolsConfig,
     pub computer_use: ComputerUseToolsConfig,
@@ -412,6 +415,7 @@ pub trait TaskToolProvider: Send + Sync {
 impl ToolLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
+            provider: self.provider,
             preflight: self.preflight.normalized(),
             web: self.web.normalized(),
             computer_use: self.computer_use.normalized(),
