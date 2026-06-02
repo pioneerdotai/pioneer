@@ -9,10 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pioneerdotai/pioneer/actions/workflows/ci.yml"><img src="https://github.com/pioneerdotai/pioneer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/pioneerdotai/pioneer/releases"><img src="https://img.shields.io/github/v/release/pioneerdotai/pioneer?include_prereleases&label=release" alt="Release"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/rust-edition%202024-orange.svg" alt="Rust edition 2024">
 </p>
 
 <p align="center">
@@ -29,7 +27,10 @@
   <a href="https://github.com/pioneerdotai/pioneer/releases">Releases</a>
 </p>
 
----
+<p align="center">
+  <img src="assets/screenshots/pioneer-main-dark.png" alt="Pioneer">
+  <img src="assets/screenshots/pioneer-main-light.png" alt="Pioneer">
+</p>
 
 **Pioneer** is a local-first AI workspace for running an assistant on your own machine or on infrastructure you control. It combines a persistent gateway, a native desktop app, a JSON-RPC protocol, provider adapters, durable threads, agent memory, task automation, MCP servers, skills, and real local tools.
 
