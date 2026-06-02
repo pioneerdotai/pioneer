@@ -116,6 +116,8 @@ pub enum SkillImplicitInvocationPolicy {
 pub struct SkillPolicyHints {
     #[serde(default)]
     pub implicit_invocation: SkillImplicitInvocationPolicy,
+    #[serde(default)]
+    pub catalog_hidden: bool,
     pub activation_blocked: bool,
     #[serde(default)]
     pub block_issue_codes: Vec<String>,
@@ -377,6 +379,7 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
 
     SkillPolicyHints {
         implicit_invocation: SkillImplicitInvocationPolicy::UserControlled,
+        catalog_hidden: false,
         activation_blocked: !issue_codes.is_empty(),
         block_issue_codes: issue_codes,
     }

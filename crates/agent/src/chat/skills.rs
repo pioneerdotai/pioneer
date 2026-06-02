@@ -521,6 +521,53 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
     }
 
     #[test]
+    fn catalog_hidden_skill_stays_active_but_is_omitted_from_prompt() {
+        let root = temp_case("catalog-hidden-prompt");
+        let skill_dir = root.join("tests").join("hidden");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: hidden
+slug: hidden
+description: Hidden skill prompt catalog entry.
+catalog-hide: true
+---
+HIDDEN SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
+"#,
+        )
+        .expect("write skill");
+
+        let explicit_refs = [explicit_skill_ref("hidden")];
+        let result = resolve_turn_skills_with_explicit_refs(
+            root.as_path(),
+            "ws_000000000000000001",
+            &[],
+            &explicit_refs,
+            &test_skills_config(root.as_path()),
+            &HashMap::<SkillPolicyKey, crate::WorkspaceSkillPolicy>::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .expect("resolve skills");
+
+        assert_eq!(result.result.active.len(), 1);
+        assert_eq!(result.result.active[0].slug, "tests/hidden");
+        assert!(result.prompt.is_empty());
+        assert_eq!(
+            result
+                .runtime_plan
+                .read_skill_index
+                .get("user:tests/hidden")
+                .expect("read_skill entry")
+                .body
+                .trim(),
+            "HIDDEN SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill."
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_is_excluded_when_metadata_command_dependency_is_missing() {
         let root = temp_case("metadata-missing");
         let skill_dir = root.join("tests").join("agent-browser");

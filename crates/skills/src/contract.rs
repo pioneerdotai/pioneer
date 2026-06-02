@@ -90,6 +90,7 @@ struct ParsedFrontmatter {
     runtime_tools: Vec<SkillRuntimeToolDefinition>,
     dependencies: SkillDependencies,
     implicit_invocation: SkillImplicitInvocationPolicy,
+    catalog_hidden: bool,
     metadata: JsonValue,
     issues: Vec<SkillValidationIssue>,
 }
@@ -541,11 +542,16 @@ fn parse_implicit_invocation_policy(
     }
 }
 
+fn parse_catalog_hidden(map: &serde_yaml::Mapping, issues: &mut Vec<SkillValidationIssue>) -> bool {
+    parse_bool_value(map, "catalog-hide", false, issues)
+}
+
 fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
     let mut parsed = ParsedFrontmatter {
         user_invocable: true,
         disable_model_invocation: false,
         implicit_invocation: SkillImplicitInvocationPolicy::UserControlled,
+        catalog_hidden: false,
         metadata: serde_json::json!({}),
         ..ParsedFrontmatter::default()
     };
@@ -582,6 +588,7 @@ fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
     parsed.dependencies = parse_dependencies(map, &mut parsed.issues);
     parsed.runtime_tools = parse_runtime_tools(map, &mut parsed.issues);
     parsed.implicit_invocation = parse_implicit_invocation_policy(map, &mut parsed.issues);
+    parsed.catalog_hidden = parse_catalog_hidden(map, &mut parsed.issues);
 
     parsed.metadata = parse_metadata(map, &mut parsed.issues);
 
@@ -930,6 +937,7 @@ pub fn parse_skill_from_file(
     {
         definition.policy_hints.implicit_invocation = SkillImplicitInvocationPolicy::Required;
     }
+    definition.policy_hints.catalog_hidden = frontmatter.catalog_hidden;
 
     Ok(definition)
 }
@@ -1115,6 +1123,35 @@ Instructions
                 .iter()
                 .any(|issue| issue.code == "contract.implicit-invocation.source_kind")
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_catalog_hide_frontmatter() {
+        let dir = temp_case("catalog-hide");
+        let skill_file = write_skill(
+            &dir,
+            "hidden-skill",
+            r#"---
+name: hidden-skill
+slug: hidden-skill
+description: Hidden from prompt catalog
+catalog-hide: true
+---
+Instructions
+"#,
+        );
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::System,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("skill parses");
+
+        assert!(skill.policy_hints.catalog_hidden);
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -40,7 +40,12 @@ fn full_skill_block(skill: &ResolvedSkill) -> String {
 }
 
 pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -> SkillPromptBuild {
-    if active.is_empty() {
+    let catalog_skills = active
+        .iter()
+        .filter(|skill| !skill.definition.policy_hints.catalog_hidden)
+        .collect::<Vec<_>>();
+
+    if catalog_skills.is_empty() {
         return SkillPromptBuild {
             text: String::new(),
             omitted_slugs: Vec::new(),
@@ -54,7 +59,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     let mut text = String::from("[Skills]\nThe following skills are available for this turn:\n");
     let mut omitted_slugs = std::collections::BTreeSet::new();
 
-    for skill in active {
+    for skill in catalog_skills.iter().copied() {
         let block = compact_skill_block(skill);
         if text.len() + block.len() > max_chars {
             omitted_slugs.insert(skill.slug.clone());
@@ -63,11 +68,12 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
         text.push_str(block.as_str());
     }
 
-    let can_expand_full = active.len() <= compact_mode_threshold;
+    let can_expand_full = catalog_skills.len() <= compact_mode_threshold;
 
     if can_expand_full {
-        let mut full_body_candidates = active
+        let mut full_body_candidates = catalog_skills
             .iter()
+            .copied()
             .filter(|skill| matches!(skill.reason, SkillResolvedReason::PathMatch))
             .collect::<Vec<_>>();
 
@@ -82,7 +88,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
             text.push_str(block.as_str());
         }
     } else {
-        for skill in active {
+        for skill in catalog_skills.iter().copied() {
             omitted_slugs.insert(skill.slug.clone());
         }
     }
@@ -366,5 +372,50 @@ mod tests {
                 .text
                 .contains("Skill slug for read_skill: `user:workspace/browser`")
         );
+    }
+
+    #[test]
+    fn catalog_hidden_skill_is_omitted_from_prompt_without_truncation() {
+        let mut hidden = resolved("hidden", "Hidden from prompt catalog.");
+        hidden.definition.policy_hints.catalog_hidden = true;
+        let visible = resolved("visible", "Visible in prompt catalog.");
+
+        let built = build_skill_prompt(
+            &[hidden, visible],
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert!(!built.truncated);
+        assert!(built.omitted_slugs.is_empty());
+        assert!(built.text.contains("user:workspace/visible"));
+        assert!(!built.text.contains("user:workspace/hidden"));
+        assert!(!built.text.contains("Hidden from prompt catalog."));
+    }
+
+    #[test]
+    fn catalog_hidden_path_match_does_not_expand_body() {
+        let mut hidden = resolved_with_reason(
+            "hidden",
+            "Hidden from prompt catalog.",
+            SkillResolvedReason::PathMatch,
+        );
+        hidden.definition.policy_hints.catalog_hidden = true;
+
+        let built = build_skill_prompt(
+            &[hidden],
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert_eq!(built.text, "");
+        assert!(!built.truncated);
+        assert!(built.omitted_slugs.is_empty());
     }
 }
