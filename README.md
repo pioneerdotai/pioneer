@@ -44,25 +44,86 @@ The gateway is the core of Pioneer. It owns state, configuration, storage, model
 
 ## Highlights
 
-- **Gateway-centered design** - all important work happens in the gateway: workspaces, threads, turns, tools, MCP, skills, tasks, provider settings, auth, and durable storage.
-- **Local or remote deployment** - run a gateway on your personal computer for a local assistant, or host gateways on separate servers for work, study, home, or other isolated environments.
-- **One desktop, many gateways** - connect the desktop app to any number of gateways and switch between them from one native client.
-- **Workspace management** - create, switch, and rename workspaces inside a gateway; each workspace keeps its own threads, provider keys, MCP servers, skills, tasks, and artifacts.
-- **Multi-agent workflows** - the gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads. The parent agent reviews each subagent result, accepts it, or asks the same subagent to revise the work with concrete feedback.
-- **Durable agent memory** - agent mode can recall and write stable facts, preferences, recurring instructions, project decisions, and communication style through prompt policy, memory tools, proactive post-turn extraction, service-owned dedupe, and memvid-backed search capsules. It is configurable, quality-gated, and does not claim full transcript recall.
-- **Typed hook runtime** - lifecycle hooks attach policy, context, prompt sections, tool bundles, diagnostics, and post-turn work without turning the agent loop into a domain-specific container.
-- **Bring your own model** - built-in providers for OpenAI, Anthropic, OpenRouter, Gemini, Azure OpenAI, Bedrock, Ollama, Copilot, Claude Code, Gemini CLI, Kilo CLI, and many OpenAI-compatible endpoints.
-- **Keystore-backed secrets** - workspace-scoped provider API keys, MCP env/header secrets, superuser JWT signing material, and desktop gateway bearer tokens are stored in `keystore.db` instead of ordinary TOML or domain tables.
-- **Real tools** - shell sessions, file reads and edits, patch application, grep, web search/fetch, URL downloads, computer use, MCP tool proxying, and dynamic skill tools.
-- **MCP servers** - install and manage servers compatible with [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.
-- **Skills** - compatible with the [Agent Skills specification](https://agentskills.io/home), with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.
-- **Tasks** - scheduled and on-demand task execution with dependencies, retries, delivery state, progress events, write locks, and task trees.
-- **Thread modes** - use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.
-- **Thread tree AGENTS.md** - define persistent instructions at the workspace root or any thread folder; child threads inherit the nearest active file and Pioneer injects it into the prompt through the hook runtime.
-- **Protocol-first architecture** - `pioneer-protocol` defines the public JSON-RPC surface and generated schemas under `schemas/`.
-- **Explicit workspace-scoped artifacts** - user uploads and agent-created result files are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.
-- **Cross-platform packaging** - gateway builds for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.
-- **Multi-language desktop** - desktop UI locales are available for English, German, Spanish, French, Hindi, Japanese, Russian, and Chinese.
+<table>
+  <tbody>
+    <tr>
+      <td><strong>Gateway-centered design</strong></td>
+      <td>All important work happens in the gateway: workspaces, threads, turns, tools, MCP, skills, tasks, provider settings, auth, and durable storage.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/getting-started/concepts">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/gateway">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Local or remote deployment</strong></td>
+      <td>Run a gateway on your personal computer for a local assistant, or host gateways on separate servers for work, study, home, or other isolated environments.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/getting-started/installation">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/overview">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>One desktop, many gateways</strong></td>
+      <td>Connect the desktop app to any number of gateways and switch between them from one native client.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/gateway">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Workspace management</strong></td>
+      <td>Create, switch, and rename workspaces inside a gateway; each workspace keeps its own threads, provider keys, MCP servers, skills, tasks, and artifacts.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/workspace">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/persistence">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Multi-agent workflows</strong></td>
+      <td>The gateway can automatically fan work out to subagents with their own prompts, roles, models, context policies, tool policies, result contracts, and child threads. The parent agent reviews each subagent result, accepts it, or asks the same subagent to revise the work with concrete feedback.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/threads">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/agent-loop">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Durable agent memory</strong></td>
+      <td>Agent mode can recall and write stable facts, preferences, recurring instructions, project decisions, and communication style through prompt policy, memory tools, proactive post-turn extraction, service-owned dedupe, and memvid-backed search capsules. It is configurable, quality-gated, and does not claim full transcript recall.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/memory">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/memory">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Typed hook runtime</strong></td>
+      <td>Lifecycle hooks attach policy, context, prompt sections, tool bundles, diagnostics, and post-turn work without turning the agent loop into a domain-specific container.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/getting-started/concepts">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/hooks">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Bring your own model</strong></td>
+      <td>Built-in providers are available for OpenAI, Anthropic, OpenRouter, Gemini, Azure OpenAI, Bedrock, Ollama, Copilot, Claude Code, Gemini CLI, Kilo CLI, and many OpenAI-compatible endpoints.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/providers/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/providers">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Keystore-backed secrets</strong></td>
+      <td>Workspace-scoped provider API keys, MCP env/header secrets, superuser JWT signing material, and desktop gateway bearer tokens are stored in <code>keystore.db</code> instead of ordinary TOML or domain tables.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/configuration/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/secrets">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Real tools</strong></td>
+      <td>Shell sessions, file reads and edits, patch application, grep, web search/fetch, URL downloads, computer use, MCP tool proxying, and dynamic skill tools are available to agents through the gateway.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/getting-started/concepts">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/tools">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>MCP servers</strong></td>
+      <td>Install and manage servers compatible with <a href="https://modelcontextprotocol.io/docs/getting-started/intro">Model Context Protocol</a> per gateway and per workspace, track their health and catalog, and expose their tools to agents through the gateway.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/mcp/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/mcp">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Skills</strong></td>
+      <td>Skills are compatible with the <a href="https://agentskills.io/home">Agent Skills specification</a>, with installation, validation, trust gates, dependency preflight, gateway/workspace policy, upload flow, and health diagnostics.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/skills/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/skills">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Tasks</strong></td>
+      <td>Scheduled and on-demand task execution is available with dependencies, retries, delivery state, progress events, write locks, and task trees.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/tasks/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/tasks">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Thread modes</strong></td>
+      <td>Use Chat mode for direct conversations and Agent mode when the thread should plan, use tools, and work through multi-step tasks.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/threads">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/agent-loop">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Thread tree AGENTS.md</strong></td>
+      <td>Define persistent instructions at the workspace root or any thread folder; child threads inherit the nearest active file and Pioneer injects it into the prompt through the hook runtime.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/agents-md">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/agents-md">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Protocol-first architecture</strong></td>
+      <td><code>pioneer-protocol</code> defines the public JSON-RPC surface and generated schemas under <code>schemas/</code>.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/protocol/introduction">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/protocol">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Explicit workspace-scoped artifacts</strong></td>
+      <td>User uploads and agent-created result files are stored by the gateway, linked to workspace/thread/turn/message lineage, previewed when possible, and downloadable from local or remote gateways.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/artifacts">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/artifacts">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Cross-platform packaging</strong></td>
+      <td>Gateway builds are available for macOS, Linux, and Windows; desktop packaging targets DMG, AppImage, and MSI.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/getting-started/installation">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/crates">Architecture</a></td>
+    </tr>
+    <tr>
+      <td><strong>Multi-language desktop</strong></td>
+      <td>Desktop UI locales are available for English, German, Spanish, French, Hindi, Japanese, Russian, and Chinese.<br><br>Relevant docs: <a href="https://docs.getpioneer.dev/desktop/overview">User Guide</a> · <a href="https://docs.getpioneer.dev/architecture/crates">Architecture</a></td>
+    </tr>
+  </tbody>
+</table>
 
 ## 100% Rust
 
