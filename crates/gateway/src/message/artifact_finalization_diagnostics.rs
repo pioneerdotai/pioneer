@@ -42,7 +42,7 @@ pub(super) fn artifact_finalization_retry_instruction(
     paths.dedup();
 
     let mut instruction = String::from(
-        "Artifact finalization correction required. Your previous final answer cannot be accepted because a user-visible artifact output was prepared or referenced but not registered. Call `artifact_register` for every generated user-visible file before giving the final answer. Do not mention `$PIONEER_ARTIFACT_OUTPUT_DIR` or private gateway paths in the final answer.",
+        "Artifact finalization correction required. Your previous final answer cannot be accepted because an artifact output prepared through `artifact_prepare` was written or referenced but not registered. Call `artifact_register` for each prepared artifact output before giving the final answer. Do not mention `$PIONEER_ARTIFACT_OUTPUT_DIR` or private gateway paths in the final answer.",
     );
     if !paths.is_empty() {
         instruction.push_str("\n\nPrepared output paths to register:");
@@ -100,7 +100,7 @@ pub(super) fn diagnose_artifact_finalization(
         diagnostics.push(ArtifactFinalizationDiagnostic {
             code: ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered,
             message: format!(
-                "prepared artifact output `{path}` was not registered; call artifact_register after writing user-visible files"
+                "prepared artifact output `{path}` was not registered; call artifact_register after writing artifact_prepare outputs"
             ),
             path: Some(path),
         });
