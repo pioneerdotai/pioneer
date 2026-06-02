@@ -169,10 +169,10 @@ impl PioneerDesktop {
                 ..Default::default()
             },
             MarkdownMarkKind::Link { url: _ } => HighlightStyle {
-                color: Some(cx.theme().secondary),
+                color: Some(cx.theme().link),
                 underline: Some(UnderlineStyle {
                     thickness: px(1.),
-                    color: Some(cx.theme().secondary),
+                    color: Some(cx.theme().link),
                     wavy: false,
                 }),
                 ..Default::default()
