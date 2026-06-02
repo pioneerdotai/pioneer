@@ -119,6 +119,14 @@ fn try_parse_skill_dir(
     }
 }
 
+fn catalog_key(skill: &SkillDefinition) -> String {
+    format!(
+        "{}:{}",
+        skill.identity.source_kind.as_db_value(),
+        qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str())
+    )
+}
+
 fn scan_root(
     root: &Path,
     source_kind: SkillSourceKind,
@@ -210,10 +218,7 @@ pub fn load_catalog(params: &SkillCatalogLoadParams) -> Result<SkillCatalogSnaps
             max_skills,
             max_file_bytes,
         ) {
-            merged.insert(
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()),
-                skill,
-            );
+            merged.insert(catalog_key(&skill), skill);
         }
     }
 
@@ -224,10 +229,7 @@ pub fn load_catalog(params: &SkillCatalogLoadParams) -> Result<SkillCatalogSnaps
             max_skills,
             max_file_bytes,
         ) {
-            merged.insert(
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()),
-                skill,
-            );
+            merged.insert(catalog_key(&skill), skill);
         }
     }
 
@@ -238,19 +240,25 @@ pub fn load_catalog(params: &SkillCatalogLoadParams) -> Result<SkillCatalogSnaps
             max_skills,
             max_file_bytes,
         ) {
-            merged.insert(
-                qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str()),
-                skill,
-            );
+            merged.insert(catalog_key(&skill), skill);
         }
     }
 
     let mut skills = merged.into_values().collect::<Vec<_>>();
 
     skills.sort_by(|left, right| {
-        qualified_skill_slug(left.identity.owner.as_str(), left.identity.slug.as_str()).cmp(
-            &qualified_skill_slug(right.identity.owner.as_str(), right.identity.slug.as_str()),
-        )
+        left.identity
+            .source_kind
+            .as_db_value()
+            .cmp(right.identity.source_kind.as_db_value())
+            .then_with(|| {
+                qualified_skill_slug(left.identity.owner.as_str(), left.identity.slug.as_str()).cmp(
+                    &qualified_skill_slug(
+                        right.identity.owner.as_str(),
+                        right.identity.slug.as_str(),
+                    ),
+                )
+            })
     });
 
     Ok(SkillCatalogSnapshot {
@@ -276,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn user_overrides_registry_and_system() {
+    fn same_slug_across_sources_coexist() {
         let system = temp_case("system");
         let user = temp_case("user");
         let registry = temp_case("registry");
@@ -306,11 +314,74 @@ mod tests {
         })
         .expect("load catalog");
 
-        assert_eq!(snapshot.skills.len(), 1);
-        assert_eq!(snapshot.skills[0].identity.name, "User");
+        assert_eq!(snapshot.skills.len(), 3);
+        assert!(snapshot.skills.iter().any(|skill| {
+            skill.identity.name == "System"
+                && matches!(
+                    skill.identity.source_kind,
+                    crate::contract::SkillSourceKind::System
+                )
+        }));
+        assert!(snapshot.skills.iter().any(|skill| {
+            skill.identity.name == "Registry"
+                && matches!(
+                    skill.identity.source_kind,
+                    crate::contract::SkillSourceKind::Registry
+                )
+        }));
+        assert!(snapshot.skills.iter().any(|skill| {
+            skill.identity.name == "User"
+                && matches!(
+                    skill.identity.source_kind,
+                    crate::contract::SkillSourceKind::User
+                )
+        }));
 
         let _ = fs::remove_dir_all(system);
         let _ = fs::remove_dir_all(user);
         let _ = fs::remove_dir_all(registry);
+    }
+
+    #[test]
+    fn later_root_overrides_same_source_slug() {
+        let first = temp_case("first-system-root");
+        let second = temp_case("second-system-root");
+
+        let write_skill = |root: &std::path::Path, name: &str, description: &str| {
+            let dir = root.join("acme").join("shared-skill");
+            fs::create_dir_all(&dir).expect("create skill dir");
+            fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\nslug: shared-skill\ndescription: {description}\n---\nInstructions"
+                ),
+            )
+            .expect("write skill");
+        };
+
+        write_skill(first.as_path(), "First", "First version");
+        write_skill(second.as_path(), "Second", "Second version");
+
+        let snapshot = load_catalog(&SkillCatalogLoadParams {
+            system_roots: vec![first.clone(), second.clone()],
+            user_roots: Vec::new(),
+            registry_roots: Vec::new(),
+            max_skills_per_source: 32,
+            max_file_bytes: 64 * 1024,
+        })
+        .expect("load catalog");
+
+        assert_eq!(snapshot.skills.len(), 1);
+        assert_eq!(snapshot.skills[0].identity.name, "Second");
+        assert_eq!(
+            snapshot.skills[0].identity.source_root,
+            fs::canonicalize(second.as_path())
+                .expect("canonicalize second root")
+                .display()
+                .to_string()
+        );
+
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
     }
 }

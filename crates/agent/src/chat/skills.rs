@@ -499,7 +499,7 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
         assert!(
             result
                 .prompt
-                .contains("Skill slug for read_skill: `tests/weather`")
+                .contains("Skill slug for read_skill: `user:tests/weather`")
         );
         assert!(
             !result
@@ -510,7 +510,7 @@ SELECTED SKILL BODY SHOULD ONLY BE AVAILABLE THROUGH read_skill.
             result
                 .runtime_plan
                 .read_skill_index
-                .get("tests/weather")
+                .get("user:tests/weather")
                 .expect("read_skill entry")
                 .body
                 .trim(),

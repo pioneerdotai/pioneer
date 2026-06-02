@@ -1,4 +1,6 @@
-use crate::compile::{CompileSkillInput, SkillDefinition, compile_skill_definition};
+use crate::compile::{
+    CompileSkillInput, SkillDefinition, SkillImplicitInvocationPolicy, compile_skill_definition,
+};
 use crate::runtime::{
     DynamicToolOutputPolicyDeclaration, RuntimeExecutionClassHint, SkillRuntimeToolDefinition,
     SkillRuntimeToolKind,
@@ -87,6 +89,7 @@ struct ParsedFrontmatter {
     allowed_tools_input_kind: AllowedToolsInputKind,
     runtime_tools: Vec<SkillRuntimeToolDefinition>,
     dependencies: SkillDependencies,
+    implicit_invocation: SkillImplicitInvocationPolicy,
     metadata: JsonValue,
     issues: Vec<SkillValidationIssue>,
 }
@@ -503,10 +506,46 @@ fn parse_runtime_tools(
         .collect()
 }
 
+fn parse_implicit_invocation_policy(
+    map: &serde_yaml::Mapping,
+    issues: &mut Vec<SkillValidationIssue>,
+) -> SkillImplicitInvocationPolicy {
+    let Some(value) = yaml_lookup(map, "implicit-invocation") else {
+        return SkillImplicitInvocationPolicy::UserControlled;
+    };
+
+    match value {
+        serde_yaml::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "required" => SkillImplicitInvocationPolicy::Required,
+            "user-controlled" | "user_controlled" | "optional" => {
+                SkillImplicitInvocationPolicy::UserControlled
+            }
+            _ => {
+                issues.push(SkillValidationIssue::error(
+                    "contract.implicit-invocation.value",
+                    "`implicit-invocation` must be `required` or `user-controlled`",
+                    Some("implicit-invocation".to_owned()),
+                ));
+                SkillImplicitInvocationPolicy::UserControlled
+            }
+        },
+        serde_yaml::Value::Null => SkillImplicitInvocationPolicy::UserControlled,
+        _ => {
+            issues.push(SkillValidationIssue::error(
+                "contract.implicit-invocation.type",
+                "`implicit-invocation` must be a string when provided",
+                Some("implicit-invocation".to_owned()),
+            ));
+            SkillImplicitInvocationPolicy::UserControlled
+        }
+    }
+}
+
 fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
     let mut parsed = ParsedFrontmatter {
         user_invocable: true,
         disable_model_invocation: false,
+        implicit_invocation: SkillImplicitInvocationPolicy::UserControlled,
         metadata: serde_json::json!({}),
         ..ParsedFrontmatter::default()
     };
@@ -542,10 +581,49 @@ fn parse_frontmatter(frontmatter: Option<&str>) -> Result<ParsedFrontmatter> {
 
     parsed.dependencies = parse_dependencies(map, &mut parsed.issues);
     parsed.runtime_tools = parse_runtime_tools(map, &mut parsed.issues);
+    parsed.implicit_invocation = parse_implicit_invocation_policy(map, &mut parsed.issues);
 
     parsed.metadata = parse_metadata(map, &mut parsed.issues);
 
     Ok(parsed)
+}
+
+fn normalize_implicit_invocation_policy_for_source(
+    source_kind: &SkillSourceKind,
+    frontmatter: &mut ParsedFrontmatter,
+) {
+    if !matches!(
+        frontmatter.implicit_invocation,
+        SkillImplicitInvocationPolicy::Required
+    ) {
+        return;
+    }
+
+    if !matches!(source_kind, SkillSourceKind::System) {
+        frontmatter.issues.push(SkillValidationIssue::warning(
+            "contract.implicit-invocation.source_kind",
+            "`implicit-invocation: required` is supported only for system skills",
+            Some("implicit-invocation".to_owned()),
+        ));
+        frontmatter.implicit_invocation = SkillImplicitInvocationPolicy::UserControlled;
+        return;
+    }
+
+    if !frontmatter.user_invocable {
+        frontmatter.issues.push(SkillValidationIssue::error(
+            "contract.implicit-invocation.user_invocable_conflict",
+            "`implicit-invocation: required` requires `user-invocable` to be true",
+            Some("implicit-invocation".to_owned()),
+        ));
+    }
+
+    if frontmatter.disable_model_invocation {
+        frontmatter.issues.push(SkillValidationIssue::error(
+            "contract.implicit-invocation.disable_model_invocation_conflict",
+            "`implicit-invocation: required` cannot be combined with `disable-model-invocation: true`",
+            Some("implicit-invocation".to_owned()),
+        ));
+    }
 }
 
 fn normalize_slug(input: &str) -> String {
@@ -692,6 +770,10 @@ pub fn qualified_skill_slug(owner: &str, slug: &str) -> String {
     format!("{owner}/{slug}")
 }
 
+pub fn source_qualified_skill_slug(source_kind: &SkillSourceKind, qualified_slug: &str) -> String {
+    format!("{}:{qualified_slug}", source_kind.as_db_value())
+}
+
 pub fn split_qualified_skill_slug(value: &str) -> Option<(String, String)> {
     let trimmed = value.trim();
     let (owner, slug) = trimmed.split_once('/')?;
@@ -743,7 +825,8 @@ pub fn parse_skill_from_file(
     let normalized = raw.replace("\r\n", "\n");
 
     let (frontmatter_block, body_block) = split_frontmatter(normalized.as_str());
-    let frontmatter = parse_frontmatter(frontmatter_block)?;
+    let mut frontmatter = parse_frontmatter(frontmatter_block)?;
+    normalize_implicit_invocation_policy_for_source(&source_kind, &mut frontmatter);
     let body = body_block.trim().to_owned();
 
     if body.is_empty() {
@@ -813,7 +896,7 @@ pub fn parse_skill_from_file(
         carried_issues: frontmatter.issues.as_slice(),
     });
 
-    let definition = compile_skill_definition(CompileSkillInput {
+    let mut definition = compile_skill_definition(CompileSkillInput {
         owner,
         slug: slug.clone(),
         name: name.clone(),
@@ -840,6 +923,13 @@ pub fn parse_skill_from_file(
         metadata_raw: frontmatter.metadata.clone(),
         conformance: conformance.clone(),
     });
+    if matches!(
+        frontmatter.implicit_invocation,
+        SkillImplicitInvocationPolicy::Required
+    ) && matches!(source_kind, SkillSourceKind::System)
+    {
+        definition.policy_hints.implicit_invocation = SkillImplicitInvocationPolicy::Required;
+    }
 
     Ok(definition)
 }
@@ -847,6 +937,7 @@ pub fn parse_skill_from_file(
 #[cfg(test)]
 mod tests {
     use super::{SkillSourceKind, parse_skill_from_file};
+    use crate::compile::SkillImplicitInvocationPolicy;
     use crate::runtime::{
         DynamicDeltaOutputRequest, DynamicStorageOutputRequest, DynamicTimelineOutputRequest,
         SkillRuntimeToolKind,
@@ -950,6 +1041,80 @@ Instructions
         assert_eq!(skill.dependencies.commands, vec!["agent-browser"]);
         assert_eq!(skill.dependencies.bins, vec!["node"]);
         assert!(skill.metadata_raw.get("clawdbot").is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn system_skill_can_require_implicit_invocation() {
+        let dir = temp_case("required-implicit-system");
+        let skill_file = write_skill(
+            &dir,
+            "locked-implicit",
+            r#"---
+name: locked-implicit
+slug: locked-implicit
+description: Locked implicit system skill
+implicit-invocation: required
+---
+Instructions
+"#,
+        );
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::System,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("system skill parses");
+
+        assert_eq!(
+            skill.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        );
+        assert!(skill.conformance.agentskills_strict.compliant);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn non_system_skill_required_implicit_invocation_is_ignored_with_warning() {
+        let dir = temp_case("required-implicit-user");
+        let skill_file = write_skill(
+            &dir,
+            "locked-implicit",
+            r#"---
+name: locked-implicit
+slug: locked-implicit
+description: User skill cannot require implicit invocation
+implicit-invocation: required
+---
+Instructions
+"#,
+        );
+
+        let skill = parse_skill_from_file(
+            skill_file.as_path(),
+            SkillSourceKind::User,
+            dir.as_path(),
+            1024 * 1024,
+        )
+        .expect("user skill parses");
+
+        assert_eq!(
+            skill.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::UserControlled
+        );
+        assert!(skill.conformance.agentskills_strict.compliant);
+        assert!(
+            skill
+                .conformance
+                .agentskills_strict
+                .issues
+                .iter()
+                .any(|issue| issue.code == "contract.implicit-invocation.source_kind")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

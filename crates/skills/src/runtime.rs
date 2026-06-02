@@ -1,4 +1,4 @@
-use crate::contract::{SkillSourceKind, SkillTrustLevel};
+use crate::contract::{SkillSourceKind, SkillTrustLevel, source_qualified_skill_slug};
 use crate::dependencies::{DependencyCheckInput, DependencyDiagnostic, evaluate_dependency_set};
 use crate::resolver::ResolvedSkill;
 use crate::security::{SkillSecurityPolicy, minimum_trust_for_tool_kind, trust_satisfies_minimum};
@@ -514,10 +514,14 @@ pub fn build_skill_runtime_plan(
 
     let mut read_skill_index = HashMap::new();
     for skill in active {
+        let read_skill_slug = source_qualified_skill_slug(
+            &skill.definition.identity.source_kind,
+            skill.slug.as_str(),
+        );
         read_skill_index.insert(
-            skill.slug.clone(),
+            read_skill_slug.clone(),
             ReadSkillEntry {
-                slug: skill.slug.clone(),
+                slug: read_skill_slug,
                 name: skill.definition.identity.display_name.clone(),
                 description: skill.definition.instructions.description.clone(),
                 body: skill.definition.instructions.body.clone(),
@@ -565,6 +569,10 @@ pub fn build_skill_runtime_plan(
     ordered_skills.sort_by(|left, right| left.slug.as_str().cmp(right.slug.as_str()));
 
     for skill in ordered_skills {
+        let source_qualified_slug = source_qualified_skill_slug(
+            &skill.definition.identity.source_kind,
+            skill.slug.as_str(),
+        );
         let mut definitions = skill.definition.runtime.runtime_tools.clone();
         definitions.sort_by(|left, right| {
             normalize_slug(left.tool_slug.as_str()).cmp(&normalize_slug(right.tool_slug.as_str()))
@@ -604,9 +612,10 @@ pub fn build_skill_runtime_plan(
                 continue;
             }
 
-            let Some((canonical_tool_name, normalized_tool_slug)) =
-                canonical_runtime_tool_name(skill.slug.as_str(), definition.tool_slug.as_str())
-            else {
+            let Some((canonical_tool_name, normalized_tool_slug)) = canonical_runtime_tool_name(
+                source_qualified_slug.as_str(),
+                definition.tool_slug.as_str(),
+            ) else {
                 excluded_tools.push(ExcludedRuntimeTool {
                     skill_slug: skill.slug.clone(),
                     tool_slug: definition.tool_slug.clone(),
@@ -686,15 +695,24 @@ mod tests {
         default_skill_conformance,
     };
     use crate::dependencies::DependencyCheckInput;
-    use crate::policy::SkillPolicySet;
+    use crate::policy::{SkillPolicy, SkillPolicyKey, SkillPolicySet};
     use crate::resolver::{
-        SkillExplicitRef, SkillResolutionInput, SkillValidationPolicy, resolve_skills,
+        ResolvedSkill, SkillExplicitRef, SkillResolutionInput, SkillResolvedReason,
+        SkillValidationPolicy, resolve_skills,
     };
     use serde_json::json;
 
     fn skill_with_runtime_tools(
         slug: &str,
         tools: Vec<SkillRuntimeToolDefinition>,
+    ) -> SkillDefinition {
+        skill_with_runtime_tools_from_source(slug, tools, SkillSourceKind::User)
+    }
+
+    fn skill_with_runtime_tools_from_source(
+        slug: &str,
+        tools: Vec<SkillRuntimeToolDefinition>,
+        source_kind: SkillSourceKind,
     ) -> SkillDefinition {
         let conformance = default_skill_conformance();
         let definition = compile_skill_definition(CompileSkillInput {
@@ -704,7 +722,7 @@ mod tests {
             display_name: slug.to_owned(),
             description: format!("{slug} description"),
             body: "skill body".to_owned(),
-            source_kind: SkillSourceKind::User,
+            source_kind,
             source_root: "/tmp".to_owned(),
             skill_dir: format!("/tmp/{slug}"),
             skill_file: format!("/tmp/{slug}/SKILL.md"),
@@ -795,11 +813,11 @@ mod tests {
         assert_eq!(plan.tools.len(), 2);
         assert_eq!(
             plan.tools[0].canonical_tool_name,
-            "skill.workspace-my-skill.a-tool"
+            "skill.user-workspace-my-skill.a-tool"
         );
         assert_eq!(
             plan.tools[1].canonical_tool_name,
-            "skill.workspace-my-skill.b-tool"
+            "skill.user-workspace-my-skill.b-tool"
         );
     }
 
@@ -863,6 +881,178 @@ mod tests {
             tool.tool_slug == "http-2"
                 && tool.reason == RuntimeToolExcludedReason::MaxDynamicToolsPerSkill
         }));
+    }
+
+    #[test]
+    fn disabled_system_skill_exposes_no_runtime_tools() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![skill_with_runtime_tools_from_source(
+                "system-tools",
+                vec![SkillRuntimeToolDefinition {
+                    tool_slug: "fetch".to_owned(),
+                    description: "desc".to_owned(),
+                    kind: SkillRuntimeToolKind::Http,
+                    parameters: json!({"type":"object"}),
+                    execution_class: RuntimeExecutionClassHint::Shared,
+                    config: json!({}),
+                    output_policy: None,
+                }],
+                SkillSourceKind::System,
+            )],
+        };
+
+        let mut policy_set = SkillPolicySet::default();
+        policy_set.workspace_by_key.insert(
+            SkillPolicyKey::new("workspace/system-tools", "system"),
+            SkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: None,
+            },
+        );
+
+        let active = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[SkillExplicitRef {
+                capability_id: "skill:system:system-tools".to_owned(),
+                label: Some("system-tools".to_owned()),
+                slug: "system-tools".to_owned(),
+                source_kind: "system".to_owned(),
+            }],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &policy_set,
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        })
+        .active;
+
+        let plan = build_skill_runtime_plan(
+            &active,
+            SkillRuntimeBudget {
+                enable_dynamic_tools: true,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: true,
+                allow_function_proxy_tools: true,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+
+        assert!(active.is_empty());
+        assert!(plan.tools.is_empty());
+    }
+
+    #[test]
+    fn read_skill_index_keeps_same_qualified_slug_across_sources() {
+        let mut system =
+            skill_with_runtime_tools_from_source("browser", Vec::new(), SkillSourceKind::System);
+        system.identity.skill_dir = "/tmp/system/browser".to_owned();
+
+        let mut user =
+            skill_with_runtime_tools_from_source("browser", Vec::new(), SkillSourceKind::User);
+        user.identity.skill_dir = "/tmp/user/browser".to_owned();
+
+        let active = vec![
+            ResolvedSkill {
+                slug: "workspace/browser".to_owned(),
+                reason: SkillResolvedReason::ExplicitCapability,
+                definition: system,
+            },
+            ResolvedSkill {
+                slug: "workspace/browser".to_owned(),
+                reason: SkillResolvedReason::ExplicitCapability,
+                definition: user,
+            },
+        ];
+
+        let plan = build_skill_runtime_plan(
+            &active,
+            SkillRuntimeBudget {
+                enable_dynamic_tools: false,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: true,
+                allow_function_proxy_tools: true,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+
+        assert_eq!(
+            plan.read_skill_index["system:workspace/browser"].skill_asset_root,
+            "/tmp/system/browser"
+        );
+        assert_eq!(
+            plan.read_skill_index["user:workspace/browser"].skill_asset_root,
+            "/tmp/user/browser"
+        );
+    }
+
+    #[test]
+    fn runtime_tool_names_keep_same_qualified_slug_across_sources() {
+        let runtime_tool = SkillRuntimeToolDefinition {
+            tool_slug: "fetch".to_owned(),
+            description: "desc".to_owned(),
+            kind: SkillRuntimeToolKind::Http,
+            parameters: json!({"type":"object"}),
+            execution_class: RuntimeExecutionClassHint::Shared,
+            config: json!({}),
+            output_policy: None,
+        };
+        let system = skill_with_runtime_tools_from_source(
+            "browser",
+            vec![runtime_tool.clone()],
+            SkillSourceKind::System,
+        );
+        let user = skill_with_runtime_tools_from_source(
+            "browser",
+            vec![runtime_tool],
+            SkillSourceKind::User,
+        );
+
+        let active = vec![
+            ResolvedSkill {
+                slug: "workspace/browser".to_owned(),
+                reason: SkillResolvedReason::ExplicitCapability,
+                definition: system,
+            },
+            ResolvedSkill {
+                slug: "workspace/browser".to_owned(),
+                reason: SkillResolvedReason::ExplicitCapability,
+                definition: user,
+            },
+        ];
+
+        let plan = build_skill_runtime_plan(
+            &active,
+            SkillRuntimeBudget {
+                enable_dynamic_tools: true,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: true,
+                allow_function_proxy_tools: true,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+
+        let tool_names = plan
+            .tools
+            .iter()
+            .map(|tool| tool.canonical_tool_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(plan.tools.len(), 2);
+        assert!(tool_names.contains(&"skill.system-workspace-browser.fetch"));
+        assert!(tool_names.contains(&"skill.user-workspace-browser.fetch"));
+        assert!(plan.excluded_tools.is_empty());
     }
 
     #[test]

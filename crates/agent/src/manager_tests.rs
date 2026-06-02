@@ -9486,7 +9486,7 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
         .expect("compiled prompt should be attached to provider request");
     assert_compact_skill_prompt(
         compiled_prompt.full_system_text.as_str(),
-        "tests/my-skill",
+        "user:tests/my-skill",
         "My Skill",
         "Follow the skill.",
     );
@@ -9719,7 +9719,7 @@ async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provid
         .expect("compiled prompt should be attached to provider request");
     assert_compact_skill_prompt(
         compiled_prompt.full_system_text.as_str(),
-        "tests/my-skill",
+        "user:tests/my-skill",
         "My Skill",
         "Follow the skill.",
     );
@@ -9864,7 +9864,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"skill.tests-my-skill.fetch-data"));
+    assert!(tool_names.contains(&"skill.user-tests-my-skill.fetch-data"));
     assert!(tool_names.contains(&"read_skill"));
 
     let _ = fs::remove_dir_all(skill_root);
@@ -10083,7 +10083,7 @@ async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() 
         .expect("agent request should include compiled prompt");
     assert_compact_skill_prompt(
         prompt.full_system_text.as_str(),
-        "tests/my-skill",
+        "user:tests/my-skill",
         "My Skill",
         "Follow the skill.",
     );
@@ -10191,7 +10191,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_dynamic_1".to_owned(),
-            name: "skill.tests-my-skill.echo-shell".to_owned(),
+            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -10280,7 +10280,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.tests-my-skill.echo-shell")
+        Some("skill.user-tests-my-skill.echo-shell")
     );
     assert!(dynamic_result.content.contains("shell-ok"));
 
@@ -10294,7 +10294,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
                     output_policy,
                     ..
                 } = &notification.item
-                && tool_name == "skill.tests-my-skill.echo-shell"
+                && tool_name == "skill.user-tests-my-skill.echo-shell"
             {
                 return Some((storage, output_policy));
             }
@@ -10340,7 +10340,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: tool_call_id.to_owned(),
-            name: "skill.tests-my-skill.slow-shell".to_owned(),
+            name: "skill.user-tests-my-skill.slow-shell".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -10474,7 +10474,7 @@ runtime:
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_dynamic_2".to_owned(),
-            name: "skill.tests-my-skill.echo-shell".to_owned(),
+            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -10541,7 +10541,7 @@ runtime:
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.tests-my-skill.echo-shell")
+        Some("skill.user-tests-my-skill.echo-shell")
     );
     assert!(
         dynamic_result
@@ -10672,7 +10672,7 @@ async fn read_skill_returns_active_skill_body() {
         vec![ProviderToolCall {
             id: "call_read_1".to_owned(),
             name: "read_skill".to_owned(),
-            arguments: r#"{"slug":"tests/my-skill"}"#.to_owned(),
+            arguments: r#"{"slug":"user:tests/my-skill"}"#.to_owned(),
         }],
         "done",
     ));
@@ -10770,7 +10770,7 @@ async fn read_skill_returns_active_skill_body() {
     assert!(
         read_skill_result
             .content
-            .contains("\"slug\":\"tests/my-skill\"")
+            .contains("\"slug\":\"user:tests/my-skill\"")
     );
     assert!(
         read_skill_result
@@ -10979,7 +10979,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"read_file"));
-    assert!(!tool_names.contains(&"skill.tests-my-skill.bad-proxy"));
+    assert!(!tool_names.contains(&"skill.user-tests-my-skill.bad-proxy"));
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -11069,8 +11069,8 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"skill.tests-my-skill.fetch-data"));
-    assert!(!tool_names.contains(&"skill.tests-my-skill.bad-proxy"));
+    assert!(tool_names.contains(&"skill.user-tests-my-skill.fetch-data"));
+    assert!(!tool_names.contains(&"skill.user-tests-my-skill.bad-proxy"));
 
     let _ = fs::remove_dir_all(skill_root);
 }

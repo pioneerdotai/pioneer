@@ -11998,7 +11998,7 @@ Gateway skill body"#,
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_gw_dynamic_1".to_owned(),
-            name: "skill.tests-my-skill.echo-shell".to_owned(),
+            name: "skill.user-tests-my-skill.echo-shell".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -12089,7 +12089,7 @@ Gateway skill body"#,
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.tests-my-skill.echo-shell")
+        Some("skill.user-tests-my-skill.echo-shell")
     );
     assert!(dynamic_result.content.contains("gw-shell-ok"));
 
@@ -12107,7 +12107,7 @@ Gateway skill body"#,
                 && let pioneer_protocol::TurnItem::DynamicToolCall {
                     tool_name, storage, ..
                 } = item
-                && tool_name == "skill.tests-my-skill.echo-shell"
+                && tool_name == "skill.user-tests-my-skill.echo-shell"
             {
                 return Some(storage);
             }
@@ -12317,7 +12317,7 @@ Gateway HTTP skill body"#
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_gw_dynamic_http_1".to_owned(),
-            name: "skill.tests-http-skill.fetch-secret".to_owned(),
+            name: "skill.user-tests-http-skill.fetch-secret".to_owned(),
             arguments: "{}".to_owned(),
         }],
         "done",
@@ -12404,7 +12404,7 @@ Gateway HTTP skill body"#
         .expect("second round must include dynamic http tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some("skill.tests-http-skill.fetch-secret")
+        Some("skill.user-tests-http-skill.fetch-secret")
     );
     assert!(dynamic_result.content.contains(SECRET));
 
@@ -12487,6 +12487,14 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
     std::fs::create_dir_all(&registry_root).expect("must create registry root");
 
     write_test_skill(&system_root, "sys-b", "", "system skill body");
+    write_test_skill(
+        &system_root,
+        "locked-implicit",
+        "implicit-invocation: required",
+        "locked implicit system skill body",
+    );
+    write_test_skill(&system_root, "shared-skill", "", "system shared body");
+    write_test_skill(&user_root, "shared-skill", "", "user shared body");
     write_test_skill(&user_root, "user-a", "", "user skill body");
     write_test_skill(&registry_root, "registry-c", "", "registry skill body");
 
@@ -12528,7 +12536,7 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
     assert!(payload.snapshot_version > 0);
     assert!(payload.generated_at > 0);
     assert!(
-        payload.skills.len() >= 3,
+        payload.skills.len() >= 6,
         "skills/list should include all discovered sources"
     );
 
@@ -12542,11 +12550,46 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         );
     }
 
+    let system_skill = payload
+        .skills
+        .iter()
+        .find(|skill| skill.source_kind == "system" && skill.slug == "tests/sys-b")
+        .expect("system skill should be listed");
+    assert!(system_skill.install.installed);
+    assert!(system_skill.install.managed);
+    assert!(!system_skill.install.lifecycle_editable);
+    assert!(system_skill.install.updated_at.is_none());
+    assert!(
+        system_skill
+            .install
+            .install_path
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).ends_with("tests/sys-b")),
+        "system install path should point at the skill directory"
+    );
+    assert!(system_skill.policy.allow_implicit_invocation_editable);
+    let locked_system_skill = payload
+        .skills
+        .iter()
+        .find(|skill| skill.source_kind == "system" && skill.slug == "tests/locked-implicit")
+        .expect("locked implicit system skill should be listed");
+    assert!(locked_system_skill.policy.allow_implicit_invocation);
+    assert!(
+        !locked_system_skill
+            .policy
+            .allow_implicit_invocation_editable
+    );
     assert!(
         payload
             .skills
             .iter()
-            .any(|skill| skill.source_kind == "system" && skill.slug == "tests/sys-b")
+            .any(|skill| skill.source_kind == "system" && skill.slug == "tests/shared-skill")
+    );
+    assert!(
+        payload
+            .skills
+            .iter()
+            .any(|skill| skill.source_kind == "user" && skill.slug == "tests/shared-skill")
     );
     assert!(
         payload
@@ -12554,6 +12597,13 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
             .iter()
             .any(|skill| skill.source_kind == "user" && skill.slug == "tests/user-a")
     );
+    let user_skill = payload
+        .skills
+        .iter()
+        .find(|skill| skill.source_kind == "user" && skill.slug == "tests/user-a")
+        .expect("user skill should be listed");
+    assert!(user_skill.install.lifecycle_editable);
+    assert!(user_skill.policy.allow_implicit_invocation_editable);
     assert!(
         payload
             .skills
@@ -12659,6 +12709,233 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         .expect("policy-skill should exist in skills/list");
     assert!(!policy_skill.policy.enabled);
     assert_eq!(policy_skill.status, "disabled");
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_policy_set_can_disable_system_skill() {
+    let base_dir = unique_temp_dir("skills_system_policy_set");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("must create system root");
+    std::fs::create_dir_all(&user_root).expect("must create user root");
+    std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("must create registry root");
+
+    write_test_skill(
+        &system_root,
+        "system-policy-skill",
+        "",
+        "system policy skill body",
+    );
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    );
+
+    let set_request = json!({
+        "jsonrpc": "2.0",
+        "id": "syspolicyset000000001",
+        "method": "skills/policy/set",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_slug": "tests/system-policy-skill",
+            "source_kind": "system",
+            "enabled": false,
+            "allow_implicit_invocation": false
+        }
+    });
+    processor
+        .process_request(connection_id, &set_request.to_string())
+        .await;
+
+    let set_response = recv_response_by_id(&mut rx, "syspolicyset000000001").await;
+    let set_payload: SkillsPolicySetResponse =
+        serde_json::from_value(set_response.result).expect("skills/policy/set decode");
+    assert_eq!(set_payload.policy.skill_slug, "tests/system-policy-skill");
+    assert_eq!(set_payload.policy.source_kind, "system");
+    assert_eq!(set_payload.policy.enabled, Some(false));
+
+    let changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
+    let changed_params = changed
+        .params
+        .expect("skills/changed params should be present");
+    let changed_payload: SkillsChangedNotification =
+        serde_json::from_value(changed_params).expect("skills/changed payload should decode");
+    assert_eq!(changed_payload.reason, "policy_updated");
+    assert!(changed_payload.changes.iter().any(|change| {
+        change.slug == "tests/system-policy-skill"
+            && change.source_kind == "system"
+            && change.change_type == "policy"
+    }));
+
+    let list_request = json!({
+        "jsonrpc": "2.0",
+        "id": "syspolicylist00000001",
+        "method": "skills/list",
+        "params": {
+            "workspace_id": workspace_id,
+            "include_health": true,
+            "include_policy": true
+        }
+    });
+    processor
+        .process_request(connection_id, &list_request.to_string())
+        .await;
+
+    let list_response = recv_response_by_id(&mut rx, "syspolicylist00000001").await;
+    let list_payload: SkillListResponse =
+        serde_json::from_value(list_response.result).expect("skills/list payload should decode");
+    let system_skill = list_payload
+        .skills
+        .iter()
+        .find(|skill| skill.slug == "tests/system-policy-skill" && skill.source_kind == "system")
+        .expect("system policy skill should exist in skills/list");
+    assert!(system_skill.install.installed);
+    assert!(system_skill.install.managed);
+    assert!(!system_skill.install.lifecycle_editable);
+    assert!(!system_skill.policy.enabled);
+    assert_eq!(system_skill.status, "disabled");
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_policy_set_rejects_locked_system_implicit_disable() {
+    let base_dir = unique_temp_dir("skills_locked_system_policy_set");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("must create system root");
+    std::fs::create_dir_all(&user_root).expect("must create user root");
+    std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("must create registry root");
+
+    write_test_skill(
+        &system_root,
+        "locked-system-policy-skill",
+        "implicit-invocation: required",
+        "locked system policy skill body",
+    );
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    );
+
+    let reject_request = json!({
+        "jsonrpc": "2.0",
+        "id": "lockedpolicy000000001",
+        "method": "skills/policy/set",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_slug": "tests/locked-system-policy-skill",
+            "source_kind": "system",
+            "enabled": true,
+            "allow_implicit_invocation": false
+        }
+    });
+    processor
+        .process_request(connection_id, &reject_request.to_string())
+        .await;
+
+    let reject_error = recv_error_by_id(&mut rx, "lockedpolicy000000001").await;
+    assert_eq!(
+        reject_error.error.code,
+        pioneer_protocol::INVALID_REQUEST_CODE
+    );
+    let reject_code = reject_error
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(reject_code, "skills.invalid_request");
+
+    let disable_request = json!({
+        "jsonrpc": "2.0",
+        "id": "lockedpolicy000000002",
+        "method": "skills/policy/set",
+        "params": {
+            "workspace_id": workspace_id,
+            "skill_slug": "tests/locked-system-policy-skill",
+            "source_kind": "system",
+            "enabled": false,
+            "allow_implicit_invocation": true
+        }
+    });
+    processor
+        .process_request(connection_id, &disable_request.to_string())
+        .await;
+
+    let disable_response = recv_response_by_id(&mut rx, "lockedpolicy000000002").await;
+    let disable_payload: SkillsPolicySetResponse =
+        serde_json::from_value(disable_response.result).expect("skills/policy/set decode");
+    assert_eq!(disable_payload.policy.enabled, Some(false));
+    assert_eq!(disable_payload.policy.allow_implicit_invocation, Some(true));
+
+    let _changed = recv_notification_by_method(&mut rx, events::SKILLS_CHANGED).await;
+
+    let list_request = json!({
+        "jsonrpc": "2.0",
+        "id": "lockedpolicy000000003",
+        "method": "skills/list",
+        "params": {
+            "workspace_id": workspace_id,
+            "include_health": true,
+            "include_policy": true
+        }
+    });
+    processor
+        .process_request(connection_id, &list_request.to_string())
+        .await;
+
+    let list_response = recv_response_by_id(&mut rx, "lockedpolicy000000003").await;
+    let list_payload: SkillListResponse =
+        serde_json::from_value(list_response.result).expect("skills/list payload should decode");
+    let locked_skill = list_payload
+        .skills
+        .iter()
+        .find(|skill| {
+            skill.slug == "tests/locked-system-policy-skill" && skill.source_kind == "system"
+        })
+        .expect("locked system policy skill should exist in skills/list");
+    assert!(!locked_skill.policy.enabled);
+    assert!(locked_skill.policy.allow_implicit_invocation);
+    assert!(!locked_skill.policy.allow_implicit_invocation_editable);
+    assert_eq!(locked_skill.status, "disabled");
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -12895,6 +13172,147 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_lifecycle_rejects_system_source_kind() {
+    let base_dir = unique_temp_dir("skills_system_lifecycle_reject");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("must create system root");
+    std::fs::create_dir_all(&user_root).expect("must create user root");
+    std::fs::create_dir_all(&workspace_root).expect("must create workspace root");
+    std::fs::create_dir_all(&registry_root).expect("must create registry root");
+
+    write_test_skill(
+        &system_root,
+        "system-lifecycle",
+        "",
+        "system lifecycle body",
+    );
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let crud_store_for_assert = crud_store.clone();
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
+    );
+
+    let install_id = generate_test_request_id("syslife", "install");
+    let install_request = json!({
+        "jsonrpc": "2.0",
+        "id": install_id,
+        "method": "skills/install",
+        "params": {
+            "workspace_id": workspace_id,
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": "unused-upload-id"
+            },
+            "target_source_kind": "system"
+        }
+    });
+    processor
+        .process_request(connection_id, &install_request.to_string())
+        .await;
+    let install_error = recv_error_by_id(&mut rx, install_id.as_str()).await;
+    assert_eq!(
+        install_error.error.code,
+        pioneer_protocol::INVALID_PARAMS_CODE
+    );
+    let install_code = install_error
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(install_code, "skills.source_not_supported");
+
+    let update_id = generate_test_request_id("syslife", "update");
+    let update_request = json!({
+        "jsonrpc": "2.0",
+        "id": update_id,
+        "method": "skills/update",
+        "params": {
+            "workspace_id": workspace_id,
+            "slug": "tests/system-lifecycle",
+            "source_kind": "system",
+            "source": {
+                "type": "uploaded_archive",
+                "upload_id": "unused-upload-id"
+            }
+        }
+    });
+    processor
+        .process_request(connection_id, &update_request.to_string())
+        .await;
+    let update_error = recv_error_by_id(&mut rx, update_id.as_str()).await;
+    assert_eq!(
+        update_error.error.code,
+        pioneer_protocol::INVALID_PARAMS_CODE
+    );
+    let update_code = update_error
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(update_code, "skills.source_not_supported");
+
+    let uninstall_id = generate_test_request_id("syslife", "uninstall");
+    let uninstall_request = json!({
+        "jsonrpc": "2.0",
+        "id": uninstall_id,
+        "method": "skills/uninstall",
+        "params": {
+            "workspace_id": workspace_id,
+            "slug": "tests/system-lifecycle",
+            "source_kind": "system"
+        }
+    });
+    processor
+        .process_request(connection_id, &uninstall_request.to_string())
+        .await;
+    let uninstall_error = recv_error_by_id(&mut rx, uninstall_id.as_str()).await;
+    assert_eq!(
+        uninstall_error.error.code,
+        pioneer_protocol::INVALID_PARAMS_CODE
+    );
+    let uninstall_code = uninstall_error
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(uninstall_code, "skills.source_not_supported");
+
+    let system_row = crud_store_for_assert
+        .find_skill_installation("tests/system-lifecycle", "system", workspace_id.as_str())
+        .await
+        .expect("read system installation row should succeed");
+    assert!(
+        system_row.is_none(),
+        "system lifecycle requests must not create installation rows"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_health_returns_dependency_diagnostics() {
     let base_dir = unique_temp_dir("skills_health");
     let system_root = base_dir.join("system");
@@ -12912,6 +13330,27 @@ async fn skills_health_returns_dependency_diagnostics() {
         "dependencies:\n  bins:\n    - pioneer_missing_bin_for_health_test",
         "dep skill body",
     );
+    write_test_skill(
+        &system_root,
+        "system-dep-skill",
+        "dependencies:\n  bins:\n    - pioneer_missing_system_bin_for_health_test",
+        "system dep skill body",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let insecure_skill = write_test_skill(
+            &system_root,
+            "system-security-skill",
+            "",
+            "system security skill body",
+        );
+        let outside_file = base_dir.join("outside-secret.txt");
+        std::fs::write(outside_file.as_path(), "outside").expect("write outside file");
+        symlink(outside_file.as_path(), insecure_skill.join("leak"))
+            .expect("create system skill symlink");
+    }
 
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -12960,6 +13399,35 @@ async fn skills_health_returns_dependency_diagnostics() {
             .any(|diagnostic| diagnostic.name == "pioneer_missing_bin_for_health_test"),
         "skills/health should expose dependency diagnostics"
     );
+    let system_dep_skill = health_payload
+        .skills
+        .iter()
+        .find(|skill| skill.slug == "tests/system-dep-skill" && skill.source_kind == "system")
+        .expect("system dep-skill should exist in health payload");
+    assert!(
+        system_dep_skill
+            .dependency_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.name == "pioneer_missing_system_bin_for_health_test"),
+        "skills/health should expose system skill dependency diagnostics"
+    );
+    #[cfg(unix)]
+    {
+        let system_security_skill = health_payload
+            .skills
+            .iter()
+            .find(|skill| {
+                skill.slug == "tests/system-security-skill" && skill.source_kind == "system"
+            })
+            .expect("system security skill should exist in health payload");
+        assert!(
+            system_security_skill
+                .security_findings
+                .iter()
+                .any(|finding| finding.rule_id == "path.symlink_escape"),
+            "skills/health should expose system skill security diagnostics"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(base_dir);
 }

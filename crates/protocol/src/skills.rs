@@ -138,16 +138,24 @@ pub struct SkillListItem {
 pub struct SkillInstallState {
     pub managed: bool,
     pub installed: bool,
+    #[serde(default = "default_skill_install_lifecycle_editable")]
+    pub lifecycle_editable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
 }
 
+const fn default_skill_install_lifecycle_editable() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SkillPolicyState {
     pub enabled: bool,
     pub allow_implicit_invocation: bool,
+    #[serde(default = "default_true")]
+    pub allow_implicit_invocation_editable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

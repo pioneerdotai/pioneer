@@ -18,6 +18,7 @@ mod resilience;
 mod secrets;
 mod session;
 mod settings;
+mod system_skills;
 mod task_tools;
 mod thread;
 mod tokenizer;
@@ -229,10 +230,21 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         },
     });
 
-    let skill_system_roots = expand_home_directory_templates(
+    let mut skill_system_roots =
+        match system_skills::materialize_bundled_system_skill_roots(runtime_home.as_path()) {
+            Ok(roots) => roots,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to materialize bundled system skills"
+                );
+                Vec::new()
+            }
+        };
+    skill_system_roots.extend(expand_home_directory_templates(
         skills_cfg.paths.system.as_slice(),
         &runtime_home_directory,
-    );
+    ));
     let skill_user_roots =
         expand_home_directory_templates(skills_cfg.paths.user.as_slice(), &runtime_home_directory);
     let skill_registry_roots = expand_home_directory_templates(

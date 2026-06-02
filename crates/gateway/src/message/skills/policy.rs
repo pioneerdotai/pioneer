@@ -106,7 +106,10 @@ impl MessageProcessor {
             }
         };
 
-        if params.skill_slug.trim().is_empty() || params.source_kind.trim().is_empty() {
+        let skill_slug = params.skill_slug.trim().to_owned();
+        let source_kind = params.source_kind.trim().to_ascii_lowercase();
+
+        if skill_slug.is_empty() || source_kind.is_empty() {
             self.send_error(
                 connection_id,
                 skills_error(
@@ -115,15 +118,32 @@ impl MessageProcessor {
                     SKILLS_ERROR_INVALID_REQUEST,
                     "skill_slug and source_kind are required",
                     json!({
-                        "skill_slug": params.skill_slug,
-                        "source_kind": params.source_kind,
+                        "skill_slug": skill_slug,
+                        "source_kind": source_kind,
                     }),
                 ),
             )
             .await;
             return;
         }
-        if !is_qualified_slug(params.skill_slug.as_str()) {
+        if !matches!(source_kind.as_str(), "system" | "user" | "registry") {
+            self.send_error(
+                connection_id,
+                skills_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    SKILLS_ERROR_SOURCE_NOT_SUPPORTED,
+                    "source_kind must be system, user, or registry",
+                    json!({
+                        "skill_slug": skill_slug,
+                        "source_kind": source_kind,
+                    }),
+                ),
+            )
+            .await;
+            return;
+        }
+        if !is_qualified_slug(skill_slug.as_str()) {
             self.send_error(
                 connection_id,
                 skills_error(
@@ -132,8 +152,8 @@ impl MessageProcessor {
                     SKILLS_ERROR_INVALID_REQUEST,
                     "skill_slug must use owner/slug",
                     json!({
-                        "skill_slug": params.skill_slug,
-                        "source_kind": params.source_kind,
+                        "skill_slug": skill_slug,
+                        "source_kind": source_kind,
                     }),
                 ),
             )
@@ -147,8 +167,8 @@ impl MessageProcessor {
                 .crud_store
                 .delete_workspace_skill_policy(
                     workspace_id.as_str(),
-                    params.skill_slug.as_str(),
-                    params.source_kind.as_str(),
+                    skill_slug.as_str(),
+                    source_kind.as_str(),
                 )
                 .await
             {
@@ -168,8 +188,8 @@ impl MessageProcessor {
 
             let policy = SkillWorkspacePolicy {
                 workspace_id: workspace_id.clone(),
-                skill_slug: params.skill_slug.clone(),
-                source_kind: params.source_kind.clone(),
+                skill_slug: skill_slug.clone(),
+                source_kind: source_kind.clone(),
                 enabled: None,
                 allow_implicit_invocation: None,
             };
@@ -222,10 +242,75 @@ impl MessageProcessor {
             return;
         }
 
+        if matches!(params.allow_implicit_invocation, Some(false)) {
+            let context = match self.skills_runtime_context(workspace_id.as_str()) {
+                Ok(context) => context,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        skills_error(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            "failed to resolve skills runtime context",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let catalog = match load_catalog(&context.catalog_params) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        skills_error(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            SKILLS_ERROR_INTERNAL,
+                            "failed to load skills catalog",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let implicit_invocation_locked = catalog.skills.iter().any(|skill| {
+                skill.identity.source_kind.as_db_value() == source_kind
+                    && qualified_skill_slug(
+                        skill.identity.owner.as_str(),
+                        skill.identity.slug.as_str(),
+                    ) == skill_slug
+                    && !skill_implicit_invocation_editable(skill)
+            });
+
+            if implicit_invocation_locked {
+                self.send_error(
+                    connection_id,
+                    skills_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        SKILLS_ERROR_INVALID_REQUEST,
+                        "allow_implicit_invocation cannot be disabled for this system skill",
+                        json!({
+                            "skill_slug": skill_slug,
+                            "source_kind": source_kind,
+                            "allow_implicit_invocation": false,
+                        }),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
         let record = WorkspaceSkillPolicyRecord {
             workspace_id: workspace_id.clone(),
-            skill_slug: params.skill_slug.clone(),
-            source_kind: params.source_kind.clone(),
+            skill_slug,
+            source_kind,
             enabled: params.enabled,
             allow_implicit_invocation: params.allow_implicit_invocation,
         };

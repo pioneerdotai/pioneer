@@ -4,7 +4,7 @@ use crate::dependencies::{
     DependencyCheckInput, DependencyDiagnostic, evaluate_skill_dependencies,
 };
 use crate::path_match::path_matches_any_pattern;
-use crate::policy::{SkillPolicySet, merge_policy};
+use crate::policy::{SkillPolicySet, effective_policy_for_skill};
 use crate::security::{SecurityFinding, scan_skill_directory};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -272,11 +272,7 @@ pub fn resolve_skills(input: SkillResolutionInput<'_>) -> SkillResolutionResult 
         let skill_slug =
             qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str());
 
-        let effective_policy = merge_policy(
-            skill_slug.as_str(),
-            skill.identity.source_kind.as_db_value(),
-            input.policy_set,
-        );
+        let effective_policy = effective_policy_for_skill(skill, input.policy_set);
 
         if !effective_policy.enabled {
             excluded.push(ExcludedSkill {
@@ -401,7 +397,9 @@ mod tests {
         SkillExcludedReason, SkillExplicitRef, SkillResolutionInput, SkillResolvedReason,
         SkillValidationPolicy, resolve_skills,
     };
-    use crate::compile::{CompileSkillInput, SkillDefinition, compile_skill_definition};
+    use crate::compile::{
+        CompileSkillInput, SkillDefinition, SkillImplicitInvocationPolicy, compile_skill_definition,
+    };
     use crate::contract::{
         SkillCatalogSnapshot, SkillDependencies, SkillSourceKind, SkillTrustLevel,
         default_skill_conformance,
@@ -503,6 +501,43 @@ mod tests {
 
         let result = resolve_skills(SkillResolutionInput {
             explicit_refs: &[explicit_ref("explicit-skill")],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &policy,
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        assert!(result.active.is_empty());
+        assert_eq!(result.excluded.len(), 1);
+        assert_eq!(
+            result.excluded[0].reason,
+            SkillExcludedReason::DisabledByPolicy
+        );
+    }
+
+    #[test]
+    fn policy_can_disable_system_skill() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![skill("system-skill", &[], SkillSourceKind::System)],
+        };
+
+        let mut policy = SkillPolicySet::default();
+        policy.workspace_by_key.insert(
+            SkillPolicyKey::new("workspace/system-skill", "system"),
+            SkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: None,
+            },
+        );
+
+        let result = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[explicit_ref_with_source_kind(
+                "system-skill",
+                SkillSourceKind::System,
+            )],
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy,
@@ -776,6 +811,40 @@ mod tests {
 
         assert_eq!(result.active.len(), 1);
         assert_eq!(result.active[0].slug, "workspace/implicit-skill");
+        assert_eq!(result.active[0].reason, SkillResolvedReason::Implicit);
+    }
+
+    #[test]
+    fn required_system_implicit_invocation_overrides_policy_disable() {
+        let mut required = skill("required-implicit", &[], SkillSourceKind::System);
+        required.policy_hints.implicit_invocation = SkillImplicitInvocationPolicy::Required;
+
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![required],
+        };
+
+        let mut policy = SkillPolicySet::default();
+        policy.workspace_by_key.insert(
+            SkillPolicyKey::new("workspace/required-implicit", "system"),
+            SkillPolicy {
+                enabled: Some(true),
+                allow_implicit_invocation: Some(false),
+            },
+        );
+
+        let result = resolve_skills(SkillResolutionInput {
+            explicit_refs: &[],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &policy,
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        assert_eq!(result.active.len(), 1);
+        assert_eq!(result.active[0].slug, "workspace/required-implicit");
         assert_eq!(result.active[0].reason, SkillResolvedReason::Implicit);
     }
 

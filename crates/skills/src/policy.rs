@@ -1,3 +1,5 @@
+use crate::compile::{SkillDefinition, SkillImplicitInvocationPolicy};
+use crate::contract::{SkillSourceKind, qualified_skill_slug};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -61,6 +63,33 @@ pub fn merge_policy(slug: &str, source_kind: &str, set: &SkillPolicySet) -> Effe
         apply(&mut effective, workspace);
     }
 
+    effective
+}
+
+pub fn skill_implicit_invocation_editable(skill: &SkillDefinition) -> bool {
+    !(matches!(&skill.identity.source_kind, SkillSourceKind::System)
+        && matches!(
+            skill.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        ))
+}
+
+pub fn apply_skill_policy_constraints(
+    skill: &SkillDefinition,
+    effective: &mut EffectiveSkillPolicy,
+) {
+    if !skill_implicit_invocation_editable(skill) {
+        effective.allow_implicit_invocation = true;
+    }
+}
+
+pub fn effective_policy_for_skill(
+    skill: &SkillDefinition,
+    set: &SkillPolicySet,
+) -> EffectiveSkillPolicy {
+    let slug = qualified_skill_slug(skill.identity.owner.as_str(), skill.identity.slug.as_str());
+    let mut effective = merge_policy(slug.as_str(), skill.identity.source_kind.as_db_value(), set);
+    apply_skill_policy_constraints(skill, &mut effective);
     effective
 }
 

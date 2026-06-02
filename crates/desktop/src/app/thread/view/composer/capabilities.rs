@@ -1796,12 +1796,14 @@ mod tests {
             install: SkillInstallState {
                 managed: false,
                 installed: true,
+                lifecycle_editable: true,
                 install_path: None,
                 updated_at: None,
             },
             policy: SkillPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
+                allow_implicit_invocation_editable: true,
             },
             health: SkillHealthSummary {
                 status: "ok".to_owned(),

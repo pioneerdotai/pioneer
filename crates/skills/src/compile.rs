@@ -104,8 +104,18 @@ pub struct SkillKnownMetadata {
     pub clawdbot: Option<ClawdbotMetadata>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillImplicitInvocationPolicy {
+    #[default]
+    UserControlled,
+    Required,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SkillPolicyHints {
+    #[serde(default)]
+    pub implicit_invocation: SkillImplicitInvocationPolicy,
     pub activation_blocked: bool,
     #[serde(default)]
     pub block_issue_codes: Vec<String>,
@@ -366,6 +376,7 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
     issue_codes.dedup();
 
     SkillPolicyHints {
+        implicit_invocation: SkillImplicitInvocationPolicy::UserControlled,
         activation_blocked: !issue_codes.is_empty(),
         block_issue_codes: issue_codes,
     }
@@ -374,8 +385,8 @@ fn compile_policy_hints(conformance: &SkillConformanceReport) -> SkillPolicyHint
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileSkillInput, SkillDependencySet, SkillSourceKind, compile_skill_definition,
-        normalize_string_list,
+        CompileSkillInput, SkillDependencySet, SkillImplicitInvocationPolicy, SkillSourceKind,
+        compile_skill_definition, normalize_string_list,
     };
     use crate::contract::{SkillDependencies, SkillTrustLevel, default_skill_conformance};
 
@@ -491,6 +502,10 @@ mod tests {
         });
 
         assert!(manifest.policy_hints.activation_blocked);
+        assert_eq!(
+            manifest.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::UserControlled
+        );
         assert_eq!(
             manifest.policy_hints.block_issue_codes,
             vec!["contract.metadata.invalid_json".to_owned()]

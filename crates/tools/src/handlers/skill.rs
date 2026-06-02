@@ -12,9 +12,7 @@ use crate::router::{RawToolCall, ToolRouter};
 use crate::runtime::ToolCallRuntime;
 use crate::spec::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
 use async_trait::async_trait;
-use pioneer_skills::{
-    DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel, is_qualified_skill_slug,
-};
+use pioneer_skills::{DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -346,14 +344,14 @@ fn read_skill_spec() -> ConfiguredToolSpec {
     ConfiguredToolSpec::new(
         ToolSpec::new(
             READ_SKILL_TOOL_NAME,
-            "Read full instructions and skill_asset_root for an active skill by its exact qualified slug. Relative paths in the returned skill body resolve under skill_asset_root.",
+            "Read full instructions and skill_asset_root for an active skill by its exact source-qualified slug. Relative paths in the returned skill body resolve under skill_asset_root.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "slug": {
                         "type": "string",
-                        "description": "Exact skill slug from the Skills prompt in owner/slug format, for example \"owner/weather\". Do not pass the display name alone.",
-                        "pattern": "^[^/\\s]+/[^/\\s]+$"
+                        "description": "Exact skill slug from the Skills prompt in source:owner/slug format, for example \"system:pioneer/browser\". Do not pass owner/slug, the short slug, or the display name alone.",
+                        "pattern": "^(?:system|user|registry):[^/\\s:]+/[^/\\s:]+$"
                     },
                     "max_chars": {
                         "type": "integer",
@@ -382,38 +380,36 @@ struct ReadSkillHandler {
 
 impl ReadSkillHandler {
     fn resolve_requested_slug(&self, requested: &str) -> Result<String, ToolError> {
-        if is_qualified_skill_slug(requested) {
+        if self.read_skill_index.contains_key(requested) {
             return Ok(requested.to_owned());
         }
 
-        let mut matches = self
-            .read_skill_index
-            .iter()
-            .filter_map(|(qualified_slug, entry)| {
-                let short_slug = qualified_slug
-                    .rsplit_once('/')
-                    .map(|(_, slug)| slug)
-                    .unwrap_or(qualified_slug.as_str());
-                if requested == short_slug || requested == entry.name {
-                    Some(qualified_slug.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        matches.sort();
-        matches.dedup();
-
-        match matches.as_slice() {
-            [qualified_slug] => Ok(qualified_slug.clone()),
-            [] => Err(ToolError::invalid_arguments(
-                "`slug` must be the exact qualified skill slug from the Skills prompt, in owner/slug format",
-            )),
-            _ => Err(ToolError::invalid_arguments(format!(
-                "ambiguous skill slug `{requested}`; use the exact owner/slug value from the Skills prompt"
-            ))),
+        if is_source_qualified_skill_slug(requested) {
+            return Ok(requested.to_owned());
         }
+
+        Err(ToolError::invalid_arguments(
+            "`slug` must be the exact source-qualified skill slug from the Skills prompt, in source:owner/slug format",
+        ))
     }
+}
+
+fn is_source_qualified_skill_slug(value: &str) -> bool {
+    let Some((source, qualified_slug)) = value.split_once(':') else {
+        return false;
+    };
+    if !matches!(source, "system" | "user" | "registry") || qualified_slug.contains(':') {
+        return false;
+    }
+
+    let Some((owner, slug)) = qualified_slug.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !slug.is_empty()
+        && !owner.chars().any(|ch| ch.is_whitespace() || ch == '/')
+        && !slug.chars().any(char::is_whitespace)
+        && !slug.contains('/')
 }
 
 #[async_trait]
@@ -821,14 +817,19 @@ mod tests {
     use std::path::PathBuf;
 
     fn read_skill_entry(slug: &str, name: &str) -> SkillReadToolEntry {
+        let source_kind = slug
+            .split_once(':')
+            .map(|(source, _)| source)
+            .unwrap_or("user")
+            .to_owned();
         SkillReadToolEntry {
             slug: slug.to_owned(),
             name: name.to_owned(),
             description: "Skill description".to_owned(),
             body: "Skill body".to_owned(),
-            skill_asset_root: "/tmp/pioneer-skills/workspace/weather".to_owned(),
+            skill_asset_root: format!("/tmp/pioneer-skills/{source_kind}/workspace/weather"),
             fingerprint: "fingerprint".to_owned(),
-            source_kind: "user".to_owned(),
+            source_kind,
         }
     }
 
@@ -854,77 +855,31 @@ mod tests {
         let spec = read_skill_spec();
         let slug = &spec.spec.parameters["properties"]["slug"];
 
-        assert_eq!(slug["pattern"], r"^[^/\s]+/[^/\s]+$");
-        assert!(
-            slug["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("owner/slug")
+        assert_eq!(
+            slug["pattern"],
+            r"^(?:system|user|registry):[^/\s:]+/[^/\s:]+$"
         );
         assert!(
             slug["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Do not pass the display name alone")
+                .contains("source:owner/slug")
+        );
+        assert!(
+            slug["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Do not pass owner/slug")
         );
         assert!(spec.spec.description.contains("skill_asset_root"));
     }
 
     #[tokio::test]
-    async fn read_skill_handler_accepts_unique_short_slug_as_fallback() {
+    async fn read_skill_handler_rejects_short_slug() {
         let mut index = HashMap::<String, SkillReadToolEntry>::new();
         index.insert(
-            "workspace/weather".to_owned(),
-            read_skill_entry("workspace/weather", "weather"),
-        );
-        let handler = ReadSkillHandler {
-            read_skill_index: index,
-            default_max_chars: 1024,
-        };
-
-        let output = handler
-            .handle(
-                read_skill_invocation("weather"),
-                crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
-            )
-            .await
-            .expect("unique short slug should resolve");
-
-        assert_eq!(output.raw_json()["slug"], "workspace/weather");
-        assert_eq!(output.raw_json()["body"], "Skill body");
-        assert_eq!(
-            output.raw_json()["skill_asset_root"],
-            "/tmp/pioneer-skills/workspace/weather"
-        );
-        assert!(
-            output.raw_json()["relative_path_resolution"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("skill_asset_root")
-        );
-    }
-
-    #[test]
-    fn expands_skill_asset_placeholders() {
-        assert_eq!(
-            super::expand_skill_asset_placeholders(
-                "${skill_asset_root}/scripts/run.py:${skill_dir}/data",
-                "/tmp/skill-root",
-            ),
-            "/tmp/skill-root/scripts/run.py:/tmp/skill-root/data"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_skill_handler_rejects_ambiguous_short_slug() {
-        let mut index = HashMap::<String, SkillReadToolEntry>::new();
-        index.insert(
-            "workspace/weather".to_owned(),
-            read_skill_entry("workspace/weather", "weather"),
-        );
-        index.insert(
-            "user/weather".to_owned(),
-            read_skill_entry("user/weather", "weather"),
+            "user:workspace/weather".to_owned(),
+            read_skill_entry("user:workspace/weather", "weather"),
         );
         let handler = ReadSkillHandler {
             read_skill_index: index,
@@ -939,11 +894,83 @@ mod tests {
             .await;
 
         let error = match result {
-            Ok(_) => panic!("ambiguous short slug should fail"),
+            Ok(_) => panic!("short slug should fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("ambiguous skill slug"));
-        assert!(error.to_string().contains("owner/slug"));
+        assert!(error.to_string().contains("source:owner/slug"));
+    }
+
+    #[test]
+    fn expands_skill_asset_placeholders() {
+        assert_eq!(
+            super::expand_skill_asset_placeholders(
+                "${skill_asset_root}/scripts/run.py:${skill_dir}/data",
+                "/tmp/skill-root",
+            ),
+            "/tmp/skill-root/scripts/run.py:/tmp/skill-root/data"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skill_handler_rejects_owner_slug() {
+        let mut index = HashMap::<String, SkillReadToolEntry>::new();
+        index.insert(
+            "system:workspace/weather".to_owned(),
+            read_skill_entry("system:workspace/weather", "weather"),
+        );
+        index.insert(
+            "user:workspace/weather".to_owned(),
+            read_skill_entry("user:workspace/weather", "weather"),
+        );
+        let handler = ReadSkillHandler {
+            read_skill_index: index,
+            default_max_chars: 1024,
+        };
+
+        let result = handler
+            .handle(
+                read_skill_invocation("workspace/weather"),
+                crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
+            )
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("owner/slug should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("source:owner/slug"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_handler_accepts_exact_source_qualified_slug() {
+        let mut index = HashMap::<String, SkillReadToolEntry>::new();
+        index.insert(
+            "system:workspace/weather".to_owned(),
+            read_skill_entry("system:workspace/weather", "weather"),
+        );
+        index.insert(
+            "user:workspace/weather".to_owned(),
+            read_skill_entry("user:workspace/weather", "weather"),
+        );
+        let handler = ReadSkillHandler {
+            read_skill_index: index,
+            default_max_chars: 1024,
+        };
+
+        let output = handler
+            .handle(
+                read_skill_invocation("system:workspace/weather"),
+                crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
+            )
+            .await
+            .expect("exact source-qualified slug should resolve");
+
+        assert_eq!(output.raw_json()["slug"], "system:workspace/weather");
+        assert_eq!(
+            output.raw_json()["skill_asset_root"],
+            "/tmp/pioneer-skills/system/workspace/weather"
+        );
+        assert_eq!(output.raw_json()["source_kind"], "system");
     }
 
     #[tokio::test]
@@ -955,11 +982,15 @@ mod tests {
 
         let result = handler
             .handle(
-                read_skill_invocation("missing/skill"),
+                read_skill_invocation("system:missing/skill"),
                 crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
             )
             .await;
 
-        assert!(result.is_err());
+        let error = match result {
+            Ok(_) => panic!("inactive exact source-qualified slug should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not active"));
     }
 }

@@ -1,4 +1,5 @@
 use crate::resolver::{ResolvedSkill, SkillResolvedReason};
+use crate::source_qualified_skill_slug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPromptBuild {
@@ -15,20 +16,25 @@ pub struct SkillPromptBudget {
 }
 
 fn compact_skill_block(skill: &ResolvedSkill) -> String {
+    let read_skill_slug =
+        source_qualified_skill_slug(&skill.definition.identity.source_kind, skill.slug.as_str());
     format!(
-        "- {}\n  Skill slug for read_skill: `{}`\n  Use when: {}\n",
+        "- {}\n  Skill slug for read_skill: `{}`\n  Skill asset root: `{}`\n  Use when: {}\n",
         skill.definition.identity.display_name,
-        skill.slug,
+        read_skill_slug,
+        skill.definition.identity.skill_dir,
         skill.definition.instructions.description,
     )
 }
 
 fn full_skill_block(skill: &ResolvedSkill) -> String {
+    let read_skill_slug =
+        source_qualified_skill_slug(&skill.definition.identity.source_kind, skill.slug.as_str());
     format!(
         "\nSkill asset root for ${}: `{}`\nResolve relative paths mentioned by this skill under Skill asset root. Prefer absolute paths built from Skill asset root for commands and file operations.\n[Skill Body: ${}]\n{}\n",
-        skill.slug,
+        read_skill_slug,
         skill.definition.identity.skill_dir,
-        skill.slug,
+        read_skill_slug,
         skill.definition.instructions.body
     )
 }
@@ -137,6 +143,15 @@ mod tests {
         description: &str,
         reason: SkillResolvedReason,
     ) -> ResolvedSkill {
+        resolved_with_reason_and_source(slug, description, reason, SkillSourceKind::User)
+    }
+
+    fn resolved_with_reason_and_source(
+        slug: &str,
+        description: &str,
+        reason: SkillResolvedReason,
+        source_kind: SkillSourceKind,
+    ) -> ResolvedSkill {
         let owner = "workspace";
         let conformance = default_skill_conformance();
         let definition = compile_skill_definition(CompileSkillInput {
@@ -146,7 +161,7 @@ mod tests {
             display_name: slug.to_owned(),
             description: description.to_owned(),
             body: "body".to_owned(),
-            source_kind: SkillSourceKind::User,
+            source_kind,
             source_root: "/tmp".to_owned(),
             skill_dir: format!("/tmp/{slug}"),
             skill_file: format!("/tmp/{slug}/SKILL.md"),
@@ -227,11 +242,11 @@ mod tests {
 
         assert!(built.truncated);
         assert!(built.text.contains("Use `read_skill`"));
-        assert!(!built.text.contains("[Skill Body: $workspace/one]"));
+        assert!(!built.text.contains("[Skill Body: $user:workspace/one]"));
     }
 
     #[test]
-    fn compact_prompt_uses_exact_read_skill_slug_and_omits_file_location() {
+    fn compact_prompt_uses_exact_read_skill_slug_and_asset_root() {
         let active = vec![resolved("weather", "Get weather forecasts.")];
 
         let built = build_skill_prompt(
@@ -246,7 +261,7 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `workspace/weather`")
+                .contains("Skill slug for read_skill: `user:workspace/weather`")
         );
         assert!(
             built
@@ -258,7 +273,7 @@ mod tests {
                 .text
                 .contains("`read_skill` returns `skill_asset_root`")
         );
-        assert!(!built.text.contains("Location:"));
+        assert!(built.text.contains("Skill asset root: `/tmp/weather`"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
     }
 
@@ -278,9 +293,9 @@ mod tests {
         assert!(
             built
                 .text
-                .contains("Skill slug for read_skill: `workspace/weather`")
+                .contains("Skill slug for read_skill: `user:workspace/weather`")
         );
-        assert!(!built.text.contains("[Skill Body: $workspace/weather]"));
+        assert!(!built.text.contains("[Skill Body: $user:workspace/weather]"));
         assert!(!built.text.contains("\nbody\n"));
     }
 
@@ -301,11 +316,11 @@ mod tests {
             },
         );
 
-        assert!(built.text.contains("[Skill Body: $workspace/weather]"));
+        assert!(built.text.contains("[Skill Body: $user:workspace/weather]"));
         assert!(
             built
                 .text
-                .contains("Skill asset root for $workspace/weather: `/tmp/weather`")
+                .contains("Skill asset root for $user:workspace/weather: `/tmp/weather`")
         );
         assert!(
             built
@@ -313,5 +328,43 @@ mod tests {
                 .contains("Resolve relative paths mentioned by this skill under Skill asset root")
         );
         assert!(built.text.contains("\nbody\n"));
+    }
+
+    #[test]
+    fn same_qualified_slug_across_sources_gets_distinct_read_skill_slugs() {
+        let active = vec![
+            resolved_with_reason_and_source(
+                "browser",
+                "System browser.",
+                SkillResolvedReason::ExplicitCapability,
+                SkillSourceKind::System,
+            ),
+            resolved_with_reason_and_source(
+                "browser",
+                "User browser.",
+                SkillResolvedReason::ExplicitCapability,
+                SkillSourceKind::User,
+            ),
+        ];
+
+        let built = build_skill_prompt(
+            active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert!(
+            built
+                .text
+                .contains("Skill slug for read_skill: `system:workspace/browser`")
+        );
+        assert!(
+            built
+                .text
+                .contains("Skill slug for read_skill: `user:workspace/browser`")
+        );
     }
 }

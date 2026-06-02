@@ -125,6 +125,10 @@ impl PioneerDesktop {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
             return;
         }
+        if self.skill_lifecycle_editable(slug.as_str(), source_kind.as_str()) == Some(false) {
+            self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
+            return;
+        }
         if source_path.is_empty() {
             self.skills_error = Some(t!("skills.error.path_required").to_string());
             return;
@@ -232,6 +236,10 @@ impl PioneerDesktop {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
             return;
         }
+        if self.skill_lifecycle_editable(slug.as_str(), source_kind.as_str()) == Some(false) {
+            self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.skills_error = Some(t!("skills.error.gateway_not_connected").to_string());
             return;
@@ -318,6 +326,15 @@ impl PioneerDesktop {
             return;
         }
 
+        let allow_implicit_invocation = if self
+            .skill_policy_implicit_editable(slug.as_str(), source_kind.as_str())
+            .unwrap_or(true)
+        {
+            allow_implicit_invocation
+        } else {
+            true
+        };
+
         let Some(connection_id) = self.gateway.ws_connection_id else {
             self.skills_error = Some(t!("skills.error.gateway_not_connected").to_string());
             return;
@@ -402,6 +419,22 @@ impl PioneerDesktop {
             .map(|skill| (skill.policy.enabled, skill.policy.allow_implicit_invocation))
     }
 
+    fn skill_policy_implicit_editable(&self, slug: &str, source_kind: &str) -> Option<bool> {
+        self.installed_skills
+            .iter()
+            .chain(self.skills_catalog.iter())
+            .find(|skill| skill.slug == slug && skill.source_kind == source_kind)
+            .map(|skill| skill.policy.allow_implicit_invocation_editable)
+    }
+
+    fn skill_lifecycle_editable(&self, slug: &str, source_kind: &str) -> Option<bool> {
+        self.installed_skills
+            .iter()
+            .chain(self.skills_catalog.iter())
+            .find(|skill| skill.slug == slug && skill.source_kind == source_kind)
+            .map(|skill| skill.install.lifecycle_editable)
+    }
+
     fn apply_local_skill_policy(
         &mut self,
         slug: &str,
@@ -411,6 +444,11 @@ impl PioneerDesktop {
     ) {
         for skill in &mut self.skills_catalog {
             if skill.slug == slug && skill.source_kind == source_kind {
+                let allow_implicit_invocation = if skill.policy.allow_implicit_invocation_editable {
+                    allow_implicit_invocation
+                } else {
+                    true
+                };
                 skill.policy.enabled = enabled;
                 skill.policy.allow_implicit_invocation = allow_implicit_invocation;
                 skill.status = if enabled {
@@ -427,6 +465,11 @@ impl PioneerDesktop {
 
         for skill in &mut self.installed_skills {
             if skill.slug == slug && skill.source_kind == source_kind {
+                let allow_implicit_invocation = if skill.policy.allow_implicit_invocation_editable {
+                    allow_implicit_invocation
+                } else {
+                    true
+                };
                 skill.policy.enabled = enabled;
                 skill.policy.allow_implicit_invocation = allow_implicit_invocation;
                 skill.status = if enabled {

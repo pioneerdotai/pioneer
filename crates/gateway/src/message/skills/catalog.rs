@@ -179,11 +179,8 @@ impl MessageProcessor {
                     skill.identity.source_kind.as_db_value(),
                 );
                 let installation = installation_by_key.get(&key);
-                let effective_policy = merge_policy(
-                    qualified_slug.as_str(),
-                    skill.identity.source_kind.as_db_value(),
-                    &policy_set,
-                );
+                let is_system = matches!(&skill.identity.source_kind, SkillSourceKind::System);
+                let effective_policy = effective_policy_for_skill(skill, &policy_set);
                 let health = if params.include_health {
                     self.compute_skill_health_summary(skill, &context)
                 } else {
@@ -215,14 +212,27 @@ impl MessageProcessor {
                     fingerprint: skill.identity.fingerprint.clone(),
                     trust_level: trust_level_as_str(&skill.runtime.trust_level).to_owned(),
                     install: SkillInstallState {
-                        managed: matches!(skill.identity.source_kind, SkillSourceKind::Registry),
-                        installed: installation.is_some(),
-                        install_path: installation.map(|item| item.install_path.clone()),
-                        updated_at: installation.map(|item| item.updated_at_unix),
+                        managed: is_system
+                            || matches!(skill.identity.source_kind, SkillSourceKind::Registry),
+                        installed: is_system || installation.is_some(),
+                        lifecycle_editable: !is_system,
+                        install_path: if is_system {
+                            Some(skill.identity.skill_dir.clone())
+                        } else {
+                            installation.map(|item| item.install_path.clone())
+                        },
+                        updated_at: if is_system {
+                            None
+                        } else {
+                            installation.map(|item| item.updated_at_unix)
+                        },
                     },
                     policy: SkillPolicyState {
                         enabled: effective_policy.enabled,
                         allow_implicit_invocation: effective_policy.allow_implicit_invocation,
+                        allow_implicit_invocation_editable: skill_implicit_invocation_editable(
+                            skill,
+                        ),
                     },
                     health,
                     status,

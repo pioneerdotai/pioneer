@@ -243,7 +243,10 @@ impl PioneerDesktop {
                                     .when(!skill.policy.allow_implicit_invocation, |this| {
                                         this.outline()
                                     })
-                                    .disabled(is_pending)
+                                    .disabled(
+                                        is_pending
+                                            || !skill.policy.allow_implicit_invocation_editable,
+                                    )
                                     .label(t!("skills.button.implicit").to_string())
                                     .on_click({
                                         let desktop_entity = desktop_entity.clone();
