@@ -53,6 +53,23 @@ The parent must:
 - synthesize only accepted child results into the final parent answer;
 - never finish while attached tasks are still active or waiting for review.
 
+## Ensure Task Tools Are Visible
+
+Before using task orchestration, check whether the needed `task_*` tools are currently visible.
+
+If `task_create` or other required `task_*` tools are not visible, call `request_tools` for the `task` domain first:
+
+```json
+{
+  "domains": ["task"],
+  "reason": "Need task tools to create, wait for, review, revise, accept, cancel, or detach subagent work."
+}
+```
+
+After `request_tools` succeeds, use the newly visible task tools according to the sections below.
+
+Do not call `request_tools` for individual tool names such as `task_create`; request the whole `task` domain.
+
 ## Create Attached Subagents
 
 Use `task_create` with a structured JSON object. Do not wrap the payload in a raw JSON string.
