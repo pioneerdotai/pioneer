@@ -26,7 +26,7 @@ pub const TOOL_RECOVERY_POLICY_PROMPT: &str = "When a tool result indicates fail
 
 pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = "- If you create a file that is a result for the user, register it in the artifact store before final response.\n- Prefer creating user-visible result files in the managed artifact output directory exposed as $PIONEER_ARTIFACT_OUTPUT_DIR.\n- Use artifact_prepare when you need a safe output path before creating the file.\n- Use artifact_register after writing the file.\n- When registering a copied or moved prepared output, pass preparedOutputPath with the original outputPath returned by artifact_prepare.\n- Do not rely on filesystem paths as the durable result.\n- $PIONEER_ARTIFACT_OUTPUT_DIR is staging only; registered artifacts are stored durably by the gateway.\n- Do not place turn result files outside the workspace/artifact-controlled flow.\n- The only exception is when the user explicitly asks you to write a file to a specific path. In that case, write to that path, and also register a copy/reference as an artifact when the result should be visible in the thread.\n- In the final response, refer to registered artifacts, not to private gateway filesystem paths.";
 
-pub const TASK_ORCHESTRATION_POLICY_PROMPT: &str = "You can delegate independent work by creating attached agent tasks with `task_create`. Use this when the user explicitly asks for subagents, multi-agent work, parallel investigation, or when the task naturally splits into independent subtasks that can run concurrently.\n\nPrefer doing the work yourself when the task is small, tightly coupled, or the next step is blocked on one specific result.\n\nWhen delegating:\n- create one attached task per independent subtask;\n- give each task a precise title, goal, scope, relevant paths/context, and expected output format;\n- start independent tasks before waiting;\n- call `task_wait` once for the created task set;\n- if `task_wait` returns review-required candidates, inspect each candidate against the user request and task goal, then call `task_accept` for acceptable child results or `task_revise` with concrete feedback when the child must fix the result;\n- do not use a review-required candidate as final accepted work until `task_accept` succeeds;\n- after accepted or terminal `task_wait` results, synthesize accepted child results into the parent answer;\n- do not finish the parent turn while attached tasks are still active or waiting for review;\n- use `task_cancel` or `task_detach` only when intentionally abandoning or backgrounding work.\n\nWhen scheduling future work with `task_create` using scheduled_at, interval, or cron:\n- treat `waitable=false` or `runId=null` as confirmation that there is no active run to wait for;\n- do not call `task_wait` for scheduled future work without an active run;\n- after successful creation, confirm the schedule, task id, and next fire time to the user.\n\nSubagents may use tools and return task results or review candidates according to review policy. Only accepted review candidates are final task results. Respect task depth limits; if delegation is unavailable or depth is exhausted, continue locally.";
+pub const TASK_ORCHESTRATION_POLICY_PROMPT: &str = "Task tools may be available for durable work, scheduling, and attached subagents.\n\nFor every non-trivial user task, first look for a useful split into meaningful independent subtasks. Prefer attached subagents when parallel work can improve speed, coverage, verification, or auditability, and use the parent turn to coordinate, review, and synthesize their accepted results.\n\nDo not over-delegate. Handle tiny, obvious, tightly coupled, or single-step tasks yourself when subagents would add coordination overhead without improving the outcome.\n\nBefore creating subagents, coordinating multi-agent work, or using task tools for scheduled/background work, call `read_skill` with skill slug `system:pioneer/subagents` and follow that skill's instructions. That skill is the authoritative guide for exact tool selection, payloads, waiting, review, revision, cancellation, detaching, scheduling, and final synthesis.\n\nDo not finish the parent turn while attached subagent work created by this turn is still unresolved. Resolve it according to the subagents skill before giving a final answer.";
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";
 
@@ -153,16 +153,14 @@ mod tests {
     }
 
     #[test]
-    fn phase_11_task_orchestration_policy_mentions_review_actions() {
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("task_accept"));
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("task_revise"));
+    fn task_orchestration_policy_points_to_subagents_skill_and_review_tools() {
+        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("system:pioneer/subagents"));
+        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("read_skill"));
+        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("exact tool selection"));
+        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("payloads"));
         assert!(
             TASK_ORCHESTRATION_POLICY_PROMPT
-                .contains("do not use a review-required candidate as final accepted work")
-        );
-        assert!(
-            TASK_ORCHESTRATION_POLICY_PROMPT
-                .contains("Only accepted review candidates are final task results")
+                .contains("Do not finish the parent turn while attached subagent work")
         );
     }
 }

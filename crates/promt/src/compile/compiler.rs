@@ -784,20 +784,23 @@ mod tests {
                 .dynamic_system_text
                 .contains("## Task Orchestration")
         );
-        assert!(compiled.dynamic_system_text.contains("task_create"));
-        assert!(compiled.dynamic_system_text.contains("task_wait"));
-        assert!(compiled.dynamic_system_text.contains("task_accept"));
-        assert!(compiled.dynamic_system_text.contains("task_revise"));
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("do not use a review-required candidate as final accepted work")
+                .contains("`read_skill` with skill slug `system:pioneer/subagents`")
         );
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("do not finish the parent turn while attached tasks")
+                .contains("exact tool selection, payloads, waiting, review")
         );
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("Do not finish the parent turn while attached subagent work")
+        );
+        assert!(!compiled.dynamic_system_text.contains("task_create"));
+        assert!(!compiled.dynamic_system_text.contains("task_accept"));
     }
 
     #[test]
