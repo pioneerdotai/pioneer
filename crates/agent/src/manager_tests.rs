@@ -5067,6 +5067,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
         "write_stdin",
         "apply_patch",
         "write_file",
+        "edit_file",
         "request_tools",
     ] {
         assert!(

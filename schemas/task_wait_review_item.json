@@ -54,47 +54,6 @@
     "candidate"
   ],
   "$defs": {
-    "TaskAgentReviewMode": {
-      "type": "string",
-      "enum": [
-        "none",
-        "parent_agent",
-        "parent_agent_with_reviewers",
-        "user_approval"
-      ]
-    },
-    "TaskAgentReviewPolicy": {
-      "type": "object",
-      "properties": {
-        "maxRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "mode": {
-          "$ref": "#/$defs/TaskAgentReviewMode"
-        },
-        "requireExplicitAcceptance": {
-          "type": "boolean"
-        },
-        "resolutionStrategy": {
-          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
-        },
-        "reviewers": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TaskResultReviewerSpec"
-          }
-        }
-      },
-      "required": [
-        "mode",
-        "maxRevisionRounds",
-        "requireExplicitAcceptance",
-        "resolutionStrategy"
-      ]
-    },
     "Task": {
       "type": "object",
       "properties": {
@@ -265,6 +224,47 @@
         "revision",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "TaskAgentReviewMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "parent_agent",
+        "parent_agent_with_reviewers",
+        "user_approval"
+      ]
+    },
+    "TaskAgentReviewPolicy": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskAgentReviewMode"
+        },
+        "requireExplicitAcceptance": {
+          "type": "boolean"
+        },
+        "resolutionStrategy": {
+          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
+        },
+        "reviewers": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskResultReviewerSpec"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "maxRevisionRounds",
+        "requireExplicitAcceptance",
+        "resolutionStrategy"
       ]
     },
     "TaskArtifact": {

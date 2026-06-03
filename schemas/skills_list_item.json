@@ -126,6 +126,10 @@
         "installed": {
           "type": "boolean"
         },
+        "lifecycle_editable": {
+          "type": "boolean",
+          "default": true
+        },
         "managed": {
           "type": "boolean"
         },
@@ -147,6 +151,10 @@
       "properties": {
         "allow_implicit_invocation": {
           "type": "boolean"
+        },
+        "allow_implicit_invocation_editable": {
+          "type": "boolean",
+          "default": true
         },
         "enabled": {
           "type": "boolean"

@@ -609,4 +609,97 @@ mod tests {
                 .contains("SECRET_WRITE_FILE_CONTENT")
         );
     }
+
+    #[tokio::test]
+    async fn edit_file_completed_event_carries_file_change_metadata() {
+        let raw_output_json = serde_json::json!({
+            "ok": true,
+            "status": "completed",
+            "operation": "edited",
+            "path": "src/lib.rs",
+            "resolved_path": "/tmp/project/src/lib.rs",
+            "matches": 1,
+            "matches_replaced": 1,
+            "replace_all": false,
+            "bytes_before": 44,
+            "bytes_after": 45,
+            "bytes_written": 45,
+            "sha256_before": "before123",
+            "sha256": "after456",
+            "old_string_bytes": 31,
+            "new_string_bytes": 31,
+            "old_string_sha256": "oldhash",
+            "new_string_sha256": "newhash",
+            "line_ending_mode": "lf",
+            "file_observation": {
+                "id": "edit_file:call_edit",
+                "path": "/tmp/project/src/lib.rs",
+                "bytes": 45,
+                "sha256": "after456",
+                "mtime_ms": 1234,
+                "complete": true,
+                "source_tool_call_id": "call_edit"
+            },
+            "changed_files": ["/tmp/project/src/lib.rs"],
+            "old_string": "SECRET_EDIT_OLD_SENTINEL",
+            "new_string": "SECRET_EDIT_NEW_SENTINEL",
+            "content": "SECRET_EDIT_FINAL_SENTINEL"
+        });
+        let outcome = ToolOutcome::ok();
+        let output_policy = ToolOutputPolicySnapshot::for_tool_name("edit_file");
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_edit",
+            tool_name: "edit_file",
+            arguments: &serde_json::json!({"path": "src/lib.rs"}),
+            raw_output_text: "edit_file completed: edited /tmp/project/src/lib.rs, replaced 1 occurrence, 45 bytes.",
+            raw_output_json: &raw_output_json,
+            success: true,
+            outcome: &outcome,
+            output_policy: &output_policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let bus = ToolEventBus::new(4);
+        let mut events = bus.subscribe();
+        let trace = bus.start_trace("turn_1", "call_edit", "edit_file");
+
+        trace.emit_completed(1, &envelope);
+
+        let event = timeout(Duration::from_millis(100), events.recv())
+            .await
+            .expect("event should arrive")
+            .expect("event should decode");
+        let ToolEventPayload::CallCompleted(completed) = event.payload else {
+            panic!("edit_file completion should emit CallCompleted");
+        };
+        let ToolDisplayPayload::Summary(display_summary) = &completed.display else {
+            panic!("edit_file display should be a summary");
+        };
+        let ToolStoragePayload::Metadata { metadata } = &completed.storage else {
+            panic!("edit_file storage should be metadata-only");
+        };
+        let display_metadata = display_summary.metadata.to_json();
+        let storage_metadata = metadata.to_json();
+
+        assert_eq!(event.tool_name, "edit_file");
+        assert_eq!(display_summary.title, "edit_file changed 1 file(s)");
+        assert_eq!(
+            display_metadata["changedFiles"][0],
+            "/tmp/project/src/lib.rs"
+        );
+        assert_eq!(storage_metadata["operation"], "edited");
+        assert_eq!(storage_metadata["matchesReplaced"], 1);
+        assert_eq!(storage_metadata["replaceAll"], false);
+        assert_eq!(storage_metadata["bytesBefore"], 44);
+        assert_eq!(storage_metadata["bytesAfter"], 45);
+        assert_eq!(storage_metadata["bytesWritten"], 45);
+        assert_eq!(storage_metadata["sha256Before"], "before123");
+        assert_eq!(storage_metadata["sha256"], "after456");
+        assert_eq!(storage_metadata["oldStringSha256"], "oldhash");
+        assert_eq!(storage_metadata["newStringSha256"], "newhash");
+        assert_eq!(storage_metadata["lineEndingMode"], "lf");
+        let completed_json = serde_json::to_string(&completed).unwrap();
+        assert!(!completed_json.contains("SECRET_EDIT_OLD_SENTINEL"));
+        assert!(!completed_json.contains("SECRET_EDIT_NEW_SENTINEL"));
+        assert!(!completed_json.contains("SECRET_EDIT_FINAL_SENTINEL"));
+    }
 }

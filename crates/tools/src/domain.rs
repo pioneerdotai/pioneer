@@ -250,6 +250,12 @@ mod tests {
 
         assert!(!mapped.contains(&REQUEST_TOOLS_TOOL_NAME));
         assert!(!mapped.contains(&"read_skill"));
+        for core_file_tool in crate::tool_index::PREFLIGHT_CORE_FILE_TOOL_NAMES {
+            assert!(
+                !mapped.contains(core_file_tool),
+                "core file tool `{core_file_tool}` must not be a request_tools domain candidate"
+            );
+        }
         assert!(!mapped.iter().any(|name| name.starts_with("skill.")));
         assert!(!mapped.iter().any(|name| name.starts_with("mcp_")));
         assert!(!mapped.iter().any(|name| name.contains("dynamic")));

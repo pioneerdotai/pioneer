@@ -49,7 +49,7 @@ fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         "web_fetch" => project_web_fetch(input),
         "web_search" => project_web_search(input),
         "download_url" | "download" => project_download(input),
-        "apply_patch" | "write_file" => project_file_change(input),
+        "apply_patch" | "write_file" | "edit_file" => project_file_change(input),
         "read_file" => project_read_file(input),
         "read_skill" => project_read_skill(input),
         "list_dir" => project_list_dir(input),
@@ -319,8 +319,19 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     let metadata = serde_json::json!({
         "changedFiles": changed_files,
         "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
+        "matches": input.raw_output_json.get("matches").cloned().unwrap_or(JsonValue::Null),
+        "matchesReplaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
+        "replaceAll": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
+        "bytesBefore": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
+        "bytesAfter": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
         "bytesWritten": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
+        "sha256Before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
         "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
+        "oldStringBytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
+        "newStringBytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
+        "oldStringSha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
+        "newStringSha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
+        "lineEndingMode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
         "exitCode": input.raw_output_json.get("exit_code").cloned().unwrap_or(JsonValue::Null),
         "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
         "outputHash": sha256_hex(input.raw_output_text.as_bytes()),
@@ -363,22 +374,42 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
 }
 
 fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    if input.tool_name != "write_file" {
-        return llm_view_for_policy(input);
-    }
-
-    let value = serde_json::json!({
-        "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
-        "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
-        "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-        "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-        "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
-        "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-        "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-        "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
-        "created_dirs": input.raw_output_json.get("created_dirs").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
-    });
+    let value = match input.tool_name {
+        "write_file" => serde_json::json!({
+            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
+            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
+            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
+            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
+            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
+            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
+            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
+            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
+            "created_dirs": input.raw_output_json.get("created_dirs").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
+        }),
+        "edit_file" => serde_json::json!({
+            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
+            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
+            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
+            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
+            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
+            "matches_replaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
+            "replace_all": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
+            "bytes_before": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
+            "bytes_after": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
+            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
+            "sha256_before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
+            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
+            "old_string_bytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
+            "new_string_bytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
+            "old_string_sha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
+            "new_string_sha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
+            "line_ending_mode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
+            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
+            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
+        }),
+        _ => return llm_view_for_policy(input),
+    };
     match input.output_policy.llm {
         LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
             ToolResultView::Json {
@@ -1802,6 +1833,79 @@ mod tests {
         assert_eq!(metadata["operation"], "overwritten");
         assert_eq!(metadata["bytesWritten"], 12);
         assert_eq!(metadata["sha256"], "def456");
+        assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
+    }
+
+    #[test]
+    fn edit_file_projection_does_not_echo_sensitive_strings() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "status": "completed",
+            "operation": "edited",
+            "path": "/tmp/project/src/lib.rs",
+            "resolved_path": "/tmp/project/src/lib.rs",
+            "matches_replaced": 1,
+            "replace_all": false,
+            "bytes_before": 44,
+            "bytes_after": 45,
+            "bytes_written": 45,
+            "sha256_before": "before123",
+            "sha256": "after456",
+            "old_string_bytes": 31,
+            "new_string_bytes": 31,
+            "old_string_sha256": "oldhash",
+            "new_string_sha256": "newhash",
+            "line_ending_mode": "lf",
+            "changed_files": ["/tmp/project/src/lib.rs"],
+            "old_string": "SECRET_EDIT_OLD_SENTINEL",
+            "new_string": "SECRET_EDIT_NEW_SENTINEL",
+            "content": "SECRET_EDIT_FINAL_SENTINEL"
+        });
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_edit_projection",
+            tool_name: "edit_file",
+            arguments: &serde_json::json!({"path": "/tmp/project/src/lib.rs"}),
+            raw_output_text: "edit_file completed: edited /tmp/project/src/lib.rs, replaced 1 occurrence, 45 bytes.",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("edit_file"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let rendered = serde_json::to_string(&envelope).expect("envelope should serialize");
+
+        assert!(!rendered.contains("SECRET_EDIT_OLD_SENTINEL"));
+        assert!(!rendered.contains("SECRET_EDIT_NEW_SENTINEL"));
+        assert!(!rendered.contains("SECRET_EDIT_FINAL_SENTINEL"));
+        assert!(rendered.contains("matches_replaced"));
+        assert!(rendered.contains("old_string_sha256"));
+
+        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
+            panic!("edit_file should use summary display");
+        };
+        assert_eq!(display_summary.title, "edit_file changed 1 file(s)");
+        assert_eq!(
+            display_summary.lines,
+            vec!["/tmp/project/src/lib.rs".to_owned()]
+        );
+
+        let ToolStoragePayload::Metadata { metadata } = &envelope.storage else {
+            panic!("edit_file should use metadata-only storage");
+        };
+        let metadata = metadata.to_json();
+        assert_eq!(metadata["operation"], "edited");
+        assert_eq!(metadata["matchesReplaced"], 1);
+        assert_eq!(metadata["replaceAll"], false);
+        assert_eq!(metadata["bytesBefore"], 44);
+        assert_eq!(metadata["bytesAfter"], 45);
+        assert_eq!(metadata["bytesWritten"], 45);
+        assert_eq!(metadata["sha256Before"], "before123");
+        assert_eq!(metadata["sha256"], "after456");
+        assert_eq!(metadata["oldStringBytes"], 31);
+        assert_eq!(metadata["newStringBytes"], 31);
+        assert_eq!(metadata["oldStringSha256"], "oldhash");
+        assert_eq!(metadata["newStringSha256"], "newhash");
+        assert_eq!(metadata["lineEndingMode"], "lf");
         assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
     }
 

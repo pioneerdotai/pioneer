@@ -90,8 +90,8 @@ pub use spec::{
     builtin_tool_recovery_metadata, builtin_tool_specs,
 };
 pub use tool_index::{
-    PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor, PreflightToolIndex,
-    build_preflight_tool_index,
+    PREFLIGHT_CORE_FILE_TOOL_NAMES, PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor,
+    PreflightToolIndex, build_preflight_tool_index,
 };
 pub use visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilityDiagnostic,
@@ -109,8 +109,8 @@ use handlers::materialize_computer_use_domain_bundle;
 
 use handlers::FileObservationStore;
 use handlers::{
-    ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
-    UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
+    ApplyPatchHandler, DownloadUrlHandler, EditFileHandler, GrepHandler, ListDirHandler,
+    ReadFileHandler, UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -454,6 +454,10 @@ pub fn build_tools_with_environment(
         "write_file",
         Arc::new(WriteFileHandler::new(file_observation_store.clone())),
     );
+    builder.register_handler(
+        "edit_file",
+        Arc::new(EditFileHandler::new(file_observation_store.clone())),
+    );
     builder.register_handler("list_dir", Arc::new(ListDirHandler));
     builder.register_handler("grep_files", Arc::new(GrepHandler));
     builder.register_handler("apply_patch", Arc::new(ApplyPatchHandler));
@@ -769,6 +773,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_file_has_builtin_spec_and_handler() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_edit_file_registered",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        assert!(built.router.find_spec("edit_file").is_some());
+        assert!(
+            built.router.has_handler("edit_file"),
+            "edit_file must have a runtime handler"
+        );
+        assert!(
+            built
+                .router
+                .preflight_tool_index()
+                .core_tools
+                .contains(&"edit_file".to_owned()),
+            "edit_file must be a core preflight-visible tool once its handler is registered"
+        );
+    }
+
+    #[tokio::test]
     async fn write_file_runtime_read_then_write_flow_uses_shared_observation_store() {
         let workdir = tools_runtime_temp_dir("write-file-runtime-flow");
         let target = workdir.join("existing.txt");
@@ -866,6 +894,164 @@ mod tests {
             std::fs::read_to_string(target.as_path()).expect("stale write must not modify target"),
             "external mutation\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_file_runtime_read_then_edit_flow_uses_shared_observation_store() {
+        let workdir = tools_runtime_temp_dir("edit-file-runtime-flow");
+        let target = workdir.join("existing.txt");
+        std::fs::write(target.as_path(), "alpha\nbeta\ngamma\n").expect("seed existing file");
+        let built = build_builtin_tools(
+            workdir.as_path(),
+            "turn_edit_file_runtime_flow",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let before_read = execute_builtin_json_call(
+            &built,
+            "edit_before_read",
+            "edit_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "old_string": "beta",
+                "new_string": "delta"
+            }),
+        )
+        .await;
+        assert!(!before_read.success());
+        assert_eq!(
+            before_read.raw_output_json()["status"].as_str(),
+            Some("read_required")
+        );
+
+        let read = execute_builtin_json_call(
+            &built,
+            "read_existing_for_edit",
+            "read_file",
+            serde_json::json!({"path": "existing.txt"}),
+        )
+        .await;
+        assert!(read.success());
+        assert_eq!(
+            read.raw_output_json()["file_observation"]["complete"].as_bool(),
+            Some(true)
+        );
+
+        let edit = execute_builtin_json_call(
+            &built,
+            "edit_after_read",
+            "edit_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "old_string": "alpha\nbeta\ngamma\n",
+                "new_string": "alpha\ndelta\ngamma\n"
+            }),
+        )
+        .await;
+        assert!(edit.success());
+        let edit_json = edit.raw_output_json();
+        assert_eq!(edit_json["operation"].as_str(), Some("edited"));
+        assert_eq!(edit_json["matches_replaced"].as_u64(), Some(1));
+        let expected_changed_file = target.display().to_string();
+        assert_eq!(
+            edit_json["changed_files"][0].as_str(),
+            Some(expected_changed_file.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("target should update"),
+            "alpha\ndelta\ngamma\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workdir);
+    }
+
+    #[tokio::test]
+    async fn edit_file_runtime_observation_chain_authorizes_second_edit_and_catches_stale() {
+        let workdir = tools_runtime_temp_dir("edit-file-observation-chain");
+        let target = workdir.join("existing.txt");
+        std::fs::write(target.as_path(), "one\ntwo\nthree\n").expect("seed existing file");
+        let built = build_builtin_tools(
+            workdir.as_path(),
+            "turn_edit_file_chain",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let read = execute_builtin_json_call(
+            &built,
+            "read_existing_for_chain",
+            "read_file",
+            serde_json::json!({"path": "existing.txt"}),
+        )
+        .await;
+        assert!(read.success());
+
+        let first_edit = execute_builtin_json_call(
+            &built,
+            "edit_chain_first",
+            "edit_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "old_string": "two",
+                "new_string": "deux"
+            }),
+        )
+        .await;
+        assert!(first_edit.success());
+        assert_eq!(
+            first_edit.raw_output_json()["file_observation"]["id"].as_str(),
+            Some("edit_file:edit_chain_first")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("target should update"),
+            "one\ndeux\nthree\n"
+        );
+
+        let second_edit = execute_builtin_json_call(
+            &built,
+            "edit_chain_second",
+            "edit_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "old_string": "three",
+                "new_string": "trois"
+            }),
+        )
+        .await;
+        assert!(second_edit.success());
+        assert_eq!(
+            second_edit.raw_output_json()["file_observation"]["id"].as_str(),
+            Some("edit_file:edit_chain_second")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("target should update again"),
+            "one\ndeux\ntrois\n"
+        );
+
+        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
+        let stale_edit = execute_builtin_json_call(
+            &built,
+            "edit_chain_after_external_mutation",
+            "edit_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "old_string": "external",
+                "new_string": "internal"
+            }),
+        )
+        .await;
+        assert!(!stale_edit.success());
+        assert_eq!(
+            stale_edit.raw_output_json()["status"].as_str(),
+            Some("precondition_failed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("stale edit must not modify target"),
+            "external mutation\n"
+        );
+
+        let _ = std::fs::remove_dir_all(workdir);
     }
 
     #[tokio::test]

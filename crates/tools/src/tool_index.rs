@@ -5,11 +5,21 @@ use std::collections::BTreeMap;
 
 const PREFLIGHT_SUMMARY_MAX_CHARS: usize = 160;
 
+pub const PREFLIGHT_CORE_FILE_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "grep_files",
+    "apply_patch",
+];
+
 pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "exec_command",
     "write_stdin",
     "read_file",
     "write_file",
+    "edit_file",
     "list_dir",
     "grep_files",
     "apply_patch",
@@ -227,6 +237,7 @@ mod tests {
             "write_stdin",
             "read_file",
             "write_file",
+            "edit_file",
             "list_dir",
             "grep_files",
             "apply_patch",
@@ -241,6 +252,7 @@ mod tests {
         for name in [
             "read_file",
             "write_file",
+            "edit_file",
             "list_dir",
             "grep_files",
             "apply_patch",
@@ -250,6 +262,21 @@ mod tests {
                 "core tools must include default-visible file tool `{name}`"
             );
         }
+    }
+
+    #[test]
+    fn tool_index_defines_core_file_tool_identity() {
+        assert_eq!(
+            PREFLIGHT_CORE_FILE_TOOL_NAMES,
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "grep_files",
+                "apply_patch",
+            ]
+        );
     }
 
     #[test]

@@ -12,6 +12,10 @@
     "installed": {
       "type": "boolean"
     },
+    "lifecycle_editable": {
+      "type": "boolean",
+      "default": true
+    },
     "managed": {
       "type": "boolean"
     },

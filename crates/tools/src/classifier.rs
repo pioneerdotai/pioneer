@@ -58,6 +58,13 @@ impl ErrorClassifier for DefaultErrorClassifier {
             return outcome;
         }
 
+        if invocation.tool_name == "edit_file"
+            && !success
+            && let Some(outcome) = classify_edit_file_result(raw_output_json)
+        {
+            return outcome;
+        }
+
         if is_mcp_invocation(invocation) {
             return classify_mcp_result(raw_output_json, success);
         }
@@ -169,6 +176,53 @@ fn classify_write_file_result(raw_output_json: &JsonValue) -> Option<ToolOutcome
             "The target changed before write_file could overwrite it. Call read_file again for the complete current file, then retry write_file with updated content.",
             false,
             None,
+        )),
+        _ => None,
+    }
+}
+
+fn classify_edit_file_result(raw_output_json: &JsonValue) -> Option<ToolOutcome> {
+    let status = raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let error_class = raw_output_json
+        .get("errorClass")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+
+    match (status, error_class) {
+        ("read_required", _) => Some(ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "edit_file needs current file state before editing. Call read_file for the complete file, then retry edit_file with exact old_string text copied without line-number prefixes.",
+            false,
+            None,
+        )),
+        ("precondition_failed", _) | (_, "precondition_failed") => Some(ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "The target changed before edit_file could modify it. Call read_file again for the complete current file, then retry edit_file with updated exact old_string text.",
+            false,
+            None,
+        )),
+        ("not_found", _) => Some(ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "edit_file could not find old_string. Call read_file again, copy the exact current file text without line-number prefixes, and retry with a corrected old_string.",
+            false,
+            None,
+        )),
+        ("ambiguous_match", _) => Some(ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "edit_file old_string matched multiple locations. Retry with more surrounding context for a unique match, or set replace_all=true only if every exact occurrence should change.",
+            false,
+            None,
+        )),
+        ("not_utf8", _) => Some(ToolOutcome::fatal(
+            ToolErrorClass::InvalidArguments,
+            Some("edit_file only supports UTF-8 text files. Use an appropriate binary-safe workflow instead of retrying edit_file with the same target.".to_owned()),
+        )),
+        ("no_change", _) => Some(ToolOutcome::fatal(
+            ToolErrorClass::InvalidArguments,
+            Some("edit_file computed no content change. Do not retry the same edit_file arguments; inspect the current file and choose a different edit only if needed.".to_owned()),
         )),
         _ => None,
     }
@@ -1017,6 +1071,23 @@ mod tests {
         }
     }
 
+    fn edit_file_invocation() -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call".to_owned(),
+            tool_name: "edit_file".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: crate::context::ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+            workdir: std::path::PathBuf::from("."),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[test]
     fn grep_needs_narrowing_result_uses_dedicated_error_class() {
         let classifier = DefaultErrorClassifier;
@@ -1105,6 +1176,124 @@ mod tests {
         let hint = outcome.retry_hint.expect("retry hint should exist");
         assert!(hint.contains("`path` and `content`"));
         assert!(hint.contains("write_stdin only"));
+    }
+
+    #[test]
+    fn edit_file_read_required_result_points_to_complete_read_then_retry() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = edit_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "read_required",
+                "errorClass": "invalid_arguments"
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("read_file for the complete file"));
+        assert!(hint.contains("retry edit_file"));
+        assert!(hint.contains("without line-number prefixes"));
+    }
+
+    #[test]
+    fn edit_file_precondition_failed_result_points_to_fresh_read() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = edit_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "precondition_failed",
+                "errorClass": "precondition_failed"
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::ExecutionFailed));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("Call read_file again"));
+        assert!(hint.contains("retry edit_file"));
+    }
+
+    #[test]
+    fn edit_file_not_found_result_points_to_exact_current_text() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = edit_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "not_found",
+                "errorClass": "invalid_arguments"
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("could not find old_string"));
+        assert!(hint.contains("copy the exact current file text"));
+        assert!(hint.contains("without line-number prefixes"));
+    }
+
+    #[test]
+    fn edit_file_ambiguous_match_result_points_to_unique_context_or_replace_all() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = edit_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "ambiguous_match",
+                "errorClass": "invalid_arguments",
+                "matches": 2
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("more surrounding context"));
+        assert!(hint.contains("replace_all=true"));
+    }
+
+    #[test]
+    fn edit_file_terminal_statuses_do_not_retry_same_arguments() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = edit_file_invocation();
+
+        for (status, expected_hint) in [
+            ("not_utf8", "only supports UTF-8"),
+            ("no_change", "Do not retry the same edit_file arguments"),
+        ] {
+            let outcome = classifier.classify_result(
+                &invocation,
+                &serde_json::json!({
+                    "ok": false,
+                    "status": status,
+                    "errorClass": "invalid_arguments"
+                }),
+                false,
+            );
+
+            assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
+            assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+            assert!(!outcome.should_retry);
+            let hint = outcome.retry_hint.expect("retry hint should exist");
+            assert!(hint.contains(expected_hint));
+        }
     }
 
     #[test]

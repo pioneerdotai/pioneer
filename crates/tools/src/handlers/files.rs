@@ -20,6 +20,8 @@ const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 const HARD_MAX_READ_BYTES: usize = 1024 * 1024;
 const DEFAULT_WRITE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const HARD_WRITE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_EDIT_MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+const HARD_EDIT_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_LIST_DEPTH: usize = 2;
 const HARD_MAX_LIST_DEPTH: usize = 8;
 const DEFAULT_LIST_LIMIT: usize = 512;
@@ -59,6 +61,12 @@ pub struct WriteFileHandler {
     observation_store: Arc<FileObservationStore>,
 }
 
+#[derive(Clone)]
+pub struct EditFileHandler {
+    #[allow(dead_code)]
+    observation_store: Arc<FileObservationStore>,
+}
+
 impl ReadFileHandler {
     pub(crate) fn new(observation_store: Arc<FileObservationStore>) -> Self {
         Self { observation_store }
@@ -78,6 +86,18 @@ impl WriteFileHandler {
 }
 
 impl Default for WriteFileHandler {
+    fn default() -> Self {
+        Self::new(Arc::new(FileObservationStore::default()))
+    }
+}
+
+impl EditFileHandler {
+    pub(crate) fn new(observation_store: Arc<FileObservationStore>) -> Self {
+        Self { observation_store }
+    }
+}
+
+impl Default for EditFileHandler {
     fn default() -> Self {
         Self::new(Arc::new(FileObservationStore::default()))
     }
@@ -187,6 +207,22 @@ struct WriteFileArgs {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: Option<bool>,
+    #[serde(default)]
+    read_observation_id: Option<String>,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+    #[serde(default)]
+    expected_mtime_ms: Option<i64>,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteFileOperation {
     Created,
@@ -210,6 +246,166 @@ struct WriteFileTarget {
     resolved_path: PathBuf,
     operation: WriteFileOperation,
     created_dirs: Vec<PathBuf>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditFileTarget {
+    original_path: String,
+    resolved_path: PathBuf,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditFileLoadedTarget {
+    target: EditFileTarget,
+    text: String,
+    current: CurrentFileState,
+}
+
+enum EditFileTargetValidation {
+    Ready(EditFileTarget),
+    Failed(Box<dyn ToolOutput>),
+}
+
+enum EditFileTextLoad {
+    Loaded(EditFileLoadedTarget),
+    Failed(Box<dyn ToolOutput>),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditFileRawMatch {
+    occurrences: usize,
+    source: EditFileMatchSource,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditFileMatchSource {
+    Raw {
+        line_ending_mode: LineEndingMode,
+    },
+    CrlfFallback {
+        normalized_text: String,
+        normalized_old_string: String,
+        normalized_new_string: String,
+    },
+}
+
+impl EditFileMatchSource {
+    fn line_ending_mode(&self) -> &'static str {
+        match self {
+            Self::Raw { line_ending_mode } => line_ending_mode.as_str(),
+            Self::CrlfFallback { .. } => "crlf_fallback",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditFileComputedEdit {
+    final_text: String,
+    matches_replaced: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEndingMode {
+    None,
+    Lf,
+    Crlf,
+    Mixed,
+}
+
+impl LineEndingMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Lf => "lf",
+            Self::Crlf => "crlf",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+enum EditFileRawMatchResult {
+    Matched(EditFileRawMatch),
+    Failed(Box<dyn ToolOutput>),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileMutationTool {
+    WriteFile,
+    EditFile,
+}
+
+#[allow(dead_code)]
+impl FileMutationTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::WriteFile => "write_file",
+            Self::EditFile => "edit_file",
+        }
+    }
+
+    fn current_state_action_context(self) -> &'static str {
+        match self {
+            Self::WriteFile => "before overwrite",
+            Self::EditFile => "before edit",
+        }
+    }
+
+    fn read_required_message(self) -> &'static str {
+        match self {
+            Self::WriteFile => {
+                "write_file cannot overwrite an existing file until read_file has observed the complete current file"
+            }
+            Self::EditFile => {
+                "edit_file cannot modify an existing file until read_file has observed the complete current file"
+            }
+        }
+    }
+
+    fn stale_message(self) -> &'static str {
+        match self {
+            Self::WriteFile => "file changed before write_file could overwrite it",
+            Self::EditFile => "file changed before edit_file could modify it",
+        }
+    }
+
+    fn text_payload_label(self) -> &'static str {
+        match self {
+            Self::WriteFile => "write_file content",
+            Self::EditFile => "edit_file result",
+        }
+    }
+
+    fn verification_failed_message(self) -> &'static str {
+        match self {
+            Self::WriteFile => "write_file wrote bytes but post-write verification failed",
+            Self::EditFile => "edit_file wrote bytes but post-write verification failed",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct FilePreconditionInput<'a> {
+    tool: FileMutationTool,
+    original_path: &'a str,
+    resolved_path: &'a Path,
+    read_observation_id: Option<&'a str>,
+    expected_sha256: Option<&'a str>,
+    expected_mtime_ms: Option<i64>,
+}
+
+#[allow(dead_code)]
+impl FilePreconditionInput<'_> {
+    fn has_explicit_precondition(&self) -> bool {
+        self.expected_sha256.is_some() || self.expected_mtime_ms.is_some()
+    }
 }
 
 #[allow(dead_code)]
@@ -398,18 +594,77 @@ impl ToolHandler for WriteFileHandler {
             WriteVerification::Verified(current) => current,
             WriteVerification::Failed(output) => return Ok(output),
         };
-        let observation = FileObservation {
-            id: format!("write_file:{}", invocation.call_id),
-            resolved_path: target.resolved_path.clone(),
-            bytes: current.bytes,
-            sha256: current.sha256.clone(),
-            mtime_ms: current.mtime_ms,
-            complete: true,
-            source_tool_call_id: invocation.call_id,
-        };
-        self.observation_store.record(observation.clone());
+        let observation = record_file_mutation_observation(
+            self.observation_store.as_ref(),
+            FileMutationTool::WriteFile,
+            invocation.call_id.as_str(),
+            target.resolved_path.as_path(),
+            &current,
+        );
 
         Ok(write_file_success_output(&target, &current, observation))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for EditFileHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _trace: crate::events::ToolEventTrace,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let args = parse_edit_file_args(invocation.payload)?;
+        let target = match prepare_edit_file_target(invocation.workdir.as_path(), &args).await? {
+            EditFileTargetValidation::Ready(target) => target,
+            EditFileTargetValidation::Failed(output) => return Ok(output),
+        };
+        if args.old_string == args.new_string {
+            return Ok(edit_file_identical_no_change_output(
+                args.path.as_str(),
+                target.resolved_path.as_path(),
+            ));
+        }
+        let loaded = match load_edit_file_text(target).await? {
+            EditFileTextLoad::Loaded(loaded) => loaded,
+            EditFileTextLoad::Failed(output) => return Ok(output),
+        };
+        if let Some(output) = verify_edit_file_observation_preconditions(
+            self.observation_store.as_ref(),
+            &loaded,
+            &args,
+        )
+        .await?
+        {
+            return Ok(output);
+        }
+        let raw_match = match compute_edit_file_raw_match(&loaded, &args) {
+            EditFileRawMatchResult::Matched(raw_match) => raw_match,
+            EditFileRawMatchResult::Failed(output) => return Ok(output),
+        };
+        let computed = compute_edit_file_replacement(&loaded, &args, &raw_match);
+        if let Some(output) = edit_file_no_change_if_unchanged(&loaded, &computed) {
+            return Ok(output);
+        }
+        let write_result = edit_file_atomically(&loaded, &computed).await?;
+        let current = match verify_edited_file(&loaded, &write_result).await? {
+            WriteVerification::Verified(current) => current,
+            WriteVerification::Failed(output) => return Ok(output),
+        };
+        let observation = record_file_mutation_observation(
+            self.observation_store.as_ref(),
+            FileMutationTool::EditFile,
+            invocation.call_id.as_str(),
+            loaded.target.resolved_path.as_path(),
+            &current,
+        );
+        Ok(edit_file_success_output(
+            &loaded,
+            &args,
+            &raw_match,
+            &computed,
+            &current,
+            observation,
+        ))
     }
 }
 
@@ -924,19 +1179,37 @@ fn parse_write_file_args(payload: ToolPayload) -> Result<WriteFileArgs, ToolErro
         ));
     }
     if let Some(expected_sha256) = args.expected_sha256.as_deref() {
-        validate_expected_sha256(expected_sha256)?;
+        validate_expected_sha256("write_file", expected_sha256)?;
     }
     Ok(args)
 }
 
-fn validate_expected_sha256(value: &str) -> Result<(), ToolError> {
+fn parse_edit_file_args(payload: ToolPayload) -> Result<EditFileArgs, ToolError> {
+    let args = parse_json_args::<EditFileArgs>(payload)?;
+    if args.path.trim().is_empty() {
+        return Err(ToolError::invalid_arguments(
+            "edit_file `path` must not be empty",
+        ));
+    }
+    if args.old_string.is_empty() {
+        return Err(ToolError::invalid_arguments(
+            "edit_file `old_string` must not be empty",
+        ));
+    }
+    if let Some(expected_sha256) = args.expected_sha256.as_deref() {
+        validate_expected_sha256("edit_file", expected_sha256)?;
+    }
+    Ok(args)
+}
+
+fn validate_expected_sha256(tool_name: &str, value: &str) -> Result<(), ToolError> {
     let is_valid = value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if is_valid {
         Ok(())
     } else {
-        Err(ToolError::invalid_arguments(
-            "write_file `expected_sha256` must be a 64-character hex SHA-256 digest",
-        ))
+        Err(ToolError::invalid_arguments(format!(
+            "{tool_name} `expected_sha256` must be a 64-character hex SHA-256 digest"
+        )))
     }
 }
 
@@ -1022,6 +1295,145 @@ async fn prepare_write_file_target(
     })
 }
 
+async fn prepare_edit_file_target(
+    workdir: &Path,
+    args: &EditFileArgs,
+) -> Result<EditFileTargetValidation, ToolError> {
+    let resolved_path = normalize_path_lexically(resolve_path(workdir, args.path.as_str()));
+
+    match tokio::fs::metadata(resolved_path.as_path()).await {
+        Ok(metadata) if metadata.is_file() => Ok(EditFileTargetValidation::Ready(EditFileTarget {
+            original_path: args.path.clone(),
+            resolved_path,
+        })),
+        Ok(metadata) if metadata.is_dir() => Err(ToolError::invalid_arguments(format!(
+            "edit_file target `{}` is a directory",
+            resolved_path.display()
+        ))),
+        Ok(_) => Err(ToolError::invalid_arguments(format!(
+            "edit_file target `{}` is not a regular file",
+            resolved_path.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(EditFileTargetValidation::Failed(
+            edit_file_target_not_found_output(args.path.as_str(), resolved_path.as_path()),
+        )),
+        Err(error) => Err(ToolError::execution_failed(format!(
+            "failed to stat edit_file target `{}`: {error}",
+            resolved_path.display()
+        ))),
+    }
+}
+
+fn edit_file_target_not_found_output(
+    original_path: &str,
+    resolved_path: &Path,
+) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "target_not_found",
+        "errorClass": "invalid_arguments",
+        "message": "edit_file target does not exist; use write_file if the goal is to create a new file",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "retryableByModel": true,
+        "retrySameArguments": false,
+        "suggestedTool": "write_file",
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+            "edit_file target does not exist; use write_file if the goal is to create a new file"
+                .to_owned()
+        }),
+        false,
+        payload,
+    ))
+}
+
+fn edit_max_file_bytes() -> usize {
+    DEFAULT_EDIT_MAX_FILE_BYTES.min(HARD_EDIT_MAX_FILE_BYTES)
+}
+
+async fn load_edit_file_text(target: EditFileTarget) -> Result<EditFileTextLoad, ToolError> {
+    let metadata = tokio::fs::metadata(target.resolved_path.as_path())
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to stat edit_file target `{}` before edit: {error}",
+                target.resolved_path.display()
+            ))
+        })?;
+    if !metadata.is_file() {
+        return Err(ToolError::invalid_arguments(format!(
+            "edit_file target `{}` is not a regular file",
+            target.resolved_path.display()
+        )));
+    }
+
+    let max_bytes = edit_max_file_bytes();
+    let metadata_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if metadata_len > max_bytes {
+        return Err(ToolError::invalid_arguments(format!(
+            "edit_file target `{}` is larger than edit_file limit ({max_bytes} bytes)",
+            target.resolved_path.display()
+        )));
+    }
+
+    let bytes = tokio::fs::read(target.resolved_path.as_path())
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to read edit_file target `{}` before edit: {error}",
+                target.resolved_path.display()
+            ))
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(ToolError::invalid_arguments(format!(
+            "edit_file target `{}` is larger than edit_file limit ({max_bytes} bytes)",
+            target.resolved_path.display()
+        )));
+    }
+
+    let current = CurrentFileState {
+        bytes: bytes.len() as u64,
+        sha256: sha256_hex(bytes.as_slice()),
+        mtime_ms: metadata_mtime_ms(&metadata).unwrap_or_default(),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(EditFileTextLoad::Failed(edit_file_not_utf8_output(
+                target.original_path.as_str(),
+                target.resolved_path.as_path(),
+            )));
+        }
+    };
+
+    Ok(EditFileTextLoad::Loaded(EditFileLoadedTarget {
+        target,
+        text,
+        current,
+    }))
+}
+
+fn edit_file_not_utf8_output(original_path: &str, resolved_path: &Path) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "not_utf8",
+        "errorClass": "invalid_arguments",
+        "message": "edit_file target is not valid UTF-8 text",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "retryableByModel": false,
+        "retrySameArguments": false,
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "edit_file target is not valid UTF-8 text".to_owned()),
+        false,
+        payload,
+    ))
+}
+
 async fn verify_existing_file_preconditions(
     observation_store: &FileObservationStore,
     target: &WriteFileTarget,
@@ -1031,38 +1443,61 @@ async fn verify_existing_file_preconditions(
         return Ok(None);
     }
 
-    let observation = match args.read_observation_id.as_deref() {
-        Some(observation_id) => observation_store
-            .complete_by_id_for_path(observation_id, target.resolved_path.as_path()),
-        None => observation_store.latest_complete_for_path(target.resolved_path.as_path()),
+    verify_file_preconditions(
+        observation_store,
+        FilePreconditionInput {
+            tool: FileMutationTool::WriteFile,
+            original_path: args.path.as_str(),
+            resolved_path: target.resolved_path.as_path(),
+            read_observation_id: args.read_observation_id.as_deref(),
+            expected_sha256: args.expected_sha256.as_deref(),
+            expected_mtime_ms: args.expected_mtime_ms,
+        },
+    )
+    .await
+}
+
+async fn verify_file_preconditions(
+    observation_store: &FileObservationStore,
+    input: FilePreconditionInput<'_>,
+) -> Result<Option<Box<dyn ToolOutput>>, ToolError> {
+    let observation = match input.read_observation_id {
+        Some(observation_id) => {
+            observation_store.complete_by_id_for_path(observation_id, input.resolved_path)
+        }
+        None => observation_store.latest_complete_for_path(input.resolved_path),
     };
-    let has_explicit_precondition =
-        args.expected_sha256.is_some() || args.expected_mtime_ms.is_some();
+    let has_explicit_precondition = input.has_explicit_precondition();
 
     if observation.is_none() && !has_explicit_precondition {
-        return Ok(Some(read_required_output(target)));
+        return Ok(Some(read_required_output(input)));
     }
 
-    let current = read_current_file_state(target.resolved_path.as_path()).await?;
+    let current = read_current_file_state_for_tool(
+        input.tool.name(),
+        input.resolved_path,
+        input.tool.current_state_action_context(),
+    )
+    .await?;
     if has_explicit_precondition {
-        if let Some(expected_sha256) = args.expected_sha256.as_deref()
+        if let Some(expected_sha256) = input.expected_sha256
             && current.sha256 != expected_sha256
         {
             return Ok(Some(precondition_failed_output_for_expected(
-                target,
+                input,
                 &current,
                 Some(expected_sha256),
-                args.expected_mtime_ms,
+                input.expected_mtime_ms,
             )));
         }
 
-        if let Some(expected_mtime_ms) = args.expected_mtime_ms
+        if let Some(expected_mtime_ms) = input.expected_mtime_ms
             && current.mtime_ms != expected_mtime_ms
         {
             return Ok(Some(precondition_failed_output_for_expected(
-                target,
+                input,
                 &current,
-                args.expected_sha256.as_deref(),
+                input.expected_sha256,
                 Some(expected_mtime_ms),
             )));
         }
@@ -1074,7 +1509,7 @@ async fn verify_existing_file_preconditions(
         && (current.sha256 != observation.sha256 || current.mtime_ms != observation.mtime_ms)
     {
         return Ok(Some(precondition_failed_output(
-            target,
+            input,
             &current,
             observation,
         )));
@@ -1083,23 +1518,327 @@ async fn verify_existing_file_preconditions(
     Ok(None)
 }
 
-async fn read_current_file_state(path: &Path) -> Result<CurrentFileState, ToolError> {
+async fn verify_edit_file_observation_preconditions(
+    observation_store: &FileObservationStore,
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+) -> Result<Option<Box<dyn ToolOutput>>, ToolError> {
+    verify_file_preconditions(
+        observation_store,
+        FilePreconditionInput {
+            tool: FileMutationTool::EditFile,
+            original_path: loaded.target.original_path.as_str(),
+            resolved_path: loaded.target.resolved_path.as_path(),
+            read_observation_id: args.read_observation_id.as_deref(),
+            expected_sha256: args.expected_sha256.as_deref(),
+            expected_mtime_ms: args.expected_mtime_ms,
+        },
+    )
+    .await
+}
+
+fn compute_edit_file_raw_match(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+) -> EditFileRawMatchResult {
+    let line_ending_mode = detect_line_ending_mode(loaded.text.as_str());
+    let occurrences = loaded.text.matches(args.old_string.as_str()).count();
+    if occurrences > 0 {
+        return validate_edit_file_match_count(
+            loaded,
+            args,
+            EditFileRawMatch {
+                occurrences,
+                source: EditFileMatchSource::Raw { line_ending_mode },
+            },
+        );
+    }
+
+    if line_ending_mode == LineEndingMode::Crlf {
+        let normalized_text = loaded.text.replace("\r\n", "\n");
+        let normalized_old_string = args.old_string.replace("\r\n", "\n");
+        let normalized_new_string = args.new_string.replace("\r\n", "\n");
+        let normalized_occurrences = normalized_text
+            .matches(normalized_old_string.as_str())
+            .count();
+        if normalized_occurrences > 0 {
+            return validate_edit_file_match_count(
+                loaded,
+                args,
+                EditFileRawMatch {
+                    occurrences: normalized_occurrences,
+                    source: EditFileMatchSource::CrlfFallback {
+                        normalized_text,
+                        normalized_old_string,
+                        normalized_new_string,
+                    },
+                },
+            );
+        }
+    }
+
+    EditFileRawMatchResult::Failed(edit_file_not_found_output(
+        loaded.target.original_path.as_str(),
+        loaded.target.resolved_path.as_path(),
+    ))
+}
+
+fn validate_edit_file_match_count(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+    raw_match: EditFileRawMatch,
+) -> EditFileRawMatchResult {
+    if raw_match.occurrences > 1 && !args.replace_all.unwrap_or(false) {
+        return EditFileRawMatchResult::Failed(edit_file_ambiguous_match_output(
+            loaded.target.original_path.as_str(),
+            loaded.target.resolved_path.as_path(),
+            raw_match.occurrences,
+        ));
+    }
+
+    EditFileRawMatchResult::Matched(raw_match)
+}
+
+fn compute_edit_file_replacement(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+    raw_match: &EditFileRawMatch,
+) -> EditFileComputedEdit {
+    match &raw_match.source {
+        EditFileMatchSource::Raw { .. } => {
+            if args.replace_all.unwrap_or(false) {
+                compute_edit_file_replace_all(loaded, args, raw_match.occurrences)
+            } else if raw_match.occurrences == 1 {
+                compute_edit_file_single_replacement(loaded, args)
+            } else {
+                EditFileComputedEdit {
+                    final_text: loaded.text.clone(),
+                    matches_replaced: 0,
+                }
+            }
+        }
+        EditFileMatchSource::CrlfFallback {
+            normalized_text,
+            normalized_old_string,
+            normalized_new_string,
+        } => {
+            let normalized_final_text = if args.replace_all.unwrap_or(false) {
+                normalized_text.replace(
+                    normalized_old_string.as_str(),
+                    normalized_new_string.as_str(),
+                )
+            } else {
+                normalized_text.replacen(
+                    normalized_old_string.as_str(),
+                    normalized_new_string.as_str(),
+                    1,
+                )
+            };
+            EditFileComputedEdit {
+                final_text: normalized_final_text.replace('\n', "\r\n"),
+                matches_replaced: if args.replace_all.unwrap_or(false) {
+                    raw_match.occurrences
+                } else {
+                    1
+                },
+            }
+        }
+    }
+}
+
+fn compute_edit_file_single_replacement(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+) -> EditFileComputedEdit {
+    EditFileComputedEdit {
+        final_text: loaded
+            .text
+            .replacen(args.old_string.as_str(), args.new_string.as_str(), 1),
+        matches_replaced: 1,
+    }
+}
+
+fn compute_edit_file_replace_all(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+    occurrences: usize,
+) -> EditFileComputedEdit {
+    EditFileComputedEdit {
+        final_text: loaded
+            .text
+            .replace(args.old_string.as_str(), args.new_string.as_str()),
+        matches_replaced: occurrences,
+    }
+}
+
+async fn edit_file_atomically(
+    loaded: &EditFileLoadedTarget,
+    computed: &EditFileComputedEdit,
+) -> Result<AtomicWriteResult, ToolError> {
+    write_text_atomically_for_tool(
+        FileMutationTool::EditFile,
+        loaded.target.resolved_path.as_path(),
+        computed.final_text.as_str(),
+        edit_max_file_bytes(),
+    )
+    .await
+}
+
+fn detect_line_ending_mode(text: &str) -> LineEndingMode {
+    let bytes = text.as_bytes();
+    let mut crlf = 0usize;
+    let mut lone_lf = 0usize;
+    let mut lone_cr = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                crlf += 1;
+                index += 2;
+            }
+            b'\r' => {
+                lone_cr += 1;
+                index += 1;
+            }
+            b'\n' => {
+                lone_lf += 1;
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    match (crlf > 0, lone_lf > 0, lone_cr > 0) {
+        (false, false, false) => LineEndingMode::None,
+        (false, true, false) => LineEndingMode::Lf,
+        (true, false, false) => LineEndingMode::Crlf,
+        _ => LineEndingMode::Mixed,
+    }
+}
+
+fn edit_file_no_change_if_unchanged(
+    loaded: &EditFileLoadedTarget,
+    computed: &EditFileComputedEdit,
+) -> Option<Box<dyn ToolOutput>> {
+    (loaded.text.as_bytes() == computed.final_text.as_bytes()).then(|| {
+        edit_file_no_change_output(
+            loaded.target.original_path.as_str(),
+            loaded.target.resolved_path.as_path(),
+        )
+    })
+}
+
+fn edit_file_no_change_output(original_path: &str, resolved_path: &Path) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "no_change",
+        "errorClass": "invalid_arguments",
+        "message": "computed edit did not change file contents",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "retryableByModel": false,
+        "retrySameArguments": false,
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "computed edit did not change file contents".to_owned()),
+        false,
+        payload,
+    ))
+}
+
+fn edit_file_identical_no_change_output(
+    original_path: &str,
+    resolved_path: &Path,
+) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "no_change",
+        "errorClass": "invalid_arguments",
+        "message": "old_string and new_string are identical",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "retryableByModel": false,
+        "retrySameArguments": false,
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "old_string and new_string are identical".to_owned()),
+        false,
+        payload,
+    ))
+}
+
+fn edit_file_not_found_output(original_path: &str, resolved_path: &Path) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "not_found",
+        "errorClass": "invalid_arguments",
+        "message": "old_string was not found in the current file",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "retryableByModel": true,
+        "retrySameArguments": false,
+        "suggestedTool": "read_file",
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "old_string was not found in the current file".to_owned()),
+        false,
+        payload,
+    ))
+}
+
+fn edit_file_ambiguous_match_output(
+    original_path: &str,
+    resolved_path: &Path,
+    occurrences: usize,
+) -> Box<dyn ToolOutput> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "status": "ambiguous_match",
+        "errorClass": "invalid_arguments",
+        "message": "old_string matched more than once; provide more surrounding context or set replace_all=true",
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
+        "matches": occurrences,
+        "retryableByModel": true,
+        "retrySameArguments": false,
+    });
+    Box::new(FunctionToolOutput::with_payload(
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+            "old_string matched more than once; provide more surrounding context or set replace_all=true"
+                .to_owned()
+        }),
+        false,
+        payload,
+    ))
+}
+
+async fn read_current_file_state_for_tool(
+    tool_name: &str,
+    path: &Path,
+    action_context: &str,
+) -> Result<CurrentFileState, ToolError> {
     let metadata = tokio::fs::metadata(path).await.map_err(|error| {
         ToolError::execution_failed(format!(
-            "failed to stat write_file target `{}` before overwrite: {error}",
+            "failed to stat {tool_name} target `{}` {action_context}: {error}",
             path.display()
         ))
     })?;
     if !metadata.is_file() {
         return Err(ToolError::invalid_arguments(format!(
-            "write_file target `{}` is not a regular file",
+            "{tool_name} target `{}` is not a regular file",
             path.display()
         )));
     }
 
     let bytes = tokio::fs::read(path).await.map_err(|error| {
         ToolError::execution_failed(format!(
-            "failed to read write_file target `{}` before overwrite: {error}",
+            "failed to read {tool_name} target `{}` {action_context}: {error}",
             path.display()
         ))
     })?;
@@ -1111,40 +1850,39 @@ async fn read_current_file_state(path: &Path) -> Result<CurrentFileState, ToolEr
     })
 }
 
-fn read_required_output(target: &WriteFileTarget) -> Box<dyn ToolOutput> {
+fn read_required_output(input: FilePreconditionInput<'_>) -> Box<dyn ToolOutput> {
+    let message = input.tool.read_required_message();
     let payload = serde_json::json!({
         "ok": false,
         "status": "read_required",
         "errorClass": "invalid_arguments",
-        "message": "write_file cannot overwrite an existing file until read_file has observed the complete current file",
-        "path": target.original_path,
-        "resolved_path": target.resolved_path.display().to_string(),
+        "message": message,
+        "path": input.original_path,
+        "resolved_path": input.resolved_path.display().to_string(),
         "retryableByModel": true,
         "retrySameArguments": false,
         "suggestedTool": "read_file",
     });
     Box::new(FunctionToolOutput::with_payload(
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-            "write_file cannot overwrite an existing file until read_file has observed it"
-                .to_owned()
-        }),
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| message.to_owned()),
         false,
         payload,
     ))
 }
 
 fn precondition_failed_output(
-    target: &WriteFileTarget,
+    input: FilePreconditionInput<'_>,
     current: &CurrentFileState,
     observation: &FileObservation,
 ) -> Box<dyn ToolOutput> {
+    let message = input.tool.stale_message();
     let payload = serde_json::json!({
         "ok": false,
         "status": "precondition_failed",
         "errorClass": "precondition_failed",
-        "message": "file changed before write_file could overwrite it",
-        "path": target.original_path,
-        "resolved_path": target.resolved_path.display().to_string(),
+        "message": message,
+        "path": input.original_path,
+        "resolved_path": input.resolved_path.display().to_string(),
         "retryableByModel": true,
         "retrySameArguments": false,
         "observed_sha256": observation.sha256,
@@ -1153,26 +1891,26 @@ fn precondition_failed_output(
         "current_mtime_ms": current.mtime_ms,
     });
     Box::new(FunctionToolOutput::with_payload(
-        serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "file changed before write_file could overwrite it".to_owned()),
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| message.to_owned()),
         false,
         payload,
     ))
 }
 
 fn precondition_failed_output_for_expected(
-    target: &WriteFileTarget,
+    input: FilePreconditionInput<'_>,
     current: &CurrentFileState,
     expected_sha256: Option<&str>,
     expected_mtime_ms: Option<i64>,
 ) -> Box<dyn ToolOutput> {
+    let message = input.tool.stale_message();
     let payload = serde_json::json!({
         "ok": false,
         "status": "precondition_failed",
         "errorClass": "precondition_failed",
-        "message": "file changed before write_file could overwrite it",
-        "path": target.original_path,
-        "resolved_path": target.resolved_path.display().to_string(),
+        "message": message,
+        "path": input.original_path,
+        "resolved_path": input.resolved_path.display().to_string(),
         "retryableByModel": true,
         "retrySameArguments": false,
         "expected_sha256": expected_sha256,
@@ -1181,8 +1919,7 @@ fn precondition_failed_output_for_expected(
         "current_mtime_ms": current.mtime_ms,
     });
     Box::new(FunctionToolOutput::with_payload(
-        serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "file changed before write_file could overwrite it".to_owned()),
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| message.to_owned()),
         false,
         payload,
     ))
@@ -1192,21 +1929,38 @@ async fn write_file_atomically(
     target: &WriteFileTarget,
     content: &str,
 ) -> Result<AtomicWriteResult, ToolError> {
+    write_text_atomically_for_tool(
+        FileMutationTool::WriteFile,
+        target.resolved_path.as_path(),
+        content,
+        write_max_bytes(),
+    )
+    .await
+}
+
+async fn write_text_atomically_for_tool(
+    tool: FileMutationTool,
+    resolved_path: &Path,
+    content: &str,
+    max_bytes: usize,
+) -> Result<AtomicWriteResult, ToolError> {
     let bytes = content.as_bytes();
-    let max_bytes = write_max_bytes();
     if bytes.len() > max_bytes {
         return Err(ToolError::invalid_arguments(format!(
-            "write_file content is larger than write_file limit ({max_bytes} bytes)"
+            "{} is larger than {} limit ({max_bytes} bytes)",
+            tool.text_payload_label(),
+            tool.name()
         )));
     }
 
-    let parent = target.resolved_path.parent().ok_or_else(|| {
+    let parent = resolved_path.parent().ok_or_else(|| {
         ToolError::invalid_arguments(format!(
-            "write_file target `{}` does not have a parent directory",
-            target.resolved_path.display()
+            "{} target `{}` does not have a parent directory",
+            tool.name(),
+            resolved_path.display()
         ))
     })?;
-    let (temp_path, mut temp_file) = create_write_temp_file(parent, &target.resolved_path).await?;
+    let (temp_path, mut temp_file) = create_write_temp_file(parent, resolved_path).await?;
 
     if let Err(error) = temp_file.write_all(bytes).await {
         cleanup_write_temp_file(temp_path.as_path()).await;
@@ -1227,13 +1981,12 @@ async fn write_file_atomically(
     let _ = temp_file.sync_all().await;
     drop(temp_file);
 
-    if let Err(error) = tokio::fs::rename(temp_path.as_path(), target.resolved_path.as_path()).await
-    {
+    if let Err(error) = tokio::fs::rename(temp_path.as_path(), resolved_path).await {
         cleanup_write_temp_file(temp_path.as_path()).await;
         return Err(ToolError::execution_failed(format!(
             "failed to move temporary file `{}` to `{}`: {error}",
             temp_path.display(),
-            target.resolved_path.display()
+            resolved_path.display()
         )));
     }
 
@@ -1247,10 +2000,47 @@ async fn verify_written_file(
     target: &WriteFileTarget,
     expected: &AtomicWriteResult,
 ) -> Result<WriteVerification, ToolError> {
-    let current = read_current_file_state(target.resolved_path.as_path()).await?;
+    verify_text_write_for_tool(
+        FileMutationTool::WriteFile,
+        target.original_path.as_str(),
+        target.resolved_path.as_path(),
+        expected,
+    )
+    .await
+}
+
+async fn verify_edited_file(
+    loaded: &EditFileLoadedTarget,
+    expected: &AtomicWriteResult,
+) -> Result<WriteVerification, ToolError> {
+    verify_text_write_for_tool(
+        FileMutationTool::EditFile,
+        loaded.target.original_path.as_str(),
+        loaded.target.resolved_path.as_path(),
+        expected,
+    )
+    .await
+}
+
+async fn verify_text_write_for_tool(
+    tool: FileMutationTool,
+    original_path: &str,
+    resolved_path: &Path,
+    expected: &AtomicWriteResult,
+) -> Result<WriteVerification, ToolError> {
+    let current = read_current_file_state_for_tool(
+        tool.name(),
+        resolved_path,
+        tool.current_state_action_context(),
+    )
+    .await?;
     if current.bytes != expected.bytes_written || current.sha256 != expected.sha256 {
         return Ok(WriteVerification::Failed(verification_failed_output(
-            target, expected, &current,
+            tool,
+            original_path,
+            resolved_path,
+            expected,
+            &current,
         )));
     }
 
@@ -1258,28 +2048,50 @@ async fn verify_written_file(
 }
 
 fn verification_failed_output(
-    target: &WriteFileTarget,
+    tool: FileMutationTool,
+    original_path: &str,
+    resolved_path: &Path,
     expected: &AtomicWriteResult,
     current: &CurrentFileState,
 ) -> Box<dyn ToolOutput> {
+    let message = tool.verification_failed_message();
     let payload = serde_json::json!({
         "ok": false,
         "status": "verification_failed",
         "errorClass": "execution_failed",
-        "message": "write_file wrote bytes but post-write verification failed",
-        "path": target.original_path,
-        "resolved_path": target.resolved_path.display().to_string(),
+        "message": message,
+        "path": original_path,
+        "resolved_path": resolved_path.display().to_string(),
         "expected_bytes": expected.bytes_written,
         "actual_bytes": current.bytes,
         "expected_sha256": expected.sha256,
         "actual_sha256": current.sha256,
     });
     Box::new(FunctionToolOutput::with_payload(
-        serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "write_file post-write verification failed".to_owned()),
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| message.to_owned()),
         false,
         payload,
     ))
+}
+
+fn record_file_mutation_observation(
+    observation_store: &FileObservationStore,
+    tool: FileMutationTool,
+    call_id: &str,
+    resolved_path: &Path,
+    current: &CurrentFileState,
+) -> FileObservation {
+    let observation = FileObservation {
+        id: format!("{}:{call_id}", tool.name()),
+        resolved_path: resolved_path.to_path_buf(),
+        bytes: current.bytes,
+        sha256: current.sha256.clone(),
+        mtime_ms: current.mtime_ms,
+        complete: true,
+        source_tool_call_id: call_id.to_owned(),
+    };
+    observation_store.record(observation.clone());
+    observation
 }
 
 fn write_file_success_output(
@@ -1309,6 +2121,52 @@ fn write_file_success_output(
         "sha256": current.sha256,
         "file_observation": observation,
         "created_dirs": created_dirs,
+        "changed_files": changed_files,
+    });
+
+    Box::new(FunctionToolOutput::with_payload(body, true, payload))
+}
+
+fn edit_file_success_output(
+    loaded: &EditFileLoadedTarget,
+    args: &EditFileArgs,
+    raw_match: &EditFileRawMatch,
+    computed: &EditFileComputedEdit,
+    current: &CurrentFileState,
+    observation: FileObservation,
+) -> Box<dyn ToolOutput> {
+    let body = format!(
+        "edit_file completed: edited {}, replaced {} occurrence{}, {} bytes.",
+        loaded.target.resolved_path.display(),
+        computed.matches_replaced,
+        if computed.matches_replaced == 1 {
+            ""
+        } else {
+            "s"
+        },
+        current.bytes
+    );
+    let changed_files = vec![loaded.target.resolved_path.display().to_string()];
+    let payload = serde_json::json!({
+        "ok": true,
+        "status": "completed",
+        "operation": "edited",
+        "path": loaded.target.original_path,
+        "resolved_path": loaded.target.resolved_path.display().to_string(),
+        "matches": raw_match.occurrences,
+        "matches_replaced": computed.matches_replaced,
+        "replace_all": args.replace_all.unwrap_or(false),
+        "bytes_before": loaded.current.bytes,
+        "bytes_after": current.bytes,
+        "bytes_written": current.bytes,
+        "sha256_before": loaded.current.sha256,
+        "sha256": current.sha256,
+        "old_string_bytes": args.old_string.as_bytes().len(),
+        "new_string_bytes": args.new_string.as_bytes().len(),
+        "old_string_sha256": sha256_hex(args.old_string.as_bytes()),
+        "new_string_sha256": sha256_hex(args.new_string.as_bytes()),
+        "line_ending_mode": raw_match.source.line_ending_mode(),
+        "file_observation": observation,
         "changed_files": changed_files,
     });
 
@@ -1492,6 +2350,21 @@ mod tests {
         }
     }
 
+    fn edit_invocation(call_id: &str, workdir: PathBuf, arguments: JsonValue) -> ToolInvocation {
+        ToolInvocation {
+            call_id: call_id.to_owned(),
+            tool_name: "edit_file".to_owned(),
+            source: ToolCallSource::Model,
+            payload: ToolPayload::Function { arguments },
+            workdir,
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     fn trace() -> crate::events::ToolEventTrace {
         ToolEventBus::default().start_trace("turn", "call_1", "grep_files")
     }
@@ -1502,6 +2375,10 @@ mod tests {
 
     fn write_trace(call_id: &str) -> crate::events::ToolEventTrace {
         ToolEventBus::default().start_trace("turn", call_id, "write_file")
+    }
+
+    fn edit_trace(call_id: &str) -> crate::events::ToolEventTrace {
+        ToolEventBus::default().start_trace("turn", call_id, "edit_file")
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1561,6 +2438,111 @@ mod tests {
 
         assert!(mtime_ms > 0);
         let _ = std::fs::remove_file(temp);
+    }
+
+    #[tokio::test]
+    async fn current_file_state_helper_reads_regular_file_state() {
+        let temp = temp_path("current-state");
+        fs::write(temp.as_path(), b"hello")
+            .await
+            .expect("temp file should write");
+
+        let state = read_current_file_state_for_tool("edit_file", temp.as_path(), "before edit")
+            .await
+            .expect("current state should read");
+
+        assert_eq!(state.bytes, 5);
+        assert_eq!(state.sha256, sha256_hex(b"hello"));
+        assert!(state.mtime_ms > 0);
+        let _ = fs::remove_file(temp).await;
+    }
+
+    #[tokio::test]
+    async fn current_file_state_helper_reports_missing_with_tool_context() {
+        let missing = temp_path("current-state-missing");
+
+        let error = read_current_file_state_for_tool("edit_file", missing.as_path(), "before edit")
+            .await
+            .expect_err("missing file should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to stat edit_file target")
+        );
+        assert!(error.to_string().contains("before edit"));
+    }
+
+    #[tokio::test]
+    async fn current_file_state_helper_rejects_directory_with_tool_context() {
+        let temp = temp_path("current-state-directory");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp directory should create");
+
+        let error = read_current_file_state_for_tool("edit_file", temp.as_path(), "before edit")
+            .await
+            .expect_err("directory should fail");
+
+        assert!(error.to_string().contains("edit_file target"));
+        assert!(error.to_string().contains("is not a regular file"));
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[test]
+    fn file_mutation_tool_model_provides_tool_specific_precondition_messages() {
+        assert_eq!(FileMutationTool::WriteFile.name(), "write_file");
+        assert_eq!(FileMutationTool::EditFile.name(), "edit_file");
+        assert!(
+            FileMutationTool::WriteFile
+                .read_required_message()
+                .contains("overwrite")
+        );
+        assert!(
+            FileMutationTool::EditFile
+                .read_required_message()
+                .contains("modify")
+        );
+        assert!(
+            FileMutationTool::WriteFile
+                .stale_message()
+                .contains("write_file")
+        );
+        assert!(
+            FileMutationTool::EditFile
+                .stale_message()
+                .contains("edit_file")
+        );
+    }
+
+    #[test]
+    fn file_precondition_input_tracks_explicit_preconditions() {
+        let path = Path::new("/tmp/example.txt");
+        let without_explicit = FilePreconditionInput {
+            tool: FileMutationTool::EditFile,
+            original_path: "example.txt",
+            resolved_path: path,
+            read_observation_id: None,
+            expected_sha256: None,
+            expected_mtime_ms: None,
+        };
+        let with_sha = FilePreconditionInput {
+            expected_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ..without_explicit
+        };
+        let with_mtime = FilePreconditionInput {
+            expected_mtime_ms: Some(1_234),
+            ..without_explicit
+        };
+
+        assert!(!without_explicit.has_explicit_precondition());
+        assert!(with_sha.has_explicit_precondition());
+        assert!(with_mtime.has_explicit_precondition());
+        assert_eq!(without_explicit.tool, FileMutationTool::EditFile);
+        assert_eq!(without_explicit.original_path, "example.txt");
+        assert_eq!(without_explicit.resolved_path, path);
     }
 
     fn test_observation(id: &str, path: &str, complete: bool, content: &[u8]) -> FileObservation {
@@ -2145,9 +3127,13 @@ mod tests {
         fs::write(target_path.as_path(), "old")
             .await
             .expect("file should write");
-        let current = read_current_file_state(target_path.as_path())
-            .await
-            .expect("current state should read");
+        let current = read_current_file_state_for_tool(
+            FileMutationTool::WriteFile.name(),
+            target_path.as_path(),
+            FileMutationTool::WriteFile.current_state_action_context(),
+        )
+        .await
+        .expect("current state should read");
         let mut args = write_args("file.txt", "new");
         args.expected_mtime_ms = Some(current.mtime_ms);
         let target = prepare_write_file_target(temp.as_path(), &args)
@@ -2164,6 +3150,26 @@ mod tests {
         let _ = fs::remove_dir_all(temp).await;
     }
 
+    #[tokio::test]
+    async fn current_file_state_helper_preserves_write_file_error_wording() {
+        let missing = temp_path("write-current-state-missing");
+
+        let error = read_current_file_state_for_tool(
+            FileMutationTool::WriteFile.name(),
+            missing.as_path(),
+            FileMutationTool::WriteFile.current_state_action_context(),
+        )
+        .await
+        .expect_err("missing file should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to stat write_file target")
+        );
+        assert!(error.to_string().contains("before overwrite"));
+    }
+
     #[test]
     fn write_file_rejects_invalid_expected_sha256() {
         let error = parse_write_file_args(ToolPayload::Function {
@@ -2176,6 +3182,1649 @@ mod tests {
         .expect_err("invalid sha should fail");
 
         assert!(error.to_string().contains("expected_sha256"));
+    }
+
+    #[test]
+    fn edit_file_args_parse_valid_payload() {
+        let args = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "replace_all": true,
+                "read_observation_id": "read_file:call_1",
+                "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expected_mtime_ms": 1_234
+            }),
+        })
+        .expect("valid edit_file args should parse");
+
+        assert_eq!(args.path, "file.txt");
+        assert_eq!(args.old_string, "old");
+        assert_eq!(args.new_string, "new");
+        assert_eq!(args.replace_all, Some(true));
+        assert_eq!(
+            args.read_observation_id.as_deref(),
+            Some("read_file:call_1")
+        );
+        assert_eq!(
+            args.expected_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(args.expected_mtime_ms, Some(1_234));
+    }
+
+    #[test]
+    fn edit_file_args_reject_missing_path() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        })
+        .expect_err("missing path should fail");
+
+        assert!(error.to_string().contains("path"));
+    }
+
+    #[test]
+    fn edit_file_args_reject_empty_path() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "   ",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        })
+        .expect_err("empty path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("edit_file `path` must not be empty")
+        );
+    }
+
+    #[test]
+    fn edit_file_args_reject_missing_old_string() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "new_string": "new"
+            }),
+        })
+        .expect_err("missing old_string should fail");
+
+        assert!(error.to_string().contains("old_string"));
+    }
+
+    #[test]
+    fn edit_file_args_reject_empty_old_string() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "old_string": "",
+                "new_string": "new"
+            }),
+        })
+        .expect_err("empty old_string should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("edit_file `old_string` must not be empty")
+        );
+    }
+
+    #[test]
+    fn edit_file_args_reject_missing_new_string() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "old_string": "old"
+            }),
+        })
+        .expect_err("missing new_string should fail");
+
+        assert!(error.to_string().contains("new_string"));
+    }
+
+    #[test]
+    fn edit_file_args_allow_identical_old_and_new_for_structured_no_change() {
+        let args = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "old_string": "same",
+                "new_string": "same"
+            }),
+        })
+        .expect("identical strings should parse so handler can return structured no_change");
+
+        assert_eq!(args.old_string, "same");
+        assert_eq!(args.new_string, "same");
+    }
+
+    #[test]
+    fn edit_file_args_reject_invalid_expected_sha256() {
+        let error = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "expected_sha256": "bad"
+            }),
+        })
+        .expect_err("invalid expected_sha256 should fail");
+
+        assert!(error.to_string().contains("edit_file `expected_sha256`"));
+        assert!(error.to_string().contains("64-character hex"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_atomic_write_persists_exact_final_contents() {
+        let temp = temp_path("edit-atomic-write");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:edit_atomic", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_atomic_write",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_atomic_write"),
+            )
+            .await
+            .expect("edit_file should write through atomic helper");
+        let json = output.raw_json();
+
+        assert!(output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            json.get("operation").and_then(JsonValue::as_str),
+            Some("edited")
+        );
+        assert_eq!(
+            json.get("path").and_then(JsonValue::as_str),
+            Some("file.txt")
+        );
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("replace_all").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json.get("bytes_before").and_then(JsonValue::as_u64),
+            Some("old".len() as u64)
+        );
+        assert_eq!(
+            json.get("bytes_after").and_then(JsonValue::as_u64),
+            Some("new".len() as u64)
+        );
+        assert_eq!(
+            json.get("bytes_written").and_then(JsonValue::as_u64),
+            Some("new".len() as u64)
+        );
+        assert_eq!(
+            json.get("sha256_before").and_then(JsonValue::as_str),
+            Some(sha256_hex(b"old").as_str())
+        );
+        assert_eq!(
+            json.get("sha256").and_then(JsonValue::as_str),
+            Some(sha256_hex(b"new").as_str())
+        );
+        assert_eq!(
+            json.get("old_string_bytes").and_then(JsonValue::as_u64),
+            Some("old".len() as u64)
+        );
+        assert_eq!(
+            json.get("new_string_bytes").and_then(JsonValue::as_u64),
+            Some("new".len() as u64)
+        );
+        assert_eq!(
+            json.get("old_string_sha256").and_then(JsonValue::as_str),
+            Some(sha256_hex(b"old").as_str())
+        );
+        assert_eq!(
+            json.get("new_string_sha256").and_then(JsonValue::as_str),
+            Some(sha256_hex(b"new").as_str())
+        );
+        assert_eq!(
+            json.get("line_ending_mode").and_then(JsonValue::as_str),
+            Some("none")
+        );
+        let changed_files = json
+            .get("changed_files")
+            .and_then(JsonValue::as_array)
+            .expect("changed_files should be array");
+        let expected_changed_file = target_path.display().to_string();
+        assert_eq!(changed_files.len(), 1);
+        assert_eq!(
+            changed_files[0].as_str(),
+            Some(expected_changed_file.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "new"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_atomic_write_rejects_result_over_limit() {
+        let temp = temp_path("edit-result-over-limit");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store
+            .record(observation_for_file("read_file:edit_over_limit", target_path.as_path()).await);
+        let oversized_content = "x".repeat(edit_max_file_bytes().saturating_add(1));
+
+        let error = match EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_over_limit",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": oversized_content
+                    }),
+                ),
+                edit_trace("edit_over_limit"),
+            )
+            .await
+        {
+            Ok(_) => panic!("oversized edit result should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("edit_file result is larger than edit_file limit")
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "old"
+        );
+        assert_eq!(write_temp_file_count(temp.as_path(), "file.txt").await, 0);
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_identical_old_new_returns_structured_no_change_without_read_or_write() {
+        let temp = temp_path("edit-identical-no-change");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "same")
+            .await
+            .expect("file should write");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_identical",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "same",
+                        "new_string": "same"
+                    }),
+                ),
+                edit_trace("edit_identical"),
+            )
+            .await
+            .expect("identical strings should return structured output");
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("no_change")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some("old_string and new_string are identical")
+        );
+        assert_eq!(
+            json.get("retryableByModel").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json.get("retrySameArguments").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "same"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_success_output_does_not_echo_old_new_or_final_content() {
+        let temp = temp_path("edit-no-echo");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        let old_secret = "OLD_SECRET_EDIT_FILE_SENTINEL_1974";
+        let new_secret = "NEW_SECRET_EDIT_FILE_SENTINEL_9832";
+        let initial_content = format!("prefix {old_secret} suffix");
+        let final_content = format!("prefix {new_secret} suffix");
+        fs::write(target_path.as_path(), initial_content.as_str())
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:edit_no_echo", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_no_echo",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": old_secret,
+                        "new_string": new_secret
+                    }),
+                ),
+                edit_trace("edit_no_echo"),
+            )
+            .await
+            .expect("edit_file should succeed");
+        let raw_json = output.raw_json().to_string();
+
+        assert!(output.success());
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            final_content
+        );
+        assert!(!output.raw_text().contains(old_secret));
+        assert!(!output.raw_text().contains(new_secret));
+        assert!(!output.raw_text().contains(final_content.as_str()));
+        assert!(!raw_json.contains(old_secret));
+        assert!(!raw_json.contains(new_secret));
+        assert!(!raw_json.contains(final_content.as_str()));
+        assert_eq!(
+            output
+                .raw_json()
+                .get("old_string_bytes")
+                .and_then(JsonValue::as_u64),
+            Some(old_secret.len() as u64)
+        );
+        assert_eq!(
+            output
+                .raw_json()
+                .get("new_string_bytes")
+                .and_then(JsonValue::as_u64),
+            Some(new_secret.len() as u64)
+        );
+
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_observation_store_updates_and_authorizes_followup_edit() {
+        let temp = temp_path("edit-store-update");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "first")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(
+            observation_for_file("read_file:edit_store_initial", target_path.as_path()).await,
+        );
+        let handler = EditFileHandler::new(Arc::clone(&store));
+
+        let first_output = handler
+            .handle(
+                edit_invocation(
+                    "edit_store_first",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "first",
+                        "new_string": "second"
+                    }),
+                ),
+                edit_trace("edit_store_first"),
+            )
+            .await
+            .expect("first edit should succeed");
+        let first_json = first_output.raw_json();
+
+        assert!(first_output.success());
+        assert_eq!(
+            first_json
+                .get("file_observation")
+                .and_then(|value| value.get("id"))
+                .and_then(JsonValue::as_str),
+            Some("edit_file:edit_store_first")
+        );
+        let latest = store
+            .latest_complete_for_path(target_path.as_path())
+            .expect("edit observation should be latest");
+        assert_eq!(latest.id, "edit_file:edit_store_first");
+        assert_eq!(latest.bytes, "second".len() as u64);
+        assert_eq!(latest.sha256, sha256_hex(b"second"));
+
+        let second_output = handler
+            .handle(
+                edit_invocation(
+                    "edit_store_second",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "second",
+                        "new_string": "third"
+                    }),
+                ),
+                edit_trace("edit_store_second"),
+            )
+            .await
+            .expect("second edit should use first edit observation");
+
+        assert!(second_output.success());
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "third"
+        );
+        assert_eq!(
+            store
+                .latest_complete_for_path(target_path.as_path())
+                .expect("second edit observation should be latest")
+                .id,
+            "edit_file:edit_store_second"
+        );
+
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_requires_latest_complete_observation() {
+        let temp = temp_path("edit-read-required");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_read_required",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_read_required"),
+            )
+            .await
+            .expect("read_required should be a structured output");
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("read_required")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some(
+                "edit_file cannot modify an existing file until read_file has observed the complete current file"
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "old"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_partial_observation() {
+        let temp = temp_path("edit-partial-observation");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(FileObservation {
+            complete: false,
+            ..observation_for_file("read_file:partial", target_path.as_path()).await
+        });
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_partial",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_partial"),
+            )
+            .await
+            .expect("partial observation should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("read_required")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_stale_file_after_read() {
+        let temp = temp_path("edit-stale-observation");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:stale", target_path.as_path()).await);
+        fs::write(target_path.as_path(), "changed")
+            .await
+            .expect("file should change");
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_stale",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "changed",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_stale"),
+            )
+            .await
+            .expect("stale observation should return structured output");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("precondition_failed")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some("file changed before edit_file could modify it")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_allows_matching_read_observation_id() {
+        let temp = temp_path("edit-observation-id-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:explicit", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_observation_id",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "read_observation_id": "read_file:explicit"
+                    }),
+                ),
+                edit_trace("edit_observation_id"),
+            )
+            .await
+            .expect("matching observation id should succeed");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_read_observation_id_for_wrong_path() {
+        let temp = temp_path("edit-observation-id-wrong-path");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        let other_path = temp.join("other.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        fs::write(other_path.as_path(), "other")
+            .await
+            .expect("other file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:other", other_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_observation_wrong_path",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "read_observation_id": "read_file:other"
+                    }),
+                ),
+                edit_trace("edit_observation_wrong_path"),
+            )
+            .await
+            .expect("wrong-path observation id should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("read_required")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_partial_read_observation_id() {
+        let temp = temp_path("edit-observation-id-partial");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(FileObservation {
+            complete: false,
+            ..observation_for_file("read_file:partial_id", target_path.as_path()).await
+        });
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_observation_partial",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "read_observation_id": "read_file:partial_id"
+                    }),
+                ),
+                edit_trace("edit_observation_partial"),
+            )
+            .await
+            .expect("partial observation id should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("read_required")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_allows_matching_expected_sha256() {
+        let temp = temp_path("edit-sha-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_sha_match",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "expected_sha256": sha256_hex(b"old")
+                    }),
+                ),
+                edit_trace("edit_sha_match"),
+            )
+            .await
+            .expect("matching sha should succeed");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_mismatching_expected_sha256() {
+        let temp = temp_path("edit-sha-mismatch");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_sha_mismatch",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "expected_sha256": sha256_hex(b"different")
+                    }),
+                ),
+                edit_trace("edit_sha_mismatch"),
+            )
+            .await
+            .expect("mismatching sha should return structured output");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("precondition_failed")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some("file changed before edit_file could modify it")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_allows_matching_expected_mtime() {
+        let temp = temp_path("edit-mtime-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let current = read_current_file_state_for_tool(
+            FileMutationTool::EditFile.name(),
+            target_path.as_path(),
+            FileMutationTool::EditFile.current_state_action_context(),
+        )
+        .await
+        .expect("current state should read");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_mtime_match",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "expected_mtime_ms": current.mtime_ms
+                    }),
+                ),
+                edit_trace("edit_mtime_match"),
+            )
+            .await
+            .expect("matching mtime should succeed");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_existing_rejects_mismatching_expected_mtime() {
+        let temp = temp_path("edit-mtime-mismatch");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+
+        let output = EditFileHandler::default()
+            .handle(
+                edit_invocation(
+                    "edit_mtime_mismatch",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "expected_mtime_ms": -1
+                    }),
+                ),
+                edit_trace("edit_mtime_mismatch"),
+            )
+            .await
+            .expect("mismatching mtime should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("precondition_failed")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_raw_match_counting_allows_one_match_to_reach_next_stage() {
+        let temp = temp_path("edit-raw-one-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "hello old world")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:raw_one", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_raw_one",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_raw_one"),
+            )
+            .await
+            .expect("one raw match should succeed");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        assert_eq!(json.get("matches").and_then(JsonValue::as_u64), Some(1));
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_single_replacement_writes_final_text() {
+        let temp = temp_path("edit-single-replacement");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "hello old world")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:single", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_single",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_single"),
+            )
+            .await
+            .expect("single replacement should compute");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("bytes_after").and_then(JsonValue::as_u64),
+            Some("hello new world".len() as u64)
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "hello new world"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_deletion_replacement_writes_final_text() {
+        let temp = temp_path("edit-delete-replacement");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "keep remove keep")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:delete", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_delete",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": " remove",
+                        "new_string": ""
+                    }),
+                ),
+                edit_trace("edit_delete"),
+            )
+            .await
+            .expect("deletion replacement should compute");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("bytes_after").and_then(JsonValue::as_u64),
+            Some("keep keep".len() as u64)
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "keep keep"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[test]
+    fn edit_file_computed_no_change_returns_no_change_output() {
+        let loaded = EditFileLoadedTarget {
+            target: EditFileTarget {
+                original_path: "file.txt".to_owned(),
+                resolved_path: PathBuf::from("/tmp/file.txt"),
+            },
+            text: "unchanged".to_owned(),
+            current: CurrentFileState {
+                bytes: "unchanged".len() as u64,
+                sha256: sha256_hex(b"unchanged"),
+                mtime_ms: 1_234,
+            },
+        };
+        let computed = EditFileComputedEdit {
+            final_text: "unchanged".to_owned(),
+            matches_replaced: 1,
+        };
+
+        let output = edit_file_no_change_if_unchanged(&loaded, &computed)
+            .expect("unchanged computation should return output");
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("no_change")
+        );
+        assert_eq!(
+            json.get("retryableByModel").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn edit_file_line_ending_detection_classifies_common_modes() {
+        assert_eq!(detect_line_ending_mode("plain text"), LineEndingMode::None);
+        assert_eq!(detect_line_ending_mode("a\nb\n"), LineEndingMode::Lf);
+        assert_eq!(detect_line_ending_mode("a\r\nb\r\n"), LineEndingMode::Crlf);
+        assert_eq!(detect_line_ending_mode("a\r\nb\n"), LineEndingMode::Mixed);
+        assert_eq!(detect_line_ending_mode("a\rb"), LineEndingMode::Mixed);
+    }
+
+    #[tokio::test]
+    async fn edit_file_line_ending_metadata_is_reported_in_handler_output() {
+        let temp = temp_path("edit-line-ending-metadata");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old\r\nline\r\n")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:line_endings", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_line_endings",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_line_endings"),
+            )
+            .await
+            .expect("handler should return metadata");
+
+        assert_eq!(
+            output
+                .raw_json()
+                .get("line_ending_mode")
+                .and_then(JsonValue::as_str),
+            Some("crlf")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[test]
+    fn edit_file_crlf_fallback_computes_crlf_final_text() {
+        let loaded = EditFileLoadedTarget {
+            target: EditFileTarget {
+                original_path: "file.txt".to_owned(),
+                resolved_path: PathBuf::from("/tmp/file.txt"),
+            },
+            text: "old\r\nline\r\n".to_owned(),
+            current: CurrentFileState {
+                bytes: "old\r\nline\r\n".len() as u64,
+                sha256: sha256_hex(b"old\r\nline\r\n"),
+                mtime_ms: 1_234,
+            },
+        };
+        let args = EditFileArgs {
+            path: "file.txt".to_owned(),
+            old_string: "old\nline".to_owned(),
+            new_string: "new\nline".to_owned(),
+            replace_all: None,
+            read_observation_id: None,
+            expected_sha256: None,
+            expected_mtime_ms: None,
+        };
+
+        let raw_match = match compute_edit_file_raw_match(&loaded, &args) {
+            EditFileRawMatchResult::Matched(raw_match) => raw_match,
+            EditFileRawMatchResult::Failed(_) => panic!("CRLF fallback should match"),
+        };
+        let computed = compute_edit_file_replacement(&loaded, &args, &raw_match);
+
+        assert_eq!(raw_match.occurrences, 1);
+        assert_eq!(raw_match.source.line_ending_mode(), "crlf_fallback");
+        assert_eq!(computed.final_text, "new\r\nline\r\n");
+        assert_eq!(computed.matches_replaced, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_file_crlf_fallback_writes_crlf_final_text() {
+        let temp = temp_path("edit-crlf-fallback");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old\r\nline\r\n")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:crlf_fallback", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_crlf_fallback",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old\nline",
+                        "new_string": "new\nline"
+                    }),
+                ),
+                edit_trace("edit_crlf_fallback"),
+            )
+            .await
+            .expect("CRLF fallback should compute");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            json.get("line_ending_mode").and_then(JsonValue::as_str),
+            Some("crlf_fallback")
+        );
+        assert_eq!(
+            json.get("bytes_after").and_then(JsonValue::as_u64),
+            Some("new\r\nline\r\n".len() as u64)
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "new\r\nline\r\n"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_raw_crlf_match_uses_raw_mode() {
+        let temp = temp_path("edit-raw-crlf-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old\r\nline\r\n")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:raw_crlf", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_raw_crlf",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old\r\nline",
+                        "new_string": "new\r\nline"
+                    }),
+                ),
+                edit_trace("edit_raw_crlf"),
+            )
+            .await
+            .expect("raw CRLF match should compute");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("line_ending_mode").and_then(JsonValue::as_str),
+            Some("crlf")
+        );
+        assert_eq!(json.get("matches").and_then(JsonValue::as_u64), Some(1));
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_mixed_line_endings_do_not_use_crlf_fallback() {
+        let temp = temp_path("edit-mixed-no-fallback");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old\r\nline\n")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(
+            observation_for_file("read_file:mixed_no_fallback", target_path.as_path()).await,
+        );
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_mixed_no_fallback",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old\nline",
+                        "new_string": "new\nline"
+                    }),
+                ),
+                edit_trace("edit_mixed_no_fallback"),
+            )
+            .await
+            .expect("mixed line endings should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("not_found")
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "old\r\nline\n"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_raw_match_counting_returns_not_found_for_zero_matches() {
+        let temp = temp_path("edit-raw-not-found");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "hello current world")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:raw_missing", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_raw_missing",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_raw_missing"),
+            )
+            .await
+            .expect("zero raw matches should return structured output");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("not_found")
+        );
+        assert_eq!(
+            json.get("suggestedTool").and_then(JsonValue::as_str),
+            Some("read_file")
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "hello current world"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_ambiguous_match_rejects_multiple_matches_by_default() {
+        let temp = temp_path("edit-ambiguous-match");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old one old two")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:ambiguous", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_ambiguous",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                ),
+                edit_trace("edit_ambiguous"),
+            )
+            .await
+            .expect("ambiguous match should return structured output");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("ambiguous_match")
+        );
+        assert_eq!(json.get("matches").and_then(JsonValue::as_u64), Some(2));
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "old one old two"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_all_writes_all_replacements() {
+        let temp = temp_path("edit-replace-all");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old one old two")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(observation_for_file("read_file:replace_all", target_path.as_path()).await);
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_replace_all",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "replace_all": true
+                    }),
+                ),
+                edit_trace("edit_replace_all"),
+            )
+            .await
+            .expect("replace_all should compute");
+        let json = output.raw_json();
+
+        assert_eq!(
+            json.get("matches_replaced").and_then(JsonValue::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            json.get("bytes_after").and_then(JsonValue::as_u64),
+            Some("new one new two".len() as u64)
+        );
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "new one new two"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_replace_all_still_returns_not_found_for_zero_matches() {
+        let temp = temp_path("edit-replace-all-not-found");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "current")
+            .await
+            .expect("file should write");
+        let store = Arc::new(FileObservationStore::default());
+        store.record(
+            observation_for_file("read_file:replace_all_missing", target_path.as_path()).await,
+        );
+
+        let output = EditFileHandler::new(store)
+            .handle(
+                edit_invocation(
+                    "edit_replace_all_missing",
+                    temp.clone(),
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "old_string": "old",
+                        "new_string": "new",
+                        "replace_all": true
+                    }),
+                ),
+                edit_trace("edit_replace_all_missing"),
+            )
+            .await
+            .expect("replace_all missing should return structured output");
+
+        assert_eq!(
+            output.raw_json().get("status").and_then(JsonValue::as_str),
+            Some("not_found")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_target_validation_resolves_relative_existing_file() {
+        let temp = temp_path("edit-target-relative");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "old")
+            .await
+            .expect("file should write");
+        let args = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "./file.txt",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        })
+        .expect("args should parse");
+
+        let target = match prepare_edit_file_target(temp.as_path(), &args)
+            .await
+            .expect("target validation should run")
+        {
+            EditFileTargetValidation::Ready(target) => target,
+            EditFileTargetValidation::Failed(_) => panic!("existing file should be ready"),
+        };
+
+        assert_eq!(target.original_path, "./file.txt");
+        assert_eq!(target.resolved_path, target_path);
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_target_validation_returns_target_not_found_for_missing_file() {
+        let temp = temp_path("edit-target-missing");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let args = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "missing.txt",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        })
+        .expect("args should parse");
+
+        let output = match prepare_edit_file_target(temp.as_path(), &args)
+            .await
+            .expect("target validation should run")
+        {
+            EditFileTargetValidation::Ready(_) => panic!("missing file should not be ready"),
+            EditFileTargetValidation::Failed(output) => output,
+        };
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("target_not_found")
+        );
+        assert_eq!(
+            json.get("suggestedTool").and_then(JsonValue::as_str),
+            Some("write_file")
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_target_validation_rejects_directory_target() {
+        let temp = temp_path("edit-target-directory");
+        fs::create_dir_all(temp.join("dir").as_path())
+            .await
+            .expect("temp dir should create");
+        let args = parse_edit_file_args(ToolPayload::Function {
+            arguments: serde_json::json!({
+                "path": "dir",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        })
+        .expect("args should parse");
+
+        let error = match prepare_edit_file_target(temp.as_path(), &args).await {
+            Ok(_) => panic!("directory target should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("edit_file target"));
+        assert!(error.to_string().contains("is a directory"));
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_utf8_load_reads_text_and_current_state() {
+        let temp = temp_path("edit-utf8-load");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "hello")
+            .await
+            .expect("file should write");
+        let target = EditFileTarget {
+            original_path: "file.txt".to_owned(),
+            resolved_path: target_path.clone(),
+        };
+
+        let loaded = match load_edit_file_text(target).await.expect("load should run") {
+            EditFileTextLoad::Loaded(loaded) => loaded,
+            EditFileTextLoad::Failed(_) => panic!("valid UTF-8 should load"),
+        };
+
+        assert_eq!(loaded.text, "hello");
+        assert_eq!(loaded.current.bytes, 5);
+        assert_eq!(loaded.current.sha256, sha256_hex(b"hello"));
+        assert!(loaded.current.mtime_ms > 0);
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_utf8_load_returns_not_utf8_for_invalid_utf8() {
+        let temp = temp_path("edit-not-utf8");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), [0xff, 0xfe])
+            .await
+            .expect("file should write");
+        let target = EditFileTarget {
+            original_path: "file.txt".to_owned(),
+            resolved_path: target_path,
+        };
+
+        let output = match load_edit_file_text(target).await.expect("load should run") {
+            EditFileTextLoad::Loaded(_) => panic!("invalid UTF-8 should fail"),
+            EditFileTextLoad::Failed(output) => output,
+        };
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("not_utf8")
+        );
+        assert_eq!(
+            json.get("retryableByModel").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_utf8_load_rejects_file_over_size_limit() {
+        let temp = temp_path("edit-size-limit");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), vec![b'x'; edit_max_file_bytes() + 1])
+            .await
+            .expect("file should write");
+        let target = EditFileTarget {
+            original_path: "file.txt".to_owned(),
+            resolved_path: target_path,
+        };
+
+        let error = match load_edit_file_text(target).await {
+            Ok(_) => panic!("oversized file should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("larger than edit_file limit"));
+        let _ = fs::remove_dir_all(temp).await;
     }
 
     #[tokio::test]
@@ -2313,6 +4962,59 @@ mod tests {
 
         assert!(!temp_path.exists());
 
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_text_write_helper_writes_exact_content_for_edit_file_context() {
+        let temp = temp_path("atomic-text-edit");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+
+        let result = write_text_atomically_for_tool(
+            FileMutationTool::EditFile,
+            target_path.as_path(),
+            "edited",
+            write_max_bytes(),
+        )
+        .await
+        .expect("atomic helper should write");
+
+        assert_eq!(result.bytes_written, 6);
+        assert_eq!(result.sha256, sha256_hex(b"edited"));
+        assert_eq!(
+            fs::read_to_string(target_path.as_path())
+                .await
+                .expect("target should read"),
+            "edited"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_text_write_helper_cleans_temp_file_for_edit_file_context() {
+        let temp = temp_path("atomic-text-cleanup");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+
+        write_text_atomically_for_tool(
+            FileMutationTool::EditFile,
+            target_path.as_path(),
+            "edited",
+            write_max_bytes(),
+        )
+        .await
+        .expect("atomic helper should write");
+
+        assert_eq!(
+            write_temp_file_count(temp.as_path(), "file.txt").await,
+            0,
+            "shared atomic helper should not leave temp files after success"
+        );
         let _ = fs::remove_dir_all(temp).await;
     }
 
@@ -2554,6 +5256,150 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn text_write_verification_helper_uses_edit_file_metadata_shape() {
+        let temp = temp_path("edit-verification-failed");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "actual")
+            .await
+            .expect("file should write");
+        let expected = AtomicWriteResult {
+            bytes_written: 999,
+            sha256: sha256_hex(b"expected"),
+        };
+
+        let verification = verify_text_write_for_tool(
+            FileMutationTool::EditFile,
+            "file.txt",
+            target_path.as_path(),
+            &expected,
+        )
+        .await
+        .expect("verification helper should run");
+
+        let WriteVerification::Failed(output) = verification else {
+            panic!("verification should fail");
+        };
+        let json = output.raw_json();
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("verification_failed")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some("edit_file wrote bytes but post-write verification failed")
+        );
+        assert_eq!(
+            json.get("path").and_then(JsonValue::as_str),
+            Some("file.txt")
+        );
+        let expected_resolved_path = target_path.display().to_string();
+        assert_eq!(
+            json.get("resolved_path").and_then(JsonValue::as_str),
+            Some(expected_resolved_path.as_str())
+        );
+        assert_eq!(
+            json.get("expected_bytes").and_then(JsonValue::as_u64),
+            Some(999)
+        );
+
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_post_write_verification_failed_output_shape() {
+        let temp = temp_path("edit-wrapper-verification-failed");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let target_path = temp.join("file.txt");
+        fs::write(target_path.as_path(), "actual")
+            .await
+            .expect("file should write");
+        let loaded = EditFileLoadedTarget {
+            target: EditFileTarget {
+                original_path: "file.txt".to_owned(),
+                resolved_path: target_path.clone(),
+            },
+            text: "before".to_owned(),
+            current: CurrentFileState {
+                bytes: "before".len() as u64,
+                sha256: sha256_hex(b"before"),
+                mtime_ms: 1_234,
+            },
+        };
+        let expected = AtomicWriteResult {
+            bytes_written: 999,
+            sha256: sha256_hex(b"expected"),
+        };
+
+        let output = match verify_edited_file(&loaded, &expected)
+            .await
+            .expect("verification should run")
+        {
+            WriteVerification::Verified(_) => panic!("mismatched file should fail verification"),
+            WriteVerification::Failed(output) => output,
+        };
+        let json = output.raw_json();
+
+        assert!(!output.success());
+        assert_eq!(
+            json.get("status").and_then(JsonValue::as_str),
+            Some("verification_failed")
+        );
+        assert_eq!(
+            json.get("message").and_then(JsonValue::as_str),
+            Some("edit_file wrote bytes but post-write verification failed")
+        );
+        assert_eq!(
+            json.get("path").and_then(JsonValue::as_str),
+            Some("file.txt")
+        );
+        assert_eq!(
+            json.get("expected_bytes").and_then(JsonValue::as_u64),
+            Some(999)
+        );
+        assert_eq!(
+            json.get("actual_bytes").and_then(JsonValue::as_u64),
+            Some("actual".len() as u64)
+        );
+
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[test]
+    fn file_mutation_observation_helper_records_edit_file_observation() {
+        let store = FileObservationStore::default();
+        let path = Path::new("/tmp/edited.txt");
+        let current = CurrentFileState {
+            bytes: 6,
+            sha256: sha256_hex(b"edited"),
+            mtime_ms: 1_234,
+        };
+
+        let observation = record_file_mutation_observation(
+            &store,
+            FileMutationTool::EditFile,
+            "call_edit",
+            path,
+            &current,
+        );
+
+        assert_eq!(observation.id, "edit_file:call_edit");
+        assert_eq!(observation.resolved_path, path);
+        assert_eq!(observation.bytes, 6);
+        assert_eq!(observation.sha256, sha256_hex(b"edited"));
+        assert!(observation.complete);
+        let latest = store
+            .latest_complete_for_path(path)
+            .expect("recorded observation should be latest");
+        assert_eq!(latest.id, "edit_file:call_edit");
     }
 
     #[tokio::test]

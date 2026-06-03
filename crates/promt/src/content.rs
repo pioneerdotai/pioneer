@@ -26,11 +26,14 @@ pub const ASSISTANT_SAFETY_LINES: [&str; 3] = [
 pub const TOOL_RECOVERY_POLICY_PROMPT: &str = "When a tool result indicates failure (especially shell exec with non-zero `exit_code`, `timed_out=true`, or explicit error output), do not treat it as final. First diagnose the failure from tool output, then run a corrected tool call when needed. For web tasks prefer this chain: web_search -> web_fetch -> download_url (to save artifacts). Only provide a final answer after tools succeed or after you clearly explain why retry is not possible.";
 
 pub const TOOL_USAGE_POLICY_PROMPT: &str = concat!(
-    "- Use `write_file` to create a complete UTF-8 text file or replace a file with complete known contents.\n",
+    "- Use `write_file` to create a complete file from UTF-8 content or replace a file with complete known contents.\n",
     "- Before replacing an existing file, call `read_file` for the complete current file unless exact `expected_sha256` or `expected_mtime_ms` preconditions are already available.\n",
+    "- Use `edit_file` for precise edits to an existing file whose contents are valid UTF-8, such as source code, configs, Markdown, JSON, or YAML, after a complete `read_file` or exact explicit preconditions.\n",
+    "- For `edit_file`, copy the exact file text into `old_string` without `read_file` line-number prefixes or tabs; include enough surrounding context for a unique match.\n",
+    "- Leave `replace_all` false unless every exact occurrence should be replaced.\n",
     "- Use `write_stdin` only to send input to an already-running `exec_command` session; do not use it to create or edit files.\n",
-    "- Do not use `exec_command` shell heredocs for ordinary file creation when `write_file` is available.\n",
-    "- Use `apply_patch` for coordinated patch-style edits, especially partial edits or multi-file changes where a diff is clearer than a full rewrite.",
+    "- Do not use `exec_command`, sed, perl, or shell heredocs for ordinary file edits when `edit_file`, `write_file`, or `apply_patch` are available.\n",
+    "- Use `apply_patch` for coordinated diff-style patches, especially multi-file changes or changes where reviewing a unified diff is clearer than a single exact replacement.",
 );
 
 pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
@@ -187,10 +190,19 @@ mod tests {
     #[test]
     fn tool_usage_policy_distinguishes_file_write_tools() {
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_file`"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`edit_file`"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`read_file`"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("source code"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("configs"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("valid UTF-8"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete current file"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("without `read_file` line-number prefixes"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`replace_all` false"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_stdin` only"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command` shell heredocs"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command`, sed, perl"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("ordinary file edits"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`apply_patch`"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("coordinated diff-style patches"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("partial edits"));
     }
 }

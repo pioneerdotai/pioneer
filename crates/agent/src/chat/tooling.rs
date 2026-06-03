@@ -431,7 +431,7 @@ fn protocol_delta_from_tool_delta(
 pub(super) fn tool_item_type_from_name(tool_name: &str) -> TurnItemType {
     match tool_name {
         "exec_command" | "write_stdin" => TurnItemType::CommandExecution,
-        "apply_patch" | "write_file" => TurnItemType::FileChange,
+        "apply_patch" | "write_file" | "edit_file" => TurnItemType::FileChange,
         "web_search" => TurnItemType::WebSearch,
         "web_fetch" => TurnItemType::WebFetch,
         "download_url" => TurnItemType::Download,
@@ -1372,6 +1372,10 @@ mod tests {
         );
         assert_eq!(
             tool_item_type_from_name("apply_patch"),
+            TurnItemType::FileChange
+        );
+        assert_eq!(
+            tool_item_type_from_name("edit_file"),
             TurnItemType::FileChange
         );
         assert_eq!(

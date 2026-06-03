@@ -1,90 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "TaskWaitResponse",
+  "title": "TaskAcceptResponse",
   "type": "object",
   "properties": {
-    "cancelled": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
-    },
-    "completed": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
-    },
-    "failed": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
-    },
-    "mode": {
-      "$ref": "#/$defs/TaskWaitMode"
-    },
-    "nonWaitable": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitNonWaitableItem"
-      }
-    },
-    "nonWaitableCount": {
-      "type": "integer",
-      "format": "uint32",
-      "default": 0,
-      "minimum": 0
-    },
-    "pending": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitItem"
-      }
-    },
-    "pendingCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "reviewRequired": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/TaskWaitReviewItem"
-      }
-    },
-    "reviewRequiredCount": {
-      "type": "integer",
-      "format": "uint32",
-      "default": 0,
-      "minimum": 0
-    },
-    "terminalCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "timedOut": {
+    "accepted": {
       "type": "boolean"
     },
-    "totalCount": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
+    "alreadyAccepted": {
+      "type": "boolean"
+    },
+    "candidate": {
+      "$ref": "#/$defs/TaskResultCandidate"
+    },
+    "childThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "childTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "$ref": "#/$defs/TaskResult"
+    },
+    "reviewEvent": {
+      "$ref": "#/$defs/TaskResultReviewEvent"
+    },
+    "run": {
+      "$ref": "#/$defs/TaskRun"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskStatus"
+    },
+    "task": {
+      "$ref": "#/$defs/Task"
     }
   },
   "required": [
-    "timedOut",
-    "totalCount",
-    "terminalCount",
-    "pendingCount",
-    "mode"
+    "task",
+    "run",
+    "candidate",
+    "reviewEvent",
+    "result",
+    "accepted",
+    "alreadyAccepted",
+    "status"
   ],
   "$defs": {
     "Task": {
@@ -257,47 +221,6 @@
         "revision",
         "createdAt",
         "updatedAt"
-      ]
-    },
-    "TaskAgentReviewMode": {
-      "type": "string",
-      "enum": [
-        "none",
-        "parent_agent",
-        "parent_agent_with_reviewers",
-        "user_approval"
-      ]
-    },
-    "TaskAgentReviewPolicy": {
-      "type": "object",
-      "properties": {
-        "maxRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "mode": {
-          "$ref": "#/$defs/TaskAgentReviewMode"
-        },
-        "requireExplicitAcceptance": {
-          "type": "boolean"
-        },
-        "resolutionStrategy": {
-          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
-        },
-        "reviewers": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TaskResultReviewerSpec"
-          }
-        }
-      },
-      "required": [
-        "mode",
-        "maxRevisionRounds",
-        "requireExplicitAcceptance",
-        "resolutionStrategy"
       ]
     },
     "TaskArtifact": {
@@ -703,14 +626,126 @@
         "cancelled"
       ]
     },
-    "TaskResultReviewResolutionStrategy": {
+    "TaskResultReviewDecision": {
       "type": "string",
       "enum": [
-        "parent_final",
-        "user_final",
-        "require_all_required_reviewers_then_parent",
-        "quorum_then_parent",
-        "any_required_reviewer_can_request_changes"
+        "accept",
+        "request_changes",
+        "reject",
+        "abstain",
+        "cancel"
+      ]
+    },
+    "TaskResultReviewEvent": {
+      "type": "object",
+      "properties": {
+        "candidateId": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "$ref": "#/$defs/TaskResultReviewDecision"
+        },
+        "eventKind": {
+          "$ref": "#/$defs/TaskResultReviewEventKind"
+        },
+        "feedback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "feedbackText": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "nextTaskRunTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerAgentSpecId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerKind": {
+          "$ref": "#/$defs/TaskResultReviewerKind"
+        },
+        "reviewerThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewerUserId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": "string"
+        },
+        "supersedesReviewEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "taskRunTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "candidateId",
+        "taskId",
+        "runId",
+        "taskRunTurnId",
+        "reviewerKind",
+        "eventKind",
+        "decision",
+        "createdAt"
+      ]
+    },
+    "TaskResultReviewEventKind": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "decision",
+        "override",
+        "system_auto"
       ]
     },
     "TaskResultReviewerKind": {
@@ -721,40 +756,6 @@
         "review_agent",
         "user",
         "system"
-      ]
-    },
-    "TaskResultReviewerSpec": {
-      "type": "object",
-      "properties": {
-        "agentNickname": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "agentRole": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "required": {
-          "type": "boolean"
-        },
-        "reviewerKind": {
-          "$ref": "#/$defs/TaskResultReviewerKind"
-        },
-        "weight": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        }
-      },
-      "required": [
-        "reviewerKind",
-        "required"
       ]
     },
     "TaskRetryBackoffKind": {
@@ -1102,145 +1103,6 @@
             "value"
           ]
         }
-      ]
-    },
-    "TaskWaitItem": {
-      "type": "object",
-      "properties": {
-        "childThreadId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "childTurnId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "run": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TaskRun"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "task": {
-          "$ref": "#/$defs/Task"
-        }
-      },
-      "required": [
-        "task"
-      ]
-    },
-    "TaskWaitMode": {
-      "type": "string",
-      "enum": [
-        "all_terminal",
-        "any_terminal",
-        "all_terminal_or_review_required",
-        "any_terminal_or_review_required"
-      ]
-    },
-    "TaskWaitNonWaitableItem": {
-      "type": "object",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TaskWaitItem"
-        },
-        "nextFireAt": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "reason": {
-          "$ref": "#/$defs/TaskWaitNonWaitableReason"
-        }
-      },
-      "required": [
-        "item",
-        "reason"
-      ]
-    },
-    "TaskWaitNonWaitableReason": {
-      "type": "string",
-      "enum": [
-        "future_scheduled_task_without_active_run"
-      ]
-    },
-    "TaskWaitReviewAction": {
-      "type": "string",
-      "enum": [
-        "task_accept",
-        "task_revise",
-        "task_cancel"
-      ]
-    },
-    "TaskWaitReviewItem": {
-      "type": "object",
-      "properties": {
-        "allowedActions": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TaskWaitReviewAction"
-          }
-        },
-        "candidate": {
-          "$ref": "#/$defs/TaskResultCandidate"
-        },
-        "item": {
-          "$ref": "#/$defs/TaskWaitItem"
-        },
-        "maxRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "default": 0,
-          "minimum": 0
-        },
-        "remainingRevisionRounds": {
-          "type": "integer",
-          "format": "uint32",
-          "default": 0,
-          "minimum": 0
-        },
-        "reviewPolicy": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TaskAgentReviewPolicy"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "revisionBlockedReason": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TaskWaitRevisionBlockedReason"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "item",
-        "candidate"
-      ]
-    },
-    "TaskWaitRevisionBlockedReason": {
-      "type": "string",
-      "enum": [
-        "max_revision_rounds_reached",
-        "candidate_not_revisable"
       ]
     }
   }

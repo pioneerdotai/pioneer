@@ -207,8 +207,22 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "write_file",
-            "Create a UTF-8 text file or fully overwrite an existing file after current-file state has been observed. Use this for writing complete file contents. Do not use exec_command, shell heredocs, or write_stdin to create ordinary files.",
+            "Create a file from complete UTF-8 content or fully overwrite an existing file after current-file state has been observed. Use this for writing complete file contents. Do not use exec_command, shell heredocs, or write_stdin to create ordinary files.",
             write_file_schema(),
+            PayloadKind::Function,
+            ExecutionClass::Exclusive,
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Arguments,
+                idempotency_mode: ToolIdempotencyMode::RequiresKey,
+                max_attempts: 2,
+                can_resume: false,
+                max_wall_clock_secs: None,
+            },
+        ),
+        configured_builtin_spec(
+            "edit_file",
+            "Edit an existing file whose contents are valid UTF-8, such as source code, config, Markdown, JSON, or YAML, by replacing an exact old_string with new_string after current-file state has been observed. Use write_file for file creation or full-file rewrites, and apply_patch for coordinated diff-style or multi-file patches.",
+            edit_file_schema(),
             PayloadKind::Function,
             ExecutionClass::Exclusive,
             ToolRecoveryMetadata {
@@ -445,6 +459,44 @@ fn write_file_schema() -> JsonValue {
             }
         },
         "required": ["path", "content"],
+        "additionalProperties": false
+    })
+}
+
+fn edit_file_schema() -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute path, or path relative to the tool invocation workdir."
+            },
+            "old_string": {
+                "type": "string",
+                "description": "Exact current text to replace. Must be non-empty."
+            },
+            "new_string": {
+                "type": "string",
+                "description": "Replacement text. May be empty to delete old_string."
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace every occurrence of old_string. Defaults to false."
+            },
+            "read_observation_id": {
+                "type": "string",
+                "description": "Optional id from a prior complete read_file result for the same target path."
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional current file SHA-256 precondition for stale-edit protection."
+            },
+            "expected_mtime_ms": {
+                "type": "integer",
+                "description": "Optional current file mtime precondition in Unix epoch milliseconds."
+            }
+        },
+        "required": ["path", "old_string", "new_string"],
         "additionalProperties": false
     })
 }
@@ -968,6 +1020,7 @@ mod tests {
 
         assert_eq!(by_name.get("apply_patch"), Some(&ExecutionClass::Exclusive));
         assert_eq!(by_name.get("write_file"), Some(&ExecutionClass::Exclusive));
+        assert_eq!(by_name.get("edit_file"), Some(&ExecutionClass::Exclusive));
         assert_eq!(
             by_name.get("write_stdin"),
             Some(&ExecutionClass::SessionScoped)
@@ -1048,6 +1101,65 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_schema_matches_contract() {
+        let schema = edit_file_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("edit_file properties should be an object");
+        let property_names = properties.keys().cloned().collect::<HashSet<_>>();
+
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["path", "old_string", "new_string"])
+        );
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            property_names,
+            HashSet::from([
+                "path".to_owned(),
+                "old_string".to_owned(),
+                "new_string".to_owned(),
+                "replace_all".to_owned(),
+                "read_observation_id".to_owned(),
+                "expected_sha256".to_owned(),
+                "expected_mtime_ms".to_owned(),
+            ])
+        );
+        assert_eq!(properties["path"]["type"], serde_json::json!("string"));
+        assert_eq!(
+            properties["old_string"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["new_string"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["replace_all"]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(
+            properties["read_observation_id"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["expected_sha256"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["expected_mtime_ms"]["type"],
+            serde_json::json!("integer")
+        );
+        assert!(
+            properties["old_string"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("non-empty")
+        );
+    }
+
+    #[test]
     fn write_file_builtin_spec_matches_contract() {
         let specs = builtin_tool_specs();
         let configured = specs
@@ -1069,6 +1181,30 @@ mod tests {
         assert!(!configured.spec.recovery.can_resume);
         assert_eq!(configured.spec.recovery.max_wall_clock_secs, None);
         assert_eq!(configured.spec.parameters, write_file_schema());
+    }
+
+    #[test]
+    fn edit_file_builtin_spec_matches_contract() {
+        let specs = builtin_tool_specs();
+        let configured = specs
+            .iter()
+            .find(|configured| configured.spec.name == "edit_file")
+            .expect("edit_file spec should exist");
+
+        assert_eq!(configured.spec.payload_kind, PayloadKind::Function);
+        assert_eq!(configured.execution_class, ExecutionClass::Exclusive);
+        assert_eq!(
+            configured.spec.recovery.retry_class,
+            ToolRetryClass::Arguments
+        );
+        assert_eq!(
+            configured.spec.recovery.idempotency_mode,
+            ToolIdempotencyMode::RequiresKey
+        );
+        assert_eq!(configured.spec.recovery.max_attempts, 2);
+        assert!(!configured.spec.recovery.can_resume);
+        assert_eq!(configured.spec.recovery.max_wall_clock_secs, None);
+        assert_eq!(configured.spec.parameters, edit_file_schema());
     }
 
     #[test]

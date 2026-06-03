@@ -388,6 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn artifact_registration_edit_file_does_not_create_candidate() {
+        let item = TurnItem::FileChange {
+            id: "call_edit".to_owned(),
+            tool_name: "edit_file".to_owned(),
+            arguments: json!({
+                "path": "/workspace/docs/existing.md",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: output_policy(),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(json!({
+                    "changedFiles": ["/workspace/docs/existing.md"],
+                    "operation": "edited",
+                    "matchesReplaced": 1,
+                    "replaceAll": false,
+                    "bytesBefore": 3,
+                    "bytesAfter": 3,
+                    "bytesWritten": 3,
+                    "sha256Before": "before123",
+                    "sha256": "after456",
+                    "lineEndingMode": "none"
+                })),
+            },
+            recovery: None,
+            changed_files: vec!["/workspace/docs/existing.md".to_owned()],
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+
+        assert!(artifact_registration_candidates_from_completed_item(&item).is_empty());
+    }
+
+    #[test]
     fn artifact_registration_computer_use_snapshot_candidate() {
         let item = TurnItem::DynamicToolCall {
             id: "call_cu".to_owned(),

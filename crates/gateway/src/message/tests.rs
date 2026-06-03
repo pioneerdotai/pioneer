@@ -3206,6 +3206,60 @@ fn write_file_completed_notification(
     }
 }
 
+fn edit_file_completed_notification(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    path: &std::path::Path,
+    before_bytes: &[u8],
+    after_bytes: &[u8],
+) -> ItemCompletedNotification {
+    let path = path.display().to_string();
+    let sha256_before = hex::encode(Sha256::digest(before_bytes));
+    let sha256_after = hex::encode(Sha256::digest(after_bytes));
+    ItemCompletedNotification {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        item: TurnItem::FileChange {
+            id: item_id.to_owned(),
+            tool_name: "edit_file".to_owned(),
+            arguments: json!({
+                "path": path.clone(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("edit_file"),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(json!({
+                    "changedFiles": [path.clone()],
+                    "operation": "edited",
+                    "matchesReplaced": 1,
+                    "replaceAll": false,
+                    "bytesBefore": before_bytes.len(),
+                    "bytesAfter": after_bytes.len(),
+                    "bytesWritten": after_bytes.len(),
+                    "sha256Before": sha256_before,
+                    "sha256": sha256_after,
+                    "lineEndingMode": "lf"
+                })),
+            },
+            recovery: None,
+            changed_files: vec![path],
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    }
+}
+
 async fn assert_persisted_completed_item(
     crud_store: &CrudStore,
     thread_id: &str,
@@ -3548,6 +3602,55 @@ async fn write_file_overwrite_completed_item_does_not_register_artifact() {
             .count_artifacts_by_workspace(workspace_id.as_str())
             .await
             .expect("artifact count should be readable after overwrite"),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_file_completed_item_does_not_register_artifact() {
+    let (processor, crud_store, workspace_id, thread_id, turn_id) =
+        setup_write_file_artifact_registration_gateway("edit").await;
+    let item_id = "edit_file_art";
+    let before_bytes = b"old\n";
+    let after_bytes = b"new\n";
+    let path = write_file_artifact_test_path("edit", "existing.md");
+    std::fs::write(path.as_path(), after_bytes).expect("edit_file artifact test file should exist");
+
+    let notification = edit_file_completed_notification(
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        item_id,
+        path.as_path(),
+        before_bytes,
+        after_bytes,
+    );
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted { notification })
+        .await;
+    assert_persisted_completed_item(
+        crud_store.as_ref(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        item_id,
+    )
+    .await;
+
+    let page = processor
+        .artifact_service
+        .list_thread_artifacts(
+            workspace_id.as_str(),
+            thread_id.as_str(),
+            pioneer_artifacts::ArtifactListFilter::default(),
+        )
+        .await
+        .expect("thread artifacts should remain listable after edit_file");
+    assert!(page.items.is_empty());
+    assert_eq!(
+        crud_store
+            .count_artifacts_by_workspace(workspace_id.as_str())
+            .await
+            .expect("artifact count should be readable after edit_file"),
         0
     );
 }

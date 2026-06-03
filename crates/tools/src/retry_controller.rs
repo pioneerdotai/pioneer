@@ -1018,6 +1018,105 @@ mod tests {
     }
 
     #[test]
+    fn retry_prompt_for_edit_file_read_required_keeps_changed_sequence_hint() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "edit_file needs current file state before editing. Call read_file for the complete file, then retry edit_file with exact old_string text copied without line-number prefixes.",
+            false,
+            None,
+        );
+
+        let decision = controller.decide(&[observation(
+            "edit_file",
+            r#"{"path":"file.txt","old_string":"old","new_string":"new"}"#,
+            outcome,
+        )]);
+
+        let ToolRetryDecision::Retry { prompt, .. } = decision else {
+            panic!("expected retry decision");
+        };
+        let ToolRetryPrompt::Retry { entries } = prompt else {
+            panic!("expected retry prompt");
+        };
+        assert_eq!(entries[0].tool_name, "edit_file");
+        assert_eq!(entries[0].error_class, ToolErrorClass::InvalidArguments);
+        assert!(entries[0].retry_hint.contains("read_file"));
+        assert!(entries[0].retry_hint.contains("retry edit_file"));
+        assert!(
+            entries[0]
+                .retry_hint
+                .contains("without line-number prefixes")
+        );
+    }
+
+    #[test]
+    fn retry_prompt_for_edit_file_precondition_failed_keeps_fresh_read_hint() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "The target changed before edit_file could modify it. Call read_file again for the complete current file, then retry edit_file with updated exact old_string text.",
+            false,
+            None,
+        );
+
+        let decision = controller.decide(&[observation(
+            "edit_file",
+            r#"{"path":"file.txt","old_string":"old","new_string":"new"}"#,
+            outcome,
+        )]);
+
+        let ToolRetryDecision::Retry { prompt, .. } = decision else {
+            panic!("expected retry decision");
+        };
+        let ToolRetryPrompt::Retry { entries } = prompt else {
+            panic!("expected retry prompt");
+        };
+        assert_eq!(entries[0].tool_name, "edit_file");
+        assert_eq!(entries[0].error_class, ToolErrorClass::ExecutionFailed);
+        assert!(entries[0].retry_hint.contains("read_file again"));
+        assert!(entries[0].retry_hint.contains("retry edit_file"));
+    }
+
+    #[test]
+    fn retry_prompt_for_edit_file_match_failures_requires_corrected_arguments() {
+        for (status_name, hint) in [
+            (
+                "not_found",
+                "edit_file could not find old_string. Call read_file again, copy the exact current file text without line-number prefixes, and retry with a corrected old_string.",
+            ),
+            (
+                "ambiguous_match",
+                "edit_file old_string matched multiple locations. Retry with more surrounding context for a unique match, or set replace_all=true only if every exact occurrence should change.",
+            ),
+        ] {
+            let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+            let outcome =
+                ToolOutcome::recoverable(ToolErrorClass::InvalidArguments, hint, false, None);
+
+            let decision = controller.decide(&[observation(
+                "edit_file",
+                r#"{"path":"file.txt","old_string":"old","new_string":"new"}"#,
+                outcome,
+            )]);
+
+            let ToolRetryDecision::Retry { prompt, .. } = decision else {
+                panic!("expected retry decision for {status_name}");
+            };
+            let ToolRetryPrompt::Retry { entries } = prompt else {
+                panic!("expected retry prompt for {status_name}");
+            };
+            assert_eq!(entries[0].tool_name, "edit_file");
+            assert_eq!(entries[0].error_class, ToolErrorClass::InvalidArguments);
+            assert!(
+                entries[0].retry_hint.contains("corrected old_string")
+                    || entries[0].retry_hint.contains("more surrounding context")
+            );
+            assert!(!entries[0].retry_hint.contains("retry the same arguments"));
+        }
+    }
+
+    #[test]
     fn no_retry_for_fatal_result() {
         let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
         let decision = controller.decide(&[observation(

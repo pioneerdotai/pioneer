@@ -850,13 +850,24 @@ mod tests {
         assert!(
             compiled
                 .stable_system_text
-                .contains("Use `write_file` to create a complete UTF-8 text file")
+                .contains("Use `write_file` to create a complete file from UTF-8 content")
         );
         assert!(
             compiled
                 .stable_system_text
                 .contains("Before replacing an existing file, call `read_file`")
         );
+        assert!(compiled.stable_system_text.contains(
+            "Use `edit_file` for precise edits to an existing file whose contents are valid UTF-8"
+        ));
+        assert!(compiled.stable_system_text.contains("source code"));
+        assert!(compiled.stable_system_text.contains("configs"));
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("without `read_file` line-number prefixes")
+        );
+        assert!(compiled.stable_system_text.contains("`replace_all` false"));
         assert!(
             compiled
                 .stable_system_text
@@ -865,13 +876,15 @@ mod tests {
         assert!(
             compiled
                 .stable_system_text
-                .contains("Do not use `exec_command` shell heredocs")
+                .contains("Do not use `exec_command`, sed, perl")
         );
+        assert!(compiled.stable_system_text.contains("ordinary file edits"));
         assert!(
             compiled
                 .stable_system_text
-                .contains("Use `apply_patch` for coordinated patch-style edits")
+                .contains("Use `apply_patch` for coordinated diff-style patches")
         );
+        assert!(!compiled.stable_system_text.contains("partial edits"));
     }
 
     #[test]
