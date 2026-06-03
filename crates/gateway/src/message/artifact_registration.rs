@@ -356,6 +356,35 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, PathBuf::from("created.txt"));
         assert_eq!(candidates[0].kind_hint, Some(ArtifactKind::WorkspaceFile));
+        assert_eq!(
+            candidates[0].source,
+            ArtifactRegistrationSource::ApplyPatchAddFile
+        );
+    }
+
+    #[test]
+    fn artifact_registration_write_file_does_not_create_candidate() {
+        let created = write_file_item(
+            json!({
+                "changedFiles": ["/workspace/docs/created.md"],
+                "operation": "created",
+                "bytesWritten": 5,
+                "sha256": "abc123"
+            }),
+            vec!["/workspace/docs/created.md".to_owned()],
+        );
+        assert!(artifact_registration_candidates_from_completed_item(&created).is_empty());
+
+        let overwritten = write_file_item(
+            json!({
+                "changedFiles": ["/workspace/docs/existing.md"],
+                "operation": "overwritten",
+                "bytesWritten": 12,
+                "sha256": "def456"
+            }),
+            vec!["/workspace/docs/existing.md".to_owned()],
+        );
+        assert!(artifact_registration_candidates_from_completed_item(&overwritten).is_empty());
     }
 
     #[test]
@@ -448,6 +477,29 @@ mod tests {
             elapsed_ms: None,
             truncated: Some(truncated),
             success: Some(success),
+            outcome: None,
+            observation: None,
+        }
+    }
+
+    fn write_file_item(metadata: JsonValue, changed_files: Vec<String>) -> TurnItem {
+        TurnItem::FileChange {
+            id: "call_write".to_owned(),
+            tool_name: "write_file".to_owned(),
+            arguments: json!({"path": "/workspace/docs/created.md"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: output_policy(),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(metadata),
+            },
+            recovery: None,
+            changed_files,
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: Some(true),
             outcome: None,
             observation: None,
         }

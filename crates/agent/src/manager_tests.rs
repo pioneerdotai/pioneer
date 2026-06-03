@@ -5062,6 +5062,22 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
+    for core_tool in [
+        "exec_command",
+        "write_stdin",
+        "apply_patch",
+        "write_file",
+        "request_tools",
+    ] {
+        assert!(
+            hook_tool_names.contains(&core_tool.to_owned()),
+            "ordinary turns should expose core tool `{core_tool}` before prompt compile: {hook_tool_names:?}"
+        );
+        assert!(
+            request_tool_names.contains(&core_tool.to_owned()),
+            "ordinary turns should expose core tool `{core_tool}` to the provider without lazy activation: {request_tool_names:?}"
+        );
+    }
     assert!(
         !request_tool_names
             .iter()

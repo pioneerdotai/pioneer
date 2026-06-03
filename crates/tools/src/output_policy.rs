@@ -365,7 +365,14 @@ mod tests {
 
     #[test]
     fn model_only_tools_do_not_persist_full_output() {
-        for tool_name in ["read_file", "read_skill", "list_dir", "grep_files"] {
+        for tool_name in [
+            "read_file",
+            "read_skill",
+            "list_dir",
+            "grep_files",
+            "apply_patch",
+            "write_file",
+        ] {
             let policy = builtin_output_policy(tool_name);
             assert!(!matches!(policy.storage, StorageOutputPolicy::Full { .. }));
             assert!(matches!(policy.deltas, DeltaOutputPolicy::Disabled));

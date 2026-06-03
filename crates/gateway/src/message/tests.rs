@@ -71,7 +71,7 @@ use pioneer_protocol::{
     ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
     ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
     ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
     ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
     TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
@@ -3087,6 +3087,145 @@ async fn ingest_user_test_artifact(
         .artifact
 }
 
+async fn setup_write_file_artifact_registration_gateway(
+    case_id: &str,
+) -> (MessageProcessor, Arc<CrudStore>, String, String, String) {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager.clone(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    let thread_id = generate_test_request_id("wfat", case_id);
+    let turn_id = generate_test_request_id("wfaturn", case_id);
+    let thread_start = thread_manager
+        .system_thread_start_seeded(
+            workspace_id.clone(),
+            pioneer_protocol::ThreadStartParams {
+                thread_id: thread_id.clone(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("write_file artifact registration thread should start");
+    crud_store
+        .materialize_turn_start(
+            &thread_start.started_notification.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("write_file artifact registration turn should persist");
+    agent_manager
+        .ensure_thread(thread_id.as_str(), workspace_id.as_str())
+        .await
+        .expect("write_file artifact registration agent thread should register");
+
+    (processor, crud_store, workspace_id, thread_id, turn_id)
+}
+
+fn write_file_artifact_test_path(case_id: &str, file_name: &str) -> std::path::PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::current_dir()
+        .expect("current dir should resolve")
+        .join("target")
+        .join("pioneer-gateway-write-file-artifacts")
+        .join(format!("{}_{}_{}", case_id, std::process::id(), now_nanos));
+    std::fs::create_dir_all(root.as_path())
+        .expect("write_file artifact test directory should exist");
+    root.join(file_name)
+}
+
+fn write_file_completed_notification(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    path: &std::path::Path,
+    operation: &str,
+    bytes: &[u8],
+) -> ItemCompletedNotification {
+    let path = path.display().to_string();
+    let sha256 = hex::encode(Sha256::digest(bytes));
+    ItemCompletedNotification {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        item: TurnItem::FileChange {
+            id: item_id.to_owned(),
+            tool_name: "write_file".to_owned(),
+            arguments: json!({"path": path.clone()}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("write_file"),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(json!({
+                    "changedFiles": [path.clone()],
+                    "operation": operation,
+                    "bytesWritten": bytes.len(),
+                    "sha256": sha256
+                })),
+            },
+            recovery: None,
+            changed_files: vec![path],
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    }
+}
+
+async fn assert_persisted_completed_item(
+    crud_store: &CrudStore,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) {
+    let item_events = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    assert!(
+        item_events.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted { item, .. } if item.item_id() == item_id
+        )),
+        "completed item {item_id} should be persisted before artifact registration assertions"
+    );
+}
+
 async fn materialize_artifact_api_thread(
     crud_store: &CrudStore,
     workspace_id: &str,
@@ -3282,6 +3421,135 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
                 && file.size_bytes == Some(14)
                 && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_file_created_completed_item_does_not_register_artifact() {
+    let (processor, crud_store, workspace_id, thread_id, turn_id) =
+        setup_write_file_artifact_registration_gateway("created").await;
+    let item_id = "write_created_art";
+    let bytes = b"# Created\n";
+    let path = write_file_artifact_test_path("created", "created.md");
+    std::fs::write(path.as_path(), bytes).expect("write_file artifact test file should exist");
+
+    let notification = write_file_completed_notification(
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        item_id,
+        path.as_path(),
+        "created",
+        bytes,
+    );
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted { notification })
+        .await;
+    assert_persisted_completed_item(
+        crud_store.as_ref(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        item_id,
+    )
+    .await;
+
+    let page = processor
+        .artifact_service
+        .list_thread_artifacts(
+            workspace_id.as_str(),
+            thread_id.as_str(),
+            pioneer_artifacts::ArtifactListFilter::default(),
+        )
+        .await
+        .expect("thread artifacts should remain listable after write_file create");
+
+    assert!(page.items.is_empty());
+    assert_eq!(
+        crud_store
+            .count_artifacts_by_workspace(workspace_id.as_str())
+            .await
+            .expect("artifact count should be readable after write_file create"),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_file_overwrite_completed_item_does_not_register_artifact() {
+    let (processor, crud_store, workspace_id, thread_id, turn_id) =
+        setup_write_file_artifact_registration_gateway("overwrite").await;
+    let path = write_file_artifact_test_path("overwrite", "existing.md");
+    let initial_bytes = b"initial\n";
+    std::fs::write(path.as_path(), initial_bytes)
+        .expect("write_file created artifact test file should exist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+            notification: write_file_completed_notification(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "write_created_once",
+                path.as_path(),
+                "created",
+                initial_bytes,
+            ),
+        })
+        .await;
+    assert_persisted_completed_item(
+        crud_store.as_ref(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        "write_created_once",
+    )
+    .await;
+    assert_eq!(
+        crud_store
+            .count_artifacts_by_workspace(workspace_id.as_str())
+            .await
+            .expect("artifact count should be readable after create"),
+        0
+    );
+
+    let overwritten_bytes = b"overwritten\n";
+    std::fs::write(path.as_path(), overwritten_bytes)
+        .expect("write_file overwritten artifact test file should update");
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+            notification: write_file_completed_notification(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "write_overwrite_one",
+                path.as_path(),
+                "overwritten",
+                overwritten_bytes,
+            ),
+        })
+        .await;
+    assert_persisted_completed_item(
+        crud_store.as_ref(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+        "write_overwrite_one",
+    )
+    .await;
+
+    let page = processor
+        .artifact_service
+        .list_thread_artifacts(
+            workspace_id.as_str(),
+            thread_id.as_str(),
+            pioneer_artifacts::ArtifactListFilter::default(),
+        )
+        .await
+        .expect("thread artifacts should remain listable after overwrite");
+    assert!(page.items.is_empty());
+    assert_eq!(
+        crud_store
+            .count_artifacts_by_workspace(workspace_id.as_str())
+            .await
+            .expect("artifact count should be readable after overwrite"),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

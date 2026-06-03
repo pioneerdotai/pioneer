@@ -9,6 +9,7 @@ pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "exec_command",
     "write_stdin",
     "read_file",
+    "write_file",
     "list_dir",
     "grep_files",
     "apply_patch",
@@ -217,6 +218,38 @@ mod tests {
         let artifact_register = &index.candidate_tools[2];
         assert_eq!(artifact_register.domain, BuiltinToolDomain::Artifact);
         assert!(artifact_register.mutation);
+    }
+
+    #[test]
+    fn tool_index_core_tools_include_default_visible_file_tools() {
+        let specs = [
+            "exec_command",
+            "write_stdin",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "grep_files",
+            "apply_patch",
+            "request_tools",
+        ]
+        .into_iter()
+        .map(|name| configured_spec(name, "Core tool.", ToolIdempotencyMode::Safe))
+        .collect::<Vec<_>>();
+
+        let index = build_preflight_tool_index(&specs);
+
+        for name in [
+            "read_file",
+            "write_file",
+            "list_dir",
+            "grep_files",
+            "apply_patch",
+        ] {
+            assert!(
+                index.core_tools.contains(&name.to_owned()),
+                "core tools must include default-visible file tool `{name}`"
+            );
+        }
     }
 
     #[test]

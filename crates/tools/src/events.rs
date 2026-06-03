@@ -483,7 +483,8 @@ fn monotonic_now_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_policy::ToolResultView;
+    use crate::output_policy::{ToolOutputProjectionKind, ToolResultView};
+    use crate::output_projection::{ToolProjectionInput, project_tool_result};
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
@@ -533,5 +534,79 @@ mod tests {
         });
 
         assert_eq!(event.event_class(), ProtocolEventClass::Durable);
+    }
+
+    #[tokio::test]
+    async fn write_file_completed_event_carries_file_change_metadata() {
+        let raw_output_json = serde_json::json!({
+            "ok": true,
+            "status": "completed",
+            "operation": "created",
+            "path": "docs/example.md",
+            "resolved_path": "/tmp/project/docs/example.md",
+            "bytes_written": 5,
+            "sha256": "abc123",
+            "file_observation": {
+                "id": "write_file:call_write",
+                "path": "/tmp/project/docs/example.md",
+                "bytes": 5,
+                "sha256": "abc123",
+                "mtime_ms": 1234,
+                "complete": true,
+                "source_tool_call_id": "call_write"
+            },
+            "created_dirs": [],
+            "changed_files": ["/tmp/project/docs/example.md"],
+            "content": "SECRET_WRITE_FILE_CONTENT"
+        });
+        let outcome = ToolOutcome::ok();
+        let output_policy = ToolOutputPolicySnapshot::for_tool_name("write_file");
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_write",
+            tool_name: "write_file",
+            arguments: &serde_json::json!({"path": "docs/example.md"}),
+            raw_output_text: "write_file completed: created /tmp/project/docs/example.md, 5 bytes.",
+            raw_output_json: &raw_output_json,
+            success: true,
+            outcome: &outcome,
+            output_policy: &output_policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let bus = ToolEventBus::new(4);
+        let mut events = bus.subscribe();
+        let trace = bus.start_trace("turn_1", "call_write", "write_file");
+
+        trace.emit_completed(1, &envelope);
+
+        let event = timeout(Duration::from_millis(100), events.recv())
+            .await
+            .expect("event should arrive")
+            .expect("event should decode");
+        let ToolEventPayload::CallCompleted(completed) = event.payload else {
+            panic!("write_file completion should emit CallCompleted");
+        };
+        let ToolDisplayPayload::Summary(display_summary) = &completed.display else {
+            panic!("write_file display should be a summary");
+        };
+        let ToolStoragePayload::Metadata { metadata } = &completed.storage else {
+            panic!("write_file storage should be metadata-only");
+        };
+        let display_metadata = display_summary.metadata.to_json();
+        let storage_metadata = metadata.to_json();
+
+        assert_eq!(event.tool_name, "write_file");
+        assert_eq!(display_summary.title, "write_file changed 1 file(s)");
+        assert_eq!(
+            display_metadata["changedFiles"][0],
+            "/tmp/project/docs/example.md"
+        );
+        assert_eq!(storage_metadata["operation"], "created");
+        assert_eq!(storage_metadata["bytesWritten"], 5);
+        assert_eq!(storage_metadata["sha256"], "abc123");
+        assert!(
+            !serde_json::to_string(&completed)
+                .unwrap()
+                .contains("SECRET_WRITE_FILE_CONTENT")
+        );
     }
 }

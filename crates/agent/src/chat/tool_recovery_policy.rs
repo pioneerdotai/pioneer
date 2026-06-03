@@ -202,4 +202,30 @@ mod tests {
         assert_eq!(snapshot.max_wall_clock_secs, 300);
         assert_eq!(snapshot.no_progress_limit, 1);
     }
+
+    #[test]
+    fn file_change_argument_retry_metadata_matches_write_file_recovery_policy() {
+        let snapshot = snapshot_for_tool_metadata(
+            TurnItemType::FileChange,
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Arguments,
+                idempotency_mode: ToolIdempotencyMode::RequiresKey,
+                max_attempts: 2,
+                can_resume: false,
+                max_wall_clock_secs: None,
+            },
+        );
+
+        assert_eq!(snapshot.retry_class, ToolRecoveryRetryClass::Arguments);
+        assert_eq!(
+            snapshot.idempotency_mode,
+            ToolRecoveryIdempotencyMode::RequiresKey
+        );
+        assert_eq!(snapshot.max_attempts, 2);
+        assert!(!snapshot.can_resume);
+        assert_eq!(snapshot.resolved_action, RecoveryAction::RetryAttempt);
+        assert_eq!(snapshot.base_backoff_secs, 1);
+        assert_eq!(snapshot.max_wall_clock_secs, 180);
+        assert_eq!(snapshot.no_progress_limit, 2);
+    }
 }

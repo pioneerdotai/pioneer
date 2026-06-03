@@ -51,6 +51,13 @@ impl ErrorClassifier for DefaultErrorClassifier {
             );
         }
 
+        if invocation.tool_name == "write_file"
+            && !success
+            && let Some(outcome) = classify_write_file_result(raw_output_json)
+        {
+            return outcome;
+        }
+
         if is_mcp_invocation(invocation) {
             return classify_mcp_result(raw_output_json, success);
         }
@@ -85,6 +92,12 @@ impl ErrorClassifier for DefaultErrorClassifier {
 
         if is_web_tool(invocation.tool_name.as_str()) {
             return classify_web_error(error);
+        }
+
+        if invocation.tool_name == "write_file"
+            && let Some(outcome) = classify_write_file_error(error)
+        {
+            return outcome;
         }
 
         if is_mcp_invocation(invocation) {
@@ -132,6 +145,53 @@ impl ErrorClassifier for DefaultErrorClassifier {
             ),
         }
     }
+}
+
+fn classify_write_file_result(raw_output_json: &JsonValue) -> Option<ToolOutcome> {
+    let status = raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let error_class = raw_output_json
+        .get("errorClass")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+
+    match (status, error_class) {
+        ("read_required", _) => Some(ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "write_file needs current file state before overwrite. Call read_file for the complete file, then retry write_file with updated content.",
+            false,
+            None,
+        )),
+        ("precondition_failed", _) | (_, "precondition_failed") => Some(ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "The target changed before write_file could overwrite it. Call read_file again for the complete current file, then retry write_file with updated content.",
+            false,
+            None,
+        )),
+        _ => None,
+    }
+}
+
+fn classify_write_file_error(error: &ToolError) -> Option<ToolOutcome> {
+    let ToolError::InvalidArguments(message) = error else {
+        return None;
+    };
+
+    if message.contains("missing field `path`")
+        || message.contains("missing field `content`")
+        || message.contains("unknown field")
+    {
+        return Some(ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Call write_file with canonical JSON fields `path` and `content`. Use write_stdin only for an existing exec_command session, not for file creation.",
+            false,
+            None,
+        ));
+    }
+
+    None
 }
 
 pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
@@ -940,6 +1000,23 @@ mod tests {
         }
     }
 
+    fn write_file_invocation() -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call".to_owned(),
+            tool_name: "write_file".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: crate::context::ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+            workdir: std::path::PathBuf::from("."),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[test]
     fn grep_needs_narrowing_result_uses_dedicated_error_class() {
         let classifier = DefaultErrorClassifier;
@@ -968,6 +1045,66 @@ mod tests {
 
         assert_eq!(outcome.error_class, Some(ToolErrorClass::NeedsNarrowing));
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn write_file_read_required_result_points_to_complete_read_then_retry() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = write_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "read_required",
+                "errorClass": "invalid_arguments"
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("read_file for the complete file"));
+        assert!(hint.contains("retry write_file"));
+    }
+
+    #[test]
+    fn write_file_precondition_failed_result_points_to_fresh_read() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = write_file_invocation();
+        let outcome = classifier.classify_result(
+            &invocation,
+            &serde_json::json!({
+                "ok": false,
+                "status": "precondition_failed",
+                "errorClass": "precondition_failed"
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::ExecutionFailed));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("Call read_file again"));
+        assert!(hint.contains("retry write_file"));
+    }
+
+    #[test]
+    fn write_file_malformed_arguments_get_write_specific_hint() {
+        let classifier = DefaultErrorClassifier;
+        let invocation = write_file_invocation();
+        let outcome = classifier.classify_error(
+            &invocation,
+            &ToolError::invalid_arguments("invalid arguments: missing field `content`"),
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        let hint = outcome.retry_hint.expect("retry hint should exist");
+        assert!(hint.contains("`path` and `content`"));
+        assert!(hint.contains("write_stdin only"));
     }
 
     #[test]

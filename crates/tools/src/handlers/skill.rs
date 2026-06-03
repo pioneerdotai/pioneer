@@ -287,6 +287,7 @@ fn builtin_target_policy(tool_name: &str) -> Option<ToolOutputPolicySnapshot> {
             | "list_dir"
             | "grep_files"
             | "apply_patch"
+            | "write_file"
             | "web_fetch"
             | "web_search"
             | "download_url"

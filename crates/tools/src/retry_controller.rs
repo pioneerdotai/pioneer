@@ -961,6 +961,63 @@ mod tests {
     }
 
     #[test]
+    fn retry_prompt_for_write_file_read_required_keeps_changed_sequence_hint() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "write_file needs current file state before overwrite. Call read_file for the complete file, then retry write_file with updated content.",
+            false,
+            None,
+        );
+
+        let decision = controller.decide(&[observation(
+            "write_file",
+            r#"{"path":"file.txt","content":"new"}"#,
+            outcome,
+        )]);
+
+        let ToolRetryDecision::Retry { prompt, .. } = decision else {
+            panic!("expected retry decision");
+        };
+        let ToolRetryPrompt::Retry { entries } = prompt else {
+            panic!("expected retry prompt");
+        };
+        assert_eq!(entries[0].tool_name, "write_file");
+        assert_eq!(entries[0].error_class, ToolErrorClass::InvalidArguments);
+        assert!(entries[0].retry_hint.contains("read_file"));
+        assert!(entries[0].retry_hint.contains("retry write_file"));
+        assert_eq!(entries[0].signature_retry_used, 1);
+    }
+
+    #[test]
+    fn retry_prompt_for_write_file_precondition_failed_keeps_fresh_read_hint() {
+        let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            "The target changed before write_file could overwrite it. Call read_file again for the complete current file, then retry write_file with updated content.",
+            false,
+            None,
+        );
+
+        let decision = controller.decide(&[observation(
+            "write_file",
+            r#"{"path":"file.txt","content":"new"}"#,
+            outcome,
+        )]);
+
+        let ToolRetryDecision::Retry { prompt, .. } = decision else {
+            panic!("expected retry decision");
+        };
+        let ToolRetryPrompt::Retry { entries } = prompt else {
+            panic!("expected retry prompt");
+        };
+        assert_eq!(entries[0].tool_name, "write_file");
+        assert_eq!(entries[0].error_class, ToolErrorClass::ExecutionFailed);
+        assert!(entries[0].retry_hint.contains("read_file again"));
+        assert!(entries[0].retry_hint.contains("retry write_file"));
+    }
+
+    #[test]
     fn no_retry_for_fatal_result() {
         let mut controller = ToolRetryController::new(ToolRetryBudgetConfig::default());
         let decision = controller.decide(&[observation(

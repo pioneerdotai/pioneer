@@ -52,6 +52,16 @@ fn build_artifact_output_contract_section() -> PromptSection {
     }
 }
 
+fn build_tool_usage_policy_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::ToolUsagePolicy,
+        stability: PromptStability::Stable,
+        title: content::SECTION_TITLE_TOOL_USAGE_POLICY.to_owned(),
+        content: content::TOOL_USAGE_POLICY_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 fn build_tool_recovery_policy_section() -> PromptSection {
     PromptSection {
         id: PromptSectionId::ToolRecoveryPolicy,
@@ -473,6 +483,10 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         sections.push(build_artifact_output_contract_section());
     }
 
+    if policy::include_tool_usage_policy(profile) {
+        sections.push(build_tool_usage_policy_section());
+    }
+
     if policy::include_workspace_context(profile) {
         let (loaded_files, mut file_diagnostics) =
             load_bootstrap_files(input.workspace_root.as_path(), profile);
@@ -601,7 +615,7 @@ mod tests {
     use crate::profile::PromptProfile;
     use crate::section::{
         DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
-        PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSectionId,
+        PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSectionId, PromptStability,
     };
 
     fn temp_workspace(name: &str) -> std::path::PathBuf {
@@ -735,6 +749,7 @@ mod tests {
                 PromptSectionId::IdentityBase,
                 PromptSectionId::AssistantSafety,
                 PromptSectionId::ArtifactOutputContract,
+                PromptSectionId::ToolUsagePolicy,
                 PromptSectionId::SoulCore,
                 PromptSectionId::IdentityCore,
                 PromptSectionId::UserPersona,
@@ -801,6 +816,62 @@ mod tests {
         );
         assert!(!compiled.dynamic_system_text.contains("task_create"));
         assert!(!compiled.dynamic_system_text.contains("task_accept"));
+    }
+
+    #[test]
+    fn tool_usage_policy_renders_write_file_guidance() {
+        let root = temp_workspace("tool_usage_policy");
+        std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
+        std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections: Vec::new(),
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        let tool_usage_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::ToolUsagePolicy)
+            .expect("tool usage section should be present");
+        assert_eq!(tool_usage_section.stability, PromptStability::Stable);
+        assert!(compiled.stable_system_text.contains("## Tool Usage"));
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Use `write_file` to create a complete UTF-8 text file")
+        );
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Before replacing an existing file, call `read_file`")
+        );
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Use `write_stdin` only")
+        );
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Do not use `exec_command` shell heredocs")
+        );
+        assert!(
+            compiled
+                .stable_system_text
+                .contains("Use `apply_patch` for coordinated patch-style edits")
+        );
     }
 
     #[test]

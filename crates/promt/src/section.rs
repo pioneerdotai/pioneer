@@ -126,6 +126,7 @@ pub enum PromptSectionId {
     IdentityBase,
     AssistantSafety,
     ArtifactOutputContract,
+    ToolUsagePolicy,
     SoulCore,
     IdentityCore,
     UserPersona,
@@ -147,6 +148,7 @@ impl PromptSectionId {
             Self::IdentityBase => "identity_base",
             Self::AssistantSafety => "assistant_safety",
             Self::ArtifactOutputContract => "artifact_output_contract",
+            Self::ToolUsagePolicy => "tool_usage_policy",
             Self::SoulCore => "soul_core",
             Self::IdentityCore => "identity_core",
             Self::UserPersona => "user_persona",
@@ -170,6 +172,7 @@ impl PromptSectionId {
             "identity_base"
                 | "assistant_safety"
                 | "artifact_output_contract"
+                | "tool_usage_policy"
                 | "soul_core"
                 | "identity_core"
                 | "user_persona"

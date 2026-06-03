@@ -4,7 +4,7 @@ use crate::context::{
 use crate::domain::parse_request_tools_domains;
 use crate::error::ToolError;
 use crate::events::{ToolEventBus, ToolEventTrace};
-use crate::normalize_tool_arguments_from_schema;
+use crate::normalize_tool_arguments_for_tool;
 use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{ToolOutputPolicySnapshot, ToolOutputProjectionKind};
 use crate::registry::ToolRegistry;
@@ -317,8 +317,11 @@ impl ToolRouter {
         match configured.spec.payload_kind {
             PayloadKind::Function => {
                 let parsed = parse_json_arguments(arguments)?;
-                let normalized =
-                    normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
+                let normalized = normalize_tool_arguments_for_tool(
+                    tool_name,
+                    parsed,
+                    &configured.spec.parameters,
+                )?;
                 if tool_name == REQUEST_TOOLS_TOOL_NAME {
                     parse_request_tools_domains(&normalized.arguments)
                         .map_err(ToolError::invalid_arguments)?;
@@ -332,8 +335,11 @@ impl ToolRouter {
             }
             PayloadKind::Mcp => {
                 let parsed = parse_json_arguments(arguments)?;
-                let normalized =
-                    normalize_tool_arguments_from_schema(parsed, &configured.spec.parameters)?;
+                let normalized = normalize_tool_arguments_for_tool(
+                    tool_name,
+                    parsed,
+                    &configured.spec.parameters,
+                )?;
                 match &configured.payload_binding {
                     ToolPayloadBinding::Mcp {
                         server_id,
@@ -545,6 +551,13 @@ mod tests {
             .expect("request_tools builtin spec should exist")
     }
 
+    fn write_file_configured_spec() -> ConfiguredToolSpec {
+        crate::builtin_tool_specs()
+            .into_iter()
+            .find(|configured| configured.spec.name == "write_file")
+            .expect("write_file builtin spec should exist")
+    }
+
     fn router_with_specs(specs: Vec<ConfiguredToolSpec>) -> ToolRouter {
         router_with_event_bus(specs, ToolEventBus::default())
     }
@@ -685,6 +698,99 @@ mod tests {
 
         assert!(error.to_string().contains("$.trigger"));
         assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn build_tool_call_normalizes_write_file_alias_arguments() {
+        let router = router_with_specs(vec![write_file_configured_spec()]);
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_write_alias".to_owned(),
+                tool_name: "write_file".to_owned(),
+                arguments: r#"{"file_path":"docs/example.md","contents":"hello"}"#.to_owned(),
+            })
+            .expect("write_file aliases should parse");
+
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                assert_eq!(arguments["path"], "docs/example.md");
+                assert_eq!(arguments["content"], "hello");
+                assert!(arguments.get("file_path").is_none());
+                assert!(arguments.get("contents").is_none());
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tool_call_normalizes_write_file_filename_and_text_aliases() {
+        let router = router_with_specs(vec![write_file_configured_spec()]);
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_write_alias_2".to_owned(),
+                tool_name: "write_file".to_owned(),
+                arguments: r#"{"filename":"notes.txt","text":"hello"}"#.to_owned(),
+            })
+            .expect("write_file aliases should parse");
+
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                assert_eq!(arguments["path"], "notes.txt");
+                assert_eq!(arguments["content"], "hello");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tool_call_rejects_write_file_unknown_fields_after_alias_normalization() {
+        let router = router_with_specs(vec![write_file_configured_spec()]);
+
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_write_unknown".to_owned(),
+                tool_name: "write_file".to_owned(),
+                arguments: r#"{"file_path":"docs/example.md","contents":"hello","mode":"append"}"#
+                    .to_owned(),
+            })
+            .expect_err("unknown write_file field should fail");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(error.to_string().contains("unknown field `mode`"));
+    }
+
+    #[test]
+    fn build_tool_call_does_not_apply_write_file_aliases_to_other_tools() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "other_tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                }
+            }),
+        )]);
+
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_other_alias".to_owned(),
+                tool_name: "other_tool".to_owned(),
+                arguments: r#"{"file_path":"docs/example.md","contents":"hello"}"#.to_owned(),
+            })
+            .expect("other tool should parse without write_file aliases");
+
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                assert_eq!(arguments["file_path"], "docs/example.md");
+                assert_eq!(arguments["contents"], "hello");
+                assert!(arguments.get("path").is_none());
+                assert!(arguments.get("content").is_none());
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     #[test]

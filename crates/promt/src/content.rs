@@ -1,6 +1,7 @@
 pub const SECTION_TITLE_IDENTITY_BASE: &str = "Identity";
 pub const SECTION_TITLE_ASSISTANT_SAFETY: &str = "Safety";
 pub const SECTION_TITLE_ARTIFACT_OUTPUT_CONTRACT: &str = "Artifact output contract";
+pub const SECTION_TITLE_TOOL_USAGE_POLICY: &str = "Tool Usage";
 pub const SECTION_TITLE_TOOL_RECOVERY_POLICY: &str = "Tool Recovery Policy";
 pub const SECTION_TITLE_SOUL_CORE: &str = "Soul Core";
 pub const SECTION_TITLE_IDENTITY_CORE: &str = "Identity Core";
@@ -23,6 +24,14 @@ pub const ASSISTANT_SAFETY_LINES: [&str; 3] = [
 ];
 
 pub const TOOL_RECOVERY_POLICY_PROMPT: &str = "When a tool result indicates failure (especially shell exec with non-zero `exit_code`, `timed_out=true`, or explicit error output), do not treat it as final. First diagnose the failure from tool output, then run a corrected tool call when needed. For web tasks prefer this chain: web_search -> web_fetch -> download_url (to save artifacts). Only provide a final answer after tools succeed or after you clearly explain why retry is not possible.";
+
+pub const TOOL_USAGE_POLICY_PROMPT: &str = concat!(
+    "- Use `write_file` to create a complete UTF-8 text file or replace a file with complete known contents.\n",
+    "- Before replacing an existing file, call `read_file` for the complete current file unless exact `expected_sha256` or `expected_mtime_ms` preconditions are already available.\n",
+    "- Use `write_stdin` only to send input to an already-running `exec_command` session; do not use it to create or edit files.\n",
+    "- Do not use `exec_command` shell heredocs for ordinary file creation when `write_file` is available.\n",
+    "- Use `apply_patch` for coordinated patch-style edits, especially partial edits or multi-file changes where a diff is clearer than a full rewrite.",
+);
 
 pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
     "- Apply these artifact rules in order; earlier rules take precedence.\n",
@@ -173,5 +182,15 @@ mod tests {
             TASK_ORCHESTRATION_POLICY_PROMPT
                 .contains("Do not finish the parent turn while attached subagent work")
         );
+    }
+
+    #[test]
+    fn tool_usage_policy_distinguishes_file_write_tools() {
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_file`"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`read_file`"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete current file"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_stdin` only"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command` shell heredocs"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`apply_patch`"));
     }
 }

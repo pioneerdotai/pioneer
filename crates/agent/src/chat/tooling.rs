@@ -431,7 +431,7 @@ fn protocol_delta_from_tool_delta(
 pub(super) fn tool_item_type_from_name(tool_name: &str) -> TurnItemType {
     match tool_name {
         "exec_command" | "write_stdin" => TurnItemType::CommandExecution,
-        "apply_patch" => TurnItemType::FileChange,
+        "apply_patch" | "write_file" => TurnItemType::FileChange,
         "web_search" => TurnItemType::WebSearch,
         "web_fetch" => TurnItemType::WebFetch,
         "download_url" => TurnItemType::Download,
@@ -1363,6 +1363,30 @@ mod tests {
         ObservationContext, ToolCallCompletedEvent, ToolEventPayload, ToolResultView,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn tool_item_type_maps_write_file_to_file_change() {
+        assert_eq!(
+            tool_item_type_from_name("write_file"),
+            TurnItemType::FileChange
+        );
+        assert_eq!(
+            tool_item_type_from_name("apply_patch"),
+            TurnItemType::FileChange
+        );
+        assert_eq!(
+            tool_item_type_from_name("exec_command"),
+            TurnItemType::CommandExecution
+        );
+        assert_eq!(
+            tool_item_type_from_name("write_stdin"),
+            TurnItemType::CommandExecution
+        );
+        assert_eq!(
+            tool_item_type_from_name("unknown_tool"),
+            TurnItemType::DynamicToolCall
+        );
+    }
 
     #[tokio::test]
     async fn completed_tool_event_emits_llm_context_without_leaking_to_turn_item() {

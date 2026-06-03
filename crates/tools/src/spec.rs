@@ -206,6 +206,20 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
             },
         ),
         configured_builtin_spec(
+            "write_file",
+            "Create a UTF-8 text file or fully overwrite an existing file after current-file state has been observed. Use this for writing complete file contents. Do not use exec_command, shell heredocs, or write_stdin to create ordinary files.",
+            write_file_schema(),
+            PayloadKind::Function,
+            ExecutionClass::Exclusive,
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Arguments,
+                idempotency_mode: ToolIdempotencyMode::RequiresKey,
+                max_attempts: 2,
+                can_resume: false,
+                max_wall_clock_secs: None,
+            },
+        ),
+        configured_builtin_spec(
             "list_dir",
             "List files/directories recursively.",
             list_dir_schema(),
@@ -393,6 +407,44 @@ fn read_file_schema() -> JsonValue {
             "max_bytes": { "type": "integer", "minimum": 1 }
         },
         "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
+fn write_file_schema() -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute path, or path relative to the tool invocation workdir."
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete UTF-8 file contents to write."
+            },
+            "create_dirs": {
+                "type": "boolean",
+                "description": "Create missing parent directories. Defaults to true."
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Allow replacing an existing file. Defaults to true."
+            },
+            "read_observation_id": {
+                "type": "string",
+                "description": "Optional id from a prior complete read_file result for the same target path."
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional current file SHA-256 precondition for stale-write protection."
+            },
+            "expected_mtime_ms": {
+                "type": "integer",
+                "description": "Optional current file mtime precondition in Unix epoch milliseconds."
+            }
+        },
+        "required": ["path", "content"],
         "additionalProperties": false
     })
 }
@@ -915,6 +967,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(by_name.get("apply_patch"), Some(&ExecutionClass::Exclusive));
+        assert_eq!(by_name.get("write_file"), Some(&ExecutionClass::Exclusive));
         assert_eq!(
             by_name.get("write_stdin"),
             Some(&ExecutionClass::SessionScoped)
@@ -945,6 +998,77 @@ mod tests {
             exec.spec.parameters["required"],
             serde_json::json!(["command"])
         );
+    }
+
+    #[test]
+    fn write_file_schema_matches_contract() {
+        let schema = write_file_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("write_file properties should be an object");
+        let property_names = properties.keys().cloned().collect::<HashSet<_>>();
+
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        assert_eq!(schema["required"], serde_json::json!(["path", "content"]));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            property_names,
+            HashSet::from([
+                "path".to_owned(),
+                "content".to_owned(),
+                "create_dirs".to_owned(),
+                "overwrite".to_owned(),
+                "read_observation_id".to_owned(),
+                "expected_sha256".to_owned(),
+                "expected_mtime_ms".to_owned(),
+            ])
+        );
+        assert_eq!(properties["path"]["type"], serde_json::json!("string"));
+        assert_eq!(properties["content"]["type"], serde_json::json!("string"));
+        assert_eq!(
+            properties["create_dirs"]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(
+            properties["overwrite"]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(
+            properties["read_observation_id"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["expected_sha256"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["expected_mtime_ms"]["type"],
+            serde_json::json!("integer")
+        );
+    }
+
+    #[test]
+    fn write_file_builtin_spec_matches_contract() {
+        let specs = builtin_tool_specs();
+        let configured = specs
+            .iter()
+            .find(|configured| configured.spec.name == "write_file")
+            .expect("write_file spec should exist");
+
+        assert_eq!(configured.spec.payload_kind, PayloadKind::Function);
+        assert_eq!(configured.execution_class, ExecutionClass::Exclusive);
+        assert_eq!(
+            configured.spec.recovery.retry_class,
+            ToolRetryClass::Arguments
+        );
+        assert_eq!(
+            configured.spec.recovery.idempotency_mode,
+            ToolIdempotencyMode::RequiresKey
+        );
+        assert_eq!(configured.spec.recovery.max_attempts, 2);
+        assert!(!configured.spec.recovery.can_resume);
+        assert_eq!(configured.spec.recovery.max_wall_clock_secs, None);
+        assert_eq!(configured.spec.parameters, write_file_schema());
     }
 
     #[test]

@@ -22,7 +22,8 @@ mod web;
 pub mod handlers;
 
 pub use argument_normalizer::{
-    ToolArgumentCoercion, ToolArgumentNormalization, normalize_tool_arguments_from_schema,
+    ToolArgumentCoercion, ToolArgumentNormalization, normalize_tool_arguments_for_tool,
+    normalize_tool_arguments_from_schema,
 };
 pub use classifier::{DefaultErrorClassifier, ErrorClassifier, classify_tool_error};
 pub use context::{
@@ -106,9 +107,10 @@ pub use web::{
 #[cfg(feature = "computer-use")]
 use handlers::materialize_computer_use_domain_bundle;
 
+use handlers::FileObservationStore;
 use handlers::{
     ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
-    UnifiedExecHandler, WebFetchHandler, WebSearchHandler,
+    UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -441,9 +443,17 @@ pub fn build_tools_with_environment(
     }
 
     let unified_exec_handler = Arc::new(UnifiedExecHandler::default());
+    let file_observation_store = Arc::new(FileObservationStore::default());
     builder.register_handler("exec_command", unified_exec_handler.clone());
     builder.register_handler("write_stdin", unified_exec_handler);
-    builder.register_handler("read_file", Arc::new(ReadFileHandler));
+    builder.register_handler(
+        "read_file",
+        Arc::new(ReadFileHandler::new(file_observation_store.clone())),
+    );
+    builder.register_handler(
+        "write_file",
+        Arc::new(WriteFileHandler::new(file_observation_store.clone())),
+    );
     builder.register_handler("list_dir", Arc::new(ListDirHandler));
     builder.register_handler("grep_files", Arc::new(GrepHandler));
     builder.register_handler("apply_patch", Arc::new(ApplyPatchHandler));
@@ -527,7 +537,7 @@ pub fn build_builtin_tools(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildToolsError, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig,
+        BuildToolsError, BuiltinTools, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig,
         build_builtin_tools, build_tools,
     };
     use crate::context::{FunctionToolOutput, ToolInvocation};
@@ -602,6 +612,43 @@ mod tests {
             run_max_steps_default: 30,
             ..ComputerUseToolsConfig::default()
         }
+    }
+
+    fn tools_runtime_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "pioneer_tools_{prefix}_{}_{}",
+            std::process::id(),
+            now_nanos
+        ));
+        std::fs::create_dir_all(path.as_path()).expect("tools runtime temp dir should exist");
+        path
+    }
+
+    async fn execute_builtin_json_call(
+        built: &BuiltinTools,
+        call_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> crate::context::AnyToolResult {
+        let call = built
+            .router
+            .build_model_tool_call(RawToolCall {
+                call_id: call_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: arguments.to_string(),
+            })
+            .await
+            .expect("model tool call should build");
+
+        built
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("tool call should execute")
     }
 
     #[test]
@@ -694,6 +741,130 @@ mod tests {
         assert!(
             built.router.has_handler("request_tools"),
             "request_tools must have a runtime handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_has_builtin_spec_and_handler() {
+        let built = build_builtin_tools(
+            ".",
+            "turn_write_file_registered",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        assert!(built.router.find_spec("write_file").is_some());
+        assert!(
+            built.router.has_handler("write_file"),
+            "write_file must have a runtime handler"
+        );
+        assert!(
+            built
+                .router
+                .preflight_tool_index()
+                .core_tools
+                .contains(&"write_file".to_owned()),
+            "write_file must be a core preflight-visible tool once its handler is registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_runtime_read_then_write_flow_uses_shared_observation_store() {
+        let workdir = tools_runtime_temp_dir("write-file-runtime-flow");
+        let target = workdir.join("existing.txt");
+        std::fs::write(target.as_path(), "original\n").expect("seed existing file");
+        let built = build_builtin_tools(
+            workdir.as_path(),
+            "turn_write_file_runtime_flow",
+            test_web_config(),
+            test_computer_use_config(),
+        );
+
+        let before_read = execute_builtin_json_call(
+            &built,
+            "write_before_read",
+            "write_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "content": "updated\n",
+                "overwrite": true
+            }),
+        )
+        .await;
+        assert!(!before_read.success());
+        assert_eq!(
+            before_read.raw_output_json()["status"].as_str(),
+            Some("read_required")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("target should remain readable"),
+            "original\n"
+        );
+
+        let read = execute_builtin_json_call(
+            &built,
+            "read_existing_complete",
+            "read_file",
+            serde_json::json!({"path": "existing.txt"}),
+        )
+        .await;
+        assert!(read.success());
+        let read_json = read.raw_output_json();
+        assert_eq!(
+            read_json["file_observation"]["complete"].as_bool(),
+            Some(true)
+        );
+
+        let overwrite = execute_builtin_json_call(
+            &built,
+            "write_after_read",
+            "write_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "content": "updated\n",
+                "overwrite": true
+            }),
+        )
+        .await;
+        assert!(overwrite.success());
+        assert_eq!(
+            overwrite.raw_output_json()["operation"].as_str(),
+            Some("overwritten")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("target should update"),
+            "updated\n"
+        );
+
+        let fresh_read = execute_builtin_json_call(
+            &built,
+            "read_existing_for_stale_check",
+            "read_file",
+            serde_json::json!({"path": "existing.txt"}),
+        )
+        .await;
+        assert!(fresh_read.success());
+        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
+
+        let stale_write = execute_builtin_json_call(
+            &built,
+            "write_after_external_mutation",
+            "write_file",
+            serde_json::json!({
+                "path": "existing.txt",
+                "content": "should not land\n",
+                "overwrite": true
+            }),
+        )
+        .await;
+        assert!(!stale_write.success());
+        assert_eq!(
+            stale_write.raw_output_json()["status"].as_str(),
+            Some("precondition_failed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.as_path()).expect("stale write must not modify target"),
+            "external mutation\n"
         );
     }
 
