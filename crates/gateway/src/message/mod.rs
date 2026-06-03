@@ -1282,6 +1282,7 @@ impl MessageProcessor {
                 ..pioneer_memory::hooks::MemoryLoopConfig::default()
             },
             budget: pioneer_tools::ToolLoopBudgetConfig::default(),
+            execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: pioneer_tools::ToolRetryBudgetConfig::default(),
         }
         .normalized();

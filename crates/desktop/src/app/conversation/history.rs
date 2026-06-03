@@ -532,6 +532,61 @@ impl Conversation {
                     event.created_at,
                 );
             }
+            ThreadHistoryEventPayload::TurnExecutionWindowStarted(notification) => {
+                let conversation_event = ConversationEvent::TurnExecutionWindowStarted {
+                    notification: notification.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_execution_window_started(
+                    notification.turn_id.as_str(),
+                    notification,
+                    event.created_at,
+                );
+            }
+            ThreadHistoryEventPayload::TurnExecutionWindowExhausted(notification) => {
+                let conversation_event = ConversationEvent::TurnExecutionWindowExhausted {
+                    notification: notification.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_execution_window_exhausted(
+                    notification.turn_id.as_str(),
+                    notification,
+                    event.created_at,
+                );
+            }
+            ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(notification) => {
+                let conversation_event = ConversationEvent::TurnExecutionWindowCheckpointed {
+                    notification: notification.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_execution_window_checkpointed(
+                    notification.turn_id.as_str(),
+                    notification,
+                    event.created_at,
+                );
+            }
+            ThreadHistoryEventPayload::TurnExecutionWindowContinued(notification) => {
+                let conversation_event = ConversationEvent::TurnExecutionWindowContinued {
+                    notification: notification.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_execution_window_continued(
+                    notification.turn_id.as_str(),
+                    notification,
+                    event.created_at,
+                );
+            }
+            ThreadHistoryEventPayload::TurnExecutionWindowBlocked(notification) => {
+                let conversation_event = ConversationEvent::TurnExecutionWindowBlocked {
+                    notification: notification.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_execution_window_blocked(
+                    notification.turn_id.as_str(),
+                    notification,
+                    event.created_at,
+                );
+            }
             ThreadHistoryEventPayload::TurnCompleted {
                 thread_id, turn, ..
             } => {
@@ -834,6 +889,41 @@ impl Conversation {
                 reason.as_str(),
                 ts_unix_ms,
             ),
+            TurnItemEventPayload::TurnExecutionWindowStarted(notification) => {
+                self.projector.apply_turn_execution_window_started(
+                    parent_turn_id,
+                    notification,
+                    ts_unix_ms,
+                );
+            }
+            TurnItemEventPayload::TurnExecutionWindowExhausted(notification) => {
+                self.projector.apply_turn_execution_window_exhausted(
+                    parent_turn_id,
+                    notification,
+                    ts_unix_ms,
+                );
+            }
+            TurnItemEventPayload::TurnExecutionWindowCheckpointed(notification) => {
+                self.projector.apply_turn_execution_window_checkpointed(
+                    parent_turn_id,
+                    notification,
+                    ts_unix_ms,
+                );
+            }
+            TurnItemEventPayload::TurnExecutionWindowContinued(notification) => {
+                self.projector.apply_turn_execution_window_continued(
+                    parent_turn_id,
+                    notification,
+                    ts_unix_ms,
+                );
+            }
+            TurnItemEventPayload::TurnExecutionWindowBlocked(notification) => {
+                self.projector.apply_turn_execution_window_blocked(
+                    parent_turn_id,
+                    notification,
+                    ts_unix_ms,
+                );
+            }
         }
     }
 
@@ -891,7 +981,12 @@ fn timeline_turn_item_payload_id(payload: &TurnItemEventPayload) -> Option<&str>
         | TurnItemEventPayload::ItemToolRetryScheduled { item_id, .. }
         | TurnItemEventPayload::ItemToolRetryResolved { item_id, .. }
         | TurnItemEventPayload::ItemToolRetryExhausted { item_id, .. } => Some(item_id.as_str()),
-        TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. } => None,
+        TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. }
+        | TurnItemEventPayload::TurnExecutionWindowStarted(_)
+        | TurnItemEventPayload::TurnExecutionWindowExhausted(_)
+        | TurnItemEventPayload::TurnExecutionWindowCheckpointed(_)
+        | TurnItemEventPayload::TurnExecutionWindowContinued(_)
+        | TurnItemEventPayload::TurnExecutionWindowBlocked(_) => None,
     }
 }
 

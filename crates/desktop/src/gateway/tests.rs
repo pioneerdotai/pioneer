@@ -522,6 +522,7 @@ pub(crate) fn test_config() -> AppConfig {
                 web: GatewayWebToolsConfig::default(),
                 computer_use: GatewayComputerUseToolsConfig::default(),
                 budget: GatewayToolLoopBudgetConfig::default(),
+                execution_windows: Some(pioneer_config::GatewayExecutionWindowsConfig::default()),
                 retry: GatewayToolRetryBudgetConfig::default(),
             },
             tasks: Default::default(),

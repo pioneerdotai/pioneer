@@ -7,7 +7,7 @@ use pioneer_protocol::{
     ProviderTransportKind, TurnItem, TurnItemType,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk,
+    ChatRequest, Provider, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk, TokenUsage,
 };
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -22,6 +22,20 @@ impl<'a> FailureTarget<'a> {
     fn new(item_id: &'a str, item_type: TurnItemType) -> Self {
         Self { item_id, item_type }
     }
+}
+
+fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
+    let usage = usage?;
+    if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
+        return None;
+    }
+
+    Some(
+        usage
+            .input_tokens
+            .unwrap_or_default()
+            .saturating_add(usage.output_tokens.unwrap_or_default()),
+    )
 }
 
 pub(super) async fn request_agent_round(
@@ -117,6 +131,7 @@ pub(super) async fn request_agent_round(
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
+            provider_token_count: None,
         });
     }
 
@@ -135,6 +150,7 @@ pub(super) async fn request_agent_round(
         )
     })?;
 
+    let provider_token_count = total_token_usage(response.usage.as_ref());
     let reasoning = response.reasoning_content.unwrap_or_default();
 
     if !reasoning.is_empty() {
@@ -161,6 +177,7 @@ pub(super) async fn request_agent_round(
         text: response.text,
         reasoning,
         tool_calls: response.tool_calls,
+        provider_token_count,
     })
 }
 

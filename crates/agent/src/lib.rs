@@ -7,7 +7,8 @@ mod manager_tests;
 
 use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream, McpScopeKind,
+    AgentDurableEvent, AgentProgressEvent, ExecutionCheckpointPayload,
+    ExecutionWindowExhaustionReason, ItemDeltaNotification, ItemDeltaStream, McpScopeKind,
     ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnCapability, TurnItemType,
     UserInput,
 };
@@ -52,7 +53,8 @@ pub use pioneer_memory::hooks::{
     MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
-    ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+    ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig,
+    WebToolsConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,7 @@ pub struct ToolLoopConfig {
     pub skills: SkillsLoopConfig,
     pub memory: MemoryLoopConfig,
     pub budget: ToolLoopBudgetConfig,
+    pub execution_windows: ExecutionWindowsConfig,
     pub retry: ToolRetryBudgetConfig,
 }
 
@@ -422,6 +425,7 @@ impl ToolLoopConfig {
             skills: self.skills.normalized(),
             memory: self.memory.normalized(),
             budget: self.budget.normalized(),
+            execution_windows: self.execution_windows.normalized(),
             retry: self.retry.normalized(),
         }
     }
@@ -1299,6 +1303,94 @@ pub struct RecoveryAttemptRequest {
     pub continue_generation: bool,
     pub model_override: Option<String>,
     pub retained_llm_context: Vec<RetainedToolLlmContext>,
+    pub execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionCheckpointContext {
+    pub window_id: String,
+    pub window_index: u32,
+    pub checkpoint_id: String,
+    pub checkpoint_kind: String,
+    pub payload: ExecutionCheckpointPayload,
+}
+
+impl ExecutionCheckpointContext {
+    pub fn next_window_index(&self) -> u32 {
+        self.window_index.saturating_add(1).max(2)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TurnExecutionUsageCounters {
+    total_windows: u32,
+    total_tool_calls: u64,
+    total_wall_clock_ms: u64,
+    total_provider_tokens: u64,
+    provider_token_usage_unknown: bool,
+    consecutive_failed_windows: u32,
+}
+
+impl TurnExecutionUsageCounters {
+    fn observe_checkpoint_payload(&mut self, payload: &ExecutionCheckpointPayload) {
+        if payload.window.window_index <= self.total_windows {
+            return;
+        }
+
+        self.total_windows = payload.window.window_index;
+        self.total_tool_calls = self
+            .total_tool_calls
+            .saturating_add(u64::from(payload.window.tool_call_count));
+
+        if let (Some(started_at), Some(completed_at)) = (
+            payload.window.started_at_unix_ms,
+            payload.window.completed_at_unix_ms,
+        ) {
+            let duration_ms = completed_at.saturating_sub(started_at);
+            if duration_ms > 0 {
+                self.total_wall_clock_ms = self
+                    .total_wall_clock_ms
+                    .saturating_add(u64::try_from(duration_ms).unwrap_or(u64::MAX));
+            }
+        }
+
+        match payload
+            .window
+            .provider_token_count
+            .or(payload.provider_budget.provider_token_count)
+        {
+            Some(tokens) => {
+                self.total_provider_tokens = self.total_provider_tokens.saturating_add(tokens);
+            }
+            None => {
+                self.provider_token_usage_unknown = true;
+            }
+        }
+
+        if execution_checkpoint_payload_is_failure_heavy(payload) {
+            self.consecutive_failed_windows = self.consecutive_failed_windows.saturating_add(1);
+        } else {
+            self.consecutive_failed_windows = 0;
+        }
+    }
+}
+
+fn execution_checkpoint_payload_is_failure_heavy(payload: &ExecutionCheckpointPayload) -> bool {
+    payload.tools.executed_count > 0 && payload.tools.failed_count > payload.tools.succeeded_count
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredRecoveryTurnRequest {
+    pub turn_id: String,
+    pub mode: ThreadMode,
+    pub model: String,
+    pub provider_name: String,
+    pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+    pub input: Vec<UserInput>,
+    pub capabilities: Vec<TurnCapability>,
+    pub resolved_artifacts: Vec<ResolvedArtifactInput>,
+    pub runtime_environment: HashMap<String, String>,
+    pub history: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1310,6 +1402,7 @@ struct TurnExecutionOptions {
 #[derive(Debug, Clone)]
 struct ActiveTurnRequest {
     turn_id: String,
+    execution_window_index: u32,
     mode: ThreadMode,
     hook_runtime_context: AgentTurnHookRuntimeContext,
     model: String,
@@ -1321,6 +1414,8 @@ struct ActiveTurnRequest {
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
+    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    execution_usage: TurnExecutionUsageCounters,
     execution_options: TurnExecutionOptions,
 }
 
@@ -1334,9 +1429,23 @@ enum TurnTaskFailure {
     },
 }
 
+#[derive(Debug, Clone)]
+struct ExecutionWindowContinuation {
+    reason: ExecutionWindowExhaustionReason,
+    exhausted_window_id: String,
+    checkpoint_id: String,
+    checkpoint_payload: ExecutionCheckpointPayload,
+}
+
+#[derive(Debug, Clone)]
+enum TurnTaskSuccess {
+    Completed,
+    NeedsContinuation(ExecutionWindowContinuation),
+}
+
 #[derive(Debug)]
 struct TurnTaskCompletion {
-    result: Result<(), TurnTaskFailure>,
+    result: Result<TurnTaskSuccess, TurnTaskFailure>,
     post_turn_dispatch: Option<hooks::AgentTurnPostTurnHookDispatch>,
 }
 
@@ -1354,6 +1463,7 @@ enum AgentCommand {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         ack: oneshot::Sender<Result<(), AgentStartError>>,
     },
     TurnTaskFinished {
@@ -1373,6 +1483,11 @@ enum AgentCommand {
     },
     StartRecoveryAttempt {
         request: RecoveryAttemptRequest,
+        ack: oneshot::Sender<Result<(), AgentControlError>>,
+    },
+    StartRestoredRecoveryTurn {
+        turn_request: RestoredRecoveryTurnRequest,
+        recovery_request: RecoveryAttemptRequest,
         ack: oneshot::Sender<Result<(), AgentControlError>>,
     },
     RecoveryAttemptSucceeded {
@@ -1836,6 +1951,41 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_and_execution_checkpoint(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_hook_context_and_execution_checkpoint(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
@@ -1859,6 +2009,7 @@ impl AgentManager {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                execution_checkpoint_context,
                 ack: ack_tx,
             })
             .await
@@ -2049,6 +2200,43 @@ impl AgentManager {
         ack_rx.await.unwrap_or_else(|_| {
             Err(AgentControlError::Internal(
                 "agent loop dropped recovery ack".to_owned(),
+            ))
+        })
+    }
+
+    pub async fn start_restored_recovery_turn(
+        &self,
+        thread_id: &str,
+        workspace_id: &str,
+        turn_request: RestoredRecoveryTurnRequest,
+        recovery_request: RecoveryAttemptRequest,
+    ) -> Result<(), AgentControlError> {
+        self.ensure_thread(thread_id, workspace_id)
+            .await
+            .map_err(|error| AgentControlError::Internal(error.to_string()))?;
+
+        let command_tx = {
+            let state = self.state.read().await;
+            let Some(thread) = state.threads.get(thread_id) else {
+                return Err(AgentControlError::ThreadNotFound);
+            };
+            thread.command_tx.clone()
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        command_tx
+            .send(AgentCommand::StartRestoredRecoveryTurn {
+                turn_request,
+                recovery_request,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| AgentControlError::ThreadNotFound)?;
+
+        ack_rx.await.unwrap_or_else(|_| {
+            Err(AgentControlError::Internal(
+                "agent loop dropped restored recovery ack".to_owned(),
             ))
         })
     }

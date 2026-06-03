@@ -112,6 +112,7 @@ pub async fn delete_turn_llm_context_for_terminal_turns<C: ConnectionTrait>(db: 
         turn_status_to_db(TurnStatus::Completed).to_owned(),
         turn_status_to_db(TurnStatus::Failed).to_owned(),
         turn_status_to_db(TurnStatus::Interrupted).to_owned(),
+        turn_status_to_db(TurnStatus::Blocked).to_owned(),
     ];
 
     let terminal_turn_ids = turn::Entity::find()

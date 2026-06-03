@@ -139,6 +139,9 @@ fn protocol_loop_limit_kind(reason: ToolLoopBudgetReason) -> ToolLoopBudgetLimit
 
 fn protocol_loop_action(action: pioneer_tools::ToolLoopBudgetAction) -> ToolLoopBudgetAction {
     match action {
+        pioneer_tools::ToolLoopBudgetAction::ContinueInNextWindow => {
+            ToolLoopBudgetAction::ContinueInNextWindow
+        }
         pioneer_tools::ToolLoopBudgetAction::RequestFinalNoToolsRound => {
             ToolLoopBudgetAction::RequestFinalNoToolsRound
         }

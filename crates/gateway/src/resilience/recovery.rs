@@ -1,14 +1,17 @@
 use anyhow::{Result, bail};
 use pioneer_agent::{
-    AgentControlError, AgentManager, RecoveryAttemptRequest, RetainedToolLlmContext,
+    AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
+    RestoredRecoveryTurnRequest, RetainedToolLlmContext, WorkspaceSkillPolicy,
 };
 use pioneer_crud::{ClaimedRecoveryActivation, CrudStore, RecoveryJobRecord, TimeoutCandidate};
 use pioneer_protocol::{
-    ProviderFailureClass, ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext,
-    RecoveryJobStatus, RecoveryTrigger, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+    ExecutionCheckpointPayload, ExecutionWindowStatus, ProviderFailureClass,
+    ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus,
+    RecoveryTrigger, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
     ToolRecoveryRetryClass, TurnItem, TurnItemType, TurnStatus, generate_id,
 };
-use pioneer_provider::ProviderRegistry;
+use pioneer_provider::{ChatMessage, ProviderRegistry};
+use pioneer_skills::SkillPolicyKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
@@ -1180,7 +1183,7 @@ impl RecoveryCoordinator {
             return Ok(events);
         }
 
-        let Some((thread_id, _workspace_id)) = self
+        let Some((thread_id, workspace_id)) = self
             .crud_store
             .get_turn_location(job.turn_id.as_str())
             .await?
@@ -1283,6 +1286,11 @@ impl RecoveryCoordinator {
         let retained_llm_context = self
             .retained_llm_context_for_turn(job.turn_id.as_str())
             .await?;
+        let execution_checkpoint_context = self
+            .execution_checkpoint_context_for_turn(thread_id.as_str(), job.turn_id.as_str())
+            .await?;
+        let continue_generation =
+            execution_plan.continue_generation || execution_checkpoint_context.is_some();
 
         let request = RecoveryAttemptRequest {
             recovery_job_id: job.id.clone(),
@@ -1293,14 +1301,15 @@ impl RecoveryCoordinator {
             force_non_stream: execution_plan.force_non_stream,
             refresh_provider_auth: execution_plan.refresh_provider_auth,
             compact_history: execution_plan.compact_history,
-            continue_generation: execution_plan.continue_generation,
+            continue_generation,
             model_override: execution_plan.model_override,
             retained_llm_context,
+            execution_checkpoint_context,
         };
 
         match self
             .agent_manager
-            .start_recovery_attempt(thread_id.as_str(), request)
+            .start_recovery_attempt(thread_id.as_str(), request.clone())
             .await
         {
             Ok(()) => {
@@ -1313,77 +1322,282 @@ impl RecoveryCoordinator {
                 });
             }
             Err(error) => {
-                let terminal = matches!(
-                    error,
-                    AgentControlError::TurnMismatch | AgentControlError::ThreadNotFound
-                );
-                if terminal {
-                    let message = error.to_string();
-                    if self
-                        .crud_store
-                        .mark_recovery_job_terminal_after_attempt(
-                            job.id.as_str(),
-                            active_attempt_id.as_str(),
-                            RecoveryJobStatus::Failed,
-                            Some(message.clone()),
-                            now_unix,
-                        )
+                if matches!(
+                    &error,
+                    AgentControlError::ThreadNotFound | AgentControlError::NoActiveTurn
+                ) && !request.item_type.is_tool_item()
+                    && request.execution_checkpoint_context.is_some()
+                    && let Some(restored_turn_request) = self
+                        .restored_recovery_turn_request(thread_id.as_str(), job.turn_id.as_str())
                         .await?
-                    {
-                        self.cancel_other_open_jobs_after_terminal_recovery(
-                            job.turn_id.as_str(),
-                            job.id.as_str(),
-                            now_unix,
+                {
+                    match self
+                        .agent_manager
+                        .start_restored_recovery_turn(
+                            thread_id.as_str(),
+                            workspace_id.as_str(),
+                            restored_turn_request,
+                            request.clone(),
                         )
-                        .await?;
-                        events.push(RecoveryCoordinatorEvent::RecoveryExhausted(
-                            RecoveryTerminalOutcome {
-                                job_id: job.id,
-                                turn_id: job.turn_id,
-                                item_id: job.item_id,
+                        .await
+                    {
+                        Ok(()) => {
+                            events.push(RecoveryCoordinatorEvent::RetryAttemptStarted {
+                                job_id: job.id.clone(),
+                                turn_id: job.turn_id.clone(),
+                                item_id: job.item_id.clone(),
                                 item_type: job.item_type,
                                 attempt_number,
-                                status: RecoveryJobStatus::Failed,
-                                error_message: message,
-                            },
-                        ));
-                    }
-                } else {
-                    let next_run_at_unix = backoff_deadline(
-                        now_unix,
-                        policy.base_backoff_secs,
-                        job.run_count,
-                        job.id.as_str(),
-                        job.retry_after_ms,
-                    );
-                    let reason = Some(error.to_string());
-                    if self
-                        .crud_store
-                        .mark_recovery_job_retrying(
-                            job.id.as_str(),
-                            active_attempt_id.as_str(),
-                            next_run_at_unix,
-                            reason.clone(),
-                            now_unix,
-                        )
-                        .await?
-                    {
-                        events.push(RecoveryCoordinatorEvent::RetryScheduled {
-                            job_id: job.id,
-                            turn_id: job.turn_id,
-                            item_id: job.item_id,
-                            item_type: job.item_type,
-                            attempt_number,
-                            next_run_at_unix,
-                            reason,
-                        });
+                            });
+                            return Ok(events);
+                        }
+                        Err(restored_error) => {
+                            return self
+                                .handle_recovery_start_error(
+                                    job,
+                                    active_attempt_id,
+                                    restored_error,
+                                    policy,
+                                    attempt_number,
+                                    now_unix,
+                                )
+                                .await;
+                        }
                     }
                 }
+
+                return self
+                    .handle_recovery_start_error(
+                        job,
+                        active_attempt_id,
+                        error,
+                        policy,
+                        attempt_number,
+                        now_unix,
+                    )
+                    .await;
             }
         }
 
         Ok(events)
     }
+
+    async fn handle_recovery_start_error(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        error: AgentControlError,
+        policy: RecoveryPolicy,
+        attempt_number: u32,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        let terminal = matches!(
+            &error,
+            AgentControlError::TurnMismatch | AgentControlError::ThreadNotFound
+        );
+        if terminal {
+            let message = error.to_string();
+            if self
+                .crud_store
+                .mark_recovery_job_terminal_after_attempt(
+                    job.id.as_str(),
+                    active_attempt_id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some(message.clone()),
+                    now_unix,
+                )
+                .await?
+            {
+                self.cancel_other_open_jobs_after_terminal_recovery(
+                    job.turn_id.as_str(),
+                    job.id.as_str(),
+                    now_unix,
+                )
+                .await?;
+                events.push(RecoveryCoordinatorEvent::RecoveryExhausted(
+                    RecoveryTerminalOutcome {
+                        job_id: job.id,
+                        turn_id: job.turn_id,
+                        item_id: job.item_id,
+                        item_type: job.item_type,
+                        attempt_number,
+                        status: RecoveryJobStatus::Failed,
+                        error_message: message,
+                    },
+                ));
+            }
+        } else {
+            let next_run_at_unix = backoff_deadline(
+                now_unix,
+                policy.base_backoff_secs,
+                job.run_count,
+                job.id.as_str(),
+                job.retry_after_ms,
+            );
+            let reason = Some(error.to_string());
+            if self
+                .crud_store
+                .mark_recovery_job_retrying(
+                    job.id.as_str(),
+                    active_attempt_id.as_str(),
+                    next_run_at_unix,
+                    reason.clone(),
+                    now_unix,
+                )
+                .await?
+            {
+                events.push(RecoveryCoordinatorEvent::RetryScheduled {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    item_id: job.item_id,
+                    item_type: job.item_type,
+                    attempt_number,
+                    next_run_at_unix,
+                    reason,
+                });
+            }
+        }
+
+        Ok(events)
+    }
+
+    async fn execution_checkpoint_context_for_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<ExecutionCheckpointContext>> {
+        let Some((_workspace_id, turn)) = self.crud_store.get_turn(thread_id, turn_id).await?
+        else {
+            return Ok(None);
+        };
+        if turn.status != TurnStatus::InProgress {
+            return Ok(None);
+        }
+
+        let Some(window) = self
+            .crud_store
+            .latest_turn_execution_window(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            window.status,
+            ExecutionWindowStatus::Exhausted
+                | ExecutionWindowStatus::Checkpointed
+                | ExecutionWindowStatus::Continued
+        ) {
+            return Ok(None);
+        }
+
+        let Some(checkpoint) = self
+            .crud_store
+            .list_turn_execution_checkpoints_for_window(window.id.as_str())
+            .await?
+            .into_iter()
+            .last()
+        else {
+            return Ok(None);
+        };
+
+        let Ok(payload) =
+            serde_json::from_value::<ExecutionCheckpointPayload>(checkpoint.payload_json.clone())
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(ExecutionCheckpointContext {
+            window_id: window.id,
+            window_index: window.window_index,
+            checkpoint_id: checkpoint.id,
+            checkpoint_kind: checkpoint_kind_label(checkpoint.checkpoint_kind),
+            payload,
+        }))
+    }
+
+    async fn restored_recovery_turn_request(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<RestoredRecoveryTurnRequest>> {
+        let Some(thread) = self.crud_store.get_thread_model(thread_id).await? else {
+            return Ok(None);
+        };
+        let Some((_workspace_id, turn)) = self.crud_store.get_turn(thread_id, turn_id).await?
+        else {
+            return Ok(None);
+        };
+        if turn.status != TurnStatus::InProgress {
+            return Ok(None);
+        }
+
+        let input = self.crud_store.get_turn_inputs(turn_id).await?;
+        let history = self.history_messages_for_thread(thread_id).await?;
+        let workspace_skill_policies = self
+            .workspace_skill_policies_for_workspace(thread.workspace_id.as_str())
+            .await?;
+
+        Ok(Some(RestoredRecoveryTurnRequest {
+            turn_id: turn_id.to_owned(),
+            mode: thread.mode,
+            model: thread.model,
+            provider_name: thread.model_provider,
+            workspace_skill_policies,
+            input,
+            capabilities: Vec::new(),
+            resolved_artifacts: Vec::new(),
+            runtime_environment: HashMap::new(),
+            history,
+        }))
+    }
+
+    async fn history_messages_for_thread(&self, thread_id: &str) -> Result<Vec<ChatMessage>> {
+        const MAX_TURNS: usize = 200;
+
+        let entries = self
+            .crud_store
+            .get_thread_conversation_history(thread_id, MAX_TURNS)
+            .await?;
+        let mut messages = Vec::with_capacity(entries.len() * 2);
+        for entry in entries {
+            if let Some(user_text) = entry.user_text {
+                messages.push(ChatMessage::user(user_text));
+            }
+            if let Some(assistant_text) = entry.assistant_text {
+                messages.push(ChatMessage::assistant(assistant_text));
+            }
+        }
+        Ok(messages)
+    }
+
+    async fn workspace_skill_policies_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<HashMap<SkillPolicyKey, WorkspaceSkillPolicy>> {
+        Ok(self
+            .crud_store
+            .list_workspace_skill_policies(workspace_id)
+            .await?
+            .into_iter()
+            .map(|record| {
+                (
+                    SkillPolicyKey::new(record.skill_slug, record.source_kind),
+                    WorkspaceSkillPolicy {
+                        enabled: record.enabled,
+                        allow_implicit_invocation: record.allow_implicit_invocation,
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
+fn checkpoint_kind_label(kind: pioneer_crud::TurnExecutionCheckpointKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 impl RecoveryCoordinator {
@@ -1850,20 +2064,26 @@ mod tests {
         AgentManager, SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig,
     };
-    use pioneer_crud::{ClaimedRecoveryActivation, CrudStore, TimeoutCandidate};
+    use pioneer_crud::{
+        ClaimedRecoveryActivation, CrudStore, NewTurnExecutionCheckpointRecord,
+        NewTurnExecutionWindowRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord,
+    };
     use pioneer_protocol::{
-        ItemStartedNotification, ProviderFailureClass, ProviderFailureDetails,
-        ProviderFailureStage, ProviderTransportKind, RecoveryAction, RecoveryAttemptContext,
-        RecoveryJobStatus, RecoveryTrigger, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
-        ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-        ToolRecoveryRetryClass, ToolStoragePayload, TurnCompletedNotification, TurnItem,
-        TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput,
+        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemStartedNotification,
+        ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
+        RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
+        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
+        ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload,
+        TurnCompletedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
+        UserInput, build_execution_checkpoint_payload,
     };
     use pioneer_provider::{ProviderRegistry, providers::EchoProvider};
     use pioneer_skills::SkillTrustLevel;
     use pioneer_tools::{
-        ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+        ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
+        ToolRetryBudgetConfig, WebToolsConfig,
     };
     use sea_orm::Database;
     use std::sync::Arc;
@@ -1941,11 +2161,13 @@ mod tests {
                 ..pioneer_memory::hooks::MemoryLoopConfig::default()
             },
             budget: ToolLoopBudgetConfig::default(),
+            execution_windows: ExecutionWindowsConfig::default(),
             retry: ToolRetryBudgetConfig::default(),
         }
     }
 
-    async fn setup_coordinator() -> (Arc<CrudStore>, RecoveryCoordinator) {
+    async fn setup_coordinator_with_agent()
+    -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect sqlite memory");
@@ -1963,10 +2185,15 @@ mod tests {
         ));
         let coordinator = RecoveryCoordinator::new(
             crud_store.clone(),
-            agent_manager,
+            agent_manager.clone(),
             provider_registry,
             RecoveryPolicyRegistry::default(),
         );
+        (crud_store, agent_manager, coordinator)
+    }
+
+    async fn setup_coordinator() -> (Arc<CrudStore>, RecoveryCoordinator) {
+        let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
         (crud_store, coordinator)
     }
 
@@ -2093,6 +2320,348 @@ mod tests {
             )
             .await
             .expect("tool item should persist");
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_context_loads_latest_checkpoint_for_in_progress_turn() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_startup_checkpoint";
+        let thread_id = "thr_startup_checkpoint";
+        let turn_id = "turn_startup_checkpoint";
+        let item_id = "item_startup_checkpoint";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+        )
+        .await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let first_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "runtime_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("first window should persist");
+        crud_store
+            .mark_turn_execution_window_exhausted(
+                first_window.id.as_str(),
+                ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 3,
+                    tool_call_count: 5,
+                    provider_token_count: 8,
+                    metadata_json: serde_json::json!({}),
+                    completed_at: timestamp + chrono::Duration::seconds(1),
+                    updated_at: timestamp + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .expect("window should mark exhausted");
+
+        let payload = build_execution_checkpoint_payload(
+            workspace_id.to_owned(),
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
+                input_count: 1,
+                text_preview: Some("startup recovery request".to_owned()),
+                text_truncated: false,
+                attachment_count: 0,
+                attachment_kinds: Vec::new(),
+            },
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                window_id: Some("runtime_window_1".to_owned()),
+                window_index: 1,
+                started_at_unix_ms: Some(1_000),
+                completed_at_unix_ms: Some(2_000),
+                agent_round_count: 3,
+                tool_call_count: 5,
+                provider_token_count: Some(8),
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+            },
+            pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
+                model: Some("test-model".to_owned()),
+                model_provider: Some("echo".to_owned()),
+                agent_round_count: 3,
+                tool_call_count: 5,
+                provider_token_count: Some(8),
+                provider_usage_available: true,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+                exhausted_limit: Some(4),
+                exhausted_observed: Some(5),
+            },
+            pioneer_protocol::ExecutionCheckpointToolSummary {
+                requested_count: 5,
+                executed_count: 5,
+                unexecuted_count: 0,
+                total_count: 5,
+                succeeded_count: 4,
+                failed_count: 1,
+                in_progress_count: 0,
+                detail_limit: 0,
+                details_truncated: false,
+                details: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let checkpoint = crud_store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                window_id: first_window.id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: serde_json::to_value(&payload).expect("checkpoint should serialize"),
+                created_at: timestamp + chrono::Duration::seconds(2),
+            })
+            .await
+            .expect("checkpoint should persist");
+        crud_store
+            .mark_turn_execution_window_checkpointed(
+                first_window.id.as_str(),
+                timestamp + chrono::Duration::seconds(3),
+            )
+            .await
+            .expect("window should mark checkpointed");
+
+        let context = coordinator
+            .execution_checkpoint_context_for_turn(thread_id, turn_id)
+            .await
+            .expect("checkpoint context lookup should succeed")
+            .expect("checkpoint context should exist");
+        assert_eq!(context.window_id, first_window.id);
+        assert_eq!(context.window_index, 1);
+        assert_eq!(context.next_window_index(), 2);
+        assert_eq!(context.checkpoint_id, checkpoint.id);
+        assert_eq!(context.checkpoint_kind, "window_exhausted");
+        assert_eq!(context.payload.turn_id, turn_id);
+
+        let missing_context = coordinator
+            .execution_checkpoint_context_for_turn(thread_id, "missing_turn")
+            .await
+            .expect("missing checkpoint context lookup should not fail");
+        assert!(missing_context.is_none());
+
+        let no_checkpoint_turn_id = "turn_startup_no_checkpoint";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            no_checkpoint_turn_id,
+            "item_startup_no_checkpoint",
+            None,
+        )
+        .await;
+        let no_checkpoint_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: no_checkpoint_turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("window without checkpoint should persist");
+        crud_store
+            .mark_turn_execution_window_exhausted(
+                no_checkpoint_window.id.as_str(),
+                ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 2,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    completed_at: timestamp + chrono::Duration::seconds(4),
+                    updated_at: timestamp + chrono::Duration::seconds(4),
+                },
+            )
+            .await
+            .expect("window without checkpoint should mark exhausted");
+        let missing_checkpoint_context = coordinator
+            .execution_checkpoint_context_for_turn(thread_id, no_checkpoint_turn_id)
+            .await
+            .expect("missing checkpoint for latest window should not fail");
+        assert!(missing_checkpoint_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_job_starts_restored_turn_from_checkpoint() {
+        let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
+        let workspace_id = "ws_startup_restore";
+        let thread_id = "thr_startup_restore";
+        let turn_id = "turn_startup_restore";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "item_startup_restore",
+            None,
+        )
+        .await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("window should persist");
+        crud_store
+            .mark_turn_execution_window_exhausted(
+                window.id.as_str(),
+                ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 1,
+                    metadata_json: serde_json::json!({}),
+                    completed_at: timestamp + chrono::Duration::seconds(1),
+                    updated_at: timestamp + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .expect("window should mark exhausted");
+        let payload = build_execution_checkpoint_payload(
+            workspace_id.to_owned(),
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
+                input_count: 1,
+                text_preview: Some("restore".to_owned()),
+                text_truncated: false,
+                attachment_count: 0,
+                attachment_kinds: Vec::new(),
+            },
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                window_id: Some("restore_window_1".to_owned()),
+                window_index: 1,
+                started_at_unix_ms: Some(1),
+                completed_at_unix_ms: Some(2),
+                agent_round_count: 1,
+                tool_call_count: 1,
+                provider_token_count: Some(1),
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+            },
+            pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
+                model: Some("test-model".to_owned()),
+                model_provider: Some("echo".to_owned()),
+                agent_round_count: 1,
+                tool_call_count: 1,
+                provider_token_count: Some(1),
+                provider_usage_available: true,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+                exhausted_limit: Some(1),
+                exhausted_observed: Some(1),
+            },
+            pioneer_protocol::ExecutionCheckpointToolSummary {
+                requested_count: 1,
+                executed_count: 1,
+                unexecuted_count: 0,
+                total_count: 1,
+                succeeded_count: 1,
+                failed_count: 0,
+                in_progress_count: 0,
+                detail_limit: 0,
+                details_truncated: false,
+                details: Vec::new(),
+            },
+            Vec::new(),
+        );
+        crud_store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                window_id: window.id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: serde_json::to_value(&payload).expect("checkpoint should serialize"),
+                created_at: timestamp + chrono::Duration::seconds(2),
+            })
+            .await
+            .expect("checkpoint should persist");
+        crud_store
+            .mark_turn_execution_window_checkpointed(
+                window.id.as_str(),
+                timestamp + chrono::Duration::seconds(3),
+            )
+            .await
+            .expect("window should mark checkpointed");
+        coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "reasoning_startup_restore".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(
+                        ProviderFailureClass::MaxOutputTokens,
+                        "window exhausted before restart",
+                    ),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("provider failure job should enqueue");
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_001, 1)
+            .await
+            .expect("startup recovery job should run");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecoveryCoordinatorEvent::RetryAttemptStarted {
+                turn_id: started_turn_id,
+                item_type: TurnItemType::Reasoning,
+                ..
+            } if started_turn_id == turn_id
+        )));
+        assert!(
+            agent_manager.has_thread(thread_id).await,
+            "restored recovery should create the agent thread after restart"
+        );
     }
 
     async fn claim_and_activate(crud_store: &CrudStore, job_id: &str) -> String {

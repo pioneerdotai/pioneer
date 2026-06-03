@@ -50,6 +50,8 @@ pub use super::thread_placement::Entity as ThreadPlacement;
 pub use super::thread_sandox_policy::Entity as ThreadSandoxPolicy;
 pub use super::turn::Entity as Turn;
 pub use super::turn_event::Entity as TurnEvent;
+pub use super::turn_execution_checkpoint::Entity as TurnExecutionCheckpoint;
+pub use super::turn_execution_window::Entity as TurnExecutionWindow;
 pub use super::turn_input::Entity as TurnInput;
 pub use super::turn_item::Entity as TurnItem;
 pub use super::turn_item_attempt::Entity as TurnItemAttempt;

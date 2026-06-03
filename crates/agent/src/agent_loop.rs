@@ -1,7 +1,8 @@
 use super::{
     ActiveTurnRequest, AgentCommand, AgentEventHub, AgentMcpToolProvider, AgentStartError,
-    TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
-    TurnFinalizationProvider, TurnTaskCompletion, TurnTaskFailure, TurnToolProvider,
+    ExecutionCheckpointContext, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
+    TurnExecutionControl, TurnExecutionUsageCounters, TurnFinalizationProvider, TurnTaskCompletion,
+    TurnTaskFailure, TurnTaskSuccess, TurnToolProvider,
 };
 use crate::chat;
 use crate::hooks::{
@@ -11,7 +12,8 @@ use crate::hooks::{
 };
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{
-    AgentDurableEvent, RecoveryAttemptContext, ThreadMode, TurnCapability, UserInput,
+    AgentDurableEvent, ExecutionWindowStatus, RecoveryAttemptContext, ThreadMode, TurnCapability,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification, UserInput,
 };
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::future::Future;
@@ -20,11 +22,160 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
-use tracing::error;
+use tracing::{debug, error};
 
 const TURN_CANCEL_GRACE_MS: u64 = 750;
 
 type TurnFlowFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionWindowMaxWindowsDecision {
+    Continue { next_window_index: u32 },
+    Block { total_windows: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionWindowTotalBudgetBlockKind {
+    MaxWindows,
+    MaxToolCalls,
+    MaxWallClockMs,
+    MaxProviderTokens,
+    MaxConsecutiveFailedWindows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionWindowTotalBudgetBlock {
+    kind: ExecutionWindowTotalBudgetBlockKind,
+    total_windows: u32,
+    total_tool_calls: u32,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionWindowTotalBudgetDecision {
+    Continue { next_window_index: u32 },
+    Block(ExecutionWindowTotalBudgetBlock),
+}
+
+fn decide_execution_window_max_windows(
+    current_window_count: u32,
+    max_windows_per_turn: u32,
+) -> ExecutionWindowMaxWindowsDecision {
+    let current_window_count = current_window_count.max(1);
+    let max_windows_per_turn = max_windows_per_turn.max(1);
+    if current_window_count >= max_windows_per_turn {
+        return ExecutionWindowMaxWindowsDecision::Block {
+            total_windows: current_window_count,
+        };
+    }
+
+    ExecutionWindowMaxWindowsDecision::Continue {
+        next_window_index: current_window_count.saturating_add(1).max(2),
+    }
+}
+
+fn decide_execution_window_total_budget(
+    usage: &TurnExecutionUsageCounters,
+    total_budget: &pioneer_tools::ExecutionWindowTotalBudgetConfig,
+) -> ExecutionWindowTotalBudgetDecision {
+    let next_window_index = match decide_execution_window_max_windows(
+        usage.total_windows,
+        total_budget.max_windows_per_turn,
+    ) {
+        ExecutionWindowMaxWindowsDecision::Continue { next_window_index } => next_window_index,
+        ExecutionWindowMaxWindowsDecision::Block { total_windows } => {
+            return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+                kind: ExecutionWindowTotalBudgetBlockKind::MaxWindows,
+                total_windows,
+                total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+                reason: format!(
+                    "max execution windows per turn reached: limit={}, observed={total_windows}",
+                    total_budget.max_windows_per_turn
+                ),
+            });
+        }
+    };
+
+    let max_tool_calls = u64::from(total_budget.max_tool_calls_per_turn.max(1));
+    if usage.total_tool_calls >= max_tool_calls {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxToolCalls,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_total_tool_calls_per_turn reached: limit={max_tool_calls}, observed={}",
+                usage.total_tool_calls
+            ),
+        });
+    }
+
+    if let Some(max_wall_clock_ms) = total_budget.max_wall_clock_ms_per_turn
+        && usage.total_wall_clock_ms >= max_wall_clock_ms
+    {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxWallClockMs,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_total_wall_clock_ms_per_turn reached: limit={max_wall_clock_ms}, observed={}",
+                usage.total_wall_clock_ms
+            ),
+        });
+    }
+
+    if let Some(max_provider_tokens) = total_budget.max_provider_tokens_per_turn
+        && !usage.provider_token_usage_unknown
+        && usage.total_provider_tokens >= max_provider_tokens
+    {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_total_provider_tokens_per_turn reached: limit={max_provider_tokens}, observed={}",
+                usage.total_provider_tokens
+            ),
+        });
+    }
+
+    let max_consecutive_failed_windows = total_budget.max_consecutive_failed_windows.max(1);
+    if usage.consecutive_failed_windows >= max_consecutive_failed_windows {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_consecutive_failed_windows reached: limit={max_consecutive_failed_windows}, observed={}",
+                usage.consecutive_failed_windows
+            ),
+        });
+    }
+
+    ExecutionWindowTotalBudgetDecision::Continue { next_window_index }
+}
+
+fn total_budget_block_exhaustion_reason(
+    kind: ExecutionWindowTotalBudgetBlockKind,
+    fallback: pioneer_protocol::ExecutionWindowExhaustionReason,
+) -> pioneer_protocol::ExecutionWindowExhaustionReason {
+    match kind {
+        ExecutionWindowTotalBudgetBlockKind::MaxWindows => fallback,
+        ExecutionWindowTotalBudgetBlockKind::MaxToolCalls => {
+            pioneer_protocol::ExecutionWindowExhaustionReason::MaxToolCallsPerWindow
+        }
+        ExecutionWindowTotalBudgetBlockKind::MaxWallClockMs => {
+            pioneer_protocol::ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow
+        }
+        ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens => {
+            pioneer_protocol::ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow
+        }
+        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows => fallback,
+    }
+}
+
+fn saturating_u32_from_u64(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
 
 // Agent turn execution composes prompt, hook, provider, and tool-loop futures; keep it off worker stacks.
 fn turn_flow_future<'a, F, T>(future: F) -> TurnFlowFuture<'a, T>
@@ -73,6 +224,7 @@ pub(super) async fn run_agent_loop(
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                execution_checkpoint_context,
                 ack,
             } => {
                 if active_turn_id.is_some() {
@@ -80,8 +232,18 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
+                let execution_window_index = execution_checkpoint_context
+                    .as_ref()
+                    .map(ExecutionCheckpointContext::next_window_index)
+                    .unwrap_or(1);
+                let mut execution_usage = super::TurnExecutionUsageCounters::default();
+                if let Some(context) = execution_checkpoint_context.as_ref() {
+                    execution_usage.observe_checkpoint_payload(&context.payload);
+                }
+
                 let turn_request = ActiveTurnRequest {
                     turn_id: turn_id.clone(),
+                    execution_window_index,
                     mode,
                     hook_runtime_context,
                     model,
@@ -93,6 +255,8 @@ pub(super) async fn run_agent_loop(
                     runtime_environment,
                     history,
                     retained_llm_context: Vec::new(),
+                    execution_checkpoint_context,
+                    execution_usage,
                     execution_options: super::TurnExecutionOptions::default(),
                 };
 
@@ -169,7 +333,7 @@ pub(super) async fn run_agent_loop(
                 } = completion;
 
                 match result {
-                    Ok(()) => {
+                    Ok(TurnTaskSuccess::Completed) => {
                         active_turn_id = None;
                         active_turn_request = None;
                         publish_loop_durable_event(
@@ -186,6 +350,160 @@ pub(super) async fn run_agent_loop(
                             post_turn_hook_dispatch_policy,
                             post_turn_dispatch,
                         );
+                    }
+                    Ok(TurnTaskSuccess::NeedsContinuation(continuation)) => {
+                        debug!(
+                            turn_id = %turn_id,
+                            reason = ?continuation.reason,
+                            checkpoint_schema_version =
+                                continuation.checkpoint_payload.schema_version,
+                            "turn execution window needs continuation"
+                        );
+                        let Some(mut next_turn_request) = turn_request_snapshot.clone() else {
+                            debug!(
+                                turn_id = %turn_id,
+                                "cannot continue execution window without active turn request"
+                            );
+                            continue;
+                        };
+                        let total_budget = tool_loop_config.execution_windows.total.normalized();
+                        next_turn_request
+                            .execution_usage
+                            .observe_checkpoint_payload(&continuation.checkpoint_payload);
+                        let next_window_index = match decide_execution_window_total_budget(
+                            &next_turn_request.execution_usage,
+                            &total_budget,
+                        ) {
+                            ExecutionWindowTotalBudgetDecision::Continue { next_window_index } => {
+                                next_window_index
+                            }
+                            ExecutionWindowTotalBudgetDecision::Block(block) => {
+                                active_turn_id = None;
+                                active_turn_run_id = None;
+                                active_turn_control = None;
+                                active_turn_request = None;
+                                active_recovery = None;
+                                publish_loop_durable_event(
+                                    event_hub.as_ref(),
+                                    AgentDurableEvent::TurnExecutionWindowBlocked {
+                                        notification: TurnExecutionWindowBlockedNotification {
+                                            workspace_id: workspace_id.clone(),
+                                            thread_id: thread_id.clone(),
+                                            turn_id: turn_id.clone(),
+                                            window_id: continuation.exhausted_window_id.clone(),
+                                            window_index: continuation
+                                                .checkpoint_payload
+                                                .window
+                                                .window_index,
+                                            status: ExecutionWindowStatus::Blocked,
+                                            exhaustion_reason: Some(
+                                                total_budget_block_exhaustion_reason(
+                                                    block.kind,
+                                                    continuation.reason,
+                                                ),
+                                            ),
+                                            checkpoint_id: Some(continuation.checkpoint_id.clone()),
+                                            total_windows: block.total_windows,
+                                            total_tool_calls: block.total_tool_calls,
+                                            reason: block.reason,
+                                            blocked_at_unix_ms: chrono::Local::now()
+                                                .timestamp_millis(),
+                                        },
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        next_turn_request.execution_window_index = next_window_index;
+                        next_turn_request.execution_options.continue_generation_hint = true;
+                        next_turn_request.execution_checkpoint_context =
+                            Some(ExecutionCheckpointContext {
+                                window_id: continuation.exhausted_window_id.clone(),
+                                window_index: continuation.checkpoint_payload.window.window_index,
+                                checkpoint_id: continuation.checkpoint_id.clone(),
+                                checkpoint_kind: "execution_window_exhausted".to_owned(),
+                                payload: continuation.checkpoint_payload.clone(),
+                            });
+
+                        let provider = match provider_registry.get_or_create_for_workspace(
+                            workspace_id.as_str(),
+                            next_turn_request.provider_name.as_str(),
+                        ) {
+                            Ok(provider) => provider,
+                            Err(error) => {
+                                active_turn_id = None;
+                                active_turn_request = None;
+                                publish_loop_durable_event(
+                                    event_hub.as_ref(),
+                                    AgentDurableEvent::TurnFailed {
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        error: format!(
+                                            "failed to recreate provider `{}` for execution window continuation: {error}",
+                                            next_turn_request.provider_name
+                                        ),
+                                        recovery: None,
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+
+                        let run_id = next_turn_run_id;
+                        next_turn_run_id = next_turn_run_id.saturating_add(1);
+                        let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                        let next_window_id = format!("{turn_id}:window:{next_window_index}");
+
+                        publish_loop_durable_event(
+                            event_hub.as_ref(),
+                            AgentDurableEvent::TurnExecutionWindowContinued {
+                                notification: TurnExecutionWindowContinuedNotification {
+                                    workspace_id: workspace_id.clone(),
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    window_id: next_window_id,
+                                    window_index: next_window_index,
+                                    status: ExecutionWindowStatus::Continued,
+                                    previous_window_id: continuation.exhausted_window_id.clone(),
+                                    previous_window_index: continuation
+                                        .checkpoint_payload
+                                        .window
+                                        .window_index,
+                                    checkpoint_id: continuation.checkpoint_id.clone(),
+                                    continued_at_unix_ms: chrono::Local::now().timestamp_millis(),
+                                },
+                            },
+                        )
+                        .await;
+
+                        active_turn_id = Some(turn_id.clone());
+                        active_turn_run_id = Some(run_id);
+                        active_turn_control = Some(turn_control.clone());
+                        active_turn_request = Some(next_turn_request.clone());
+                        last_turn_request = Some(next_turn_request.clone());
+                        active_recovery = None;
+
+                        active_turn_task = Some(spawn_turn_task(
+                            command_tx.clone(),
+                            event_hub.clone(),
+                            thread_id.clone(),
+                            workspace_id.clone(),
+                            provider_registry.clone(),
+                            tool_loop_config.clone(),
+                            mcp_tool_provider.clone(),
+                            turn_tool_provider.clone(),
+                            turn_finalization_provider.clone(),
+                            task_tool_provider.clone(),
+                            hook_runtime.clone(),
+                            tool_bundle_artifacts.clone(),
+                            provider,
+                            next_turn_request,
+                            turn_control,
+                            None,
+                            run_id,
+                        ));
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
                         active_turn_id = None;
@@ -548,6 +866,93 @@ pub(super) async fn run_agent_loop(
 
                 let _ = ack.send(Ok(()));
             }
+            AgentCommand::StartRestoredRecoveryTurn {
+                turn_request,
+                recovery_request,
+                ack,
+            } => {
+                if active_turn_id.is_some() {
+                    let _ = ack.send(Err(super::AgentControlError::TurnAlreadyRunning));
+                    continue;
+                }
+                if turn_request.turn_id != recovery_request.turn_id {
+                    let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
+                    continue;
+                }
+
+                let mut active_request = ActiveTurnRequest {
+                    turn_id: turn_request.turn_id.clone(),
+                    execution_window_index: 1,
+                    mode: turn_request.mode,
+                    hook_runtime_context: super::AgentTurnHookRuntimeContext::default(),
+                    model: turn_request.model,
+                    provider_name: turn_request.provider_name,
+                    workspace_skill_policies: turn_request.workspace_skill_policies,
+                    input: turn_request.input,
+                    capabilities: turn_request.capabilities,
+                    resolved_artifacts: turn_request.resolved_artifacts,
+                    runtime_environment: turn_request.runtime_environment,
+                    history: turn_request.history,
+                    retained_llm_context: Vec::new(),
+                    execution_checkpoint_context: None,
+                    execution_usage: super::TurnExecutionUsageCounters::default(),
+                    execution_options: super::TurnExecutionOptions::default(),
+                };
+
+                super::apply_recovery_adjustments(&mut active_request, &recovery_request);
+
+                if recovery_request.refresh_provider_auth {
+                    provider_registry.invalidate(active_request.provider_name.as_str());
+                }
+
+                let provider = match provider_registry.get_or_create_for_workspace(
+                    workspace_id.as_str(),
+                    active_request.provider_name.as_str(),
+                ) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                            "failed to recreate provider `{}` for restored recovery: {error}",
+                            active_request.provider_name
+                        ))));
+                        continue;
+                    }
+                };
+
+                let run_id = next_turn_run_id;
+                next_turn_run_id = next_turn_run_id.saturating_add(1);
+                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                let recovery = recovery_context(&recovery_request);
+
+                active_turn_id = Some(active_request.turn_id.clone());
+                active_turn_run_id = Some(run_id);
+                active_turn_control = Some(turn_control.clone());
+                active_turn_request = Some(active_request.clone());
+                last_turn_request = Some(active_request.clone());
+                active_recovery = Some(recovery.clone());
+
+                active_turn_task = Some(spawn_turn_task(
+                    command_tx.clone(),
+                    event_hub.clone(),
+                    thread_id.clone(),
+                    workspace_id.clone(),
+                    provider_registry.clone(),
+                    tool_loop_config.clone(),
+                    mcp_tool_provider.clone(),
+                    turn_tool_provider.clone(),
+                    turn_finalization_provider.clone(),
+                    task_tool_provider.clone(),
+                    hook_runtime.clone(),
+                    tool_bundle_artifacts.clone(),
+                    provider,
+                    active_request,
+                    turn_control,
+                    Some(recovery),
+                    run_id,
+                ));
+
+                let _ = ack.send(Ok(()));
+            }
             AgentCommand::Shutdown => {
                 if let Some(task) = active_turn_task.take() {
                     task.abort();
@@ -594,6 +999,8 @@ fn spawn_turn_task(
             turn_request.runtime_environment,
             turn_request.history,
             turn_request.retained_llm_context,
+            turn_request.execution_window_index,
+            turn_request.execution_checkpoint_context,
             turn_request.execution_options.force_non_stream,
             turn_request.execution_options.continue_generation_hint,
             tool_loop_config,
@@ -645,6 +1052,8 @@ async fn execute_turn_flow(
     runtime_environment: std::collections::HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<super::RetainedToolLlmContext>,
+    execution_window_index: u32,
+    execution_checkpoint_context: Option<super::ExecutionCheckpointContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
@@ -675,6 +1084,8 @@ async fn execute_turn_flow(
             runtime_environment,
             history,
             retained_llm_context,
+            execution_window_index,
+            execution_checkpoint_context,
             force_non_stream,
             continue_generation_hint,
             tool_loop_config,
@@ -689,9 +1100,15 @@ async fn execute_turn_flow(
             event_hub,
         ))
         .await
-        .map(|outcome| TurnTaskCompletion {
-            result: Ok(()),
-            post_turn_dispatch: outcome.post_turn_dispatch,
+        .map(|outcome| match outcome {
+            chat::ChatTurnOutcome::Completed { post_turn_dispatch } => TurnTaskCompletion {
+                result: Ok(TurnTaskSuccess::Completed),
+                post_turn_dispatch,
+            },
+            chat::ChatTurnOutcome::NeedsContinuation(continuation) => TurnTaskCompletion {
+                result: Ok(TurnTaskSuccess::NeedsContinuation(continuation)),
+                post_turn_dispatch: None,
+            },
         })
         .unwrap_or_else(|error| {
             let (error, post_turn_dispatch) = error.into_parts();
@@ -807,4 +1224,262 @@ async fn cleanup_attached_tasks(
             reason,
         )
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ExecutionWindowMaxWindowsDecision, ExecutionWindowTotalBudgetBlockKind,
+        ExecutionWindowTotalBudgetDecision, TurnExecutionUsageCounters,
+        decide_execution_window_max_windows, decide_execution_window_total_budget,
+    };
+
+    fn total_budget(
+        max_windows_per_turn: u32,
+        max_tool_calls_per_turn: u32,
+        max_wall_clock_ms_per_turn: Option<u64>,
+        max_provider_tokens_per_turn: Option<u64>,
+    ) -> pioneer_tools::ExecutionWindowTotalBudgetConfig {
+        pioneer_tools::ExecutionWindowTotalBudgetConfig {
+            max_windows_per_turn,
+            max_tool_calls_per_turn,
+            max_wall_clock_ms_per_turn,
+            max_provider_tokens_per_turn,
+            max_consecutive_failed_windows: 3,
+        }
+    }
+
+    fn checkpoint_payload_with_tool_counts(
+        window_index: u32,
+        succeeded_count: u32,
+        failed_count: u32,
+    ) -> pioneer_protocol::ExecutionCheckpointPayload {
+        let executed_count = succeeded_count.saturating_add(failed_count);
+        pioneer_protocol::build_execution_checkpoint_payload(
+            "ws",
+            "thr",
+            "turn",
+            pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
+                input_count: 1,
+                text_preview: Some("continue".to_owned()),
+                text_truncated: false,
+                attachment_count: 0,
+                attachment_kinds: Vec::new(),
+            },
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                window_id: Some(format!("window_{window_index}")),
+                window_index,
+                started_at_unix_ms: Some(i64::from(window_index) * 1_000),
+                completed_at_unix_ms: Some(i64::from(window_index) * 1_000 + 100),
+                agent_round_count: 1,
+                tool_call_count: executed_count,
+                provider_token_count: Some(10),
+                exhaustion_reason: Some(
+                    pioneer_protocol::ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                ),
+            },
+            pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
+                model: Some("model".to_owned()),
+                model_provider: Some("provider".to_owned()),
+                agent_round_count: 1,
+                tool_call_count: executed_count,
+                provider_token_count: Some(10),
+                provider_usage_available: true,
+                exhaustion_reason: Some(
+                    pioneer_protocol::ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                ),
+                exhausted_limit: Some(u64::from(executed_count)),
+                exhausted_observed: Some(u64::from(executed_count)),
+            },
+            pioneer_protocol::ExecutionCheckpointToolSummary {
+                requested_count: executed_count,
+                executed_count,
+                unexecuted_count: 0,
+                total_count: executed_count,
+                succeeded_count,
+                failed_count,
+                in_progress_count: 0,
+                detail_limit: 0,
+                details_truncated: false,
+                details: Vec::new(),
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn max_windows_decision_allows_continuation_below_limit() {
+        assert_eq!(
+            decide_execution_window_max_windows(1, 3),
+            ExecutionWindowMaxWindowsDecision::Continue {
+                next_window_index: 2
+            }
+        );
+    }
+
+    #[test]
+    fn max_windows_decision_blocks_at_exact_limit() {
+        assert_eq!(
+            decide_execution_window_max_windows(3, 3),
+            ExecutionWindowMaxWindowsDecision::Block { total_windows: 3 }
+        );
+    }
+
+    #[test]
+    fn max_windows_decision_blocks_above_limit() {
+        assert_eq!(
+            decide_execution_window_max_windows(4, 3),
+            ExecutionWindowMaxWindowsDecision::Block { total_windows: 4 }
+        );
+    }
+
+    #[test]
+    fn total_budget_decision_blocks_on_total_tool_calls() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            total_tool_calls: 12,
+            total_wall_clock_ms: 100,
+            total_provider_tokens: 0,
+            provider_token_usage_unknown: false,
+            consecutive_failed_windows: 0,
+        };
+
+        let decision =
+            decide_execution_window_total_budget(&usage, &total_budget(4, 12, Some(10_000), None));
+
+        let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
+            panic!("total tool-call budget should block continuation");
+        };
+        assert_eq!(
+            block.kind,
+            ExecutionWindowTotalBudgetBlockKind::MaxToolCalls
+        );
+        assert_eq!(block.total_windows, 1);
+        assert_eq!(block.total_tool_calls, 12);
+        assert!(block.reason.contains("max_total_tool_calls_per_turn"));
+    }
+
+    #[test]
+    fn total_budget_decision_blocks_on_total_wall_clock() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 2,
+            total_tool_calls: 4,
+            total_wall_clock_ms: 5_000,
+            total_provider_tokens: 0,
+            provider_token_usage_unknown: false,
+            consecutive_failed_windows: 0,
+        };
+
+        let decision =
+            decide_execution_window_total_budget(&usage, &total_budget(4, 100, Some(5_000), None));
+
+        let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
+            panic!("total wall-clock budget should block continuation");
+        };
+        assert_eq!(
+            block.kind,
+            ExecutionWindowTotalBudgetBlockKind::MaxWallClockMs
+        );
+        assert_eq!(block.total_windows, 2);
+        assert_eq!(block.total_tool_calls, 4);
+        assert!(block.reason.contains("max_total_wall_clock_ms_per_turn"));
+    }
+
+    #[test]
+    fn total_budget_decision_blocks_on_known_provider_tokens() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 2,
+            total_tool_calls: 4,
+            total_wall_clock_ms: 500,
+            total_provider_tokens: 10_000,
+            provider_token_usage_unknown: false,
+            consecutive_failed_windows: 0,
+        };
+
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(4, 100, Some(50_000), Some(10_000)),
+        );
+
+        let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
+            panic!("known total provider-token budget should block continuation");
+        };
+        assert_eq!(
+            block.kind,
+            ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens
+        );
+        assert_eq!(block.total_windows, 2);
+        assert_eq!(block.total_tool_calls, 4);
+        assert!(block.reason.contains("max_total_provider_tokens_per_turn"));
+    }
+
+    #[test]
+    fn total_budget_decision_does_not_block_on_unknown_provider_tokens() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            total_tool_calls: 4,
+            total_wall_clock_ms: 500,
+            total_provider_tokens: 10_000,
+            provider_token_usage_unknown: true,
+            consecutive_failed_windows: 0,
+        };
+
+        assert_eq!(
+            decide_execution_window_total_budget(
+                &usage,
+                &total_budget(4, 100, Some(50_000), Some(10))
+            ),
+            ExecutionWindowTotalBudgetDecision::Continue {
+                next_window_index: 2
+            }
+        );
+    }
+
+    #[test]
+    fn consecutive_failed_window_accounting_increments_on_failure_heavy_windows() {
+        let mut usage = TurnExecutionUsageCounters::default();
+
+        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(1, 1, 3));
+
+        assert_eq!(usage.total_windows, 1);
+        assert_eq!(usage.consecutive_failed_windows, 1);
+    }
+
+    #[test]
+    fn consecutive_failed_window_accounting_resets_on_non_failure_heavy_window() {
+        let mut usage = TurnExecutionUsageCounters::default();
+
+        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(1, 0, 2));
+        usage.observe_checkpoint_payload(&checkpoint_payload_with_tool_counts(2, 2, 1));
+
+        assert_eq!(usage.total_windows, 2);
+        assert_eq!(usage.consecutive_failed_windows, 0);
+    }
+
+    #[test]
+    fn total_budget_decision_blocks_on_consecutive_failed_windows() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 3,
+            total_tool_calls: 9,
+            total_wall_clock_ms: 300,
+            total_provider_tokens: 30,
+            provider_token_usage_unknown: false,
+            consecutive_failed_windows: 3,
+        };
+
+        let mut budget = total_budget(8, 100, Some(10_000), None);
+        budget.max_consecutive_failed_windows = 3;
+        let decision = decide_execution_window_total_budget(&usage, &budget);
+
+        let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
+            panic!("consecutive failed-window budget should block continuation");
+        };
+        assert_eq!(
+            block.kind,
+            ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveFailedWindows
+        );
+        assert_eq!(block.total_windows, 3);
+        assert_eq!(block.total_tool_calls, 9);
+        assert!(block.reason.contains("max_consecutive_failed_windows"));
+    }
 }

@@ -1,0 +1,563 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionCheckpointPayload",
+  "type": "object",
+  "properties": {
+    "original_request": {
+      "$ref": "#/$defs/ExecutionCheckpointOriginalRequestSummary"
+    },
+    "provider_budget": {
+      "$ref": "#/$defs/ExecutionCheckpointProviderBudgetSummary"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "strict_obligations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionCheckpointStrictObligation"
+      }
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "tools": {
+      "$ref": "#/$defs/ExecutionCheckpointToolSummary"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "window": {
+      "$ref": "#/$defs/ExecutionCheckpointWindowSummary"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "original_request",
+    "window",
+    "provider_budget",
+    "tools"
+  ],
+  "$defs": {
+    "ExecutionCheckpointOriginalRequestSummary": {
+      "type": "object",
+      "properties": {
+        "attachment_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "attachment_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "input_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "text_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "input_count",
+        "text_truncated",
+        "attachment_count"
+      ]
+    },
+    "ExecutionCheckpointProviderBudgetSummary": {
+      "type": "object",
+      "properties": {
+        "agent_round_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "exhausted_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exhausted_observed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exhaustion_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_token_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provider_usage_available": {
+          "type": "boolean"
+        },
+        "tool_call_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "agent_round_count",
+        "tool_call_count",
+        "provider_usage_available"
+      ]
+    },
+    "ExecutionCheckpointStrictObligation": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "obligation_id": {
+          "type": "string"
+        },
+        "refs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "obligation_id",
+        "kind",
+        "description"
+      ]
+    },
+    "ExecutionCheckpointToolCallSummary": {
+      "type": "object",
+      "properties": {
+        "error_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolErrorClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "item_type": {
+          "$ref": "#/$defs/TurnItemType"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolMetadataValue"
+          }
+        },
+        "retry_error_class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus"
+        },
+        "success": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item_id",
+        "tool_name",
+        "item_type",
+        "status",
+        "metadata"
+      ]
+    },
+    "ExecutionCheckpointToolSummary": {
+      "type": "object",
+      "properties": {
+        "detail_limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionCheckpointToolCallSummary"
+          }
+        },
+        "details_truncated": {
+          "type": "boolean"
+        },
+        "executed_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "failed_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "in_progress_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "requested_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "succeeded_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unexecuted_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "requested_count",
+        "executed_count",
+        "unexecuted_count",
+        "total_count",
+        "succeeded_count",
+        "failed_count",
+        "in_progress_count",
+        "detail_limit",
+        "details_truncated"
+      ]
+    },
+    "ExecutionCheckpointWindowSummary": {
+      "type": "object",
+      "properties": {
+        "agent_round_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "completed_at_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "exhaustion_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_token_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "started_at_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "tool_call_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "window_index",
+        "agent_round_count",
+        "tool_call_count"
+      ]
+    },
+    "ExecutionWindowExhaustionReason": {
+      "type": "string",
+      "enum": [
+        "max_agent_rounds_per_window",
+        "max_tool_calls_per_window",
+        "max_wall_clock_ms_per_window",
+        "max_provider_tokens_per_window",
+        "provider_failure_continuation",
+        "runtime_shutdown_continuation"
+      ]
+    },
+    "ToolCallStatus": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "completed",
+        "failed"
+      ]
+    },
+    "ToolErrorClass": {
+      "type": "string",
+      "enum": [
+        "invalid_arguments",
+        "not_found",
+        "tool_not_visible",
+        "permission_denied",
+        "command_not_found",
+        "timeout",
+        "cancelled",
+        "execution_failed",
+        "needs_narrowing",
+        "internal",
+        "output_truncated",
+        "unknown"
+      ]
+    },
+    "ToolMetadataRawKind": {
+      "type": "string",
+      "enum": [
+        "content",
+        "body",
+        "blob",
+        "base64",
+        "bytes",
+        "data",
+        "html",
+        "image",
+        "output",
+        "screenshot",
+        "stdout",
+        "stderr",
+        "text",
+        "unknown"
+      ]
+    },
+    "ToolMetadataValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "null"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bool"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "number"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "array"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fields": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "fields"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "redacted_raw"
+            },
+            "raw_kind": {
+              "$ref": "#/$defs/ToolMetadataRawKind"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "value_kind": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "raw_kind",
+            "sha256",
+            "bytes",
+            "value_kind"
+          ]
+        }
+      ]
+    },
+    "TurnItemType": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "agent_message",
+        "reasoning",
+        "system_event",
+        "task",
+        "command_execution",
+        "file_change",
+        "web_search",
+        "web_fetch",
+        "download",
+        "dynamic_tool_call"
+      ]
+    }
+  }
+}

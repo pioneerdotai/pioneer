@@ -14,6 +14,12 @@ struct SystemEventPresentation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemEventDetailRow {
+    label: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CapabilityRejectionRow {
     label: String,
     kind: String,
@@ -133,6 +139,137 @@ fn detail_u64(details: Option<&JsonValue>, key: &str) -> Option<u64> {
     details?.get(key).and_then(JsonValue::as_u64)
 }
 
+fn execution_window_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("turn_execution_window_started")
+            | Some("turn_execution_window_exhausted")
+            | Some("turn_execution_window_checkpointed")
+            | Some("turn_execution_window_continued")
+            | Some("turn_execution_window_blocked")
+    )
+}
+
+fn window_index_label(details: Option<&JsonValue>) -> Option<String> {
+    detail_u64(details, "window_index").map(|window_index| format!("Window #{window_index}"))
+}
+
+fn execution_window_presentation_label(
+    code: Option<&str>,
+    level: &SystemEventLevel,
+    details: Option<&JsonValue>,
+) -> String {
+    match code {
+        Some("turn_execution_window_checkpointed") => "Checkpoint".to_owned(),
+        Some("turn_execution_window_continued") => "Continued".to_owned(),
+        Some("turn_execution_window_blocked") => "Paused".to_owned(),
+        Some("turn_execution_window_started") | Some("turn_execution_window_exhausted") => {
+            window_index_label(details).unwrap_or_else(|| "Execution window".to_owned())
+        }
+        _ => system_event_label(level),
+    }
+}
+
+fn push_detail_row(
+    rows: &mut Vec<SystemEventDetailRow>,
+    label: impl Into<String>,
+    value: Option<String>,
+) {
+    let Some(value) = value.map(|value| value.trim().to_owned()) else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    rows.push(SystemEventDetailRow {
+        label: label.into(),
+        value,
+    });
+}
+
+fn execution_window_detail_rows(
+    code: Option<&str>,
+    details: Option<&JsonValue>,
+) -> Vec<SystemEventDetailRow> {
+    if !execution_window_code(code) {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    push_detail_row(&mut rows, "Window", window_index_label(details));
+    push_detail_row(&mut rows, "Status", detail_string(details, "status"));
+    if code == Some("turn_execution_window_blocked") {
+        push_detail_row(&mut rows, "Reason", detail_string(details, "reason"));
+        push_detail_row(
+            &mut rows,
+            "Window exhaustion",
+            detail_string(details, "exhaustion_reason"),
+        );
+    } else {
+        push_detail_row(
+            &mut rows,
+            "Reason",
+            detail_string(details, "exhaustion_reason")
+                .or_else(|| detail_string(details, "reason")),
+        );
+    }
+    push_detail_row(
+        &mut rows,
+        "Checkpoint",
+        detail_string(details, "checkpoint_id"),
+    );
+    push_detail_row(
+        &mut rows,
+        "Previous window",
+        detail_u64(details, "previous_window_index")
+            .map(|window_index| format!("Window #{window_index}")),
+    );
+    push_detail_row(
+        &mut rows,
+        "Limit",
+        match (
+            detail_u64(details, "observed"),
+            detail_u64(details, "limit"),
+        ) {
+            (Some(observed), Some(limit)) => Some(format!("{observed}/{limit}")),
+            _ => None,
+        },
+    );
+    push_detail_row(
+        &mut rows,
+        "Agent rounds",
+        detail_u64(details, "agent_round_count").map(|value| value.to_string()),
+    );
+    push_detail_row(
+        &mut rows,
+        "Tool calls",
+        detail_u64(details, "tool_call_count")
+            .or_else(|| detail_u64(details, "total_tool_calls"))
+            .map(|value| value.to_string()),
+    );
+    push_detail_row(
+        &mut rows,
+        "Provider tokens",
+        detail_u64(details, "provider_token_count").map(|value| value.to_string()),
+    );
+    push_detail_row(
+        &mut rows,
+        "Total windows",
+        detail_u64(details, "total_windows").map(|value| value.to_string()),
+    );
+    push_detail_row(
+        &mut rows,
+        "Checkpoint kind",
+        detail_string(details, "checkpoint_kind"),
+    );
+    push_detail_row(
+        &mut rows,
+        "Checkpoint size",
+        detail_u64(details, "payload_bytes").map(|value| format!("{value} bytes")),
+    );
+    rows
+}
+
 fn tool_name_from_details(details: Option<&JsonValue>) -> String {
     detail_string(details, "tool_name").unwrap_or_else(|| t!("timeline.system.tool").to_string())
 }
@@ -236,6 +373,10 @@ fn system_event_presentation(
         Some("turn_tool_loop_budget_exceeded") => SystemEventPresentation {
             message: t!("timeline.system.tool_loop_budget_exceeded").to_string(),
             label: system_event_label(level),
+        },
+        code if execution_window_code(code) => SystemEventPresentation {
+            message: message.to_owned(),
+            label: execution_window_presentation_label(code, level, details),
         },
         Some("turn_failed") if is_recovery_failure_message(message) => SystemEventPresentation {
             message: t!("timeline.system.recovery_failed").to_string(),
@@ -461,6 +602,36 @@ impl PioneerDesktop {
             return body.child(rows).into_any_element();
         }
 
+        let execution_window_rows = execution_window_detail_rows(code, details);
+        if !execution_window_rows.is_empty() {
+            let mut rows = v_flex().w_full().gap_1p5();
+            for row in execution_window_rows {
+                rows = rows.child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            div()
+                                .w(px(132.0))
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(row.label),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(row.value),
+                        ),
+                );
+            }
+            return body.child(rows).into_any_element();
+        }
+
         let details = details.and_then(pretty_details);
         if let Some(details) = details.filter(|value| !value.trim().is_empty()) {
             body = body.child(
@@ -489,7 +660,11 @@ impl PioneerDesktop {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_rejection_rows, capability_rejection_rows_for_event};
+    use super::{
+        capability_rejection_rows, capability_rejection_rows_for_event,
+        execution_window_detail_rows, system_event_presentation,
+    };
+    use pioneer_protocol::SystemEventLevel;
     use serde_json::json;
 
     #[test]
@@ -567,5 +742,95 @@ mod tests {
         assert_eq!(rows[0].label, "github");
         assert_eq!(rows[0].kind, "MCP server");
         assert_eq!(rows[0].message, "MCP server `github` is disabled.");
+    }
+
+    #[test]
+    fn execution_window_rows_render_compact_continuation_details() {
+        let details = json!({
+            "window_index": 2,
+            "status": "continued",
+            "previous_window_index": 1,
+            "checkpoint_id": "chk_000000000000000001",
+            "payload": {
+                "large": "payload must not be rendered inline"
+            }
+        });
+
+        let presentation = system_event_presentation(
+            &SystemEventLevel::Info,
+            "Continuing in execution window #2 from checkpoint chk_000000000000000001",
+            Some("turn_execution_window_continued"),
+            Some(&details),
+        );
+        assert_eq!(presentation.label, "Continued");
+        assert!(
+            presentation
+                .message
+                .contains("Continuing in execution window #2")
+        );
+
+        let rows =
+            execution_window_detail_rows(Some("turn_execution_window_continued"), Some(&details));
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Previous window" && row.value == "Window #1")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Checkpoint" && row.value == "chk_000000000000000001")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "payload" || row.value.contains("large"))
+        );
+    }
+
+    #[test]
+    fn execution_window_rows_render_blocked_reason_and_checkpoint_reference() {
+        let details = json!({
+            "window_index": 3,
+            "status": "blocked",
+            "exhaustion_reason": "max_agent_rounds_per_window",
+            "checkpoint_id": "chk_000000000000000003",
+            "total_windows": 3,
+            "total_tool_calls": 384,
+            "reason": "max_total_windows_exceeded"
+        });
+
+        let presentation = system_event_presentation(
+            &SystemEventLevel::Warning,
+            "Execution paused: max_total_windows_exceeded",
+            Some("turn_execution_window_blocked"),
+            Some(&details),
+        );
+        assert_eq!(presentation.label, "Paused");
+        assert_eq!(
+            presentation.message,
+            "Execution paused: max_total_windows_exceeded"
+        );
+
+        let rows =
+            execution_window_detail_rows(Some("turn_execution_window_blocked"), Some(&details));
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Reason" && row.value == "max_total_windows_exceeded")
+        );
+        assert!(
+            rows.iter().any(|row| row.label == "Window exhaustion"
+                && row.value == "max_agent_rounds_per_window")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Checkpoint" && row.value == "chk_000000000000000003")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Total windows" && row.value == "3")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Tool calls" && row.value == "384")
+        );
     }
 }

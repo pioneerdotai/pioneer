@@ -28,7 +28,7 @@ use pioneer_protocol::{
     McpTurnBindingSummary, MemoryCategory, MemoryScope, MemoryScopeKind,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookTruncation, ProviderFailureClass, RecoveryAction, RecoveryAttemptContext,
-    StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolLoopBudgetAction,
+    StorageOutputPolicy, SystemEventLevel, ThreadMode, ToolCallStatus, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRecoveryIdempotencyMode, ToolRecoveryRetryClass,
     ToolRetryResolution, ToolStoragePayload, TurnCapability, TurnCapabilityAcceptedReason,
     TurnCapabilityKind, TurnCapabilityRejectedReason, TurnItem, TurnItemType, UserInput,
@@ -41,10 +41,10 @@ use pioneer_provider::{
 };
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
-    ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind,
-    ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler, ToolIdempotencyMode,
-    ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata, ToolRetryBudgetConfig,
-    ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
+    ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
+    FunctionToolOutput, PayloadKind, ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler,
+    ToolIdempotencyMode, ToolInvocation, ToolLoopBudgetConfig, ToolPayload, ToolRecoveryMetadata,
+    ToolRetryBudgetConfig, ToolRetryClass, ToolSpec, WebToolsConfig, dynamic_unknown_output_policy,
 };
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -136,8 +136,20 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             ..super::MemoryLoopConfig::default()
         },
         budget: ToolLoopBudgetConfig::default(),
+        execution_windows: ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
     }
+}
+
+fn set_execution_window_budget(
+    config: &mut ToolLoopConfig,
+    max_agent_rounds_per_window: u32,
+    max_tool_calls_per_window: u32,
+) {
+    config.budget.max_agent_rounds_per_turn = max_agent_rounds_per_window;
+    config.budget.max_tool_calls_per_turn = max_tool_calls_per_window;
+    config.execution_windows.window.max_agent_rounds_per_window = max_agent_rounds_per_window;
+    config.execution_windows.window.max_tool_calls_per_window = max_tool_calls_per_window;
 }
 
 fn test_manager() -> AgentManager {
@@ -1578,6 +1590,7 @@ impl TaskToolProvider for StaticTaskToolProvider {
 #[derive(Clone, Copy)]
 enum LoopBudgetProviderMode {
     ToolWhileAvailableThenFinal,
+    TwoToolRoundsThenFinal,
     AlwaysTools,
     TooManyToolsThenFinal,
     RepeatedMissingToolThenFinal,
@@ -2311,6 +2324,11 @@ impl Provider for LoopBudgetProvider {
             LoopBudgetProviderMode::ToolWhileAvailableThenFinal if tools_available => {
                 vec![Self::missing_tool_call(round_index)]
             }
+            LoopBudgetProviderMode::TwoToolRoundsThenFinal
+                if tools_available && round_index < 2 =>
+            {
+                vec![Self::missing_tool_call(round_index)]
+            }
             LoopBudgetProviderMode::AlwaysTools => vec![Self::missing_tool_call(round_index)],
             LoopBudgetProviderMode::TooManyToolsThenFinal if tools_available => {
                 self.missing_tool_calls(round_index)
@@ -2878,6 +2896,11 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         AgentDurableEvent::TurnToolLoopBudgetExceeded { notification } => {
             Some(AgentEvent::TurnToolLoopBudgetExceeded(notification))
         }
+        AgentDurableEvent::TurnExecutionWindowStarted { .. }
+        | AgentDurableEvent::TurnExecutionWindowExhausted { .. }
+        | AgentDurableEvent::TurnExecutionWindowCheckpointed { .. }
+        | AgentDurableEvent::TurnExecutionWindowContinued { .. }
+        | AgentDurableEvent::TurnExecutionWindowBlocked { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
             thread_id,
             turn_id,
@@ -2985,6 +3008,69 @@ async fn recv_events_until_terminal(
     }
 
     panic!("terminal agent event not received")
+}
+
+async fn recv_events_until_loop_budget_action(
+    events: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    limit_kind: ToolLoopBudgetLimitKind,
+    action: ToolLoopBudgetAction,
+) -> Vec<AgentEvent> {
+    let mut observed = Vec::new();
+
+    for _ in 0..160 {
+        let event = match timeout(Duration::from_secs(2), events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                panic!("agent event channel should stay open")
+            }
+            Err(_) => panic!("timed out waiting for loop budget event"),
+        };
+        let matched = matches!(
+            &event,
+            AgentEvent::TurnToolLoopBudgetExceeded(notification)
+                if notification.limit_kind == limit_kind && notification.action == action
+        );
+        assert!(
+            !matches!(
+                &event,
+                AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
+            ),
+            "window budget exhaustion must not be terminal before continuation: {event:?}"
+        );
+        observed.push(event);
+        if matched {
+            return observed;
+        }
+    }
+
+    panic!("loop budget event not received")
+}
+
+async fn recv_durable_events_until_window_blocked(
+    events: &mut tokio::sync::mpsc::Receiver<AgentDurableEvent>,
+) -> Vec<AgentDurableEvent> {
+    let mut observed = Vec::new();
+
+    for _ in 0..160 {
+        let event = match timeout(Duration::from_secs(2), events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                panic!("agent durable event channel should stay open")
+            }
+            Err(_) => panic!("timed out waiting for execution window blocked event"),
+        };
+        assert!(
+            !matches!(&event, AgentDurableEvent::TurnFailed { .. }),
+            "controlled budget stop must not emit crash-style turn failure: {event:?}"
+        );
+        let blocked = matches!(&event, AgentDurableEvent::TurnExecutionWindowBlocked { .. });
+        observed.push(event);
+        if blocked {
+            return observed;
+        }
+    }
+
+    panic!("execution window blocked event not received")
 }
 
 fn assert_turn_completed(observed: &[AgentEvent]) {
@@ -3277,7 +3363,10 @@ async fn finalization_retry_runs_before_agent_message_in_same_loop() {
     assert_eq!(contexts[1].final_text, "accepted final answer");
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.len() >= 2,
+        "provider should receive the initial window requests before continuation"
+    );
     assert!(
         requests[1]
             .messages
@@ -8221,14 +8310,13 @@ async fn start_loop_budget_turn(
 }
 
 #[tokio::test]
-async fn tool_loop_provider_round_budget_requests_final_no_tools_round() {
+async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_tools_round() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 2;
-    config.budget.max_tool_calls_per_turn = 16;
+    set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -8239,21 +8327,31 @@ async fn tool_loop_provider_round_budget_requests_final_no_tools_round() {
     )
     .await;
 
-    let observed_events = recv_events_until_terminal(&mut events).await;
-    let terminal = observed_events
-        .last()
-        .expect("terminal event should be observed");
-    assert!(matches!(terminal, AgentEvent::TurnCompleted { .. }));
+    let observed_events = recv_events_until_loop_budget_action(
+        &mut events,
+        ToolLoopBudgetLimitKind::AgentRounds,
+        ToolLoopBudgetAction::ContinueInNextWindow,
+    )
+    .await;
     assert!(observed_events.iter().any(|event| matches!(
         event,
         AgentEvent::TurnToolLoopBudgetExceeded(notification)
             if notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
-                && notification.action == ToolLoopBudgetAction::RequestFinalNoToolsRound
+                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
                 && notification.turn_id == "turn_loop_budget_rounds"
     )));
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "agent-round window exhaustion must not fail the turn"
+    );
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 3);
+    assert!(
+        requests.len() >= 2,
+        "provider should receive the initial window requests before continuation"
+    );
     assert!(
         requests[0]
             .tools
@@ -8269,26 +8367,489 @@ async fn tool_loop_provider_round_budget_requests_final_no_tools_round() {
             .unwrap_or(false)
     );
     assert!(
-        requests[2].tools.is_none(),
-        "final budget round must send no tool definitions"
-    );
-    assert_eq!(
-        tool_result_message_count(&requests[2]),
-        2,
-        "only tool calls from the two tool-capable rounds should reach model history"
+        requests.iter().all(|request| request.tools.is_some()),
+        "window budget exhaustion must not send a fake final no-tools provider round"
     );
 }
 
 #[tokio::test]
-async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
+async fn production_regression_repeated_failed_tools_continue_without_final_no_tools_failure() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let mut events = start_loop_budget_turn(
+        &manager,
+        "thr_production_failed_tools_window_regression",
+        "turn_production_failed_tools_window_regression",
+    )
+    .await;
+
+    let observed_events = recv_events_until_loop_budget_action(
+        &mut events,
+        ToolLoopBudgetLimitKind::AgentRounds,
+        ToolLoopBudgetAction::ContinueInNextWindow,
+    )
+    .await;
+
+    let failed_tool_completions = observed_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::ItemCompleted(ItemCompletedNotification {
+                    item: TurnItem::DynamicToolCall {
+                        tool_name,
+                        status,
+                        ..
+                    },
+                    ..
+                }) if tool_name == "missing_loop_budget_tool"
+                    && matches!(status, ToolCallStatus::Failed)
+            )
+        })
+        .count();
+    assert!(
+        failed_tool_completions >= 1,
+        "fixture must simulate repeated failed tool calls before window exhaustion: {observed_events:?}"
+    );
+    assert!(observed_events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnToolLoopBudgetExceeded(notification)
+            if notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
+                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
+                && notification.turn_id == "turn_production_failed_tools_window_regression"
+    )));
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })),
+        "first window exhaustion must not produce an empty/completed final answer"
+    );
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "first window exhaustion must not fail the turn"
+    );
+    let observed_debug = format!("{observed_events:#?}");
+    assert!(
+        !observed_debug.contains("final_no_tools_round_already_used"),
+        "production regression: final no-tools pressure must not reappear after window exhaustion"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert!(
+        requests.len() >= 2,
+        "fixture should reach repeated provider rounds before continuation: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|request| request.tools.is_some()),
+        "budget continuation must not switch into final no-tools mode"
+    );
+}
+
+#[tokio::test]
+async fn execution_window_continuation_restarts_same_turn_and_completes_next_window() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::TwoToolRoundsThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let mut events = start_loop_budget_turn(
+        &manager,
+        "thr_loop_budget_multi_window",
+        "turn_loop_budget_multi_window",
+    )
+    .await;
+
+    let observed_events = recv_events_until_terminal(&mut events).await;
+    assert!(matches!(
+        observed_events.last(),
+        Some(AgentEvent::TurnCompleted { turn_id, .. })
+            if turn_id == "turn_loop_budget_multi_window"
+    ));
+    let budget_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnToolLoopBudgetExceeded(notification)
+                    if notification.turn_id == "turn_loop_budget_multi_window"
+                        && notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
+                        && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
+            )
+        })
+        .expect("first window should exhaust and request continuation");
+    let completed_index = observed_events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+        .expect("turn should complete after continuation");
+    assert!(budget_index < completed_index);
+    let observed_turn_ids = observed_events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::PromptManifestCompiled { turn_id, .. }
+            | AgentEvent::TurnSkillsResolved { turn_id, .. }
+            | AgentEvent::TurnCapabilitiesResolved { turn_id, .. }
+            | AgentEvent::SkillAuditEvents { turn_id, .. }
+            | AgentEvent::TurnLlmContextAppended { turn_id, .. }
+            | AgentEvent::ProviderFailureDetected { turn_id, .. }
+            | AgentEvent::RecoveryAttemptSucceeded { turn_id, .. }
+            | AgentEvent::TurnCompleted { turn_id, .. }
+            | AgentEvent::TurnFailed { turn_id, .. } => Some(turn_id.as_str()),
+            AgentEvent::ItemStarted(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::ItemDelta(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::ItemCompleted(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::ItemToolRetryScheduled(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::ItemToolRetryResolved(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::ItemToolRetryExhausted(notification) => Some(notification.turn_id.as_str()),
+            AgentEvent::TurnToolLoopBudgetExceeded(notification) => {
+                Some(notification.turn_id.as_str())
+            }
+            AgentEvent::ItemHeartbeat { turn_id, .. } => Some(turn_id.as_str()),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        observed_turn_ids
+            .iter()
+            .all(|turn_id| *turn_id == "turn_loop_budget_multi_window"),
+        "continuation must stay inside one user turn id: {observed_turn_ids:?}"
+    );
+    assert!(
+        !observed_events[..budget_index].iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
+        )),
+        "window boundary must not be terminal"
+    );
+    assert!(
+        !observed_events[..=budget_index]
+            .iter()
+            .any(|event| matches!(
+                event,
+                AgentEvent::ItemCompleted(ItemCompletedNotification {
+                    item: TurnItem::AgentMessage { .. },
+                    ..
+                })
+            )),
+        "first exhausted window must not emit a final assistant message"
+    );
+    let final_agent_message_index = observed_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ItemCompleted(ItemCompletedNotification {
+                    item: TurnItem::AgentMessage { text, .. },
+                    ..
+                }) if text == "final without tools"
+            )
+        })
+        .expect("final assistant message should appear after continuation");
+    assert!(budget_index < final_agent_message_index);
+    assert!(final_agent_message_index < completed_index);
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "multi-window continuation should not fail the turn"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[2]
+            .tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false),
+        "continuation window should keep tools enabled"
+    );
+    assert_eq!(
+        tool_result_message_count(&requests[2]),
+        0,
+        "same-turn continuation should not synthesize unanswered excess tool history"
+    );
+}
+
+#[tokio::test]
+async fn max_windows_cap_blocks_continuation_without_turn_failed() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config.execution_windows.total.max_windows_per_turn = 1;
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let thread_id = "thr_loop_budget_max_windows";
+    let turn_id = "turn_loop_budget_max_windows";
+    manager
+        .ensure_thread(thread_id, "ws_loop_budget")
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run max windows cap test".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let blocked = observed_events
+        .iter()
+        .find_map(|event| {
+            if let AgentDurableEvent::TurnExecutionWindowBlocked { notification } = event {
+                Some(notification)
+            } else {
+                None
+            }
+        })
+        .expect("blocked event should be observed");
+    assert_eq!(blocked.thread_id, thread_id);
+    assert_eq!(blocked.turn_id, turn_id);
+    assert_eq!(blocked.window_index, 1);
+    assert_eq!(blocked.total_windows, 1);
+    assert_eq!(
+        blocked.status,
+        pioneer_protocol::ExecutionWindowStatus::Blocked
+    );
+    assert!(
+        blocked
+            .reason
+            .contains("max execution windows per turn reached")
+    );
+    let checkpoint_id = blocked
+        .checkpoint_id
+        .as_deref()
+        .expect("blocked event should reference checkpoint");
+    assert!(
+        observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. }
+                if notification.checkpoint_id == checkpoint_id
+        )),
+        "max-window block should be preceded by checkpointed event"
+    );
+    assert!(
+        !observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowContinued { .. }
+        )),
+        "max-window cap must not schedule another execution window"
+    );
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentDurableEvent::TurnFailed { .. })),
+        "max-window cap should be controlled blocked state, not failed"
+    );
+}
+
+#[tokio::test]
+async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config.execution_windows.total.max_tool_calls_per_turn = 1;
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let thread_id = "thr_loop_budget_total_tools";
+    let turn_id = "turn_loop_budget_total_tools";
+    manager
+        .ensure_thread(thread_id, "ws_loop_budget")
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run total tool-call cap test".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let blocked = observed_events
+        .iter()
+        .find_map(|event| {
+            if let AgentDurableEvent::TurnExecutionWindowBlocked { notification } = event {
+                Some(notification)
+            } else {
+                None
+            }
+        })
+        .expect("blocked event should be observed");
+    assert_eq!(blocked.thread_id, thread_id);
+    assert_eq!(blocked.turn_id, turn_id);
+    assert!(blocked.reason.contains("max_total_tool_calls_per_turn"));
+    let checkpoint_id = blocked
+        .checkpoint_id
+        .as_deref()
+        .expect("blocked event should reference checkpoint");
+    assert!(
+        observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. }
+                if notification.checkpoint_id == checkpoint_id
+        )),
+        "total tool-call block should be preceded by checkpointed event"
+    );
+    assert!(
+        !observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowContinued { .. }
+        )),
+        "total tool-call cap must not schedule another execution window"
+    );
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentDurableEvent::TurnFailed { .. })),
+        "total tool-call cap should be controlled blocked state, not failed"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_failed_window_cap_blocks_continuation_without_turn_failed() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config
+        .execution_windows
+        .total
+        .max_consecutive_failed_windows = 1;
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let thread_id = "thr_loop_budget_failed_windows";
+    let turn_id = "turn_loop_budget_failed_windows";
+    manager
+        .ensure_thread(thread_id, "ws_loop_budget")
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run consecutive failed windows cap test".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let blocked = observed_events
+        .iter()
+        .find_map(|event| {
+            if let AgentDurableEvent::TurnExecutionWindowBlocked { notification } = event {
+                Some(notification)
+            } else {
+                None
+            }
+        })
+        .expect("blocked event should be observed");
+    assert_eq!(blocked.thread_id, thread_id);
+    assert_eq!(blocked.turn_id, turn_id);
+    assert!(blocked.reason.contains("max_consecutive_failed_windows"));
+    let checkpoint_id = blocked
+        .checkpoint_id
+        .as_deref()
+        .expect("blocked event should reference checkpoint");
+    assert!(
+        observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. }
+                if notification.checkpoint_id == checkpoint_id
+        )),
+        "consecutive failed-window block should be preceded by checkpointed event"
+    );
+    assert!(
+        !observed_events.iter().any(|event| matches!(
+            event,
+            AgentDurableEvent::TurnExecutionWindowContinued { .. }
+        )),
+        "consecutive failed-window cap must not schedule another execution window"
+    );
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentDurableEvent::TurnFailed { .. })),
+        "consecutive failed-window cap should be controlled blocked state, not failed"
+    );
+}
+
+#[tokio::test]
+async fn memory_recall_tools_remain_available_for_budget_continuation() {
     let provider = Arc::new(LoopBudgetProvider::with_preflight_response(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
         memory_read_preflight_response(),
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 2;
-    config.budget.max_tool_calls_per_turn = 16;
+    set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -8321,14 +8882,18 @@ async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
     )
     .await;
 
-    let observed_events = recv_events_until_terminal(&mut events).await;
-    assert!(matches!(
-        observed_events.last(),
-        Some(AgentEvent::TurnCompleted { .. })
-    ));
+    let _observed_events = recv_events_until_loop_budget_action(
+        &mut events,
+        ToolLoopBudgetLimitKind::AgentRounds,
+        ToolLoopBudgetAction::ContinueInNextWindow,
+    )
+    .await;
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 3);
+    assert!(
+        requests.len() >= 2,
+        "provider should receive initial window requests before continuation"
+    );
     assert!(
         requests[0]
             .tools
@@ -8345,14 +8910,9 @@ async fn memory_recall_policy_is_omitted_when_tool_loop_disables_tools() {
             .full_system_text
             .contains("## Memory Recall")
     );
-    assert!(requests[2].tools.is_none());
     assert!(
-        !requests[2]
-            .compiled_prompt
-            .as_ref()
-            .expect("final no-tools round should include prompt")
-            .full_system_text
-            .contains("## Memory Recall")
+        requests.iter().all(|request| request.tools.is_some()),
+        "budget continuation must not compile a final no-tools prompt"
     );
 }
 
@@ -8363,9 +8923,8 @@ async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
         1,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 1;
-    config.budget.max_tool_calls_per_turn = 16;
-    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    set_execution_window_budget(&mut config, 8, 16);
+    config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
     let mut events = start_loop_budget_turn(
@@ -8405,12 +8964,12 @@ async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
     assert!(budget_index < failed_index);
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].tools.is_none());
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].tools.is_none());
     assert_eq!(
-        tool_result_message_count(&requests[1]),
-        1,
-        "only the first tool-capable round should execute a tool"
+        tool_result_message_count(&requests[2]),
+        2,
+        "only tool-capable retry rounds should execute tools before no-tools violation"
     );
 }
 
@@ -8477,8 +9036,7 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
         provider.clone(),
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 1;
-    config.budget.max_tool_calls_per_turn = 16;
+    set_execution_window_budget(&mut config, 8, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = AgentManager::new(registry, config);
@@ -8519,8 +9077,13 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
         "invalid task_create arguments and final no-tools tool calls must not execute mutations"
     );
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].tools.is_none());
+    assert!(
+        requests
+            .iter()
+            .skip(1)
+            .any(|request| request.tools.is_none()),
+        "task mutation finalization should still include a no-tools provider request"
+    );
 }
 
 #[tokio::test]
@@ -8582,8 +9145,7 @@ async fn tool_loop_total_tool_call_budget_prevents_execution() {
         3,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 8;
-    config.budget.max_tool_calls_per_turn = 2;
+    set_execution_window_budget(&mut config, 8, 2);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 8;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -8594,28 +9156,32 @@ async fn tool_loop_total_tool_call_budget_prevents_execution() {
     )
     .await;
 
-    let observed_events = recv_events_until_terminal(&mut events).await;
-    let terminal = observed_events
-        .last()
-        .expect("terminal event should be observed");
-    assert!(matches!(terminal, AgentEvent::TurnCompleted { .. }));
+    let observed_events = recv_events_until_loop_budget_action(
+        &mut events,
+        ToolLoopBudgetLimitKind::ToolCalls,
+        ToolLoopBudgetAction::ContinueInNextWindow,
+    )
+    .await;
     assert!(observed_events.iter().any(|event| matches!(
         event,
         AgentEvent::TurnToolLoopBudgetExceeded(notification)
             if notification.limit_kind == ToolLoopBudgetLimitKind::ToolCalls
-                && notification.action == ToolLoopBudgetAction::RequestFinalNoToolsRound
+                && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
     )));
+    assert!(
+        !observed_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "tool-call window exhaustion must not fail the turn"
+    );
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].tools.is_none());
-    assert_eq!(
-        tool_result_message_count(&requests[1]),
-        0,
-        "tool calls that exceed total budget must not execute"
+    assert!(
+        !requests.is_empty(),
+        "provider should receive the window request that exceeded the tool-call budget"
     );
     assert!(
-        requests[1]
+        requests[0]
             .messages
             .iter()
             .all(|message| message.tool_calls.as_ref().is_none_or(Vec::is_empty)),
@@ -8630,8 +9196,7 @@ async fn tool_loop_recoverable_retry_rounds_are_bounded() {
         1,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 8;
-    config.budget.max_tool_calls_per_turn = 8;
+    set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 8;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -8700,8 +9265,7 @@ async fn tool_loop_same_failure_signature_is_bounded() {
         1,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 8;
-    config.budget.max_tool_calls_per_turn = 8;
+    set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 1;
     let manager = loop_budget_manager(provider.clone(), config);
@@ -8741,8 +9305,7 @@ async fn tool_retry_budget_resets_after_successful_episode() {
         1,
     ));
     let mut config = test_tool_loop_config();
-    config.budget.max_agent_rounds_per_turn = 8;
-    config.budget.max_tool_calls_per_turn = 8;
+    set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 1;
     config.retry.max_retries_per_tool_name_per_episode = 1;
@@ -8885,7 +9448,7 @@ async fn start_turn_emits_lifecycle_events() {
         .start_turn_with_capabilities(
             "thr_000000000000000001",
             "turn_000000000000000001",
-            ThreadMode::Chat,
+            ThreadMode::Agent,
             "openai/gpt-4o",
             "echo",
             HashMap::new(),
@@ -8935,6 +9498,67 @@ async fn start_turn_emits_lifecycle_events() {
         },
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn start_turn_initializes_first_execution_window_index() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    let manager = loop_budget_manager(provider, config);
+    let thread_id = "thr_initial_window_index";
+    let workspace_id = "ws_initial_window_index";
+    let turn_id = "turn_initial_window_index";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    for _ in 0..20 {
+        let event = match timeout(Duration::from_secs(1), durable_events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => panic!("durable receiver should stay open"),
+            Err(_) => continue,
+        };
+        if let AgentDurableEvent::TurnExecutionWindowStarted { notification } = event {
+            assert_eq!(notification.workspace_id, workspace_id);
+            assert_eq!(notification.thread_id, thread_id);
+            assert_eq!(notification.turn_id, turn_id);
+            assert_eq!(notification.window_index, 1);
+            assert_eq!(
+                notification.status,
+                pioneer_protocol::ExecutionWindowStatus::Running
+            );
+            return;
+        }
+    }
+
+    panic!("initial execution-window started event was not emitted");
 }
 
 #[tokio::test(start_paused = true)]
@@ -9123,6 +9747,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
                 continue_generation: false,
                 model_override: None,
                 retained_llm_context: Vec::new(),
+                execution_checkpoint_context: None,
             },
         )
         .await
@@ -9219,6 +9844,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 continue_generation: true,
                 model_override: None,
                 retained_llm_context: Vec::new(),
+                execution_checkpoint_context: None,
             },
         )
         .await
@@ -9347,6 +9973,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 continue_generation: false,
                 model_override: None,
                 retained_llm_context: Vec::new(),
+                execution_checkpoint_context: None,
             },
         )
         .await
@@ -10425,6 +11052,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
                         continue_generation: false,
                         model_override: None,
                         retained_llm_context: Vec::new(),
+                        execution_checkpoint_context: None,
                     },
                 )
                 .await

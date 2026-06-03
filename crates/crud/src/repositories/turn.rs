@@ -145,6 +145,30 @@ pub async fn update_turn_prompt_manifest<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+pub async fn update_turn_status<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    status: TurnStatus,
+    error: Option<&str>,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::Status,
+            Expr::value(turn_status_to_db(status).to_owned()),
+        )
+        .col_expr(turn::Column::Error, Expr::value(error.map(str::to_owned)))
+        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
+        .exec(db)
+        .await
+        .context("failed to update turn status")?;
+
+    Ok(update_result.rows_affected > 0)
+}
+
 pub async fn replace_turn_input<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

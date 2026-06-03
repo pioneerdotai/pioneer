@@ -1249,7 +1249,12 @@ fn turn_event_item_id(event: &TurnItemEvent) -> Option<String> {
         | TurnItemEventPayload::ItemToolRetryScheduled { item_id, .. }
         | TurnItemEventPayload::ItemToolRetryResolved { item_id, .. }
         | TurnItemEventPayload::ItemToolRetryExhausted { item_id, .. } => Some(item_id.clone()),
-        TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. } => None,
+        TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. }
+        | TurnItemEventPayload::TurnExecutionWindowStarted(_)
+        | TurnItemEventPayload::TurnExecutionWindowExhausted(_)
+        | TurnItemEventPayload::TurnExecutionWindowCheckpointed(_)
+        | TurnItemEventPayload::TurnExecutionWindowContinued(_)
+        | TurnItemEventPayload::TurnExecutionWindowBlocked(_) => None,
     }
 }
 
@@ -1350,6 +1355,11 @@ fn is_collapsible_child_turn_event(payload: &TurnItemEventPayload) -> bool {
             | TurnItemEventPayload::ItemRecoverySucceeded { .. }
             | TurnItemEventPayload::ItemToolRetryScheduled { .. }
             | TurnItemEventPayload::ItemToolRetryResolved { .. }
+            | TurnItemEventPayload::TurnExecutionWindowStarted(_)
+            | TurnItemEventPayload::TurnExecutionWindowExhausted(_)
+            | TurnItemEventPayload::TurnExecutionWindowCheckpointed(_)
+            | TurnItemEventPayload::TurnExecutionWindowContinued(_)
+            | TurnItemEventPayload::TurnExecutionWindowBlocked(_)
     )
 }
 

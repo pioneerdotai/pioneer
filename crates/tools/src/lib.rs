@@ -53,8 +53,9 @@ pub use handlers::{
     materialize_skill_runtime_tools,
 };
 pub use loop_guard::{
+    ExecutionWindowBudgetConfig, ExecutionWindowTotalBudgetConfig, ExecutionWindowsConfig,
     ToolLoopBudgetAction, ToolLoopBudgetConfig, ToolLoopBudgetExceeded, ToolLoopBudgetReason,
-    ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundPlan,
+    ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction, ToolLoopRoundPlan,
 };
 pub use orchestrator::{ApprovalState, OrchestratorPolicy, SandboxTarget, ToolOrchestrator};
 pub use output_dynamic_policy::{

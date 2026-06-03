@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnExecutionWindowContinuedNotification",
+  "type": "object",
+  "properties": {
+    "checkpoint_id": {
+      "type": "string"
+    },
+    "continued_at_unix_ms": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "previous_window_id": {
+      "type": "string"
+    },
+    "previous_window_index": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/ExecutionWindowStatus"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "window_id": {
+      "type": "string"
+    },
+    "window_index": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "window_id",
+    "window_index",
+    "status",
+    "previous_window_id",
+    "previous_window_index",
+    "checkpoint_id",
+    "continued_at_unix_ms"
+  ],
+  "$defs": {
+    "ExecutionWindowStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "exhausted",
+        "checkpointed",
+        "continued",
+        "completed",
+        "blocked",
+        "failed"
+      ]
+    }
+  }
+}

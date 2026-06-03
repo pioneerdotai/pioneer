@@ -1,9 +1,12 @@
 use super::state_machine::TurnStateMachine;
 use pioneer_protocol::{
-    MarkdownDocument, RecoveryJobStatus, SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction,
-    ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, Turn, TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
-    UserMessageAttachment,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, MarkdownDocument, RecoveryJobStatus,
+    SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
+    TurnStatus, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -26,6 +29,7 @@ pub(crate) enum TurnPhase {
     Running,
     Completing,
     Completed,
+    Blocked,
     Failed,
     Cancelled,
 }
@@ -652,6 +656,7 @@ impl ConversationProjector {
         let limit_kind_label = tool_loop_budget_limit_kind_label(limit_kind);
         let action_label = tool_loop_budget_action_label(action);
         let level = match action {
+            ToolLoopBudgetAction::ContinueInNextWindow => SystemEventLevel::Info,
             ToolLoopBudgetAction::RequestFinalNoToolsRound => SystemEventLevel::Warning,
             ToolLoopBudgetAction::FailTurn => SystemEventLevel::Error,
         };
@@ -667,6 +672,160 @@ impl ConversationProjector {
                 "observed": observed,
                 "action": action_label,
                 "reason": reason,
+            })),
+            ts_unix_ms,
+        );
+    }
+
+    pub(super) fn apply_turn_execution_window_started(
+        &mut self,
+        turn_id: &str,
+        notification: &TurnExecutionWindowStartedNotification,
+        ts_unix_ms: i64,
+    ) {
+        self.push_system_event_item(
+            turn_id,
+            SystemEventLevel::Info,
+            format!("Execution window #{} started", notification.window_index),
+            Some("turn_execution_window_started".to_owned()),
+            Some(serde_json::json!({
+                "workspace_id": notification.workspace_id.as_str(),
+                "thread_id": notification.thread_id.as_str(),
+                "turn_id": notification.turn_id.as_str(),
+                "window_id": notification.window_id.as_str(),
+                "window_index": notification.window_index,
+                "status": execution_window_status_label(notification.status),
+            })),
+            ts_unix_ms,
+        );
+    }
+
+    pub(super) fn apply_turn_execution_window_exhausted(
+        &mut self,
+        turn_id: &str,
+        notification: &TurnExecutionWindowExhaustedNotification,
+        ts_unix_ms: i64,
+    ) {
+        let exhaustion_reason =
+            execution_window_exhaustion_reason_label(notification.exhaustion_reason);
+        self.push_system_event_item(
+            turn_id,
+            SystemEventLevel::Warning,
+            format!(
+                "Execution window #{} exhausted: {}",
+                notification.window_index, exhaustion_reason
+            ),
+            Some("turn_execution_window_exhausted".to_owned()),
+            Some(serde_json::json!({
+                "workspace_id": notification.workspace_id.as_str(),
+                "thread_id": notification.thread_id.as_str(),
+                "turn_id": notification.turn_id.as_str(),
+                "window_id": notification.window_id.as_str(),
+                "window_index": notification.window_index,
+                "status": execution_window_status_label(notification.status),
+                "exhaustion_reason": exhaustion_reason,
+                "limit": notification.limit,
+                "observed": notification.observed,
+                "agent_round_count": notification.agent_round_count,
+                "tool_call_count": notification.tool_call_count,
+                "provider_token_count": notification.provider_token_count,
+                "reason": notification.reason.as_str(),
+            })),
+            ts_unix_ms,
+        );
+    }
+
+    pub(super) fn apply_turn_execution_window_checkpointed(
+        &mut self,
+        turn_id: &str,
+        notification: &TurnExecutionWindowCheckpointedNotification,
+        ts_unix_ms: i64,
+    ) {
+        self.push_system_event_item(
+            turn_id,
+            SystemEventLevel::Info,
+            format!(
+                "Execution checkpoint saved for window #{}",
+                notification.window_index
+            ),
+            Some("turn_execution_window_checkpointed".to_owned()),
+            Some(serde_json::json!({
+                "workspace_id": notification.workspace_id.as_str(),
+                "thread_id": notification.thread_id.as_str(),
+                "turn_id": notification.turn_id.as_str(),
+                "window_id": notification.window_id.as_str(),
+                "window_index": notification.window_index,
+                "status": execution_window_status_label(notification.status),
+                "checkpoint_id": notification.checkpoint_id.as_str(),
+                "checkpoint_kind": notification.checkpoint_kind.as_str(),
+                "payload_bytes": notification.payload_bytes,
+            })),
+            ts_unix_ms,
+        );
+    }
+
+    pub(super) fn apply_turn_execution_window_continued(
+        &mut self,
+        turn_id: &str,
+        notification: &TurnExecutionWindowContinuedNotification,
+        ts_unix_ms: i64,
+    ) {
+        self.push_system_event_item(
+            turn_id,
+            SystemEventLevel::Info,
+            format!(
+                "Continuing in execution window #{} from checkpoint {}",
+                notification.window_index,
+                notification.checkpoint_id.as_str()
+            ),
+            Some("turn_execution_window_continued".to_owned()),
+            Some(serde_json::json!({
+                "workspace_id": notification.workspace_id.as_str(),
+                "thread_id": notification.thread_id.as_str(),
+                "turn_id": notification.turn_id.as_str(),
+                "window_id": notification.window_id.as_str(),
+                "window_index": notification.window_index,
+                "status": execution_window_status_label(notification.status),
+                "previous_window_id": notification.previous_window_id.as_str(),
+                "previous_window_index": notification.previous_window_index,
+                "checkpoint_id": notification.checkpoint_id.as_str(),
+            })),
+            ts_unix_ms,
+        );
+    }
+
+    pub(super) fn apply_turn_execution_window_blocked(
+        &mut self,
+        turn_id: &str,
+        notification: &TurnExecutionWindowBlockedNotification,
+        ts_unix_ms: i64,
+    ) {
+        self.upsert_turn(
+            turn_id,
+            TurnPhase::Blocked,
+            None,
+            Some(ts_unix_ms),
+            Some(notification.reason.clone()),
+        );
+        self.push_system_event_item(
+            turn_id,
+            SystemEventLevel::Warning,
+            format!("Execution paused: {}", notification.reason),
+            Some("turn_execution_window_blocked".to_owned()),
+            Some(serde_json::json!({
+                "workspace_id": notification.workspace_id.as_str(),
+                "thread_id": notification.thread_id.as_str(),
+                "turn_id": notification.turn_id.as_str(),
+                "window_id": notification.window_id.as_str(),
+                "window_index": notification.window_index,
+                "status": execution_window_status_label(notification.status),
+                "exhaustion_reason": notification
+                    .exhaustion_reason
+                    .map(execution_window_exhaustion_reason_label),
+                "checkpoint_id": notification.checkpoint_id.as_deref(),
+                "total_windows": notification.total_windows,
+                "total_tool_calls": notification.total_tool_calls,
+                "reason": notification.reason.as_str(),
             })),
             ts_unix_ms,
         );
@@ -1147,7 +1306,39 @@ fn tool_loop_budget_limit_kind_label(limit_kind: ToolLoopBudgetLimitKind) -> &'s
 
 fn tool_loop_budget_action_label(action: ToolLoopBudgetAction) -> &'static str {
     match action {
+        ToolLoopBudgetAction::ContinueInNextWindow => "continue_in_next_window",
         ToolLoopBudgetAction::RequestFinalNoToolsRound => "request_final_no_tools_round",
         ToolLoopBudgetAction::FailTurn => "fail_turn",
+    }
+}
+
+fn execution_window_status_label(status: ExecutionWindowStatus) -> &'static str {
+    match status {
+        ExecutionWindowStatus::Running => "running",
+        ExecutionWindowStatus::Exhausted => "exhausted",
+        ExecutionWindowStatus::Checkpointed => "checkpointed",
+        ExecutionWindowStatus::Continued => "continued",
+        ExecutionWindowStatus::Completed => "completed",
+        ExecutionWindowStatus::Blocked => "blocked",
+        ExecutionWindowStatus::Failed => "failed",
+    }
+}
+
+fn execution_window_exhaustion_reason_label(
+    reason: ExecutionWindowExhaustionReason,
+) -> &'static str {
+    match reason {
+        ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow => "max_agent_rounds_per_window",
+        ExecutionWindowExhaustionReason::MaxToolCallsPerWindow => "max_tool_calls_per_window",
+        ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow => "max_wall_clock_ms_per_window",
+        ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow => {
+            "max_provider_tokens_per_window"
+        }
+        ExecutionWindowExhaustionReason::ProviderFailureContinuation => {
+            "provider_failure_continuation"
+        }
+        ExecutionWindowExhaustionReason::RuntimeShutdownContinuation => {
+            "runtime_shutdown_continuation"
+        }
     }
 }

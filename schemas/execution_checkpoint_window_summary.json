@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionCheckpointWindowSummary",
+  "type": "object",
+  "properties": {
+    "agent_round_count": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "completed_at_unix_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "exhaustion_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provider_token_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "started_at_unix_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "tool_call_count": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "window_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "window_index": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "window_index",
+    "agent_round_count",
+    "tool_call_count"
+  ],
+  "$defs": {
+    "ExecutionWindowExhaustionReason": {
+      "type": "string",
+      "enum": [
+        "max_agent_rounds_per_window",
+        "max_tool_calls_per_window",
+        "max_wall_clock_ms_per_window",
+        "max_provider_tokens_per_window",
+        "provider_failure_continuation",
+        "runtime_shutdown_continuation"
+      ]
+    }
+  }
+}

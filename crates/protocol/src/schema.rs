@@ -26,26 +26,31 @@ use crate::artifact::{
 
 use crate::{
     AgentDurableEvent, AgentProgressEvent, ByteRange, ContextCompressedNotification,
-    ContextCompressingNotification, DurableEventCausalityKey, GatewayGeneralSettings,
-    GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNotification, GatewaySettingsGetParams,
-    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, ItemCompletedNotification,
-    ItemDeltaNotification, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
-    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
-    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
-    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
-    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark,
-    MarkdownMarkKind, McpAuditEventSummary, McpChangedAction, McpChangedItem,
-    McpChangedNotification, McpDiagnosticLevel, McpInstallParams, McpInstallResponse,
-    McpInstallResult, McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary,
-    McpListItem, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
-    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
-    McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification,
-    McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
+    ContextCompressingNotification, DurableEventCausalityKey,
+    ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
+    ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
+    ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolSummary,
+    ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
+    GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewayNotification,
+    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
+    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    ItemCompletedNotification, ItemDeltaNotification, ItemRecoveryAttachedNotification,
+    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
+    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
+    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
+    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, MarkdownBlock, MarkdownDocument,
+    MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark, MarkdownMarkKind,
+    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
+    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
+    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
+    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
+    McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification, McpServerCatalogDetails,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
+    McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
+    McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, MemoryActor,
     MemoryActorKind, MemoryAttribute, MemoryAttributeCardinality, MemoryCandidate,
@@ -142,17 +147,19 @@ use crate::{
     ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn, TurnAcceptedCapability,
     TurnCancelParams, TurnCancelResponse, TurnCapability, TurnCapabilityAcceptedReason,
     TurnCapabilityKind, TurnCapabilityRejectedReason, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnOrigin, TurnRejectedCapability, TurnSkillCapabilitySummary, TurnStartParams,
-    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
-    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
-    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification,
-    UserInput, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
-    WorkspaceUpdateResponse,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse,
+    TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    TurnMcpToolCapabilitySummary, TurnOrigin, TurnRejectedCapability, TurnSkillCapabilitySummary,
+    TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    TurnStatusChangedNotification, TurnTimelineChangedNotification, TurnTimelineChangedReason,
+    TurnTimelineParams, TurnTimelineResponse, TurnToolLoopBudgetExceededNotification,
+    UnknownGatewayNotification, UserInput, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
 
 pub struct SchemaDocument {
@@ -884,6 +891,34 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_kind.json", TurnKind),
         schema_doc!("turn_origin.json", TurnOrigin),
         schema_doc!("turn_item.json", TurnItem),
+        schema_doc!(
+            "execution_checkpoint_payload.json",
+            ExecutionCheckpointPayload
+        ),
+        schema_doc!(
+            "execution_checkpoint_original_request_summary.json",
+            ExecutionCheckpointOriginalRequestSummary
+        ),
+        schema_doc!(
+            "execution_checkpoint_window_summary.json",
+            ExecutionCheckpointWindowSummary
+        ),
+        schema_doc!(
+            "execution_checkpoint_provider_budget_summary.json",
+            ExecutionCheckpointProviderBudgetSummary
+        ),
+        schema_doc!(
+            "execution_checkpoint_tool_summary.json",
+            ExecutionCheckpointToolSummary
+        ),
+        schema_doc!(
+            "execution_checkpoint_tool_call_summary.json",
+            ExecutionCheckpointToolCallSummary
+        ),
+        schema_doc!(
+            "execution_checkpoint_strict_obligation.json",
+            ExecutionCheckpointStrictObligation
+        ),
         schema_doc!("turn_started_notification.json", TurnStartedNotification),
         schema_doc!(
             "turn_completed_notification.json",
@@ -944,6 +979,31 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "turn_tool_loop_budget_exceeded_notification.json",
             TurnToolLoopBudgetExceededNotification
+        ),
+        schema_doc!(
+            "turn_execution_window_started_notification.json",
+            TurnExecutionWindowStartedNotification
+        ),
+        schema_doc!(
+            "turn_execution_window_exhausted_notification.json",
+            TurnExecutionWindowExhaustedNotification
+        ),
+        schema_doc!(
+            "turn_execution_window_checkpointed_notification.json",
+            TurnExecutionWindowCheckpointedNotification
+        ),
+        schema_doc!(
+            "turn_execution_window_continued_notification.json",
+            TurnExecutionWindowContinuedNotification
+        ),
+        schema_doc!(
+            "turn_execution_window_blocked_notification.json",
+            TurnExecutionWindowBlockedNotification
+        ),
+        schema_doc!("execution_window_status.json", ExecutionWindowStatus),
+        schema_doc!(
+            "execution_window_exhaustion_reason.json",
+            ExecutionWindowExhaustionReason
         ),
         schema_doc!("tool_retry_error_class.json", ToolRetryErrorClass),
         schema_doc!("tool_retry_budget_kind.json", ToolRetryBudgetKind),

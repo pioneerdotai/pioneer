@@ -1,11 +1,12 @@
 use anyhow::{Result, bail};
 use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
-    MemoryActorKind, MemoryCandidateStatus, MemoryCategory, MemoryEvidenceClass, MemoryFactClass,
-    MemoryLifecycleActorKind, MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass,
-    MemoryQualityAction, MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus,
-    MemoryWriteRelation, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
-    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, MemoryActorKind, MemoryCandidateStatus,
+    MemoryCategory, MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind,
+    MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
+    MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
+    PromptManifestProfile, ProviderFailureClass, ProviderFailureStage, RecoveryAction,
+    RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
     TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
     TaskOwnerKind, TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind,
@@ -596,6 +597,24 @@ pub fn is_terminal_task_run_execution_status(status: TaskRunExecutionStatus) -> 
     status.is_terminal()
 }
 
+pub fn execution_window_status_to_db(status: ExecutionWindowStatus) -> String {
+    enum_to_snake_string(status)
+}
+
+pub fn execution_window_status_from_db(value: &str) -> Result<ExecutionWindowStatus> {
+    enum_from_snake_string(value, "execution window status")
+}
+
+pub fn execution_window_exhaustion_reason_to_db(reason: ExecutionWindowExhaustionReason) -> String {
+    enum_to_snake_string(reason)
+}
+
+pub fn execution_window_exhaustion_reason_from_db(
+    value: &str,
+) -> Result<ExecutionWindowExhaustionReason> {
+    enum_from_snake_string(value, "execution window exhaustion reason")
+}
+
 pub fn task_run_thread_binding_kind_to_db(kind: TaskRunThreadBindingKind) -> String {
     enum_to_snake_string(kind)
 }
@@ -797,6 +816,7 @@ pub fn turn_status_to_db(status: TurnStatus) -> &'static str {
         TurnStatus::Completed => "completed",
         TurnStatus::Failed => "failed",
         TurnStatus::Interrupted => "interrupted",
+        TurnStatus::Blocked => "blocked",
     }
 }
 
@@ -806,6 +826,7 @@ pub fn turn_status_from_db(value: &str) -> Option<TurnStatus> {
         "completed" => Some(TurnStatus::Completed),
         "failed" => Some(TurnStatus::Failed),
         "interrupted" => Some(TurnStatus::Interrupted),
+        "blocked" => Some(TurnStatus::Blocked),
         _ => None,
     }
 }
@@ -1074,6 +1095,7 @@ mod tests {
         assert_eq!(turn_status_to_db(TurnStatus::Completed), "completed");
         assert_eq!(turn_status_to_db(TurnStatus::Failed), "failed");
         assert_eq!(turn_status_to_db(TurnStatus::Interrupted), "interrupted");
+        assert_eq!(turn_status_to_db(TurnStatus::Blocked), "blocked");
     }
 
     #[test]
@@ -1091,6 +1113,7 @@ mod tests {
             turn_status_from_db("interrupted"),
             Some(TurnStatus::Interrupted)
         );
+        assert_eq!(turn_status_from_db("blocked"), Some(TurnStatus::Blocked));
         assert_eq!(turn_status_from_db("InProgress"), None);
     }
 

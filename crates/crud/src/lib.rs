@@ -23,7 +23,7 @@ use pioneer_protocol::{
     Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
     TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
-    UserInput, generate_id,
+    TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
@@ -211,8 +211,8 @@ use crate::repositories::{
     task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
     task_result_candidate, task_result_review_event, task_run, task_run_execution,
     task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
-    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_item_attempt,
-    turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_execution_window,
+    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -237,6 +237,12 @@ pub use crate::repositories::hook_run::{
     HOOK_RUN_IDEMPOTENCY_KEY_MAX_CHARS, HookAuditEventRecord, HookRunAttemptCompletionRecord,
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
+};
+pub use crate::repositories::turn_execution_window::{
+    NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord,
+    TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TurnExecutionCheckpointKind,
+    TurnExecutionCheckpointRecord, TurnExecutionDataCleanupRecord, TurnExecutionWindowRecord,
+    TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
@@ -614,6 +620,180 @@ impl CrudStore {
 
     pub async fn delete_turn_llm_context_for_terminal_turns(&self) -> Result<u64> {
         turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
+    }
+
+    pub async fn create_turn_execution_window(
+        &self,
+        record: NewTurnExecutionWindowRecord,
+        created_at: DateTimeWithTimeZone,
+        updated_at: DateTimeWithTimeZone,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::create_turn_execution_window(
+            &self.connection,
+            record,
+            created_at,
+            updated_at,
+        )
+        .await
+    }
+
+    pub async fn get_turn_execution_window(
+        &self,
+        window_id: &str,
+    ) -> Result<Option<TurnExecutionWindowRecord>> {
+        turn_execution_window::get_turn_execution_window(&self.connection, window_id).await
+    }
+
+    pub async fn list_turn_execution_windows(
+        &self,
+        turn_id: &str,
+    ) -> Result<Vec<TurnExecutionWindowRecord>> {
+        turn_execution_window::list_turn_execution_windows(&self.connection, turn_id).await
+    }
+
+    pub async fn latest_turn_execution_window(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionWindowRecord>> {
+        turn_execution_window::latest_turn_execution_window(&self.connection, turn_id).await
+    }
+
+    pub async fn aggregate_turn_execution_window_usage(
+        &self,
+        turn_id: &str,
+    ) -> Result<TurnExecutionWindowUsageAggregateRecord> {
+        turn_execution_window::aggregate_turn_execution_window_usage(&self.connection, turn_id)
+            .await
+    }
+
+    pub async fn mark_turn_execution_window_exhausted(
+        &self,
+        window_id: &str,
+        reason: pioneer_protocol::ExecutionWindowExhaustionReason,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_exhausted(
+            &self.connection,
+            window_id,
+            reason,
+            stats,
+        )
+        .await
+    }
+
+    pub async fn mark_turn_execution_window_checkpointed(
+        &self,
+        window_id: &str,
+        updated_at: DateTimeWithTimeZone,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_checkpointed(
+            &self.connection,
+            window_id,
+            updated_at,
+        )
+        .await
+    }
+
+    pub async fn mark_turn_execution_window_continued(
+        &self,
+        window_id: &str,
+        updated_at: DateTimeWithTimeZone,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_continued(
+            &self.connection,
+            window_id,
+            updated_at,
+        )
+        .await
+    }
+
+    pub async fn mark_turn_execution_window_completed(
+        &self,
+        window_id: &str,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_completed(
+            &self.connection,
+            window_id,
+            stats,
+        )
+        .await
+    }
+
+    pub async fn mark_turn_execution_window_blocked(
+        &self,
+        window_id: &str,
+        reason: Option<pioneer_protocol::ExecutionWindowExhaustionReason>,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_blocked(
+            &self.connection,
+            window_id,
+            reason,
+            stats,
+        )
+        .await
+    }
+
+    pub async fn save_turn_execution_checkpoint(
+        &self,
+        record: NewTurnExecutionCheckpointRecord,
+    ) -> Result<TurnExecutionCheckpointRecord> {
+        turn_execution_window::save_turn_execution_checkpoint(&self.connection, record).await
+    }
+
+    pub async fn get_turn_execution_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<TurnExecutionCheckpointRecord>> {
+        turn_execution_window::get_turn_execution_checkpoint(&self.connection, checkpoint_id).await
+    }
+
+    pub async fn list_turn_execution_checkpoints_for_window(
+        &self,
+        window_id: &str,
+    ) -> Result<Vec<TurnExecutionCheckpointRecord>> {
+        turn_execution_window::list_turn_execution_checkpoints_for_window(
+            &self.connection,
+            window_id,
+        )
+        .await
+    }
+
+    pub async fn latest_turn_execution_checkpoint_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionCheckpointRecord>> {
+        turn_execution_window::latest_turn_execution_checkpoint_for_turn(&self.connection, turn_id)
+            .await
+    }
+
+    pub async fn delete_turn_execution_checkpoints_for_turn(&self, turn_id: &str) -> Result<u64> {
+        turn_execution_window::delete_turn_execution_checkpoints_for_turn(&self.connection, turn_id)
+            .await
+    }
+
+    pub async fn delete_turn_execution_checkpoints_for_window(
+        &self,
+        window_id: &str,
+    ) -> Result<u64> {
+        turn_execution_window::delete_turn_execution_checkpoints_for_window(
+            &self.connection,
+            window_id,
+        )
+        .await
+    }
+
+    pub async fn delete_turn_execution_windows_for_turn(&self, turn_id: &str) -> Result<u64> {
+        turn_execution_window::delete_turn_execution_windows_for_turn(&self.connection, turn_id)
+            .await
+    }
+
+    pub async fn delete_turn_execution_data_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<TurnExecutionDataCleanupRecord> {
+        turn_execution_window::delete_turn_execution_data_for_turn(&self.connection, turn_id).await
     }
 
     pub async fn ingest_artifact_metadata(
@@ -2847,6 +3027,66 @@ impl CrudStore {
         .await
     }
 
+    pub async fn materialize_turn_execution_window_started(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowStartedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnExecutionWindowStarted(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn materialize_turn_execution_window_exhausted(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnExecutionWindowExhausted(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn materialize_turn_execution_window_checkpointed(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnExecutionWindowCheckpointed(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn materialize_turn_execution_window_continued(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowContinuedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnExecutionWindowContinued(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
+    pub async fn materialize_turn_execution_window_blocked(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowBlockedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnExecutionWindowBlocked(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
     pub async fn materialize_turn_completed(
         &self,
         notification: pioneer_protocol::TurnCompletedNotification,
@@ -4416,6 +4656,34 @@ impl CrudStore {
         )))
     }
 
+    pub async fn get_turn_inputs(&self, turn_id: &str) -> Result<Vec<UserInput>> {
+        let rows = turn::find_turn_inputs(&self.connection, turn_id).await?;
+        let mut inputs = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            match serde_json::from_str::<UserInput>(row.payload.as_str()) {
+                Ok(input) => inputs.push(input),
+                Err(error) if row.input_type == "text" => {
+                    if let Some(text) = row.text {
+                        inputs.push(UserInput::Text {
+                            text,
+                            text_elements: Vec::new(),
+                        });
+                    } else {
+                        return Err(error)
+                            .with_context(|| format!("failed to decode turn input `{}`", row.id));
+                    }
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to decode turn input `{}`", row.id));
+                }
+            }
+        }
+
+        Ok(inputs)
+    }
+
     pub async fn update_turn_prompt_manifest(
         &self,
         thread_id: &str,
@@ -4433,6 +4701,40 @@ impl CrudStore {
                 unix_to_datetime(event_timestamp_secs),
             )
             .await
+        })
+        .await
+    }
+
+    pub async fn update_turn_status(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        status: TurnStatus,
+        error: Option<&str>,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let updated_at = unix_to_datetime(event_timestamp_secs);
+            let updated = turn::update_turn_status(
+                &self.connection,
+                thread_id,
+                turn_id,
+                status,
+                error,
+                updated_at,
+            )
+            .await?;
+            if updated {
+                turn::append_turn_status_history(
+                    &self.connection,
+                    turn_id,
+                    status,
+                    error.map(str::to_owned),
+                    updated_at,
+                )
+                .await?;
+            }
+            Ok(updated)
         })
         .await
     }
@@ -4696,6 +4998,21 @@ impl CrudStore {
                         action: notification.action,
                         reason: notification.reason,
                     }
+                }
+                TurnEventPayload::TurnExecutionWindowStarted(notification) => {
+                    TurnItemEventPayload::TurnExecutionWindowStarted(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowExhausted(notification) => {
+                    TurnItemEventPayload::TurnExecutionWindowExhausted(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowCheckpointed(notification) => {
+                    TurnItemEventPayload::TurnExecutionWindowCheckpointed(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowContinued(notification) => {
+                    TurnItemEventPayload::TurnExecutionWindowContinued(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowBlocked(notification) => {
+                    TurnItemEventPayload::TurnExecutionWindowBlocked(notification)
                 }
                 TurnEventPayload::TurnStarted(_)
                 | TurnEventPayload::TurnCompleted(_)
@@ -6288,6 +6605,21 @@ impl CrudStore {
                         reason: notification.reason,
                     }
                 }
+                TurnEventPayload::TurnExecutionWindowStarted(notification) => {
+                    ThreadHistoryEventPayload::TurnExecutionWindowStarted(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowExhausted(notification) => {
+                    ThreadHistoryEventPayload::TurnExecutionWindowExhausted(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowCheckpointed(notification) => {
+                    ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowContinued(notification) => {
+                    ThreadHistoryEventPayload::TurnExecutionWindowContinued(notification)
+                }
+                TurnEventPayload::TurnExecutionWindowBlocked(notification) => {
+                    ThreadHistoryEventPayload::TurnExecutionWindowBlocked(notification)
+                }
                 TurnEventPayload::TurnCompleted(notification) => {
                     ThreadHistoryEventPayload::TurnCompleted {
                         workspace_id: notification.workspace_id,
@@ -6627,7 +6959,10 @@ impl CrudStore {
                 else {
                     continue;
                 };
-                if !matches!(turn_model.status.as_str(), "completed" | "failed" | "interrupted") {
+                if !matches!(
+                    turn_model.status.as_str(),
+                    "completed" | "failed" | "interrupted" | "blocked"
+                ) {
                     continue;
                 }
 
@@ -8332,18 +8667,22 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 mod tests {
     use super::{
         ClaimedRecoveryActivation, CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
-        McpServerInstallationRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
+        McpServerInstallationRecord, NewTurnExecutionCheckpointRecord,
+        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
         SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, TurnItemAttemptDeadlines,
-        TurnMcpBindingRecord, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
+        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
+        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnSkillBindingRecord,
+        WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
-        ItemCompletedNotification, ItemRecoveryAttachedNotification,
-        ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-        ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-        ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
+        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemCompletedNotification,
+        ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+        ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+        ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification,
+        ItemStartedNotification, ItemTimeoutDetectedNotification,
         ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
         ItemToolRetryScheduledNotification, PromptManifest, PromptManifestDiagnostic,
         PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
@@ -11018,6 +11357,466 @@ mod tests {
         assert!(
             table_after_down.is_none(),
             "turn_llm_context table should be dropped by down migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_creates_execution_window_tables_indexes_and_entity_columns() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        for table_name in ["turn_execution_window", "turn_execution_checkpoint"] {
+            let table = connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    format!(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}'"
+                    ),
+                ))
+                .await
+                .expect("table lookup should succeed");
+            assert!(table.is_some(), "{table_name} table should exist");
+        }
+
+        let window_columns = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA table_info('turn_execution_window')".to_owned(),
+            ))
+            .await
+            .expect("window column lookup should succeed")
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "name").expect("column name"))
+            .collect::<Vec<_>>();
+        for expected in [
+            "id",
+            "workspace_id",
+            "thread_id",
+            "turn_id",
+            "window_index",
+            "status",
+            "exhaustion_reason",
+            "agent_round_count",
+            "tool_call_count",
+            "provider_token_count",
+            "metadata_json",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                window_columns.iter().any(|column| column == expected),
+                "missing turn_execution_window column {expected}"
+            );
+        }
+
+        let checkpoint_columns = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA table_info('turn_execution_checkpoint')".to_owned(),
+            ))
+            .await
+            .expect("checkpoint column lookup should succeed")
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "name").expect("column name"))
+            .collect::<Vec<_>>();
+        for expected in [
+            "id",
+            "window_id",
+            "workspace_id",
+            "thread_id",
+            "turn_id",
+            "checkpoint_kind",
+            "payload_json",
+            "created_at",
+        ] {
+            assert!(
+                checkpoint_columns.iter().any(|column| column == expected),
+                "missing turn_execution_checkpoint column {expected}"
+            );
+        }
+
+        let window_indexes = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA index_list('turn_execution_window')".to_owned(),
+            ))
+            .await
+            .expect("window index lookup should succeed")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").expect("index name"),
+                    row.try_get::<i64>("", "unique").expect("index unique flag"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for expected in [
+            "uidx_turn_execution_window_turn_index",
+            "idx_turn_execution_window_turn_id",
+            "idx_turn_execution_window_thread_turn",
+            "idx_turn_execution_window_status",
+        ] {
+            assert!(
+                window_indexes.iter().any(|(name, _)| name == expected),
+                "missing turn_execution_window index {expected}"
+            );
+        }
+        assert!(
+            window_indexes.iter().any(|(name, unique)| name
+                == "uidx_turn_execution_window_turn_index"
+                && *unique == 1),
+            "turn_id/window_index index should be unique"
+        );
+
+        let checkpoint_indexes = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA index_list('turn_execution_checkpoint')".to_owned(),
+            ))
+            .await
+            .expect("checkpoint index lookup should succeed")
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "name").expect("index name"))
+            .collect::<Vec<_>>();
+        for expected in [
+            "idx_turn_execution_checkpoint_window",
+            "idx_turn_execution_checkpoint_turn",
+            "idx_turn_execution_checkpoint_thread_turn",
+            "idx_turn_execution_checkpoint_kind",
+        ] {
+            assert!(
+                checkpoint_indexes.iter().any(|name| name == expected),
+                "missing turn_execution_checkpoint index {expected}"
+            );
+        }
+
+        assert!(
+            pioneer_entity::turn_execution_window::Entity::find()
+                .all(&connection)
+                .await
+                .expect("window entity should match migration columns")
+                .is_empty()
+        );
+        assert!(
+            pioneer_entity::turn_execution_checkpoint::Entity::find()
+                .all(&connection)
+                .await
+                .expect("checkpoint entity should match migration columns")
+                .is_empty()
+        );
+
+        Migrator::down(&connection, None)
+            .await
+            .expect("migration down should succeed");
+        for table_name in ["turn_execution_window", "turn_execution_checkpoint"] {
+            let table = connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    format!(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}'"
+                    ),
+                ))
+                .await
+                .expect("table lookup after down should succeed");
+            assert!(table.is_none(), "{table_name} table should be dropped");
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_window_repository_round_trips_lifecycle_checkpoints_and_cleanup() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let timestamp = unix_to_datetime(1_700_000_000);
+
+        let first_window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_window".to_owned(),
+                    thread_id: "thr_window".to_owned(),
+                    turn_id: "turn_window".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({ "phase": "start" }),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("first window should insert");
+        assert_eq!(first_window.window_index, 1);
+
+        let duplicate = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_window".to_owned(),
+                    thread_id: "thr_window".to_owned(),
+                    turn_id: "turn_window".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await;
+        assert!(
+            duplicate.is_err(),
+            "duplicate window index should be rejected before insert"
+        );
+
+        let exhausted = store
+            .mark_turn_execution_window_exhausted(
+                first_window.id.as_str(),
+                ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 7,
+                    tool_call_count: 11,
+                    provider_token_count: 13,
+                    metadata_json: serde_json::json!({ "phase": "exhausted" }),
+                    completed_at: timestamp + chrono::Duration::seconds(10),
+                    updated_at: timestamp + chrono::Duration::seconds(10),
+                },
+            )
+            .await
+            .expect("window should mark exhausted");
+        assert_eq!(exhausted.status, ExecutionWindowStatus::Exhausted);
+        assert_eq!(
+            exhausted.exhaustion_reason,
+            Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow)
+        );
+
+        let checkpoint = store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                window_id: first_window.id.clone(),
+                workspace_id: first_window.workspace_id.clone(),
+                thread_id: first_window.thread_id.clone(),
+                turn_id: first_window.turn_id.clone(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: serde_json::json!({
+                    "turn_id": first_window.turn_id.clone(),
+                    "window_index": first_window.window_index,
+                    "summary": "bounded runtime facts only"
+                }),
+                created_at: timestamp + chrono::Duration::seconds(11),
+            })
+            .await
+            .expect("checkpoint should save");
+        assert_eq!(
+            checkpoint.checkpoint_kind,
+            TurnExecutionCheckpointKind::WindowExhausted
+        );
+
+        assert_eq!(
+            store
+                .list_turn_execution_checkpoints_for_window(first_window.id.as_str())
+                .await
+                .expect("window checkpoints should list")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn_window")
+                .await
+                .expect("latest checkpoint should load")
+                .expect("latest checkpoint should exist")
+                .id,
+            checkpoint.id
+        );
+
+        let oversized = serde_json::json!({
+            "payload": "x".repeat(super::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1)
+        });
+        let oversized_result = store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                window_id: first_window.id.clone(),
+                workspace_id: first_window.workspace_id.clone(),
+                thread_id: first_window.thread_id.clone(),
+                turn_id: first_window.turn_id.clone(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: oversized,
+                created_at: timestamp,
+            })
+            .await;
+        assert!(
+            oversized_result.is_err(),
+            "oversized checkpoint payload should be rejected"
+        );
+
+        store
+            .mark_turn_execution_window_checkpointed(
+                first_window.id.as_str(),
+                timestamp + chrono::Duration::seconds(12),
+            )
+            .await
+            .expect("window should mark checkpointed");
+        store
+            .mark_turn_execution_window_continued(
+                first_window.id.as_str(),
+                timestamp + chrono::Duration::seconds(13),
+            )
+            .await
+            .expect("window should mark continued");
+
+        let second_window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_window".to_owned(),
+                    thread_id: "thr_window".to_owned(),
+                    turn_id: "turn_window".to_owned(),
+                    window_index: 2,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: timestamp + chrono::Duration::seconds(14),
+                },
+                timestamp + chrono::Duration::seconds(14),
+                timestamp + chrono::Duration::seconds(14),
+            )
+            .await
+            .expect("second monotonic window should insert");
+        let completed = store
+            .mark_turn_execution_window_completed(
+                second_window.id.as_str(),
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 3,
+                    tool_call_count: 5,
+                    provider_token_count: 8,
+                    metadata_json: serde_json::json!({ "phase": "completed" }),
+                    completed_at: timestamp + chrono::Duration::seconds(15),
+                    updated_at: timestamp + chrono::Duration::seconds(15),
+                },
+            )
+            .await
+            .expect("window should mark completed");
+        assert_eq!(completed.status, ExecutionWindowStatus::Completed);
+        assert_eq!(completed.exhaustion_reason, None);
+
+        let blocked = store
+            .mark_turn_execution_window_blocked(
+                second_window.id.as_str(),
+                Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
+                TurnExecutionWindowStatsRecord {
+                    agent_round_count: 3,
+                    tool_call_count: 5,
+                    provider_token_count: 8,
+                    metadata_json: serde_json::json!({ "phase": "blocked" }),
+                    completed_at: timestamp + chrono::Duration::seconds(16),
+                    updated_at: timestamp + chrono::Duration::seconds(16),
+                },
+            )
+            .await
+            .expect("window should mark blocked");
+        assert_eq!(blocked.status, ExecutionWindowStatus::Blocked);
+        assert_eq!(
+            blocked.exhaustion_reason,
+            Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow)
+        );
+        assert_eq!(
+            store
+                .latest_turn_execution_window("turn_window")
+                .await
+                .expect("latest window should load")
+                .expect("latest window should exist")
+                .id,
+            second_window.id
+        );
+
+        let aggregate = store
+            .aggregate_turn_execution_window_usage("turn_window")
+            .await
+            .expect("execution window usage should aggregate");
+        assert_eq!(
+            aggregate,
+            TurnExecutionWindowUsageAggregateRecord {
+                total_windows: 2,
+                total_agent_rounds: 10,
+                total_tool_calls: 16,
+                total_wall_clock_ms: 12_000,
+                wall_clock_window_count: 2,
+                total_provider_tokens: 21,
+            }
+        );
+
+        store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_window".to_owned(),
+                    thread_id: "thr_window".to_owned(),
+                    turn_id: "turn_window_missing_tokens".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 2,
+                    tool_call_count: 4,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({ "phase": "running_without_tokens" }),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("window with missing token usage should insert");
+        let missing_token_aggregate = store
+            .aggregate_turn_execution_window_usage("turn_window_missing_tokens")
+            .await
+            .expect("missing token usage should not block aggregate counters");
+        assert_eq!(
+            missing_token_aggregate,
+            TurnExecutionWindowUsageAggregateRecord {
+                total_windows: 1,
+                total_agent_rounds: 2,
+                total_tool_calls: 4,
+                total_wall_clock_ms: 0,
+                wall_clock_window_count: 0,
+                total_provider_tokens: 0,
+            }
+        );
+
+        let cleanup = store
+            .delete_turn_execution_data_for_turn("turn_window")
+            .await
+            .expect("execution data cleanup should succeed");
+        assert_eq!(cleanup.checkpoints_deleted, 1);
+        assert_eq!(cleanup.windows_deleted, 2);
+        assert!(
+            store
+                .list_turn_execution_windows("turn_window")
+                .await
+                .expect("windows should list after cleanup")
+                .is_empty()
+        );
+        assert!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn_window")
+                .await
+                .expect("latest checkpoint should load after cleanup")
+                .is_none()
         );
     }
 

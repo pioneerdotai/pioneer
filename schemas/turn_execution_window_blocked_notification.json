@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnExecutionWindowBlockedNotification",
+  "type": "object",
+  "properties": {
+    "blocked_at_unix_ms": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "checkpoint_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "exhaustion_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ExecutionWindowStatus"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "total_tool_calls": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "total_windows": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "window_id": {
+      "type": "string"
+    },
+    "window_index": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "window_id",
+    "window_index",
+    "status",
+    "total_windows",
+    "total_tool_calls",
+    "reason",
+    "blocked_at_unix_ms"
+  ],
+  "$defs": {
+    "ExecutionWindowExhaustionReason": {
+      "type": "string",
+      "enum": [
+        "max_agent_rounds_per_window",
+        "max_tool_calls_per_window",
+        "max_wall_clock_ms_per_window",
+        "max_provider_tokens_per_window",
+        "provider_failure_continuation",
+        "runtime_shutdown_continuation"
+      ]
+    },
+    "ExecutionWindowStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "exhausted",
+        "checkpointed",
+        "continued",
+        "completed",
+        "blocked",
+        "failed"
+      ]
+    }
+  }
+}

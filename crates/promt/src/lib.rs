@@ -24,6 +24,11 @@ pub use hooks::{
 };
 pub use profile::PromptProfile;
 pub use render::{
+    execution_continuation::{
+        ExecutionContinuationRuntimeFactsInput, execution_continuation_section,
+        execution_continuation_section_with_runtime_facts, render_execution_continuation_prompt,
+        render_execution_continuation_runtime_facts,
+    },
     memory_active_recall_contract::{
         MemoryActiveRecallProviderOutputContractInput, MemoryActiveRecallProviderOutputPath,
         render_memory_active_recall_provider_output_contract,

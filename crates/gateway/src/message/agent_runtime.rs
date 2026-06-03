@@ -56,10 +56,71 @@ fn now_db_timestamp() -> sea_orm::entity::prelude::DateTimeWithTimeZone {
     chrono::Utc::now().fixed_offset()
 }
 
+fn db_timestamp_from_unix_ms(value: i64) -> sea_orm::entity::prelude::DateTimeWithTimeZone {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+        .map(|timestamp| timestamp.fixed_offset())
+        .unwrap_or_else(now_db_timestamp)
+}
+
 fn llm_context_expires_at(
     created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
 ) -> sea_orm::entity::prelude::DateTimeWithTimeZone {
     created_at + chrono::Duration::seconds(ACTIVE_TURN_LLM_CONTEXT_TTL_SECS)
+}
+
+fn execution_window_started_metadata(runtime_window_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "runtimeWindowId": runtime_window_id,
+    })
+}
+
+fn execution_window_exhausted_metadata(
+    runtime_window_id: &str,
+    limit: u64,
+    observed: u64,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "runtimeWindowId": runtime_window_id,
+        "limit": limit,
+        "observed": observed,
+        "reason": reason,
+    })
+}
+
+fn execution_window_blocked_metadata(
+    runtime_window_id: &str,
+    total_windows: u32,
+    total_tool_calls: u32,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "runtimeWindowId": runtime_window_id,
+        "totalWindows": total_windows,
+        "totalToolCalls": total_tool_calls,
+        "reason": reason,
+    })
+}
+
+fn execution_window_can_create_after(
+    latest: Option<&pioneer_crud::TurnExecutionWindowRecord>,
+    window_index: u32,
+) -> bool {
+    match latest {
+        None => window_index == 1,
+        Some(window) => window.window_index.saturating_add(1) == window_index,
+    }
+}
+
+fn execution_checkpoint_kind_from_wire(
+    value: &str,
+) -> Option<pioneer_crud::TurnExecutionCheckpointKind> {
+    match value {
+        "window_exhausted" => Some(pioneer_crud::TurnExecutionCheckpointKind::WindowExhausted),
+        "turn_blocked" => Some(pioneer_crud::TurnExecutionCheckpointKind::TurnBlocked),
+        "startup_recovery" => Some(pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery),
+        _ => None,
+    }
 }
 
 fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
@@ -86,6 +147,21 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
             Some(notification.thread_id.as_str())
         }
         AgentDurableEvent::TurnToolLoopBudgetExceeded { notification } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
             Some(notification.thread_id.as_str())
         }
         AgentDurableEvent::TaskEvent { .. } | AgentDurableEvent::ThreadLineageCreated { .. } => {
@@ -1000,6 +1076,590 @@ impl MessageProcessor {
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
                     TurnTimelineChangedReason::ChildTurnChanged,
+                )
+                .await;
+            }
+            AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
+                let thread_id = notification.thread_id.clone();
+                let turn_id = notification.turn_id.clone();
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_execution_window_started(
+                        notification.clone(),
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.mark_turn_failed(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to persist turn/execution_window/started: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                let latest = match self
+                    .crud_store
+                    .latest_turn_execution_window(notification.turn_id.as_str())
+                    .await
+                {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to load latest execution window: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                if execution_window_can_create_after(latest.as_ref(), notification.window_index) {
+                    if let Err(error) = self
+                        .crud_store
+                        .create_turn_execution_window(
+                            pioneer_crud::NewTurnExecutionWindowRecord {
+                                workspace_id: notification.workspace_id.clone(),
+                                thread_id: notification.thread_id.clone(),
+                                turn_id: notification.turn_id.clone(),
+                                window_index: notification.window_index,
+                                status: notification.status,
+                                exhaustion_reason: None,
+                                agent_round_count: 0,
+                                tool_call_count: 0,
+                                provider_token_count: 0,
+                                metadata_json: execution_window_started_metadata(
+                                    notification.window_id.as_str(),
+                                ),
+                                started_at: db_timestamp_from_unix_ms(
+                                    notification.started_at_unix_ms,
+                                ),
+                            },
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                        )
+                        .await
+                    {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to create execution window: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                } else if latest
+                    .as_ref()
+                    .is_some_and(|window| window.window_index < notification.window_index)
+                {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        latest_window_index = latest.as_ref().map(|window| window.window_index),
+                        event_window_index = notification.window_index,
+                        "skipping out-of-order execution window started event"
+                    );
+                }
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_STARTED,
+                    &notification,
+                )
+                .await;
+            }
+            AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+                let thread_id = notification.thread_id.clone();
+                let turn_id = notification.turn_id.clone();
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_execution_window_exhausted(
+                        notification.clone(),
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.mark_turn_failed(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to persist turn/execution_window/exhausted: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                let latest = match self
+                    .crud_store
+                    .latest_turn_execution_window(notification.turn_id.as_str())
+                    .await
+                {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to load execution window for exhaustion: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                let window = if latest
+                    .as_ref()
+                    .is_some_and(|window| window.window_index == notification.window_index)
+                {
+                    latest
+                } else if execution_window_can_create_after(
+                    latest.as_ref(),
+                    notification.window_index,
+                ) {
+                    match self
+                        .crud_store
+                        .create_turn_execution_window(
+                            pioneer_crud::NewTurnExecutionWindowRecord {
+                                workspace_id: notification.workspace_id.clone(),
+                                thread_id: notification.thread_id.clone(),
+                                turn_id: notification.turn_id.clone(),
+                                window_index: notification.window_index,
+                                status: pioneer_protocol::ExecutionWindowStatus::Running,
+                                exhaustion_reason: None,
+                                agent_round_count: 0,
+                                tool_call_count: 0,
+                                provider_token_count: 0,
+                                metadata_json: execution_window_started_metadata(
+                                    notification.window_id.as_str(),
+                                ),
+                                started_at: db_timestamp_from_unix_ms(
+                                    notification.started_at_unix_ms,
+                                ),
+                            },
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                        )
+                        .await
+                    {
+                        Ok(window) => Some(window),
+                        Err(error) => {
+                            self.mark_turn_failed(
+                                thread_id.clone(),
+                                turn_id.clone(),
+                                format!(
+                                    "failed to create execution window for exhaustion: {error:#}"
+                                ),
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                } else {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        latest_window_index = latest.as_ref().map(|window| window.window_index),
+                        event_window_index = notification.window_index,
+                        "skipping out-of-order execution window exhausted event"
+                    );
+                    None
+                };
+                if let Some(window) = window
+                    && let Err(error) = self
+                        .crud_store
+                        .mark_turn_execution_window_exhausted(
+                            window.id.as_str(),
+                            notification.exhaustion_reason,
+                            pioneer_crud::TurnExecutionWindowStatsRecord {
+                                agent_round_count: notification.agent_round_count,
+                                tool_call_count: notification.tool_call_count,
+                                provider_token_count: notification
+                                    .provider_token_count
+                                    .unwrap_or(0),
+                                metadata_json: execution_window_exhausted_metadata(
+                                    notification.window_id.as_str(),
+                                    notification.limit,
+                                    notification.observed,
+                                    notification.reason.as_str(),
+                                ),
+                                completed_at: db_timestamp_from_unix_ms(
+                                    notification.exhausted_at_unix_ms,
+                                ),
+                                updated_at: now_db_timestamp(),
+                            },
+                        )
+                        .await
+                {
+                    self.mark_turn_failed(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to mark execution window exhausted: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_EXHAUSTED,
+                    &notification,
+                )
+                .await;
+            }
+            AgentDurableEvent::TurnExecutionWindowCheckpointed {
+                notification,
+                payload,
+            } => {
+                let thread_id = notification.thread_id.clone();
+                let turn_id = notification.turn_id.clone();
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_execution_window_checkpointed(
+                        notification.clone(),
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.mark_turn_failed(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to persist turn/execution_window/checkpointed: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                let latest = match self
+                    .crud_store
+                    .latest_turn_execution_window(notification.turn_id.as_str())
+                    .await
+                {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to load execution window for checkpoint: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                if let Some(window) =
+                    latest.filter(|window| window.window_index == notification.window_index)
+                {
+                    let Some(checkpoint_kind) =
+                        execution_checkpoint_kind_from_wire(notification.checkpoint_kind.as_str())
+                    else {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            checkpoint_kind = %notification.checkpoint_kind,
+                            "skipping execution window checkpoint with unknown kind"
+                        );
+                        self.send_notification_to_thread_subscribers(
+                            notification.thread_id.as_str(),
+                            events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+                            &notification,
+                        )
+                        .await;
+                        return true;
+                    };
+                    let payload_json = match serde_json::to_value(&payload) {
+                        Ok(payload_json) => payload_json,
+                        Err(error) => {
+                            warn!(
+                                turn_id = %notification.turn_id,
+                                error = %format!("{error:#}"),
+                                "skipping execution window checkpoint with unserializable payload"
+                            );
+                            self.send_notification_to_thread_subscribers(
+                                notification.thread_id.as_str(),
+                                events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+                                &notification,
+                            )
+                            .await;
+                            return true;
+                        }
+                    };
+                    let payload_size = serde_json::to_vec(&payload_json)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(usize::MAX);
+                    if payload_size > pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            payload_size,
+                            max_payload_size =
+                                pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+                            "skipping oversized execution window checkpoint payload"
+                        );
+                        self.send_notification_to_thread_subscribers(
+                            notification.thread_id.as_str(),
+                            events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+                            &notification,
+                        )
+                        .await;
+                        return true;
+                    }
+                    if let Err(error) = self
+                        .crud_store
+                        .save_turn_execution_checkpoint(
+                            pioneer_crud::NewTurnExecutionCheckpointRecord {
+                                window_id: window.id.clone(),
+                                workspace_id: notification.workspace_id.clone(),
+                                thread_id: notification.thread_id.clone(),
+                                turn_id: notification.turn_id.clone(),
+                                checkpoint_kind,
+                                payload_json,
+                                created_at: db_timestamp_from_unix_ms(
+                                    notification.created_at_unix_ms,
+                                ),
+                            },
+                        )
+                        .await
+                    {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to save execution window checkpoint: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                    if let Err(error) = self
+                        .crud_store
+                        .mark_turn_execution_window_checkpointed(
+                            window.id.as_str(),
+                            db_timestamp_from_unix_ms(notification.created_at_unix_ms),
+                        )
+                        .await
+                    {
+                        self.mark_turn_failed(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("failed to mark execution window checkpointed: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                } else {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        event_window_index = notification.window_index,
+                        "skipping execution window checkpoint without matching stored window"
+                    );
+                }
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+                    &notification,
+                )
+                .await;
+            }
+            AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_execution_window_continued(
+                        notification.clone(),
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.mark_turn_failed(
+                        notification.thread_id.clone(),
+                        notification.turn_id.clone(),
+                        format!("failed to persist turn/execution_window/continued: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                match self
+                    .crud_store
+                    .latest_turn_execution_window(notification.turn_id.as_str())
+                    .await
+                {
+                    Ok(Some(window))
+                        if window.window_index == notification.previous_window_index =>
+                    {
+                        if let Err(error) = self
+                            .crud_store
+                            .mark_turn_execution_window_continued(
+                                window.id.as_str(),
+                                db_timestamp_from_unix_ms(notification.continued_at_unix_ms),
+                            )
+                            .await
+                        {
+                            self.mark_turn_failed(
+                                notification.thread_id.clone(),
+                                notification.turn_id.clone(),
+                                format!("failed to mark execution window continued: {error:#}"),
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                    Ok(Some(window)) => {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            latest_window_index = window.window_index,
+                            previous_window_index = notification.previous_window_index,
+                            "skipping out-of-order execution window continued state update"
+                        );
+                    }
+                    Ok(None) => {
+                        warn!(
+                            turn_id = %notification.turn_id,
+                            previous_window_index = notification.previous_window_index,
+                            "skipping execution window continued state update without stored window"
+                        );
+                    }
+                    Err(error) => {
+                        self.mark_turn_failed(
+                            notification.thread_id.clone(),
+                            notification.turn_id.clone(),
+                            format!("failed to load execution window for continuation: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                }
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_CONTINUED,
+                    &notification,
+                )
+                .await;
+            }
+            AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_execution_window_blocked(
+                        notification.clone(),
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    self.mark_turn_failed(
+                        notification.thread_id.clone(),
+                        notification.turn_id.clone(),
+                        format!("failed to persist turn/execution_window/blocked: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                let latest = match self
+                    .crud_store
+                    .latest_turn_execution_window(notification.turn_id.as_str())
+                    .await
+                {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        self.mark_turn_failed(
+                            notification.thread_id.clone(),
+                            notification.turn_id.clone(),
+                            format!("failed to load execution window for blocked state: {error:#}"),
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                let window = if latest
+                    .as_ref()
+                    .is_some_and(|window| window.window_index == notification.window_index)
+                {
+                    latest
+                } else if execution_window_can_create_after(
+                    latest.as_ref(),
+                    notification.window_index,
+                ) {
+                    match self
+                        .crud_store
+                        .create_turn_execution_window(
+                            pioneer_crud::NewTurnExecutionWindowRecord {
+                                workspace_id: notification.workspace_id.clone(),
+                                thread_id: notification.thread_id.clone(),
+                                turn_id: notification.turn_id.clone(),
+                                window_index: notification.window_index,
+                                status: pioneer_protocol::ExecutionWindowStatus::Running,
+                                exhaustion_reason: None,
+                                agent_round_count: 0,
+                                tool_call_count: 0,
+                                provider_token_count: 0,
+                                metadata_json: execution_window_started_metadata(
+                                    notification.window_id.as_str(),
+                                ),
+                                started_at: db_timestamp_from_unix_ms(
+                                    notification.blocked_at_unix_ms,
+                                ),
+                            },
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                            db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000)),
+                        )
+                        .await
+                    {
+                        Ok(window) => Some(window),
+                        Err(error) => {
+                            self.mark_turn_failed(
+                                notification.thread_id.clone(),
+                                notification.turn_id.clone(),
+                                format!(
+                                    "failed to create execution window for blocked state: {error:#}"
+                                ),
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                } else {
+                    warn!(
+                        turn_id = %notification.turn_id,
+                        latest_window_index = latest.as_ref().map(|window| window.window_index),
+                        event_window_index = notification.window_index,
+                        "skipping out-of-order execution window blocked state update"
+                    );
+                    None
+                };
+                if let Some(window) = window
+                    && let Err(error) = self
+                        .crud_store
+                        .mark_turn_execution_window_blocked(
+                            window.id.as_str(),
+                            notification.exhaustion_reason,
+                            pioneer_crud::TurnExecutionWindowStatsRecord {
+                                agent_round_count: 0,
+                                tool_call_count: notification.total_tool_calls,
+                                provider_token_count: 0,
+                                metadata_json: execution_window_blocked_metadata(
+                                    notification.window_id.as_str(),
+                                    notification.total_windows,
+                                    notification.total_tool_calls,
+                                    notification.reason.as_str(),
+                                ),
+                                completed_at: db_timestamp_from_unix_ms(
+                                    notification.blocked_at_unix_ms,
+                                ),
+                                updated_at: now_db_timestamp(),
+                            },
+                        )
+                        .await
+                {
+                    self.mark_turn_failed(
+                        notification.thread_id.clone(),
+                        notification.turn_id.clone(),
+                        format!("failed to mark execution window blocked: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                if !self
+                    .mark_turn_blocked(
+                        notification.thread_id.clone(),
+                        notification.turn_id.clone(),
+                        notification.reason.clone(),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::TURN_EXECUTION_WINDOW_BLOCKED,
+                    &notification,
                 )
                 .await;
             }
@@ -2274,6 +2934,91 @@ impl MessageProcessor {
         {
             self.agent_manager.remove_thread(thread_id.as_str()).await;
         }
+        true
+    }
+
+    pub(super) async fn mark_turn_blocked(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+    ) -> bool {
+        if let Some((_workspace_id, current_turn)) = self
+            .thread_manager
+            .turn_get(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            if current_turn.status == TurnStatus::Blocked {
+                return true;
+            }
+            if current_turn.status != TurnStatus::InProgress {
+                return false;
+            }
+        }
+
+        let finish_outcome = match self
+            .thread_manager
+            .turn_finish(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                TurnStatus::Blocked,
+                Some(reason.clone()),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to mark turn as blocked"
+                );
+                return false;
+            }
+        };
+
+        let event_timestamp = now_timestamp_secs();
+        if let Err(error) = self
+            .crud_store
+            .update_turn_status(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                TurnStatus::Blocked,
+                Some(reason.as_str()),
+                event_timestamp,
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_finish(finish_outcome.rollback_context)
+                .await;
+
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to persist turn blocked status"
+            );
+            return false;
+        }
+
+        self.notify_parent_timeline_changed_for_child_turn(
+            finish_outcome.thread_id.as_str(),
+            finish_outcome.turn.id.as_str(),
+            Some(finish_outcome.workspace_id.as_str()),
+            TurnTimelineChangedReason::ChildTurnChanged,
+        )
+        .await;
+
+        if self
+            .thread_manager
+            .unload_orphaned_thread_if_idle(thread_id.as_str())
+            .await
+        {
+            self.agent_manager.remove_thread(thread_id.as_str()).await;
+        }
+
         true
     }
 

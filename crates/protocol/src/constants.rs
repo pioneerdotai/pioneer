@@ -104,6 +104,11 @@ pub mod events {
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_FAILED: &str = "turn/failed";
     pub const TURN_TIMELINE_CHANGED: &str = "turn/timeline/changed";
+    pub const TURN_EXECUTION_WINDOW_STARTED: &str = "turn/execution_window/started";
+    pub const TURN_EXECUTION_WINDOW_EXHAUSTED: &str = "turn/execution_window/exhausted";
+    pub const TURN_EXECUTION_WINDOW_CHECKPOINTED: &str = "turn/execution_window/checkpointed";
+    pub const TURN_EXECUTION_WINDOW_CONTINUED: &str = "turn/execution_window/continued";
+    pub const TURN_EXECUTION_WINDOW_BLOCKED: &str = "turn/execution_window/blocked";
     pub const ITEM_STARTED: &str = "item/started";
     pub const ITEM_AGENT_MESSAGE_DELTA: &str = "item/agent_message/delta";
     pub const ITEM_COMMAND_EXECUTION_OUTPUT_DELTA: &str = "item/command_execution/output_delta";

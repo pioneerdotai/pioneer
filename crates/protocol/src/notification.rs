@@ -23,11 +23,14 @@ use crate::{
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
     ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
-    ThreadUpdatedNotification, TurnCompletedNotification, TurnFailedNotification,
-    TurnStartedNotification, TurnTimelineChangedNotification,
+    ThreadUpdatedNotification, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
     TurnToolLoopBudgetExceededNotification, WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -58,6 +61,11 @@ pub enum GatewayNotification {
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
     TurnTimelineChanged(TurnTimelineChangedNotification),
+    TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
+    TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
+    TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
+    TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
+    TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
     ItemStarted(ItemStartedNotification),
     ItemDelta(ItemDeltaNotification),
     ItemTimeoutDetected(ItemTimeoutDetectedNotification),
@@ -161,6 +169,41 @@ impl GatewayNotification {
                 serde_json::from_value::<TurnTimelineChangedNotification>(params)
                     .ok()
                     .map(Self::TurnTimelineChanged)
+            }
+            events::TURN_EXECUTION_WINDOW_STARTED => {
+                parse_execution_window_notification::<TurnExecutionWindowStartedNotification>(
+                    method,
+                    params,
+                    Self::TurnExecutionWindowStarted,
+                )
+            }
+            events::TURN_EXECUTION_WINDOW_EXHAUSTED => {
+                parse_execution_window_notification::<TurnExecutionWindowExhaustedNotification>(
+                    method,
+                    params,
+                    Self::TurnExecutionWindowExhausted,
+                )
+            }
+            events::TURN_EXECUTION_WINDOW_CHECKPOINTED => {
+                parse_execution_window_notification::<TurnExecutionWindowCheckpointedNotification>(
+                    method,
+                    params,
+                    Self::TurnExecutionWindowCheckpointed,
+                )
+            }
+            events::TURN_EXECUTION_WINDOW_CONTINUED => {
+                parse_execution_window_notification::<TurnExecutionWindowContinuedNotification>(
+                    method,
+                    params,
+                    Self::TurnExecutionWindowContinued,
+                )
+            }
+            events::TURN_EXECUTION_WINDOW_BLOCKED => {
+                parse_execution_window_notification::<TurnExecutionWindowBlockedNotification>(
+                    method,
+                    params,
+                    Self::TurnExecutionWindowBlocked,
+                )
             }
             events::ITEM_STARTED => {
                 match serde_json::from_value::<ItemStartedNotification>(params.clone()) {
@@ -487,6 +530,22 @@ fn unknown_notification(method: String, params: JsonValue) -> UnknownGatewayNoti
     }
 }
 
+fn parse_execution_window_notification<T>(
+    method: String,
+    params: JsonValue,
+    wrap: impl FnOnce(T) -> GatewayNotification,
+) -> Option<GatewayNotification>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value::<T>(params.clone()) {
+        Ok(notification) => Some(wrap(notification)),
+        Err(_) => Some(GatewayNotification::Unknown(unknown_notification(
+            method, params,
+        ))),
+    }
+}
+
 fn extract_workspace_thread_turn_item(
     object: Option<&serde_json::Map<String, JsonValue>>,
 ) -> (
@@ -523,9 +582,10 @@ fn extract_workspace_thread_turn_item(
 mod tests {
     use super::GatewayNotification;
     use crate::{
-        ItemDeltaStream, JsonRpcNotification, MemoryCandidateCreatedNotification,
-        MemoryChangedNotification, MemoryForgottenNotification, RecoveryAction, RecoveryJobStatus,
-        RecoveryTrigger, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
+        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemDeltaStream,
+        JsonRpcNotification, MemoryCandidateCreatedNotification, MemoryChangedNotification,
+        MemoryForgottenNotification, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+        ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolRetryErrorClass,
         ToolRetryExhaustionKind, ToolRetryResolution, TurnItemType, WorkspaceChangeKind,
     };
     use serde_json::json;
@@ -922,6 +982,152 @@ mod tests {
     }
 
     #[test]
+    fn maps_execution_window_lifecycle_notifications() {
+        let started = JsonRpcNotification::from_params(
+            "turn/execution_window/started",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123",
+                "window_id": "win_1",
+                "window_index": 1,
+                "status": "running",
+                "started_at_unix_ms": 1000
+            }),
+        )
+        .expect("started notification should encode");
+        match GatewayNotification::from_jsonrpc(started).expect("started should map") {
+            GatewayNotification::TurnExecutionWindowStarted(notification) => {
+                assert_eq!(notification.window_id, "win_1");
+                assert_eq!(notification.status, ExecutionWindowStatus::Running);
+            }
+            other => panic!("expected execution window started, got {other:?}"),
+        }
+
+        let exhausted = JsonRpcNotification::from_params(
+            "turn/execution_window/exhausted",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123",
+                "window_id": "win_1",
+                "window_index": 1,
+                "status": "exhausted",
+                "exhaustion_reason": "max_tool_calls_per_window",
+                "limit": 512,
+                "observed": 513,
+                "agent_round_count": 20,
+                "tool_call_count": 513,
+                "started_at_unix_ms": 1000,
+                "exhausted_at_unix_ms": 2000,
+                "reason": "tool-call window budget exhausted"
+            }),
+        )
+        .expect("exhausted notification should encode");
+        match GatewayNotification::from_jsonrpc(exhausted).expect("exhausted should map") {
+            GatewayNotification::TurnExecutionWindowExhausted(notification) => {
+                assert_eq!(
+                    notification.exhaustion_reason,
+                    ExecutionWindowExhaustionReason::MaxToolCallsPerWindow
+                );
+                assert_eq!(notification.observed, 513);
+            }
+            other => panic!("expected execution window exhausted, got {other:?}"),
+        }
+
+        let checkpointed = JsonRpcNotification::from_params(
+            "turn/execution_window/checkpointed",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123",
+                "window_id": "win_1",
+                "window_index": 1,
+                "status": "checkpointed",
+                "checkpoint_id": "chk_1",
+                "checkpoint_kind": "window_exhausted",
+                "payload_bytes": 1024,
+                "created_at_unix_ms": 2100
+            }),
+        )
+        .expect("checkpointed notification should encode");
+        match GatewayNotification::from_jsonrpc(checkpointed).expect("checkpointed should map") {
+            GatewayNotification::TurnExecutionWindowCheckpointed(notification) => {
+                assert_eq!(notification.checkpoint_id, "chk_1");
+                assert_eq!(notification.payload_bytes, 1024);
+            }
+            other => panic!("expected execution window checkpointed, got {other:?}"),
+        }
+
+        let continued = JsonRpcNotification::from_params(
+            "turn/execution_window/continued",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123",
+                "window_id": "win_2",
+                "window_index": 2,
+                "status": "continued",
+                "previous_window_id": "win_1",
+                "previous_window_index": 1,
+                "checkpoint_id": "chk_1",
+                "continued_at_unix_ms": 2200
+            }),
+        )
+        .expect("continued notification should encode");
+        match GatewayNotification::from_jsonrpc(continued).expect("continued should map") {
+            GatewayNotification::TurnExecutionWindowContinued(notification) => {
+                assert_eq!(notification.window_id, "win_2");
+                assert_eq!(notification.previous_window_id, "win_1");
+            }
+            other => panic!("expected execution window continued, got {other:?}"),
+        }
+
+        let blocked = JsonRpcNotification::from_params(
+            "turn/execution_window/blocked",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123",
+                "window_id": "win_3",
+                "window_index": 3,
+                "status": "blocked",
+                "exhaustion_reason": "max_wall_clock_ms_per_window",
+                "checkpoint_id": "chk_3",
+                "total_windows": 3,
+                "total_tool_calls": 900,
+                "reason": "total continuation budget exhausted",
+                "blocked_at_unix_ms": 3000
+            }),
+        )
+        .expect("blocked notification should encode");
+        match GatewayNotification::from_jsonrpc(blocked).expect("blocked should map") {
+            GatewayNotification::TurnExecutionWindowBlocked(notification) => {
+                assert_eq!(notification.status, ExecutionWindowStatus::Blocked);
+                assert_eq!(notification.checkpoint_id.as_deref(), Some("chk_3"));
+            }
+            other => panic!("expected execution window blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_malformed_execution_window_notification_to_unknown() {
+        let notification = JsonRpcNotification::from_params(
+            "turn/execution_window/exhausted",
+            &json!({
+                "workspace_id": "ws_123",
+                "thread_id": "thr_123",
+                "turn_id": "turn_123"
+            }),
+        )
+        .expect("malformed window notification should encode");
+
+        let mapped =
+            GatewayNotification::from_jsonrpc(notification).expect("malformed window should map");
+        assert!(matches!(mapped, GatewayNotification::Unknown(_)));
+    }
+
+    #[test]
     fn maps_malformed_tool_retry_notification_to_unknown() {
         let notification: JsonRpcNotification = serde_json::from_value(json!({
             "jsonrpc": "2.0",
@@ -951,6 +1157,13 @@ mod tests {
             "item_tool_retry_resolved_notification.json",
             "item_tool_retry_exhausted_notification.json",
             "turn_tool_loop_budget_exceeded_notification.json",
+            "turn_execution_window_started_notification.json",
+            "turn_execution_window_exhausted_notification.json",
+            "turn_execution_window_checkpointed_notification.json",
+            "turn_execution_window_continued_notification.json",
+            "turn_execution_window_blocked_notification.json",
+            "execution_window_status.json",
+            "execution_window_exhaustion_reason.json",
             "turn_item_event_payload.json",
             "thread_history_event_payload.json",
             "tool_recovery_policy_snapshot.json",

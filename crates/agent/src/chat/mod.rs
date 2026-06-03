@@ -29,11 +29,11 @@ use crate::hooks::{
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
     AgentMcpMaterializationRequest, AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
-    AgentTurnHookRuntimeContext, ResolvedArtifactInput, RetainedToolLlmContext,
-    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext,
-    TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization,
-    TurnToolProvider,
+    AgentTurnHookRuntimeContext, ExecutionCheckpointContext, ExecutionWindowContinuation,
+    ResolvedArtifactInput, RetainedToolLlmContext, ReviewRequiredTaskObservation,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -50,22 +50,29 @@ use pioneer_memory::hooks::{
     memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_promt::{
-    CompiledPromptBundle, PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId,
-    PromptLimits, PromptProfile, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
-    PromptRuntimeSectionInput, ToolRetryInstructionKind, compile_prompt,
+    CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput, PromptCompileInput,
+    PromptDiagnosticCode, PromptDynamicSectionId, PromptLimits, PromptProfile,
+    PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
+    ToolRetryInstructionKind, compile_prompt, execution_continuation_section_with_runtime_facts,
     render_tool_retry_instruction, runtime_sections_with_request_tools_catalog,
     tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
-    ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
+    AgentDurableEvent, AgentProgressEvent, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
+    ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointProviderBudgetSummary,
+    ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemCompletedNotification,
+    ItemDeltaNotification, ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
     PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
     ProviderTransportKind, RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot,
     TurnAcceptedCapability, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnItem, TurnItemType, TurnRejectedCapability, UserInput,
-    generate_id,
+    TurnCapabilityRejectedReason, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemType, TurnRejectedCapability, UserInput,
+    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
+    build_execution_checkpoint_provider_budget_summary, generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
@@ -78,10 +85,10 @@ use pioneer_skills::{
 };
 use pioneer_tools::{
     FinalToolVisibility, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
-    RequestToolsResult, ToolErrorClass, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
-    ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope, ToolResultView,
-    ToolRetryController, ToolRetryDecision, ToolRetryObservation, build_builtin_tools,
-    build_tools_with_environment, classify_tool_error,
+    RequestToolsResult, ToolErrorClass, ToolLoopBudgetExceeded, ToolLoopBudgetReason,
+    ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction, ToolOutcome, ToolOutcomeStatus,
+    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -141,6 +148,7 @@ struct AgentRoundResponse {
     text: String,
     reasoning: String,
     tool_calls: Vec<ProviderToolCall>,
+    provider_token_count: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -413,9 +421,283 @@ pub(super) enum ChatTurnError {
     },
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct ChatTurnOutcome {
-    pub(super) post_turn_dispatch: Option<AgentTurnPostTurnHookDispatch>,
+#[derive(Debug, Clone)]
+pub(super) enum ChatTurnOutcome {
+    Completed {
+        post_turn_dispatch: Option<AgentTurnPostTurnHookDispatch>,
+    },
+    NeedsContinuation(ExecutionWindowContinuation),
+}
+
+impl Default for ChatTurnOutcome {
+    fn default() -> Self {
+        Self::Completed {
+            post_turn_dispatch: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChatExecutionWindowStats {
+    window_index: u32,
+    started_at_unix_ms: i64,
+    agent_round_count: u32,
+    requested_tool_call_count: u32,
+    executed_tool_success_count: u32,
+    executed_tool_failed_count: u32,
+    provider_token_count: Option<u64>,
+}
+
+impl ChatExecutionWindowStats {
+    fn new(window_index: u32) -> Self {
+        Self {
+            window_index,
+            started_at_unix_ms: Local::now().timestamp_millis(),
+            agent_round_count: 0,
+            requested_tool_call_count: 0,
+            executed_tool_success_count: 0,
+            executed_tool_failed_count: 0,
+            provider_token_count: None,
+        }
+    }
+
+    fn record_provider_round(
+        &mut self,
+        requested_tool_calls: usize,
+        provider_token_count: Option<u64>,
+    ) {
+        self.agent_round_count = self.agent_round_count.saturating_add(1);
+        self.requested_tool_call_count = self
+            .requested_tool_call_count
+            .saturating_add(u32::try_from(requested_tool_calls).unwrap_or(u32::MAX));
+        if let Some(provider_token_count) = provider_token_count {
+            self.provider_token_count = Some(
+                self.provider_token_count
+                    .unwrap_or_default()
+                    .saturating_add(provider_token_count),
+            );
+        }
+    }
+
+    fn record_executed_tools(&mut self, results: &[ExecutedToolResult]) {
+        for result in results {
+            if result.success {
+                self.executed_tool_success_count =
+                    self.executed_tool_success_count.saturating_add(1);
+            } else {
+                self.executed_tool_failed_count = self.executed_tool_failed_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn executed_tool_count(&self) -> u32 {
+        self.executed_tool_success_count
+            .saturating_add(self.executed_tool_failed_count)
+    }
+
+    fn checkpoint_window_summary(
+        &self,
+        reason: ExecutionWindowExhaustionReason,
+    ) -> ExecutionCheckpointWindowSummary {
+        ExecutionCheckpointWindowSummary {
+            window_id: None,
+            window_index: self.window_index,
+            started_at_unix_ms: Some(self.started_at_unix_ms),
+            completed_at_unix_ms: Some(Local::now().timestamp_millis()),
+            agent_round_count: self.agent_round_count,
+            tool_call_count: self.requested_tool_call_count,
+            provider_token_count: self.provider_token_count,
+            exhaustion_reason: Some(reason),
+        }
+    }
+
+    fn checkpoint_provider_budget_summary(
+        &self,
+        model: &str,
+        model_provider: &str,
+        budget_exceeded: &ToolLoopBudgetExceeded,
+        reason: ExecutionWindowExhaustionReason,
+    ) -> ExecutionCheckpointProviderBudgetSummary {
+        build_execution_checkpoint_provider_budget_summary(ExecutionCheckpointProviderBudgetInput {
+            model: Some(model.to_owned()),
+            model_provider: Some(model_provider.to_owned()),
+            agent_round_count: self.agent_round_count,
+            tool_call_count: self.requested_tool_call_count,
+            provider_token_count: self.provider_token_count,
+            exhaustion_reason: Some(reason),
+            exhausted_limit: Some(u64::from(budget_exceeded.limit)),
+            exhausted_observed: Some(u64::from(budget_exceeded.observed)),
+        })
+    }
+
+    fn checkpoint_tool_summary(&self) -> ExecutionCheckpointToolSummary {
+        let executed_count = self.executed_tool_count();
+        let unexecuted_count = self
+            .requested_tool_call_count
+            .saturating_sub(executed_count);
+
+        ExecutionCheckpointToolSummary {
+            requested_count: self.requested_tool_call_count,
+            executed_count,
+            unexecuted_count,
+            total_count: self.requested_tool_call_count,
+            succeeded_count: self.executed_tool_success_count,
+            failed_count: self.executed_tool_failed_count,
+            in_progress_count: 0,
+            detail_limit: u32::try_from(EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT)
+                .unwrap_or(u32::MAX),
+            details_truncated: false,
+            details: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AgentProviderLoopOutcome {
+    Completed,
+    NeedsContinuation(ExecutionWindowContinuation),
+}
+
+fn execution_window_exhaustion_reason(
+    budget_reason: ToolLoopBudgetReason,
+) -> ExecutionWindowExhaustionReason {
+    match budget_reason {
+        ToolLoopBudgetReason::AgentRoundsExceeded => {
+            ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow
+        }
+        ToolLoopBudgetReason::ToolCallsExceeded => {
+            ExecutionWindowExhaustionReason::MaxToolCallsPerWindow
+        }
+        ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled => {
+            ExecutionWindowExhaustionReason::ProviderFailureContinuation
+        }
+    }
+}
+
+fn build_execution_window_continuation(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+    model: &str,
+    model_provider: &str,
+    stats: &ChatExecutionWindowStats,
+    budget_exceeded: &ToolLoopBudgetExceeded,
+) -> ExecutionWindowContinuation {
+    let reason = execution_window_exhaustion_reason(budget_exceeded.reason);
+    let exhausted_window_id = execution_window_runtime_id(turn_id, stats.window_index);
+    let checkpoint_id = execution_window_checkpoint_runtime_id(exhausted_window_id.as_str());
+    let payload = build_execution_checkpoint_payload(
+        workspace_id,
+        thread_id,
+        turn_id,
+        build_execution_checkpoint_original_request_summary(input),
+        stats.checkpoint_window_summary(reason),
+        stats.checkpoint_provider_budget_summary(model, model_provider, budget_exceeded, reason),
+        stats.checkpoint_tool_summary(),
+        Vec::new(),
+    );
+
+    ExecutionWindowContinuation {
+        reason,
+        exhausted_window_id,
+        checkpoint_id,
+        checkpoint_payload: payload,
+    }
+}
+
+fn execution_window_runtime_id(turn_id: &str, window_index: u32) -> String {
+    format!("{turn_id}:window:{window_index}")
+}
+
+fn execution_window_checkpoint_runtime_id(window_id: &str) -> String {
+    format!("{window_id}:checkpoint:window_exhausted")
+}
+
+async fn emit_execution_window_started(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    stats: &ChatExecutionWindowStats,
+    event_tx: &AgentEventHub,
+) -> Result<(), ChatTurnError> {
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: execution_window_runtime_id(turn_id, stats.window_index),
+                window_index: stats.window_index,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: stats.started_at_unix_ms,
+            },
+        },
+    )
+    .await
+}
+
+async fn emit_execution_window_exhausted_and_checkpointed(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    stats: &ChatExecutionWindowStats,
+    budget_exceeded: &ToolLoopBudgetExceeded,
+    continuation: &ExecutionWindowContinuation,
+    event_tx: &AgentEventHub,
+) -> Result<(), ChatTurnError> {
+    let completed_at_unix_ms = continuation
+        .checkpoint_payload
+        .window
+        .completed_at_unix_ms
+        .unwrap_or_else(|| Local::now().timestamp_millis());
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: continuation.exhausted_window_id.clone(),
+                window_index: stats.window_index,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: continuation.reason,
+                limit: u64::from(budget_exceeded.limit),
+                observed: u64::from(budget_exceeded.observed),
+                agent_round_count: stats.agent_round_count,
+                tool_call_count: stats.requested_tool_call_count,
+                provider_token_count: stats.provider_token_count,
+                started_at_unix_ms: stats.started_at_unix_ms,
+                exhausted_at_unix_ms: completed_at_unix_ms,
+                reason: budget_exceeded.reason.code().to_owned(),
+            },
+        },
+    )
+    .await?;
+
+    let payload_bytes = serde_json::to_vec(&continuation.checkpoint_payload)
+        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::TurnExecutionWindowCheckpointed {
+            notification: TurnExecutionWindowCheckpointedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: continuation.exhausted_window_id.clone(),
+                window_index: stats.window_index,
+                status: ExecutionWindowStatus::Checkpointed,
+                checkpoint_id: continuation.checkpoint_id.clone(),
+                checkpoint_kind: "window_exhausted".to_owned(),
+                payload_bytes,
+                created_at_unix_ms: completed_at_unix_ms,
+            },
+            payload: continuation.checkpoint_payload.clone(),
+        },
+    )
+    .await
 }
 
 impl ChatTurnError {
@@ -1040,6 +1322,59 @@ fn prompt_runtime_section_id_from_hook_section(
     Ok(PromptRuntimeSectionId::Dynamic(id))
 }
 
+fn runtime_sections_with_execution_continuation_context(
+    runtime_sections: &[PromptRuntimeSectionInput],
+    execution_window_index: u32,
+    execution_checkpoint_context: Option<&ExecutionCheckpointContext>,
+    prior_visible_assistant_text: Option<&str>,
+) -> Vec<PromptRuntimeSectionInput> {
+    if execution_window_index <= 1 {
+        return runtime_sections.to_vec();
+    }
+    let Some(context) = execution_checkpoint_context else {
+        return runtime_sections.to_vec();
+    };
+
+    let mut sections = runtime_sections.to_vec();
+    if sections.iter().any(|section| {
+        matches!(
+            &section.id,
+            PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation)
+        )
+    }) {
+        return sections;
+    }
+
+    let facts_input = ExecutionContinuationRuntimeFactsInput {
+        checkpoint: &context.payload,
+        prior_visible_assistant_text,
+    };
+    let continuation_section = execution_continuation_section_with_runtime_facts(&facts_input);
+    sections.push(PromptRuntimeSectionInput {
+        id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation),
+        title: Some(continuation_section.title),
+        content: continuation_section.content,
+        max_chars: None,
+        truncated: false,
+    });
+    sections
+}
+
+fn prior_visible_assistant_text_for_execution_continuation(
+    history: &[ChatMessage],
+) -> Option<String> {
+    let text = history
+        .iter()
+        .filter(|message| message.role == pioneer_provider::Role::Assistant)
+        .filter_map(|message| {
+            let text = message.text_content_lossy();
+            (!text.trim().is_empty()).then(|| text.trim().to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    normalize_optional_prompt(Some(text))
+}
+
 fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
     let mut names = names
         .iter()
@@ -1640,6 +1975,8 @@ pub(super) async fn execute_chat_turn_flow(
     runtime_environment: HashMap<String, String>,
     history: Vec<ChatMessage>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
+    execution_window_index: u32,
+    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
@@ -1676,40 +2013,41 @@ pub(super) async fn execute_chat_turn_flow(
     .await?;
 
     let result = match mode {
-        ThreadMode::Agent => execute_agent_provider_response(
-            provider_registry,
-            &provider,
-            model,
-            hook_runtime_context,
-            history,
-            user_message.clone(),
-            &input,
-            &capabilities,
-            &workspace_skill_policies,
-            runtime_environment,
-            retained_llm_context,
-            force_non_stream,
-            continue_generation_hint,
-            tool_loop_config,
-            mcp_tool_provider,
-            turn_tool_provider,
-            turn_finalization_provider,
-            task_tool_provider,
-            hook_runtime,
-            tool_bundle_artifacts,
-            turn_control.clone(),
-            recovery,
-            &workspace_id,
-            &thread_id,
-            &turn_id,
-            thinking_item_id,
-            &message_item_id,
-            event_tx.clone(),
-        )
-        .await
-        .map(|post_turn_dispatch| ChatTurnOutcome {
-            post_turn_dispatch: Some(post_turn_dispatch),
-        }),
+        ThreadMode::Agent => {
+            execute_agent_provider_response(
+                provider_registry,
+                &provider,
+                model,
+                hook_runtime_context,
+                history,
+                user_message.clone(),
+                &input,
+                &capabilities,
+                &workspace_skill_policies,
+                runtime_environment,
+                retained_llm_context,
+                execution_window_index,
+                execution_checkpoint_context,
+                force_non_stream,
+                continue_generation_hint,
+                tool_loop_config,
+                mcp_tool_provider,
+                turn_tool_provider,
+                turn_finalization_provider,
+                task_tool_provider,
+                hook_runtime,
+                tool_bundle_artifacts,
+                turn_control.clone(),
+                recovery,
+                &workspace_id,
+                &thread_id,
+                &turn_id,
+                thinking_item_id,
+                &message_item_id,
+                event_tx.clone(),
+            )
+            .await
+        }
         ThreadMode::Chat => {
             let result = execute_standard_provider_response(
                 &provider,
@@ -2255,6 +2593,8 @@ async fn execute_agent_provider_response(
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     runtime_environment: HashMap<String, String>,
     retained_llm_context: Vec<RetainedToolLlmContext>,
+    execution_window_index: u32,
+    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     force_non_stream: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
@@ -2272,7 +2612,7 @@ async fn execute_agent_provider_response(
     initial_thinking_item_id: String,
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
-) -> Result<AgentTurnPostTurnHookDispatch, ChatTurnError> {
+) -> Result<ChatTurnOutcome, ChatTurnError> {
     let workdir = std::env::current_dir()
         .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
 
@@ -2535,11 +2875,19 @@ async fn execute_agent_provider_response(
         })?;
         let prompt_sections =
             prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
+        let prior_visible_assistant_text =
+            prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+        let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
+            prompt_sections.runtime_sections.as_slice(),
+            execution_window_index,
+            execution_checkpoint_context.as_ref(),
+            prior_visible_assistant_text.as_deref(),
+        );
 
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
             None,
-            prompt_sections.runtime_sections.as_slice(),
+            prompt_runtime_sections.as_slice(),
             include_task_orchestration_policy,
             false,
             continue_generation_hint,
@@ -2604,12 +2952,14 @@ async fn execute_agent_provider_response(
                     Vec::new(),
                     Vec::new(),
                 );
-                return Ok(AgentTurnPostTurnHookDispatch::new(
-                    hook_context,
-                    effective_policy_set,
-                    effective_prompt_context_set,
-                    summary,
-                ));
+                return Ok(ChatTurnOutcome::Completed {
+                    post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
+                        hook_context,
+                        effective_policy_set,
+                        effective_prompt_context_set,
+                        summary,
+                    )),
+                });
             }
             Err(error) => {
                 return Err(with_post_turn_failure_dispatch(
@@ -2882,11 +3232,19 @@ async fn execute_agent_provider_response(
     })?;
     let prompt_sections =
         prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
+    let prior_visible_assistant_text =
+        prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+    let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
+        prompt_sections.runtime_sections.as_slice(),
+        execution_window_index,
+        execution_checkpoint_context.as_ref(),
+        prior_visible_assistant_text.as_deref(),
+    );
 
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
         None,
-        prompt_sections.runtime_sections.as_slice(),
+        prompt_runtime_sections.as_slice(),
         include_task_orchestration_policy,
         true,
         continue_generation_hint,
@@ -2973,8 +3331,12 @@ async fn execute_agent_provider_response(
     let mut applied_retry_instruction: Option<String> = None;
     let mut observed_review_required_signatures = BTreeSet::<String>::new();
     let mut observed_terminal_task_ids = BTreeSet::<String>::new();
+    let window_budget = &tool_loop_config.execution_windows.window;
     let mut tool_loop_guard = ToolLoopGuard::new(
-        tool_loop_config.budget.clone(),
+        pioneer_tools::ToolLoopBudgetConfig {
+            max_agent_rounds_per_turn: window_budget.max_agent_rounds_per_window,
+            max_tool_calls_per_turn: window_budget.max_tool_calls_per_window,
+        },
         tool_loop_final_answer_instruction(),
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
@@ -2983,8 +3345,17 @@ async fn execute_agent_provider_response(
     let mut post_turn_assistant_text = String::new();
     let mut post_turn_tool_events = Vec::new();
     let mut post_turn_domain_events = Vec::new();
+    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
+    emit_execution_window_started(
+        workspace_id,
+        thread_id,
+        turn_id,
+        &window_stats,
+        event_tx.as_ref(),
+    )
+    .await?;
 
-    let turn_result: Result<(), (ChatTurnError, String)> = async {
+    let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
         let mut consecutive_empty_no_tool_rounds = 0usize;
 
@@ -3082,6 +3453,58 @@ async fn execute_agent_provider_response(
                 )
             })?;
 
+            if round_plan.action == ToolLoopRoundAction::RequestContinuation {
+                let budget_exceeded = round_plan.budget_exceeded.clone().ok_or_else(|| {
+                    (
+                        ChatTurnError::Terminal(
+                            "execution window continuation missing budget details".to_owned(),
+                        ),
+                        current_thinking_id.clone(),
+                    )
+                })?;
+                emit_tool_loop_budget_exceeded(
+                    &budget_exceeded,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    event_tx.as_ref(),
+                )
+                .await
+                .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    current_thinking_id.as_str(),
+                    "",
+                    event_tx.as_ref(),
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                let continuation = build_execution_window_continuation(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    post_turn_model.as_str(),
+                    post_turn_model_provider.as_str(),
+                    &window_stats,
+                    &budget_exceeded,
+                );
+                emit_execution_window_exhausted_and_checkpointed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &window_stats,
+                    &budget_exceeded,
+                    &continuation,
+                    event_tx.as_ref(),
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                return Ok(AgentProviderLoopOutcome::NeedsContinuation(continuation));
+            }
+
             if let Some(instruction) = round_plan.final_instruction.clone() {
                 if let Some(budget_exceeded) = round_plan.budget_exceeded.as_ref() {
                     emit_tool_loop_budget_exceeded(
@@ -3099,7 +3522,7 @@ async fn execute_agent_provider_response(
                     let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
-                        prompt_sections.runtime_sections.as_slice(),
+                        prompt_runtime_sections.as_slice(),
                         include_task_orchestration_policy,
                         round_plan.tools_enabled,
                         continue_generation_hint,
@@ -3176,10 +3599,17 @@ async fn execute_agent_provider_response(
                 let no_tool_prompt_sections =
                     prompt_sections_for_compile_from_hook_sections(&no_tool_prompt_section_set)
                         .map_err(|error| (error, current_thinking_id.clone()))?;
+                let no_tool_runtime_sections =
+                    runtime_sections_with_execution_continuation_context(
+                        no_tool_prompt_sections.runtime_sections.as_slice(),
+                        execution_window_index,
+                        execution_checkpoint_context.as_ref(),
+                        prior_visible_assistant_text.as_deref(),
+                    );
                 let prompt_without_tools = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
-                    no_tool_prompt_sections.runtime_sections.as_slice(),
+                    no_tool_runtime_sections.as_slice(),
                     include_task_orchestration_policy,
                     false,
                     continue_generation_hint,
@@ -3240,10 +3670,55 @@ async fn execute_agent_provider_response(
                 .succeed_recovery_attempt(turn_id, recovery.take())
                 .await;
 
+            window_stats.record_provider_round(round.tool_calls.len(), round.provider_token_count);
+
             match tool_loop_guard
                 .after_provider_round(round_plan.tools_enabled, round.tool_calls.len())
             {
                 ToolLoopGuardDecision::Continue => {}
+                ToolLoopGuardDecision::RequestContinuation { budget_exceeded } => {
+                    emit_tool_loop_budget_exceeded(
+                        &budget_exceeded,
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    send_reasoning_completed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        current_thinking_id.as_str(),
+                        round.reasoning.as_str(),
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    let continuation = build_execution_window_continuation(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        input,
+                        post_turn_model.as_str(),
+                        post_turn_model_provider.as_str(),
+                        &window_stats,
+                        &budget_exceeded,
+                    );
+                    emit_execution_window_exhausted_and_checkpointed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &window_stats,
+                        &budget_exceeded,
+                        &continuation,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    return Ok(AgentProviderLoopOutcome::NeedsContinuation(continuation));
+                }
                 ToolLoopGuardDecision::RequestFinalAnswer {
                     instruction,
                     budget_exceeded,
@@ -3274,7 +3749,7 @@ async fn execute_agent_provider_response(
                         let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
-                            prompt_sections.runtime_sections.as_slice(),
+                            prompt_runtime_sections.as_slice(),
                             include_task_orchestration_policy,
                             false,
                             continue_generation_hint,
@@ -3398,7 +3873,7 @@ async fn execute_agent_provider_response(
                         )
                         .await
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        return Ok(());
+                        return Ok(AgentProviderLoopOutcome::Completed);
                     }
                     return Err((
                         ChatTurnError::Terminal(message),
@@ -3772,7 +4247,7 @@ async fn execute_agent_provider_response(
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
 
-                return Ok(());
+                return Ok(AgentProviderLoopOutcome::Completed);
             }
 
             consecutive_empty_no_tool_rounds = 0;
@@ -4134,6 +4609,7 @@ async fn execute_agent_provider_response(
                 .buffer_unordered(parallel_tool_calls)
                 .collect::<Vec<_>>()
                 .await;
+            window_stats.record_executed_tools(&executed_results);
 
             apply_request_tools_results_to_visible_tools(
                 &mut visible_tool_names,
@@ -4208,6 +4684,8 @@ async fn execute_agent_provider_response(
                     );
                     if let Some(instruction) = exhausted_instruction.clone() {
                         next_round_tools_enabled = false;
+                        // Explicit retry exhaustion still uses a final no-tools round. Window
+                        // budget exhaustion is handled earlier as durable continuation.
                         match tool_loop_guard.request_final_answer_with_instruction(instruction) {
                             Ok(instruction) => Some(instruction),
                             Err(message) => {
@@ -4230,7 +4708,7 @@ async fn execute_agent_provider_response(
                 let refreshed_prompt_bundle = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
-                    prompt_sections.runtime_sections.as_slice(),
+                    prompt_runtime_sections.as_slice(),
                     include_task_orchestration_policy,
                     next_round_tools_enabled,
                     continue_generation_hint,
@@ -4281,7 +4759,7 @@ async fn execute_agent_provider_response(
     let _ = tool_event_forwarder.await;
 
     match turn_result {
-        Ok(()) => {
+        Ok(AgentProviderLoopOutcome::Completed) => {
             let summary = AgentTurnPostTurnSummary::succeeded_with_model(
                 Some(post_turn_model.clone()),
                 Some(post_turn_model_provider.clone()),
@@ -4290,12 +4768,17 @@ async fn execute_agent_provider_response(
                 post_turn_tool_events,
                 post_turn_domain_events,
             );
-            Ok(AgentTurnPostTurnHookDispatch::new(
-                hook_context,
-                effective_policy_set,
-                effective_prompt_context_set,
-                summary,
-            ))
+            Ok(ChatTurnOutcome::Completed {
+                post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
+                    hook_context,
+                    effective_policy_set,
+                    effective_prompt_context_set,
+                    summary,
+                )),
+            })
+        }
+        Ok(AgentProviderLoopOutcome::NeedsContinuation(continuation)) => {
+            Ok(ChatTurnOutcome::NeedsContinuation(continuation))
         }
         Err((error, thinking_id)) => {
             emit_durable_event(
@@ -4634,15 +5117,22 @@ mod tests {
         resolve_skill_capability_summary, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
         review_required_observation_payload, review_required_observation_signature,
+        runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations,
     };
-    use crate::{ResolvedArtifactInput, RetainedToolLlmContext, ReviewRequiredTaskObservation};
+    use crate::{
+        ExecutionCheckpointContext, ResolvedArtifactInput, RetainedToolLlmContext,
+        ReviewRequiredTaskObservation,
+    };
     use pioneer_promt::{
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
     use pioneer_protocol::{
-        McpScopeKind, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+        ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
+        ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointToolSummary,
+        ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, McpScopeKind,
+        TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
         TurnCapabilityRejectedReason, TurnItemType, UserInput,
     };
     use pioneer_provider::{
@@ -4677,6 +5167,116 @@ mod tests {
         ) -> Result<Box<dyn ToolOutput>, ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
+    }
+
+    fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
+        ExecutionCheckpointContext {
+            window_id: "turn_1:window:1".to_owned(),
+            window_index: 1,
+            checkpoint_id: "checkpoint_1".to_owned(),
+            checkpoint_kind: "execution_window_exhausted".to_owned(),
+            payload: ExecutionCheckpointPayload {
+                schema_version: 1,
+                workspace_id: "workspace_1".to_owned(),
+                thread_id: "thread_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                original_request: ExecutionCheckpointOriginalRequestSummary {
+                    input_count: 1,
+                    text_preview: Some("create a report".to_owned()),
+                    text_truncated: false,
+                    attachment_count: 0,
+                    attachment_kinds: Vec::new(),
+                },
+                window: ExecutionCheckpointWindowSummary {
+                    window_id: Some("turn_1:window:1".to_owned()),
+                    window_index: 1,
+                    started_at_unix_ms: Some(1_000),
+                    completed_at_unix_ms: Some(2_000),
+                    agent_round_count: 3,
+                    tool_call_count: 7,
+                    provider_token_count: Some(123),
+                    exhaustion_reason: Some(
+                        ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                    ),
+                },
+                provider_budget: ExecutionCheckpointProviderBudgetSummary {
+                    model: Some("model-a".to_owned()),
+                    model_provider: Some("provider-a".to_owned()),
+                    agent_round_count: 3,
+                    tool_call_count: 7,
+                    provider_token_count: Some(123),
+                    provider_usage_available: true,
+                    exhaustion_reason: Some(
+                        ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                    ),
+                    exhausted_limit: Some(3),
+                    exhausted_observed: Some(3),
+                },
+                tools: ExecutionCheckpointToolSummary {
+                    requested_count: 7,
+                    executed_count: 7,
+                    unexecuted_count: 0,
+                    total_count: 7,
+                    succeeded_count: 7,
+                    failed_count: 0,
+                    in_progress_count: 0,
+                    detail_limit: 32,
+                    details_truncated: false,
+                    details: Vec::new(),
+                },
+                strict_obligations: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn window_one_runtime_sections_do_not_add_execution_continuation_context() {
+        let base_sections = vec![PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall),
+            title: None,
+            content: "memory recall".to_owned(),
+            max_chars: None,
+            truncated: false,
+        }];
+        let checkpoint_context = execution_checkpoint_context_fixture();
+
+        let sections = runtime_sections_with_execution_continuation_context(
+            base_sections.as_slice(),
+            1,
+            Some(&checkpoint_context),
+            Some("partial assistant text"),
+        );
+
+        assert_eq!(sections, base_sections);
+    }
+
+    #[test]
+    fn continuation_window_runtime_sections_add_execution_continuation_context() {
+        let checkpoint_context = execution_checkpoint_context_fixture();
+
+        let sections = runtime_sections_with_execution_continuation_context(
+            &[],
+            2,
+            Some(&checkpoint_context),
+            Some("partial assistant text"),
+        );
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(
+            sections[0].id,
+            PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation)
+        );
+        assert!(
+            sections[0]
+                .content
+                .contains("Original request preview: create a report")
+        );
+        assert!(sections[0].content.contains("Completed window: index=1"));
+        assert!(
+            sections[0]
+                .content
+                .contains("Prior visible assistant text: partial assistant text")
+        );
     }
 
     #[test]

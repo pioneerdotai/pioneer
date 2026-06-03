@@ -1,7 +1,10 @@
 use pioneer_protocol::{
     ItemDeltaStream, MarkdownDocument, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
-    TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
+    TurnStatus, UserMessageAttachment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -31,6 +34,11 @@ pub(crate) enum EventKind {
     ItemToolRetryResolved,
     ItemToolRetryExhausted,
     TurnToolLoopBudgetExceeded,
+    TurnExecutionWindowStarted,
+    TurnExecutionWindowExhausted,
+    TurnExecutionWindowCheckpointed,
+    TurnExecutionWindowContinued,
+    TurnExecutionWindowBlocked,
     ItemCompleted,
     ItemUpdated,
 }
@@ -205,6 +213,21 @@ pub(crate) enum ConversationEvent {
         action: ToolLoopBudgetAction,
         reason: String,
     },
+    TurnExecutionWindowStarted {
+        notification: TurnExecutionWindowStartedNotification,
+    },
+    TurnExecutionWindowExhausted {
+        notification: TurnExecutionWindowExhaustedNotification,
+    },
+    TurnExecutionWindowCheckpointed {
+        notification: TurnExecutionWindowCheckpointedNotification,
+    },
+    TurnExecutionWindowContinued {
+        notification: TurnExecutionWindowContinuedNotification,
+    },
+    TurnExecutionWindowBlocked {
+        notification: TurnExecutionWindowBlockedNotification,
+    },
     ItemCompleted {
         thread_id: String,
         turn_id: String,
@@ -243,6 +266,21 @@ impl ConversationEvent {
             | Self::TurnToolLoopBudgetExceeded { thread_id, .. }
             | Self::ItemCompleted { thread_id, .. }
             | Self::ItemUpdated { thread_id, .. } => Some(thread_id.as_str()),
+            Self::TurnExecutionWindowStarted { notification } => {
+                Some(notification.thread_id.as_str())
+            }
+            Self::TurnExecutionWindowExhausted { notification } => {
+                Some(notification.thread_id.as_str())
+            }
+            Self::TurnExecutionWindowCheckpointed { notification } => {
+                Some(notification.thread_id.as_str())
+            }
+            Self::TurnExecutionWindowContinued { notification } => {
+                Some(notification.thread_id.as_str())
+            }
+            Self::TurnExecutionWindowBlocked { notification } => {
+                Some(notification.thread_id.as_str())
+            }
         }
     }
 
@@ -268,6 +306,21 @@ impl ConversationEvent {
             | Self::TurnToolLoopBudgetExceeded { turn_id, .. }
             | Self::ItemCompleted { turn_id, .. }
             | Self::ItemUpdated { turn_id, .. } => Some(turn_id.as_str()),
+            Self::TurnExecutionWindowStarted { notification } => {
+                Some(notification.turn_id.as_str())
+            }
+            Self::TurnExecutionWindowExhausted { notification } => {
+                Some(notification.turn_id.as_str())
+            }
+            Self::TurnExecutionWindowCheckpointed { notification } => {
+                Some(notification.turn_id.as_str())
+            }
+            Self::TurnExecutionWindowContinued { notification } => {
+                Some(notification.turn_id.as_str())
+            }
+            Self::TurnExecutionWindowBlocked { notification } => {
+                Some(notification.turn_id.as_str())
+            }
             Self::TurnStarted { turn, .. }
             | Self::TurnCompleted { turn, .. }
             | Self::TurnFailed { turn, .. } => Some(turn.id.as_str()),
@@ -298,7 +351,12 @@ impl ConversationEvent {
             | Self::TurnStarted { .. }
             | Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
-            | Self::TurnToolLoopBudgetExceeded { .. } => None,
+            | Self::TurnToolLoopBudgetExceeded { .. }
+            | Self::TurnExecutionWindowStarted { .. }
+            | Self::TurnExecutionWindowExhausted { .. }
+            | Self::TurnExecutionWindowCheckpointed { .. }
+            | Self::TurnExecutionWindowContinued { .. }
+            | Self::TurnExecutionWindowBlocked { .. } => None,
         }
     }
 
@@ -331,6 +389,13 @@ impl ConversationEvent {
             Self::ItemToolRetryResolved { .. } => EventKind::ItemToolRetryResolved,
             Self::ItemToolRetryExhausted { .. } => EventKind::ItemToolRetryExhausted,
             Self::TurnToolLoopBudgetExceeded { .. } => EventKind::TurnToolLoopBudgetExceeded,
+            Self::TurnExecutionWindowStarted { .. } => EventKind::TurnExecutionWindowStarted,
+            Self::TurnExecutionWindowExhausted { .. } => EventKind::TurnExecutionWindowExhausted,
+            Self::TurnExecutionWindowCheckpointed { .. } => {
+                EventKind::TurnExecutionWindowCheckpointed
+            }
+            Self::TurnExecutionWindowContinued { .. } => EventKind::TurnExecutionWindowContinued,
+            Self::TurnExecutionWindowBlocked { .. } => EventKind::TurnExecutionWindowBlocked,
             Self::ItemCompleted { .. } => EventKind::ItemCompleted,
             Self::ItemUpdated { .. } => EventKind::ItemUpdated,
         }

@@ -178,8 +178,9 @@ mod tests {
     use crate::secrets::GatewaySecrets;
     use pioneer_config::{
         AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
-        GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,
-        GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
+        GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig,
+        GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayProviderConfig,
+        GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
         GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
         GatewayWebToolsConfig, InstallConfig,
     };
@@ -410,6 +411,7 @@ mod tests {
                     web: GatewayWebToolsConfig::default(),
                     computer_use: GatewayComputerUseToolsConfig::default(),
                     budget: GatewayToolLoopBudgetConfig::default(),
+                    execution_windows: Some(GatewayExecutionWindowsConfig::default()),
                     retry: GatewayToolRetryBudgetConfig::default(),
                 },
                 tasks: Default::default(),

@@ -57,6 +57,7 @@ impl fmt::Display for PromptDynamicSectionId {
 pub enum PromptRuntimeBuiltInSectionId {
     AgentsMd,
     MemoryRecall,
+    ExecutionContinuation,
 }
 
 impl PromptRuntimeBuiltInSectionId {
@@ -64,6 +65,7 @@ impl PromptRuntimeBuiltInSectionId {
         match value {
             "agents_md" => Some(Self::AgentsMd),
             "memory_recall" => Some(Self::MemoryRecall),
+            "execution_continuation" => Some(Self::ExecutionContinuation),
             _ => None,
         }
     }
@@ -72,6 +74,7 @@ impl PromptRuntimeBuiltInSectionId {
         match self {
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
+            Self::ExecutionContinuation => "execution_continuation",
         }
     }
 
@@ -79,6 +82,7 @@ impl PromptRuntimeBuiltInSectionId {
         match self {
             Self::AgentsMd => PromptSectionId::AgentsMd,
             Self::MemoryRecall => PromptSectionId::MemoryRecall,
+            Self::ExecutionContinuation => PromptSectionId::ExecutionContinuation,
         }
     }
 
@@ -86,6 +90,7 @@ impl PromptRuntimeBuiltInSectionId {
         match self {
             Self::AgentsMd => crate::content::SECTION_TITLE_AGENTS_MD,
             Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
+            Self::ExecutionContinuation => crate::content::SECTION_TITLE_EXECUTION_CONTINUATION,
         }
     }
 }
@@ -135,6 +140,7 @@ pub enum PromptSectionId {
     AgentsMd,
     MemoryRecall,
     RecoveryContinuation,
+    ExecutionContinuation,
     SkillsRuntimePrompt,
     RetryRuntimeInstruction,
     DynamicContext,
@@ -157,6 +163,7 @@ impl PromptSectionId {
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
             Self::RecoveryContinuation => "recovery_continuation",
+            Self::ExecutionContinuation => "execution_continuation",
             Self::SkillsRuntimePrompt => "skills_runtime_prompt",
             Self::RetryRuntimeInstruction => "retry_runtime_instruction",
             Self::DynamicContext => "dynamic_context",
@@ -181,6 +188,7 @@ impl PromptSectionId {
                 | "agents_md"
                 | "memory_recall"
                 | "recovery_continuation"
+                | "execution_continuation"
                 | "skills_runtime_prompt"
                 | "retry_runtime_instruction"
                 | "dynamic_context"
@@ -288,6 +296,22 @@ mod tests {
         assert_eq!(id.prompt_section_id(), PromptSectionId::AgentsMd);
         assert_eq!(id.default_title(), "AGENTS.md");
         assert!(PromptSectionId::is_builtin_manifest_id("agents_md"));
+    }
+
+    #[test]
+    fn execution_continuation_builtin_round_trips_manifest_identity() {
+        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("execution_continuation")
+            .expect("execution_continuation builtin should resolve");
+        assert_eq!(id, PromptRuntimeBuiltInSectionId::ExecutionContinuation);
+        assert_eq!(id.manifest_id(), "execution_continuation");
+        assert_eq!(
+            id.prompt_section_id(),
+            PromptSectionId::ExecutionContinuation
+        );
+        assert_eq!(id.default_title(), "Execution Continuation");
+        assert!(PromptSectionId::is_builtin_manifest_id(
+            "execution_continuation"
+        ));
     }
 
     #[test]

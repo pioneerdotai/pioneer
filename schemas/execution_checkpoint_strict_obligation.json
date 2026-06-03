@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionCheckpointStrictObligation",
+  "type": "object",
+  "properties": {
+    "description": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "obligation_id": {
+      "type": "string"
+    },
+    "refs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "obligation_id",
+    "kind",
+    "description"
+  ]
+}

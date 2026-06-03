@@ -10,6 +10,7 @@ mod m20260523_000001_turn_mcp_binding_metadata;
 mod m20260531_000001_task_review;
 mod m20260531_000002_remove_old_task_execution_fields;
 mod m20260531_000003_task_agent_review_policy;
+mod m20260603_000001_turn_execution_window;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -23,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260531_000001_task_review::Migration),
             Box::new(m20260531_000002_remove_old_task_execution_fields::Migration),
             Box::new(m20260531_000003_task_agent_review_policy::Migration),
+            Box::new(m20260603_000001_turn_execution_window::Migration),
         ]
     }
 }

@@ -738,7 +738,12 @@ fn reconnect_replay_restores_final_turn_result() {
             | TurnItemEventPayload::ItemToolRetryScheduled { .. }
             | TurnItemEventPayload::ItemToolRetryResolved { .. }
             | TurnItemEventPayload::ItemToolRetryExhausted { .. }
-            | TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. } => {
+            | TurnItemEventPayload::TurnToolLoopBudgetExceeded { .. }
+            | TurnItemEventPayload::TurnExecutionWindowStarted(_)
+            | TurnItemEventPayload::TurnExecutionWindowExhausted(_)
+            | TurnItemEventPayload::TurnExecutionWindowCheckpointed(_)
+            | TurnItemEventPayload::TurnExecutionWindowContinued(_)
+            | TurnItemEventPayload::TurnExecutionWindowBlocked(_) => {
                 unreachable!("unexpected lifecycle replay event in basic turn resume test")
             }
         }

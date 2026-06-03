@@ -104,20 +104,24 @@ impl Conversation {
                 self.projector.apply_turn_started(&turn, ts_unix_ms);
             }
             ConversationEvent::TurnCompleted { turn, .. } => {
-                self.projector.apply_turn_completed(&turn, ts_unix_ms);
-                if in_flight_turn_id_before_event.as_deref() == Some(turn.id.as_str()) {
-                    self.pending_completion_turn_id = Some(turn.id);
-                } else {
-                    let _ = self
-                        .state_machine
-                        .finalize_completing_turn(turn.id.as_str());
-                    self.projector
-                        .finalize_turn_completed(turn.id.as_str(), ts_unix_ms);
+                if !self.state_machine.is_blocked_turn(turn.id.as_str()) {
+                    self.projector.apply_turn_completed(&turn, ts_unix_ms);
+                    if in_flight_turn_id_before_event.as_deref() == Some(turn.id.as_str()) {
+                        self.pending_completion_turn_id = Some(turn.id);
+                    } else {
+                        let _ = self
+                            .state_machine
+                            .finalize_completing_turn(turn.id.as_str());
+                        self.projector
+                            .finalize_turn_completed(turn.id.as_str(), ts_unix_ms);
+                    }
                 }
             }
             ConversationEvent::TurnFailed { turn, .. } => {
                 self.pending_completion_turn_id = None;
-                self.projector.apply_turn_failed(&turn, ts_unix_ms);
+                if !self.state_machine.is_blocked_turn(turn.id.as_str()) {
+                    self.projector.apply_turn_failed(&turn, ts_unix_ms);
+                }
             }
             ConversationEvent::ItemStarted { turn_id, item, .. } => {
                 self.item_handlers.apply_started(
@@ -383,6 +387,41 @@ impl Conversation {
                     observed,
                     action,
                     reason.as_str(),
+                    ts_unix_ms,
+                );
+            }
+            ConversationEvent::TurnExecutionWindowStarted { notification } => {
+                self.projector.apply_turn_execution_window_started(
+                    notification.turn_id.as_str(),
+                    &notification,
+                    ts_unix_ms,
+                );
+            }
+            ConversationEvent::TurnExecutionWindowExhausted { notification } => {
+                self.projector.apply_turn_execution_window_exhausted(
+                    notification.turn_id.as_str(),
+                    &notification,
+                    ts_unix_ms,
+                );
+            }
+            ConversationEvent::TurnExecutionWindowCheckpointed { notification } => {
+                self.projector.apply_turn_execution_window_checkpointed(
+                    notification.turn_id.as_str(),
+                    &notification,
+                    ts_unix_ms,
+                );
+            }
+            ConversationEvent::TurnExecutionWindowContinued { notification } => {
+                self.projector.apply_turn_execution_window_continued(
+                    notification.turn_id.as_str(),
+                    &notification,
+                    ts_unix_ms,
+                );
+            }
+            ConversationEvent::TurnExecutionWindowBlocked { notification } => {
+                self.projector.apply_turn_execution_window_blocked(
+                    notification.turn_id.as_str(),
+                    &notification,
                     ts_unix_ms,
                 );
             }

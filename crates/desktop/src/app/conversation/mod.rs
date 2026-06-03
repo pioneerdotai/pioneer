@@ -55,6 +55,21 @@ fn history_event_thread_id(payload: &ThreadHistoryEventPayload) -> &str {
         | ThreadHistoryEventPayload::ItemToolRetryResolved { thread_id, .. }
         | ThreadHistoryEventPayload::ItemToolRetryExhausted { thread_id, .. }
         | ThreadHistoryEventPayload::TurnToolLoopBudgetExceeded { thread_id, .. }
+        | ThreadHistoryEventPayload::TurnExecutionWindowStarted(
+            pioneer_protocol::TurnExecutionWindowStartedNotification { thread_id, .. },
+        )
+        | ThreadHistoryEventPayload::TurnExecutionWindowExhausted(
+            pioneer_protocol::TurnExecutionWindowExhaustedNotification { thread_id, .. },
+        )
+        | ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(
+            pioneer_protocol::TurnExecutionWindowCheckpointedNotification { thread_id, .. },
+        )
+        | ThreadHistoryEventPayload::TurnExecutionWindowContinued(
+            pioneer_protocol::TurnExecutionWindowContinuedNotification { thread_id, .. },
+        )
+        | ThreadHistoryEventPayload::TurnExecutionWindowBlocked(
+            pioneer_protocol::TurnExecutionWindowBlockedNotification { thread_id, .. },
+        )
         | ThreadHistoryEventPayload::TurnCompleted { thread_id, .. }
         | ThreadHistoryEventPayload::TurnFailed { thread_id, .. } => thread_id.as_str(),
     }

@@ -30,14 +30,14 @@ use pioneer_hooks::{
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_memory::hooks::{AgentMemoryProvider, MemoryRecallRequest, MemoryTurnContext};
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, INVALID_REQUEST_CODE, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
-    ItemToolRetryScheduledNotification, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
-    McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
-    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
-    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
-    McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
-    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    AgentDurableEvent, AgentProgressEvent, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemStartedNotification, ItemToolRetryScheduledNotification, JsonRpcErrorResponse,
+    JsonRpcNotification, JsonRpcResponse, McpChangedAction, McpChangedNotification,
+    McpInstallResponse, McpInstallResultStatus, McpInstallStatus, McpListResponse,
+    McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse, McpServerStatus,
+    McpSourceKind, McpTransportSummary, McpTurnBindingSummary, McpUninstallResponse, MemoryActor,
+    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
     MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
     MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
     MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
@@ -2005,6 +2005,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
             ..pioneer_memory::hooks::MemoryLoopConfig::default()
         },
         budget: ToolLoopBudgetConfig::default(),
+        execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
     }
 }
@@ -4882,6 +4883,182 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate() {
+    let provider = Arc::new(HangingChildProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = review_enabled_processor(
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        "thr_review_window_no_revision",
+        "turn_review_window_no_revision",
+        "Review child with execution window",
+        3,
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("agent spec should exist")
+        .review_policy = Some(TaskAgentReviewPolicy::parent_agent_default(1));
+
+    let response = create_task_for_test(&processor, params)
+        .await
+        .expect("review-enabled task_create should start child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        provider.child_main_call_count() > 0,
+        "child provider should be hanging before synthetic review completion"
+    );
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "review_window_no_revision_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "review_window_no_revision_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                limit: 2,
+                observed: 2,
+                agent_round_count: 2,
+                tool_call_count: 0,
+                provider_token_count: None,
+                started_at_unix_ms: 1_000,
+                exhausted_at_unix_ms: 2_000,
+                reason: "max_agent_rounds_per_window".to_owned(),
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowContinued {
+            notification: pioneer_protocol::TurnExecutionWindowContinuedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "review_window_no_revision_2".to_owned(),
+                window_index: 2,
+                status: ExecutionWindowStatus::Continued,
+                previous_window_id: "review_window_no_revision_1".to_owned(),
+                previous_window_index: 1,
+                checkpoint_id: "review_window_checkpoint_1".to_owned(),
+                continued_at_unix_ms: 2_100,
+            },
+        })
+        .await;
+
+    let task_run_turns = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should list after window continuation");
+    assert_eq!(task_run_turns.len(), 1);
+    assert_eq!(task_run_turns[0].kind, TaskRunTurnKind::Initial);
+    assert_eq!(task_run_turns[0].status, TaskRunTurnStatus::InProgress);
+    assert!(
+        !task_run_turns
+            .iter()
+            .any(|turn| turn.kind == TaskRunTurnKind::Revision),
+        "execution window continuation must not create semantic revision turns"
+    );
+
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: "item_review_candidate_after_window".to_owned(),
+                    text: r#"<task_result>{"summary":"review after window","data":{"ok":true}}</task_result>"#
+                        .to_owned(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("synthetic review child result item should persist");
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+            thread_id: lineage.child_thread_id.clone(),
+            turn_id: lineage.child_turn_id.clone(),
+            recovery: None,
+        })
+        .await;
+
+    let candidate = wait_for_result_candidate_status(
+        crud_store.clone(),
+        run.id.as_str(),
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    assert_eq!(candidate.thread_id, lineage.child_thread_id);
+    assert_eq!(candidate.turn_id, lineage.child_turn_id);
+    assert_eq!(
+        candidate
+            .result
+            .as_ref()
+            .and_then(|result| result.summary.as_deref()),
+        Some("review after window")
+    );
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::WaitingReview,
+        )
+        .await,
+        TaskRunStatus::WaitingReview
+    );
+    let task_run_turns = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should list after review candidate");
+    assert_eq!(task_run_turns.len(), 1);
+    assert_eq!(task_run_turns[0].kind, TaskRunTurnKind::Initial);
+    assert_eq!(
+        task_run_turns[0].status,
+        TaskRunTurnStatus::CandidateCreated
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
@@ -5293,7 +5470,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
         .expect("agent spec should exist")
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
-        max_revision_rounds: 2,
+        max_revision_rounds: 1,
         require_explicit_acceptance: true,
         reviewers: Vec::new(),
         resolution_strategy: TaskResultReviewResolutionStrategy::UserFinal,
@@ -5396,6 +5573,36 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
         )
         .await,
         TaskRunStatus::WaitingReview
+    );
+    let wait_response = wait_tasks_for_test(
+        &processor,
+        TaskWaitParams {
+            task_ids: vec![response.task.id.clone()],
+            run_ids: Vec::new(),
+            timeout_ms: Some(5_000),
+            return_completed: true,
+            return_pending: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("task_wait should return revised review candidate");
+    let review = wait_response
+        .review_required
+        .iter()
+        .find(|review| review.candidate.id == next_candidate.id)
+        .expect("revised candidate should be waiting for review");
+    assert_eq!(review.max_revision_rounds, 1);
+    assert_eq!(review.remaining_revision_rounds, 0);
+    assert_eq!(
+        review.revision_blocked_reason,
+        Some(pioneer_protocol::TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
+    );
+    assert!(
+        !review
+            .allowed_actions
+            .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise),
+        "max revision rounds must still be enforced after semantic revision"
     );
     let execution = crud_store
         .load_execution_for_run(run.id.as_str())
@@ -6269,6 +6476,111 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .await
         .expect("execution query should succeed")
         .expect("task run execution should exist");
+    initial_processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_recovery_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+    initial_processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_recovery_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                limit: 3,
+                observed: 3,
+                agent_round_count: 2,
+                tool_call_count: 3,
+                provider_token_count: None,
+                started_at_unix_ms: 1_000,
+                exhausted_at_unix_ms: 2_000,
+                reason: "max_tool_calls_per_window".to_owned(),
+            },
+        })
+        .await;
+    let checkpoint_payload = pioneer_protocol::build_execution_checkpoint_payload(
+        workspace_id.clone(),
+        lineage.child_thread_id.clone(),
+        lineage.child_turn_id.clone(),
+        pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
+            input_count: 1,
+            text_preview: Some("Recovered hidden preflight child".to_owned()),
+            text_truncated: false,
+            attachment_count: 0,
+            attachment_kinds: Vec::new(),
+        },
+        pioneer_protocol::ExecutionCheckpointWindowSummary {
+            window_id: Some("task_recovery_window_1".to_owned()),
+            window_index: 1,
+            started_at_unix_ms: Some(1_000),
+            completed_at_unix_ms: Some(2_000),
+            agent_round_count: 2,
+            tool_call_count: 3,
+            provider_token_count: None,
+            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+        },
+        pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
+            model: Some("test-model".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            agent_round_count: 2,
+            tool_call_count: 3,
+            provider_token_count: None,
+            provider_usage_available: false,
+            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+            exhausted_limit: Some(3),
+            exhausted_observed: Some(3),
+        },
+        pioneer_protocol::ExecutionCheckpointToolSummary {
+            requested_count: 3,
+            executed_count: 2,
+            unexecuted_count: 1,
+            total_count: 3,
+            succeeded_count: 1,
+            failed_count: 1,
+            in_progress_count: 0,
+            detail_limit: 0,
+            details_truncated: false,
+            details: Vec::new(),
+        },
+        Vec::new(),
+    );
+    initial_processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
+            notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_recovery_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Checkpointed,
+                checkpoint_id: "task_recovery_checkpoint_1".to_owned(),
+                checkpoint_kind: "window_exhausted".to_owned(),
+                payload_bytes: 512,
+                created_at_unix_ms: 2_050,
+            },
+            payload: checkpoint_payload,
+        })
+        .await;
+    assert!(
+        crud_store
+            .latest_turn_execution_checkpoint_for_turn(lineage.child_turn_id.as_str())
+            .await
+            .expect("latest checkpoint should load")
+            .is_some(),
+        "startup recovery fixture should persist a child execution checkpoint"
+    );
     let stale_at = super::now_timestamp_secs().saturating_sub(120);
     crud_store
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
@@ -6345,6 +6657,28 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
     assert!(requests[preflight_pos].compiled_prompt.is_none());
     assert!(requests[child_main_pos].compiled_prompt.is_some());
+    let restored_prompt = requests[child_main_pos]
+        .compiled_prompt
+        .as_ref()
+        .expect("restored child main request should have compiled prompt");
+    assert!(
+        restored_prompt
+            .full_system_text
+            .contains("Execution Continuation"),
+        "restored child prompt should include execution continuation section"
+    );
+    assert!(
+        restored_prompt
+            .full_system_text
+            .contains("Completed window: index=1"),
+        "restored child prompt should include checkpoint window facts"
+    );
+    assert!(
+        restored_prompt
+            .full_system_text
+            .contains("Original request preview: Recovered hidden preflight child"),
+        "restored child prompt should include checkpoint original request facts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6428,6 +6762,508 @@ async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
             .expect("accepted candidate lookup should succeed")
             .is_none(),
         "failed child turn must not create an accepted candidate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_execution_window_recovery_does_not_fail_child_task_run() {
+    let provider = Arc::new(HangingChildProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_blocked_window_task",
+            "turn_parent_blocked_window_task",
+            "Blocked execution window child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        provider.child_main_call_count() > 0,
+        "child provider should be hanging before synthetic window block"
+    );
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowBlocked {
+            notification: pioneer_protocol::TurnExecutionWindowBlockedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_blocked_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Blocked,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+                checkpoint_id: Some("task_blocked_checkpoint_1".to_owned()),
+                total_windows: 1,
+                total_tool_calls: 16,
+                reason: "total budget exhausted".to_owned(),
+                blocked_at_unix_ms: 2_000,
+            },
+        })
+        .await;
+    assert_eq!(
+        wait_for_turn_status(
+            crud_store.clone(),
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+            TurnStatus::Blocked,
+        )
+        .await,
+        TurnStatus::Blocked
+    );
+
+    let execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    let stale_at = super::now_timestamp_secs().saturating_sub(120);
+    crud_store
+        .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
+        .await
+        .expect("execution lease should be stale for recovery");
+
+    let current_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("run should reload")
+        .expect("run should exist");
+    let handle = pioneer_tasks::TaskExecutionHandle::new(
+        crud_store.clone(),
+        processor.task_runtime.event_bus(),
+        response.task.id.clone(),
+        run.id.clone(),
+    );
+    let outcome = pioneer_tasks::TaskExecutor::recover_run(
+        &*processor.task_agent_executor,
+        pioneer_tasks::TaskExecutionContext {
+            workspace_id: workspace_id.clone(),
+            task_id: response.task.id.clone(),
+            execution_id: Some(execution.id.clone()),
+            worker_id: "task-window-block-recovery".to_owned(),
+        },
+        current_run,
+        handle,
+    )
+    .await
+    .expect("blocked window recovery should not fail");
+    assert_eq!(
+        outcome,
+        pioneer_tasks::TaskExecutorRecoveryOutcome::AlreadyRunning
+    );
+
+    let stored_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("run should reload after recovery")
+        .expect("run should still exist");
+    assert_eq!(stored_run.status, TaskRunStatus::Running);
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("target task_run_turn should exist");
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::InProgress);
+    assert!(
+        crud_store
+            .list_task_result_candidates(run.id.as_str())
+            .await
+            .expect("result candidates should list")
+            .is_empty(),
+        "runtime window block must not create a result candidate"
+    );
+    let task_events = crud_store
+        .get_task_events(response.task.id.as_str(), None)
+        .await
+        .expect("task events should load");
+    let event_types = task_events
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    assert!(!event_types.contains(&events::TASK_RUN_FAILED));
+    assert!(!event_types.contains(&events::TASK_RUN_TURN_FAILED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execution_window_continuation_keeps_task_run_turn_in_progress() {
+    let provider = Arc::new(HangingChildProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_cont_window_task",
+            "turn_parent_cont_window_task",
+            "Continued execution window child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        provider.child_main_call_count() > 0,
+        "child provider should be hanging before window continuation"
+    );
+
+    let execution_before = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution_before.status, TaskRunExecutionStatus::Running);
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_cont_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_cont_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                limit: 2,
+                observed: 2,
+                agent_round_count: 2,
+                tool_call_count: 0,
+                provider_token_count: None,
+                started_at_unix_ms: 1_000,
+                exhausted_at_unix_ms: 2_000,
+                reason: "max_agent_rounds_per_window".to_owned(),
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowContinued {
+            notification: pioneer_protocol::TurnExecutionWindowContinuedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_cont_window_2".to_owned(),
+                window_index: 2,
+                status: ExecutionWindowStatus::Continued,
+                previous_window_id: "task_cont_window_1".to_owned(),
+                previous_window_index: 1,
+                checkpoint_id: "task_cont_checkpoint_1".to_owned(),
+                continued_at_unix_ms: 2_100,
+            },
+        })
+        .await;
+
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("target task_run_turn should exist");
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::InProgress);
+    let stored_run = crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("run should reload")
+        .expect("run should exist");
+    assert_eq!(stored_run.status, TaskRunStatus::Running);
+    let execution_after = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should reload")
+        .expect("execution should still exist");
+    assert_eq!(execution_after.status, TaskRunExecutionStatus::Running);
+    assert_eq!(execution_after.worker_id, execution_before.worker_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_window_does_not_create_candidate_until_child_turn_completes() {
+    let provider = Arc::new(HangingChildProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let response = create_task_for_test(
+        &processor,
+        test_task_create_params(
+            workspace_id.as_str(),
+            "thr_parent_candidate_window_task",
+            "turn_parent_candidate_window_task",
+            "Candidate after execution window child",
+            3,
+        ),
+    )
+    .await
+    .expect("task_create should start hidden child task");
+    let run = response
+        .run
+        .clone()
+        .expect("immediate task should create run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    for _ in 0..100 {
+        if provider.child_main_call_count() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        provider.child_main_call_count() > 0,
+        "child provider should be hanging before synthetic completion"
+    );
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_candidate_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_candidate_window_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                limit: 8,
+                observed: 8,
+                agent_round_count: 2,
+                tool_call_count: 8,
+                provider_token_count: None,
+                started_at_unix_ms: 1_000,
+                exhausted_at_unix_ms: 2_000,
+                reason: "max_tool_calls_per_window".to_owned(),
+            },
+        })
+        .await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowContinued {
+            notification: pioneer_protocol::TurnExecutionWindowContinuedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                window_id: "task_candidate_window_2".to_owned(),
+                window_index: 2,
+                status: ExecutionWindowStatus::Continued,
+                previous_window_id: "task_candidate_window_1".to_owned(),
+                previous_window_index: 1,
+                checkpoint_id: "task_candidate_checkpoint_1".to_owned(),
+                continued_at_unix_ms: 2_100,
+            },
+        })
+        .await;
+    assert!(
+        crud_store
+            .list_task_result_candidates(run.id.as_str())
+            .await
+            .expect("candidates should list after window boundary")
+            .is_empty(),
+        "window boundary must not create task result candidates"
+    );
+    let task_run_turns_after_window = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should list after window boundary");
+    assert_eq!(
+        task_run_turns_after_window.len(),
+        1,
+        "window boundary must stay inside the original child task_run_turn"
+    );
+    assert_eq!(
+        task_run_turns_after_window[0].kind,
+        TaskRunTurnKind::Initial
+    );
+    assert_eq!(
+        task_run_turns_after_window[0].status,
+        TaskRunTurnStatus::InProgress
+    );
+
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: "item_candidate_after_window".to_owned(),
+                    text: r#"<task_result>{"summary":"completed after window","data":{"ok":true}}</task_result>"#
+                        .to_owned(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("synthetic child result item should persist");
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+            thread_id: lineage.child_thread_id.clone(),
+            turn_id: lineage.child_turn_id.clone(),
+            recovery: None,
+        })
+        .await;
+
+    assert_eq!(
+        wait_for_run_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskRunStatus::Succeeded
+        )
+        .await,
+        TaskRunStatus::Succeeded
+    );
+    let accepted_candidate = crud_store
+        .get_accepted_task_result_candidate(run.id.as_str())
+        .await
+        .expect("accepted candidate should load")
+        .expect("completed child turn should create accepted candidate");
+    assert_eq!(accepted_candidate.turn_id, lineage.child_turn_id);
+    assert_eq!(
+        accepted_candidate.summary.as_deref(),
+        Some("completed after window")
+    );
+    let candidates = crud_store
+        .list_task_result_candidates(run.id.as_str())
+        .await
+        .expect("candidates should list after child completion");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "continued child turn completion must create exactly one result candidate"
+    );
+    assert_eq!(candidates[0].status, TaskResultCandidateStatus::Accepted);
+    assert_eq!(candidates[0].turn_id, lineage.child_turn_id);
+    let task_run_turn = crud_store
+        .get_task_run_turn_by_turn(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("task run turn lookup should succeed")
+        .expect("target task_run_turn should exist");
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::CandidateCreated);
+    let task_run_turns_after_completion = crud_store
+        .list_task_run_turns(run.id.as_str())
+        .await
+        .expect("task run turns should list after child completion");
+    assert_eq!(
+        task_run_turns_after_completion.len(),
+        1,
+        "continued child turn completion must not create duplicate task_run_turn rows"
+    );
+    assert_eq!(
+        task_run_turns_after_completion[0].kind,
+        TaskRunTurnKind::Initial
+    );
+    assert!(
+        !task_run_turns_after_completion
+            .iter()
+            .any(|turn| turn.kind == TaskRunTurnKind::Revision),
+        "execution window continuation must not create task revisions"
     );
 }
 
@@ -8583,6 +9419,562 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
             } if id == item_id && text == "durably completed"
         )),
         "committed durable event must already be persisted in the read model"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_durable_execution_window_lifecycle_updates_rows() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager,
+        session_manager.clone(),
+        workspace_manager,
+        crud_store.clone(),
+    );
+
+    let thread_id = "thr_window_lifecycle_1";
+    let turn_id = "turn_window_lifecycle1";
+    let (tx, mut rx) = mpsc::channel(16);
+    let connection_id = session_manager.register_connection(tx).await;
+
+    let thread_start = thread_manager
+        .system_thread_start_seeded(
+            workspace_id.clone(),
+            pioneer_protocol::ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("thread should start");
+    assert!(
+        thread_manager
+            .subscribe_connection(thread_id, connection_id)
+            .await,
+        "connection should subscribe to execution window notifications"
+    );
+    thread_manager
+        .system_turn_start(pioneer_protocol::TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            input: Vec::new(),
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: None,
+        })
+        .await
+        .expect("turn should start in thread manager");
+
+    crud_store
+        .materialize_turn_start(
+            &thread_start.started_notification.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+    let started_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/execution_window/started live notification",
+    )
+    .await;
+    let started_live_rpc: JsonRpcNotification =
+        serde_json::from_str(&started_live_payload).expect("started notification should decode");
+    assert_eq!(
+        started_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_STARTED
+    );
+    let started_live_params = started_live_rpc
+        .params
+        .expect("started notification should include params");
+    assert_eq!(started_live_params["workspace_id"], workspace_id);
+    assert_eq!(started_live_params["thread_id"], thread_id);
+    assert_eq!(started_live_params["turn_id"], turn_id);
+    assert_eq!(started_live_params["window_id"], "runtime_win_1");
+    assert_eq!(started_live_params["window_index"], 1);
+    let started = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("started window should exist");
+    assert_eq!(started.window_index, 1);
+    assert_eq!(started.status, ExecutionWindowStatus::Running);
+    assert_eq!(started.metadata_json["runtimeWindowId"], "runtime_win_1");
+
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "item_window_history_order".to_owned(),
+                    text: "history ordering marker".to_owned(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("history ordering item should persist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
+            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Exhausted,
+                exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                limit: 2,
+                observed: 3,
+                agent_round_count: 4,
+                tool_call_count: 3,
+                provider_token_count: Some(100),
+                started_at_unix_ms: 1_000,
+                exhausted_at_unix_ms: 2_000,
+                reason: "max_tool_calls_per_window".to_owned(),
+            },
+        })
+        .await;
+    let exhausted_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/execution_window/exhausted live notification",
+    )
+    .await;
+    let exhausted_live_rpc: JsonRpcNotification = serde_json::from_str(&exhausted_live_payload)
+        .expect("exhausted notification should decode");
+    assert_eq!(
+        exhausted_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_EXHAUSTED
+    );
+    let exhausted_live_params = exhausted_live_rpc
+        .params
+        .expect("exhausted notification should include params");
+    assert_eq!(exhausted_live_params["workspace_id"], workspace_id);
+    assert_eq!(exhausted_live_params["thread_id"], thread_id);
+    assert_eq!(exhausted_live_params["turn_id"], turn_id);
+    assert_eq!(exhausted_live_params["window_id"], "runtime_win_1");
+    assert_eq!(exhausted_live_params["window_index"], 1);
+    let exhausted = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest exhausted window should load")
+        .expect("exhausted window should exist");
+    assert_eq!(exhausted.status, ExecutionWindowStatus::Exhausted);
+    assert_eq!(
+        exhausted.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow)
+    );
+    assert_eq!(exhausted.agent_round_count, 4);
+    assert_eq!(exhausted.tool_call_count, 3);
+    assert_eq!(exhausted.provider_token_count, 100);
+    let window_id = exhausted.id.clone();
+
+    let checkpoint_payload = pioneer_protocol::build_execution_checkpoint_payload(
+        workspace_id.clone(),
+        thread_id.to_owned(),
+        turn_id.to_owned(),
+        pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
+            input_count: 1,
+            text_preview: Some("continue original request".to_owned()),
+            text_truncated: false,
+            attachment_count: 0,
+            attachment_kinds: Vec::new(),
+        },
+        pioneer_protocol::ExecutionCheckpointWindowSummary {
+            window_id: Some("runtime_win_1".to_owned()),
+            window_index: 1,
+            started_at_unix_ms: Some(1_000),
+            completed_at_unix_ms: Some(2_000),
+            agent_round_count: 4,
+            tool_call_count: 3,
+            provider_token_count: Some(100),
+            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+        },
+        pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
+            model: Some("o4-mini".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            agent_round_count: 4,
+            tool_call_count: 3,
+            provider_token_count: Some(100),
+            provider_usage_available: true,
+            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+            exhausted_limit: Some(2),
+            exhausted_observed: Some(3),
+        },
+        pioneer_protocol::ExecutionCheckpointToolSummary {
+            requested_count: 3,
+            executed_count: 2,
+            unexecuted_count: 1,
+            total_count: 3,
+            succeeded_count: 1,
+            failed_count: 1,
+            in_progress_count: 0,
+            detail_limit: 0,
+            details_truncated: false,
+            details: Vec::new(),
+        },
+        Vec::new(),
+    );
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
+            notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Checkpointed,
+                checkpoint_id: "checkpoint_1".to_owned(),
+                checkpoint_kind: "window_exhausted".to_owned(),
+                payload_bytes: 512,
+                created_at_unix_ms: 2_050,
+            },
+            payload: checkpoint_payload.clone(),
+        })
+        .await;
+    let checkpointed_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/execution_window/checkpointed live notification",
+    )
+    .await;
+    let checkpointed_live_rpc: JsonRpcNotification =
+        serde_json::from_str(&checkpointed_live_payload)
+            .expect("checkpointed notification should decode");
+    assert_eq!(
+        checkpointed_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_CHECKPOINTED
+    );
+    let checkpointed_live_params = checkpointed_live_rpc
+        .params
+        .expect("checkpointed notification should include params");
+    assert_eq!(checkpointed_live_params["workspace_id"], workspace_id);
+    assert_eq!(checkpointed_live_params["thread_id"], thread_id);
+    assert_eq!(checkpointed_live_params["turn_id"], turn_id);
+    assert_eq!(checkpointed_live_params["window_id"], "runtime_win_1");
+    assert_eq!(checkpointed_live_params["window_index"], 1);
+    assert_eq!(checkpointed_live_params["checkpoint_id"], "checkpoint_1");
+    assert!(
+        checkpointed_live_params.get("payload").is_none(),
+        "checkpoint payload must not be forwarded in live notification"
+    );
+    let checkpointed = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest checkpointed window should load")
+        .expect("checkpointed window should exist");
+    assert_eq!(checkpointed.status, ExecutionWindowStatus::Checkpointed);
+    let checkpoints = crud_store
+        .list_turn_execution_checkpoints_for_window(window_id.as_str())
+        .await
+        .expect("checkpoints should list");
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(
+        checkpoints[0].checkpoint_kind,
+        pioneer_crud::TurnExecutionCheckpointKind::WindowExhausted
+    );
+
+    let mut oversized_payload = checkpoint_payload;
+    oversized_payload.strict_obligations =
+        vec![pioneer_protocol::ExecutionCheckpointStrictObligation {
+            obligation_id: "oversized".to_owned(),
+            kind: "test".to_owned(),
+            description: "x".repeat(pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1),
+            refs: BTreeMap::new(),
+        }];
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
+            notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Checkpointed,
+                checkpoint_id: "checkpoint_oversized".to_owned(),
+                checkpoint_kind: "window_exhausted".to_owned(),
+                payload_bytes: u64::try_from(
+                    pioneer_crud::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1,
+                )
+                .unwrap_or(u64::MAX),
+                created_at_unix_ms: 2_060,
+            },
+            payload: oversized_payload,
+        })
+        .await;
+    let oversized_checkpointed_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "oversized turn/execution_window/checkpointed live notification",
+    )
+    .await;
+    let oversized_checkpointed_live_rpc: JsonRpcNotification =
+        serde_json::from_str(&oversized_checkpointed_live_payload)
+            .expect("oversized checkpointed notification should decode");
+    assert_eq!(
+        oversized_checkpointed_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_CHECKPOINTED
+    );
+    let oversized_checkpointed_live_params = oversized_checkpointed_live_rpc
+        .params
+        .expect("oversized checkpointed notification should include params");
+    assert_eq!(
+        oversized_checkpointed_live_params["checkpoint_id"],
+        "checkpoint_oversized"
+    );
+    assert!(
+        oversized_checkpointed_live_params.get("payload").is_none(),
+        "oversized checkpoint payload must not be forwarded in live notification"
+    );
+    assert_eq!(
+        crud_store
+            .list_turn_execution_checkpoints_for_window(window_id.as_str())
+            .await
+            .expect("checkpoints should list after oversized payload")
+            .len(),
+        1
+    );
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowContinued {
+            notification: pioneer_protocol::TurnExecutionWindowContinuedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_2".to_owned(),
+                window_index: 2,
+                status: ExecutionWindowStatus::Continued,
+                previous_window_id: "runtime_win_1".to_owned(),
+                previous_window_index: 1,
+                checkpoint_id: "checkpoint_1".to_owned(),
+                continued_at_unix_ms: 2_100,
+            },
+        })
+        .await;
+    let continued_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/execution_window/continued live notification",
+    )
+    .await;
+    let continued_live_rpc: JsonRpcNotification = serde_json::from_str(&continued_live_payload)
+        .expect("continued notification should decode");
+    assert_eq!(
+        continued_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_CONTINUED
+    );
+    let continued_live_params = continued_live_rpc
+        .params
+        .expect("continued notification should include params");
+    assert_eq!(continued_live_params["workspace_id"], workspace_id);
+    assert_eq!(continued_live_params["thread_id"], thread_id);
+    assert_eq!(continued_live_params["turn_id"], turn_id);
+    assert_eq!(continued_live_params["window_id"], "runtime_win_2");
+    assert_eq!(continued_live_params["window_index"], 2);
+    let continued = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest continued window should load")
+        .expect("continued window should exist");
+    assert_eq!(continued.status, ExecutionWindowStatus::Continued);
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowBlocked {
+            notification: pioneer_protocol::TurnExecutionWindowBlockedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: "runtime_win_1".to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Blocked,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
+                checkpoint_id: Some("checkpoint_1".to_owned()),
+                total_windows: 1,
+                total_tool_calls: 3,
+                reason: "total budget exhausted".to_owned(),
+                blocked_at_unix_ms: 2_200,
+            },
+        })
+        .await;
+    let blocked_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/execution_window/blocked live notification",
+    )
+    .await;
+    let blocked_live_rpc: JsonRpcNotification =
+        serde_json::from_str(&blocked_live_payload).expect("blocked notification should decode");
+    assert_eq!(
+        blocked_live_rpc.method,
+        events::TURN_EXECUTION_WINDOW_BLOCKED
+    );
+    let blocked_live_params = blocked_live_rpc
+        .params
+        .expect("blocked notification should include params");
+    assert_eq!(blocked_live_params["workspace_id"], workspace_id);
+    assert_eq!(blocked_live_params["thread_id"], thread_id);
+    assert_eq!(blocked_live_params["turn_id"], turn_id);
+    assert_eq!(blocked_live_params["window_id"], "runtime_win_1");
+    assert_eq!(blocked_live_params["window_index"], 1);
+    let blocked = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest blocked window should load")
+        .expect("blocked window should exist");
+    assert_eq!(blocked.status, ExecutionWindowStatus::Blocked);
+    assert_eq!(
+        blocked.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow)
+    );
+    let (_blocked_workspace_id, blocked_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("blocked turn should load")
+        .expect("blocked turn should exist");
+    assert_eq!(blocked_turn.status, TurnStatus::Blocked);
+    assert_eq!(
+        blocked_turn.error.as_deref(),
+        Some("total budget exhausted")
+    );
+
+    let item_events = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    assert!(item_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnExecutionWindowStarted(_)
+    )));
+    assert!(item_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnExecutionWindowExhausted(_)
+    )));
+    assert!(item_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnExecutionWindowCheckpointed(_)
+    )));
+    assert!(item_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnExecutionWindowContinued(_)
+    )));
+    assert!(item_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnExecutionWindowBlocked(_)
+    )));
+
+    let history = crud_store
+        .get_thread_history(thread_id, Some(32))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    let started_position = history
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::TurnExecutionWindowStarted(notification)
+                    if notification.window_id == "runtime_win_1"
+            )
+        })
+        .expect("history should include execution window started event");
+    let item_position = history
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemCompleted {
+                    item: TurnItem::AgentMessage { id, .. },
+                    ..
+                } if id == "item_window_history_order"
+            )
+        })
+        .expect("history should include regular item event between window events");
+    let exhausted_position = history
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::TurnExecutionWindowExhausted(notification)
+                    if notification.window_id == "runtime_win_1"
+            )
+        })
+        .expect("history should include execution window exhausted event");
+    assert!(
+        started_position < item_position && item_position < exhausted_position,
+        "thread history should preserve chronological order across window and item events"
+    );
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(notification)
+            if notification.checkpoint_id == "checkpoint_1"
+    )));
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnExecutionWindowContinued(notification)
+            if notification.window_id == "runtime_win_2"
+    )));
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnExecutionWindowBlocked(notification)
+            if notification.reason == "total budget exhausted"
+    )));
+    let history_json =
+        serde_json::to_string(&history.events).expect("thread history should serialize");
+    assert!(
+        !history_json.contains("strictObligations")
+            && !history_json.contains("continue original request"),
+        "thread history must not expose compacted checkpoint payload details"
     );
 }
 
@@ -18232,14 +19624,22 @@ async fn recv_text(rx: &mut mpsc::Receiver<Message>) -> String {
 }
 
 async fn recv_text_timeout(rx: &mut mpsc::Receiver<Message>, wait_for: Duration) -> String {
+    recv_text_timeout_context(rx, wait_for, "websocket message").await
+}
+
+async fn recv_text_timeout_context(
+    rx: &mut mpsc::Receiver<Message>,
+    wait_for: Duration,
+    context: &str,
+) -> String {
     let message = timeout(wait_for, rx.recv())
         .await
-        .expect("timed out waiting for websocket message")
-        .expect("websocket channel closed unexpectedly");
+        .unwrap_or_else(|error| panic!("timed out waiting for {context}: {error:?}"))
+        .unwrap_or_else(|| panic!("websocket channel closed unexpectedly waiting for {context}"));
 
     match message {
         Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text websocket message, got {other:?}"),
+        other => panic!("expected text websocket message for {context}, got {other:?}"),
     }
 }
 

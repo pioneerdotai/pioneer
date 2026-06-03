@@ -6,6 +6,7 @@
     "InProgress",
     "Completed",
     "Failed",
-    "Interrupted"
+    "Interrupted",
+    "Blocked"
   ]
 }

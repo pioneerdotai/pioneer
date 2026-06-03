@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionCheckpointProviderBudgetSummary",
+  "type": "object",
+  "properties": {
+    "agent_round_count": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "exhausted_limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "exhausted_observed": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "exhaustion_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider_token_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "provider_usage_available": {
+      "type": "boolean"
+    },
+    "tool_call_count": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "agent_round_count",
+    "tool_call_count",
+    "provider_usage_available"
+  ],
+  "$defs": {
+    "ExecutionWindowExhaustionReason": {
+      "type": "string",
+      "enum": [
+        "max_agent_rounds_per_window",
+        "max_tool_calls_per_window",
+        "max_wall_clock_ms_per_window",
+        "max_provider_tokens_per_window",
+        "provider_failure_continuation",
+        "runtime_shutdown_continuation"
+      ]
+    }
+  }
+}

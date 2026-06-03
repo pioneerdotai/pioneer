@@ -24,6 +24,9 @@ pub(super) enum TurnFlowState {
         turn_id: String,
         error: String,
     },
+    Blocked {
+        turn_id: String,
+    },
     Cancelled {
         turn_id: String,
         error: Option<String>,
@@ -52,6 +55,7 @@ impl TurnStateMachine {
             TurnFlowState::Idle
                 | TurnFlowState::Completed { .. }
                 | TurnFlowState::Failed { .. }
+                | TurnFlowState::Blocked { .. }
                 | TurnFlowState::Cancelled { .. }
         )
     }
@@ -69,6 +73,7 @@ impl TurnStateMachine {
             TurnFlowState::Idle
             | TurnFlowState::Completed { .. }
             | TurnFlowState::Failed { .. }
+            | TurnFlowState::Blocked { .. }
             | TurnFlowState::Cancelled { .. } => None,
         }
     }
@@ -84,6 +89,7 @@ impl TurnStateMachine {
             | TurnFlowState::Completing { .. }
             | TurnFlowState::Completed { .. }
             | TurnFlowState::Failed { .. }
+            | TurnFlowState::Blocked { .. }
             | TurnFlowState::Cancelled { .. } => None,
         }
     }
@@ -97,8 +103,18 @@ impl TurnStateMachine {
             TurnFlowState::Completing { .. } => "completing",
             TurnFlowState::Completed { .. } => "completed",
             TurnFlowState::Failed { .. } => "failed",
+            TurnFlowState::Blocked { .. } => "blocked",
             TurnFlowState::Cancelled { .. } => "cancelled",
         }
+    }
+
+    pub(super) fn is_blocked_turn(&self, turn_id: &str) -> bool {
+        matches!(
+            &self.state,
+            TurnFlowState::Blocked {
+                turn_id: current_turn_id,
+            } if current_turn_id == turn_id
+        )
     }
 
     pub(super) fn apply(&mut self, event: &ConversationEvent) {
@@ -179,6 +195,12 @@ impl TurnStateMachine {
                     } if current_turn_id == &turn.id
                 ) || matches!(
                     &self.state,
+                    TurnFlowState::Blocked {
+                        turn_id: current_turn_id,
+                        ..
+                    } if current_turn_id == &turn.id
+                ) || matches!(
+                    &self.state,
                     TurnFlowState::Cancelled {
                         turn_id: current_turn_id,
                         ..
@@ -194,6 +216,16 @@ impl TurnStateMachine {
                 }
             }
             ConversationEvent::TurnFailed { turn, .. } => {
+                if matches!(
+                    &self.state,
+                    TurnFlowState::Blocked {
+                        turn_id: current_turn_id,
+                        ..
+                    } if current_turn_id == &turn.id
+                ) {
+                    return;
+                }
+
                 if self.matches_turn(turn.id.as_str()) || self.in_flight_turn_id().is_none() {
                     if turn.status == TurnStatus::Interrupted {
                         self.state = TurnFlowState::Cancelled {
@@ -230,6 +262,51 @@ impl TurnStateMachine {
                 {
                     self.state = TurnFlowState::Running {
                         turn_id: turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::TurnExecutionWindowStarted { notification } => {
+                if self.matches_turn(notification.turn_id.as_str())
+                    && matches!(self.state, TurnFlowState::Starting { .. })
+                {
+                    self.state = TurnFlowState::Running {
+                        turn_id: notification.turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::TurnExecutionWindowExhausted { notification } => {
+                if self.matches_turn(notification.turn_id.as_str())
+                    && matches!(self.state, TurnFlowState::Starting { .. })
+                {
+                    self.state = TurnFlowState::Running {
+                        turn_id: notification.turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::TurnExecutionWindowCheckpointed { notification } => {
+                if self.matches_turn(notification.turn_id.as_str())
+                    && matches!(self.state, TurnFlowState::Starting { .. })
+                {
+                    self.state = TurnFlowState::Running {
+                        turn_id: notification.turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::TurnExecutionWindowContinued { notification } => {
+                if self.matches_turn(notification.turn_id.as_str())
+                    && matches!(self.state, TurnFlowState::Starting { .. })
+                {
+                    self.state = TurnFlowState::Running {
+                        turn_id: notification.turn_id.clone(),
+                    };
+                }
+            }
+            ConversationEvent::TurnExecutionWindowBlocked { notification } => {
+                if self.matches_turn(notification.turn_id.as_str())
+                    || self.in_flight_turn_id().is_none()
+                {
+                    self.state = TurnFlowState::Blocked {
+                        turn_id: notification.turn_id.clone(),
                     };
                 }
             }
@@ -279,6 +356,10 @@ impl TurnStateMachine {
                 turn_id: current_turn_id,
             }
             | TurnFlowState::Failed {
+                turn_id: current_turn_id,
+                ..
+            }
+            | TurnFlowState::Blocked {
                 turn_id: current_turn_id,
                 ..
             }

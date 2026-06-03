@@ -6,7 +6,10 @@ use crate::thread_agents_doc::ThreadAgentsDocSummary;
 use crate::turn::{
     ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, Turn, TurnItem, TurnItemTimeoutReason, TurnItemType, UserInput,
+    ToolRetryResolution, Turn, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemTimeoutReason, TurnItemType, UserInput,
 };
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +397,16 @@ pub enum ThreadHistoryEventPayload {
         action: ToolLoopBudgetAction,
         reason: String,
     },
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
     #[serde(rename_all = "camelCase")]
     TurnCompleted {
         workspace_id: String,

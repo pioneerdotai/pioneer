@@ -2,14 +2,17 @@ use super::events::EventKind;
 use super::reducer::ConversationProjector;
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
 use pioneer_protocol::{
-    ArtifactKind, ArtifactRef, ArtifactStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, TaskEvent, TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind,
-    TaskTurnItem, ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane,
-    TimelineOrigin, TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload,
-    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
-    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-    ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, ToolStoragePayload, Turn, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
+    ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+    TaskEvent, TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane, TimelineOrigin,
+    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
+    ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
+    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
+    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemEvent, TurnItemEventPayload,
     TurnItemTimeoutReason, TurnItemType, TurnStatus, TurnTimelineResponse, UserInput,
     UserMessageAttachment,
 };
@@ -17,9 +20,135 @@ use pioneer_protocol::{
 const THREAD_ID: &str = "thr_000000000000000001";
 const TURN_ID: &str = "turn_000000000000000001";
 const PENDING_REQUEST_ID: &str = "req_000000000000000001";
+const WORKSPACE_ID: &str = "ws_000000000000000001";
 
 fn pending_request_id(conversation: &Conversation) -> Option<&str> {
     conversation.state_machine.pending_request_id()
+}
+
+fn apply_in_progress_turn(conversation: &mut Conversation) {
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+        },
+    });
+}
+
+fn system_event_details<'a>(
+    conversation: &'a Conversation,
+    code: &str,
+) -> (&'a str, &'a serde_json::Value) {
+    conversation
+        .projection()
+        .items
+        .iter()
+        .find_map(|item| match &item.item {
+            TurnItem::SystemEvent {
+                message,
+                code: Some(existing_code),
+                details: Some(details),
+                ..
+            } if existing_code == code => Some((message.as_str(), details)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected system event with code {code}"))
+}
+
+fn window_started_notification(
+    window_id: &str,
+    window_index: u32,
+) -> TurnExecutionWindowStartedNotification {
+    TurnExecutionWindowStartedNotification {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        window_id: window_id.to_owned(),
+        window_index,
+        status: ExecutionWindowStatus::Running,
+        started_at_unix_ms: 1_000,
+    }
+}
+
+fn window_exhausted_notification(
+    window_id: &str,
+    window_index: u32,
+) -> TurnExecutionWindowExhaustedNotification {
+    TurnExecutionWindowExhaustedNotification {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        window_id: window_id.to_owned(),
+        window_index,
+        status: ExecutionWindowStatus::Exhausted,
+        exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+        limit: 128,
+        observed: 129,
+        agent_round_count: 64,
+        tool_call_count: 129,
+        provider_token_count: Some(42_000),
+        started_at_unix_ms: 1_000,
+        exhausted_at_unix_ms: 2_000,
+        reason: "max_tool_calls_per_window".to_owned(),
+    }
+}
+
+fn window_checkpointed_notification(
+    window_id: &str,
+    window_index: u32,
+) -> TurnExecutionWindowCheckpointedNotification {
+    TurnExecutionWindowCheckpointedNotification {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        window_id: window_id.to_owned(),
+        window_index,
+        status: ExecutionWindowStatus::Checkpointed,
+        checkpoint_id: "chk_000000000000000001".to_owned(),
+        checkpoint_kind: "execution_window_budget".to_owned(),
+        payload_bytes: 4096,
+        created_at_unix_ms: 2_100,
+    }
+}
+
+fn window_continued_notification(
+    window_id: &str,
+    window_index: u32,
+) -> TurnExecutionWindowContinuedNotification {
+    TurnExecutionWindowContinuedNotification {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        window_id: window_id.to_owned(),
+        window_index,
+        status: ExecutionWindowStatus::Continued,
+        previous_window_id: "win_000000000000000001".to_owned(),
+        previous_window_index: 1,
+        checkpoint_id: "chk_000000000000000001".to_owned(),
+        continued_at_unix_ms: 2_200,
+    }
+}
+
+fn window_blocked_notification() -> TurnExecutionWindowBlockedNotification {
+    TurnExecutionWindowBlockedNotification {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        window_id: "win_000000000000000003".to_owned(),
+        window_index: 3,
+        status: ExecutionWindowStatus::Blocked,
+        exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow),
+        checkpoint_id: Some("chk_000000000000000003".to_owned()),
+        total_windows: 3,
+        total_tool_calls: 384,
+        reason: "max_total_windows_exceeded".to_owned(),
+        blocked_at_unix_ms: 3_000,
+    }
 }
 
 fn sample_tool_recovery_policy() -> ToolRecoveryPolicySnapshot {
@@ -1458,17 +1587,7 @@ fn tool_retry_budget_usage() -> Vec<ToolRetryBudgetUsage> {
 fn tool_retry_events_are_logged_without_recovery_projection() {
     let mut conversation = Conversation::new(THREAD_ID);
 
-    conversation.apply(ConversationEvent::TurnStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn: Turn {
-            id: TURN_ID.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            error: None,
-            prompt_manifest: None,
-        },
-    });
+    apply_in_progress_turn(&mut conversation);
     conversation.apply(ConversationEvent::ItemToolRetryScheduled {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
@@ -1553,19 +1672,177 @@ fn tool_retry_events_are_logged_without_recovery_projection() {
 }
 
 #[test]
-fn history_hydration_replays_tool_retry_events_like_live_events() {
-    let mut live = Conversation::new(THREAD_ID);
-    live.apply(ConversationEvent::TurnStarted {
+fn execution_window_events_project_runtime_rows_without_ending_turn() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    conversation.apply(ConversationEvent::TurnExecutionWindowStarted {
+        notification: window_started_notification("win_000000000000000001", 1),
+    });
+    conversation.apply(ConversationEvent::TurnExecutionWindowExhausted {
+        notification: window_exhausted_notification("win_000000000000000001", 1),
+    });
+    conversation.apply(ConversationEvent::TurnExecutionWindowCheckpointed {
+        notification: window_checkpointed_notification("win_000000000000000001", 1),
+    });
+    conversation.apply(ConversationEvent::TurnExecutionWindowContinued {
+        notification: window_continued_notification("win_000000000000000002", 2),
+    });
+
+    let kinds = conversation
+        .event_log
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&EventKind::TurnExecutionWindowStarted));
+    assert!(kinds.contains(&EventKind::TurnExecutionWindowExhausted));
+    assert!(kinds.contains(&EventKind::TurnExecutionWindowCheckpointed));
+    assert!(kinds.contains(&EventKind::TurnExecutionWindowContinued));
+
+    assert_eq!(conversation.status_label(), "running");
+    assert!(!conversation.can_submit_message());
+    assert_eq!(
+        conversation.projection().in_flight_turn_id.as_deref(),
+        Some(TURN_ID)
+    );
+
+    let (started_message, started_details) =
+        system_event_details(&conversation, "turn_execution_window_started");
+    assert_eq!(started_message, "Execution window #1 started");
+    assert_eq!(
+        started_details
+            .get("status")
+            .and_then(|value| value.as_str()),
+        Some("running")
+    );
+
+    let (_, exhausted_details) =
+        system_event_details(&conversation, "turn_execution_window_exhausted");
+    assert_eq!(
+        exhausted_details
+            .get("exhaustion_reason")
+            .and_then(|value| value.as_str()),
+        Some("max_tool_calls_per_window")
+    );
+    assert_eq!(
+        exhausted_details
+            .get("observed")
+            .and_then(|value| value.as_u64()),
+        Some(129)
+    );
+    assert!(exhausted_details.get("payload").is_none());
+
+    let (_, checkpointed_details) =
+        system_event_details(&conversation, "turn_execution_window_checkpointed");
+    assert_eq!(
+        checkpointed_details
+            .get("checkpoint_id")
+            .and_then(|value| value.as_str()),
+        Some("chk_000000000000000001")
+    );
+    assert_eq!(
+        checkpointed_details
+            .get("payload_bytes")
+            .and_then(|value| value.as_u64()),
+        Some(4096)
+    );
+    assert!(checkpointed_details.get("payload").is_none());
+
+    let (_, continued_details) =
+        system_event_details(&conversation, "turn_execution_window_continued");
+    assert_eq!(
+        continued_details
+            .get("previous_window_index")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        continued_details
+            .get("checkpoint_id")
+            .and_then(|value| value.as_str()),
+        Some("chk_000000000000000001")
+    );
+    assert!(continued_details.get("payload").is_none());
+
+    conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),
         turn: Turn {
             id: TURN_ID.to_owned(),
-            status: TurnStatus::InProgress,
+            status: TurnStatus::Completed,
             turn_kind: Default::default(),
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
         },
     });
+
+    assert_eq!(conversation.status_label(), "completing");
+    assert!(conversation.tick());
+    assert_eq!(conversation.status_label(), "completed");
+    assert!(conversation.can_submit_message());
+}
+
+#[test]
+fn execution_window_blocked_projects_controlled_pause_not_failure() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    conversation.apply(ConversationEvent::TurnExecutionWindowBlocked {
+        notification: window_blocked_notification(),
+    });
+
+    assert_eq!(conversation.status_label(), "blocked");
+    assert!(conversation.can_submit_message());
+    assert_eq!(conversation.projection().in_flight_turn_id, None);
+    assert_eq!(
+        conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .map(|turn| (turn.phase, turn.error.as_deref())),
+        Some((TurnPhase::Blocked, Some("max_total_windows_exceeded")))
+    );
+    assert!(
+        conversation
+            .projection()
+            .items
+            .iter()
+            .all(|item| { item.turn_id != TURN_ID || item.status != TimelineEntryStatus::Failed })
+    );
+
+    let kinds = conversation
+        .event_log
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&EventKind::TurnExecutionWindowBlocked));
+
+    let (message, details) = system_event_details(&conversation, "turn_execution_window_blocked");
+    assert_eq!(message, "Execution paused: max_total_windows_exceeded");
+    assert_eq!(
+        details.get("status").and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+    assert_eq!(
+        details
+            .get("checkpoint_id")
+            .and_then(|value| value.as_str()),
+        Some("chk_000000000000000003")
+    );
+    assert_eq!(
+        details
+            .get("exhaustion_reason")
+            .and_then(|value| value.as_str()),
+        Some("max_agent_rounds_per_window")
+    );
+    assert!(details.get("payload").is_none());
+}
+
+#[test]
+fn history_hydration_replays_tool_retry_events_like_live_events() {
+    let mut live = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut live);
     live.apply(ConversationEvent::ItemToolRetryScheduled {
         thread_id: THREAD_ID.to_owned(),
         turn_id: TURN_ID.to_owned(),
@@ -1672,6 +1949,120 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
             .filter(|item| item.item_type == "system_event")
             .count()
     );
+}
+
+#[test]
+fn history_hydration_replays_execution_window_events_like_live_events() {
+    let mut live = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut live);
+    live.apply(ConversationEvent::TurnExecutionWindowStarted {
+        notification: window_started_notification("win_000000000000000001", 1),
+    });
+    live.apply(ConversationEvent::TurnExecutionWindowExhausted {
+        notification: window_exhausted_notification("win_000000000000000001", 1),
+    });
+    live.apply(ConversationEvent::TurnExecutionWindowCheckpointed {
+        notification: window_checkpointed_notification("win_000000000000000001", 1),
+    });
+    live.apply(ConversationEvent::TurnExecutionWindowContinued {
+        notification: window_continued_notification("win_000000000000000002", 2),
+    });
+
+    let mut replay = Conversation::new(THREAD_ID);
+    replay.hydrate_history(&[
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 1,
+            created_at: 1_000,
+            payload: ThreadHistoryEventPayload::TurnStarted {
+                workspace_id: WORKSPACE_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                turn: Turn {
+                    id: TURN_ID.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
+                    error: None,
+                    prompt_manifest: None,
+                },
+                input: Vec::new(),
+            },
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 2,
+            created_at: 1_100,
+            payload: ThreadHistoryEventPayload::TurnExecutionWindowStarted(
+                window_started_notification("win_000000000000000001", 1),
+            ),
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 3,
+            created_at: 1_200,
+            payload: ThreadHistoryEventPayload::TurnExecutionWindowExhausted(
+                window_exhausted_notification("win_000000000000000001", 1),
+            ),
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 4,
+            created_at: 1_300,
+            payload: ThreadHistoryEventPayload::TurnExecutionWindowCheckpointed(
+                window_checkpointed_notification("win_000000000000000001", 1),
+            ),
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 5,
+            created_at: 1_400,
+            payload: ThreadHistoryEventPayload::TurnExecutionWindowContinued(
+                window_continued_notification("win_000000000000000002", 2),
+            ),
+        },
+    ]);
+
+    let live_kinds = live
+        .event_log
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    let replay_kinds = replay
+        .event_log
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(live_kinds, replay_kinds);
+    assert_eq!(replay.status_label(), "running");
+    assert!(!replay.can_submit_message());
+
+    let live_system_events = live
+        .projection()
+        .items
+        .iter()
+        .filter_map(|item| match &item.item {
+            TurnItem::SystemEvent {
+                message,
+                code: Some(code),
+                ..
+            } => Some((code.clone(), message.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let replay_system_events = replay
+        .projection()
+        .items
+        .iter()
+        .filter_map(|item| match &item.item {
+            TurnItem::SystemEvent {
+                message,
+                code: Some(code),
+                ..
+            } => Some((code.clone(), message.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(live_system_events, replay_system_events);
 }
 
 #[test]

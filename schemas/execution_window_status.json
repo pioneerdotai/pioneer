@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionWindowStatus",
+  "type": "string",
+  "enum": [
+    "running",
+    "exhausted",
+    "checkpointed",
+    "continued",
+    "completed",
+    "blocked",
+    "failed"
+  ]
+}

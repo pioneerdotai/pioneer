@@ -565,10 +565,10 @@ mod tests {
     use super::{GatewayMemorySettings, load_or_create_gateway_settings, save_gateway_settings};
     use pioneer_config::{
         GatewayArtifactsConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
-        GatewayDatabaseConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
-        GatewayProviderConfig, GatewaySkillsConfig, GatewayThreadConfig,
-        GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
-        GatewayWebToolsConfig,
+        GatewayDatabaseConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig,
+        GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySkillsConfig,
+        GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
+        GatewayToolsConfig, GatewayWebToolsConfig,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1136,6 +1136,7 @@ model = "legacy-model"
                 web: GatewayWebToolsConfig::default(),
                 computer_use: GatewayComputerUseToolsConfig::default(),
                 budget: GatewayToolLoopBudgetConfig::default(),
+                execution_windows: Some(GatewayExecutionWindowsConfig::default()),
                 retry: GatewayToolRetryBudgetConfig::default(),
             },
             tasks: Default::default(),

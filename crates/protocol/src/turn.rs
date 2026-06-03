@@ -717,6 +717,16 @@ pub enum TurnItemEventPayload {
         action: ToolLoopBudgetAction,
         reason: String,
     },
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -865,6 +875,687 @@ pub enum TurnStatus {
     Completed,
     Failed,
     Interrupted,
+    Blocked,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWindowStatus {
+    Running,
+    Exhausted,
+    Checkpointed,
+    Continued,
+    Completed,
+    Blocked,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWindowExhaustionReason {
+    MaxAgentRoundsPerWindow,
+    MaxToolCallsPerWindow,
+    MaxWallClockMsPerWindow,
+    MaxProviderTokensPerWindow,
+    ProviderFailureContinuation,
+    RuntimeShutdownContinuation,
+}
+
+pub const EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT: usize = 32;
+pub const EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS: usize = 512;
+pub const EXECUTION_CHECKPOINT_METADATA_MAX_CHARS: usize = 256;
+pub const EXECUTION_CHECKPOINT_METADATA_MAX_FIELDS: usize = 16;
+pub const EXECUTION_CHECKPOINT_METADATA_MAX_ARRAY_ITEMS: usize = 8;
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointPayload {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub original_request: ExecutionCheckpointOriginalRequestSummary,
+    pub window: ExecutionCheckpointWindowSummary,
+    pub provider_budget: ExecutionCheckpointProviderBudgetSummary,
+    pub tools: ExecutionCheckpointToolSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strict_obligations: Vec<ExecutionCheckpointStrictObligation>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointOriginalRequestSummary {
+    pub input_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
+    pub text_truncated: bool,
+    pub attachment_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_kinds: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointWindowSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<String>,
+    pub window_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    pub agent_round_count: u32,
+    pub tool_call_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_token_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion_reason: Option<ExecutionWindowExhaustionReason>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointProviderBudgetSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    pub agent_round_count: u32,
+    pub tool_call_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_token_count: Option<u64>,
+    pub provider_usage_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion_reason: Option<ExecutionWindowExhaustionReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_observed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointProviderBudgetInput {
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub agent_round_count: u32,
+    pub tool_call_count: u32,
+    pub provider_token_count: Option<u64>,
+    pub exhaustion_reason: Option<ExecutionWindowExhaustionReason>,
+    pub exhausted_limit: Option<u64>,
+    pub exhausted_observed: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointToolSummary {
+    pub requested_count: u32,
+    pub executed_count: u32,
+    pub unexecuted_count: u32,
+    pub total_count: u32,
+    pub succeeded_count: u32,
+    pub failed_count: u32,
+    pub in_progress_count: u32,
+    pub detail_limit: u32,
+    pub details_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<ExecutionCheckpointToolCallSummary>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointToolCallSummary {
+    pub item_id: String,
+    pub tool_name: String,
+    pub item_type: TurnItemType,
+    pub status: ToolCallStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<ToolErrorClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_error_class: Option<String>,
+    pub metadata: ToolMetadata,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCheckpointStrictObligation {
+    pub obligation_id: String,
+    pub kind: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refs: BTreeMap<String, String>,
+}
+
+pub trait StrictObligationCollector {
+    fn collect_strict_obligations(&self) -> Vec<ExecutionCheckpointStrictObligation>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmptyStrictObligationCollector;
+
+impl StrictObligationCollector for EmptyStrictObligationCollector {
+    fn collect_strict_obligations(&self) -> Vec<ExecutionCheckpointStrictObligation> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticStrictObligationCollector {
+    obligations: Vec<ExecutionCheckpointStrictObligation>,
+}
+
+impl StaticStrictObligationCollector {
+    pub fn new(obligations: Vec<ExecutionCheckpointStrictObligation>) -> Self {
+        Self { obligations }
+    }
+}
+
+impl StrictObligationCollector for StaticStrictObligationCollector {
+    fn collect_strict_obligations(&self) -> Vec<ExecutionCheckpointStrictObligation> {
+        self.obligations.clone()
+    }
+}
+
+pub fn build_execution_checkpoint_original_request_summary(
+    input: &[UserInput],
+) -> ExecutionCheckpointOriginalRequestSummary {
+    let mut text = String::new();
+    let mut text_truncated = false;
+    let mut attachment_kinds = BTreeMap::<String, ()>::new();
+
+    for item in input {
+        match item {
+            UserInput::Text {
+                text: item_text, ..
+            } => {
+                if !text.is_empty() {
+                    push_preview_text(&mut text, "\n", &mut text_truncated);
+                }
+                push_preview_text(&mut text, item_text, &mut text_truncated);
+            }
+            _ => {
+                attachment_kinds.insert(user_input_kind(item).to_owned(), ());
+            }
+        }
+    }
+
+    ExecutionCheckpointOriginalRequestSummary {
+        input_count: u32::try_from(input.len()).unwrap_or(u32::MAX),
+        text_preview: if text.is_empty() { None } else { Some(text) },
+        text_truncated,
+        attachment_count: u32::try_from(
+            input
+                .iter()
+                .filter(|item| !matches!(item, UserInput::Text { .. }))
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        attachment_kinds: attachment_kinds.into_keys().collect(),
+    }
+}
+
+pub fn build_execution_checkpoint_provider_budget_summary(
+    input: ExecutionCheckpointProviderBudgetInput,
+) -> ExecutionCheckpointProviderBudgetSummary {
+    ExecutionCheckpointProviderBudgetSummary {
+        model: input.model,
+        model_provider: input.model_provider,
+        agent_round_count: input.agent_round_count,
+        tool_call_count: input.tool_call_count,
+        provider_token_count: input.provider_token_count,
+        provider_usage_available: input.provider_token_count.is_some(),
+        exhaustion_reason: input.exhaustion_reason,
+        exhausted_limit: input.exhausted_limit,
+        exhausted_observed: input.exhausted_observed,
+    }
+}
+
+pub fn build_execution_checkpoint_tool_summary(
+    items: &[TurnItem],
+    detail_limit: usize,
+) -> ExecutionCheckpointToolSummary {
+    let detail_limit = detail_limit.max(1);
+    let tool_items = items
+        .iter()
+        .filter_map(tool_call_summary_from_item)
+        .collect::<Vec<_>>();
+
+    let total_count = u32::try_from(tool_items.len()).unwrap_or(u32::MAX);
+    let succeeded_count = u32::try_from(
+        tool_items
+            .iter()
+            .filter(|item| item.status == ToolCallStatus::Completed)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let failed_count = u32::try_from(
+        tool_items
+            .iter()
+            .filter(|item| item.status == ToolCallStatus::Failed)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let in_progress_count = u32::try_from(
+        tool_items
+            .iter()
+            .filter(|item| item.status == ToolCallStatus::InProgress)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let details_truncated = tool_items.len() > detail_limit;
+
+    ExecutionCheckpointToolSummary {
+        requested_count: total_count,
+        executed_count: succeeded_count.saturating_add(failed_count),
+        unexecuted_count: 0,
+        total_count,
+        succeeded_count,
+        failed_count,
+        in_progress_count,
+        detail_limit: u32::try_from(detail_limit).unwrap_or(u32::MAX),
+        details_truncated,
+        details: tool_items.into_iter().take(detail_limit).collect(),
+    }
+}
+
+pub fn build_execution_checkpoint_payload(
+    workspace_id: impl Into<String>,
+    thread_id: impl Into<String>,
+    turn_id: impl Into<String>,
+    original_request: ExecutionCheckpointOriginalRequestSummary,
+    window: ExecutionCheckpointWindowSummary,
+    provider_budget: ExecutionCheckpointProviderBudgetSummary,
+    tools: ExecutionCheckpointToolSummary,
+    obligations: Vec<ExecutionCheckpointStrictObligation>,
+) -> ExecutionCheckpointPayload {
+    ExecutionCheckpointPayload {
+        schema_version: EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        workspace_id: workspace_id.into(),
+        thread_id: thread_id.into(),
+        turn_id: turn_id.into(),
+        original_request,
+        window,
+        provider_budget,
+        tools,
+        strict_obligations: obligations,
+    }
+}
+
+pub fn collect_execution_checkpoint_strict_obligations<C: StrictObligationCollector + ?Sized>(
+    collector: &C,
+) -> Vec<ExecutionCheckpointStrictObligation> {
+    collector.collect_strict_obligations()
+}
+
+fn push_preview_text(buffer: &mut String, text: &str, truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+    for ch in text.chars() {
+        if buffer.chars().count() >= EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS {
+            *truncated = true;
+            break;
+        }
+        buffer.push(ch);
+    }
+}
+
+fn user_input_kind(input: &UserInput) -> &'static str {
+    match input {
+        UserInput::Text { .. } => "text",
+        UserInput::Image { .. } => "image",
+        UserInput::LocalImage { .. } => "local_image",
+        UserInput::File { .. } => "file",
+        UserInput::LocalFile { .. } => "local_file",
+        UserInput::Audio { .. } => "audio",
+        UserInput::LocalAudio { .. } => "local_audio",
+        UserInput::Video { .. } => "video",
+        UserInput::LocalVideo { .. } => "local_video",
+        UserInput::Artifact { .. } => "artifact",
+        UserInput::Mention { .. } => "mention",
+    }
+}
+
+fn tool_call_summary_from_item(item: &TurnItem) -> Option<ExecutionCheckpointToolCallSummary> {
+    match item {
+        TurnItem::CommandExecution {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            command,
+            cwd,
+            success,
+            outcome,
+            ..
+        } => {
+            let mut metadata = base_tool_metadata(display, storage);
+            insert_json_field(
+                &mut metadata,
+                "command_arg_count",
+                usize_to_u64(command.len()),
+            );
+            if let Some(cwd) = cwd {
+                insert_json_field(&mut metadata, "cwd", cwd.as_str());
+            }
+            Some(make_tool_call_summary(
+                id,
+                tool_name,
+                item.item_type(),
+                *status,
+                *success,
+                outcome.as_ref(),
+                recovery.as_ref(),
+                metadata,
+            ))
+        }
+        TurnItem::FileChange {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            changed_files,
+            exit_code,
+            success,
+            outcome,
+            ..
+        } => {
+            let mut metadata = base_tool_metadata(display, storage);
+            insert_json_field(
+                &mut metadata,
+                "changed_file_count",
+                usize_to_u64(changed_files.len()),
+            );
+            if let Some(exit_code) = exit_code {
+                insert_json_field(&mut metadata, "exit_code", i64::from(*exit_code));
+            }
+            Some(make_tool_call_summary(
+                id,
+                tool_name,
+                item.item_type(),
+                *status,
+                *success,
+                outcome.as_ref(),
+                recovery.as_ref(),
+                metadata,
+            ))
+        }
+        TurnItem::WebSearch {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            query,
+            provider,
+            took_ms,
+            result_count,
+            success,
+            outcome,
+            ..
+        } => {
+            let mut metadata = base_tool_metadata(display, storage);
+            if let Some(query) = query {
+                insert_json_field(&mut metadata, "query_preview", truncate_string(query, 120));
+            }
+            if let Some(provider) = provider {
+                insert_json_field(&mut metadata, "provider", provider.as_str());
+            }
+            if let Some(took_ms) = took_ms {
+                insert_json_field(&mut metadata, "took_ms", *took_ms);
+            }
+            if let Some(result_count) = result_count {
+                insert_json_field(&mut metadata, "result_count", usize_to_u64(*result_count));
+            }
+            Some(make_tool_call_summary(
+                id,
+                tool_name,
+                item.item_type(),
+                *status,
+                *success,
+                outcome.as_ref(),
+                recovery.as_ref(),
+                metadata,
+            ))
+        }
+        TurnItem::WebFetch {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            url,
+            final_url,
+            status_code,
+            content_type,
+            bytes_received,
+            elapsed_ms,
+            title,
+            word_count,
+            success,
+            outcome,
+            ..
+        } => {
+            let mut metadata = base_tool_metadata(display, storage);
+            if let Some(url) = url {
+                insert_json_field(&mut metadata, "url", truncate_string(url, 180));
+            }
+            if let Some(final_url) = final_url {
+                insert_json_field(&mut metadata, "final_url", truncate_string(final_url, 180));
+            }
+            if let Some(status_code) = status_code {
+                insert_json_field(&mut metadata, "status_code", u64::from(*status_code));
+            }
+            if let Some(content_type) = content_type {
+                insert_json_field(&mut metadata, "content_type", content_type.as_str());
+            }
+            if let Some(bytes_received) = bytes_received {
+                insert_json_field(
+                    &mut metadata,
+                    "bytes_received",
+                    usize_to_u64(*bytes_received),
+                );
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                insert_json_field(&mut metadata, "elapsed_ms", *elapsed_ms);
+            }
+            if let Some(title) = title {
+                insert_json_field(&mut metadata, "title_preview", truncate_string(title, 160));
+            }
+            if let Some(word_count) = word_count {
+                insert_json_field(&mut metadata, "word_count", usize_to_u64(*word_count));
+            }
+            Some(make_tool_call_summary(
+                id,
+                tool_name,
+                item.item_type(),
+                *status,
+                *success,
+                outcome.as_ref(),
+                recovery.as_ref(),
+                metadata,
+            ))
+        }
+        TurnItem::Download {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            url,
+            final_url,
+            status_code,
+            path,
+            bytes_written,
+            sha256,
+            content_type,
+            elapsed_ms,
+            success,
+            outcome,
+            ..
+        } => {
+            let mut metadata = base_tool_metadata(display, storage);
+            if let Some(url) = url {
+                insert_json_field(&mut metadata, "url", truncate_string(url, 180));
+            }
+            if let Some(final_url) = final_url {
+                insert_json_field(&mut metadata, "final_url", truncate_string(final_url, 180));
+            }
+            if let Some(status_code) = status_code {
+                insert_json_field(&mut metadata, "status_code", u64::from(*status_code));
+            }
+            if let Some(path) = path {
+                insert_json_field(&mut metadata, "path", truncate_string(path, 180));
+            }
+            if let Some(bytes_written) = bytes_written {
+                insert_json_field(&mut metadata, "bytes_written", *bytes_written);
+            }
+            if let Some(sha256) = sha256 {
+                insert_json_field(&mut metadata, "sha256", sha256.as_str());
+            }
+            if let Some(content_type) = content_type {
+                insert_json_field(&mut metadata, "content_type", content_type.as_str());
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                insert_json_field(&mut metadata, "elapsed_ms", *elapsed_ms);
+            }
+            Some(make_tool_call_summary(
+                id,
+                tool_name,
+                item.item_type(),
+                *status,
+                *success,
+                outcome.as_ref(),
+                recovery.as_ref(),
+                metadata,
+            ))
+        }
+        TurnItem::DynamicToolCall {
+            id,
+            tool_name,
+            status,
+            display,
+            storage,
+            recovery,
+            success,
+            outcome,
+            ..
+        } => Some(make_tool_call_summary(
+            id,
+            tool_name,
+            item.item_type(),
+            *status,
+            *success,
+            outcome.as_ref(),
+            recovery.as_ref(),
+            base_tool_metadata(display, storage),
+        )),
+        TurnItem::UserMessage { .. }
+        | TurnItem::AgentMessage { .. }
+        | TurnItem::Reasoning { .. }
+        | TurnItem::SystemEvent { .. }
+        | TurnItem::Task { .. } => None,
+    }
+}
+
+fn make_tool_call_summary(
+    item_id: &str,
+    tool_name: &str,
+    item_type: TurnItemType,
+    status: ToolCallStatus,
+    success: Option<bool>,
+    outcome: Option<&ToolOutcome>,
+    recovery: Option<&ToolRecoveryView>,
+    metadata: ToolMetadata,
+) -> ExecutionCheckpointToolCallSummary {
+    ExecutionCheckpointToolCallSummary {
+        item_id: item_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        item_type,
+        status,
+        success,
+        error_class: outcome.and_then(|outcome| outcome.error_class),
+        retry_error_class: recovery.and_then(|recovery| recovery.error_class.clone()),
+        metadata: ToolMetadata::from_json(bound_json_value(metadata.to_json(), 0)),
+    }
+}
+
+fn base_tool_metadata(display: &ToolDisplayPayload, storage: &ToolStoragePayload) -> ToolMetadata {
+    let mut metadata = ToolMetadata::empty();
+    if let Some(tool_metadata) = safe_tool_metadata(display, storage) {
+        metadata.insert(
+            "tool_metadata",
+            ToolMetadataValue::from_json(tool_metadata.to_json()),
+        );
+    }
+    metadata
+}
+
+fn safe_tool_metadata(
+    display: &ToolDisplayPayload,
+    storage: &ToolStoragePayload,
+) -> Option<ToolMetadata> {
+    match storage {
+        ToolStoragePayload::Summary(summary) => Some(summary.metadata.clone()),
+        ToolStoragePayload::Metadata { metadata } => Some(metadata.clone()),
+        ToolStoragePayload::Shell { .. } | ToolStoragePayload::None => match display {
+            ToolDisplayPayload::Summary(summary) => Some(summary.metadata.clone()),
+            ToolDisplayPayload::Progress { metadata, .. } => Some(metadata.clone()),
+            ToolDisplayPayload::Shell { .. } | ToolDisplayPayload::Hidden => None,
+        },
+    }
+}
+
+fn insert_json_field<T: Into<JsonValue>>(metadata: &mut ToolMetadata, key: &str, value: T) {
+    metadata.insert(key, ToolMetadataValue::from_json(value.into()));
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn bound_json_value(value: JsonValue, depth: usize) -> JsonValue {
+    match value {
+        JsonValue::String(value) => JsonValue::String(truncate_string(
+            &value,
+            EXECUTION_CHECKPOINT_METADATA_MAX_CHARS,
+        )),
+        JsonValue::Array(values) => JsonValue::Array(
+            values
+                .into_iter()
+                .take(EXECUTION_CHECKPOINT_METADATA_MAX_ARRAY_ITEMS)
+                .map(|value| bound_json_value(value, depth + 1))
+                .collect(),
+        ),
+        JsonValue::Object(map) if depth < 3 => JsonValue::Object(
+            map.into_iter()
+                .take(EXECUTION_CHECKPOINT_METADATA_MAX_FIELDS)
+                .map(|(key, value)| (key, bound_json_value(value, depth + 1)))
+                .collect(),
+        ),
+        JsonValue::Object(map) => serde_json::json!({
+            "truncated": true,
+            "objectFieldCount": map.len(),
+        }),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => value,
+    }
+}
+
+fn truncate_string(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut truncated = false;
+    for ch in value.chars() {
+        if output.chars().count() >= max_chars {
+            truncated = true;
+            break;
+        }
+        output.push(ch);
+    }
+    if truncated {
+        output.push_str("...");
+    }
+    output
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1486,6 +2177,7 @@ pub enum ToolLoopBudgetLimitKind {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolLoopBudgetAction {
+    ContinueInNextWindow,
     RequestFinalNoToolsRound,
     FailTurn,
 }
@@ -2163,6 +2855,83 @@ pub struct TurnToolLoopBudgetExceededNotification {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionWindowStartedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_id: String,
+    pub window_index: u32,
+    pub status: ExecutionWindowStatus,
+    pub started_at_unix_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionWindowExhaustedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_id: String,
+    pub window_index: u32,
+    pub status: ExecutionWindowStatus,
+    pub exhaustion_reason: ExecutionWindowExhaustionReason,
+    pub limit: u64,
+    pub observed: u64,
+    pub agent_round_count: u32,
+    pub tool_call_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_token_count: Option<u64>,
+    pub started_at_unix_ms: i64,
+    pub exhausted_at_unix_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionWindowCheckpointedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_id: String,
+    pub window_index: u32,
+    pub status: ExecutionWindowStatus,
+    pub checkpoint_id: String,
+    pub checkpoint_kind: String,
+    pub payload_bytes: u64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionWindowContinuedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_id: String,
+    pub window_index: u32,
+    pub status: ExecutionWindowStatus,
+    pub previous_window_id: String,
+    pub previous_window_index: u32,
+    pub checkpoint_id: String,
+    pub continued_at_unix_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionWindowBlockedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_id: String,
+    pub window_index: u32,
+    pub status: ExecutionWindowStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion_reason: Option<ExecutionWindowExhaustionReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    pub total_windows: u32,
+    pub total_tool_calls: u32,
+    pub reason: String,
+    pub blocked_at_unix_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnStatusChangedNotification {
     pub thread_id: String,
     pub turn_id: String,
@@ -2187,6 +2956,458 @@ pub struct ContextCompressedNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn execution_window_status_uses_snake_case_wire_values() {
+        let cases = [
+            (ExecutionWindowStatus::Running, "running"),
+            (ExecutionWindowStatus::Exhausted, "exhausted"),
+            (ExecutionWindowStatus::Checkpointed, "checkpointed"),
+            (ExecutionWindowStatus::Continued, "continued"),
+            (ExecutionWindowStatus::Completed, "completed"),
+            (ExecutionWindowStatus::Blocked, "blocked"),
+            (ExecutionWindowStatus::Failed, "failed"),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("status should serialize");
+            assert_eq!(encoded, json!(expected));
+            let decoded: ExecutionWindowStatus =
+                serde_json::from_value(encoded).expect("status should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn execution_window_exhaustion_reason_uses_window_scoped_wire_values() {
+        let cases = [
+            (
+                ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+                "max_agent_rounds_per_window",
+            ),
+            (
+                ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                "max_tool_calls_per_window",
+            ),
+            (
+                ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow,
+                "max_wall_clock_ms_per_window",
+            ),
+            (
+                ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow,
+                "max_provider_tokens_per_window",
+            ),
+            (
+                ExecutionWindowExhaustionReason::ProviderFailureContinuation,
+                "provider_failure_continuation",
+            ),
+            (
+                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                "runtime_shutdown_continuation",
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("reason should serialize");
+            assert_eq!(encoded, json!(expected));
+            let decoded: ExecutionWindowExhaustionReason =
+                serde_json::from_value(encoded).expect("reason should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn tool_loop_budget_action_includes_continuation_wire_value() {
+        let cases = [
+            (
+                ToolLoopBudgetAction::ContinueInNextWindow,
+                "continue_in_next_window",
+            ),
+            (
+                ToolLoopBudgetAction::RequestFinalNoToolsRound,
+                "request_final_no_tools_round",
+            ),
+            (ToolLoopBudgetAction::FailTurn, "fail_turn"),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("action should serialize");
+            assert_eq!(encoded, json!(expected));
+            let decoded: ToolLoopBudgetAction =
+                serde_json::from_value(encoded).expect("action should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn execution_window_lifecycle_notifications_serialize_bounded_payloads() {
+        let started = TurnExecutionWindowStartedNotification {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thr_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            window_id: "win_1".to_owned(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Running,
+            started_at_unix_ms: 1000,
+        };
+        let started_json = serde_json::to_value(&started).expect("started should serialize");
+        assert_eq!(started_json["workspace_id"], "ws_1");
+        assert_eq!(started_json["status"], "running");
+
+        let exhausted = TurnExecutionWindowExhaustedNotification {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thr_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            window_id: "win_1".to_owned(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Exhausted,
+            exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+            limit: 512,
+            observed: 513,
+            agent_round_count: 20,
+            tool_call_count: 513,
+            provider_token_count: Some(42_000),
+            started_at_unix_ms: 1000,
+            exhausted_at_unix_ms: 2000,
+            reason: "tool-call window budget exhausted".to_owned(),
+        };
+        let exhausted_json = serde_json::to_value(&exhausted).expect("exhausted should serialize");
+        assert_eq!(
+            exhausted_json["exhaustion_reason"],
+            "max_tool_calls_per_window"
+        );
+        assert_eq!(exhausted_json["tool_call_count"], 513);
+
+        let checkpointed = TurnExecutionWindowCheckpointedNotification {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thr_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            window_id: "win_1".to_owned(),
+            window_index: 1,
+            status: ExecutionWindowStatus::Checkpointed,
+            checkpoint_id: "chk_1".to_owned(),
+            checkpoint_kind: "window_exhausted".to_owned(),
+            payload_bytes: 1024,
+            created_at_unix_ms: 2100,
+        };
+        let checkpointed_json =
+            serde_json::to_value(&checkpointed).expect("checkpointed should serialize");
+        assert_eq!(checkpointed_json["checkpoint_id"], "chk_1");
+        assert!(checkpointed_json.get("payload").is_none());
+
+        let continued = TurnExecutionWindowContinuedNotification {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thr_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            window_id: "win_2".to_owned(),
+            window_index: 2,
+            status: ExecutionWindowStatus::Continued,
+            previous_window_id: "win_1".to_owned(),
+            previous_window_index: 1,
+            checkpoint_id: "chk_1".to_owned(),
+            continued_at_unix_ms: 2200,
+        };
+        let continued_json = serde_json::to_value(&continued).expect("continued should serialize");
+        assert_eq!(continued_json["window_id"], "win_2");
+        assert_eq!(continued_json["previous_window_id"], "win_1");
+
+        let blocked = TurnExecutionWindowBlockedNotification {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thr_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            window_id: "win_3".to_owned(),
+            window_index: 3,
+            status: ExecutionWindowStatus::Blocked,
+            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
+            checkpoint_id: Some("chk_3".to_owned()),
+            total_windows: 3,
+            total_tool_calls: 900,
+            reason: "total continuation budget exhausted".to_owned(),
+            blocked_at_unix_ms: 3000,
+        };
+        let blocked_json = serde_json::to_value(&blocked).expect("blocked should serialize");
+        assert_eq!(blocked_json["status"], "blocked");
+        assert_eq!(
+            blocked_json["exhaustion_reason"],
+            "max_wall_clock_ms_per_window"
+        );
+        assert_eq!(blocked_json["checkpoint_id"], "chk_3");
+    }
+
+    #[test]
+    fn turn_status_blocked_round_trips_as_distinct_status() {
+        let encoded = serde_json::to_value(TurnStatus::Blocked).expect("status should serialize");
+        assert_eq!(encoded, json!("Blocked"));
+
+        let decoded: TurnStatus =
+            serde_json::from_value(encoded).expect("status should deserialize");
+        assert_eq!(decoded, TurnStatus::Blocked);
+    }
+
+    #[test]
+    fn execution_checkpoint_payload_round_trips_with_bounded_original_request() {
+        let original_request = build_execution_checkpoint_original_request_summary(&[
+            UserInput::Text {
+                text: "x".repeat(EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS + 64),
+                text_elements: Vec::new(),
+            },
+            UserInput::LocalFile {
+                path: "/tmp/input.md".to_owned(),
+            },
+        ]);
+        assert_eq!(original_request.input_count, 2);
+        assert_eq!(original_request.attachment_count, 1);
+        assert_eq!(original_request.attachment_kinds, vec!["local_file"]);
+        assert_eq!(
+            original_request
+                .text_preview
+                .as_ref()
+                .expect("text preview should exist")
+                .chars()
+                .count(),
+            EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS
+        );
+        assert!(original_request.text_truncated);
+
+        let payload = build_execution_checkpoint_payload(
+            "ws_1",
+            "thr_1",
+            "turn_1",
+            original_request,
+            ExecutionCheckpointWindowSummary {
+                window_id: Some("win_1".to_owned()),
+                window_index: 1,
+                started_at_unix_ms: Some(1000),
+                completed_at_unix_ms: Some(2000),
+                agent_round_count: 7,
+                tool_call_count: 3,
+                provider_token_count: Some(1024),
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+            },
+            build_execution_checkpoint_provider_budget_summary(
+                ExecutionCheckpointProviderBudgetInput {
+                    model: Some("model_a".to_owned()),
+                    model_provider: Some("provider_a".to_owned()),
+                    agent_round_count: 7,
+                    tool_call_count: 3,
+                    provider_token_count: Some(1024),
+                    exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
+                    exhausted_limit: Some(3),
+                    exhausted_observed: Some(4),
+                },
+            ),
+            build_execution_checkpoint_tool_summary(&[], 4),
+            Vec::new(),
+        );
+
+        let encoded = serde_json::to_vec(&payload).expect("payload should serialize");
+        assert!(
+            encoded.len() < 10 * 1024,
+            "sample checkpoint payload should stay compact"
+        );
+        let decoded: ExecutionCheckpointPayload =
+            serde_json::from_slice(&encoded).expect("payload should deserialize");
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            decoded.schema_version,
+            EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn execution_checkpoint_tool_summary_counts_and_omits_raw_shell_output() {
+        let items = vec![
+            TurnItem::CommandExecution {
+                id: "cmd_1".to_owned(),
+                tool_name: "exec_command".to_owned(),
+                arguments: json!({"cmd": "printf secret"}),
+                status: ToolCallStatus::Failed,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                display: ToolDisplayPayload::Shell {
+                    stdout: Some("RAW_STDOUT_DO_NOT_COPY".to_owned()),
+                    stderr: Some("RAW_STDERR_DO_NOT_COPY".to_owned()),
+                    aggregated_output: Some("RAW_AGGREGATED_DO_NOT_COPY".to_owned()),
+                    exit_code: Some(2),
+                    duration_ms: Some(50),
+                    timed_out: Some(false),
+                    truncated: false,
+                },
+                storage: ToolStoragePayload::Shell {
+                    stdout: Some("STORED_STDOUT_DO_NOT_COPY".to_owned()),
+                    stderr: Some("STORED_STDERR_DO_NOT_COPY".to_owned()),
+                    aggregated_output: Some("STORED_AGGREGATED_DO_NOT_COPY".to_owned()),
+                    exit_code: Some(2),
+                    duration_ms: Some(50),
+                    timed_out: Some(false),
+                    truncated: false,
+                },
+                recovery: Some(ToolRecoveryView {
+                    error_class: Some("invalid_arguments".to_owned()),
+                    retry_hint: None,
+                    incomplete_reason: None,
+                    diagnostic_summary: None,
+                    diagnostic_excerpt: None,
+                    output_fingerprint: Some("out_fp".to_owned()),
+                    content_fingerprint: None,
+                    was_truncated: false,
+                    continuation: None,
+                }),
+                command: vec!["printf".to_owned(), "secret".to_owned()],
+                cwd: Some("/tmp".to_owned()),
+                success: Some(false),
+                outcome: Some(ToolOutcome {
+                    status: ToolOutcomeStatus::FatalError,
+                    error_class: Some(ToolErrorClass::InvalidArguments),
+                    should_retry: false,
+                    retry_hint: None,
+                    incomplete: false,
+                    incomplete_reason: None,
+                }),
+                observation: None,
+            },
+            TurnItem::FileChange {
+                id: "file_1".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json!({}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+                display: ToolDisplayPayload::default(),
+                storage: ToolStoragePayload::default(),
+                recovery: None,
+                changed_files: vec!["/tmp/a.txt".to_owned()],
+                exit_code: Some(0),
+                stdout: Some("FILE_STDOUT_DO_NOT_COPY".to_owned()),
+                stderr: Some("FILE_STDERR_DO_NOT_COPY".to_owned()),
+                success: Some(true),
+                outcome: Some(ToolOutcome {
+                    status: ToolOutcomeStatus::Ok,
+                    error_class: None,
+                    should_retry: false,
+                    retry_hint: None,
+                    incomplete: false,
+                    incomplete_reason: None,
+                }),
+                observation: None,
+            },
+            TurnItem::AgentMessage {
+                id: "agent_1".to_owned(),
+                text: "visible".to_owned(),
+                markdown: None,
+                markdown_version: None,
+            },
+        ];
+
+        let summary = build_execution_checkpoint_tool_summary(&items, 1);
+        assert_eq!(summary.requested_count, 2);
+        assert_eq!(summary.executed_count, 2);
+        assert_eq!(summary.unexecuted_count, 0);
+        assert_eq!(summary.total_count, 2);
+        assert_eq!(summary.succeeded_count, 1);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.in_progress_count, 0);
+        assert_eq!(summary.details.len(), 1);
+        assert!(summary.details_truncated);
+        assert_eq!(summary.details[0].item_id, "cmd_1");
+        assert_eq!(
+            summary.details[0].error_class,
+            Some(ToolErrorClass::InvalidArguments)
+        );
+        assert_eq!(
+            summary.details[0].retry_error_class.as_deref(),
+            Some("invalid_arguments")
+        );
+        assert_eq!(
+            summary.details[0]
+                .metadata
+                .get("command_arg_count")
+                .and_then(ToolMetadataValue::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            summary.details[0]
+                .metadata
+                .get("cwd")
+                .and_then(ToolMetadataValue::as_str),
+            Some("/tmp")
+        );
+
+        let encoded = serde_json::to_string(&summary).expect("summary should serialize");
+        for forbidden in [
+            "RAW_STDOUT_DO_NOT_COPY",
+            "RAW_STDERR_DO_NOT_COPY",
+            "RAW_AGGREGATED_DO_NOT_COPY",
+            "STORED_STDOUT_DO_NOT_COPY",
+            "STORED_STDERR_DO_NOT_COPY",
+            "STORED_AGGREGATED_DO_NOT_COPY",
+            "FILE_STDOUT_DO_NOT_COPY",
+            "FILE_STDERR_DO_NOT_COPY",
+            "visible",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "checkpoint tool summary should not include raw output or non-tool content"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_checkpoint_provider_budget_does_not_fabricate_missing_usage() {
+        let unavailable = build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: Some("model_a".to_owned()),
+                model_provider: Some("provider_a".to_owned()),
+                agent_round_count: 4,
+                tool_call_count: 9,
+                provider_token_count: None,
+                exhaustion_reason: None,
+                exhausted_limit: None,
+                exhausted_observed: None,
+            },
+        );
+        assert_eq!(unavailable.provider_token_count, None);
+        assert!(!unavailable.provider_usage_available);
+
+        let available = build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: None,
+                model_provider: None,
+                agent_round_count: 4,
+                tool_call_count: 9,
+                provider_token_count: Some(0),
+                exhaustion_reason: Some(
+                    ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow,
+                ),
+                exhausted_limit: Some(100),
+                exhausted_observed: Some(101),
+            },
+        );
+        assert_eq!(available.provider_token_count, Some(0));
+        assert!(available.provider_usage_available);
+        assert_eq!(available.exhausted_limit, Some(100));
+        assert_eq!(available.exhausted_observed, Some(101));
+    }
+
+    #[test]
+    fn strict_obligation_collectors_only_return_explicit_runtime_obligations() {
+        let empty = EmptyStrictObligationCollector;
+        assert!(collect_execution_checkpoint_strict_obligations(&empty).is_empty());
+
+        let mut refs = BTreeMap::new();
+        refs.insert("artifact_id".to_owned(), "art_1".to_owned());
+        let obligation = ExecutionCheckpointStrictObligation {
+            obligation_id: "obl_1".to_owned(),
+            kind: "artifact_not_registered".to_owned(),
+            description: "artifact was prepared but not finalized".to_owned(),
+            refs,
+        };
+        let collector = StaticStrictObligationCollector::new(vec![obligation.clone()]);
+        assert_eq!(
+            collect_execution_checkpoint_strict_obligations(&collector),
+            vec![obligation]
+        );
+    }
 
     #[test]
     fn turn_start_params_decode_text_input() {

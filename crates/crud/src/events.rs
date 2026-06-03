@@ -5,8 +5,10 @@ use pioneer_protocol::{
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    SandboxMode, Thread, Turn, TurnCompletedNotification, TurnFailedNotification,
-    TurnToolLoopBudgetExceededNotification, UserInput,
+    SandboxMode, Thread, Turn, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnToolLoopBudgetExceededNotification, UserInput,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,11 @@ pub enum TurnEventPayload {
     ItemToolRetryResolved(ItemToolRetryResolvedNotification),
     ItemToolRetryExhausted(ItemToolRetryExhaustedNotification),
     TurnToolLoopBudgetExceeded(TurnToolLoopBudgetExceededNotification),
+    TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
+    TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
+    TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
+    TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
+    TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
 }
@@ -59,6 +66,11 @@ impl TurnEventPayload {
             Self::ItemToolRetryResolved(_) => events::ITEM_TOOL_RETRY_RESOLVED,
             Self::ItemToolRetryExhausted(_) => events::ITEM_TOOL_RETRY_EXHAUSTED,
             Self::TurnToolLoopBudgetExceeded(_) => events::TURN_TOOL_LOOP_BUDGET_EXCEEDED,
+            Self::TurnExecutionWindowStarted(_) => events::TURN_EXECUTION_WINDOW_STARTED,
+            Self::TurnExecutionWindowExhausted(_) => events::TURN_EXECUTION_WINDOW_EXHAUSTED,
+            Self::TurnExecutionWindowCheckpointed(_) => events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
+            Self::TurnExecutionWindowContinued(_) => events::TURN_EXECUTION_WINDOW_CONTINUED,
+            Self::TurnExecutionWindowBlocked(_) => events::TURN_EXECUTION_WINDOW_BLOCKED,
             Self::TurnCompleted(_) => events::TURN_COMPLETED,
             Self::TurnFailed(_) => events::TURN_FAILED,
         }
@@ -81,6 +93,11 @@ impl TurnEventPayload {
             Self::ItemToolRetryResolved(payload) => payload.thread_id.as_str(),
             Self::ItemToolRetryExhausted(payload) => payload.thread_id.as_str(),
             Self::TurnToolLoopBudgetExceeded(payload) => payload.thread_id.as_str(),
+            Self::TurnExecutionWindowStarted(payload) => payload.thread_id.as_str(),
+            Self::TurnExecutionWindowExhausted(payload) => payload.thread_id.as_str(),
+            Self::TurnExecutionWindowCheckpointed(payload) => payload.thread_id.as_str(),
+            Self::TurnExecutionWindowContinued(payload) => payload.thread_id.as_str(),
+            Self::TurnExecutionWindowBlocked(payload) => payload.thread_id.as_str(),
             Self::TurnCompleted(payload) => payload.thread_id.as_str(),
             Self::TurnFailed(payload) => payload.thread_id.as_str(),
         }
@@ -103,6 +120,11 @@ impl TurnEventPayload {
             Self::ItemToolRetryResolved(payload) => payload.turn_id.as_str(),
             Self::ItemToolRetryExhausted(payload) => payload.turn_id.as_str(),
             Self::TurnToolLoopBudgetExceeded(payload) => payload.turn_id.as_str(),
+            Self::TurnExecutionWindowStarted(payload) => payload.turn_id.as_str(),
+            Self::TurnExecutionWindowExhausted(payload) => payload.turn_id.as_str(),
+            Self::TurnExecutionWindowCheckpointed(payload) => payload.turn_id.as_str(),
+            Self::TurnExecutionWindowContinued(payload) => payload.turn_id.as_str(),
+            Self::TurnExecutionWindowBlocked(payload) => payload.turn_id.as_str(),
             Self::TurnCompleted(payload) => payload.turn.id.as_str(),
             Self::TurnFailed(payload) => payload.turn.id.as_str(),
         }

@@ -1,3 +1,4 @@
+pub mod execution_continuation;
 pub mod memory_active_recall_contract;
 pub mod memory_post_turn_extractor;
 pub mod memory_recall;

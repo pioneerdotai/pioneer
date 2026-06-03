@@ -129,7 +129,12 @@ impl TurnProjector {
             | TurnEventPayload::ItemToolRetryScheduled(_)
             | TurnEventPayload::ItemToolRetryResolved(_)
             | TurnEventPayload::ItemToolRetryExhausted(_)
-            | TurnEventPayload::TurnToolLoopBudgetExceeded(_) => project_future(async { Ok(()) }),
+            | TurnEventPayload::TurnToolLoopBudgetExceeded(_)
+            | TurnEventPayload::TurnExecutionWindowStarted(_)
+            | TurnEventPayload::TurnExecutionWindowExhausted(_)
+            | TurnEventPayload::TurnExecutionWindowCheckpointed(_)
+            | TurnEventPayload::TurnExecutionWindowContinued(_)
+            | TurnEventPayload::TurnExecutionWindowBlocked(_) => project_future(async { Ok(()) }),
             TurnEventPayload::TurnCompleted(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(
                     db,

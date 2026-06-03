@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionWindowExhaustionReason",
+  "type": "string",
+  "enum": [
+    "max_agent_rounds_per_window",
+    "max_tool_calls_per_window",
+    "max_wall_clock_ms_per_window",
+    "max_provider_tokens_per_window",
+    "provider_failure_continuation",
+    "runtime_shutdown_continuation"
+  ]
+}

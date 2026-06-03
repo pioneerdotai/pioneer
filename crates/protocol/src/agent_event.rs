@@ -2,8 +2,10 @@ use crate::{
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
     ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, TaskEvent,
-    TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind, TurnItemType,
-    TurnToolLoopBudgetExceededNotification,
+    TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItemType, TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,22 @@ pub enum AgentDurableEvent {
     },
     TurnToolLoopBudgetExceeded {
         notification: TurnToolLoopBudgetExceededNotification,
+    },
+    TurnExecutionWindowStarted {
+        notification: TurnExecutionWindowStartedNotification,
+    },
+    TurnExecutionWindowExhausted {
+        notification: TurnExecutionWindowExhaustedNotification,
+    },
+    TurnExecutionWindowCheckpointed {
+        notification: TurnExecutionWindowCheckpointedNotification,
+        payload: crate::ExecutionCheckpointPayload,
+    },
+    TurnExecutionWindowContinued {
+        notification: TurnExecutionWindowContinuedNotification,
+    },
+    TurnExecutionWindowBlocked {
+        notification: TurnExecutionWindowBlockedNotification,
     },
     ProviderFailureDetected {
         thread_id: String,
@@ -241,6 +259,23 @@ impl AgentDurableEvent {
             Self::TurnToolLoopBudgetExceeded { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
+            Self::TurnExecutionWindowStarted { notification } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
+            Self::TurnExecutionWindowExhausted { notification } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
+            Self::TurnExecutionWindowCheckpointed { notification, .. } => {
+                DurableEventCausalityKey::Turn {
+                    turn_id: notification.turn_id.clone(),
+                }
+            }
+            Self::TurnExecutionWindowContinued { notification } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
+            Self::TurnExecutionWindowBlocked { notification } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
             Self::TaskEvent { event } => event.causality_key(),
             Self::ThreadLineageCreated { lineage } => DurableEventCausalityKey::ThreadLineage {
                 child_thread_id: lineage.child_thread_id.clone(),
@@ -265,6 +300,11 @@ impl AgentDurableEvent {
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }
             | Self::TurnToolLoopBudgetExceeded { .. }
+            | Self::TurnExecutionWindowStarted { .. }
+            | Self::TurnExecutionWindowExhausted { .. }
+            | Self::TurnExecutionWindowCheckpointed { .. }
+            | Self::TurnExecutionWindowContinued { .. }
+            | Self::TurnExecutionWindowBlocked { .. }
             | Self::ProviderFailureDetected { .. }
             | Self::RecoveryAttemptSucceeded { .. }
             | Self::ThreadLineageCreated { .. } => false,

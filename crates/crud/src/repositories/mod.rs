@@ -37,6 +37,7 @@ pub mod thread_lineage;
 pub mod thread_tree;
 pub mod turn;
 pub mod turn_event;
+pub mod turn_execution_window;
 pub mod turn_item_attempt;
 pub mod turn_llm_context;
 pub mod turn_mcp_binding;

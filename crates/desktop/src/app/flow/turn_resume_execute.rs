@@ -554,6 +554,111 @@ impl PioneerDesktop {
                                             },
                                         );
                                     }
+                                    TurnItemEventPayload::TurnExecutionWindowStarted(
+                                        notification,
+                                    ) => {
+                                        if notification.thread_id != turn_snapshot.thread_id
+                                            || notification.workspace_id
+                                                != turn_snapshot.workspace_id
+                                        {
+                                            continue;
+                                        }
+                                        let thread_id = notification.thread_id.clone();
+                                        let workspace_id = notification.workspace_id.clone();
+                                        view.upsert_thread_conversation_mut(
+                                            thread_id.as_str(),
+                                            workspace_id.as_str(),
+                                        )
+                                        .apply(
+                                            ConversationEvent::TurnExecutionWindowStarted {
+                                                notification,
+                                            },
+                                        );
+                                    }
+                                    TurnItemEventPayload::TurnExecutionWindowExhausted(
+                                        notification,
+                                    ) => {
+                                        if notification.thread_id != turn_snapshot.thread_id
+                                            || notification.workspace_id
+                                                != turn_snapshot.workspace_id
+                                        {
+                                            continue;
+                                        }
+                                        let thread_id = notification.thread_id.clone();
+                                        let workspace_id = notification.workspace_id.clone();
+                                        view.upsert_thread_conversation_mut(
+                                            thread_id.as_str(),
+                                            workspace_id.as_str(),
+                                        )
+                                        .apply(
+                                            ConversationEvent::TurnExecutionWindowExhausted {
+                                                notification,
+                                            },
+                                        );
+                                    }
+                                    TurnItemEventPayload::TurnExecutionWindowCheckpointed(
+                                        notification,
+                                    ) => {
+                                        if notification.thread_id != turn_snapshot.thread_id
+                                            || notification.workspace_id
+                                                != turn_snapshot.workspace_id
+                                        {
+                                            continue;
+                                        }
+                                        let thread_id = notification.thread_id.clone();
+                                        let workspace_id = notification.workspace_id.clone();
+                                        view.upsert_thread_conversation_mut(
+                                            thread_id.as_str(),
+                                            workspace_id.as_str(),
+                                        )
+                                        .apply(
+                                            ConversationEvent::TurnExecutionWindowCheckpointed {
+                                                notification,
+                                            },
+                                        );
+                                    }
+                                    TurnItemEventPayload::TurnExecutionWindowContinued(
+                                        notification,
+                                    ) => {
+                                        if notification.thread_id != turn_snapshot.thread_id
+                                            || notification.workspace_id
+                                                != turn_snapshot.workspace_id
+                                        {
+                                            continue;
+                                        }
+                                        let thread_id = notification.thread_id.clone();
+                                        let workspace_id = notification.workspace_id.clone();
+                                        view.upsert_thread_conversation_mut(
+                                            thread_id.as_str(),
+                                            workspace_id.as_str(),
+                                        )
+                                        .apply(
+                                            ConversationEvent::TurnExecutionWindowContinued {
+                                                notification,
+                                            },
+                                        );
+                                    }
+                                    TurnItemEventPayload::TurnExecutionWindowBlocked(
+                                        notification,
+                                    ) => {
+                                        if notification.thread_id != turn_snapshot.thread_id
+                                            || notification.workspace_id
+                                                != turn_snapshot.workspace_id
+                                        {
+                                            continue;
+                                        }
+                                        let thread_id = notification.thread_id.clone();
+                                        let workspace_id = notification.workspace_id.clone();
+                                        view.upsert_thread_conversation_mut(
+                                            thread_id.as_str(),
+                                            workspace_id.as_str(),
+                                        )
+                                        .apply(
+                                            ConversationEvent::TurnExecutionWindowBlocked {
+                                                notification,
+                                            },
+                                        );
+                                    }
                                 }
                             }
 
@@ -599,6 +704,9 @@ impl PioneerDesktop {
                                             turn: turn_snapshot.turn,
                                         },
                                     );
+                                    view.reset_thread_resume_state(target_thread_id.as_str());
+                                }
+                                pioneer_protocol::TurnStatus::Blocked => {
                                     view.reset_thread_resume_state(target_thread_id.as_str());
                                 }
                             }

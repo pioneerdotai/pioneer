@@ -1,18 +1,18 @@
 use super::*;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use pioneer_agent::AgentTurnHookRuntimeContext;
+use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    ItemCompletedNotification, ItemStartedNotification, SandboxMode, Task, TaskAgentContext,
-    TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract, TaskAgentResultFormat,
-    TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError, TaskErrorClass,
-    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTrigger,
-    TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+    ExecutionCheckpointPayload, ItemCompletedNotification, ItemStartedNotification, SandboxMode,
+    Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError,
+    TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse,
+    TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
+    TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
     ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
     TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
 };
@@ -472,7 +472,9 @@ impl TaskAgentExecutor {
                     let error_message = turn
                         .error
                         .unwrap_or_else(|| "revision child turn failed".to_owned());
-                    let target_status = task_run_turn_status_from_child_turn_status(turn.status);
+                    let target_status =
+                        task_run_turn_failure_status_from_child_turn_status(turn.status)
+                            .unwrap_or(TaskRunTurnStatus::Failed);
                     self.fail_child_turn(
                         child_runtime,
                         error_message.as_str(),
@@ -480,6 +482,10 @@ impl TaskAgentExecutor {
                         handle,
                     )
                     .await?;
+                }
+                TurnStatus::Blocked => {
+                    // Execution-window blocking is a runtime pause for the same child turn.
+                    // It must not be reconciled as a semantic task revision failure.
                 }
                 TurnStatus::InProgress => {
                     let started_at = now_timestamp_secs();
@@ -714,9 +720,11 @@ impl TaskAgentExecutor {
             .context("failed to prepare revision task artifact output directory")?
             .into_iter()
             .collect();
+        let execution_checkpoint_context =
+            load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await?;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context(
+            .start_turn_with_hook_context_and_execution_checkpoint(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -729,6 +737,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 Vec::new(),
+                execution_checkpoint_context,
             )
             .await
         {
@@ -804,10 +813,18 @@ impl TaskAgentExecutor {
             }
             TurnStatus::Failed | TurnStatus::Interrupted => {
                 let error_message = turn.error.unwrap_or_else(|| "child turn failed".to_owned());
-                let target_status = task_run_turn_status_from_child_turn_status(turn.status);
+                let target_status =
+                    task_run_turn_failure_status_from_child_turn_status(turn.status)
+                        .unwrap_or(TaskRunTurnStatus::Failed);
                 self.fail_child_turn(child_runtime, error_message.as_str(), target_status, handle)
                     .await?;
                 Ok(TaskExecutorStartOutcome::Started)
+            }
+            TurnStatus::Blocked => {
+                // A blocked execution window is a controlled runtime stop, not a child task
+                // failure. Leave task-run reconciliation untouched until an actual terminal
+                // child status or an explicit task action resolves it.
+                Ok(TaskExecutorStartOutcome::Queued)
             }
             TurnStatus::InProgress => {
                 self.restart_in_progress_child_turn(
@@ -988,9 +1005,11 @@ impl TaskAgentExecutor {
             .context("failed to prepare restored task artifact output directory")?
             .into_iter()
             .collect();
+        let execution_checkpoint_context =
+            load_execution_checkpoint_context_for_turn(processor, child_turn_id).await?;
         processor
             .agent_manager
-            .start_turn_with_hook_context(
+            .start_turn_with_hook_context_and_execution_checkpoint(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
@@ -1003,6 +1022,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 Vec::new(),
+                execution_checkpoint_context,
             )
             .await
             .map_err(|error| anyhow!("failed to redispatch child task turn: {error}"))?;
@@ -1133,7 +1153,7 @@ impl TaskAgentExecutor {
             .crud_store
             .get_turn(thread_id, turn_id)
             .await?
-            .map(|(_, turn)| task_run_turn_status_from_child_turn_status(turn.status))
+            .and_then(|(_, turn)| task_run_turn_failure_status_from_child_turn_status(turn.status))
             .unwrap_or(TaskRunTurnStatus::Failed);
         self.fail_child_turn(child_runtime, error_message, target_status, handle)
             .await?;
@@ -1422,7 +1442,7 @@ impl TaskAgentExecutor {
                     .await?;
                 }
                 TurnStatus::InProgress => {}
-                TurnStatus::Failed | TurnStatus::Interrupted => {}
+                TurnStatus::Failed | TurnStatus::Interrupted | TurnStatus::Blocked => {}
             }
             return Ok(());
         }
@@ -2137,6 +2157,7 @@ async fn mark_task_run_occurrence_turn_terminal(
                 )
                 .await;
         }
+        TurnStatus::Blocked => {}
         TurnStatus::InProgress => {}
     }
     Ok(())
@@ -2225,6 +2246,65 @@ async fn load_child_runtime_from_task_run_turn(
         lineage,
         task_run_turn,
     })
+}
+
+async fn load_execution_checkpoint_context_for_turn(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+) -> Result<Option<ExecutionCheckpointContext>> {
+    let Some(checkpoint) = processor
+        .crud_store
+        .latest_turn_execution_checkpoint_for_turn(turn_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(window) = processor
+        .crud_store
+        .get_turn_execution_window(checkpoint.window_id.as_str())
+        .await?
+    else {
+        return Ok(None);
+    };
+    if window.turn_id != turn_id {
+        warn!(
+            turn_id,
+            checkpoint_id = %checkpoint.id,
+            window_turn_id = %window.turn_id,
+            "skipping execution checkpoint whose window belongs to another turn"
+        );
+        return Ok(None);
+    }
+    let payload =
+        match serde_json::from_value::<ExecutionCheckpointPayload>(checkpoint.payload_json.clone())
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    checkpoint_id = %checkpoint.id,
+                    error = %format!("{error:#}"),
+                    "skipping invalid execution checkpoint payload during task child recovery"
+                );
+                return Ok(None);
+            }
+        };
+    Ok(Some(ExecutionCheckpointContext {
+        window_id: window.id,
+        window_index: window.window_index,
+        checkpoint_id: checkpoint.id,
+        checkpoint_kind: task_execution_checkpoint_kind_label(checkpoint.checkpoint_kind),
+        payload,
+    }))
+}
+
+fn task_execution_checkpoint_kind_label(kind: pioneer_crud::TurnExecutionCheckpointKind) -> String {
+    match kind {
+        pioneer_crud::TurnExecutionCheckpointKind::WindowExhausted => "window_exhausted",
+        pioneer_crud::TurnExecutionCheckpointKind::TurnBlocked => "turn_blocked",
+        pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery => "startup_recovery",
+    }
+    .to_owned()
 }
 
 fn task_run_primary_binding_from_turn(
@@ -2582,12 +2662,13 @@ fn runtime_auto_accept_review_event_id(run_id: &str, turn_id: &str) -> String {
     format!("trre_auto_{run_id}_{turn_id}")
 }
 
-fn task_run_turn_status_from_child_turn_status(status: TurnStatus) -> TaskRunTurnStatus {
+fn task_run_turn_failure_status_from_child_turn_status(
+    status: TurnStatus,
+) -> Option<TaskRunTurnStatus> {
     match status {
-        TurnStatus::Completed => TaskRunTurnStatus::CandidateCreated,
-        TurnStatus::Failed => TaskRunTurnStatus::Failed,
-        TurnStatus::Interrupted => TaskRunTurnStatus::Interrupted,
-        TurnStatus::InProgress => TaskRunTurnStatus::InProgress,
+        TurnStatus::Failed => Some(TaskRunTurnStatus::Failed),
+        TurnStatus::Interrupted => Some(TaskRunTurnStatus::Interrupted),
+        TurnStatus::Completed | TurnStatus::Blocked | TurnStatus::InProgress => None,
     }
 }
 
@@ -3959,6 +4040,17 @@ mod tests {
         assert!(framed.contains("create a daily scheduled task"));
     }
 
+    #[tokio::test]
+    async fn missing_execution_checkpoint_context_falls_back_to_none() {
+        let (processor, _task, task_run_turn, _lineage) =
+            task_artifact_harness("missing_checkpoint_context").await;
+        let context =
+            load_execution_checkpoint_context_for_turn(&processor, task_run_turn.turn_id.as_str())
+                .await
+                .expect("missing checkpoint should not fail");
+        assert!(context.is_none());
+    }
+
     async fn task_artifact_harness(
         name: &str,
     ) -> (Arc<MessageProcessor>, Task, TaskRunTurn, TaskThreadLineage) {
@@ -4135,6 +4227,7 @@ mod tests {
                 ..MemoryLoopConfig::default()
             },
             budget: ToolLoopBudgetConfig::default(),
+            execution_windows: pioneer_tools::ExecutionWindowsConfig::default(),
             retry: ToolRetryBudgetConfig::default(),
         }
         .normalized()

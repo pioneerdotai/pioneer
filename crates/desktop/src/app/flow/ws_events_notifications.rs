@@ -269,6 +269,36 @@ impl PioneerDesktop {
                     reason: notification.reason,
                 });
             }
+            GatewayNotification::TurnExecutionWindowStarted(notification) => {
+                let thread_id = notification.thread_id.clone();
+                let workspace_id = notification.workspace_id.clone();
+                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                    .apply(ConversationEvent::TurnExecutionWindowStarted { notification });
+            }
+            GatewayNotification::TurnExecutionWindowExhausted(notification) => {
+                let thread_id = notification.thread_id.clone();
+                let workspace_id = notification.workspace_id.clone();
+                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                    .apply(ConversationEvent::TurnExecutionWindowExhausted { notification });
+            }
+            GatewayNotification::TurnExecutionWindowCheckpointed(notification) => {
+                let thread_id = notification.thread_id.clone();
+                let workspace_id = notification.workspace_id.clone();
+                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                    .apply(ConversationEvent::TurnExecutionWindowCheckpointed { notification });
+            }
+            GatewayNotification::TurnExecutionWindowContinued(notification) => {
+                let thread_id = notification.thread_id.clone();
+                let workspace_id = notification.workspace_id.clone();
+                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                    .apply(ConversationEvent::TurnExecutionWindowContinued { notification });
+            }
+            GatewayNotification::TurnExecutionWindowBlocked(notification) => {
+                let thread_id = notification.thread_id.clone();
+                let workspace_id = notification.workspace_id.clone();
+                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                    .apply(ConversationEvent::TurnExecutionWindowBlocked { notification });
+            }
             GatewayNotification::Unknown(_notification) => {}
             GatewayNotification::ThreadClosed(notification) => {
                 let matches_thread_workspace = self.thread_workspace_matches(

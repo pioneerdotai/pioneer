@@ -318,6 +318,7 @@ fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
             DEFAULT_AGENTS_MD_PROMPT_SECTION_MAX_CHARS
         }
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall)
+        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation)
         | PromptRuntimeSectionId::Dynamic(_) => DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS,
     }
 }
@@ -326,7 +327,8 @@ fn runtime_section_order(id: &PromptRuntimeSectionId) -> u8 {
     match id {
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => 0,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall) => 1,
-        PromptRuntimeSectionId::Dynamic(_) => 2,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 2,
+        PromptRuntimeSectionId::Dynamic(_) => 3,
     }
 }
 
@@ -657,6 +659,18 @@ mod tests {
             title: None,
             content: content.to_owned(),
             max_chars,
+            truncated: false,
+        }
+    }
+
+    fn execution_continuation_runtime_section(content: &str) -> PromptRuntimeSectionInput {
+        PromptRuntimeSectionInput {
+            id: PromptRuntimeSectionId::BuiltIn(
+                PromptRuntimeBuiltInSectionId::ExecutionContinuation,
+            ),
+            title: None,
+            content: content.to_owned(),
+            max_chars: None,
             truncated: false,
         }
     }
@@ -1061,6 +1075,7 @@ mod tests {
             continue_generation_hint: false,
             runtime_sections: vec![
                 runtime_dynamic,
+                execution_continuation_runtime_section("execution continuation content"),
                 memory_recall_runtime_section("memory recall content"),
                 agents_md_runtime_section("agents content", Some(20_000)),
             ],
@@ -1092,12 +1107,18 @@ mod tests {
             .iter()
             .position(|id| id == "runtime.custom")
             .expect("runtime dynamic section present");
+        let execution_continuation_index = section_ids
+            .iter()
+            .position(|id| id == "execution_continuation")
+            .expect("execution continuation section present");
         let hook_index = section_ids
             .iter()
             .position(|id| id == "test.phase10.after")
             .expect("dynamic section present");
 
         assert!(agents_index < memory_index);
+        assert!(memory_index < execution_continuation_index);
+        assert!(execution_continuation_index < runtime_dynamic_index);
         assert!(memory_index < runtime_dynamic_index);
         assert!(runtime_dynamic_index < hook_index);
     }

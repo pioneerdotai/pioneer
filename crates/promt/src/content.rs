@@ -10,6 +10,7 @@ pub const SECTION_TITLE_TASK_ORCHESTRATION_POLICY: &str = "Task Orchestration";
 pub const SECTION_TITLE_MEMORY_RECALL: &str = "Memory Recall";
 pub const SECTION_TITLE_AGENTS_MD: &str = "AGENTS.md";
 pub const SECTION_TITLE_RECOVERY_CONTINUATION: &str = "Recovery Continuation";
+pub const SECTION_TITLE_EXECUTION_CONTINUATION: &str = "Execution Continuation";
 pub const SECTION_TITLE_SKILLS_RUNTIME: &str = "Skills Runtime";
 pub const SECTION_TITLE_RETRY_INSTRUCTION: &str = "Retry Instruction";
 pub const SECTION_TITLE_DYNAMIC_CONTEXT: &str = "Dynamic Context";
@@ -52,6 +53,12 @@ pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
 pub const TASK_ORCHESTRATION_POLICY_PROMPT: &str = "Task tools may be available for durable work, scheduling, and attached subagents.\n\nFor every non-trivial user task, first look for a useful split into meaningful independent subtasks. Prefer attached subagents when parallel work can improve speed, coverage, verification, or auditability, and use the parent turn to coordinate, review, and synthesize their accepted results.\n\nDo not over-delegate. Handle tiny, obvious, tightly coupled, or single-step tasks yourself when subagents would add coordination overhead without improving the outcome.\n\nBefore creating subagents, coordinating multi-agent work, or using task tools for scheduled/background work, call `read_skill` with skill slug `system:pioneer/subagents` and follow that skill's instructions. That skill is the authoritative guide for exact tool selection, payloads, waiting, review, revision, cancellation, detaching, scheduling, and final synthesis.\n\nDo not finish the parent turn while attached subagent work created by this turn is still unresolved. Resolve it according to the subagents skill before giving a final answer.";
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";
+
+pub const EXECUTION_CONTINUATION_PROMPT: &str = concat!(
+    "This is the same user turn continuing in a new execution window. ",
+    "Continue from the saved execution-window state without restarting the request. ",
+    "Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action."
+);
 
 pub const TOOL_LOOP_FINAL_ANSWER_INSTRUCTION: &str = "Tool loop budget is exhausted. Do not call more tools. Use the available tool results, summarize any unresolved work, and ask the user for guidance only if required.";
 

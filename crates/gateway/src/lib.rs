@@ -28,7 +28,10 @@ mod workspace;
 use anyhow::{Context, Result};
 use attachment::CrudArtifactExternalRefCacheBackend;
 use pioneer_agent::ToolLoopConfig;
-use pioneer_config::{AppConfig, GatewayMemoryConfig, GatewayTasksConfig};
+use pioneer_config::{
+    AppConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayTasksConfig,
+    GatewayToolLoopBudgetConfig, GatewayToolsConfig,
+};
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
 use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
@@ -41,7 +44,8 @@ use pioneer_provider::{
 use pioneer_skills::SkillTrustLevel;
 use pioneer_tasks::{TaskReviewRuntimeConfig, TaskRuntimeConfig};
 use pioneer_tools::{
-    ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
+    ComputerUseToolsConfig, ExecutionWindowBudgetConfig, ExecutionWindowTotalBudgetConfig,
+    ExecutionWindowsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -187,7 +191,6 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let web_cfg = &config.gateway.tools.web;
     let computer_use_cfg = &config.gateway.tools.computer_use;
-    let tool_budget_cfg = &config.gateway.tools.budget;
     let tool_retry_cfg = &config.gateway.tools.retry;
     let provider_attachments_cfg = &config.gateway.provider.attachments;
     let skills_cfg = &config.gateway.skills;
@@ -385,9 +388,12 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         },
         memory: memory_loop_config_from_gateway_memory_config(&config.gateway.memory),
         budget: ToolLoopBudgetConfig {
-            max_agent_rounds_per_turn: tool_budget_cfg.max_agent_rounds_per_turn,
-            max_tool_calls_per_turn: tool_budget_cfg.max_tool_calls_per_turn,
+            max_agent_rounds_per_turn: config.gateway.tools.budget.max_agent_rounds_per_turn,
+            max_tool_calls_per_turn: config.gateway.tools.budget.max_tool_calls_per_turn,
         },
+        execution_windows: execution_windows_config_from_gateway_tools_config(
+            &config.gateway.tools,
+        ),
         retry: ToolRetryBudgetConfig {
             max_recoverable_retry_rounds_per_episode: tool_retry_cfg
                 .max_recoverable_retry_rounds_per_episode,
@@ -561,6 +567,59 @@ fn task_runtime_config_from_gateway_tasks_config(config: &GatewayTasksConfig) ->
     }
 }
 
+fn execution_windows_config_from_gateway_tools_config(
+    config: &GatewayToolsConfig,
+) -> ExecutionWindowsConfig {
+    match config.execution_windows.as_ref() {
+        Some(execution_windows) => {
+            execution_windows_config_from_gateway_execution_windows_config(execution_windows)
+        }
+        None => legacy_execution_windows_config_from_gateway_budget_config(&config.budget),
+    }
+}
+
+fn execution_windows_config_from_gateway_execution_windows_config(
+    config: &GatewayExecutionWindowsConfig,
+) -> ExecutionWindowsConfig {
+    ExecutionWindowsConfig {
+        window: ExecutionWindowBudgetConfig {
+            max_agent_rounds_per_window: config.window.max_agent_rounds_per_window,
+            max_tool_calls_per_window: config.window.max_tool_calls_per_window,
+            max_wall_clock_ms_per_window: config.window.max_wall_clock_ms_per_window,
+            max_provider_tokens_per_window: config.window.max_provider_tokens_per_window,
+        },
+        total: ExecutionWindowTotalBudgetConfig {
+            max_windows_per_turn: config.total.max_windows_per_turn,
+            max_tool_calls_per_turn: config.total.max_tool_calls_per_turn,
+            max_wall_clock_ms_per_turn: config.total.max_wall_clock_ms_per_turn,
+            max_provider_tokens_per_turn: config.total.max_provider_tokens_per_turn,
+            max_consecutive_failed_windows: config.total.max_consecutive_failed_windows,
+        },
+    }
+    .normalized()
+}
+
+fn legacy_execution_windows_config_from_gateway_budget_config(
+    config: &GatewayToolLoopBudgetConfig,
+) -> ExecutionWindowsConfig {
+    let total_default = ExecutionWindowTotalBudgetConfig::default();
+    ExecutionWindowsConfig {
+        window: ExecutionWindowBudgetConfig {
+            max_agent_rounds_per_window: config.max_agent_rounds_per_turn,
+            max_tool_calls_per_window: config.max_tool_calls_per_turn,
+            max_wall_clock_ms_per_window: None,
+            max_provider_tokens_per_window: None,
+        },
+        total: ExecutionWindowTotalBudgetConfig {
+            max_tool_calls_per_turn: total_default
+                .max_tool_calls_per_turn
+                .max(config.max_tool_calls_per_turn),
+            ..total_default
+        },
+    }
+    .normalized()
+}
+
 pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     settings: &GatewayMemorySettings,
 ) -> MemoryLoopConfig {
@@ -657,12 +716,16 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_home_directory_templates, memory_loop_config_from_gateway_memory_config,
-        parse_skill_trust_level, task_runtime_config_from_gateway_tasks_config,
+        execution_windows_config_from_gateway_tools_config, expand_home_directory_templates,
+        memory_loop_config_from_gateway_memory_config, parse_skill_trust_level,
+        task_runtime_config_from_gateway_tasks_config,
     };
     use crate::secrets::GatewaySecrets;
     use pioneer_config::{
-        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayTasksConfig,
+        GatewayExecutionWindowBudgetConfig, GatewayExecutionWindowTotalBudgetConfig,
+        GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+        GatewayTasksConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
+        GatewayToolsConfig,
     };
     use pioneer_hooks::HookAwaitPolicy;
     use pioneer_keystore::MemorySecretStore;
@@ -761,6 +824,83 @@ mod tests {
         assert!(!loop_config.post_turn_extractor.enabled);
         assert!(!loop_config.post_turn_extractor.provider_enabled);
         assert!(!loop_config.post_turn_extractor.proactive_writes_enabled);
+    }
+
+    #[test]
+    fn execution_windows_config_maps_legacy_budget_when_new_section_is_absent() {
+        let config = execution_windows_config_from_gateway_tools_config(&GatewayToolsConfig {
+            budget: GatewayToolLoopBudgetConfig {
+                max_agent_rounds_per_turn: 17,
+                max_tool_calls_per_turn: 23,
+            },
+            execution_windows: None,
+            retry: GatewayToolRetryBudgetConfig::default(),
+            ..GatewayToolsConfig::default()
+        });
+
+        assert_eq!(config.window.max_agent_rounds_per_window, 17);
+        assert_eq!(config.window.max_tool_calls_per_window, 23);
+        assert_eq!(config.total.max_tool_calls_per_turn, 4096);
+    }
+
+    #[test]
+    fn execution_windows_config_uses_new_section_when_present() {
+        let config = execution_windows_config_from_gateway_tools_config(&GatewayToolsConfig {
+            budget: GatewayToolLoopBudgetConfig {
+                max_agent_rounds_per_turn: 17,
+                max_tool_calls_per_turn: 23,
+            },
+            execution_windows: Some(GatewayExecutionWindowsConfig {
+                window: GatewayExecutionWindowBudgetConfig {
+                    max_agent_rounds_per_window: 31,
+                    max_tool_calls_per_window: 37,
+                    max_wall_clock_ms_per_window: Some(1_000),
+                    max_provider_tokens_per_window: Some(2_000),
+                },
+                total: GatewayExecutionWindowTotalBudgetConfig {
+                    max_windows_per_turn: 5,
+                    max_tool_calls_per_turn: 41,
+                    max_wall_clock_ms_per_turn: Some(3_000),
+                    max_provider_tokens_per_turn: Some(4_000),
+                    max_consecutive_failed_windows: 2,
+                },
+            }),
+            retry: GatewayToolRetryBudgetConfig::default(),
+            ..GatewayToolsConfig::default()
+        });
+
+        assert_eq!(config.window.max_agent_rounds_per_window, 31);
+        assert_eq!(config.window.max_tool_calls_per_window, 37);
+        assert_eq!(config.window.max_wall_clock_ms_per_window, Some(1_000));
+        assert_eq!(config.window.max_provider_tokens_per_window, Some(2_000));
+        assert_eq!(config.total.max_windows_per_turn, 5);
+        assert_eq!(config.total.max_tool_calls_per_turn, 41);
+        assert_eq!(config.total.max_wall_clock_ms_per_turn, Some(3_000));
+        assert_eq!(config.total.max_provider_tokens_per_turn, Some(4_000));
+        assert_eq!(config.total.max_consecutive_failed_windows, 2);
+    }
+
+    #[test]
+    fn execution_windows_config_prefers_new_section_over_legacy_budget() {
+        let config = execution_windows_config_from_gateway_tools_config(&GatewayToolsConfig {
+            budget: GatewayToolLoopBudgetConfig {
+                max_agent_rounds_per_turn: 17,
+                max_tool_calls_per_turn: 23,
+            },
+            execution_windows: Some(GatewayExecutionWindowsConfig {
+                window: GatewayExecutionWindowBudgetConfig {
+                    max_agent_rounds_per_window: 31,
+                    max_tool_calls_per_window: 37,
+                    ..GatewayExecutionWindowBudgetConfig::default()
+                },
+                total: GatewayExecutionWindowTotalBudgetConfig::default(),
+            }),
+            retry: GatewayToolRetryBudgetConfig::default(),
+            ..GatewayToolsConfig::default()
+        });
+
+        assert_eq!(config.window.max_agent_rounds_per_window, 31);
+        assert_eq!(config.window.max_tool_calls_per_window, 37);
     }
 
     #[test]

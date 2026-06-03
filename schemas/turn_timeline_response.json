@@ -291,6 +291,29 @@
         }
       ]
     },
+    "ExecutionWindowExhaustionReason": {
+      "type": "string",
+      "enum": [
+        "max_agent_rounds_per_window",
+        "max_tool_calls_per_window",
+        "max_wall_clock_ms_per_window",
+        "max_provider_tokens_per_window",
+        "provider_failure_continuation",
+        "runtime_shutdown_continuation"
+      ]
+    },
+    "ExecutionWindowStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "exhausted",
+        "checkpointed",
+        "continued",
+        "completed",
+        "blocked",
+        "failed"
+      ]
+    },
     "ItemDeltaStream": {
       "type": "string",
       "enum": [
@@ -5400,6 +5423,7 @@
     "ToolLoopBudgetAction": {
       "type": "string",
       "enum": [
+        "continue_in_next_window",
         "request_final_no_tools_round",
         "fail_turn"
       ]
@@ -6004,6 +6028,301 @@
             "kind"
           ]
         }
+      ]
+    },
+    "TurnExecutionWindowBlockedNotification": {
+      "type": "object",
+      "properties": {
+        "blocked_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "checkpoint_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exhaustion_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionWindowStatus"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "total_tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total_windows": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "window_id",
+        "window_index",
+        "status",
+        "total_windows",
+        "total_tool_calls",
+        "reason",
+        "blocked_at_unix_ms"
+      ]
+    },
+    "TurnExecutionWindowCheckpointedNotification": {
+      "type": "object",
+      "properties": {
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "checkpoint_kind": {
+          "type": "string"
+        },
+        "created_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "payload_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionWindowStatus"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "window_id",
+        "window_index",
+        "status",
+        "checkpoint_id",
+        "checkpoint_kind",
+        "payload_bytes",
+        "created_at_unix_ms"
+      ]
+    },
+    "TurnExecutionWindowContinuedNotification": {
+      "type": "object",
+      "properties": {
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "continued_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "previous_window_id": {
+          "type": "string"
+        },
+        "previous_window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionWindowStatus"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "window_id",
+        "window_index",
+        "status",
+        "previous_window_id",
+        "previous_window_index",
+        "checkpoint_id",
+        "continued_at_unix_ms"
+      ]
+    },
+    "TurnExecutionWindowExhaustedNotification": {
+      "type": "object",
+      "properties": {
+        "agent_round_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "exhausted_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "exhaustion_reason": {
+          "$ref": "#/$defs/ExecutionWindowExhaustionReason"
+        },
+        "limit": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provider_token_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string"
+        },
+        "started_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionWindowStatus"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "tool_call_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "window_id",
+        "window_index",
+        "status",
+        "exhaustion_reason",
+        "limit",
+        "observed",
+        "agent_round_count",
+        "tool_call_count",
+        "started_at_unix_ms",
+        "exhausted_at_unix_ms",
+        "reason"
+      ]
+    },
+    "TurnExecutionWindowStartedNotification": {
+      "type": "object",
+      "properties": {
+        "started_at_unix_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/ExecutionWindowStatus"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "window_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "window_id",
+        "window_index",
+        "status",
+        "started_at_unix_ms"
       ]
     },
     "TurnItem": {
@@ -7724,6 +8043,71 @@
             "observed",
             "action",
             "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "turnExecutionWindowStarted"
+            }
+          },
+          "$ref": "#/$defs/TurnExecutionWindowStartedNotification",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "turnExecutionWindowExhausted"
+            }
+          },
+          "$ref": "#/$defs/TurnExecutionWindowExhaustedNotification",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "turnExecutionWindowCheckpointed"
+            }
+          },
+          "$ref": "#/$defs/TurnExecutionWindowCheckpointedNotification",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "turnExecutionWindowContinued"
+            }
+          },
+          "$ref": "#/$defs/TurnExecutionWindowContinuedNotification",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "turnExecutionWindowBlocked"
+            }
+          },
+          "$ref": "#/$defs/TurnExecutionWindowBlockedNotification",
+          "required": [
+            "type"
           ]
         }
       ]
