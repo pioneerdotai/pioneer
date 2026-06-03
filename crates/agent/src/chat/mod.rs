@@ -166,6 +166,66 @@ struct ExecutedToolResult {
     message: ChatMessage,
 }
 
+struct SpawnedToolTask {
+    item_id: String,
+    item_type: TurnItemType,
+    tool_name: String,
+    arguments: String,
+    handle: AbortOnDropJoinHandle<ExecutedToolResult>,
+}
+
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("join handle should be present")
+            .await
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn joined_tool_task_failure_result(
+    item_id: String,
+    item_type: TurnItemType,
+    tool_name: String,
+    arguments: String,
+    error: tokio::task::JoinError,
+) -> ExecutedToolResult {
+    let error_text = format!("tool task join failed: {error}");
+    let tool_error = pioneer_tools::ToolError::internal(error_text.clone());
+    let outcome = classify_tool_error(tool_name.as_str(), &tool_error);
+    ExecutedToolResult {
+        item_id: item_id.clone(),
+        item_type,
+        attempt_number: 1,
+        tool_name: tool_name.clone(),
+        arguments,
+        model_visible_text: error_text.clone(),
+        success: false,
+        outcome: outcome.clone(),
+        recovery_view: None,
+        request_tools_result: None,
+        message: tooling::build_tool_error_message(item_id, tool_name, error_text, outcome),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TaskMutationFailure {
     tool_name: String,
@@ -4283,8 +4343,16 @@ async fn execute_agent_provider_response(
                     let workspace_id = workspace_id.to_owned();
                     let thread_id = thread_id.to_owned();
                     let turn_id = turn_id.to_owned();
+                    let task_item_id = model_tool_call.id.clone();
+                    let task_tool_name = model_tool_call.name.clone();
+                    let task_arguments = model_tool_call.arguments.clone();
+                    let task_item_type =
+                        tooling::tool_item_type_from_name(task_tool_name.as_str());
 
-                    async move {
+                    // Tool handlers can execute nested tools. Running each model tool call in its
+                    // own task keeps nested dispatch from being polled under the full chat-loop
+                    // future, whose execution-window state is intentionally large.
+                    let handle = tokio::spawn(async move {
                         let item_id = model_tool_call.id.clone();
                         let arguments = model_tool_call.arguments.clone();
                         let tool_name = model_tool_call.name.clone();
@@ -4600,12 +4668,35 @@ async fn execute_agent_provider_response(
                             request_tools_result,
                             message,
                         }
+                    });
+
+                    SpawnedToolTask {
+                        item_id: task_item_id,
+                        item_type: task_item_type,
+                        tool_name: task_tool_name,
+                        arguments: task_arguments,
+                        handle: AbortOnDropJoinHandle::new(handle),
                     }
                 })
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
             let executed_results = stream::iter(tool_tasks)
+                .map(|task| async move {
+                    let SpawnedToolTask {
+                        item_id,
+                        item_type,
+                        tool_name,
+                        arguments,
+                        handle,
+                    } = task;
+                    match handle.join().await {
+                        Ok(result) => result,
+                        Err(error) => joined_tool_task_failure_result(
+                            item_id, item_type, tool_name, arguments, error,
+                        ),
+                    }
+                })
                 .buffer_unordered(parallel_tool_calls)
                 .collect::<Vec<_>>()
                 .await;
