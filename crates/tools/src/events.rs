@@ -595,7 +595,7 @@ mod tests {
         let storage_metadata = metadata.to_json();
 
         assert_eq!(event.tool_name, "write_file");
-        assert_eq!(display_summary.title, "write_file changed 1 file(s)");
+        assert_eq!(display_summary.title, "write_file created 1 file(s)");
         assert_eq!(
             display_metadata["changedFiles"][0],
             "/tmp/project/docs/example.md"
@@ -681,7 +681,7 @@ mod tests {
         let storage_metadata = metadata.to_json();
 
         assert_eq!(event.tool_name, "edit_file");
-        assert_eq!(display_summary.title, "edit_file changed 1 file(s)");
+        assert_eq!(display_summary.title, "edit_file edited 1 file(s)");
         assert_eq!(
             display_metadata["changedFiles"][0],
             "/tmp/project/src/lib.rs"

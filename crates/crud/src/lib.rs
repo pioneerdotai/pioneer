@@ -242,7 +242,8 @@ pub use crate::repositories::turn_execution_window::{
     NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord,
     TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TurnExecutionCheckpointKind,
     TurnExecutionCheckpointRecord, TurnExecutionDataCleanupRecord, TurnExecutionWindowRecord,
-    TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
+    TurnExecutionWindowStatsRecord, TurnExecutionWindowTerminalItemCountsRecord,
+    TurnExecutionWindowUsageAggregateRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
@@ -720,6 +721,15 @@ impl CrudStore {
         .await
     }
 
+    pub async fn mark_turn_execution_window_failed(
+        &self,
+        window_id: &str,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_failed(&self.connection, window_id, stats)
+            .await
+    }
+
     pub async fn mark_turn_execution_window_blocked(
         &self,
         window_id: &str,
@@ -733,6 +743,14 @@ impl CrudStore {
             stats,
         )
         .await
+    }
+
+    pub async fn count_turn_execution_window_terminal_items(
+        &self,
+        turn_id: &str,
+    ) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+        turn_execution_window::count_turn_execution_window_terminal_items(&self.connection, turn_id)
+            .await
     }
 
     pub async fn save_turn_execution_checkpoint(

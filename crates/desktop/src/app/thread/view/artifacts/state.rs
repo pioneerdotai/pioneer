@@ -455,7 +455,7 @@ impl PioneerDesktop {
                                     .thread_artifacts
                                     .defer_transient_load_retry(thread_id.as_str())
                                 {
-                                    warn!(
+                                    debug!(
                                         thread_id = thread_id.as_str(),
                                         retry_after_ms = delay.as_millis(),
                                         error = %error_message,

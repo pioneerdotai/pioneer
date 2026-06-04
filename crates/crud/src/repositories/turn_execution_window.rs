@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{turn_execution_checkpoint, turn_execution_window};
+use pioneer_entity::{turn_execution_checkpoint, turn_execution_window, turn_item};
 use pioneer_protocol::{ExecutionWindowExhaustionReason, ExecutionWindowStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::convention::{
     DB_ID_LEN, execution_window_exhaustion_reason_from_db,
     execution_window_exhaustion_reason_to_db, execution_window_status_from_db,
-    execution_window_status_to_db,
+    execution_window_status_to_db, turn_item_type_from_db,
 };
 
 pub const TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
@@ -76,6 +76,12 @@ pub struct TurnExecutionWindowUsageAggregateRecord {
     pub total_wall_clock_ms: u64,
     pub wall_clock_window_count: u32,
     pub total_provider_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnExecutionWindowTerminalItemCountsRecord {
+    pub agent_round_count: u32,
+    pub tool_call_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +381,14 @@ pub async fn mark_turn_execution_window_completed<C: ConnectionTrait>(
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Completed, None, stats).await
 }
 
+pub async fn mark_turn_execution_window_failed<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    stats: TurnExecutionWindowStatsRecord,
+) -> Result<TurnExecutionWindowRecord> {
+    update_window_with_stats(db, window_id, ExecutionWindowStatus::Failed, None, stats).await
+}
+
 pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
@@ -382,6 +396,32 @@ pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     stats: TurnExecutionWindowStatsRecord,
 ) -> Result<TurnExecutionWindowRecord> {
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Blocked, reason, stats).await
+}
+
+pub async fn count_turn_execution_window_terminal_items<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+    let rows = turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .all(db)
+        .await
+        .context("failed to list turn_item rows for execution-window terminal stats")?;
+
+    let mut counts = TurnExecutionWindowTerminalItemCountsRecord::default();
+    for row in rows {
+        let Some(item_type) = turn_item_type_from_db(row.item_type.as_str()) else {
+            continue;
+        };
+        if item_type == pioneer_protocol::TurnItemType::Reasoning {
+            counts.agent_round_count = counts.agent_round_count.saturating_add(1);
+        }
+        if item_type.is_tool_item() {
+            counts.tool_call_count = counts.tool_call_count.saturating_add(1);
+        }
+    }
+
+    Ok(counts)
 }
 
 pub async fn save_turn_execution_checkpoint<C: ConnectionTrait>(

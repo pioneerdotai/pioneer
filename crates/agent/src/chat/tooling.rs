@@ -707,6 +707,16 @@ fn metadata_string(metadata: &ToolMetadata, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn file_change_title(tool_name: &str, operation: Option<&str>, file_count: usize) -> String {
+    let verb = match operation {
+        Some("created") => "created",
+        Some("overwritten") => "overwrote",
+        Some("edited") => "edited",
+        _ => "changed",
+    };
+    format!("{tool_name} {verb} {file_count} file(s)")
+}
+
 fn metadata_u16(metadata: &ToolMetadata, key: &str) -> Option<u16> {
     metadata
         .get(key)
@@ -1076,7 +1086,11 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
             let title = if changed_files.is_empty() {
                 format!("{} completed", tool_name)
             } else {
-                format!("{} changed {} file(s)", tool_name, changed_files.len())
+                file_change_title(
+                    tool_name.as_str(),
+                    metadata_string(&metadata, "operation").as_deref(),
+                    changed_files.len(),
+                )
             };
             let summary = storage_summary.clone().unwrap_or_else(|| {
                 summary_payload(
@@ -1389,6 +1403,26 @@ mod tests {
         assert_eq!(
             tool_item_type_from_name("unknown_tool"),
             TurnItemType::DynamicToolCall
+        );
+    }
+
+    #[test]
+    fn file_change_title_uses_operation_when_available() {
+        assert_eq!(
+            file_change_title("write_file", Some("created"), 1),
+            "write_file created 1 file(s)"
+        );
+        assert_eq!(
+            file_change_title("write_file", Some("overwritten"), 1),
+            "write_file overwrote 1 file(s)"
+        );
+        assert_eq!(
+            file_change_title("edit_file", Some("edited"), 1),
+            "edit_file edited 1 file(s)"
+        );
+        assert_eq!(
+            file_change_title("apply_patch", None, 2),
+            "apply_patch changed 2 file(s)"
         );
     }
 

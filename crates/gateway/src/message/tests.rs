@@ -9978,6 +9978,259 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
     );
 }
 
+async fn setup_execution_window_terminal_turn(
+    thread_id: &str,
+    turn_id: &str,
+) -> (MessageProcessor, Arc<CrudStore>, String) {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+
+    let thread_start = thread_manager
+        .system_thread_start_seeded(
+            workspace_id.clone(),
+            pioneer_protocol::ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("thread should start");
+    thread_manager
+        .system_turn_start(pioneer_protocol::TurnStartParams {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            input: Vec::new(),
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: None,
+        })
+        .await
+        .expect("turn should start in thread manager");
+    crud_store
+        .materialize_turn_start(
+            &thread_start.started_notification.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist");
+
+    (processor, crud_store, workspace_id)
+}
+
+async fn start_terminal_test_execution_window(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    window_id: &str,
+) {
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+            notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                window_id: window_id.to_owned(),
+                window_index: 1,
+                status: ExecutionWindowStatus::Running,
+                started_at_unix_ms: 1_000,
+            },
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_turn_completion_closes_running_execution_window() {
+    let thread_id = "thr_window_terminal_complete";
+    let turn_id = "turn_window_terminal_complete";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_terminal_complete",
+    )
+    .await;
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::Reasoning {
+                    id: "item_window_terminal_reasoning".to_owned(),
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("reasoning item should persist");
+    crud_store
+        .materialize_item_completed(
+            write_file_completed_notification(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                "item_window_terminal_tool",
+                std::path::Path::new("/tmp/window-terminal-complete.md"),
+                "created",
+                b"complete",
+            ),
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("tool item should persist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            recovery: None,
+        })
+        .await;
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Completed);
+    assert!(window.completed_at.is_some());
+    assert_eq!(window.agent_round_count, 1);
+    assert_eq!(window.tool_call_count, 1);
+    assert_eq!(window.metadata_json["terminalStatus"], "completed");
+    assert_eq!(
+        window.metadata_json["terminalSource"],
+        "turn_terminal_event"
+    );
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_turn_failure_closes_running_execution_window() {
+    let thread_id = "thr_window_terminal_fail";
+    let turn_id = "turn_window_terminal_fail";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_terminal_fail",
+    )
+    .await;
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnFailed {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            error: "provider failed".to_owned(),
+            recovery: None,
+        })
+        .await;
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Failed);
+    assert!(window.completed_at.is_some());
+    assert_eq!(window.metadata_json["terminalStatus"], "failed");
+    assert_eq!(window.metadata_json["terminalReason"], "provider failed");
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_turn_interruption_closes_running_execution_window() {
+    let thread_id = "thr_window_terminal_interrupt";
+    let turn_id = "turn_window_terminal_interrupt";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_terminal_interrupt",
+    )
+    .await;
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnInterrupted {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            reason: "user cancelled".to_owned(),
+            recovery: None,
+        })
+        .await;
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Failed);
+    assert!(window.completed_at.is_some());
+    assert_eq!(window.metadata_json["terminalStatus"], "failed");
+    assert_eq!(window.metadata_json["terminalReason"], "user cancelled");
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Interrupted);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_durable_item_completed_does_not_commit_when_persistence_fails() {
     let session_manager = Arc::new(SessionManager::new());

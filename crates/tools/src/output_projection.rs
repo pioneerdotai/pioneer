@@ -345,7 +345,11 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         if file_count == 0 {
             format!("{} completed", input.tool_name)
         } else {
-            format!("{} changed {file_count} file(s)", input.tool_name)
+            file_change_title(
+                input.tool_name,
+                metadata.get("operation").and_then(JsonValue::as_str),
+                file_count,
+            )
         },
         metadata
             .get("changedFiles")
@@ -371,6 +375,16 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         storage_for_policy(input.output_policy, summary, metadata),
         recovery_view(&input),
     )
+}
+
+fn file_change_title(tool_name: &str, operation: Option<&str>, file_count: usize) -> String {
+    let verb = match operation {
+        Some("created") => "created",
+        Some("overwritten") => "overwrote",
+        Some("edited") => "edited",
+        _ => "changed",
+    };
+    format!("{tool_name} {verb} {file_count} file(s)")
 }
 
 fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
@@ -1763,7 +1777,7 @@ mod tests {
         let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
             panic!("write_file should use summary display");
         };
-        assert_eq!(display_summary.title, "write_file changed 1 file(s)");
+        assert_eq!(display_summary.title, "write_file created 1 file(s)");
         assert_eq!(
             display_summary.lines,
             vec!["/tmp/project/docs/example.md".to_owned()]
@@ -1830,6 +1844,11 @@ mod tests {
         };
         let metadata = metadata.to_json();
 
+        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
+            panic!("write_file overwrite should use summary display");
+        };
+        assert_eq!(display_summary.title, "write_file overwrote 1 file(s)");
+
         assert_eq!(metadata["operation"], "overwritten");
         assert_eq!(metadata["bytesWritten"], 12);
         assert_eq!(metadata["sha256"], "def456");
@@ -1883,7 +1902,7 @@ mod tests {
         let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
             panic!("edit_file should use summary display");
         };
-        assert_eq!(display_summary.title, "edit_file changed 1 file(s)");
+        assert_eq!(display_summary.title, "edit_file edited 1 file(s)");
         assert_eq!(
             display_summary.lines,
             vec!["/tmp/project/src/lib.rs".to_owned()]

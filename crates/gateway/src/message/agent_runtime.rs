@@ -102,6 +102,50 @@ fn execution_window_blocked_metadata(
     })
 }
 
+fn execution_window_terminal_metadata(
+    previous: &serde_json::Value,
+    status: pioneer_protocol::ExecutionWindowStatus,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = previous.as_object().cloned().unwrap_or_default();
+    let status_label = match status {
+        pioneer_protocol::ExecutionWindowStatus::Completed => "completed",
+        pioneer_protocol::ExecutionWindowStatus::Failed => "failed",
+        pioneer_protocol::ExecutionWindowStatus::Running => "running",
+        pioneer_protocol::ExecutionWindowStatus::Exhausted => "exhausted",
+        pioneer_protocol::ExecutionWindowStatus::Checkpointed => "checkpointed",
+        pioneer_protocol::ExecutionWindowStatus::Continued => "continued",
+        pioneer_protocol::ExecutionWindowStatus::Blocked => "blocked",
+    };
+    metadata.insert(
+        "terminalStatus".to_owned(),
+        serde_json::Value::String(status_label.to_owned()),
+    );
+    metadata.insert(
+        "terminalSource".to_owned(),
+        serde_json::Value::String("turn_terminal_event".to_owned()),
+    );
+    if let Some(reason) = reason
+        && !reason.trim().is_empty()
+    {
+        metadata.insert(
+            "terminalReason".to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
+    }
+    serde_json::Value::Object(metadata)
+}
+
+fn execution_window_is_active_for_terminal_close(
+    status: pioneer_protocol::ExecutionWindowStatus,
+) -> bool {
+    matches!(
+        status,
+        pioneer_protocol::ExecutionWindowStatus::Running
+            | pioneer_protocol::ExecutionWindowStatus::Checkpointed
+    )
+}
+
 fn execution_window_can_create_after(
     latest: Option<&pioneer_crud::TurnExecutionWindowRecord>,
     window_index: u32,
@@ -196,6 +240,58 @@ fn normalized_titles_equal(left: &str, right: &str) -> bool {
 }
 
 impl MessageProcessor {
+    async fn close_latest_active_execution_window_for_terminal_turn(
+        &self,
+        turn_id: &str,
+        terminal_status: pioneer_protocol::ExecutionWindowStatus,
+        terminal_reason: Option<&str>,
+    ) -> Result<()> {
+        let Some(window) = self
+            .crud_store
+            .latest_turn_execution_window(turn_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if !execution_window_is_active_for_terminal_close(window.status) {
+            return Ok(());
+        }
+
+        let counts = self
+            .crud_store
+            .count_turn_execution_window_terminal_items(turn_id)
+            .await?;
+        let now = now_db_timestamp();
+        let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
+            agent_round_count: window.agent_round_count.max(counts.agent_round_count),
+            tool_call_count: window.tool_call_count.max(counts.tool_call_count),
+            provider_token_count: window.provider_token_count,
+            metadata_json: execution_window_terminal_metadata(
+                &window.metadata_json,
+                terminal_status,
+                terminal_reason,
+            ),
+            completed_at: now,
+            updated_at: now,
+        };
+
+        match terminal_status {
+            pioneer_protocol::ExecutionWindowStatus::Completed => {
+                self.crud_store
+                    .mark_turn_execution_window_completed(window.id.as_str(), stats)
+                    .await?;
+            }
+            pioneer_protocol::ExecutionWindowStatus::Failed => {
+                self.crud_store
+                    .mark_turn_execution_window_failed(window.id.as_str(), stats)
+                    .await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     async fn parent_timeline_target_for_child_turn(
         &self,
         child_thread_id: &str,
@@ -2865,6 +2961,22 @@ impl MessageProcessor {
         }
 
         if let Err(error) = self
+            .close_latest_active_execution_window_for_terminal_turn(
+                turn_id.as_str(),
+                pioneer_protocol::ExecutionWindowStatus::Completed,
+                None,
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to close execution window after turn completion"
+            );
+        }
+
+        if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_completed(thread_id.as_str(), turn_id.as_str())
             .await
@@ -3132,6 +3244,22 @@ impl MessageProcessor {
         }
 
         if let Err(error) = self
+            .close_latest_active_execution_window_for_terminal_turn(
+                turn_id.as_str(),
+                pioneer_protocol::ExecutionWindowStatus::Failed,
+                Some(reason.as_str()),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to close execution window after turn interruption"
+            );
+        }
+
+        if let Err(error) = self
             .task_agent_executor
             .reconcile_child_turn_failed(
                 thread_id.as_str(),
@@ -3300,6 +3428,22 @@ impl MessageProcessor {
                 "failed to persist turn/failed event"
             );
             return false;
+        }
+
+        if let Err(error) = self
+            .close_latest_active_execution_window_for_terminal_turn(
+                turn_id.as_str(),
+                pioneer_protocol::ExecutionWindowStatus::Failed,
+                turn_failed.turn.error.as_deref(),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to close execution window after turn failure"
+            );
         }
 
         if let Err(error) = self
