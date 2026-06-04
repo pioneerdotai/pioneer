@@ -44,6 +44,14 @@ fn system_event_details<'a>(
     conversation: &'a Conversation,
     code: &str,
 ) -> (&'a str, &'a serde_json::Value) {
+    system_event_details_optional(conversation, code)
+        .unwrap_or_else(|| panic!("expected system event with code {code}"))
+}
+
+fn system_event_details_optional<'a>(
+    conversation: &'a Conversation,
+    code: &str,
+) -> Option<(&'a str, &'a serde_json::Value)> {
     conversation
         .projection()
         .items
@@ -57,7 +65,6 @@ fn system_event_details<'a>(
             } if existing_code == code => Some((message.as_str(), details)),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("expected system event with code {code}"))
 }
 
 fn window_started_notification(
@@ -1706,50 +1713,28 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
         Some(TURN_ID)
     );
 
-    let (started_message, started_details) =
-        system_event_details(&conversation, "turn_execution_window_started");
-    assert_eq!(started_message, "Execution window #1 started");
-    assert_eq!(
-        started_details
-            .get("status")
-            .and_then(|value| value.as_str()),
-        Some("running")
+    assert!(
+        system_event_details_optional(&conversation, "turn_execution_window_started").is_none(),
+        "window start should stay in the event log but not create a noisy timeline item"
     );
 
-    let (_, exhausted_details) =
-        system_event_details(&conversation, "turn_execution_window_exhausted");
-    assert_eq!(
-        exhausted_details
-            .get("exhaustion_reason")
-            .and_then(|value| value.as_str()),
-        Some("max_tool_calls_per_window")
+    assert!(
+        system_event_details_optional(&conversation, "turn_execution_window_exhausted").is_none(),
+        "exhausted should be folded into the continued item once continuation arrives"
     );
-    assert_eq!(
-        exhausted_details
-            .get("observed")
-            .and_then(|value| value.as_u64()),
-        Some(129)
-    );
-    assert!(exhausted_details.get("payload").is_none());
 
-    let (_, checkpointed_details) =
-        system_event_details(&conversation, "turn_execution_window_checkpointed");
-    assert_eq!(
-        checkpointed_details
-            .get("checkpoint_id")
-            .and_then(|value| value.as_str()),
-        Some("chk_000000000000000001")
+    assert!(
+        system_event_details_optional(&conversation, "turn_execution_window_checkpointed")
+            .is_none(),
+        "checkpoint persistence is an internal detail and should not create a timeline item"
     );
-    assert_eq!(
-        checkpointed_details
-            .get("payload_bytes")
-            .and_then(|value| value.as_u64()),
-        Some(4096)
-    );
-    assert!(checkpointed_details.get("payload").is_none());
 
-    let (_, continued_details) =
+    let (continued_message, continued_details) =
         system_event_details(&conversation, "turn_execution_window_continued");
+    assert_eq!(
+        continued_message,
+        "Continued in execution window #2 after window #1 limit"
+    );
     assert_eq!(
         continued_details
             .get("previous_window_index")
@@ -1762,7 +1747,36 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
             .and_then(|value| value.as_str()),
         Some("chk_000000000000000001")
     );
+    assert_eq!(
+        continued_details
+            .get("exhaustion_reason")
+            .and_then(|value| value.as_str()),
+        Some("max_tool_calls_per_window"),
+        "continued item should retain the earlier exhausted-window details"
+    );
+    assert_eq!(
+        continued_details
+            .get("observed")
+            .and_then(|value| value.as_u64()),
+        Some(129)
+    );
     assert!(continued_details.get("payload").is_none());
+    assert_eq!(
+        conversation
+            .projection()
+            .items
+            .iter()
+            .filter(|item| matches!(
+                &item.item,
+                TurnItem::SystemEvent {
+                    code: Some(code),
+                    ..
+                } if code.starts_with("turn_execution_window_")
+            ))
+            .count(),
+        1,
+        "exhausted + checkpointed + continued should render as one compact timeline item"
+    );
 
     conversation.apply(ConversationEvent::TurnCompleted {
         thread_id: THREAD_ID.to_owned(),

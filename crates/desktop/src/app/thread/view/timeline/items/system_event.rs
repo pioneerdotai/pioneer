@@ -758,7 +758,7 @@ mod tests {
 
         let presentation = system_event_presentation(
             &SystemEventLevel::Info,
-            "Continuing in execution window #2 from checkpoint chk_000000000000000001",
+            "Continued in execution window #2 after window #1 limit",
             Some("turn_execution_window_continued"),
             Some(&details),
         );
@@ -766,7 +766,7 @@ mod tests {
         assert!(
             presentation
                 .message
-                .contains("Continuing in execution window #2")
+                .contains("Continued in execution window #2")
         );
 
         let rows =

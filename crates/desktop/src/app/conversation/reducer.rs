@@ -679,25 +679,12 @@ impl ConversationProjector {
 
     pub(super) fn apply_turn_execution_window_started(
         &mut self,
-        turn_id: &str,
-        notification: &TurnExecutionWindowStartedNotification,
-        ts_unix_ms: i64,
+        _turn_id: &str,
+        _notification: &TurnExecutionWindowStartedNotification,
+        _ts_unix_ms: i64,
     ) {
-        self.push_system_event_item(
-            turn_id,
-            SystemEventLevel::Info,
-            format!("Execution window #{} started", notification.window_index),
-            Some("turn_execution_window_started".to_owned()),
-            Some(serde_json::json!({
-                "workspace_id": notification.workspace_id.as_str(),
-                "thread_id": notification.thread_id.as_str(),
-                "turn_id": notification.turn_id.as_str(),
-                "window_id": notification.window_id.as_str(),
-                "window_index": notification.window_index,
-                "status": execution_window_status_label(notification.status),
-            })),
-            ts_unix_ms,
-        );
+        // Starting the first execution window is expected for every turn and is too noisy
+        // for the user-facing timeline. The event remains in the event log and gateway DB.
     }
 
     pub(super) fn apply_turn_execution_window_exhausted(
@@ -708,7 +695,8 @@ impl ConversationProjector {
     ) {
         let exhaustion_reason =
             execution_window_exhaustion_reason_label(notification.exhaustion_reason);
-        self.push_system_event_item(
+        self.push_system_event_item_with_id(
+            execution_window_transition_item_id(turn_id, notification.window_index),
             turn_id,
             SystemEventLevel::Warning,
             format!(
@@ -737,31 +725,12 @@ impl ConversationProjector {
 
     pub(super) fn apply_turn_execution_window_checkpointed(
         &mut self,
-        turn_id: &str,
-        notification: &TurnExecutionWindowCheckpointedNotification,
-        ts_unix_ms: i64,
+        _turn_id: &str,
+        _notification: &TurnExecutionWindowCheckpointedNotification,
+        _ts_unix_ms: i64,
     ) {
-        self.push_system_event_item(
-            turn_id,
-            SystemEventLevel::Info,
-            format!(
-                "Execution checkpoint saved for window #{}",
-                notification.window_index
-            ),
-            Some("turn_execution_window_checkpointed".to_owned()),
-            Some(serde_json::json!({
-                "workspace_id": notification.workspace_id.as_str(),
-                "thread_id": notification.thread_id.as_str(),
-                "turn_id": notification.turn_id.as_str(),
-                "window_id": notification.window_id.as_str(),
-                "window_index": notification.window_index,
-                "status": execution_window_status_label(notification.status),
-                "checkpoint_id": notification.checkpoint_id.as_str(),
-                "checkpoint_kind": notification.checkpoint_kind.as_str(),
-                "payload_bytes": notification.payload_bytes,
-            })),
-            ts_unix_ms,
-        );
+        // Checkpoint persistence is an internal continuation detail. Keep it in the
+        // durable event stream, but do not create a standalone timeline item.
     }
 
     pub(super) fn apply_turn_execution_window_continued(
@@ -770,16 +739,14 @@ impl ConversationProjector {
         notification: &TurnExecutionWindowContinuedNotification,
         ts_unix_ms: i64,
     ) {
-        self.push_system_event_item(
-            turn_id,
-            SystemEventLevel::Info,
-            format!(
-                "Continuing in execution window #{} from checkpoint {}",
-                notification.window_index,
-                notification.checkpoint_id.as_str()
-            ),
-            Some("turn_execution_window_continued".to_owned()),
-            Some(serde_json::json!({
+        let item_id =
+            execution_window_transition_item_id(turn_id, notification.previous_window_index);
+        let mut details = self
+            .system_event_details_for_item(item_id.as_str())
+            .unwrap_or_else(|| serde_json::json!({}));
+        merge_json_object(
+            &mut details,
+            serde_json::json!({
                 "workspace_id": notification.workspace_id.as_str(),
                 "thread_id": notification.thread_id.as_str(),
                 "turn_id": notification.turn_id.as_str(),
@@ -789,7 +756,18 @@ impl ConversationProjector {
                 "previous_window_id": notification.previous_window_id.as_str(),
                 "previous_window_index": notification.previous_window_index,
                 "checkpoint_id": notification.checkpoint_id.as_str(),
-            })),
+            }),
+        );
+        self.push_system_event_item_with_id(
+            item_id,
+            turn_id,
+            SystemEventLevel::Info,
+            format!(
+                "Continued in execution window #{} after window #{} limit",
+                notification.window_index, notification.previous_window_index
+            ),
+            Some("turn_execution_window_continued".to_owned()),
+            Some(details),
             ts_unix_ms,
         );
     }
@@ -1079,6 +1057,21 @@ impl ConversationProjector {
     ) {
         let item_id = stable_system_event_item_id(turn_id, code.as_deref(), details.as_ref())
             .unwrap_or_else(|| self.next_synthetic_item_id("system_event"));
+        self.push_system_event_item_with_id(
+            item_id, turn_id, level, message, code, details, ts_unix_ms,
+        );
+    }
+
+    fn push_system_event_item_with_id(
+        &mut self,
+        item_id: String,
+        turn_id: &str,
+        level: SystemEventLevel,
+        message: String,
+        code: Option<String>,
+        details: Option<JsonValue>,
+        ts_unix_ms: i64,
+    ) {
         let item = TurnItem::SystemEvent {
             id: item_id.clone(),
             level,
@@ -1107,6 +1100,18 @@ impl ConversationProjector {
             details,
             ts_unix_ms,
         );
+    }
+
+    fn system_event_details_for_item(&self, item_id: &str) -> Option<JsonValue> {
+        let index = self.item_index.get(item_id).copied()?;
+        let item = self.view_state.items.get(index)?;
+        match &item.item {
+            TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            } => Some(details.clone()),
+            _ => item.opaque_meta.clone(),
+        }
     }
 
     fn next_timeline_entry_id(&mut self) -> String {
@@ -1240,6 +1245,27 @@ fn stable_system_event_item_id(
     code.hash(&mut hasher);
     details.to_string().hash(&mut hasher);
     Some(format!("system_event_{:016x}", hasher.finish()))
+}
+
+fn execution_window_transition_item_id(turn_id: &str, window_index: u32) -> String {
+    let mut hasher = DefaultHasher::new();
+    turn_id.hash(&mut hasher);
+    "execution_window_transition".hash(&mut hasher);
+    window_index.hash(&mut hasher);
+    format!("system_event_{:016x}", hasher.finish())
+}
+
+fn merge_json_object(target: &mut JsonValue, incoming: JsonValue) {
+    match (target.as_object_mut(), incoming) {
+        (Some(target), JsonValue::Object(incoming)) => {
+            for (key, value) in incoming {
+                target.insert(key, value);
+            }
+        }
+        (_, incoming) => {
+            *target = incoming;
+        }
+    }
 }
 
 fn merge_item_opaque_meta(existing: &mut Option<JsonValue>, incoming: Option<JsonValue>) {
