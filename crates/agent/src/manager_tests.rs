@@ -248,6 +248,15 @@ struct SequencedTextProvider {
     next_index: AtomicUsize,
 }
 
+const TOOL_SCHEMA_DUMP_RESPONSE: &str = r#"{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}"#;
+const RAW_TOOL_CALL_MARKUP_RESPONSE: &str = concat!(
+    "][transport][<tool_call>\n",
+    "][transport][<invoke name=\"exec_command\">][transport][<command>]",
+    "<item>bash && -lc && grep -nP '[\\xe2\\x80\\x94]' /tmp/article.md</item>",
+    "</command></invoke>\n",
+    "</tool_call>"
+);
+
 #[derive(Default)]
 struct RetryOnceFinalizationProvider {
     contexts: std::sync::Mutex<Vec<TurnFinalizationContext>>,
@@ -3312,6 +3321,121 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
 }
 
 #[tokio::test]
+async fn tool_schema_dump_no_tool_round_retries_without_schema_agent_message() {
+    let provider = Arc::new(SequencedTextProvider::new(vec![
+        TOOL_SCHEMA_DUMP_RESPONSE,
+        "done after schema dump recovery",
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "schema_dump_retry_thread",
+        "workspace",
+        "schema_dump_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let completed_messages = observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                return None;
+            };
+            Some(text.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_messages,
+        vec!["done after schema dump recovery".to_owned()],
+        "tool schema dumps must not create completed AgentMessage items"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "schema dump should be retried inside the same agent loop before final answer"
+    );
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("reproduced tool schemas or tool definitions")
+        }),
+        "retry request should include the schema-dump recovery instruction"
+    );
+}
+
+#[tokio::test]
+async fn raw_tool_call_markup_no_tool_round_retries_without_raw_agent_message() {
+    let provider = Arc::new(SequencedTextProvider::new(vec![
+        RAW_TOOL_CALL_MARKUP_RESPONSE,
+        "done after raw tool-call recovery",
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+
+    let observed = start_simple_turn(
+        &manager,
+        "raw_tool_markup_retry_thread",
+        "workspace",
+        "raw_tool_markup_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+
+    let completed_messages = observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::AgentMessage { text, .. } = &notification.item else {
+                return None;
+            };
+            Some(text.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_messages,
+        vec!["done after raw tool-call recovery".to_owned()],
+        "raw tool-call markup must not create completed AgentMessage items"
+    );
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "raw tool-call markup should be retried inside the same agent loop before final answer"
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("raw tool-call markup")),
+        "retry request should include the raw tool-call markup recovery instruction"
+    );
+}
+
+#[tokio::test]
 async fn finalization_retry_runs_before_agent_message_in_same_loop() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
         "premature final answer",
@@ -3456,6 +3580,93 @@ async fn third_consecutive_empty_no_tool_round_surfaces_provider_failure() {
     }
 
     panic!("provider failure was not emitted for repeated empty no-tool rounds")
+}
+
+#[tokio::test]
+async fn third_consecutive_tool_schema_dump_no_tool_round_surfaces_provider_failure() {
+    let provider = Arc::new(SequencedTextProvider::new(vec![
+        TOOL_SCHEMA_DUMP_RESPONSE,
+        TOOL_SCHEMA_DUMP_RESPONSE,
+        TOOL_SCHEMA_DUMP_RESPONSE,
+    ]));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread_id = "schema_dump_failure_thread";
+    let turn_id = "schema_dump_failure_turn";
+
+    manager
+        .ensure_thread(thread_id, "workspace")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    manager
+        .start_turn_with_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-text",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut completed_agent_messages = Vec::new();
+    for _ in 0..40 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("must receive agent event in time")
+            .expect("broadcast should remain open");
+        match event {
+            AgentEvent::ItemCompleted(notification) => {
+                if let TurnItem::AgentMessage { text, .. } = notification.item {
+                    completed_agent_messages.push(text);
+                }
+            }
+            AgentEvent::ProviderFailureDetected { failure, .. } => {
+                assert_eq!(failure.class, ProviderFailureClass::Unknown);
+                assert_eq!(
+                    failure.provider_code.as_deref(),
+                    Some("tool_schema_dump_response")
+                );
+                assert!(failure.is_recoverable_hint);
+                assert_eq!(
+                    failure.message.as_deref(),
+                    Some("model returned tool schema definitions instead of a final answer")
+                );
+                assert!(
+                    completed_agent_messages.is_empty(),
+                    "tool schema dump provider failure must not create AgentMessage items"
+                );
+                assert_eq!(
+                    provider.snapshot_requests().len(),
+                    3,
+                    "provider failure should happen on the third consecutive schema dump no-tool round"
+                );
+                return;
+            }
+            AgentEvent::TurnCompleted { .. } => {
+                panic!("tool schema dump no-tool rounds must not complete the turn")
+            }
+            AgentEvent::TurnFailed { error, .. } => {
+                panic!(
+                    "tool schema dump no-tool rounds should surface provider failure, not TurnFailed: {error}"
+                )
+            }
+            _ => {}
+        }
+    }
+
+    panic!("provider failure was not emitted for repeated tool schema dump no-tool rounds")
 }
 
 #[tokio::test]

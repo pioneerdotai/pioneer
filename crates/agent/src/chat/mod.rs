@@ -5,6 +5,7 @@ mod skills;
 mod tool_recovery_policy;
 mod tool_retry_lifecycle;
 mod tooling;
+mod validator;
 
 use self::preflight::{
     TurnPreflightOrchestratorInput, TurnPreflightOrchestratorResult, TurnPreflightTurnInput,
@@ -15,6 +16,7 @@ use self::tool_retry_lifecycle::{
     ToolRetryLifecycleTracker, emit_tool_loop_budget_exceeded, emit_tool_retry_drafts,
     turn_item_type_code,
 };
+use self::validator::no_tool_final_answer_rejection;
 use crate::hooks::{
     AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
     AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
@@ -65,14 +67,14 @@ use pioneer_protocol::{
     ItemDeltaNotification, ItemStartedNotification, PromptManifest, PromptManifestDiagnostic,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
-    ProviderTransportKind, RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot,
-    TurnAcceptedCapability, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemType, TurnRejectedCapability, UserInput,
-    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
-    build_execution_checkpoint_provider_budget_summary, generate_id,
+    PromptManifestProfile, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
+    RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot, TurnAcceptedCapability,
+    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemType, TurnRejectedCapability,
+    UserInput, build_execution_checkpoint_original_request_summary,
+    build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
+    generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
@@ -105,14 +107,7 @@ const SKILL_TOOL_BUNDLE_PRIORITY: i32 = 400;
 const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
 const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
-const MAX_CONSECUTIVE_EMPTY_NO_TOOL_ROUNDS: usize = 3;
-const EMPTY_NO_TOOL_ROUND_RECOVERY_INSTRUCTION: &str = concat!(
-    "Your previous response was empty and was not accepted. ",
-    "Continue the current turn from the existing tool results in context. ",
-    "Do not restart completed work. ",
-    "If work remains, call the next required tool. ",
-    "If the task is complete, provide a non-empty final answer."
-);
+const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
 
 #[derive(Debug, Default, Clone)]
 struct PendingToolUiState {
@@ -3417,7 +3412,7 @@ async fn execute_agent_provider_response(
 
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
-        let mut consecutive_empty_no_tool_rounds = 0usize;
+        let mut consecutive_rejected_no_tool_rounds = 0usize;
 
         loop {
             retain_agent_attachment_messages(&mut messages);
@@ -3846,7 +3841,7 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
-                    consecutive_empty_no_tool_rounds = 0;
+                    consecutive_rejected_no_tool_rounds = 0;
 
                     continue;
                 }
@@ -3944,7 +3939,7 @@ async fn execute_agent_provider_response(
 
             if round.tool_calls.is_empty() {
                 if round_plan.tools_enabled && pending_retry_instruction.take().is_some() {
-                    consecutive_empty_no_tool_rounds = 0;
+                    consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -4012,7 +4007,7 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
-                    consecutive_empty_no_tool_rounds = 0;
+                    consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -4059,7 +4054,7 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
-                    consecutive_empty_no_tool_rounds = 0;
+                    consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -4110,7 +4105,7 @@ async fn execute_agent_provider_response(
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
                             .map_err(|error| (error, current_thinking_id.clone()))?;
-                    consecutive_empty_no_tool_rounds = 0;
+                    consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
 
@@ -4119,11 +4114,16 @@ async fn execute_agent_provider_response(
                 let final_text = deterministic_final_text
                     .clone()
                     .unwrap_or_else(|| round.text.clone());
-                if deterministic_final_text.is_none() && final_text.trim().is_empty() {
-                    consecutive_empty_no_tool_rounds += 1;
+                let final_answer_rejection = deterministic_final_text
+                    .is_none()
+                    .then(|| no_tool_final_answer_rejection(final_text.as_str()))
+                    .flatten();
+                if let Some(rejection) = final_answer_rejection {
+                    post_turn_assistant_text.truncate(post_turn_assistant_text_len_before_round);
+                    consecutive_rejected_no_tool_rounds += 1;
 
-                    if consecutive_empty_no_tool_rounds
-                        >= MAX_CONSECUTIVE_EMPTY_NO_TOOL_ROUNDS
+                    if consecutive_rejected_no_tool_rounds
+                        >= MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS
                     {
                         return Err((
                             ChatTurnError::ProviderFailure {
@@ -4139,16 +4139,13 @@ async fn execute_agent_provider_response(
                                     } else {
                                         ProviderTransportKind::NonStream
                                     },
-                                    class: ProviderFailureClass::EmptyResponse,
+                                    class: rejection.provider_failure_class(),
                                     stage: ProviderFailureStage::Finalize,
                                     http_status: None,
-                                    provider_code: Some("empty_model_response".to_owned()),
+                                    provider_code: Some(rejection.provider_code().to_owned()),
                                     retry_after_ms: None,
                                     is_recoverable_hint: true,
-                                    message: Some(
-                                        "model returned an empty response without tool calls"
-                                            .to_owned(),
-                                    ),
+                                    message: Some(rejection.provider_message().to_owned()),
                                 },
                             },
                             current_thinking_id.clone(),
@@ -4173,7 +4170,7 @@ async fn execute_agent_provider_response(
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                     }
 
-                    messages.push(ChatMessage::user(EMPTY_NO_TOOL_ROUND_RECOVERY_INSTRUCTION));
+                    messages.push(ChatMessage::user(rejection.recovery_instruction()));
                     continue;
                 }
 
@@ -4212,7 +4209,7 @@ async fn execute_agent_provider_response(
                                 .await
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                             }
-                            consecutive_empty_no_tool_rounds = 0;
+                            consecutive_rejected_no_tool_rounds = 0;
                             messages.push(ChatMessage::user(instruction));
                             continue;
                         }
@@ -4310,7 +4307,7 @@ async fn execute_agent_provider_response(
                 return Ok(AgentProviderLoopOutcome::Completed);
             }
 
-            consecutive_empty_no_tool_rounds = 0;
+            consecutive_rejected_no_tool_rounds = 0;
 
             send_reasoning_completed(
                 workspace_id,
